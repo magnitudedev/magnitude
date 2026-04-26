@@ -23,6 +23,7 @@ export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'kimi-for-coding': rest('k2p6'),
   'fireworks-ai': rest('accounts/fireworks/models/kimi-k2p6'),
   'magnitude': tiered('glm-5.1', 'kimi-k2.6'),
+  'deepseek': tiered('deepseek-v4-pro', 'deepseek-v4-flash'),
 }
 
 /** OAuth-specific overrides */

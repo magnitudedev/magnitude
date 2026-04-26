@@ -142,4 +142,41 @@ describe('Protocol builders', () => {
       }))
     })
   })
+
+  // -------------------------------------------------------------------------
+  // DeepSeek — openai-generic, thinking disabled
+  // -------------------------------------------------------------------------
+  describe('deepseek', () => {
+    it('builds options with api key auth', () => {
+      vi.stubEnv('DEEPSEEK_API_KEY', 'ds-key')
+      const opts = __testOnly_buildProviderOptions('deepseek', 'deepseek-v4-pro', null, 1000, ['stop'])
+      expect(opts).toEqual(expect.objectContaining({
+        model: 'deepseek-v4-pro',
+        api_key: 'ds-key',
+        base_url: 'https://api.deepseek.com/v1',
+        stop: ['stop'],
+        thinking: { type: 'disabled' },
+        stream_options: { include_usage: true },
+      }))
+    })
+
+    it('disables thinking for all models', () => {
+      vi.stubEnv('DEEPSEEK_API_KEY', 'ds-key')
+      const optsPro = __testOnly_buildProviderOptions('deepseek', 'deepseek-v4-pro', null)
+      const optsFlash = __testOnly_buildProviderOptions('deepseek', 'deepseek-v4-flash', null)
+      expect(optsPro).toEqual(expect.objectContaining({ thinking: { type: 'disabled' } }))
+      expect(optsFlash).toEqual(expect.objectContaining({ thinking: { type: 'disabled' } }))
+    })
+
+    it('returns undefined when no auth available', () => {
+      vi.stubEnv('DEEPSEEK_API_KEY', '')
+      const opts = __testOnly_buildProviderOptions('deepseek', 'deepseek-v4-pro', null)
+      expect(opts).toBeUndefined()
+    })
+
+    it('uses explicit api auth', () => {
+      const opts = __testOnly_buildProviderOptions('deepseek', 'deepseek-v4-pro', { type: 'api', key: 'explicit-key' })
+      expect(opts).toEqual(expect.objectContaining({ api_key: 'explicit-key' }))
+    })
+  })
 })

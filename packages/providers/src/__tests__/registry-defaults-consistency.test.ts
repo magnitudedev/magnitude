@@ -27,6 +27,7 @@ const MODEL_DEFAULTS: Record<string, Record<TestSlot, string>> = {
   'kimi-for-coding': rest('k2p6'),
   'fireworks-ai': rest('accounts/fireworks/models/kimi-k2p6'),
   'magnitude': tiered('glm-5.1', 'kimi-k2.6'),
+  'deepseek': tiered('deepseek-v4-pro', 'deepseek-v4-flash'),
 }
 
 const MODEL_OAUTH_DEFAULTS: Record<string, Record<TestSlot, string>> = {

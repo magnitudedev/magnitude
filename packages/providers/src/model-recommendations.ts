@@ -64,6 +64,10 @@ export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   rule(/^accounts\/fireworks\/models\/glm-5p1$/, [...ALL_SLOTS], 'fireworks-ai'),
   rule(/^accounts\/fireworks\/models\/kimi-k2p6$/, [...ALL_SLOTS], 'fireworks-ai'),
 
+  // DeepSeek (direct provider)
+  rule(/^deepseek-v4-pro$/, ['lead'], 'deepseek'),
+  rule(/^deepseek-v4-flash$/, [...SUBAGENT_SLOTS], 'deepseek'),
+
   // Local intentionally omitted: recommendations depend on user-local inventory
 ]
 
