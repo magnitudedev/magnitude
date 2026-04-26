@@ -79,6 +79,50 @@ describe('fileEditModel provisional diffs', () => {
     expect(completed.diffs[0]?.addedLines).toEqual(['new'])
   })
 
+  test('diffs appear when baseContent arrives before ToolInputReady', () => {
+    const started = fileEditModel.reduce(fileEditModel.initial, { _tag: 'ToolInputStarted' })
+
+    // Simulate path completed (as if ToolInputFieldComplete fired for path)
+    let state = fileEditModel.reduce(started, {
+      _tag: 'ToolInputFieldChunk',
+      field: 'path',
+      path: ['path'] as unknown as never,
+      delta: 'f.ts',
+    })
+
+    // old streaming
+    state = fileEditModel.reduce(state, {
+      _tag: 'ToolInputFieldChunk',
+      field: 'old',
+      path: ['old'] as unknown as never,
+      delta: 'old',
+    })
+
+    // new streaming
+    state = fileEditModel.reduce(state, {
+      _tag: 'ToolInputFieldChunk',
+      field: 'new',
+      path: ['new'] as unknown as never,
+      delta: 'new',
+    })
+
+    // baseContent arrives BEFORE ToolInputReady (the fix enables this)
+    const withBase = fileEditModel.reduce(state, {
+      _tag: 'ToolEmission',
+      value: {
+        type: 'file_edit_base_content',
+        path: 'f.ts',
+        baseContent: 'a\nold\nb',
+      },
+    })
+
+    expect(withBase.diffs).toHaveLength(1)
+    expect(withBase.diffs[0]?.contextBefore).toEqual(['a'])
+    expect(withBase.diffs[0]?.removedLines).toEqual(['old'])
+    expect(withBase.diffs[0]?.addedLines).toEqual(['new'])
+    expect(withBase.diffs[0]?.contextAfter).toEqual(['b'])
+  })
+
   test('inputReady uses parsed input values directly', () => {
     const started = fileEditModel.reduce(fileEditModel.initial, { _tag: 'ToolInputStarted' })
 

@@ -70,7 +70,7 @@ import { createPolicyContextProvider } from '../agents/policy-context'
 import { ExecutionManager, IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
 import type { TurnEvent, TurnEventSink, ExecuteOptions, ExecuteResult, ExecutionManagerService } from './types'
 import { WorkingDirectoryTag } from './working-directory'
-import type { StreamingLeaf, StreamHook, ToolDefinition } from '@magnitudedev/tools'
+import type { StreamingLeaf, StreamHook, ToolContext, ToolDefinition } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -343,9 +343,51 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Streaming hook state per tool call
       const streamHookStates = new Map<string, unknown>()
-      const streamHookConfigs = new Map<string, AnyStreamHook>()
+      interface StreamHookEntry {
+        readonly hook: AnyStreamHook
+        readonly layerProvider?: () => Effect.Effect<Layer.Layer<never>, unknown>
+      }
+
+      const streamHookConfigs = new Map<string, StreamHookEntry>()
       // Simple field accumulator for streaming partial input
       const streamingFields = new Map<string, Record<string, StreamingLeaf<unknown>>>()
+
+      /** Invoke a tool's stream hook with current streaming state.
+       *  Uses the registered tool's layerProvider to satisfy R requirements internally,
+       *  following the same pattern as the xml-act dispatcher's executeToolEffect. */
+      const invokeStreamHook = (toolCallId: string, toolKey: ToolKey): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          const entry = streamHookConfigs.get(toolCallId)
+          if (!entry) return Effect.void
+
+          const currentState = streamHookStates.get(toolCallId)
+          const partialInput = streamingFields.get(toolCallId) ?? {}
+          const { hook, layerProvider } = entry
+
+          const streamCtx: ToolContext<unknown> = {
+            emit: (value) => sink.emit({
+              _tag: 'ToolEvent' as const,
+              toolCallId,
+              toolKey,
+              event: { _tag: 'ToolEmission' as const, toolCallId, value },
+            }),
+          }
+
+          const effect = hook.onInput(partialInput, currentState, streamCtx).pipe(
+            Effect.tapError((e) => Effect.sync(() => {
+              logger.error(`[ExecutionManager] Stream hook error for ${toolKey} (${toolCallId}): ${e}`)
+            })),
+            Effect.catchAll(() => Effect.succeed(currentState)),
+          )
+
+          const provided = layerProvider
+            ? layerProvider().pipe(Effect.flatMap((layer) => effect.pipe(Effect.provide(layer))))
+            : effect
+
+          return provided.pipe(
+            Effect.map((newState) => { streamHookStates.set(toolCallId, newState) }),
+          ) as Effect.Effect<void>
+        })
 
       // Track tag names for ToolStarted events
       const toolCallTagNames = new Map<string, string>()
@@ -406,8 +448,9 @@ const makeExecutionManager = Effect.gen(function* () {
                 const tool = toolEntry?.tool
                 if (tool && hasStreamHook(tool)) {
                   const streamConfig = tool.stream
+                  const registered = registeredTools.get(event.tagName)
                   streamHookStates.set(event.toolCallId, streamConfig.initial)
-                  streamHookConfigs.set(event.toolCallId, streamConfig)
+                  streamHookConfigs.set(event.toolCallId, { hook: streamConfig, layerProvider: registered?.layerProvider })
                   streamingFields.set(event.toolCallId, {})
                 }
 
@@ -437,25 +480,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   }
                 }
 
-                const streamConfig = streamHookConfigs.get(event.toolCallId)
-                if (streamConfig) {
-                  const currentState = streamHookStates.get(event.toolCallId)
-                  const partialInput = streamingFields.get(event.toolCallId) ?? {}
-                  const streamCtx = {
-                    emit: (value: unknown) => sink.emit( {
-                      _tag: 'ToolEvent' as const,
-                      toolCallId: event.toolCallId,
-                      toolKey,
-                      event: { _tag: 'ToolEmission' as const, toolCallId: event.toolCallId, value },
-                    }),
-                  }
-                  const streamEffect = streamConfig.onInput(partialInput, currentState, streamCtx) as Effect.Effect<unknown, unknown, any>
-                  const newState = yield* (streamEffect.pipe(
-                    Effect.provide(executionLayer),
-                    Effect.catchAll(() => Effect.succeed(currentState)),
-                  ) as Effect.Effect<unknown, never, never>)
-                  streamHookStates.set(event.toolCallId, newState)
-                }
+                yield* invokeStreamHook(event.toolCallId, toolKey)
 
                 yield* sink.emit( {
                   _tag: 'ToolEvent',
@@ -582,25 +607,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 }
 
                 // Invoke stream hook if present
-                const streamConfig = streamHookConfigs.get(event.toolCallId)
-                if (streamConfig) {
-                  const currentState = streamHookStates.get(event.toolCallId)
-                  const partialInput = streamingFields.get(event.toolCallId) ?? {}
-                  const streamCtx = {
-                    emit: (value: unknown) => sink.emit( {
-                      _tag: 'ToolEvent' as const,
-                      toolCallId: event.toolCallId,
-                      toolKey,
-                      event: { _tag: 'ToolEmission' as const, toolCallId: event.toolCallId, value },
-                    }),
-                  }
-                  const streamEffect = streamConfig.onInput(partialInput, currentState, streamCtx) as Effect.Effect<unknown, unknown, any>
-                  const newState = yield* (streamEffect.pipe(
-                    Effect.provide(executionLayer),
-                    Effect.catchAll(() => Effect.succeed(currentState)),
-                  ) as Effect.Effect<unknown, never, never>)
-                  streamHookStates.set(event.toolCallId, newState)
-                }
+                yield* invokeStreamHook(event.toolCallId, toolKey)
 
                 yield* sink.emit( {
                   _tag: 'ToolEvent',
@@ -611,20 +618,33 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              case 'ToolInputFieldComplete':
-                // Field complete — final value comes via ToolInputReady; emit for consumers
-                {
-                  const toolKey = toolCallKeys.get(event.toolCallId)
-                  if (toolKey) {
-                    yield* sink.emit( {
-                      _tag: 'ToolEvent',
-                      toolCallId: event.toolCallId,
-                      toolKey,
-                      event,
-                    })
+              case 'ToolInputFieldComplete': {
+                const toolKey = toolCallKeys.get(event.toolCallId)
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
+                  break
+                }
+
+                // Mark the completed field as final in streamingFields
+                const fields = streamingFields.get(event.toolCallId)
+                if (fields) {
+                  const existing = fields[event.field]
+                  if (existing) {
+                    fields[event.field] = { value: existing.value, isFinal: true }
                   }
                 }
+
+                // Invoke stream hook if present — the completed field is now isFinal=true
+                yield* invokeStreamHook(event.toolCallId, toolKey)
+
+                yield* sink.emit( {
+                  _tag: 'ToolEvent',
+                  toolCallId: event.toolCallId,
+                  toolKey,
+                  event,
+                })
                 break
+              }
 
               // --- Messages / Think prose ---
               case 'MessageStart': {

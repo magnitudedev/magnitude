@@ -1,7 +1,12 @@
 ## Turn control
 
 Yield user: End the turn, cannot send more messages or invoke more tools until the user responds.
-- Use AFTER you've sent the user a message and are awaiting a response
+- Do NOT yield to user until you've messaged in a way that elicits a response
+    - Example (GOOD): INVOKE -> MESSAGE("Did the thing.") // Good. User is informed.
+    - Example (BAD): MESSAGE("Let me do the thing.") -> INVOKE // Bad. No conclusive message! User is left hanging.
+- Do NOT yield to user after leading language "Let me do X" - you must follow leading language with invoking tools
+    - Example (GOOD): MESSAGE("Let me do the thing.") -> INVOKE -> YIELD INVOKE // Good. Can message user next turn.
+    - Example (BAD): MESSAGE("Let me do the thing.") -> YIELD USER // Bad. You just said you would do something and didn't. The user is left hanging. You do not get another turn.
 
 Yield worker: End the turn, cannot send more messages or invoke more tools until a worker follows up.
 - Use when you have ongoing workers that you are waiting on
