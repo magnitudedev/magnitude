@@ -27,6 +27,7 @@
     "@magnitudedev/roles": "0.0.1"
   },
   "changesets": [
+    "early-beers-ask",
     "fair-deserts-strive",
     "fine-things-invent",
     "hip-ads-sleep",
