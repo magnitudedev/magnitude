@@ -7,7 +7,6 @@ export type {
   BamlProviderType,
   AuthFlowType,
   AuthMethodDef,
-  ModelDefinition,
   ProviderDefinition,
   AuthInfo,
   ApiKeyAuth,
@@ -22,7 +21,10 @@ export type {
 // Model types
 export type { ModelDriverId, ModelDriver } from './model/model-driver'
 export { DRIVERS } from './model/model-driver'
-export { Model, type ModelCosts } from './model/model'
+export type { ProviderModel, ModelCosts } from './model/model'
+export type { ModelId, Model } from './model/canonical-model'
+export { MODEL_MANIFEST, type ModelManifestEntry } from './model/model-manifest'
+export { MODELS, getModel, hasModel } from './model/generated'
 export { ModelConnection, type ModelConnection as ModelConnectionType } from './model/model-connection'
 export type { InferenceConfig } from './model/inference-config'
 export type { BoundModel, ChatStream, ModelFunctionDef, StreamingFn, CompleteFn } from './model/bound-model'

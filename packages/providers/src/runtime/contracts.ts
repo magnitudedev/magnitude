@@ -1,15 +1,15 @@
 import { Context, Effect } from 'effect'
-import type { ProviderDefinition, ModelDefinition, AuthInfo, OAuthAuth } from '../types'
+import type { ProviderDefinition, AuthInfo, OAuthAuth } from '../types'
 import type { CallUsage, SlotState, SlotUsage } from '../state/provider-state'
 import type { DetectedAuthMethod, ProviderAuthMethodStatus } from '../detect'
-import type { Model } from '../model/model'
+import type { ProviderModel } from '../model/model'
 
 export interface ProviderCatalogShape {
   readonly listProviders: () => Effect.Effect<readonly ProviderDefinition[]>
   readonly getProvider: (providerId: string) => Effect.Effect<ProviderDefinition | null>
   readonly getProviderName: (providerId: string) => Effect.Effect<string>
-  readonly listModels: (providerId: string) => Effect.Effect<readonly ModelDefinition[]>
-  readonly getModel: (providerId: string, modelId: string) => Effect.Effect<ModelDefinition | null>
+  readonly listModels: (providerId: string) => Effect.Effect<readonly ProviderModel[]>
+  readonly getModel: (providerId: string, modelId: string) => Effect.Effect<ProviderModel | null>
   readonly refresh: () => Effect.Effect<void>
 }
 
@@ -19,7 +19,7 @@ export class ProviderCatalog extends Context.Tag('ProviderCatalog')<
 >() {}
 
 export interface ProviderStateShape<TSlot extends string> {
-  readonly peek: (slot: TSlot) => Effect.Effect<{ model: Model; auth: AuthInfo | null } | null>
+  readonly peek: (slot: TSlot) => Effect.Effect<{ model: ProviderModel; auth: AuthInfo | null } | null>
   readonly getSlot: (slot: TSlot) => Effect.Effect<SlotState>
   readonly setSelection: (
     slot: TSlot,

@@ -1,5 +1,6 @@
 import type { Effect, Stream } from 'effect'
-import type { Model } from './model'
+import type { ProviderModel } from './model'
+import type { Model } from './canonical-model'
 import type { ModelConnection } from './model-connection'
 import type { CallUsage } from '../state/provider-state'
 import type { CollectorData } from '../drivers/types'
@@ -53,7 +54,8 @@ export interface CallLevelOptions {
 }
 
 export interface BoundModel {
-  readonly model: Model
+  readonly model: ProviderModel
+  readonly canonicalModel: Model | null
   readonly connection: ModelConnection
 
   /** Typed invoke for streaming functions */

@@ -4,7 +4,7 @@
  * Extracted from model-proxy.ts so both model-proxy and provider-client can use them.
  */
 
-import type { Model } from './model/model'
+import type { ProviderModel } from './model/model'
 import type { CallUsage } from './state/provider-state'
 import { getModelCost } from './registry'
 
@@ -13,7 +13,7 @@ import { getModelCost } from './registry'
  * OAuth subscriptions are free ($0). Returns null costs if no pricing available.
  */
 export function calculateCosts(
-  model: Model | null,
+  model: ProviderModel | null,
   authType: string | null,
   inputTokens: number | null,
   outputTokens: number | null,
@@ -34,17 +34,17 @@ export function calculateCosts(
   let outputCost: number | null = null
 
   if (inputTokens !== null) {
-    inputCost = (inputTokens / 1_000_000) * pricing.input
-    if (cacheReadTokens !== null && pricing.cache_read) {
-      inputCost += (cacheReadTokens / 1_000_000) * pricing.cache_read
+    inputCost = (inputTokens / 1_000_000) * pricing.inputPerM
+    if (cacheReadTokens !== null && pricing.cacheReadPerM != null) {
+      inputCost += (cacheReadTokens / 1_000_000) * pricing.cacheReadPerM
     }
-    if (cacheWriteTokens !== null && pricing.cache_write) {
-      inputCost += (cacheWriteTokens / 1_000_000) * pricing.cache_write
+    if (cacheWriteTokens !== null && pricing.cacheWritePerM != null) {
+      inputCost += (cacheWriteTokens / 1_000_000) * pricing.cacheWritePerM
     }
   }
 
   if (outputTokens !== null) {
-    outputCost = (outputTokens / 1_000_000) * pricing.output
+    outputCost = (outputTokens / 1_000_000) * pricing.outputPerM
   }
 
   const totalCost = (inputCost !== null || outputCost !== null)
@@ -59,7 +59,7 @@ export function calculateCosts(
  * Calculates costs based on the model's pricing.
  */
 export function buildUsage(
-  model: Model | null,
+  model: ProviderModel | null,
   authType: string | null,
   inputTokens: number | null,
   outputTokens: number | null,

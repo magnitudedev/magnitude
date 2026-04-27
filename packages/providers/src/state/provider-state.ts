@@ -11,7 +11,6 @@ import { buildClientRegistry } from '../client-registry-builder'
 import { getProvider } from '../registry'
 import type { AuthInfo } from '../types'
 import { DEFAULT_CONTEXT_WINDOW } from '../constants'
-import { Model } from '../model/model'
 
 export interface SlotState {
   providerId: string | null
@@ -43,7 +42,7 @@ export interface SlotUsage {
 
 export interface ProviderStateStore<TSlot extends string> {
   readonly getSlots: () => Map<TSlot, SlotState>
-  readonly peekSlot: (slot: TSlot) => { model: Model; auth: AuthInfo | null } | null
+  readonly peekSlot: (slot: TSlot) => { model: ProviderModel; auth: AuthInfo | null } | null
   readonly setModel: (
     slot: TSlot,
     providerId: string,
@@ -92,31 +91,9 @@ export function makeProviderStateStore<TSlot extends string>(): ProviderStateSto
       const s = getOrCreateSlot(slot)
       if (!s.providerId || !s.modelId) return null
       const provider = getProvider(s.providerId)
-      const def = provider?.models.find(m => m.id === s.modelId)
-      const providerHasGrammar = (() => {
-        if (!provider) return false
-        const { protocol } = provider.resolveProtocol(s.auth)
-        return protocol.type === 'openai-generic' && protocol.capabilities.grammar !== undefined
-      })()
-      return {
-        model: new Model({
-          id: s.modelId,
-          providerId: s.providerId,
-          providerName: provider!.name,
-          name: def?.name ?? s.modelId,
-          contextWindow: def?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-          maxOutputTokens: def?.maxOutputTokens ?? null,
-          costs: def?.cost ? {
-            inputPerM: def.cost.input,
-            outputPerM: def.cost.output,
-            cacheReadPerM: def.cost.cache_read ?? null,
-            cacheWritePerM: def.cost.cache_write ?? null,
-          } : null,
-          supportsGrammar: def?.supportsGrammar ?? providerHasGrammar,
-          supportsVision: def?.supportsVision ?? false,
-        }),
-        auth: s.auth,
-      }
+      const model = provider?.models.find(m => m.id === s.modelId)
+      if (!model) return null
+      return { model, auth: s.auth }
     },
     setModel: (slot, providerId, modelId, auth, providerOptions) => {
       const provider = getProvider(providerId)

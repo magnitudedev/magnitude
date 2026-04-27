@@ -14,7 +14,7 @@ import {
 } from '../index'
 import type { AuthInfo } from '../types'
 import type { CallUsage } from '../state/provider-state'
-import type { Model } from '../model/model'
+import type { ProviderModel } from '../model/model'
 import type { BoundModel } from '../model/bound-model'
 import type { TraceInput } from '../resolver/tracing'
 
@@ -27,7 +27,7 @@ export interface LiveTraceStore {
 
 export interface LiveTestTarget {
   readonly slot: string
-  readonly model: Model
+  readonly model: ProviderModel
   readonly auth: AuthInfo | null
   readonly expectedDriver: ExpectedDriver
 }
@@ -59,7 +59,7 @@ export function getLiveProviderTestSkipReason(): string | null {
     : 'Set MAGNITUDE_RUN_LIVE_PROVIDER_TESTS=1 to run live provider integration tests'
 }
 
-export function expectedDriverForSelection(_model: Model, _auth: AuthInfo | null): ExpectedDriver {
+export function expectedDriverForSelection(_model: ProviderModel, _auth: AuthInfo | null): ExpectedDriver {
   return 'baml'
 }
 

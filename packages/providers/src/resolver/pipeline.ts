@@ -1,5 +1,6 @@
 import { Effect, Stream, Schedule, Duration, Scope, Exit, Option, Sink, Cause } from 'effect'
-import type { Model } from '../model/model'
+import type { ProviderModel } from '../model/model'
+import { getModel as getCanonicalModel } from '../model/generated'
 import type { ModelConnection } from '../model/model-connection'
 import type { InferenceConfig } from '../model/inference-config'
 import type { ExecutableDriver, DriverRequest } from '../drivers/types'
@@ -22,7 +23,7 @@ const MIN_OUTPUT_TOKENS = 1024
 const MAX_OUTPUT_TOKENS_FALLBACK = 32_768
 
 /** Compute clamped max_tokens given model limits and estimated input size */
-function computeMaxTokens(model: Model, inputTokenEstimate?: number): number | undefined {
+function computeMaxTokens(model: ProviderModel, inputTokenEstimate?: number): number | undefined {
   const maxOut = model.maxOutputTokens
   if (!maxOut) return undefined
   if (inputTokenEstimate != null) {
@@ -81,7 +82,7 @@ function extractTraceResponse(
 
 export function createBoundModel<TSlot extends string>(
   slot: TSlot,
-  model: Model,
+  model: ProviderModel,
   connection: ModelConnection,
   driver: ExecutableDriver<TSlot>,
   inference: InferenceConfig = {},
@@ -95,15 +96,17 @@ export function createBoundModel<TSlot extends string>(
 
 function createBoundModelImpl<TSlot extends string>(
   slot: TSlot,
-  model: Model,
+  model: ProviderModel,
   connection: ModelConnection,
   driver: ExecutableDriver<TSlot>,
   inference: InferenceConfig,
   providerOptions: ProviderOptions | undefined,
   providerState: import('../runtime/contracts').ProviderStateShape<string>,
 ): BoundModel {
+  const canonicalModel = model.modelId ? getCanonicalModel(model.modelId) ?? null : null
   const boundModel: BoundModel = {
     model,
+    canonicalModel,
     connection,
     invoke<I, O>(fn: ModelFunctionDef<I, O>, input: I, callOptions?: CallLevelOptions) {
       const maxTokens = computeMaxTokens(model, callOptions?.inputTokenEstimate)

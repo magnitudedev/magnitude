@@ -1,6 +1,9 @@
 export type { ModelDriverId, ModelDriver } from './model-driver'
 export { DRIVERS } from './model-driver'
-export { Model, type ModelCosts } from './model'
+export type { ProviderModel, ModelCosts } from './model'
+export type { ModelId, Model } from './canonical-model'
+export { MODEL_MANIFEST, type ModelManifestEntry } from './model-manifest'
+export { MODELS, getModel, hasModel } from './generated'
 export { ModelConnection, type ModelConnection as ModelConnectionType } from './model-connection'
 export type { InferenceConfig } from './inference-config'
 

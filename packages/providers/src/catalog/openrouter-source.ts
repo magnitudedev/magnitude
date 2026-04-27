@@ -1,6 +1,7 @@
 import { Effect } from 'effect'
-import type { ModelDefinition } from '../types'
+import type { ProviderModel } from '../model/model'
 import type { OpenRouterResponse } from './types'
+import { tryResolveCanonicalModelId } from '../registry'
 
 const API_URL = 'https://openrouter.ai/api/v1/models'
 const FETCH_TIMEOUT_MS = 10_000
@@ -43,35 +44,36 @@ export const fetchOpenRouterModels: Effect.Effect<OpenRouterResponse, Error> = E
   catch: (error) => (error instanceof Error ? error : new Error(String(error))),
 })
 
-export function normalizeOpenRouterModels(data: OpenRouterResponse): ModelDefinition[] {
+export function normalizeOpenRouterModels(providerId: string, providerName: string, data: OpenRouterResponse): ProviderModel[] {
   const now = Date.now()
 
-  return data.data.map((model): ModelDefinition => {
+  return data.data.map((model): ProviderModel => {
     const expiration = model.expiration_date ? Date.parse(model.expiration_date) : Number.NaN
     const inputModalities = model.architecture?.input_modalities ?? []
     const supportedParameters = model.supported_parameters ?? []
 
     return {
       id: model.id,
+      providerId,
+      providerName,
+      modelId: tryResolveCanonicalModelId(model.id),
       name: model.name,
       contextWindow: model.context_length,
-      maxOutputTokens: model.top_provider?.max_completion_tokens ?? undefined,
+      maxContextTokens: null,
+      maxOutputTokens: model.top_provider?.max_completion_tokens ?? null,
       supportsToolCalls: supportedParameters.includes('tools'),
       supportsReasoning: supportedParameters.includes('reasoning'),
       supportsVision: inputModalities.includes('image'),
-      description: model.description,
-      cost: {
-        input: parsePrice(model.pricing.prompt),
-        output: parsePrice(model.pricing.completion),
-        cache_read: model.pricing.input_cache_read ? parsePrice(model.pricing.input_cache_read) : undefined,
-        cache_write: model.pricing.input_cache_write ? parsePrice(model.pricing.input_cache_write) : undefined,
+      costs: {
+        inputPerM: parsePrice(model.pricing.prompt),
+        outputPerM: parsePrice(model.pricing.completion),
+        cacheReadPerM: model.pricing.input_cache_read ? parsePrice(model.pricing.input_cache_read) : null,
+        cacheWritePerM: model.pricing.input_cache_write ? parsePrice(model.pricing.input_cache_write) : null,
       },
-      family: inferFamily(model.id),
       releaseDate: toIsoDate(model.created),
-      status: (!Number.isNaN(expiration) && expiration < now) || model.deprecated ? 'deprecated' : undefined,
       discovery: {
         primarySource: 'openrouter-api',
       },
     }
-  }).sort((a, b) => b.releaseDate.localeCompare(a.releaseDate))
+  }).sort((a, b) => (b.releaseDate ?? '').localeCompare(a.releaseDate ?? ''))
 }

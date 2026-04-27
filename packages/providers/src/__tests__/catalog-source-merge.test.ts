@@ -1,17 +1,22 @@
 import { describe, expect, it } from 'vitest'
 
 import { mergeProviderModels } from '../catalog/merge'
-import type { ModelDefinition } from '../types'
+import type { ProviderModel } from '../model/model'
 
-function model(id: string, overrides: Partial<ModelDefinition> = {}): ModelDefinition {
+function model(id: string, overrides: Partial<ProviderModel> = {}): ProviderModel {
   return {
     id,
+    providerId: 'test',
+    providerName: 'Test',
+    modelId: null,
     name: id,
     contextWindow: 1000,
+    maxContextTokens: null,
+    maxOutputTokens: null,
     supportsToolCalls: false,
     supportsReasoning: false,
-    cost: { input: 0, output: 0 },
-    family: 'test',
+    supportsVision: false,
+    costs: { inputPerM: 0, outputPerM: 0, cacheReadPerM: null, cacheWritePerM: null },
     releaseDate: '2025-01-01T00:00:00.000Z',
     discovery: { primarySource: 'static' },
     ...overrides,
@@ -42,11 +47,11 @@ describe('catalog source merge order', () => {
   it('later sources only override defined fields', () => {
     const merged = mergeProviderModels(
       [],
-      [model('x', { description: 'static', supportsVision: true })],
-      [model('x', { description: undefined, supportsToolCalls: true, discovery: { primarySource: 'models.dev' } })],
+      [model('x', { supportsVision: true })],
+      [model('x', { supportsVision: undefined, supportsToolCalls: true, discovery: { primarySource: 'models.dev' } })],
     )
 
-    expect(merged[0]?.description).toBe('static')
     expect(merged[0]?.supportsToolCalls).toBe(true)
+    expect(merged[0]?.supportsVision).toBe(true)
   })
 })

@@ -3,13 +3,13 @@ import { Effect, Stream, Duration, Fiber, Scope } from 'effect'
 import { createBoundModel } from '../resolver/pipeline'
 import type { ExecutableDriver, DriverRequest, StreamResult, CompleteResult } from '../drivers/types'
 import { CollectorData } from '../drivers/types'
-import { Model } from '../model/model'
+import type { ProviderModel } from '../model/model'
 import { ModelConnection } from '../model/model-connection'
 import type { ProviderStateShape } from '../runtime/contracts'
 import { ProviderState } from '../runtime/contracts'
 import { TraceEmitter } from '../resolver/tracing'
 import type { CallUsage } from '../state/provider-state'
-import type { ModelError } from '../errors/model-error'
+import { ModelError, TransportError } from '../errors/model-error'
 
 const nullUsage: CallUsage = {
   inputTokens: null,
@@ -53,11 +53,14 @@ function createHangingDriver(): ExecutableDriver {
             },
           },
           () => new Error('stream error'),
-        ) as Stream.Stream<string, ModelError>,
+        ).pipe(
+          Stream.map(() => ''),
+          Stream.mapError(() => new TransportError({ message: 'stream error', status: null })),
+        ),
         getUsage: () => nullUsage,
         getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null, sseEvents: null }),
       }),
-    complete: (req: DriverRequest): Effect.Effect<CompleteResult, ModelError> =>
+    complete: <T = unknown>(req: DriverRequest): Effect.Effect<CompleteResult<T>, ModelError> =>
       Effect.die('not used in this test'),
   }
 }
@@ -80,16 +83,20 @@ const traceEmitter: { emit: () => Effect.Effect<void>; debug: boolean } = { emit
 
 describe('provider stream interrupt cancellation', () => {
   it('interrupting consumer fiber should cancel hanging provider stream promptly', async () => {
-    const model = new Model({
+    const model: ProviderModel = {
       id: 'test-model',
       providerId: 'test-provider',
       providerName: 'Test Provider',
       name: 'Test Model',
+      modelId: null,
       contextWindow: 100_000,
+      maxContextTokens: null,
       maxOutputTokens: 8_192,
-      costs: null,
+      supportsToolCalls: false,
+      supportsReasoning: false,
       supportsVision: true,
-    })
+      costs: null,
+    }
 
     const connection = ModelConnection.Baml({ auth: null })
     const driver = createHangingDriver()
@@ -124,15 +131,20 @@ describe('provider stream interrupt cancellation', () => {
   })
 
   it('normal completion should preserve late usage finalization (no cleanup abort)', async () => {
-    const model = new Model({
+    const model: ProviderModel = {
       id: 'test-model',
       providerId: 'test-provider',
       providerName: 'Test Provider',
       name: 'Test Model',
+      modelId: null,
       contextWindow: 100_000,
+      maxContextTokens: null,
       maxOutputTokens: 8_192,
+      supportsToolCalls: false,
+      supportsReasoning: false,
+      supportsVision: false,
       costs: null,
-    })
+    }
 
     const connection = ModelConnection.Baml({ auth: null })
 
@@ -165,7 +177,7 @@ describe('provider stream interrupt cancellation', () => {
           getUsage: () => finalizedUsage,
           getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null, sseEvents: null }),
         }),
-      complete: () => Effect.die('not used in this test'),
+      complete: <T = unknown>() => Effect.die('not used in this test') as Effect.Effect<CompleteResult<T>, ModelError>,
     }
 
     const bound = await Effect.runPromise(

@@ -6,7 +6,7 @@ import { CatalogSourceRegistry, ModelCatalog } from './contracts'
 import { mergeProviderModels } from './merge'
 import { makeRefreshSchedule } from './refresh'
 import { getProvider, getStaticProviderModels, PROVIDERS, setProviderModels } from '../registry'
-import type { ModelDefinition } from '../types'
+import type { ProviderModel } from '../model/model'
 
 export const ModelCatalogLive = Layer.scoped(
   ModelCatalog,
@@ -24,7 +24,7 @@ export const ModelCatalogLive = Layer.scoped(
           .filter((source) => source.supports(provider))
           .sort((a, b) => a.priority - b.priority)
 
-        const successfulLayers: ModelDefinition[][] = []
+        const successfulLayers: ProviderModel[][] = []
 
         for (const source of matchingSources) {
           const result = yield* Effect.either(source.refresh(provider))
@@ -54,7 +54,7 @@ export const ModelCatalogLive = Layer.scoped(
 
     const getModels = (
       providerId: string,
-    ): Effect.Effect<readonly ModelDefinition[]> =>
+    ): Effect.Effect<readonly ProviderModel[]> =>
       Effect.sync(() => getProvider(providerId)?.models ?? [])
 
     return {

@@ -12,7 +12,7 @@ import { buildClientRegistry } from '../client-registry-builder'
 import type { CallUsage } from '../state/provider-state'
 import type { ExecutableDriver, DriverRequest, StreamResult, CompleteResult } from './types'
 import type { AuthInfo } from '../types'
-import type { Model } from '../model/model'
+import type { ProviderModel } from '../model/model'
 import { CollectorData } from './types'
 import { classifyHttpError, classifyUnknownError } from '../errors/classify-error'
 import { TransportError } from '../errors/model-error'
@@ -37,7 +37,7 @@ function buildRegistry(req: DriverRequest): ClientRegistry | undefined {
 
 function extractUsageFromCollector(
   collector: Collector,
-  model: Model | null,
+  model: ProviderModel | null,
   authType: string | null,
 ): CallUsage {
   const extracted = extractUsageFromCollectorData(collector as Parameters<typeof extractUsageFromCollectorData>[0])
@@ -89,7 +89,7 @@ function toNormalizedAsyncStream(stream: AsyncIterable<string>): AsyncIterable<s
 
 export const BamlDriver: ExecutableDriver = {
   id: 'baml',
-  connect(_model: Model, auth: AuthInfo | null, _inference: InferenceConfig): Effect.Effect<ReturnType<typeof ModelConnectionCtor.Baml>, ModelError> {
+  connect(_model: ProviderModel, auth: AuthInfo | null, _inference: InferenceConfig): Effect.Effect<ReturnType<typeof ModelConnectionCtor.Baml>, ModelError> {
     return Effect.succeed(ModelConnectionCtor.Baml({ auth }))
   },
   stream(req: DriverRequest) {

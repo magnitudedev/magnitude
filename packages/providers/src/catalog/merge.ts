@@ -1,34 +1,36 @@
-import type { ModelDefinition } from '../types'
+import type { ProviderModel } from '../model/model'
 
-function assignDefined<K extends keyof ModelDefinition>(
-  target: ModelDefinition,
-  source: Partial<ModelDefinition>,
-  key: K,
+type ProviderModelKey = keyof ProviderModel
+
+function assignDefined(
+  target: ProviderModel,
+  source: Partial<ProviderModel>,
+  key: ProviderModelKey,
 ): void {
   const value = source[key]
   if (value !== undefined) {
-    target[key] = value
+    (target as any)[key] = value
   }
 }
 
 function overlayModel(
-  base: ModelDefinition | undefined,
-  patch: ModelDefinition,
-): ModelDefinition {
+  base: ProviderModel | undefined,
+  patch: ProviderModel,
+): ProviderModel {
   if (!base) return { ...patch }
 
-  const next: ModelDefinition = { ...base }
-  for (const key of Object.keys(patch) as Array<keyof ModelDefinition>) {
+  const next: ProviderModel = { ...base }
+  for (const key of Object.keys(patch) as ProviderModelKey[]) {
     assignDefined(next, patch, key)
   }
   return next
 }
 
 export function mergeProviderModels(
-  staticFallback: readonly ModelDefinition[],
-  ...sources: readonly ModelDefinition[][]
-): ModelDefinition[] {
-  const merged = new Map<string, ModelDefinition>()
+  staticFallback: readonly ProviderModel[],
+  ...sources: readonly ProviderModel[][]
+): ProviderModel[] {
+  const merged = new Map<string, ProviderModel>()
   const sourceOrder = new Map<string, number>()
 
   let order = 0
@@ -48,7 +50,7 @@ export function mergeProviderModels(
   }
 
   return Array.from(merged.values()).sort((a, b) => {
-    const byDate = b.releaseDate.localeCompare(a.releaseDate)
+    const byDate = (b.releaseDate ?? '').localeCompare(a.releaseDate ?? '')
     if (byDate !== 0) return byDate
     return (sourceOrder.get(a.id) ?? 0) - (sourceOrder.get(b.id) ?? 0)
   })

@@ -15,6 +15,6 @@ export const openRouterCatalogSource: CatalogSource = {
       OPENROUTER_TTL_MS,
       fetchOpenRouterModels,
     ).pipe(
-      Effect.map((data) => (data ? normalizeOpenRouterModels(data) : [])),
+      Effect.map((data) => (data ? normalizeOpenRouterModels('openrouter', 'OpenRouter', data) : [])),
     ),
 }

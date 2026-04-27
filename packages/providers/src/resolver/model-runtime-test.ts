@@ -1,7 +1,7 @@
 import { Effect, Layer, Stream } from 'effect'
 
 import type { CallUsage } from '../state/provider-state'
-import { Model } from '../model/model'
+import type { ProviderModel } from '../model/model'
 import { ModelConnection } from '../model/model-connection'
 import { ModelResolver } from './model-resolver'
 import { makeTestTracer, type TraceEmitter, type TracePersister } from './tracing'
@@ -15,16 +15,20 @@ export interface TestModelConfig {
   streamResponse?: string | ((functionName: string, args: readonly unknown[]) => string)
 }
 
-const fakeModel = new Model({
+const fakeModel: ProviderModel = {
   id: 'test-model',
   providerId: 'test',
   providerName: 'Test Provider',
   name: 'Test Model',
+  modelId: null,
   contextWindow: 200_000,
+  maxContextTokens: null,
   maxOutputTokens: null,
-  costs: null,
+  supportsToolCalls: false,
+  supportsReasoning: false,
   supportsVision: true,
-})
+  costs: null,
+}
 
 const zeroUsage: CallUsage = {
   inputTokens: 0,
@@ -78,6 +82,7 @@ export function makeTestResolver(config: TestModelConfig = {}): Layer.Layer<Mode
 
   const fakeBoundModel: BoundModel = {
     model: fakeModel,
+    canonicalModel: null,
     connection: ModelConnection.Baml({
       auth: null,
     }),

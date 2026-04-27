@@ -39,7 +39,7 @@ export function buildClientRegistry(
 
   const { bamlProvider, protocol } = def.resolveProtocol(auth)
   const modelDef = def.models.find(m => m.id === modelId)
-  const maxOutputTokens = maxTokensOverride ?? modelDef?.maxOutputTokens
+  const maxOutputTokens = maxTokensOverride ?? modelDef?.maxOutputTokens ?? undefined
 
   const options = buildOptions(protocol, modelId, auth, providerOptions, stopSequences, maxOutputTokens, grammar, debug)
   if (!options) return undefined
@@ -96,7 +96,7 @@ export function __testOnly_buildProviderOptions(
     auth,
     providerOptions,
     stopSequences,
-    modelDef?.maxOutputTokens,
+    modelDef?.maxOutputTokens ?? undefined,
     grammar,
     debug,
   )

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Effect, Stream } from 'effect'
 import type { BoundModel } from './bound-model'
-import { Model, type ModelCosts } from './model'
+import type { ProviderModel, ModelCosts } from './model'
 import { ModelConnection } from './model-connection'
 import { TraceEmitter } from '../resolver/tracing'
 import {
@@ -12,21 +12,26 @@ import {
 } from './model-function'
 
 function makeModel(providerId: string, id: string, authType: 'oauth' | 'api' | null): BoundModel {
-  const model = new Model({
+  const model: ProviderModel = {
     id,
     providerId,
     providerName: 'Test Provider',
     name: id,
+    modelId: null,
     contextWindow: 100_000,
+    maxContextTokens: null,
     maxOutputTokens: 8192,
-    costs: null as unknown as ModelCosts,
+    supportsToolCalls: false,
+    supportsReasoning: false,
     supportsVision: true,
-  })
+    costs: null as unknown as ModelCosts,
+  }
 
   const calls: Array<{ kind: 'stream' | 'complete'; functionName: string; args: readonly unknown[]; options: any }> = []
 
   const bound: BoundModel = {
     model,
+    canonicalModel: null,
     connection: ModelConnection.Baml({
       auth: authType === null
         ? null

@@ -12,7 +12,7 @@ import {
 import { ProviderAuth } from '../runtime/contracts'
 import type { ProviderAuthShape } from '../runtime/contracts'
 import { getProvider } from '../registry'
-import type { ModelDefinition } from '../types'
+import type { ProviderModel } from '../model/model'
 
 const providerAuthStub: ProviderAuthShape = {
   loadAuth: () => Effect.succeed({}),
@@ -26,15 +26,20 @@ const providerAuthStub: ProviderAuthShape = {
   connectedProviderIds: () => Effect.succeed(new Set()),
 }
 
-function model(id: string, overrides: Partial<ModelDefinition> = {}): ModelDefinition {
+function model(id: string, overrides: Partial<ProviderModel> = {}): ProviderModel {
   return {
     id,
+    providerId: 'test',
+    providerName: 'Test',
+    modelId: null,
     name: id,
     contextWindow: 1000,
+    maxContextTokens: null,
+    maxOutputTokens: null,
     supportsToolCalls: false,
     supportsReasoning: false,
-    cost: { input: 0, output: 0 },
-    family: 'test',
+    supportsVision: false,
+    costs: { inputPerM: 0, outputPerM: 0, cacheReadPerM: null, cacheWritePerM: null },
     releaseDate: '2025-01-01T00:00:00.000Z',
     discovery: { primarySource: 'static' },
     ...overrides,
@@ -100,7 +105,7 @@ describe('ModelCatalog source refresh', () => {
         id: 'models.dev',
         priority: 100,
         supports: (provider) => provider.id === 'openrouter',
-        refresh: () => Effect.succeed([model('anthropic/claude-opus-4.6', { description: 'Enriched', discovery: { primarySource: 'models.dev' } })]),
+        refresh: () => Effect.succeed([model('anthropic/claude-opus-4.6', { discovery: { primarySource: 'models.dev' } })]),
       },
       {
         id: 'openrouter-api',
@@ -127,7 +132,6 @@ describe('ModelCatalog source refresh', () => {
     const selected = models.find((entry) => entry.id === 'anthropic/claude-opus-4.6')
 
     expect(selected?.name).toBe('Live')
-    expect(selected?.description).toBe('Enriched')
     expect(selected?.supportsToolCalls).toBe(true)
   })
 

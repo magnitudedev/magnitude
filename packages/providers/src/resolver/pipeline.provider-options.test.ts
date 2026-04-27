@@ -1,23 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import { Effect, Stream } from 'effect'
 import { createBoundModel } from './pipeline'
-import { Model, type ModelCosts } from '../model/model'
+import type { ProviderModel, ModelCosts } from '../model/model'
 import { ModelConnection } from '../model/model-connection'
 import type { ExecutableDriver } from '../drivers/types'
 import { CollectorData } from '../drivers/types'
 import { ProviderState } from '../runtime/contracts'
 import { TraceEmitter } from './tracing'
 
-const model = new Model({
+const model: ProviderModel = {
   id: 'gpt-5.3-codex',
   providerId: 'openai',
   providerName: 'OpenAI',
   name: 'test',
+  modelId: null,
   contextWindow: 100_000,
+  maxContextTokens: null,
   maxOutputTokens: 8192,
-  costs: null as unknown as ModelCosts,
+  supportsToolCalls: false,
+  supportsReasoning: false,
   supportsVision: true,
-})
+  costs: null as unknown as ModelCosts,
+}
 
 const providerState = {
   peek: () => Effect.succeed(null),

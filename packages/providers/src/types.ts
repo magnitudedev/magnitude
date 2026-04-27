@@ -40,26 +40,7 @@ export interface AuthMethodDef {
   envKeys?: string[]      // Env vars to check for this method
 }
 
-export interface ModelDefinition {
-  id: string
-  name: string
-  contextWindow: number
-  maxContextTokens?: number | null
-  supportsToolCalls: boolean
-  supportsReasoning: boolean
-  cost: { input: number; output: number; cache_read?: number; cache_write?: number }
-  family: string
-  releaseDate: string
-  maxOutputTokens?: number
-  supportsVision: boolean
-  supportsGrammar?: boolean
-  description?: string
-  status?: 'alpha' | 'beta' | 'deprecated'
-  discovery?: {
-    primarySource: 'static' | 'models.dev' | 'openrouter-api'
-    fetchedAt?: string
-  }
-}
+import type { ProviderModel } from './model/model'
 
 import type { AuthInfo } from '@magnitudedev/storage'
 import type { ProviderProtocol } from './protocol/types'
@@ -73,7 +54,7 @@ export interface ProviderDefinition {
   id: string                    // e.g. "anthropic", "openrouter", "lmstudio". Should match models.dev key.
   name: string                  // Display name: "Anthropic", "OpenRouter", etc.
   defaultBaseUrl?: string       // For openai-generic providers
-  models: ModelDefinition[]     // Known models for this provider
+  models: ProviderModel[]       // Known models for this provider
   authMethods: AuthMethodDef[]  // All supported auth methods, in display order
   oauthOnlyModelIds?: string[]  // Model IDs that require OAuth (hidden for API key users)
   providerFamily?: 'local' | 'cloud'
