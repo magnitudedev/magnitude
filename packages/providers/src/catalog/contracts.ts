@@ -1,7 +1,8 @@
 import { AppConfig, CatalogCache } from '@magnitudedev/storage'
 import { Context, Data, Effect } from 'effect'
 import type { ProviderAuth } from '../runtime/contracts'
-import type { ModelDefinition, ProviderDefinition } from '../types'
+import type { ProviderDefinition } from '../types'
+import type { ProviderModel } from '../model/model'
 
 export type CatalogSourceEnv = CatalogCache | AppConfig | ProviderAuth
 
@@ -10,7 +11,7 @@ export interface CatalogSource {
   readonly priority: number
   readonly supports: (provider: ProviderDefinition) => boolean
   readonly refresh: (provider: ProviderDefinition) => Effect.Effect<
-    readonly ModelDefinition[],
+    readonly ProviderModel[],
     CatalogError,
     CatalogSourceEnv
   >
@@ -50,6 +51,6 @@ export class ModelCatalog extends Context.Tag('ModelCatalog')<
   ModelCatalog,
   {
     refresh: () => Effect.Effect<void>
-    getModels: (providerId: string) => Effect.Effect<readonly ModelDefinition[]>
+    getModels: (providerId: string) => Effect.Effect<readonly ProviderModel[]>
   }
 >() {}

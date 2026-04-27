@@ -22,7 +22,7 @@ export function bootstrapProviderRuntime<TSlot extends string>(args: {
 
       const modelDef = yield* catalog.getModel(selection.providerId, selection.modelId)
       const isConnected = connectedIds.has(selection.providerId)
-      const isActive = Boolean(modelDef && modelDef.status !== 'deprecated')
+      const isActive = Boolean(modelDef)
       const isValidForSlot = args.validateSelection?.(slot, selection.providerId, selection.modelId) ?? true
 
       if (!isConnected || !isActive || !isValidForSlot) {

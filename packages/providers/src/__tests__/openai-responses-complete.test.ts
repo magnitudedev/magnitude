@@ -1,23 +1,27 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Effect } from 'effect'
 import { BamlDriver } from '../drivers/baml-driver'
-import { Model } from '../model/model'
+import type { ProviderModel } from '../model/model'
 import { ModelConnection } from '../model/model-connection'
 import type { DriverRequest } from '../drivers/types'
 import * as dispatch from '../drivers/baml-dispatch'
 
 describe('openai-responses complete path', () => {
   it('uses stream-and-collect for openai-responses-style requests', async () => {
-    const model = new Model({
+    const model: ProviderModel = {
       id: 'gpt-5.4',
       providerId: 'openai',
       providerName: 'OpenAI',
       name: 'GPT 5.4',
+      modelId: null,
       contextWindow: 128_000,
+      maxContextTokens: null,
       maxOutputTokens: 8_192,
-      costs: null,
+      supportsToolCalls: false,
+      supportsReasoning: false,
       supportsVision: true,
-    })
+      costs: null,
+    }
 
     const req: DriverRequest = {
       slot: 'lead',

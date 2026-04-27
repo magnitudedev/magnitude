@@ -5,27 +5,50 @@
  * Dynamic catalog refresh may replace these at runtime.
  */
 
-import type { AuthInfo, BamlProviderType, ProviderDefinition, ModelDefinition } from './types'
+import type { AuthInfo, BamlProviderType, ProviderDefinition } from './types'
+import type { ProviderModel, ModelCosts } from './model/model'
 import type { ProviderProtocol, OpenAIOptions } from './protocol/types'
+import { type ModelId } from './model/canonical-model'
+import { MODEL_MANIFEST } from './model/model-manifest'
 
-const STATIC_MODEL_COST = { input: 0, output: 0 } as const
+const STATIC_MODEL_COST: ModelCosts = { inputPerM: 0, outputPerM: 0, cacheReadPerM: null, cacheWritePerM: null }
 const DEFAULT_TEMPERATURE = 1.0
 
-function staticModel(model: Omit<ModelDefinition, 'contextWindow' | 'supportsReasoning' | 'cost' | 'family' | 'releaseDate' | 'discovery' | 'supportsVision'> & {
-  contextWindow?: number
-  supportsReasoning?: boolean
-  supportsVision?: boolean
-  cost?: ModelDefinition['cost']
-  family: string
+/** Try to resolve a provider-specific model ID to a canonical ModelId.
+ *  First tries direct match, then strips namespace prefix (e.g. "moonshotai/kimi-k2.6" → "kimi-k2.6").
+ */
+export function tryResolveCanonicalModelId(providerModelId: string): ModelId | null {
+  const canonicalIds = new Set(MODEL_MANIFEST.map(m => m.id))
+  if (canonicalIds.has(providerModelId)) return providerModelId
+  const stripped = providerModelId.includes('/') ? providerModelId.split('/').pop()! : providerModelId
+  if (canonicalIds.has(stripped)) return stripped
+  return null
+}
+
+type ModelInit = Partial<ProviderModel> & {
+  id: string
+  name: string
   releaseDate: string
-}): ModelDefinition {
-  return {
-    contextWindow: model.contextWindow ?? 200_000,
-    supportsReasoning: model.supportsReasoning ?? false,
-    cost: model.cost ?? { ...STATIC_MODEL_COST },
-    discovery: { primarySource: 'static' },
-    ...model,
-  }
+}
+
+function providerModels(
+  providerId: string,
+  providerName: string,
+  models: readonly ModelInit[],
+): ProviderModel[] {
+  return models.map(m => ({
+    providerId,
+    providerName,
+    modelId: tryResolveCanonicalModelId(m.id),
+    contextWindow: 200_000,
+    maxContextTokens: null,
+    maxOutputTokens: null,
+    supportsToolCalls: false,
+    supportsReasoning: false,
+    supportsVision: false,
+    costs: { ...STATIC_MODEL_COST },
+    ...m,
+  }))
 }
 
 /** Helper for providers that use a single protocol regardless of auth */
@@ -38,15 +61,15 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'magnitude',
     name: 'Magnitude',
     defaultBaseUrl: 'https://app.magnitude.dev/api/v1',
-    models: [
-      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
-      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
-      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
-      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
-      staticModel({ id: 'kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
-      staticModel({ id: 'minimax-m2.5', name: 'MiniMax M2.5', family: 'minimax', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000, supportsGrammar: false }),
-      staticModel({ id: 'minimax-m2.7', name: 'MiniMax M2.7', family: 'minimax', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000, supportsGrammar: false }),
-    ],
+    models: providerModels('magnitude', 'Magnitude', [
+      { id: 'glm-4.7', name: 'GLM-4.7', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true },
+      { id: 'glm-5', name: 'GLM-5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true },
+      { id: 'glm-5.1', name: 'GLM-5.1', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true },
+      { id: 'kimi-k2.5', name: 'Kimi K2.5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true },
+      { id: 'kimi-k2.6', name: 'Kimi K2.6', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true },
+      { id: 'minimax-m2.5', name: 'MiniMax M2.5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000, supportsGrammar: false },
+      { id: 'minimax-m2.7', name: 'MiniMax M2.7', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000, supportsGrammar: false },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['MAGNITUDE_API_KEY'] },
     ],
@@ -70,13 +93,12 @@ export const PROVIDERS: ProviderDefinition[] = [
   {
     id: 'anthropic',
     name: 'Anthropic',
-    models: [
-      staticModel({ id: 'claude-opus-4-7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      
-      staticModel({ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 }),
-    ],
+    models: providerModels('anthropic', 'Anthropic', [
+      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 },
+      { id: 'claude-opus-4-6', name: 'Claude Opus 4.6', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 },
+      { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 },
+    ]),
     authMethods: [
       { type: 'oauth-pkce', label: 'Claude Pro/Max subscription' },
       { type: 'api-key', label: 'API key', envKeys: ['ANTHROPIC_API_KEY'] },
@@ -105,13 +127,13 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'openai',
     name: 'OpenAI',
     oauthOnlyModelIds: ['gpt-5.5-codex-spark'],
-    models: [
-      staticModel({ id: 'gpt-5.5', name: 'GPT-5.5', family: 'gpt', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.4', name: 'GPT-5.4', family: 'gpt', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', family: 'gpt', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.2', name: 'GPT-5.2', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-    ],
+    models: providerModels('openai', 'OpenAI', [
+      { id: 'gpt-5.5', name: 'GPT-5.5', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 },
+      { id: 'gpt-5.4', name: 'GPT-5.4', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 },
+      { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 },
+      { id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 },
+      { id: 'gpt-5.2', name: 'GPT-5.2', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 },
+    ]),
     authMethods: [
       { type: 'oauth-browser', label: 'ChatGPT Pro/Plus (browser)' },
       { type: 'oauth-device', label: 'ChatGPT Pro/Plus (headless)' },
@@ -162,16 +184,15 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'openrouter',
     name: 'OpenRouter',
     defaultBaseUrl: 'https://openrouter.ai/api/v1',
-    models: [
-      staticModel({ id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      
-      staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 }),
-      staticModel({ id: 'z-ai/glm-5.1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
-      staticModel({ id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
-      staticModel({ id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', family: 'deepseek', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: false }),
-    ],
+    models: providerModels('openrouter', 'OpenRouter', [
+      { id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 },
+      { id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 },
+      { id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 },
+      { id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 },
+      { id: 'z-ai/glm-5.1', name: 'GLM 5.1', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true },
+      { id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true },
+      { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: false },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['OPENROUTER_API_KEY'] },
     ],
@@ -190,16 +211,15 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'vercel',
     name: 'Vercel AI Gateway',
     defaultBaseUrl: 'https://ai-gateway.vercel.sh/v1',
-    models: [
-      staticModel({ id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      
-      staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 }),
-      staticModel({ id: 'zai/glm-5.1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
-      staticModel({ id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
-      staticModel({ id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', family: 'deepseek', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: false }),
-    ],
+    models: providerModels('vercel', 'Vercel AI Gateway', [
+      { id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 },
+      { id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 },
+      { id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 },
+      { id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 },
+      { id: 'zai/glm-5.1', name: 'GLM 5.1', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true },
+      { id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true },
+      { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: false },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['AI_GATEWAY_API_KEY'] },
     ],
@@ -218,30 +238,28 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'deepseek',
     name: 'DeepSeek',
     defaultBaseUrl: 'https://api.deepseek.com/v1',
-    models: [
-      staticModel({
+    models: providerModels('deepseek', 'DeepSeek', [
+      {
         id: 'deepseek-v4-flash',
         name: 'DeepSeek V4 Flash',
-        family: 'deepseek',
         releaseDate: '2026-04-24',
         supportsToolCalls: true,
         supportsReasoning: true,
         maxOutputTokens: 384000,
         contextWindow: 1000000,
         supportsGrammar: false,
-      }),
-      staticModel({
+      },
+      {
         id: 'deepseek-v4-pro',
         name: 'DeepSeek V4 Pro',
-        family: 'deepseek',
         releaseDate: '2026-04-24',
         supportsToolCalls: true,
         supportsReasoning: true,
         maxOutputTokens: 384000,
         contextWindow: 1000000,
         supportsGrammar: false,
-      }),
-    ],
+      },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['DEEPSEEK_API_KEY'] },
     ],
@@ -263,10 +281,10 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'minimax',
     name: 'MiniMax',
     defaultBaseUrl: 'https://api.minimax.io/anthropic',
-    models: [
-      staticModel({ id: 'MiniMax-M2.7', name: 'MiniMax M2.7', family: 'minimax', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'MiniMax-M2.5', name: 'MiniMax M2.5', family: 'minimax', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
-    ],
+    models: providerModels('minimax', 'MiniMax', [
+      { id: 'MiniMax-M2.7', name: 'MiniMax M2.7', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 },
+      { id: 'MiniMax-M2.5', name: 'MiniMax M2.5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['MINIMAX_API_KEY'] },
     ],
@@ -285,11 +303,11 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'zai',
     name: 'Z.AI',
     defaultBaseUrl: 'https://api.z.ai/api/paas/v4',
-    models: [
-      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
-    ],
+    models: providerModels('zai', 'Z.AI', [
+      { id: 'glm-5.1', name: 'GLM-5.1', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 },
+      { id: 'glm-5', name: 'GLM-5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 },
+      { id: 'glm-4.7', name: 'GLM-4.7', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['ZHIPU_API_KEY'] },
     ],
@@ -308,11 +326,11 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'zai-coding-plan',
     name: 'Z.AI Coding Plan',
     defaultBaseUrl: 'https://api.z.ai/api/coding/paas/v4',
-    models: [
-      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
-    ],
+    models: providerModels('zai-coding-plan', 'Z.AI Coding Plan', [
+      { id: 'glm-5.1', name: 'GLM-5.1', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 },
+      { id: 'glm-5', name: 'GLM-5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 },
+      { id: 'glm-4.7', name: 'GLM-4.7', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['ZHIPU_API_KEY'] },
     ],
@@ -331,10 +349,10 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'moonshotai',
     name: 'Moonshot AI',
     defaultBaseUrl: 'https://api.moonshot.ai/v1',
-    models: [
-      staticModel({ id: 'kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
-      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
-    ],
+    models: providerModels('moonshotai', 'Moonshot AI', [
+      { id: 'kimi-k2.6', name: 'Kimi K2.6', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 },
+      { id: 'kimi-k2.5', name: 'Kimi K2.5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['MOONSHOT_API_KEY'] },
     ],
@@ -353,10 +371,10 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'kimi-for-coding',
     name: 'Kimi for Coding',
     defaultBaseUrl: 'https://api.kimi.com/coding',
-    models: [
-      staticModel({ id: 'k2p6', name: 'K2p6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
-      staticModel({ id: 'k2p5', name: 'K2p5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
-    ],
+    models: providerModels('kimi-for-coding', 'Kimi for Coding', [
+      { id: 'k2p6', name: 'K2p6', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 },
+      { id: 'k2p5', name: 'K2p5', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['KIMI_API_KEY'] },
     ],
@@ -376,9 +394,9 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'cerebras',
     name: 'Cerebras',
     defaultBaseUrl: 'https://api.cerebras.ai/v1',
-    models: [
-      staticModel({ id: 'gpt-oss-120b', name: 'GPT-OSS 120B', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 32768, contextWindow: 131072 }),
-    ],
+    models: providerModels('cerebras', 'Cerebras', [
+      { id: 'gpt-oss-120b', name: 'GPT-OSS 120B', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 32768, contextWindow: 131072 },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['CEREBRAS_API_KEY'] },
     ],
@@ -397,10 +415,10 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'fireworks-ai',
     name: 'Fireworks AI',
     defaultBaseUrl: 'https://api.fireworks.ai/inference/v1',
-    models: [
-      staticModel({ id: 'accounts/fireworks/models/kimi-k2p6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
-      staticModel({ id: 'accounts/fireworks/models/glm-5p1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
-    ],
+    models: providerModels('fireworks-ai', 'Fireworks AI', [
+      { id: 'accounts/fireworks/models/kimi-k2p6', name: 'Kimi K2.6', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true },
+      { id: 'accounts/fireworks/models/glm-5p1', name: 'GLM 5.1', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true },
+    ]),
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },
     ],
@@ -515,7 +533,7 @@ export const PROVIDERS: ProviderDefinition[] = [
   },
 ]
 
-const STATIC_FALLBACK_MODELS: Record<string, readonly ModelDefinition[]> = Object.fromEntries(
+const STATIC_FALLBACK_MODELS: Record<string, readonly ProviderModel[]> = Object.fromEntries(
   PROVIDERS.map((provider) => [provider.id, [...provider.models]]),
 )
 
@@ -536,11 +554,11 @@ export function getProviderIds(): string[] {
   return PROVIDERS.map(p => p.id)
 }
 
-export function getStaticProviderModels(providerId: string): readonly ModelDefinition[] {
+export function getStaticProviderModels(providerId: string): readonly ProviderModel[] {
   return STATIC_FALLBACK_MODELS[providerId] ?? []
 }
 
-export function setProviderModels(providerId: string, models: ModelDefinition[]): void {
+export function setProviderModels(providerId: string, models: ProviderModel[]): void {
   const provider = getProvider(providerId)
   if (!provider) return
   if (provider.inventoryMode === 'dynamic' || provider.models.length > 0) {
@@ -548,9 +566,9 @@ export function setProviderModels(providerId: string, models: ModelDefinition[])
   }
 }
 
-export function getModelCost(providerId: string, modelId: string): { input: number; output: number; cache_read?: number; cache_write?: number } | null {
+export function getModelCost(providerId: string, modelId: string): ModelCosts | null {
   const provider = getProvider(providerId)
   if (!provider) return null
   const model = provider.models.find(m => m.id === modelId)
-  return model?.cost ?? null
+  return model?.costs ?? null
 }

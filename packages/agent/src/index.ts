@@ -239,7 +239,6 @@ export type {
   BamlProviderType,
   AuthFlowType,
   AuthMethodDef,
-  ModelDefinition,
   ProviderDefinition,
   AuthInfo,
   ApiKeyAuth,

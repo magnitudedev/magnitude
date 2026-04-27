@@ -1,4 +1,4 @@
-import { Data } from 'effect'
+import type { ModelId } from './canonical-model'
 
 export interface ModelCosts {
   readonly inputPerM: number
@@ -7,14 +7,23 @@ export interface ModelCosts {
   readonly cacheWritePerM: number | null
 }
 
-export class Model extends Data.Class<{
+export interface ProviderModel {
   readonly id: string
   readonly providerId: string
   readonly providerName: string
+  readonly modelId: ModelId | null
   readonly name: string
   readonly contextWindow: number
+  readonly maxContextTokens: number | null
   readonly maxOutputTokens: number | null
-  readonly costs: ModelCosts | null
-  readonly supportsGrammar?: boolean
+  readonly supportsToolCalls: boolean
+  readonly supportsReasoning: boolean
   readonly supportsVision: boolean
-}> {}
+  readonly supportsGrammar?: boolean
+  readonly costs: ModelCosts | null
+  readonly releaseDate?: string
+  readonly discovery?: {
+    primarySource: 'static' | 'models.dev' | 'openrouter-api'
+    fetchedAt?: string
+  }
+}

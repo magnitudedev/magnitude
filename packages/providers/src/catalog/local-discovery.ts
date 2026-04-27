@@ -1,5 +1,6 @@
 import { Effect } from 'effect'
-import type { ModelDefinition, ProviderDefinition } from '../types'
+import type { ProviderModel } from '../model/model'
+import type { ProviderDefinition } from '../types'
 
 type OpenAIModelsResponse = {
   data?: Array<{ id?: string; name?: string; capabilities?: string[] }>
@@ -114,38 +115,41 @@ interface LlamaV1MetaResponse {
 export type LocalDiscoveryStatus = 'success_non_empty' | 'success_empty' | 'failure'
 
 export type LocalDiscoveryResult = {
-  models: ModelDefinition[]
+  models: ProviderModel[]
   error: string | null
   source: string | null
   status: LocalDiscoveryStatus
   diagnostics: string[]
 }
 
-const STATIC_COST = { input: 0, output: 0 } as const
+const STATIC_COST: { inputPerM: number; outputPerM: number; cacheReadPerM: null; cacheWritePerM: null } = { inputPerM: 0, outputPerM: 0, cacheReadPerM: null, cacheWritePerM: null }
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, '')
 }
 
-function toModel(id: string, name?: string, maxContextTokens: number | null = null, supportsVision: boolean = false): ModelDefinition {
+function toModel(id: string, name?: string, maxContextTokens: number | null = null, supportsVision: boolean = false): ProviderModel {
   const now = new Date().toISOString()
   return {
     id,
+    providerId: '',
+    providerName: '',
+    modelId: null,
     name: name || id,
     contextWindow: maxContextTokens ?? 200_000,
     maxContextTokens,
+    maxOutputTokens: null,
     supportsToolCalls: true,
     supportsReasoning: false,
     supportsVision,
-    cost: { ...STATIC_COST },
-    family: 'local',
+    costs: { inputPerM: 0, outputPerM: 0, cacheReadPerM: null, cacheWritePerM: null },
     releaseDate: now,
     discovery: { primarySource: 'static', fetchedAt: now },
   }
 }
 
-function fromOpenAIModels(payload: OpenAIModelsResponse): ModelDefinition[] {
-  const out: ModelDefinition[] = []
+function fromOpenAIModels(payload: OpenAIModelsResponse): ProviderModel[] {
+  const out: ProviderModel[] = []
   for (const model of payload.data ?? []) {
     const id = model.id?.trim()
     if (!id) continue
@@ -185,7 +189,7 @@ function lmStudioNativeV0Url(baseUrl: string): string {
   return `${root}/api/v0/models`
 }
 
-export function discoverOpenAIModels(baseUrl: string): Effect.Effect<ModelDefinition[], Error> {
+export function discoverOpenAIModels(baseUrl: string): Effect.Effect<ProviderModel[], Error> {
   return Effect.tryPromise({
     try: async () => {
       const payload = await fetchJson<OpenAIModelsResponse>(openAIModelsUrl(baseUrl))
@@ -195,7 +199,7 @@ export function discoverOpenAIModels(baseUrl: string): Effect.Effect<ModelDefini
   })
 }
 
-export function discoverOllamaHybrid(baseUrl: string): Effect.Effect<ModelDefinition[], Error> {
+export function discoverOllamaHybrid(baseUrl: string): Effect.Effect<ProviderModel[], Error> {
   return Effect.tryPromise({
     try: async () => {
       const payload = await fetchJson<OllamaTagsResponse>(ollamaTagsUrl(baseUrl))
@@ -277,8 +281,8 @@ function readLmStudioLoadedContextV0(item: LmStudioModelV0): number | null {
   )
 }
 
-function fromLmStudioNativeModels(payload: unknown): ModelDefinition[] {
-  const out: ModelDefinition[] = []
+function fromLmStudioNativeModels(payload: unknown): ProviderModel[] {
+  const out: ProviderModel[] = []
   for (const item of parseLmStudioModels(payload)) {
     const id = readModelRecordId(item)
     if (!id) continue
@@ -293,9 +297,9 @@ function fromLmStudioNativeModels(payload: unknown): ModelDefinition[] {
 }
 
 function mergeContextMetadata(
-  models: readonly ModelDefinition[],
+  models: readonly ProviderModel[],
   maxById: ReadonlyMap<string, number>,
-): ModelDefinition[] {
+): ProviderModel[] {
   return models.map((model) => {
     const maxContextTokens = maxById.get(model.id) ?? null
     if (maxContextTokens == null) return model
@@ -347,7 +351,7 @@ function findSingleLmStudioRecord(
   return null
 }
 
-function maybeAttachContext(model: ModelDefinition, maxContextTokens: number | null): ModelDefinition {
+function maybeAttachContext(model: ProviderModel, maxContextTokens: number | null): ProviderModel {
   if (maxContextTokens == null) return model
   return {
     ...model,
@@ -497,8 +501,8 @@ function areOllamaIdsEquivalent(a: string, b: string): boolean {
 
 async function enrichLmStudioContext(
   baseUrl: string,
-  models: readonly ModelDefinition[],
-): Promise<ModelDefinition[]> {
+  models: readonly ProviderModel[],
+): Promise<ProviderModel[]> {
   let v1Records: LmStudioModel[] | null = null
   let v0Records: LmStudioModel[] | null = null
 
@@ -596,8 +600,8 @@ function matchOllamaRuntimeContext(modelId: string, entries: readonly OllamaPsEn
 
 async function enrichOllamaContext(
   baseUrl: string,
-  models: readonly ModelDefinition[],
-): Promise<ModelDefinition[]> {
+  models: readonly ProviderModel[],
+): Promise<ProviderModel[]> {
   const root = ollamaRoot(baseUrl)
   const maxById = new Map<string, number>()
   const visionById = new Map<string, boolean>()
@@ -680,8 +684,8 @@ function parseLlamaV1MetaContextMap(payload: unknown): Map<string, number> {
 
 async function enrichLlamaCppContext(
   baseUrl: string,
-  models: readonly ModelDefinition[],
-): Promise<ModelDefinition[]> {
+  models: readonly ProviderModel[],
+): Promise<ProviderModel[]> {
   const maxById = new Map<string, number>()
   const root = normalizeBaseUrl(baseUrl)
 
@@ -958,10 +962,10 @@ export function discoverLocalProviderModels(
 }
 
 export function mergeDiscoveredAndRemembered(
-  discoveredModels: readonly ModelDefinition[],
+  discoveredModels: readonly ProviderModel[],
   rememberedModelIds: readonly string[] | undefined,
-): ModelDefinition[] {
-  const byId = new Map<string, ModelDefinition>()
+): ProviderModel[] {
+  const byId = new Map<string, ProviderModel>()
   for (const model of discoveredModels) byId.set(model.id, model)
   for (const id of rememberedModelIds ?? []) {
     if (!id || byId.has(id)) continue
