@@ -22,4 +22,6 @@ export const MODEL_MANIFEST: readonly ModelManifestEntry[] = [
   { id: "glm-5.1", name: "GLM-5.1", family: "glm", hfRepo: "zai-org/GLM-5.1" },
   { id: "minimax-m2.5", name: "MiniMax M2.5", family: "minimax", hfRepo: "MiniMaxAI/MiniMax-M2.5" },
   { id: "minimax-m2.7", name: "MiniMax M2.7", family: "minimax", hfRepo: "MiniMaxAI/MiniMax-M2.7" },
+  { id: "qwen-3.6-27b", name: "Qwen 3.6 27B", family: "qwen", hfRepo: "Qwen/Qwen3.6-27B" },
+  { id: "qwen-3.6-35b-a3b", name: "Qwen 3.6 35B A3B", family: "qwen", hfRepo: "Qwen/Qwen3.6-35B-A3B" },
 ]

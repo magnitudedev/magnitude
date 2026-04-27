@@ -7,6 +7,8 @@ import glm5Template from './templates/glm-5/chat_template.jinja' with { type: "t
 import glm51Template from './templates/glm-5.1/chat_template.jinja' with { type: "text" }
 import minimaxM25Template from './templates/minimax-m2.5/chat_template.jinja' with { type: "text" }
 import minimaxM27Template from './templates/minimax-m2.7/chat_template.jinja' with { type: "text" }
+import qwen3627bTemplate from './templates/qwen-3.6-27b/chat_template.jinja' with { type: "text" }
+import qwen3635bA3bTemplate from './templates/qwen-3.6-35b-a3b/chat_template.jinja' with { type: "text" }
 
 export const MODELS: readonly Model[] = [
   { id: "kimi-k2.5" as const, name: "Kimi K2.5", family: "kimi", hfRepo: "moonshotai/Kimi-K2.5", template: kimiK25Template },
@@ -16,6 +18,8 @@ export const MODELS: readonly Model[] = [
   { id: "glm-5.1" as const, name: "GLM-5.1", family: "glm", hfRepo: "zai-org/GLM-5.1", template: glm51Template },
   { id: "minimax-m2.5" as const, name: "MiniMax M2.5", family: "minimax", hfRepo: "MiniMaxAI/MiniMax-M2.5", template: minimaxM25Template },
   { id: "minimax-m2.7" as const, name: "MiniMax M2.7", family: "minimax", hfRepo: "MiniMaxAI/MiniMax-M2.7", template: minimaxM27Template },
+  { id: "qwen-3.6-27b" as const, name: "Qwen 3.6 27B", family: "qwen", hfRepo: "Qwen/Qwen3.6-27B", template: qwen3627bTemplate },
+  { id: "qwen-3.6-35b-a3b" as const, name: "Qwen 3.6 35B A3B", family: "qwen", hfRepo: "Qwen/Qwen3.6-35B-A3B", template: qwen3635bA3bTemplate },
 ]
 
 export function getModel(modelId: ModelId): Model | undefined {
