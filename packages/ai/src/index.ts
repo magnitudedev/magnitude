@@ -103,7 +103,7 @@ export { execute } from "./lib/execution/execute"
 export { AiTracer, NoopAiTracer, NoopAiTracerLive } from "./lib/tracing/tracer"
 
 // Catalogue
-export { ModelCatalogue, ModelCatalogueLive } from "./catalogues/catalogue"
+export { ModelCatalogue, ModelCatalogueLive, makeModelCatalogueLive } from "./catalogues/catalogue"
 export { CatalogueCache, type CachedData } from "./catalogues/cache"
 export {
   CatalogueConfig,
@@ -121,7 +121,7 @@ export { mergeProviderModels } from "./catalogues/merge"
 export { staticCatalogueSource } from "./catalogues/static/source"
 export { modelsDevCatalogueSource } from "./catalogues/models-dev/source"
 export { openRouterCatalogueSource } from "./catalogues/openrouter/source"
-export { makeLocalDiscoverySource } from "./catalogues/local-discovery/source"
+export { localDiscoveryCatalogueSource } from "./catalogues/local-discovery/source"
 
 // Wire types
 export type {

@@ -2,6 +2,7 @@ import { Effect, Option } from "effect"
 import { CatalogueConfig, type ProviderOptions } from "../config"
 import type { ProviderDefinition } from "../../lib/execution/provider-definition"
 import type { ProviderModel } from "../../lib/model/provider-model"
+import { getAllProviders } from "../../providers/registry"
 import type { CatalogueSource } from "../types"
 import { discoverLlamaCppModels } from "./strategies/llamacpp"
 import { discoverLmStudioModels, type LocalDiscoveryResult } from "./strategies/lmstudio"
@@ -134,40 +135,54 @@ function getProviderOptions(
   })
 }
 
-export function makeLocalDiscoverySource(
+function isSupportedLocalProvider(provider: ProviderDefinition): boolean {
+  return provider.family === "local" && LOCAL_PROVIDER_IDS.has(provider.id)
+}
+
+function fetchProviderModels(
   provider: ProviderDefinition,
-): CatalogueSource | null {
-  if (provider.family !== "local" || !LOCAL_PROVIDER_IDS.has(provider.id)) {
-    return null
-  }
+): Effect.Effect<readonly ProviderModel[], never> {
+  return Effect.gen(function* () {
+    const options = yield* getProviderOptions(provider.id)
+    const effectiveBaseUrl = options?.baseUrl?.trim() || provider.defaultBaseUrl
 
-  return {
-    id: `local-discovery:${provider.id}`,
-    fetch: Effect.gen(function* () {
-      const options = yield* getProviderOptions(provider.id)
-      const effectiveBaseUrl = options?.baseUrl?.trim() || provider.defaultBaseUrl
+    if (!effectiveBaseUrl) {
+      return mergeDiscoveredAndRemembered([], options?.rememberedModelIds, provider)
+    }
 
-      if (!effectiveBaseUrl) {
-        return mergeDiscoveredAndRemembered([], options?.rememberedModelIds, provider)
-      }
+    const discovery = yield* discoverForProvider(provider, effectiveBaseUrl)
+    const merged = mergeDiscoveredAndRemembered(
+      discovery.models,
+      options?.rememberedModelIds,
+      provider,
+    )
 
-      const discovery = yield* discoverForProvider(provider, effectiveBaseUrl)
-      const merged = mergeDiscoveredAndRemembered(
-        discovery.models,
-        options?.rememberedModelIds,
-        provider,
+    const config = yield* Effect.serviceOption(CatalogueConfig)
+    if (Option.isSome(config)) {
+      yield* persistDiscovery(provider.id, discovery).pipe(
+        Effect.provideService(CatalogueConfig, config.value),
       )
+    }
 
-      const config = yield* Effect.serviceOption(CatalogueConfig)
-      if (Option.isSome(config)) {
-        yield* persistDiscovery(provider.id, discovery).pipe(
-          Effect.provideService(CatalogueConfig, config.value),
-        )
-      } else {
-        yield* Effect.void
+    return merged
+  })
+}
+
+export const localDiscoveryCatalogueSource: CatalogueSource = {
+  id: "local-discovery",
+  fetch: () =>
+    Effect.gen(function* () {
+      const result = new Map<string, readonly ProviderModel[]>()
+
+      for (const provider of getAllProviders()) {
+        if (!isSupportedLocalProvider(provider)) {
+          continue
+        }
+
+        const models = yield* fetchProviderModels(provider)
+        result.set(provider.id, models)
       }
 
-      return merged
+      return result
     }),
-  }
 }

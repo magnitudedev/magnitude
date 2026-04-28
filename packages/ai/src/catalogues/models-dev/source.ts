@@ -172,24 +172,37 @@ function resolveFromCache(
 
 export const modelsDevCatalogueSource: CatalogueSource = {
   id: SOURCE_ID,
-  fetch: Effect.gen(function* () {
-    const cache = yield* Effect.serviceOption(CatalogueCache)
+  fetch: () =>
+    Effect.gen(function* () {
+      const cache = yield* Effect.serviceOption(CatalogueCache)
 
-    const data = yield* Option.match(cache, {
-      onNone: () => fetchModelsDevResponse.pipe(Effect.option),
-      onSome: (service) =>
-        resolveFromCache(SOURCE_ID, TTL_MS, fetchModelsDevResponse).pipe(
-          Effect.provideService(CatalogueCache, service),
-          Effect.map(Option.fromNullable),
-        ),
-    })
+      const data = yield* Option.match(cache, {
+        onNone: () => fetchModelsDevResponse.pipe(Effect.option),
+        onSome: (service) =>
+          resolveFromCache(SOURCE_ID, TTL_MS, fetchModelsDevResponse).pipe(
+            Effect.provideService(CatalogueCache, service),
+            Effect.map(Option.fromNullable),
+          ),
+      })
 
-    return Option.match(data, {
-      onNone: (): readonly ProviderModel[] => [],
-      onSome: (response) =>
-        getAllProviders()
-          .filter((provider) => provider.family === "cloud" && provider.id !== "magnitude")
-          .flatMap((provider) => normalizeProvider(provider.id, response)),
-    })
-  }),
+      return Option.match(data, {
+        onNone: () => new Map<string, readonly ProviderModel[]>(),
+        onSome: (response) => {
+          const modelsByProvider = new Map<string, readonly ProviderModel[]>()
+
+          for (const provider of getAllProviders()) {
+            if (provider.family !== "cloud" || provider.id === "magnitude") {
+              continue
+            }
+
+            const models = normalizeProvider(provider.id, response)
+            if (models.length > 0) {
+              modelsByProvider.set(provider.id, models)
+            }
+          }
+
+          return modelsByProvider
+        },
+      })
+    }),
 }

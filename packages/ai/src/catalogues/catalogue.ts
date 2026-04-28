@@ -1,11 +1,11 @@
-import { Context, Effect, Layer, Option, Ref } from "effect"
+import { Context, Effect, Layer, Ref } from "effect"
 import type { ProviderModel } from "../lib/model/provider-model"
-import { getAllProviders } from "../providers/registry"
 import { mergeProviderModels } from "./merge"
+import { localDiscoveryCatalogueSource } from "./local-discovery/source"
 import { modelsDevCatalogueSource } from "./models-dev/source"
-import { makeLocalDiscoverySource } from "./local-discovery/source"
 import { openRouterCatalogueSource } from "./openrouter/source"
 import { staticCatalogueSource } from "./static/source"
+import type { CatalogueSource } from "./types"
 
 export class ModelCatalogue extends Context.Tag("@magnitudedev/ai/ModelCatalogue")<
   ModelCatalogue,
@@ -16,7 +16,7 @@ export class ModelCatalogue extends Context.Tag("@magnitudedev/ai/ModelCatalogue
   }
 >() {}
 
-function sourceFailedMessage(sourceId: string, providerId: string, error: unknown): string {
+function sourceFailedMessage(sourceId: string, error: unknown): string {
   const detail =
     error instanceof Error
       ? error.message
@@ -24,79 +24,57 @@ function sourceFailedMessage(sourceId: string, providerId: string, error: unknow
         ? String((error as { readonly _tag: unknown })._tag)
         : String(error)
 
-  return `Catalogue source "${sourceId}" failed for provider "${providerId}": ${detail}`
+  return `Catalogue source "${sourceId}" failed: ${detail}`
 }
 
-export const ModelCatalogueLive = Layer.effect(
-  ModelCatalogue,
-  Effect.gen(function* () {
-    const state = yield* Ref.make<ReadonlyMap<string, readonly ProviderModel[]>>(
-      new Map(
-        getAllProviders().map((provider) => [provider.id, [...provider.models]] as const),
-      ),
-    )
+function mergeSourceResult(
+  merged: Map<string, ProviderModel[]>,
+  sourceModels: ReadonlyMap<string, readonly ProviderModel[]>,
+): void {
+  for (const [providerId, models] of sourceModels) {
+    const existing = merged.get(providerId) ?? []
+    merged.set(providerId, mergeProviderModels(existing, [...models]))
+  }
+}
 
-    const refreshProvider = (providerId: string): Effect.Effect<readonly ProviderModel[]> =>
-      Effect.gen(function* () {
-        const provider = getAllProviders().find((entry) => entry.id === providerId)
-        if (!provider) {
-          return []
-        }
+export function makeModelCatalogueLive(
+  sources: readonly CatalogueSource[],
+): Layer.Layer<ModelCatalogue> {
+  return Layer.effect(
+    ModelCatalogue,
+    Effect.gen(function* () {
+      const state = yield* Ref.make<ReadonlyMap<string, readonly ProviderModel[]>>(new Map())
 
-        const successfulLayers: ProviderModel[][] = []
+      const refresh = Effect.gen(function* () {
+        const merged = new Map<string, ProviderModel[]>()
 
-        const staticResult = yield* Effect.either(staticCatalogueSource.fetch)
-        if (staticResult._tag === "Right") {
-          successfulLayers.push(
-            staticResult.right.filter((model) => model.providerId === provider.id).map((model) => ({ ...model })),
-          )
-        }
-
-        const dynamicSources = [
-          provider.id === "openrouter" ? openRouterCatalogueSource : null,
-          provider.family === "cloud" && provider.id !== "magnitude" ? modelsDevCatalogueSource : null,
-          makeLocalDiscoverySource(provider),
-        ].filter((source): source is NonNullable<typeof source> => source !== null)
-
-        for (const source of dynamicSources) {
-          const result = yield* Effect.either(source.fetch)
+        for (const source of sources) {
+          const result = yield* Effect.either(source.fetch())
           if (result._tag === "Right") {
-            successfulLayers.push(result.right.map((model) => ({ ...model })))
+            mergeSourceResult(merged, result.right)
           } else {
-            yield* Effect.logDebug(sourceFailedMessage(source.id, provider.id, result.left))
+            yield* Effect.logDebug(sourceFailedMessage(source.id, result.left))
           }
         }
 
-        if (successfulLayers.length === 0) {
-          return [...provider.models]
-        }
-
-        return mergeProviderModels(successfulLayers[0] ?? [], ...successfulLayers.slice(1))
+        yield* Ref.set(state, merged)
       })
 
-    const refresh = Effect.gen(function* () {
-      const next = new Map<string, readonly ProviderModel[]>()
-
-      for (const provider of getAllProviders()) {
-        const models = yield* refreshProvider(provider.id)
-        next.set(provider.id, models)
+      return {
+        refresh: () => refresh,
+        getModels: (providerId) =>
+          Ref.get(state).pipe(Effect.map((modelsByProvider) => modelsByProvider.get(providerId) ?? [])),
+        getAllModels: () => Ref.get(state),
       }
+    }),
+  )
+}
 
-      yield* Ref.set(state, next)
-    })
+const defaultSources: readonly CatalogueSource[] = [
+  staticCatalogueSource,
+  modelsDevCatalogueSource,
+  openRouterCatalogueSource,
+  localDiscoveryCatalogueSource,
+]
 
-    const getModels = (providerId: string): Effect.Effect<readonly ProviderModel[]> =>
-      Ref.get(state).pipe(
-        Effect.map((modelsByProvider) => modelsByProvider.get(providerId) ?? []),
-      )
-
-    const getAllModels = (): Effect.Effect<ReadonlyMap<string, readonly ProviderModel[]>> =>
-      Ref.get(state)
-
-    return {
-      refresh: () => refresh,
-      getModels,
-      getAllModels,
-    }
-  }),
-)
+export const ModelCatalogueLive = makeModelCatalogueLive(defaultSources)

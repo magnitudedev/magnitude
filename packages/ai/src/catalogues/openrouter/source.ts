@@ -149,21 +149,25 @@ function resolveFromCache(
 
 export const openRouterCatalogueSource: CatalogueSource = {
   id: SOURCE_ID,
-  fetch: Effect.gen(function* () {
-    const cache = yield* Effect.serviceOption(CatalogueCache)
+  fetch: () =>
+    Effect.gen(function* () {
+      const cache = yield* Effect.serviceOption(CatalogueCache)
 
-    const data = yield* Option.match(cache, {
-      onNone: () => fetchOpenRouterResponse.pipe(Effect.option),
-      onSome: (service) =>
-        resolveFromCache(SOURCE_ID, TTL_MS, fetchOpenRouterResponse).pipe(
-          Effect.provideService(CatalogueCache, service),
-          Effect.map(Option.fromNullable),
-        ),
-    })
+      const data = yield* Option.match(cache, {
+        onNone: () => fetchOpenRouterResponse.pipe(Effect.option),
+        onSome: (service) =>
+          resolveFromCache(SOURCE_ID, TTL_MS, fetchOpenRouterResponse).pipe(
+            Effect.provideService(CatalogueCache, service),
+            Effect.map(Option.fromNullable),
+          ),
+      })
 
-    return Option.match(data, {
-      onNone: (): readonly ProviderModel[] => [],
-      onSome: normalizeOpenRouterModels,
-    })
-  }),
+      return Option.match(data, {
+        onNone: () => new Map<string, readonly ProviderModel[]>(),
+        onSome: (response) =>
+          new Map<string, readonly ProviderModel[]>([
+            ["openrouter", normalizeOpenRouterModels(response)],
+          ]),
+      })
+    }),
 }

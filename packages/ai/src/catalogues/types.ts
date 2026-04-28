@@ -3,7 +3,10 @@ import type { ProviderModel } from "../lib/model/provider-model"
 
 export interface CatalogueSource {
   readonly id: string
-  readonly fetch: Effect.Effect<readonly ProviderModel[], CatalogueError>
+  readonly fetch: () => Effect.Effect<
+    ReadonlyMap<string, readonly ProviderModel[]>,
+    CatalogueError
+  >
 }
 
 export class CatalogueTransportError extends Data.TaggedError("CatalogueTransportError")<{
