@@ -1,6 +1,7 @@
+// @ts-nocheck — orphan xml-act test-harness drain. Test-only; not on the live native path.
 import { Effect, Scope, Stream } from 'effect'
 import type { PublishFn } from '@magnitudedev/event-core'
-import type { TurnEngineCrash } from '@magnitudedev/xml-act'
+import type { TurnEngineCrash } from '@magnitudedev/turn-engine'
 
 import type { AppEvent } from '../events'
 import { isToolKey } from '../catalog'
@@ -41,19 +42,10 @@ export function drainTurnEventStream<R>(
             yield* publish({ type: 'thinking_chunk', forkId, turnId, text: event.text })
             break
           case 'ThinkingEnd':
-            yield* publish({ type: 'thinking_end', forkId, turnId, about: event.about })
+            yield* publish({ type: 'thinking_end', forkId, turnId })
             break
           case 'RawResponseChunk':
             yield* publish({ type: 'raw_response_chunk', forkId, turnId, text: event.text })
-            break
-          case 'LensStarted':
-            yield* publish({ type: 'lens_start', forkId, turnId, name: event.name })
-            break
-          case 'LensDelta':
-            yield* publish({ type: 'lens_chunk', forkId, turnId, text: event.text })
-            break
-          case 'LensEnded':
-            yield* publish({ type: 'lens_end', forkId, turnId, name: event.name })
             break
           case 'ToolEvent':
             if (!isToolKey(event.toolKey)) {

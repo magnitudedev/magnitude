@@ -71,7 +71,7 @@ export const mkTurnOutcomeEvent = (overrides: Partial<Extract<AppEvent, { type: 
   cacheWriteTokens: null,
   providerId: null,
   modelId: null,
-  outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
+  outcome: { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } },
 
   ...overrides,
 })

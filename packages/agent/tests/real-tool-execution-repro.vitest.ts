@@ -26,31 +26,21 @@ describe('real tool execution repro', () => {
 
       // Check if create-task tool actually executed
       const createTaskExec = yield* h.wait.event('tool_event' as any, (e: any) =>
-        e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'create-task'
+        e.event._tag === 'ToolExecutionEnded' && e.toolKey === 'createTask'
       , { timeoutMs: 3000 })
-      console.log('create-task result:', JSON.stringify(createTaskExec.event.result))
+      console.log('create-task result:', JSON.stringify((createTaskExec as any).event.result))
 
       // Check if spawn-worker tool executed
       const spawnWorkerExec = yield* h.wait.event('tool_event' as any, (e: any) =>
-        e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'spawn-worker'
+        e.event._tag === 'ToolExecutionEnded' && e.toolKey === 'spawnWorker'
       , { timeoutMs: 3000 }).pipe(
         Effect.catchAll(() => Effect.succeed(null))
       )
-      
+
       if (spawnWorkerExec) {
         console.log('spawn-worker result:', JSON.stringify((spawnWorkerExec as any).event.result))
       } else {
         console.log('spawn-worker: NO ToolExecutionEnded event (tool never executed or failed before execution)')
-        
-        // Check for parse error
-        const parseError = yield* h.wait.event('tool_event' as any, (e: any) =>
-          e.event._tag === 'ToolParseError' && e.event.toolName === 'spawn-worker'
-        , { timeoutMs: 1000 }).pipe(
-          Effect.catchAll(() => Effect.succeed(null))
-        )
-        if (parseError) {
-          console.log('spawn-worker PARSE ERROR:', JSON.stringify((parseError as any).event.error))
-        }
       }
 
       // The definitive assertion: does agent_created happen?

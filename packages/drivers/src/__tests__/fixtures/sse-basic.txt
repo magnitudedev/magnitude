@@ -1,0 +1,7 @@
+data: {"id":"cmpl-1","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me think."},"finish_reason":null}],"usage":null}
+
+data: {"id":"cmpl-1","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{"content":"Hello!"},"finish_reason":null}],"usage":null}
+
+data: {"id":"cmpl-1","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+
+data: [DONE]

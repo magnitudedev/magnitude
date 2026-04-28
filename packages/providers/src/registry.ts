@@ -416,7 +416,7 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Fireworks AI',
     defaultBaseUrl: 'https://api.fireworks.ai/inference/v1',
     models: providerModels('fireworks-ai', 'Fireworks AI', [
-      { id: 'accounts/fireworks/models/kimi-k2p6', name: 'Kimi K2.6', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true },
+      { id: 'accounts/fireworks/models/kimi-k2p6', name: 'Kimi K2.6', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true, paradigm: 'native' as const, modelId: 'kimi-k2.6' as const },
       { id: 'accounts/fireworks/models/glm-5p1', name: 'GLM 5.1', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true },
     ]),
     authMethods: [

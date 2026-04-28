@@ -17,9 +17,9 @@ describe('memory integration scenarios', () => {
       })
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
-      yield* h.send({ type: 'message_start', forkId: null, turnId: 't-1', id: 'm-t1', destination: { kind: 'user' } })
-      yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-t1', text: 'first answer' })
-      yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-t1' })
+      yield* h.send({ type: 'assistant_message_start', forkId: null, turnId: 't-1', id: 'm-t1', destination: { kind: 'user' } })
+      yield* h.send({ type: 'assistant_message_delta', forkId: null, turnId: 't-1', id: 'm-t1', text: 'first answer' })
+      yield* h.send({ type: 'assistant_message_end', forkId: null, turnId: 't-1', id: 'm-t1' })
       yield* h.send({
         type: 'turn_outcome',
 
@@ -30,7 +30,8 @@ describe('memory integration scenarios', () => {
         outcome: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0,
+            finishReason: 'stop',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'follow-up reminder' }],
           },
         },
@@ -80,21 +81,21 @@ describe('memory integration scenarios', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'message_start',
+        type: 'assistant_message_start',
         forkId: 'f-sub',
         turnId: 'sub-turn',
         id: 'm1',
         destination: { kind: 'parent' },
       })
       yield* h.send({
-        type: 'message_chunk',
+        type: 'assistant_message_delta',
         forkId: 'f-sub',
         turnId: 'sub-turn',
         id: 'm1',
         text: 'progress update',
       })
       yield* h.send({
-        type: 'message_end',
+        type: 'assistant_message_end',
         forkId: 'f-sub',
         turnId: 'sub-turn',
         id: 'm1',
@@ -130,9 +131,9 @@ describe('memory integration scenarios', () => {
         turnId: 't-1',
         parts: [{ type: 'text', text: 'observation' }],
       })
-      yield* h.send({ type: 'message_start', forkId: null, turnId: 't-1', id: 'm-obs', destination: { kind: 'user' } })
-      yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-obs', text: 'done' })
-      yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-obs' })
+      yield* h.send({ type: 'assistant_message_start', forkId: null, turnId: 't-1', id: 'm-obs', destination: { kind: 'user' } })
+      yield* h.send({ type: 'assistant_message_delta', forkId: null, turnId: 't-1', id: 'm-obs', text: 'done' })
+      yield* h.send({ type: 'assistant_message_end', forkId: null, turnId: 't-1', id: 'm-obs' })
       yield* h.send({
         type: 'turn_outcome',
 
@@ -140,7 +141,7 @@ describe('memory integration scenarios', () => {
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
+        outcome: { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -222,9 +223,9 @@ describe('memory integration scenarios', () => {
         timestamp: 1711641600000,
         text: 'while queued',
       })
-      yield* h.send({ type: 'message_start', forkId: null, turnId: 't-1', id: 'm-done', destination: { kind: 'user' } })
-      yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-done', text: 'assistant done' })
-      yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-done' })
+      yield* h.send({ type: 'assistant_message_start', forkId: null, turnId: 't-1', id: 'm-done', destination: { kind: 'user' } })
+      yield* h.send({ type: 'assistant_message_delta', forkId: null, turnId: 't-1', id: 'm-done', text: 'assistant done' })
+      yield* h.send({ type: 'assistant_message_end', forkId: null, turnId: 't-1', id: 'm-done' })
       yield* h.send({
         type: 'turn_outcome',
 
@@ -232,7 +233,7 @@ describe('memory integration scenarios', () => {
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
+        outcome: { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,

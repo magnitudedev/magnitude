@@ -6,7 +6,7 @@
 
 import { Effect } from 'effect'
 import { Fork } from '@magnitudedev/event-core'
-import type { InterceptorContext, InterceptorDecision } from '@magnitudedev/xml-act'
+import type { InterceptorContext, InterceptorDecision } from '@magnitudedev/turn-engine'
 import { PermissionRejection } from './permission-rejection'
 import type { RoleDefinition, Policy } from '@magnitudedev/roles'
 import type { ToolCatalog } from '@magnitudedev/tools'

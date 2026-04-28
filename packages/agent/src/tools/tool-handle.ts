@@ -1,4 +1,4 @@
-import type { TurnEngineEvent, ToolLifecycleEvent } from '@magnitudedev/xml-act'
+import type { TurnEngineEvent, ToolLifecycleEvent } from '@magnitudedev/turn-engine'
 import type { ToolStateEvent } from '@magnitudedev/tools'
 import type { ToolState } from '../models/tool-state'
 import type { ToolKey, AgentCatalogEntry } from '../catalog'
@@ -25,7 +25,7 @@ function isToolLifecycleEvent(event: TurnEngineEvent): event is ToolLifecycleEve
     case 'ToolInputFieldChunk':
     case 'ToolInputFieldComplete':
     case 'ToolInputReady':
-    case 'ToolParseError':
+    case 'ToolInputDecodeFailure':
     case 'ToolExecutionStarted':
     case 'ToolExecutionEnded':
     case 'ToolEmission':
@@ -46,8 +46,8 @@ function buildHandle<K extends ToolKey>(
     process(event: TurnEngineEvent): ToolHandle {
       if (!isToolLifecycleEvent(event)) return this
       // Map xml-act ToolLifecycleEvent → ToolStateEvent (only ToolParseError differs)
-      const mapped: ToolStateEvent = event._tag === 'ToolParseError'
-        ? { _tag: 'ToolParseError', error: event.error.detail }
+      const mapped: ToolStateEvent = event._tag === 'ToolInputDecodeFailure'
+        ? { _tag: 'ToolParseError', error: typeof event.detail === 'string' ? event.detail : String(event.detail) }
         : event as ToolStateEvent
       const reduced = reduce(state, mapped)
       return buildHandle(toolKey, reduced, reduce)

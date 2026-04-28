@@ -1,0 +1,11 @@
+data: {"id":"cmpl-2","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"cmpl-2","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"cmpl-2","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"cmpl-2","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/tmp\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"cmpl-2","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k2-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":15}}
+
+data: [DONE]

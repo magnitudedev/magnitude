@@ -1,12 +1,12 @@
-import type { ToolResult as XmlActToolResult } from '@magnitudedev/xml-act'
+import type { ToolResult as EngineToolResult } from '@magnitudedev/turn-engine'
 import type { ToolResult } from '../events'
 
 /**
- * Maps xml-act's internal ToolResult to the app-level ToolResult.
+ * Maps the engine's internal ToolResult to the app-level ToolResult.
  * Used by both ExecutionManager (live tool completion) and interrupt
  * recovery (reconstructing tool results from replay state).
  */
-export function mapXmlToolResult(result: XmlActToolResult): ToolResult {
+export function mapEngineToolResult(result: EngineToolResult): ToolResult {
   switch (result._tag) {
     case 'Success':
       return { status: 'success', output: result.output }
@@ -28,3 +28,9 @@ export function mapXmlToolResult(result: XmlActToolResult): ToolResult {
       return { status: 'interrupted' }
   }
 }
+
+/**
+ * Legacy alias used by ExecutionManager (xml-act path) — same shape as engine
+ * result. Kept for backward compatibility while xml-act execution path is alive.
+ */
+export const mapXmlToolResult = mapEngineToolResult

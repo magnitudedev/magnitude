@@ -869,52 +869,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
-    lens_start: ({ event, fork }) => {
-      if (fork.currentTurnId !== event.turnId) return fork
-      const { fork: newState, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
-      const block = findThinkBlock(newState.messages, thinkBlockId)
-      // Only create a thinking step if none exists yet
-      // If one already exists, just continue appending to it (no space, no new step)
-      if (block) {
-        const lastStep = block.steps[block.steps.length - 1]
-        if (lastStep && lastStep.type === 'thinking') {
-          return newState
-        }
-      }
-      return {
-        ...newState,
-        messages: addStepToThinkBlock(newState.messages, thinkBlockId, {
-          id: generateId(),
-          type: 'thinking',
-          content: ''
-        })
-      }
-    },
-
-    lens_chunk: ({ event, fork }) => {
-      if (fork.currentTurnId !== event.turnId) return fork
-      const { fork: newState, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
-      const block = findThinkBlock(newState.messages, thinkBlockId)
-      if (!block) return newState
-      const lastStep = block.steps[block.steps.length - 1]
-      if (!lastStep || lastStep.type !== 'thinking') return newState
-      return {
-        ...newState,
-        messages: updateStepInThinkBlock(
-          newState.messages,
-          thinkBlockId,
-          lastStep.id,
-          (s) => s.type === 'thinking'
-            ? { ...s, content: s.content + event.text }
-            : s
-        )
-      }
-    },
-
-    lens_end: ({ fork }) => fork,
-
-
-
     tool_event: ({ event, fork, read, emit }) => {
       const inner = event.event
       const toolStateFork = read(ToolStateProjection) ?? { toolHandles: {} }
@@ -991,31 +945,17 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               fork.messages,
               fork.activeThinkBlockId,
               event.toolCallId,
-              (s) => s.type === 'tool'
-                ? {
-                    ...s,
-                    state: getVisualState(toolStateFork, event.toolCallId) ?? s.state,
-                  }
-                : s
+              (s) => {
+                if (s.type !== 'tool') return s
+
+                return {
+                  ...s,
+                  state: getVisualState(toolStateFork, event.toolCallId) ?? s.state,
+                }
+              }
             )
           }
         }
-
-        case 'ToolObservation':
-          // Store the filter query when observation is set
-          if (fork.currentTurnId !== event.turnId) return fork
-          if (!fork.activeThinkBlockId) return fork
-          return {
-            ...fork,
-            messages: updateStepInThinkBlock(
-              fork.messages,
-              fork.activeThinkBlockId,
-              event.toolCallId,
-              (s) => s.type === 'tool'
-                ? { ...s, filter: inner.query }
-                : s
-            )
-          }
 
         default: {
           if (fork.currentTurnId !== event.turnId) return fork
@@ -1044,7 +984,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         return fork
       }
 
-      if (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke') {
+      if (event.outcome._tag === 'Completed' && event.outcome.completion.toolCallsCount > 0) {
         return {
           ...fork,
           currentTurnId: null,

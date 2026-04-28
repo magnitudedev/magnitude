@@ -11,7 +11,6 @@ import type { AppEvent } from '../../events'
 import { AgentStatusProjection } from '../agent-status'
 import { MemoryProjection, type ForkMemoryState } from '../memory'
 import { SubagentActivityProjection } from '../subagent-activity'
-import { CanonicalTurnProjection } from '../canonical-turn'
 import { UserPresenceProjection } from '../user-presence'
 import { OutboundMessagesProjection } from '../outbound-messages'
 import { UserMessageResolutionProjection } from '../user-message-resolution'
@@ -32,7 +31,6 @@ const makeRuntimeLayer = () => {
     projectionBusLayer,
     Layer.provide(AgentStatusProjection.Layer, projectionBusLayer),
     Layer.provide(SubagentActivityProjection.Layer, projectionBusLayer),
-    Layer.provide(CanonicalTurnProjection.Layer, projectionBusLayer),
     Layer.provide(UserPresenceProjection.Layer, projectionBusLayer),
     Layer.provide(OutboundMessagesProjection.Layer, projectionBusLayer),
     Layer.provide(UserMessageResolutionProjection.Layer, projectionBusLayer),
@@ -525,7 +523,7 @@ describe('task tree rendering mechanics', () => {
         result: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0, finishReason: 'stop' as const,
             feedback: [],
           },
         },

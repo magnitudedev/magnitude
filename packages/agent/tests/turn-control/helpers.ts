@@ -25,7 +25,7 @@ export const mkTurnOutcomeEventSuccess = (
   turnId: 'turn-1',
   chainId: 'chain-1',
   strategyId: 'xml-act',
-  outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
+  outcome: { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } },
 
   inputTokens: null,
   outputTokens: null,

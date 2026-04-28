@@ -87,41 +87,10 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     thinking_end: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
-      if (fork.thinkBlocks.length === 0) return fork
-      const blocks = [...fork.thinkBlocks]
-      const last = blocks[blocks.length - 1]
-      blocks[blocks.length - 1] = { ...last, about: event.about }
-      return { ...fork, thinkBlocks: blocks }
+      return fork
     },
 
-    lens_start: ({ event, fork }) => {
-      if (fork.turnId !== event.turnId) return fork
-      const nextLenses = [...(fork.lenses ?? []), { name: event.name, content: '' }]
-      return { ...fork, lenses: nextLenses }
-    },
-
-    lens_chunk: ({ event, fork }) => {
-      if (fork.turnId !== event.turnId) return fork
-      if (!fork.lenses || fork.lenses.length === 0) return fork
-      const nextLenses = [...fork.lenses]
-      const last = nextLenses[nextLenses.length - 1]
-      nextLenses[nextLenses.length - 1] = {
-        ...last,
-        content: last.content + event.text,
-      }
-      return { ...fork, lenses: nextLenses }
-    },
-
-    lens_end: ({ event, fork }) => {
-      if (fork.turnId !== event.turnId) return fork
-      if (!fork.lenses || fork.lenses.length === 0) return fork
-      const nextLenses = [...fork.lenses]
-      const last = nextLenses[nextLenses.length - 1]
-      if (last.name !== event.name) return fork
-      const trimmed = last.content.trim()
-      nextLenses[nextLenses.length - 1] = { ...last, content: trimmed }
-      return { ...fork, lenses: nextLenses }
-    },
+    thinking_start: ({ fork }) => fork,
 
     message_start: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
@@ -166,9 +135,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           const idx = fork.toolCalls.length
           const nextToolCalls = [...fork.toolCalls, {
             toolCallId: event.toolCallId,
-            // Canonical XML is model-facing, so preserve the parsed XML tag here
-            // instead of the internal catalog key carried alongside the app event.
-            tagName: event.event.tagName,
+            tagName: event.event.toolName,
             input: {},
             query: null,
             order: fork.orderCounter,
@@ -191,15 +158,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           return { ...fork, toolCalls: next }
         }
 
-        case 'ToolObservation': {
-          const idx = fork.toolCallMap.get(event.toolCallId)
-          if (idx === undefined) return fork
-          const nextToolCalls = [...fork.toolCalls]
-          nextToolCalls[idx] = { ...nextToolCalls[idx], query: event.event.query }
-          return { ...fork, toolCalls: nextToolCalls }
-        }
-
-        case 'ToolParseError':
+        case 'ToolInputDecodeFailure':
           return { ...fork, hasParseError: true }
 
         default:
@@ -236,7 +195,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
             .map(({ tagName, input, query }) => ({ tagName, input, query })),
-          yieldTarget: event.outcome._tag === 'Completed' ? event.outcome.completion.yieldTarget : 'invoke',
+          yieldTarget: 'invoke',
         }
         canonicalXml = serializeCanonicalTurn(trace, toolSet)
       } else {

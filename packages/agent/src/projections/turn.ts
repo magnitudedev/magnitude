@@ -13,7 +13,7 @@ import { logger } from '@magnitudedev/logger'
 import { outcomeWillChainContinue } from '../events'
 import type { AppEvent, TurnOutcomeEvent } from '../events'
 import type { ToolKey } from '../catalog'
-import type { ToolResult } from '@magnitudedev/xml-act'
+import type { ToolResult } from '@magnitudedev/turn-engine'
 import { AgentRoutingProjection } from './agent-routing'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { CompactionProjection } from './compaction'
@@ -239,46 +239,6 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
           (message) => message.source === 'user'
         ),
       })
-    },
-
-    tool_event: ({ event, fork }) => {
-      if (fork._tag !== 'active') return fork
-      if (fork.turnId !== event.turnId) return fork
-
-      switch (event.event._tag) {
-        case 'ToolInputStarted':
-          return TurnLifecycle.hold(fork, {
-            toolCalls: [
-              ...fork.toolCalls,
-              {
-                toolCallId: event.toolCallId,
-                toolKey: event.toolKey,
-                input: undefined,
-              },
-            ],
-          })
-
-        case 'ToolInputReady': {
-          const inner = event.event
-          return TurnLifecycle.hold(fork, {
-            toolCalls: fork.toolCalls.map((tc) =>
-              tc.toolCallId === event.toolCallId ? { ...tc, input: inner.input } : tc
-            ),
-          })
-        }
-
-        case 'ToolExecutionEnded': {
-          const inner = event.event
-          return TurnLifecycle.hold(fork, {
-            toolCalls: fork.toolCalls.map((tc) =>
-              tc.toolCallId === event.toolCallId ? { ...tc, result: inner.result } : tc
-            ),
-          })
-        }
-
-        default:
-          return fork
-      }
     },
 
     turn_outcome: ({ event, fork, emit }) => {

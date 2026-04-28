@@ -24,9 +24,9 @@ describe('memory/timeline-events', () => {
       })
 
       yield* h.send({ type: 'turn_started', forkId: subforkId, turnId: 'sub-turn-1', chainId: 'sub-chain-1' })
-      yield* h.send({ type: 'message_start', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', destination: { kind: 'parent' } })
-      yield* h.send({ type: 'message_chunk', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', text: 'working on auth flow' })
-      yield* h.send({ type: 'message_end', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1' })
+      yield* h.send({ type: 'assistant_message_start', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', destination: { kind: 'parent' } })
+      yield* h.send({ type: 'assistant_message_delta', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', text: 'working on auth flow' })
+      yield* h.send({ type: 'assistant_message_end', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1' })
       yield* h.send({
         type: 'turn_outcome',
 
@@ -36,7 +36,7 @@ describe('memory/timeline-events', () => {
         strategyId: 'xml-act',
 
 
-        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
+        outcome: { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -103,7 +103,8 @@ describe('memory/timeline-events', () => {
         outcome: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0,
+            finishReason: 'stop',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'follow up on deployment checks' }],
           },
         },

@@ -9,8 +9,8 @@
  *   catalog → models → tools → execution-manager → catalog
  */
 
-import { Effect, Data, Context, Stream } from 'effect'
-import type { TurnEngineEvent, TurnEngineCrash, EngineState } from '@magnitudedev/xml-act'
+import { Effect, Data, Context, Stream, Layer } from 'effect'
+import type { TurnEngineEvent, TurnEngineCrash, EngineState } from '@magnitudedev/turn-engine'
 import type { MessageDestination, TurnOutcome } from '../events'
 import type { CallUsage, ModelError } from '@magnitudedev/providers'
 import type { Projection, WorkerBusService, AmbientService } from '@magnitudedev/event-core'
@@ -143,6 +143,14 @@ export interface ExecutionManagerService {
   readonly disposeFork: (forkId: string) => Effect.Effect<void>
 
   readonly getObservables: (forkId: string | null) => BoundObservable[]
+
+  /**
+   * Returns the cached fork-scoped Layer (built by initFork). Includes
+   * WorkingDirectory, ApprovalState, EphemeralSessionContext, all reader
+   * services, ToolInterceptor, etc. Used by Cortex to provide tool-execution
+   * context for the native paradigm.
+   */
+  readonly getForkLayer: (forkId: string | null) => Layer.Layer<never> | undefined
 
   readonly fork: (params: {
     parentForkId: string | null

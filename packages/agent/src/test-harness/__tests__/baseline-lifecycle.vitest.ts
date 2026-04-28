@@ -25,7 +25,7 @@ describe('baseline harness lifecycle', () => {
 
       expect(completed.outcome._tag).toBe('Completed')
       if (completed.outcome._tag === 'Completed') {
-        expect(completed.outcome.completion.yieldTarget).toBe('user')
+        expect(completed.outcome.completion.toolCallsCount).toBe(0)
       }
 
       const root = yield* harness.projectionFork(TurnProjection.Tag, null)
@@ -50,12 +50,12 @@ describe('baseline harness lifecycle', () => {
 
       expect(first.outcome._tag).toBe('Completed')
       if (first.outcome._tag === 'Completed') {
-        expect(first.outcome.completion.yieldTarget).toBe('invoke')
+        expect(first.outcome.completion.toolCallsCount).toBeGreaterThan(0)
       }
 
       expect(second.outcome._tag).toBe('Completed')
       if (second.outcome._tag === 'Completed') {
-        expect(second.outcome.completion.yieldTarget).toBe('user')
+        expect(second.outcome.completion.toolCallsCount).toBe(0)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )

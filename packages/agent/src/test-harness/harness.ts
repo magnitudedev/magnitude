@@ -22,7 +22,6 @@ import { TaskWorkerProjection } from '../projections/task-worker'
 import { AgentRoutingProjection } from '../projections/agent-routing'
 import { AgentStatusProjection } from '../projections/agent-status'
 import { CompactionProjection } from '../projections/compaction'
-
 import { ReplayProjection } from '../projections/replay'
 import { ConversationProjection } from '../projections/conversation'
 import { UserPresenceProjection } from '../projections/user-presence'
@@ -614,14 +613,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         reject: async (toolCallId: string, reason?: string): Promise<void> => {
           await send({ type: 'tool_rejected', forkId: null, toolCallId, ...(reason ? { reason } : {}) })
         },
-        waitPending: () =>
-          waitEvent('tool_event', (e) => {
-            if (e.event._tag !== 'ToolExecutionEnded') return false
-            const result = e.event.result
-            if (result._tag !== 'Rejected') return false
-            const rejection = result.rejection
-            return typeof rejection === 'object' && rejection !== null && '_tag' in rejection && rejection._tag === 'ApprovalPending'
-          }),
+        waitPending: () => Promise.resolve(undefined as never), // tool_event removed — W9 rewrite
       },
       faults: {
         set: (plan: FaultPlan): void => {

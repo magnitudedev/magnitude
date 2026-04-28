@@ -3,6 +3,10 @@ import { Effect, Exit } from 'effect'
 import { YIELD_USER } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../src/test-harness/harness'
 import { MockTurnScriptTag } from '../src/test-harness/turn-script'
+import { response } from '../src/test-harness/response-builder'
+
+const spawnWorkerXml = (id: string, title: string, message: string) =>
+  response().createTask(id, title).spawnWorker(id, message).yield().xml!
 
 describe('parent wake edge cases', () => {
   it.live('parent woken when subagent has unexpected error', () =>
@@ -14,9 +18,7 @@ describe('parent wake edge cases', () => {
         if (forkId === null) {
           rootTurns += 1
           if (rootTurns === 1) {
-            return {
-              xml: `<invoke tool="agent_create">\n<parameter name="agentId">error-sub</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">err</parameter>\n<parameter name="message">go</parameter>\n</invoke>\n${YIELD_USER}`,
-            }
+            return { xml: spawnWorkerXml('error-sub', 'err', 'go') }
           }
           return { xml: YIELD_USER }
         }
@@ -36,7 +38,7 @@ describe('parent wake edge cases', () => {
         'turn_outcome',
         (e) => e.forkId === created.forkId,
       )
-      expect(subError.message).toContain('simulated subagent crash')
+      expect(subError.outcome._tag === 'UnexpectedError' ? subError.outcome.message : '').toContain('simulated subagent crash')
 
       // Parent should be woken
       const parentWake = yield* Effect.exit(
@@ -60,9 +62,7 @@ describe('parent wake edge cases', () => {
         if (forkId === null) {
           rootTurns += 1
           if (rootTurns === 1) {
-            return {
-              xml: `<invoke tool="agent_create">\n<parameter name="agentId">kill-sub</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">will be killed</parameter>\n<parameter name="message">do work</parameter>\n</invoke>\n${YIELD_USER}`,
-            }
+            return { xml: spawnWorkerXml('kill-sub', 'will be killed', 'do work') }
           }
           return { xml: YIELD_USER }
         }

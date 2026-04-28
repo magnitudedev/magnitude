@@ -1,0 +1,21 @@
+{
+  "name": "@magnitudedev/codecs",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "effect": "^3.19.6",
+    "@magnitudedev/drivers": "workspace:*"
+  },
+  "peerDependencies": {
+    "@effect/platform": "^0.96.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

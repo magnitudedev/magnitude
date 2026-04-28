@@ -152,12 +152,24 @@ export type StructuralEvent =
 // Tool Registration
 // =============================================================================
 
-export interface RegisteredTool {
+/**
+ * RegisteredTool — a tool wrapped with the metadata the runtime needs to
+ * dispatch it.
+ *
+ * Generic over `R` — the services the tool's `execute` requires from the
+ * effect context. The `layerProvider` returns a Layer that *provides
+ * exactly those services*, so the dispatcher can fully resolve the tool
+ * effect's R channel without losing or fabricating type information.
+ *
+ * Default `R = never` keeps every existing call site (tools with no
+ * service requirements, callers passing `Layer.empty`) typing unchanged.
+ */
+export interface RegisteredTool<R = never> {
   readonly tool: ToolDefinition
   readonly tagName: string
   readonly groupName: string
   readonly meta?: unknown
-  readonly layerProvider?: () => Effect.Effect<Layer.Layer<never>, unknown>
+  readonly layerProvider?: () => Effect.Effect<Layer.Layer<R, never, never>, unknown>
 }
 
 // =============================================================================

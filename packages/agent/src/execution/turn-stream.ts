@@ -1,5 +1,5 @@
 import { Cause, Chunk, Effect, Stream, Queue, Scope, Option } from 'effect'
-import type { TurnEngineCrash } from '@magnitudedev/xml-act'
+import type { TurnEngineCrash } from '@magnitudedev/turn-engine'
 import type { TurnEvent, TurnEventSink, TurnError } from './types'
 
 type Envelope =

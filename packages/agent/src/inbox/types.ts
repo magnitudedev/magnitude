@@ -3,7 +3,7 @@ import type {
   ResolvedMention,
   ToolResultStatus,
 } from '../events'
-import type { StructuralParseErrorEvent, ToolParseErrorEvent } from '@magnitudedev/xml-act'
+
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -82,27 +82,15 @@ type PhaseCriteriaBase<S extends string> = {
 
 export type ToolErrorResultItem = {
   readonly kind: 'tool_error'
-  readonly tagName: string
+  readonly toolName: string
   readonly status: Exclude<ToolResultStatus, 'success'>
   readonly message?: string
 }
 
-export type ToolParseErrorResultItem = {
-  readonly kind: 'tool_parse_error'
-  readonly event: ToolParseErrorEvent
-  readonly rawResponse: string
-}
-
-export type StructuralParseErrorResultItem = {
-  readonly kind: 'structural_parse_error'
-  readonly event: StructuralParseErrorEvent
-  readonly rawResponse: string
-}
-
 export type ToolObservationResultItem = {
   readonly kind: 'tool_observation'
-  readonly tagName: string
-  readonly query: string | null
+  readonly toolName: string
+  readonly toolCallId: string
   readonly content: readonly ContentPart[]
 }
 
@@ -118,8 +106,6 @@ export type NoToolsOrMessagesResultItem = {
 
 export type TurnResultItem =
   | ToolErrorResultItem
-  | ToolParseErrorResultItem
-  | StructuralParseErrorResultItem
   | ToolObservationResultItem
   | MessageAckResultItem
   | NoToolsOrMessagesResultItem

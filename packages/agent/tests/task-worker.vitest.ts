@@ -47,7 +47,7 @@ describe('TaskWorkerProjection', () => {
         toolKey: 'spawnWorker',
         event: {
           _tag: 'ToolInputReady',
-          input: { id: 'task-1', role: 'builder', message: 'do it' },
+          input: { id: 'task-1', role: 'worker', message: 'do it' },
         },
       } as any)
       yield* h.send({
@@ -57,7 +57,7 @@ describe('TaskWorkerProjection', () => {
         parentForkId: null,
         agentId: 'agent-1',
         name: 'Builder',
-        role: 'builder',
+        role: 'worker',
         context: '',
         mode: 'spawn',
         taskId: 'task-1',
@@ -72,7 +72,7 @@ describe('TaskWorkerProjection', () => {
         workerInfo: {
           agentId: 'agent-1',
           forkId: 'fork-worker',
-          role: 'builder',
+          role: 'worker',
         },
         message: 'do it',
       } as any)
@@ -97,14 +97,14 @@ describe('TaskWorkerProjection', () => {
         updatedAt: ts(5),
         assignee: {
           kind: 'worker',
-          role: 'builder',
+          role: 'worker',
           agentId: 'agent-1',
           forkId: 'fork-worker',
         },
         workerState: {
           status: 'spawning',
           toolCallId: 'spawn-1',
-          role: 'builder',
+          role: 'worker',
         },
       })
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
@@ -130,7 +130,7 @@ describe('TaskWorkerProjection', () => {
         parentForkId: null,
         agentId: 'agent-1',
         name: 'Builder',
-        role: 'builder',
+        role: 'worker',
         context: '',
         mode: 'spawn',
         taskId: 'task-1',
@@ -145,7 +145,7 @@ describe('TaskWorkerProjection', () => {
         workerInfo: {
           agentId: 'agent-1',
           forkId: 'fork-worker',
-          role: 'builder',
+          role: 'worker',
         },
         message: 'do it',
       } as any)
@@ -207,7 +207,7 @@ describe('TaskWorkerProjection', () => {
         parentForkId: null,
         agentId: 'agent-1',
         name: 'Builder',
-        role: 'builder',
+        role: 'worker',
         context: '',
         mode: 'spawn',
         taskId: 'task-1',
@@ -222,7 +222,7 @@ describe('TaskWorkerProjection', () => {
         workerInfo: {
           agentId: 'agent-1',
           forkId: 'fork-worker',
-          role: 'builder',
+          role: 'worker',
         },
         message: 'do it',
       } as any)
@@ -282,7 +282,7 @@ describe('TaskWorkerProjection', () => {
         toolKey: 'spawnWorker',
         event: {
           _tag: 'ToolInputReady',
-          input: { id: 'task-1', role: 'builder', message: 'replace it' },
+          input: { id: 'task-1', role: 'worker', message: 'replace it' },
         },
       } as any)
 
@@ -291,7 +291,7 @@ describe('TaskWorkerProjection', () => {
       expect(state.snapshots.get('task-1')?.workerState).toEqual({
         status: 'spawning',
         toolCallId: 'spawn-1',
-        role: 'builder',
+        role: 'worker',
       })
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
@@ -316,7 +316,7 @@ describe('TaskWorkerProjection', () => {
         parentForkId: null,
         agentId: 'agent-1',
         name: 'Builder',
-        role: 'builder',
+        role: 'worker',
         context: '',
         mode: 'spawn',
         taskId: 'task-1',
@@ -331,7 +331,7 @@ describe('TaskWorkerProjection', () => {
         workerInfo: {
           agentId: 'agent-1',
           forkId: 'fork-worker',
-          role: 'builder',
+          role: 'worker',
         },
         message: 'do it',
       } as any)
@@ -349,10 +349,11 @@ describe('TaskWorkerProjection', () => {
         turnId: 'turn-worker',
         chainId: 'chain-worker',
         strategyId: 'xml-act',
-        result: {
+        outcome: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0,
+            finishReason: 'stop',
             feedback: [],
           },
         },
@@ -397,7 +398,7 @@ describe('TaskWorkerProjection', () => {
         parentForkId: null,
         agentId: 'agent-1',
         name: 'Builder',
-        role: 'builder',
+        role: 'worker',
         context: '',
         mode: 'spawn',
         taskId: 'task-1',
@@ -412,7 +413,7 @@ describe('TaskWorkerProjection', () => {
         workerInfo: {
           agentId: 'agent-1',
           forkId: 'fork-worker',
-          role: 'builder',
+          role: 'worker',
         },
         message: 'do it',
       } as any)

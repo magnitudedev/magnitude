@@ -31,9 +31,7 @@ export type {
   TurnFeedback,
   TurnToolCall,
   StrategyId,
-  MessageStart,
   ThinkingChunk,
-  ToolEvent,
   ToolResult,
   ToolDisplay,
   Interrupt,
@@ -111,6 +109,7 @@ export type {
   PendingInboundCommunicationDisplay,
 } from './projections/display'
 
+export { ReplayProjection } from './projections/replay'
 export { TurnProjection } from './projections/turn'
 export type { ToolCall, TurnTrigger, PendingInboundCommunication, ForkTurnState } from './projections/turn'
 
@@ -137,7 +136,7 @@ export type { OutboundMessagesState, OutboundMessageCompletedSignal } from './pr
 export { SessionContextProjection } from './projections/session-context'
 export type { SessionContextState } from './projections/session-context'
 
-export { ReplayProjection } from './projections/replay'
+
 export { TaskGraphProjection, getPrimaryRootTask, getSessionTitleFromTaskGraph } from './projections/task-graph'
 export type { TaskGraphState, TaskRecord, TaskStatus, TaskWorkerInfo } from './projections/task-graph'
 
@@ -147,7 +146,7 @@ export type { EditDiff } from './util/line-edit'
 // Execution
 export { ExecutionManager } from './execution/types'
 export type { ExecutionManagerService, ExecuteOptions, ExecuteResult } from './execution/types'
-export { ExecutionManagerLive } from './execution/execution-manager'
+// ExecutionManagerLive — xml-act paradigm, orphaned. Import directly from the file if needed.
 export { PermissionRejection } from './execution/permission-rejection'
 
 // Prompt Utilities
@@ -157,7 +156,7 @@ export { PermissionRejection } from './execution/permission-rejection'
 // export { getProtocol } from './prompts/protocol'
 
 // Tool types (re-exported from xml-act and tools packages)
-export type { TurnEngineEvent } from '@magnitudedev/xml-act'
+
 export type { ToolDefinition } from '@magnitudedev/tools'
 
 // Tools
@@ -180,7 +179,7 @@ export type { AgentStateReader } from './tools/fork'
 
 // Workers
 export { TurnController } from './workers/turn-controller'
-export { Cortex } from './workers/cortex'
+
 export { AgentLifecycle } from './workers/agent-lifecycle'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
@@ -208,8 +207,7 @@ export {
 export type { SerializedEvent } from './serialization'
 
 // Debug Introspection
-export { createDebugStream, getDebugSnapshot } from './projections/debug-introspection'
-export type { DebugSnapshot, ProjectionSnapshot, ContextUsage } from './projections/debug-introspection'
+// debug-introspection removed (depends on ReplayProjection — W scheduled rewrite)
 
 // Ambient config
 export * from './ambient'

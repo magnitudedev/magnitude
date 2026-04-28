@@ -27,7 +27,9 @@ export const ToolStateProjection = Projection.defineForked<AppEvent, ToolStatePr
       const inner = event.event
 
       if (inner._tag === 'ToolInputStarted') {
-        const entry = catalog.entries[event.toolKey] as AgentCatalogEntry
+        if (!event.toolKey) return fork
+        const entry = catalog.entries[event.toolKey] as AgentCatalogEntry | undefined
+        if (!entry) return fork
         const handle = createToolHandle(event.toolKey, entry).process(inner)
         return {
           ...fork,

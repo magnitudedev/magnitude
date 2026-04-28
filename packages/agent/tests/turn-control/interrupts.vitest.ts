@@ -90,7 +90,7 @@ describe('turn control interrupts', () => {
       yield* h.send(mkTurnOutcomeEventFailure({
         turnId: 't-fresh-1',
         chainId: 'c-fresh-1',
-        result: { _tag: 'Cancelled' },
+        outcome: { _tag: 'Cancelled', reason: { _tag: 'UserInterrupt' } },
       }))
 
       yield* h.send(mkUserMessage('msg-fresh-after-cancel', 'new instruction after cancel'))
@@ -126,7 +126,7 @@ describe('turn control interrupts', () => {
       yield* h.send(mkTurnOutcomeEventFailure({
         turnId: 't-buffer-1',
         chainId: 'c-buffer-1',
-        result: { _tag: 'Cancelled' },
+        outcome: { _tag: 'Cancelled', reason: { _tag: 'UserInterrupt' } },
       }))
 
       const nextTurn = yield* h.wait.event(
@@ -152,7 +152,7 @@ describe('turn control interrupts', () => {
       yield* h.send(mkTurnOutcomeEventFailure({
         turnId: 't-stale-1',
         chainId: 'c-stale-1',
-        result: { _tag: 'Cancelled' },
+        outcome: { _tag: 'Cancelled', reason: { _tag: 'UserInterrupt' } },
       }))
 
       yield* h.send(mkTurnOutcomeEventSuccess({

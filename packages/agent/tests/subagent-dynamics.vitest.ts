@@ -2,7 +2,11 @@ import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../src/test-harness/harness'
 import { MockTurnScriptTag } from '../src/test-harness/turn-script'
+import { response } from '../src/test-harness/response-builder'
 import type { AppEvent } from '../src/events'
+
+const spawnXml = (id: string, title: string, message: string) =>
+  response().createTask(id, title).spawnWorker(id, message).yield().xml!
 
 describe('subagent dynamics', () => {
   it.live('Orchestrator creates subagent', () =>
@@ -13,7 +17,7 @@ describe('subagent dynamics', () => {
         Effect.flatMap(MockTurnScriptTag, (s) =>
           s.enqueue(
             {
-              xml: '<invoke tool="agent_create">\n<parameter name="agentId">test-explorer</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">test</parameter>\n<parameter name="message">do something</parameter>\n</invoke>\n<yield_user/>',
+              xml: spawnXml('test-explorer', 'test', 'do something'),
             },
             null,
           ),
@@ -25,7 +29,7 @@ describe('subagent dynamics', () => {
 
       const created = yield* h.wait.event(
         'agent_created',
-        (e) => e.agentId === 'test-explorer' && e.role === 'explorer',
+        (e) => e.agentId === 'test-explorer' && e.role === 'worker',
       )
 
       expect(created.type).toBe('agent_created')
@@ -44,7 +48,7 @@ describe('subagent dynamics', () => {
           s.setResolver(({ forkId }) => {
             if (forkId === null) {
               return {
-                xml: '<invoke tool="agent_create">\n<parameter name="agentId">test-explorer</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">test</parameter>\n<parameter name="message">do something</parameter>\n</invoke>\n<yield_user/>',
+                xml: spawnXml('test-explorer', 'test', 'do something'),
               }
             }
 

@@ -3,17 +3,34 @@ import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import { response } from '../../src/test-harness/response-builder'
 
+// Helper: tool_event predicate matching ToolExecutionEnded for a given fork+tool name.
+const writeEndedFor = (forkId: string | null) =>
+  (e: { readonly forkId: string | null; readonly event: { readonly _tag: string; readonly toolName?: string } }) =>
+    e.forkId === forkId
+    && e.event._tag === 'ToolExecutionEnded'
+    && e.event.toolName === 'write'
+
+const isSuccess = (e: { readonly event: unknown }): boolean => {
+  const ev = e.event as { _tag?: string; result?: { _tag?: string } }
+  return ev._tag === 'ToolExecutionEnded' && ev.result?._tag === 'Success'
+}
+
 function writeTurn(path: string, content: string) {
   return response().writeFile(path, content).yield()
 }
 
-function agentCreateTurn(agentId: string, type: string, title: string, message: string) {
-  return response().createAgent(agentId, type, title, message).yield()
+function agentCreateTurn(agentId: string, _type: string, title: string, message: string) {
+  // Lead variant only spawns 'worker' agents now. Create a task and spawn a
+  // worker for it; the resulting agent's agentId equals the task id.
+  return response()
+    .createTask(agentId, title)
+    .spawnWorker(agentId, message)
+    .yield()
 }
 
 function writeTurnWithParentMessage(path: string, content: string) {
   return {
-    xml: `${response().messageTo('parent', 'Done').writeFile(path, content).yield().xml.replace('<magnitude:yield_user/>', '')}<magnitude:yield_user/>`,
+    xml: `${response().messageTo('parent', 'Done').writeFile(path, content).yield().xml!.replace('<magnitude:yield_user/>', '')}<magnitude:yield_user/>`,
   }
 }
 
@@ -27,16 +44,10 @@ describe('write policy permissions', () => {
 
       yield* harness.user('write a report')
       const completed = yield* harness.wait.turnCompleted(null)
-      const writeEnded = yield* harness.wait.event(
-        'tool_event',
-        (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
-      )
+      const writeEnded = yield* harness.wait.event('tool_event', writeEndedFor(null))
 
       expect(completed.outcome._tag).toBe('Completed')
-      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
-        throw new Error('Expected ToolExecutionEnded')
-      }
-      expect(writeEnded.event.result._tag).toBe('Success')
+      expect(isSuccess(writeEnded)).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -49,88 +60,66 @@ describe('write policy permissions', () => {
 
       yield* harness.user('write a file')
       const completed = yield* harness.wait.turnCompleted(null)
-      const writeEnded = yield* harness.wait.event(
-        'tool_event',
-        (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
-      )
+      const writeEnded = yield* harness.wait.event('tool_event', writeEndedFor(null))
 
       expect(completed.outcome._tag).toBe('Completed')
-      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
-        throw new Error('Expected ToolExecutionEnded')
-      }
-      expect(writeEnded.event.result._tag).toBe('Success')
+      expect(isSuccess(writeEnded)).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('explorer can write to $M/', () =>
+  it.live('worker can write to $M/', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
 
       // Lead spawns an explorer
       yield* harness.script.next({
-        ...agentCreateTurn('explorer-test', 'explorer', 'Test', 'Write a report'),
+        ...agentCreateTurn('worker-test', 'worker', 'Test', 'Write a report'),
       }, null)
 
       yield* harness.user('explore and write report')
 
       const agentCreated = yield* harness.wait.agentCreated(
-        (e) => e.agentId === 'explorer-test',
+        (e) => e.agentId === 'worker-test',
       )
 
-      // Explorer writes to $M/
+      // Worker writes to $M/
       yield* harness.script.next({
-        ...writeTurnWithParentMessage('$M/reports/test.md', 'hello from explorer'),
+        ...writeTurnWithParentMessage('$M/reports/test.md', 'hello from worker'),
       }, agentCreated.forkId)
 
       const completed = yield* harness.wait.turnCompleted(agentCreated.forkId)
-      const writeEnded = yield* harness.wait.event(
-        'tool_event',
-        (e) => e.forkId === agentCreated.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
-      )
+      const writeEnded = yield* harness.wait.event('tool_event', writeEndedFor(agentCreated.forkId))
 
       expect(completed.outcome._tag).toBe('Completed')
-      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
-        throw new Error('Expected ToolExecutionEnded')
-      }
-      expect(writeEnded.event.result._tag).toBe('Success')
+      expect(isSuccess(writeEnded)).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('explorer cannot write to cwd', () =>
+  it.live('worker can write to cwd', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
 
-      // Lead spawns an explorer
+      // Lead spawns a worker
       yield* harness.script.next({
-        ...agentCreateTurn('explorer-cwd', 'explorer', 'Test', 'Try writing to cwd'),
+        ...agentCreateTurn('worker-cwd', 'worker', 'Test', 'Try writing to cwd'),
       }, null)
 
       yield* harness.user('explore')
 
       const agentCreated = yield* harness.wait.agentCreated(
-        (e) => e.agentId === 'explorer-cwd',
+        (e) => e.agentId === 'worker-cwd',
       )
 
-      // Explorer tries to write to cwd - should be denied
+      // Workers share lead's write policy and can write inside cwd.
       yield* harness.script.next({
-        ...writeTurnWithParentMessage('src/test.txt', 'hello from explorer'),
+        ...writeTurnWithParentMessage('src/test.txt', 'hello from worker'),
       }, agentCreated.forkId)
 
       const completed = yield* harness.wait.turnCompleted(agentCreated.forkId)
-      const writeEnded = yield* harness.wait.event(
-        'tool_event',
-        (e) => e.forkId === agentCreated.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
-      )
+      const writeEnded = yield* harness.wait.event('tool_event', writeEndedFor(agentCreated.forkId))
 
-      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
-        throw new Error('Expected ToolExecutionEnded')
-      }
-      expect(writeEnded.event.result._tag).not.toBe('Success')
-      if (completed.outcome._tag === 'Completed') {
-        expect(completed.outcome.completion.yieldTarget).toBe('invoke')
-      } else {
-        expect(completed.outcome._tag).not.toBe('Cancelled')
-      }
+      expect(completed.outcome._tag).toBe('Completed')
+      expect(isSuccess(writeEnded)).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

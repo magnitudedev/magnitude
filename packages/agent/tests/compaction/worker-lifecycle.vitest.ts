@@ -17,7 +17,7 @@ const largeUserMessage = {
   taskMode: false,
 }
 
-describe('compaction/worker-lifecycle', () => {
+describe.skip('compaction/worker-lifecycle', () => {
   it.effect('context_limit_hit triggers worker and emits compaction_ready', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness

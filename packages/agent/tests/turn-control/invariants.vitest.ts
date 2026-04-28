@@ -53,7 +53,7 @@ describe('turn control invariants', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.send(mkTurnStarted({ turnId: 't-err', chainId: 'c-err' }))
-      yield* h.send({ type: 'turn_outcome', forkId: null, turnId: 't-err', message: 'bad stream' })
+      yield* h.send(mkTurnOutcomeEventFailure({ turnId: 't-err', chainId: 'c-err' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
       yield* assertTurnStateAligned(h)

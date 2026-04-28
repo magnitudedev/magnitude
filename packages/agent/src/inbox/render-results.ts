@@ -5,7 +5,7 @@
  * and no-action nudges into the XML structures injected into conversation history.
  */
 
-import { renderParseError, YIELD_USER } from '@magnitudedev/xml-act'
+
 
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from '../prompts/constants'
@@ -14,9 +14,7 @@ import { ContentPartBuilder, type ContentPart } from '../content'
 import { imagePlaceholder } from './render'
 import type {
   MessageAckResultItem,
-  StructuralParseErrorResultItem,
   ToolErrorResultItem,
-  ToolParseErrorResultItem,
   TurnResultItem,
 } from './types'
 
@@ -26,15 +24,11 @@ function formatMessageAck(item: MessageAckResultItem): string {
 
 function formatToolError(item: ToolErrorResultItem): string {
   if (item.status === 'interrupted') {
-    return `\n<tool name="${item.tagName}"><error>Interrupted</error></tool>`
+    return `\n<tool name="${item.toolName}"><error>Interrupted</error></tool>`
   }
 
   const message = item.message ?? 'Unknown error'
-  return `\n<tool name="${item.tagName}"><error>${message}</error></tool>`
-}
-
-function formatParseError(item: ToolParseErrorResultItem | StructuralParseErrorResultItem): string {
-  return `\n${renderParseError(item.event, item.rawResponse ?? '')}`
+  return `\n<tool name="${item.toolName}"><error>${message}</error></tool>`
 }
 
 /** Format ordered turn results for LLM context */
@@ -47,17 +41,11 @@ export function formatResults(items: readonly TurnResultItem[], supportsVision: 
       continue
     }
 
-    if (item.kind === 'tool_parse_error' || item.kind === 'structural_parse_error') {
-      builder.pushText(formatParseError(item))
-      continue
-    }
-
     if (item.kind === 'tool_observation') {
       const textChars = item.content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0)
       if (textChars > INSPECT_CHAR_LIMIT) {
         const approxTokens = Math.ceil(textChars / 4)
-        const observeAttr = item.query ? ` observe="${item.query}"` : ''
-        builder.pushText(`\n<${item.tagName}${observeAttr}>Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${item.tagName}>`)
+        builder.pushText(`\n<${item.toolName}>Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a more targeted query.</${item.toolName}>`)
         for (const part of item.content) {
           if (part.type === 'image') {
             if (supportsVision) builder.pushPart(part)
@@ -67,14 +55,13 @@ export function formatResults(items: readonly TurnResultItem[], supportsVision: 
         continue
       }
 
-      const observeAttr = item.query ? ` observe="${item.query}"` : ''
-      builder.pushText(`\n<${item.tagName}${observeAttr}>`)
+      builder.pushText(`\n<${item.toolName}>`)
       for (const part of item.content) {
         if (part.type === 'text') builder.pushText(part.text)
         else if (supportsVision) builder.pushPart(part)
         else builder.pushText(imagePlaceholder({ mediaType: part.mediaType, width: part.width, height: part.height }))
       }
-      builder.pushText(`</${item.tagName}>`)
+      builder.pushText(`</${item.toolName}>`)
       continue
     }
 
@@ -101,7 +88,7 @@ export function formatError(message: string): string {
 
 /** Noop turn — agent continued without taking any task/tool operations */
 export function formatNoop(): string {
-  return `<noop>No actions were taken. Use ${YIELD_USER} if you have nothing more to do.</noop>`
+  return `<noop>No actions were taken. Use ${'<' + 'magnitude:yield_user/>'} if you have nothing more to do.</noop>`
 }
 
 /** Oneshot liveness reminder rendered as result feedback */

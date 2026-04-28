@@ -22,7 +22,7 @@ describe('turn control interleavings', () => {
       yield* h.send({ type: 'wake', forkId: null })
       yield* h.send(mkTurnStarted({ turnId: 't-rp-1', chainId: 'c-rp' }))
       yield* h.send({ type: 'wake', forkId: null })
-      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-rp-1', chainId: 'c-rp', result: { _tag: 'Completed', completion: { yieldTarget: 'invoke', feedback: [] } } }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-rp-1', chainId: 'c-rp', outcome: { _tag: 'Completed', completion: { toolCallsCount: 1, finishReason: 'tool_calls', feedback: [] } } }))
       yield* h.send(mkTurnStarted({ turnId: 't-rp-2', chainId: 'c-rp' }))
       yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-rp-2', chainId: 'c-rp' }))
 

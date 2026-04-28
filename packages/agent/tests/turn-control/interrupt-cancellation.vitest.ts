@@ -2,6 +2,7 @@ import { describe, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { expect } from 'vitest'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
+import type { AppEvent } from '../../src/events'
 
 describe('interrupt cancellation latency (regression)', () => {
   it.live('interrupt should complete cancelled turn within 1000ms for hanging stream (RED)', () =>
@@ -20,7 +21,7 @@ describe('interrupt cancellation latency (regression)', () => {
 
       const completed = yield* h.wait.event(
         'turn_outcome',
-        (e) => e.forkId === null && e.outcome._tag === 'Cancelled',
+        (e) => e.type === 'turn_outcome' && e.forkId === null && e.outcome._tag === 'Cancelled',
         { timeoutMs: 1000 },
       )
 
@@ -28,7 +29,7 @@ describe('interrupt cancellation latency (regression)', () => {
 
       const outcomes = h.events().filter((e) => e.type === 'turn_outcome' && e.forkId === null)
       expect(outcomes).toHaveLength(1)
-      expect(outcomes[0]?.outcome._tag).toBe('Cancelled')
+      expect((outcomes[0] as Extract<AppEvent, { type: 'turn_outcome' }>)?.outcome._tag).toBe('Cancelled')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

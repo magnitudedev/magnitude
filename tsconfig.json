@@ -11,6 +11,8 @@
     "jsx": "react-jsx",
     "jsxImportSource": "@opentui/react",
     "paths": {
+      "@magnitudedev/codecs": ["./packages/codecs/src"],
+      "@magnitudedev/drivers": ["./packages/drivers/src"],
       "@magnitudedev/agent": ["./packages/agent/src"],
       "@magnitudedev/roles": ["./packages/roles/src"],
       "@magnitudedev/event-core": ["./packages/event-core/src"],

@@ -32,7 +32,7 @@ export const buildInterruptedTurnOutcome = (params: {
     forkId,
     turnId,
     chainId: chainId ?? '',
-    strategyId: 'xml-act',
+    strategyId: 'native',
     outcome: { _tag: 'Cancelled', reason: { _tag: 'UserInterrupt' } },
     inputTokens: null,
     outputTokens: null,

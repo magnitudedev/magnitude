@@ -6,11 +6,8 @@ import { getAgentDefinition, getAgentSlot } from '../src/agents/registry'
 
 const mockConfigState = {
   bySlot: {
-    main: { providerId: 'openai', modelId: 'gpt-5', hardCap: 100000, softCap: 80000 },
-    background: { providerId: 'openai', modelId: 'gpt-5-mini', hardCap: 100000, softCap: 80000 },
-    thinker: { providerId: 'openai', modelId: 'gpt-5', hardCap: 100000, softCap: 80000 },
-    title: { providerId: 'openai', modelId: 'gpt-5-mini', hardCap: 100000, softCap: 80000 },
-    compact: { providerId: 'openai', modelId: 'gpt-5-mini', hardCap: 100000, softCap: 80000 },
+    lead: { providerId: 'openai', modelId: 'gpt-5', hardCap: 100000, softCap: 80000 },
+    worker: { providerId: 'openai', modelId: 'gpt-5-mini', hardCap: 100000, softCap: 80000 },
   },
 } as const
 
@@ -30,7 +27,7 @@ describe('serializeCanonicalTurn unified format', () => {
 
   test('think blocks with null about use "think" as name', () => {
     const trace: CanonicalTrace = { lenses: null, thinkBlocks: [{ about: null, content: 'plan' }], messages: [], toolCalls: [], yieldTarget: 'user' }
-    expect(serializeCanonicalTurn(trace, leadToolSet)).toBe(`<magnitude:think about="reason">\nplan\n</magnitude:think>\n${YIELD_USER}`)
+    expect(serializeCanonicalTurn(trace, leadToolSet)).toBe(`<magnitude:think about="think">\nplan\n</magnitude:think>\n${YIELD_USER}`)
   })
 
   test('empty think blocks are omitted', () => {

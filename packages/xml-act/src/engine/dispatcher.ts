@@ -47,22 +47,37 @@ export interface DispatchInput {
 // Tool execution
 // =============================================================================
 
-function executeToolEffect(
-  registered: RegisteredTool,
+/**
+ * Run a registered tool's execute and bracket it in an Either.
+ *
+ * Generic over `R`: the services the tool requires. The provided
+ * `layerProvider` produces a `Layer<R, never, never>`; piping the execute
+ * effect through `Effect.provide(layer)` resolves R to `never` cleanly.
+ */
+function executeToolEffect<R>(
+  registered: RegisteredTool<R>,
   input: unknown,
   toolContext?: ToolContext<unknown>,
 ): Effect.Effect<Either.Either<unknown, unknown>> {
   return Effect.suspend(() => {
-    const exec = (registered.tool.execute as (i: unknown, ctx?: ToolContext<unknown>) => Effect.Effect<unknown, unknown, unknown>)(input, toolContext)
+    // ToolDefinition is in its erased mode here, so execute returns
+    // Effect<unknown, unknown, unknown>. We narrow the R channel to the
+    // tool's declared R via the RegisteredTool<R> contract — the layer
+    // provider is the runtime witness that R will in fact be satisfied.
+    const exec = (registered.tool.execute as (
+      i: unknown,
+      ctx?: ToolContext<unknown>,
+    ) => Effect.Effect<unknown, unknown, R>)(input, toolContext)
 
     if (registered.layerProvider) {
       return registered.layerProvider().pipe(
         Effect.flatMap((layer) => exec.pipe(Effect.provide(layer))),
         Effect.either,
-      ) as Effect.Effect<Either.Either<unknown, unknown>>
+      )
     }
 
-    return Effect.either(exec) as Effect.Effect<Either.Either<unknown, unknown>>
+    // No layerProvider → R is the default `never`, so exec is already R-clean.
+    return Effect.either(exec as Effect.Effect<unknown, unknown, never>)
   })
 }
 

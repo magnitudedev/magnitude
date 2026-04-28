@@ -60,7 +60,8 @@ describe('memory queue and flush', () => {
         outcome: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0,
+            finishReason: 'stop',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'after turn' }],
           },
         },
@@ -155,7 +156,7 @@ describe('memory queue and flush', () => {
         chainId: 'c-1',
         strategyId: 'xml-act',
 
-        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
+        outcome: { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -195,7 +196,8 @@ describe('memory queue and flush', () => {
         outcome: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0,
+            finishReason: 'stop',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'remember me' }],
           },
         },

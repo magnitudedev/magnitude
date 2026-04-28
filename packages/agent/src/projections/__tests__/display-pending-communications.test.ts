@@ -52,24 +52,24 @@ describe('display pending communications promotion', () => {
       await harness.wait.agentCreated((e) => e.agentId === 'agent-1')
 
       await harness.send({
-        type: 'message_start',
-        id: 'm1',
+        type: 'assistant_message_start',
+        messageId: 'm1',
         timestamp: ts(2),
         forkId: null,
         turnId: 't-parent',
         destination: { kind: 'worker', taskId: 'task-1' },
       } as any)
       await harness.send({
-        type: 'message_chunk',
-        id: 'm1',
+        type: 'assistant_message_delta',
+        messageId: 'm1',
         timestamp: ts(3),
         forkId: null,
         turnId: 't-parent',
         text: 'hello from parent',
       } as any)
       await harness.send({
-        type: 'message_end',
-        id: 'm1',
+        type: 'assistant_message_end',
+        messageId: 'm1',
         timestamp: ts(4),
         forkId: null,
         turnId: 't-parent',
@@ -204,24 +204,24 @@ describe('display pending communications promotion', () => {
       await harness.wait.agentCreated((e) => e.agentId === 'agent-2')
 
       await harness.send({
-        type: 'message_start',
-        id: 'm2',
+        type: 'assistant_message_start',
+        messageId: 'm2',
         timestamp: ts(12),
         forkId: null,
         turnId: 't-parent-2',
         destination: { kind: 'worker', taskId: 'task-2' },
       } as any)
       await harness.send({
-        type: 'message_chunk',
-        id: 'm2',
+        type: 'assistant_message_delta',
+        messageId: 'm2',
         timestamp: ts(13),
         forkId: null,
         turnId: 't-parent-2',
         text: 'once only',
       } as any)
       await harness.send({
-        type: 'message_end',
-        id: 'm2',
+        type: 'assistant_message_end',
+        messageId: 'm2',
         timestamp: ts(14),
         forkId: null,
         turnId: 't-parent-2',
@@ -310,24 +310,24 @@ describe('display pending communications promotion', () => {
       } as any)
 
       await harness.send({
-        type: 'message_start',
-        id: 'm-explicit',
+        type: 'assistant_message_start',
+        messageId: 'm-explicit',
         timestamp: ts(21),
         forkId: null,
         turnId: 't-root-explicit',
         destination: { kind: 'worker', taskId: 'task-explicit' },
       } as any)
       await harness.send({
-        type: 'message_chunk',
-        id: 'm-explicit',
+        type: 'assistant_message_delta',
+        messageId: 'm-explicit',
         timestamp: ts(22),
         forkId: null,
         turnId: 't-root-explicit',
         text: 'explicit route',
       } as any)
       await harness.send({
-        type: 'message_end',
-        id: 'm-explicit',
+        type: 'assistant_message_end',
+        messageId: 'm-explicit',
         timestamp: ts(23),
         forkId: null,
         turnId: 't-root-explicit',

@@ -6,7 +6,7 @@ import {
 import type { AgentAtom, ResultEntry, TimelineEntry } from './types'
 import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults, formatYieldWorkerRetrigger } from './render-results'
 import { renderCompactToolCall } from './render-tool-call'
-import { YIELD_USER } from '@magnitudedev/xml-act'
+
 import { taskIdleReminder, taskCompleteReminder } from '../prompts/tasks/index'
 
 export interface FormatInboxInput {
@@ -87,7 +87,8 @@ function renderAgentAtom(atom: AgentAtom): string {
     case 'error':
       return `<error>${atom.message}</error>`
     case 'idle':
-      return YIELD_USER
+      // xml-act yield tag — kept as literal string for history rendering
+      return '<' + 'magnitude:yield_user/>'
   }
 }
 

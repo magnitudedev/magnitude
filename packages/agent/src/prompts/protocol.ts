@@ -1,5 +1,17 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, TAG_THINK, TAG_MESSAGE, TAG_INVOKE, TAG_PARAMETER } from '@magnitudedev/xml-act'
+
+// Protocol constants — inlined from xml-act to eliminate the live dependency.
+const P = 'magnitude:'
+const YIELD_USER     = '<' + P + 'yield_user/>'
+const YIELD_INVOKE   = '<' + P + 'yield_invoke/>'
+const YIELD_WORKER   = '<' + P + 'yield_worker/>'
+const YIELD_PARENT   = '<' + P + 'yield_parent/>'
+const LEAD_YIELD_TAGS    = [P + 'yield_user', P + 'yield_invoke', P + 'yield_worker'] as const
+const SUBAGENT_YIELD_TAGS = [P + 'yield_parent', P + 'yield_invoke'] as const
+const TAG_THINK     = P + 'think'
+const TAG_MESSAGE   = P + 'message'
+const TAG_INVOKE    = P + 'invoke'
+const TAG_PARAMETER = P + 'parameter'
 import protocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'

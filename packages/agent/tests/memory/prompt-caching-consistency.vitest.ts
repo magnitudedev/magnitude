@@ -134,7 +134,8 @@ describe('prompt caching consistency', () => {
         outcome: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0,
+            finishReason: 'stop',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'latest only' }],
           },
         },

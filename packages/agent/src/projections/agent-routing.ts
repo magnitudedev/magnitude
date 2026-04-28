@@ -334,7 +334,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       const deferredParentMessages = new Map(state.deferredParentMessages)
       deferredParentMessages.delete(event.forkId)
 
-      if (event.outcome._tag !== 'Completed' || event.outcome.completion.yieldTarget === 'invoke') {
+      if (event.outcome._tag !== 'Completed' || event.outcome.completion.toolCallsCount > 0) {
         return { ...state, deferredParentMessages }
       }
 

@@ -49,6 +49,8 @@ import {
   agentCreateTool,
   agentKillTool,
 } from './tools/agent-tools'
+import { messageWorkerTool } from './tools/agent-communication'
+
 
 // State models
 import { shellModel } from './models/shell'
@@ -83,6 +85,8 @@ import { agentCreateModel } from './models/agent-create'
 import { agentKillModel } from './models/agent-kill'
 import { skillTool } from './tools/skill-tool'
 import { skillActivationModel } from './models/skill-activation'
+import { messageWorkerModel } from './models/message-worker'
+
 
 export const catalog = defineCatalog({
   shell: { tool: shellTool, state: shellModel },
@@ -116,6 +120,7 @@ export const catalog = defineCatalog({
   spawnWorker: { tool: spawnWorkerTool, state: spawnWorkerModel },
   killWorker: { tool: killWorkerTool, state: killWorkerModel, display: false },
   skill: { tool: skillTool, state: skillActivationModel },
+  messageWorker: { tool: messageWorkerTool, state: messageWorkerModel, display: false },
 } as const)
 
 export type ToolKey = keyof typeof catalog.entries

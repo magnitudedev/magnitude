@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Cause, Effect, Exit, Ref, Scope, Stream } from 'effect'
-import type { TurnEngineEvent, TurnEngineCrash } from '@magnitudedev/xml-act'
+import type { TurnEngineEvent, TurnEngineCrash } from '@magnitudedev/turn-engine'
 import type { CallUsage } from '@magnitudedev/providers'
 import type { MessageDestination, TurnOutcome } from '../src/events'
 import { createTurnStream } from '../src/execution/turn-stream'
@@ -21,7 +21,7 @@ type PublishedEvent =
 
 const successfulTurnResult: TurnOutcome = {
   _tag: 'Completed',
-  completion: { yieldTarget: 'user', feedback: [] },
+  completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] },
 }
 
 const usage: CallUsage = {

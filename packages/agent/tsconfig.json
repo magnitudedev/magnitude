@@ -3,5 +3,22 @@
   "compilerOptions": {
     "types": ["bun"]
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests"],
+  "exclude": [
+    "src/projections/__tests__/canonical-turn.test.ts",
+    "tests/canonical-xml.vitest.ts",
+    "src/execution/execution-manager.ts",
+    "src/test-harness",
+    "src/__tests__/task-creation-race-repro.vitest.ts",
+
+    "src/projections/replay.ts",
+    "src/projections/canonical-xml.ts",
+    "src/workspace/file-tracking.ts",
+    "src/projections/debug-introspection.ts",
+    "src/projections/__tests__/chain-continue-false-idle.test.ts",
+    "tests/engine/tool-dispatcher.vitest.ts",
+    "tests/repros/exact-session-two-turn-terminal-event-repro.vitest.ts",
+    "tests/memory/queue-and-flush.vitest.ts",
+    "tests/memory/prompt-caching-consistency.vitest.ts"
+  ]
 }

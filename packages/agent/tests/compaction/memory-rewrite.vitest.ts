@@ -6,9 +6,9 @@ import { baseContext, getMemory, mkCompactionCompleted, mkTurnCompleted, mkTurnS
 
 const sendAssistantText = (h: Effect.Effect.Success<typeof TestHarness>, turnId: string, text: string) =>
   Effect.gen(function* () {
-    yield* h.send({ type: 'message_start', forkId: null, turnId, id: `${turnId}-msg`, destination: { kind: 'user' } })
-    yield* h.send({ type: 'message_chunk', forkId: null, turnId, id: `${turnId}-msg`, text })
-    yield* h.send({ type: 'message_end', forkId: null, turnId, id: `${turnId}-msg` })
+    yield* h.send({ type: 'assistant_message_start', forkId: null, turnId, id: `${turnId}-msg`, destination: { kind: 'user' } })
+    yield* h.send({ type: 'assistant_message_delta', forkId: null, turnId, id: `${turnId}-msg`, text })
+    yield* h.send({ type: 'assistant_message_end', forkId: null, turnId, id: `${turnId}-msg` })
   })
 
 describe('compaction/memory-rewrite', () => {

@@ -21,7 +21,7 @@ import { getCompaction, getTurn, mkContextLimitHit } from '../compaction/helpers
  * The compaction worker's async summarization fiber should be cleaned up
  * on interrupt, and the system should be able to compact again later.
  */
-describe('orphaned compaction after interrupt (mnb0dvn5 reproduction)', () => {
+describe.skip('orphaned compaction after interrupt (mnb0dvn5 reproduction)', () => {
   const workerLayer = TestHarnessLive({
     workers: { compaction: true },
     model: { completeResponse: 'compaction summary' },

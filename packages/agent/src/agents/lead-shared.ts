@@ -71,6 +71,7 @@ export const leadTools = catalog.pick(
   'spawnWorker',
   'killWorker',
   'skill',
+  'messageWorker',
 )
 
 export const leadObservables: readonly [] = []

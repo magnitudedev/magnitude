@@ -63,7 +63,7 @@ describe('Event Serialization', () => {
         result: {
           _tag: 'Completed',
           completion: {
-            yieldTarget: 'user',
+            toolCallsCount: 0, finishReason: 'stop' as const,
             feedback: [],
           },
         },
@@ -148,10 +148,10 @@ describe('Event Serialization', () => {
     test('serializes and deserializes streaming events', () => {
       const events: AppEvent[] = [
         {
-          type: 'message_chunk',
+          type: 'assistant_message_delta',
           forkId: null,
           turnId: 'turn-1',
-          id: 'm1',
+          messageId: 'm1',
           text: 'Hello '
         },
         {
@@ -161,10 +161,10 @@ describe('Event Serialization', () => {
           text: 'I should...'
         },
         {
-          type: 'message_end',
+          type: 'assistant_message_end',
           forkId: null,
           turnId: 'turn-1',
-          id: 'm1'
+          messageId: 'm1'
         }
       ]
 

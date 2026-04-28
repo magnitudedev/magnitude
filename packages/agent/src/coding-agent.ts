@@ -63,6 +63,10 @@ import { ChatPersistence } from './persistence/chat-persistence-service'
 // Utils
 import { collectSessionContext } from './util/collect-session-context'
 
+// Engine layers
+import { TurnEngineLive } from './engine/turn-engine'
+import { NativeModelResolverLive } from './engine/native-model-resolver-live'
+
 // Providers
 import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister, type ProviderRuntime } from '@magnitudedev/providers'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from './model-slots'
@@ -224,6 +228,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     Layer.provide(BrowserServiceLive, providerRuntime),
     Layer.provide(WebSearchServiceLive, FetchHttpClient.layer),
     Layer.provide(makeModelResolver<MagnitudeSlot>(), providerRuntime),
+    Layer.provide(NativeModelResolverLive, providerRuntime),
+    TurnEngineLive,
+    FetchHttpClient.layer,
     providerRuntime,
     FsLive,
     tracerLayer,
@@ -356,7 +363,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
             forkId: agent.forkId,
             turnId: forkTurnState.turnId,
             chainId: forkTurnState.chainId,
-            strategyId: 'xml-act',
+            strategyId: 'native',
 
             outcome: { _tag: 'Cancelled', reason: { _tag: 'WorkerKilled' } },
             inputTokens: null,
@@ -377,7 +384,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
           forkId: null,
           turnId: rootTurnState.turnId,
           chainId: rootTurnState.chainId,
-          strategyId: 'xml-act',
+          strategyId: 'native',
           outcome: { _tag: 'Cancelled', reason: { _tag: 'WorkerKilled' } },
           inputTokens: null,
           outputTokens: null,

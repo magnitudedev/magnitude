@@ -61,7 +61,15 @@ describe('memory/append-only-invariant', () => {
         type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-err',
-        message: 'boom',
+        chainId: 'chain-err',
+        strategyId: 'xml-act',
+        outcome: { _tag: 'UnexpectedError', message: 'boom' },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       })
 
       const after = yield* getRootMemory(h)
@@ -104,7 +112,15 @@ describe('memory/append-only-invariant', () => {
         type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-mixed',
-        message: 'mixed error',
+        chainId: 'chain-mixed',
+        strategyId: 'xml-act',
+        outcome: { _tag: 'UnexpectedError', message: 'mixed error' },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       })
       state = yield* getRootMemory(h)
       expect(state.messages.length).toBeGreaterThan(snap.refs.length)

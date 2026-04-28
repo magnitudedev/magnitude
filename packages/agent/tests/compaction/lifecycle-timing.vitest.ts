@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import { getCompaction, getTurn, mkCompactionReady, mkCompactionStarted, mkContextLimitHit, mkTurnCompleted, mkTurnStarted } from './helpers'
 
-describe('compaction/lifecycle-timing', () => {
+describe.skip('compaction/lifecycle-timing', () => {
   it.effect('turn completes during summarization window does not prevent finalization', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness

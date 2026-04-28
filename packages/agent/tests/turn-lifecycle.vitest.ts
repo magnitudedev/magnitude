@@ -16,7 +16,7 @@ describe('turn lifecycle', () => {
       expect(completed.type).toBe('turn_outcome')
       expect(completed.outcome._tag).toBe('Completed')
       if (completed.outcome._tag === 'Completed') {
-        expect(completed.outcome.completion.yieldTarget).toBe('user')
+        expect(completed.outcome.completion.toolCallsCount).toBe(0)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -67,7 +67,7 @@ describe('turn lifecycle', () => {
       yield* h.user('no script queued')
       const completed = yield* h.wait.turnCompleted(null)
       const chunk = yield* h.wait.event(
-        'message_chunk',
+        'assistant_message_delta',
         (e) => e.forkId === null && e.turnId === completed.turnId,
       )
 
@@ -95,12 +95,12 @@ describe('turn lifecycle', () => {
 
       expect(first.outcome._tag).toBe('Completed')
       if (first.outcome._tag === 'Completed') {
-        expect(first.outcome.completion.yieldTarget).toBe('invoke')
+        expect(first.outcome.completion.toolCallsCount).toBeGreaterThan(0)
       }
 
       expect(second.outcome._tag).toBe('Completed')
       if (second.outcome._tag === 'Completed') {
-        expect(second.outcome.completion.yieldTarget).toBe('user')
+        expect(second.outcome.completion.toolCallsCount).toBe(0)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -126,7 +126,7 @@ describe('turn lifecycle', () => {
 
       expect(completed.outcome._tag).toBe('Completed')
       if (completed.outcome._tag === 'Completed') {
-        expect(completed.outcome.completion.yieldTarget).toBe('invoke')
+        expect(completed.outcome.completion.toolCallsCount).toBeGreaterThan(0)
         expect(completed.outcome.completion.feedback).toEqual([
           {
             _tag: 'InvalidMessageDestination',
@@ -165,7 +165,7 @@ describe('turn lifecycle', () => {
       for (let i = 0; i < N - 1; i++) {
         expect(turns[i].outcome._tag).toBe('Completed')
         if (turns[i].outcome._tag === 'Completed') {
-          expect(turns[i].outcome.completion.yieldTarget).toBe('invoke')
+          expect(turns[i].outcome.completion.toolCallsCount).toBeGreaterThan(0)
         }
       }
 
@@ -201,13 +201,13 @@ describe('turn lifecycle', () => {
       for (const turn of [first, second, third, fourth]) {
         expect(turn.outcome._tag).toBe('Completed')
         if (turn.outcome._tag === 'Completed') {
-          expect(turn.outcome.completion.yieldTarget).toBe('invoke')
+          expect(turn.outcome.completion.toolCallsCount).toBeGreaterThan(0)
         }
       }
 
       expect(fifth.outcome._tag).toBe('Completed')
       if (fifth.outcome._tag === 'Completed') {
-        expect(fifth.outcome.completion.yieldTarget).toBe('user')
+        expect(fifth.outcome.completion.toolCallsCount).toBe(0)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -246,27 +246,27 @@ describe('turn lifecycle', () => {
 
       expect(first.outcome._tag).toBe('Completed')
       if (first.outcome._tag === 'Completed') {
-        expect(first.outcome.completion.yieldTarget).toBe('invoke')
+        expect(first.outcome.completion.toolCallsCount).toBeGreaterThan(0)
       }
 
       expect(second.outcome._tag).toBe('Completed')
       if (second.outcome._tag === 'Completed') {
-        expect(second.outcome.completion.yieldTarget).toBe('invoke')
+        expect(second.outcome.completion.toolCallsCount).toBeGreaterThan(0)
       }
 
       expect(third.outcome._tag).toBe('Completed')
       if (third.outcome._tag === 'Completed') {
-        expect(third.outcome.completion.yieldTarget).toBe('user')
+        expect(third.outcome.completion.toolCallsCount).toBe(0)
       }
 
       expect(fourth.outcome._tag).toBe('Completed')
       if (fourth.outcome._tag === 'Completed') {
-        expect(fourth.outcome.completion.yieldTarget).toBe('invoke')
+        expect(fourth.outcome.completion.toolCallsCount).toBeGreaterThan(0)
       }
 
       expect(fifth.outcome._tag).toBe('Completed')
       if (fifth.outcome._tag === 'Completed') {
-        expect(fifth.outcome.completion.yieldTarget).toBe('user')
+        expect(fifth.outcome.completion.toolCallsCount).toBe(0)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )

@@ -45,13 +45,13 @@ describe('spawn-worker lifecycle integration', () => {
       const workerCompleted = yield* h.wait.turnCompleted(created.forkId)
       const workerWrite = yield* h.wait.event(
         'tool_event',
-        (e) => e.forkId === created.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+        (e) =>
+          e.forkId === created.forkId
+          && e.event._tag === 'ToolExecutionEnded'
+          && e.event.toolName === 'write',
       )
       expect(workerCompleted.outcome._tag).toBe('Completed')
-      if (workerWrite.event._tag !== 'ToolExecutionEnded') {
-        throw new Error('Expected ToolExecutionEnded')
-      }
-      expect(workerWrite.event.result._tag).toBe('Success')
+      expect(workerWrite.event._tag === 'ToolExecutionEnded' && workerWrite.event.result._tag).toBe('Success')
 
       const rootFollowUp = yield* h.wait.event(
         'turn_outcome',

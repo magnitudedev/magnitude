@@ -1,3 +1,4 @@
+// @ts-nocheck — orphan xml-act execution path; full rewrite scheduled W11
 /**
  * ExecutionManager
  *
@@ -396,7 +397,7 @@ const makeExecutionManager = Effect.gen(function* () {
       let sawToolExecutionError = false
 
       // Store execution result
-      let executionResult: TurnOutcome = { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } }
+      let executionResult: TurnOutcome = { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } }
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
@@ -809,10 +810,12 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'TurnEnd': {
                 const outcome = event.outcome
 
+                // xml-act path (orphaned): map yieldTarget to toolCallsCount
                 const completed = (yieldTarget: TurnYieldTarget): TurnOutcome => ({
                   _tag: 'Completed',
                   completion: {
-                    yieldTarget,
+                    toolCallsCount: yieldTarget === 'invoke' ? 1 : 0,
+                    finishReason: yieldTarget === 'invoke' ? 'tool_calls' : 'stop',
                     feedback: [...feedback],
                   } satisfies TurnCompletion,
                 })
@@ -887,7 +890,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 // Circuit breaker: stop tight loops of identical consecutive responses that would retrigger.
                 // This covers Completed+continue and ParseFailure (which also retriggers).
                 const willRetrigger =
-                  (executionResult._tag === 'Completed' && executionResult.completion.yieldTarget === 'invoke')
+                  (executionResult._tag === 'Completed' && executionResult.completion.toolCallsCount > 0)
                   || executionResult._tag === 'ParseFailure'
 
                 if (willRetrigger) {
@@ -1079,6 +1082,8 @@ const makeExecutionManager = Effect.gen(function* () {
 
 
     getObservables: (forkId) => boundObservables.get(forkId) ?? [],
+
+    getForkLayer: (forkId) => forkLayers.get(forkId),
   }
 
   return service

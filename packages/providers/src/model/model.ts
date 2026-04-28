@@ -20,6 +20,8 @@ export interface ProviderModel {
   readonly supportsReasoning: boolean
   readonly supportsVision: boolean
   readonly supportsGrammar?: boolean
+  /** Which inference paradigm this model entry uses. Defaults to 'xml-act'. */
+  readonly paradigm?: 'xml-act' | 'native' | 'completions'
   readonly costs: ModelCosts | null
   readonly releaseDate?: string
   readonly discovery?: {
