@@ -13,7 +13,7 @@ export interface CanonicalTrace {
   lenses: readonly { name: string; content: string | null }[] | null
   thinkBlocks: ThinkBlock[]
   messages: Array<{ text: string; destination: MessageDestination }>
-  toolCalls: Array<{ tagName: string; input: unknown; query: string | null }>
+  toolCalls: Array<{ toolName: string; input: unknown; query: string | null }>
   yieldTarget: 'user' | 'invoke' | 'worker' | 'parent'
 }
 
@@ -32,10 +32,10 @@ function serializeParameter(name: string, value: unknown): string {
   return `<magnitude:parameter name="${name}">${serialized}</magnitude:parameter>`
 }
 
-function serializeToolCall(tagName: string, input: unknown, query: string | null, toolSet: ResolvedToolSet): string {
+function serializeToolCall(toolName: string, input: unknown, query: string | null, toolSet: ResolvedToolSet): string {
   const obj = (input && typeof input === 'object') ? input as Record<string, unknown> : {}
 
-  const tool = buildRegisteredTools(toolSet, Layer.empty).get(tagName)
+  const tool = buildRegisteredTools(toolSet, Layer.empty).get(toolName)
   let params: string[]
   if (tool) {
     const paramSchemas = deriveParameters(tool.tool.inputSchema.ast)
@@ -53,8 +53,8 @@ function serializeToolCall(tagName: string, input: unknown, query: string | null
 
   const filterPart = query ? `<magnitude:filter>\n${query}\n</magnitude:filter>` : ''
   const children = [...params, ...(filterPart ? [filterPart] : [])]
-  if (children.length === 0) return `<magnitude:invoke tool="${tagName}"/>`
-  return `<magnitude:invoke tool="${tagName}">\n${children.join('\n')}\n</magnitude:invoke>`
+  if (children.length === 0) return `<magnitude:invoke tool="${toolName}"/>`
+  return `<magnitude:invoke tool="${toolName}">\n${children.join('\n')}\n</magnitude:invoke>`
 }
 
 /**
@@ -92,7 +92,7 @@ export function serializeCanonicalTurn(
   }
 
   for (const call of trace.toolCalls) {
-    parts.push(serializeToolCall(call.tagName, call.input, call.query, toolSet))
+    parts.push(serializeToolCall(call.toolName, call.input, call.query, toolSet))
   }
 
   switch (trace.yieldTarget) {

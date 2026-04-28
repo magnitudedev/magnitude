@@ -1,5 +1,5 @@
 export interface CompactToolCallInput {
-  tagName: string
+  toolName: string
   attributes: Record<string, string>
   body?: string
   maxBodyChars?: number
@@ -13,7 +13,7 @@ function truncateBody(body: string, maxChars: number): string {
 }
 
 export function renderCompactToolCall(input: CompactToolCallInput): string {
-  const { tagName, attributes, body } = input
+  const { toolName, attributes, body } = input
   const maxBodyChars = input.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS
 
   const attrs = Object.entries(attributes)
@@ -22,9 +22,9 @@ export function renderCompactToolCall(input: CompactToolCallInput): string {
     .join('')
 
   if (!body || body.length === 0) {
-    return `<${tagName}${attrs}/>`
+    return `<${toolName}${attrs}/>`
   }
 
   const safeBody = truncateBody(body, maxBodyChars)
-  return `<${tagName}${attrs}>${safeBody}</${tagName}>`
+  return `<${toolName}${attrs}>${safeBody}</${toolName}>`
 }

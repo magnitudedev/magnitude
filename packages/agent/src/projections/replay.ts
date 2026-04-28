@@ -1,20 +1,18 @@
 /**
  * ReplayProjection (Forked)
  *
- * Tracks ReactorState per fork for xml-act crash recovery (used by the
- * MockCortex/test-harness path which still drives ExecutionManager.execute
- * through xml-act's createTurnEngine).
+ * Tracks EngineState per fork for crash recovery. On session resume,
+ * the accumulated EngineState is passed to TurnEngine.runTurn({ initialState })
+ * so completed tools are skipped and not re-executed.
  *
- * On session resume, the accumulated ReactorState is passed to
- * runtime.streamWith({ initialState }) so completed tools are skipped.
- *
- * NOTE: only the test-harness path consumes this. The native-paradigm live
- * runtime (Cortex worker) does not need it.
+ * Folds tool_event AppEvents through the native engine state folder.
+ * Resets on turn_outcome — only a crashed turn (no turn_outcome) retains
+ * its state for recovery.
  */
 
 import { Projection } from '@magnitudedev/event-core'
-import { initialEngineState, foldEngineState } from '@magnitudedev/xml-act'
-import type { EngineState } from '@magnitudedev/xml-act'
+import { initialEngineState, foldEngineState } from '@magnitudedev/turn-engine'
+import type { EngineState } from '@magnitudedev/turn-engine'
 import type { AppEvent } from '../events'
 
 export const ReplayProjection = Projection.defineForked<AppEvent, EngineState>()({
@@ -23,10 +21,12 @@ export const ReplayProjection = Projection.defineForked<AppEvent, EngineState>()
   initialFork: initialEngineState(),
 
   eventHandlers: {
+    tool_event: ({ fork, event }) => foldEngineState(fork, event.event),
+
     // Keep state through turn_started so crash recovery can read it.
-    // Reset on turn_outcome — terminal turns don't need replay.
-    // Only a crashed turn (no turn_outcome) retains its state for recovery.
     turn_started: ({ fork }) => fork,
+
+    // Reset on turn_outcome — terminal turns don't need replay.
     turn_outcome: () => initialEngineState(),
   },
 })

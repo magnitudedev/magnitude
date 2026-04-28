@@ -155,7 +155,7 @@ export interface TurnToolCall {
 
 export interface ObservedResult {
   readonly toolCallId: string
-  readonly tagName: string
+  readonly toolName: string
   readonly query: string
   readonly content: ContentPart[]
 }

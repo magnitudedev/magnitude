@@ -37,7 +37,7 @@ describe('CanonicalTurn final content selection behavior', async () => {
       lenses: null,
       thinkBlocks: [{ about: null, content: 't' }],
       messages: [{ text: 'm', destination: { kind: 'user' } }],
-      toolCalls: [{ tagName: 'tool', input: {}, query: null }],
+      toolCalls: [{ toolName: 'tool', input: {}, query: null }],
       toolCallsCount: 0, finishReason: 'stop' as const,
     }
     const xml = serializeCanonicalTurn(trace, { tools: new Map(), groups: new Map() })

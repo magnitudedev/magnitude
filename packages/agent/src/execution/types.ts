@@ -10,8 +10,9 @@
  */
 
 import { Effect, Data, Context, Stream, Layer } from 'effect'
-import type { TurnEngineEvent, TurnEngineCrash, EngineState } from '@magnitudedev/turn-engine'
+import type { TurnEngineEvent, TurnEngineCrash, EngineState, RegisteredTool } from '@magnitudedev/turn-engine'
 import type { MessageDestination, TurnOutcome } from '../events'
+import type { TurnEngineError } from '../engine/turn-engine'
 import type { CallUsage, ModelError } from '@magnitudedev/providers'
 import type { Projection, WorkerBusService, AmbientService } from '@magnitudedev/event-core'
 import type { AgentVariant } from '../agents/variants'
@@ -30,6 +31,7 @@ import type { BoundObservable } from '@magnitudedev/roles'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import type { AppEvent } from '../events'
 import type { ResolvedToolSet } from '../tools/resolved-toolset'
+import type { ToolKey } from '../catalog'
 
 
 // =============================================================================
@@ -48,15 +50,13 @@ export type TurnEvent =
   | { readonly _tag: 'MessageStart'; readonly id: string; readonly destination: MessageDestination }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageEnd'; readonly id: string }
+  | { readonly _tag: 'ThinkingStart' }
   | { readonly _tag: 'ThinkingDelta'; readonly text: string }
-  | { readonly _tag: 'ThinkingEnd'; readonly about: string | null }
+  | { readonly _tag: 'ThinkingEnd' }
   | { readonly _tag: 'RawResponseChunk'; readonly text: string }
-  | { readonly _tag: 'LensStarted'; readonly name: string }
-  | { readonly _tag: 'LensDelta'; readonly text: string }
-  | { readonly _tag: 'LensEnded'; readonly name: string }
 
-  // --- Tool events (forwarded xml-act TurnEngineEvent with agent metadata) ---
-  | { readonly _tag: 'ToolEvent'; readonly toolCallId: string; readonly toolKey: string; readonly event: TurnEngineEvent }
+  // --- Tool events (TurnEngineEvent with agent metadata) ---
+  | { readonly _tag: 'ToolEvent'; readonly toolCallId: string; readonly toolKey: ToolKey; readonly event: TurnEngineEvent }
 
   // --- Terminal (always last event in the stream) ---
   | { readonly _tag: 'TurnResult'; readonly value: TurnStrategyResult }
@@ -110,20 +110,25 @@ export interface ExecuteOptions {
 
 export interface ExecuteResult {
   readonly result: TurnOutcome
+  readonly usage: {
+    readonly inputTokens: number | null
+    readonly outputTokens: number | null
+    readonly cacheReadTokens: number | null
+    readonly cacheWriteTokens: number | null
+  } | null
 }
 
 export interface ExecutionManagerService {
   readonly execute: (
-    xmlStream: Stream.Stream<string, ModelError>,
+    eventStream: Stream.Stream<TurnEngineEvent, TurnEngineError>,
     options: ExecuteOptions,
     sink: TurnEventSink,
   ) => Effect.Effect<
     ExecuteResult,
-    TurnEngineCrash,
+    TurnEngineError,
     Projection.ProjectionInstance<AgentRoutingState>
     | Projection.ProjectionInstance<AgentStatusState>
     | Projection.ProjectionInstance<TaskGraphState>
-    | Projection.ForkedProjectionInstance<EngineState>
     | Projection.ForkedProjectionInstance<ForkTurnState>
     | WorkerBusService<AppEvent>
     | TaskGraphStateReaderTag

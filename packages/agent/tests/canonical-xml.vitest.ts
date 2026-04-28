@@ -41,17 +41,17 @@ describe('serializeCanonicalTurn unified format', () => {
   })
 
   test('tool calls use <magnitude:invoke tool="..."> syntax with <magnitude:parameter> children', () => {
-    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'shell', input: { command: 'ls' }, query: null }], yieldTarget: 'user' }
+    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ toolName: 'shell', input: { command: 'ls' }, query: null }], yieldTarget: 'user' }
     expect(serializeCanonicalTurn(trace, leadToolSet)).toBe(withYield('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>'))
   })
 
   test('tool calls with filter include <magnitude:filter> child', () => {
-    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'shell', input: { command: 'ls' }, query: '$.stdout' }], yieldTarget: 'user' }
+    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ toolName: 'shell', input: { command: 'ls' }, query: '$.stdout' }], yieldTarget: 'user' }
     expect(serializeCanonicalTurn(trace, leadToolSet)).toBe(withYield('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n<magnitude:filter>\n$.stdout\n</magnitude:filter>\n</magnitude:invoke>'))
   })
 
   test('tool calls with no input emit self-closing invoke', () => {
-    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'noop', input: {}, query: null }], yieldTarget: 'user' }
+    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ toolName: 'noop', input: {}, query: null }], yieldTarget: 'user' }
     expect(serializeCanonicalTurn(trace, leadToolSet)).toBe(withYield('<magnitude:invoke tool="noop"/>'))
   })
 

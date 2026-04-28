@@ -20,7 +20,7 @@ export interface CanonicalTurnState {
   thinkBlocks: ThinkBlock[]
   messages: Array<{ id: string; destination: MessageDestination; text: string; order: number }>
   messageMap: Map<string, number>
-  toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string | null; order: number }>
+  toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown; query: string | null; order: number }>
   toolCallMap: Map<string, number>
   hasParseError: boolean
   rawResponse: string
@@ -135,7 +135,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           const idx = fork.toolCalls.length
           const nextToolCalls = [...fork.toolCalls, {
             toolCallId: event.toolCallId,
-            tagName: event.event.toolName,
+            toolName: event.event.toolName,
             input: {},
             query: null,
             order: fork.orderCounter,
@@ -194,7 +194,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
             .map(({ text, destination }) => ({ text, destination })),
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
-            .map(({ tagName, input, query }) => ({ tagName, input, query })),
+            .map(({ toolName, input, query }) => ({ toolName, input, query })),
           yieldTarget: 'invoke',
         }
         canonicalXml = serializeCanonicalTurn(trace, toolSet)

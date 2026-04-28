@@ -44,7 +44,7 @@ describe('memory queue and flush', () => {
         event: {
           _tag: 'ToolObservation',
           toolCallId: 'tc-1',
-          tagName: 'shell',
+          toolName: 'shell',
           query: '.',
           content: [{ type: 'text', text: '<stdout>ok</stdout>' }],
         },

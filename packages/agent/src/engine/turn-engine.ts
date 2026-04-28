@@ -14,6 +14,7 @@ import {
   createTurnEngine,
   type TurnEngineEvent,
   type RegisteredTool,
+  type EngineState,
   TurnEngineCrash,
 } from '@magnitudedev/turn-engine'
 import {
@@ -69,6 +70,8 @@ export interface TurnEngineRunParams {
   readonly messageDestination?: string
   /** Kind injected into ThoughtStart events. Default: 'reasoning'. */
   readonly thoughtKind?: string
+  /** Initial engine state for replay/crash recovery. */
+  readonly initialState?: EngineState
 }
 
 export interface TurnEngineShape {
@@ -139,7 +142,7 @@ function wrapCrash(crash: TurnEngineCrash): TurnEngineError {
 // =============================================================================
 
 export const TurnEngineLive = Layer.succeed(TurnEngine, {
-  runTurn: ({ model, memory, tools, toolDefs, options, messageDestination, thoughtKind }) =>
+  runTurn: ({ model, memory, tools, toolDefs, options, messageDestination, thoughtKind, initialState }) =>
     Effect.gen(function* () {
       const authToken = extractAuthToken(model.auth)
       const call = {
@@ -166,7 +169,7 @@ export const TurnEngineLive = Layer.succeed(TurnEngine, {
         messageDestination: messageDestination ?? 'user',
         thoughtKind,
       })
-      const output = engine.streamWith(safePartStream).pipe(
+      const output = engine.streamWith(safePartStream, { initialState }).pipe(
         Stream.mapError(wrapCrash),
       )
 

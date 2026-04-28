@@ -76,7 +76,7 @@ function renderAgentAtom(atom: AgentAtom): string {
       return atom.text
     case 'tool_call':
       return renderCompactToolCall({
-        tagName: atom.tagName,
+        toolName: atom.toolName,
         attributes: { ...atom.attributes },
         body: atom.body,
       })

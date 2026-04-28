@@ -1,31 +1,21 @@
-// @ts-nocheck — orphan xml-act execution path; full rewrite scheduled W11
 /**
  * ExecutionManager
  *
- * Owns per-fork lifecycle and xml-act runtime execution.
- * Maps TurnEngineEvents to agent TurnEvents.
- *
- * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
+ * Owns per-fork lifecycle and turn execution.
+ * Consumes TurnEngineEvent stream, applies policy, emits TurnEvents.
  */
 
 import * as path from 'path'
 import { Effect, Stream, Layer, Ref } from 'effect'
-import type { ModelError } from '@magnitudedev/providers'
 import {
-  createTurnEngine,
   ToolInterceptorTag,
-  TurnEngineCrash,
   type TurnEngineEvent,
   type ToolInterceptor,
-  type EngineState,
-  type StructuralParseErrorEvent,
-  type ToolParseErrorEvent,
-} from '@magnitudedev/xml-act'
+} from '@magnitudedev/turn-engine'
 import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusService, type AmbientService } from '@magnitudedev/event-core'
 import { SkillsAmbient } from '../ambient/skills-ambient'
 import type {
   AppEvent,
-  TurnYieldTarget,
   ToolResult,
   MessageDestination,
   TurnFeedback,
@@ -33,8 +23,7 @@ import type {
   TurnOutcome,
 } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
-// ToolResult type is imported from ../events above
-import { buildRegisteredTools, generateToolGrammar } from '../tools/tool-registry'
+import { buildRegisteredTools } from '../tools/tool-registry'
 
 import { isValidVariant, type AgentVariant } from '../agents/variants'
 import { getAgentDefinition, getAgentSlot } from '../agents/registry'
@@ -60,7 +49,7 @@ import { AgentRoutingProjection, type AgentRoutingState, getRoutingEntryByForkId
 import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentByForkId } from '../projections/agent-status'
 import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
-import { ReplayProjection } from '../projections/replay'
+// ReplayProjection kept for backward compat but not used in execute()
 import { TaskGraphProjection, type TaskGraphState, type TaskStatus } from '../projections/task-graph'
 
 import type { RoleDefinition, BoundObservable } from '@magnitudedev/roles'
@@ -89,6 +78,7 @@ function hasStreamHook<T extends ToolDefinition>(tool: T): tool is T & Streamabl
 
 import { mapXmlToolResult } from '../util/tool-result'
 import { handleTaskDirective } from '../tasks/operations'
+import { persistResult } from '../runtime/result-persistence'
 
 
 // =============================================================================
@@ -184,7 +174,7 @@ function makeForkLayers(
 
 /**
  * Create the execution manager.
- * No sandboxes — xml-act runtime is created fresh per execute() call.
+ * No sandboxes — event stream is consumed directly per execute() call.
  */
 const makeExecutionManager = Effect.gen(function* () {
   const ephemeralSessionContext = yield* EphemeralSessionContextTag
@@ -245,7 +235,7 @@ const makeExecutionManager = Effect.gen(function* () {
   }
 
   const service: ExecutionManagerService = {
-    execute: (xmlStream: Stream.Stream<string, ModelError>, options, sink) => Effect.gen(function* () {
+    execute: (eventStream, options, sink) => Effect.gen(function* () {
       const { forkId, turnId, defaultProseDest, triggeredByUser } = options
 
       const ambientService = yield* AmbientServiceTag
@@ -278,37 +268,17 @@ const makeExecutionManager = Effect.gen(function* () {
 
       const workspacePath = forkWorkspacePaths.get(forkId)!
 
-      // Build registered tools for xml-act runtime
+      // Build registered tools for tool key resolution and stream hooks
       const registeredTools = buildRegisteredTools(options.toolSet, executionLayer)
+      const resultsDir = path.join(workspacePath, 'results')
 
-      // Create fresh runtime for this execution
-      // Surface validation errors as TurnEngineCrash so they appear as turn errors
-      const runtime = yield* Effect.try({
-        try: () => createTurnEngine({
-          tools: registeredTools,
-          defaultProseDest,
-          resultsDir: path.join(workspacePath, 'results'),
-        }),
-        catch: (e) => new TurnEngineCrash(`Runtime initialization failed: ${e instanceof Error ? e.message : String(e)}`, e),
-      })
-
-      // Get replay state from projection for crash recovery
-      const replayProjection = yield* ReplayProjection.Tag
-      const replayState: EngineState = yield* replayProjection.getFork(forkId)
-
-      // Build tool tagName → defKey lookup from registered metadata.
-      const tagToDefKey = new Map<string, string>()
-      for (const [tagName, registered] of registeredTools.entries()) {
-        const meta = registered.meta as Record<string, unknown> | undefined
+      /** Resolve a tool's model-facing name to the internal catalog key. */
+      const resolveKey = (toolName: string): ToolKey | undefined => {
+        const rt = registeredTools.get(toolName)
+        if (!rt) return undefined
+        const meta = rt.meta as { defKey?: unknown } | undefined
         const defKey = typeof meta?.defKey === 'string' ? meta.defKey : undefined
-        if (!defKey) continue
-        tagToDefKey.set(tagName, defKey)
-      }
-
-      /** Resolve a xml-act event's tagName to the definition key. */
-      const resolveKey = (tagName: string): ToolKey | undefined => {
-        const key = tagToDefKey.get(tagName)
-        return key && isToolKey(key) ? key : undefined
+        return defKey && isToolKey(defKey) ? defKey as ToolKey : undefined
       }
 
       // Track tools called (by definition key) for turn policy
@@ -336,11 +306,8 @@ const makeExecutionManager = Effect.gen(function* () {
       // Track tool input (ToolInputReady provides the parsed input)
       const toolInputs = new Map<string, unknown>()
 
-      // Track cached tool calls (replay) — skip their events
-      const cachedToolCallIds = new Set<string>()
-
-      // Position counter for tool events
-      let positionCounter = 0
+      // Content fingerprint for circuit breaker (replaces raw XML text capture)
+      let contentFingerprint = ''
 
       // Streaming hook state per tool call
       const streamHookStates = new Map<string, unknown>()
@@ -355,7 +322,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
       /** Invoke a tool's stream hook with current streaming state.
        *  Uses the registered tool's layerProvider to satisfy R requirements internally,
-       *  following the same pattern as the xml-act dispatcher's executeToolEffect. */
+       *  Uses the registered tool's layerProvider to satisfy R requirements internally. */
       const invokeStreamHook = (toolCallId: string, toolKey: ToolKey): Effect.Effect<void> =>
         Effect.suspend(() => {
           const entry = streamHookConfigs.get(toolCallId)
@@ -390,14 +357,15 @@ const makeExecutionManager = Effect.gen(function* () {
           ) as Effect.Effect<void>
         })
 
-      // Track tag names for ToolStarted events
-      const toolCallTagNames = new Map<string, string>()
+      // toolCallId → ToolKey tracking
+      const toolCallKeys = new Map<string, ToolKey>()
 
       const feedback: TurnFeedback[] = []
       let sawToolExecutionError = false
 
       // Store execution result
       let executionResult: TurnOutcome = { _tag: 'Completed', completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [] } }
+      let turnUsage: { inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null } | null = null
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
@@ -412,36 +380,18 @@ const makeExecutionManager = Effect.gen(function* () {
       )
 
 
-      // Capture raw model response text for identical-response circuit breaker.
-      let rawResponseText = ''
-      const trackedXmlStream = xmlStream.pipe(
-        Stream.tap((chunk) => Effect.sync(() => {
-          rawResponseText += chunk
-        })),
-      )
-
-      // Run xml-act runtime
-      const eventStream = runtime.streamWith(trackedXmlStream, { initialState: replayState })
-
-      // Track toolCallId → internal catalog key for app events / projections.
-      // xml-act events still carry the model-facing XML tagName; downstream
-      // renderers should use that tagName when presenting tool errors back to the model.
-      const toolCallKeys = new Map<string, ToolKey>()
-
       yield* Effect.scoped(
         eventStream.pipe(
-          Stream.provideLayer(executionLayer),
           Stream.runForEach((event: TurnEngineEvent) => Effect.gen(function* () {
             switch (event._tag) {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
                 hasAnyResponseContent = true
-                const toolKey = resolveKey(event.tagName)
+                const toolKey = resolveKey(event.toolName)
                 if (!toolKey) {
-                  logger.error(`[ExecutionManager] Failed to resolve tool key for tag ${event.tagName} (toolCallId: ${event.toolCallId}).`)
+                  logger.error(`[ExecutionManager] Failed to resolve tool key for ${event.toolName} (toolCallId: ${event.toolCallId}).`)
                   break
                 }
-                toolCallTagNames.set(event.toolCallId, event.tagName)
                 toolCallKeys.set(event.toolCallId, toolKey)
 
                 // Check for stream hook
@@ -449,7 +399,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 const tool = toolEntry?.tool
                 if (tool && hasStreamHook(tool)) {
                   const streamConfig = tool.stream
-                  const registered = registeredTools.get(event.tagName)
+                  const registered = registeredTools.get(event.toolName)
                   streamHookStates.set(event.toolCallId, streamConfig.initial)
                   streamHookConfigs.set(event.toolCallId, { hook: streamConfig, layerProvider: registered?.layerProvider })
                   streamingFields.set(event.toolCallId, {})
@@ -492,10 +442,10 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              // --- Tool Parse Error ---
-              case 'ToolParseError': {
+              // --- Tool Input Decode Failure ---
+              case 'ToolInputDecodeFailure': {
                 hasAnyResponseContent = true
-                const toolKey = resolveKey(event.tagName)
+                const toolKey = resolveKey(event.toolName)
                 if (!toolKey) break
                 toolCallKeys.set(event.toolCallId, toolKey)
 
@@ -513,18 +463,14 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              // --- Structural Parse Error ---
-              case 'StructuralParseError': {
+              // --- Turn Structure Decode Failure ---
+              case 'TurnStructureDecodeFailure': {
                 hasAnyResponseContent = true
                 break
               }
 
-              // --- Tool Execution Started (check for cached/replay) ---
+              // --- Tool Execution Started ---
               case 'ToolExecutionStarted': {
-                if (event.cached) {
-                  cachedToolCallIds.add(event.toolCallId)
-                }
-
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
@@ -562,12 +508,6 @@ const makeExecutionManager = Effect.gen(function* () {
                   break
                 }
 
-                // Skip cached tool calls — these are replays
-                if (cachedToolCallIds.has(event.toolCallId)) {
-                  cachedToolCallIds.delete(event.toolCallId)
-                  break
-                }
-
                 // Track tool calls for turn policy
                 toolsCalledKeys.push(toolKey)
                 lastToolKey = toolKey
@@ -582,6 +522,16 @@ const makeExecutionManager = Effect.gen(function* () {
                   hasToolErrors = true
                   sawToolExecutionError = true
                 }
+
+                // Persist successful tool results
+                if (event.result._tag === 'Success') {
+                  yield* persistResult(event.result.output, turnId, event.toolCallId, resultsDir).pipe(
+                    Effect.catchAll((e) => Effect.gen(function* () {
+                      logger.warn({ forkId, turnId, toolCallId: event.toolCallId, e }, '[ExecutionManager] persistResult failed')
+                    })),
+                  )
+                }
+
                 yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -609,6 +559,9 @@ const makeExecutionManager = Effect.gen(function* () {
 
                 // Invoke stream hook if present
                 yield* invokeStreamHook(event.toolCallId, toolKey)
+
+                // Accumulate fingerprint for circuit breaker
+                contentFingerprint += event.delta
 
                 yield* sink.emit( {
                   _tag: 'ToolEvent',
@@ -745,6 +698,7 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'MessageChunk': {
+                contentFingerprint += event.text
                 yield* sink.emit( { _tag: 'MessageChunk', id: event.id, text: event.text })
                 break
               }
@@ -754,128 +708,103 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              case 'ProseChunk': {
+              // --- Thinking ---
+              case 'ThoughtStart': {
                 hasAnyResponseContent = true
-                // ProseChunk is raw text content — lenses handle think blocks separately
+                yield* sink.emit({ _tag: 'ThinkingStart' })
                 break
               }
 
-              case 'ProseEnd': {
+              case 'ThoughtChunk': {
                 hasAnyResponseContent = true
-                // ProseEnd marks end of prose section — lenses handle think blocks separately
+                contentFingerprint += event.text
+                yield* sink.emit({ _tag: 'ThinkingDelta', text: event.text })
                 break
               }
 
-              case 'LensStart': {
+              case 'ThoughtEnd': {
                 hasAnyResponseContent = true
-                yield* sink.emit( { _tag: 'LensStarted', name: event.name })
+                yield* sink.emit({ _tag: 'ThinkingEnd' })
                 break
               }
 
-              case 'LensChunk': {
-                hasAnyResponseContent = true
-                yield* sink.emit( { _tag: 'LensDelta', text: event.text })
-                break
-              }
-
-              case 'LensEnd': {
-                hasAnyResponseContent = true
-                yield* sink.emit( { _tag: 'LensEnded', name: event.name })
-                break
-              }
-
-
-              case 'ToolObservation': {
-                hasAnyResponseContent = true
-                const toolKey = toolCallKeys.get(event.toolCallId)
-                if (!toolKey) {
-                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
-                  break
-                }
-                yield* sink.emit( {
-                  _tag: 'ToolEvent',
-                  toolCallId: event.toolCallId,
-                  toolKey,
-                  event,
-                })
-                break
-              }
-
-
-
-
-              // UnclosedThink detection moved there
 
               // --- Turn End ---
               case 'TurnEnd': {
                 const outcome = event.outcome
+                // Capture usage for return
+                if (event.usage) {
+                  turnUsage = {
+                    inputTokens: event.usage.inputTokens ?? null,
+                    outputTokens: event.usage.outputTokens ?? null,
+                    cacheReadTokens: event.usage.cacheReadTokens ?? null,
+                    cacheWriteTokens: event.usage.cacheWriteTokens ?? null,
+                  }
+                }
 
-                // xml-act path (orphaned): map yieldTarget to toolCallsCount
-                const completed = (yieldTarget: TurnYieldTarget): TurnOutcome => ({
+                const completed = (toolCallsCount: number): TurnOutcome => ({
                   _tag: 'Completed',
                   completion: {
-                    toolCallsCount: yieldTarget === 'invoke' ? 1 : 0,
-                    finishReason: yieldTarget === 'invoke' ? 'tool_calls' : 'stop',
+                    toolCallsCount,
+                    finishReason: toolCallsCount > 0 ? 'tool_calls' : 'stop',
                     feedback: [...feedback],
                   } satisfies TurnCompletion,
                 })
 
                 switch (outcome._tag) {
                   case 'Completed': {
-                    let yieldTarget: TurnYieldTarget
+                    let willContinue: boolean
 
                     if (hasToolErrors || feedback.length > 0) {
-                      yieldTarget = 'invoke'
-                    } else if (outcome.turnControl === null && !hasAnyResponseContent) {
-                      // Empty LLM response (no messages/tools/think/lens output).
-                      // Always retrigger so memory-injected corrective feedback is visible next turn.
-                      yieldTarget = 'invoke'
+                      // Errors or feedback → retrigger so model sees them
+                      willContinue = true
+                    } else if (!hasAnyResponseContent) {
+                      // Empty response → retrigger so corrective feedback is visible
+                      willContinue = true
                     } else {
-                      const target = outcome.turnControl?.target ?? null
-                      if (target === null) {
-                        const policyCtx = yield* policyCtxProvider.get
-                        const turnResult = agentDef.getTurn({
-                          toolsCalled: toolsCalledKeys,
-                          lastTool: lastToolKey,
-                          messagesSent,
-                          state: policyCtx,
-                        })
-                        yieldTarget = turnResult.action === 'continue' ? 'invoke' : 'user'
-                      } else {
-                        yieldTarget = target
-                      }
-                    }
-
-                    // yield-worker retrigger guard: if lead yields to workers but none are active, retrigger
-                    if (yieldTarget === 'worker') {
-                      const pCtx = yield* policyCtxProvider.get
-                      if (pCtx.activeAgentCount === 0) {
-                        feedback.push({ _tag: 'YieldWorkerRetriggered' })
-                        yieldTarget = 'invoke'
-                      }
+                      // Use agent policy to decide
+                      const policyCtx = yield* policyCtxProvider.get
+                      const turnResult = agentDef.getTurn({
+                        toolsCalled: toolsCalledKeys,
+                        lastTool: lastToolKey,
+                        messagesSent,
+                        state: policyCtx,
+                      })
+                      willContinue = turnResult.action === 'continue'
                     }
 
                     // Oneshot liveness guard: prevent stalling when nothing is active
-                    if (yieldTarget !== 'invoke' && oneshotEnabled) {
+                    if (!willContinue && oneshotEnabled) {
                       const pCtx = yield* policyCtxProvider.get
                       if (pCtx.activeAgentCount === 0) {
                         feedback.push({ _tag: 'OneshotLivenessRetriggered' })
-                        yieldTarget = 'invoke'
+                        willContinue = true
                       }
                     }
 
-                    executionResult = completed(yieldTarget)
+                    executionResult = completed(willContinue ? Math.max(outcome.toolCallsCount, 1) : 0)
                     break
                   }
 
-                  case 'StructuralParseError':
-                  case 'ToolParseError':
-                    executionResult = { _tag: 'ParseFailure', error: outcome.error }
+                  case 'ToolInputDecodeFailure':
+                    executionResult = { _tag: 'ParseFailure', error: {
+                      _tag: 'ToolInputDecodeFailure' as const,
+                      toolCallId: outcome.toolCallId,
+                      toolName: outcome.toolName,
+                      group: '',
+                      detail: outcome.detail,
+                    }}
                     break
 
-                  case 'ToolExecutionError':
+                  case 'TurnStructureDecodeFailure':
+                    executionResult = { _tag: 'ParseFailure', error: {
+                      _tag: 'TurnStructureDecodeFailure' as const,
+                      detail: outcome.detail,
+                    }}
+                    break
+
                   case 'GateRejected':
-                    executionResult = completed('invoke')
+                    executionResult = completed(1)
                     break
 
                   case 'EngineDefect':
@@ -888,19 +817,18 @@ const makeExecutionManager = Effect.gen(function* () {
                 }
 
                 // Circuit breaker: stop tight loops of identical consecutive responses that would retrigger.
-                // This covers Completed+continue and ParseFailure (which also retriggers).
                 const willRetrigger =
                   (executionResult._tag === 'Completed' && executionResult.completion.toolCallsCount > 0)
                   || executionResult._tag === 'ParseFailure'
 
                 if (willRetrigger) {
                   const previous = identicalContinueTracker.get(forkId)
-                  const nextCount = previous && previous.lastResponseText === rawResponseText
+                  const nextCount = previous && previous.lastResponseText === contentFingerprint
                     ? previous.consecutiveCount + 1
                     : 1
 
                   identicalContinueTracker.set(forkId, {
-                    lastResponseText: rawResponseText,
+                    lastResponseText: contentFingerprint,
                     consecutiveCount: nextCount,
                   })
 
@@ -926,6 +854,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
       return {
         result: executionResult,
+        usage: turnUsage,
       }
     }),
 

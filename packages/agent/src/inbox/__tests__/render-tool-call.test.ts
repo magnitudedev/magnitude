@@ -4,14 +4,14 @@ import { renderCompactToolCall } from '../render-tool-call'
 describe('renderCompactToolCall', () => {
   test('renders self-closing tag when no body', () => {
     expect(renderCompactToolCall({
-      tagName: 'read',
+      toolName: 'read',
       attributes: { path: 'src/auth.ts' },
     })).toBe('<read path="src/auth.ts"/>')
   })
 
   test('renders tag with body', () => {
     expect(renderCompactToolCall({
-      tagName: 'shell',
+      toolName: 'shell',
       attributes: { exitCode: '0' },
       body: 'npm test',
     })).toBe('<shell exitCode="0">npm test</shell>')
@@ -20,7 +20,7 @@ describe('renderCompactToolCall', () => {
   test('truncates body at default limit', () => {
     const body = 'x'.repeat(501)
     const output = renderCompactToolCall({
-      tagName: 'shell',
+      toolName: 'shell',
       attributes: {},
       body,
     })
@@ -31,7 +31,7 @@ describe('renderCompactToolCall', () => {
 
   test('truncates body at custom limit', () => {
     expect(renderCompactToolCall({
-      tagName: 'shell',
+      toolName: 'shell',
       attributes: {},
       body: 'abcdef',
       maxBodyChars: 3,
@@ -40,21 +40,21 @@ describe('renderCompactToolCall', () => {
 
   test('sorts attributes alphabetically', () => {
     expect(renderCompactToolCall({
-      tagName: 'tool',
+      toolName: 'tool',
       attributes: { z: '2', a: '1', m: '3' },
     })).toBe('<tool a="1" m="3" z="2"/>')
   })
 
   test('renders empty attributes without spaces', () => {
     expect(renderCompactToolCall({
-      tagName: 'noop',
+      toolName: 'noop',
       attributes: {},
     })).toBe('<noop/>')
   })
 
   test('does not XML-escape values', () => {
     expect(renderCompactToolCall({
-      tagName: 'x',
+      toolName: 'x',
       attributes: { raw: '<tag>&"\'', other: 'a<b' },
       body: '<body>&"\'',
     })).toBe('<x other="a<b" raw="<tag>&"\'"><body>&"\'</x>')

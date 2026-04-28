@@ -118,8 +118,8 @@ describe('prompt caching consistency', () => {
       const beforeMemory = yield* getRootMemory(h)
       const before = snapshotMessageRefs(beforeMemory)
 
-      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs', openSpan: { start: { offset: 0, line: 1, col: 1 }, end: { offset: 10, line: 1, col: 11 } } } })
-      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs', openSpan: { start: { offset: 0, line: 1, col: 1 }, end: { offset: 10, line: 1, col: 11 } } } })
+      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', toolName: 'read', toolName: 'fileRead', group: 'fs', openSpan: { start: { offset: 0, line: 1, col: 1 }, end: { offset: 10, line: 1, col: 11 } } } })
+      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', toolName: 'read', toolName: 'fileRead', group: 'fs', openSpan: { start: { offset: 0, line: 1, col: 1 }, end: { offset: 10, line: 1, col: 11 } } } })
 
       const midMemory = yield* getRootMemory(h)
       assertPrefixUnchanged(before, midMemory)

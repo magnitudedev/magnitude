@@ -43,7 +43,7 @@ export type AgentAtom =
   | (Timestamped<'thought'> & { readonly text: string })
   | (Timestamped<'tool_call'> & {
       readonly toolCallId: string
-      readonly tagName: string
+      readonly toolName: string
       readonly attributes: Readonly<Record<string, string>>
       readonly body?: string
       readonly status: 'success' | 'error' | 'interrupted'
