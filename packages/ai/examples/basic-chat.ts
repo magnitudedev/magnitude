@@ -1,34 +1,43 @@
 import { Effect, Stream } from "effect"
+import { FetchHttpClient } from "@effect/platform"
 import {
-  bindModel,
-  execute,
-  getProvider,
+  Auth,
+  Model,
+  NativeChatCompletions,
+  Option,
   PromptBuilder,
-  resolveEnvAuth,
 } from "../src/index.js"
 
-const provider = getProvider("fireworks-ai")
-if (!provider) {
-  throw new Error('Provider "fireworks-ai" not found')
-}
+// Define a model spec for Fireworks AI
+const fireworksLlama = NativeChatCompletions.model({
+  id: "fireworks/llama-v3p1-8b",
+  modelId: "accounts/fireworks/models/llama-v3p1-8b-instruct",
+  endpoint: "https://api.fireworks.ai/inference/v1",
+  contextWindow: 131_072,
+  maxOutputTokens: 16_384,
+  options: {
+    ...NativeChatCompletions.options,
+    temperature: Option.define((v: number) => ({ temperature: v }), 0.7),
+  },
+})
 
-const model = provider.models[0]
-if (!model) {
-  throw new Error('No models found for provider "fireworks-ai"')
-}
+// Bind with auth
+const apiKey = process.env.FIREWORKS_API_KEY
+if (!apiKey) throw new Error("Set FIREWORKS_API_KEY before running this example")
 
-const auth = resolveEnvAuth(provider)
-if (!auth) {
-  throw new Error("Set FIREWORKS_API_KEY before running this example")
-}
+const model = fireworksLlama.bind({ auth: Auth.bearer(apiKey) })
 
+// Build prompt
 const prompt = PromptBuilder.empty()
   .system("You are a concise, helpful assistant.")
   .user("What is the capital of France? Answer in one sentence.")
   .build()
 
-const program = execute(bindModel(provider, model, auth), prompt, [], {}).pipe(
-  Stream.runForEach((event) =>
+// Stream the response
+const program = Effect.gen(function* () {
+  const responseStream = yield* model.stream(prompt, [], { maxTokens: 256 })
+
+  yield* Stream.runForEach(responseStream, (event) =>
     Effect.sync(() => {
       switch (event._tag) {
         case "message_delta":
@@ -39,7 +48,7 @@ const program = execute(bindModel(provider, model, auth), prompt, [], {}).pipe(
           break
       }
     }),
-  ),
-)
+  )
+})
 
-Effect.runPromise(program)
+program.pipe(Effect.provide(FetchHttpClient.layer), Effect.runPromise)

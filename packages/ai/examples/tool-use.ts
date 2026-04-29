@@ -1,49 +1,45 @@
+import { Effect, Schema, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { Schema } from "effect"
-import { Effect, Layer, Stream } from "effect"
 import {
-  AiTracer,
-  bindModel,
+  Auth,
   defineTool,
-  execute,
-  getProvider,
-  NoopAiTracer,
+  Model,
+  NativeChatCompletions,
   PromptBuilder,
-  resolveEnvAuth,
 } from "../src/index.js"
 
 const weatherTool = defineTool({
   name: "get_weather",
   description: "Get the current weather for a city.",
-  inputSchema: Schema.Struct({
-    city: Schema.String,
-  }),
+  inputSchema: Schema.Struct({ city: Schema.String }),
   outputSchema: Schema.String,
 })
 
-const provider = getProvider("openai")
-if (!provider) {
-  throw new Error('Provider "openai" not found')
-}
+const openaiGpt4o = NativeChatCompletions.model({
+  id: "openai/gpt-4o",
+  modelId: "gpt-4o",
+  endpoint: "https://api.openai.com/v1",
+  contextWindow: 128_000,
+  maxOutputTokens: 16_384,
+  options: NativeChatCompletions.options,
+})
 
-const model =
-  provider.models.find((candidate) => candidate.supportsToolCalls) ?? provider.models[0]
-if (!model) {
-  throw new Error('No models found for provider "openai"')
-}
+const apiKey = process.env.OPENAI_API_KEY
+if (!apiKey) throw new Error("Set OPENAI_API_KEY before running this example")
 
-const auth = resolveEnvAuth(provider)
-if (!auth) {
-  throw new Error("Set OPENAI_API_KEY before running this example")
-}
+const model = openaiGpt4o.bind({ auth: Auth.bearer(apiKey) })
 
 const prompt = PromptBuilder.empty()
   .system("You may call tools when they are useful.")
   .user("What's the weather in Tokyo right now?")
   .build()
 
-const program = execute(bindModel(provider, model, auth), prompt, [weatherTool], {}).pipe(
-  Stream.runForEach((event) =>
+const program = Effect.gen(function* () {
+  const responseStream = yield* model.stream(prompt, [weatherTool], {
+    maxTokens: 1000,
+  })
+
+  yield* Stream.runForEach(responseStream, (event) =>
     Effect.sync(() => {
       switch (event._tag) {
         case "message_delta":
@@ -70,12 +66,7 @@ const program = execute(bindModel(provider, model, auth), prompt, [weatherTool],
           break
       }
     }),
-  ),
-)
+  )
+})
 
-const ExampleLive = Layer.mergeAll(
-  FetchHttpClient.layer,
-  Layer.succeed(AiTracer, NoopAiTracer),
-)
-
-program.pipe(Effect.provide(ExampleLive), Effect.runPromise)
+program.pipe(Effect.provide(FetchHttpClient.layer), Effect.runPromise)

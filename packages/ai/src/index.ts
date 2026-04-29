@@ -1,82 +1,37 @@
-// Model types
-export type { ModelId, Model } from "./lib/model/canonical-model"
-export type {
-  ProviderModel,
-  ModelCosts,
-  ModelDiscovery,
-} from "./lib/model/provider-model"
+// Namespaces
+export { Model } from "./model/define"
+export { NativeChatCompletions } from "./protocol/native-chat-completions"
+export { Auth, type AuthApplicator } from "./auth/auth"
+export { Option } from "./options/option"
 
-// Provider
-export type { ProviderDefinition } from "./lib/execution/provider-definition"
-export type { AuthMethod } from "./lib/auth/types"
-export { getProvider, getAllProviders, providers } from "./providers/registry"
-
-export { anthropicProvider } from "./providers/anthropic"
-export { cerebrasProvider } from "./providers/cerebras"
-export { deepseekProvider } from "./providers/deepseek"
-export { fireworksAiProvider } from "./providers/fireworks-ai"
-export { kimiForCodingProvider } from "./providers/kimi-for-coding"
-export { llamaCppProvider } from "./providers/llama.cpp"
-export { lmstudioProvider } from "./providers/lmstudio"
-export { magnitudeProvider } from "./providers/magnitude"
-export { minimaxProvider } from "./providers/minimax"
-export { moonshotAiProvider } from "./providers/moonshotai"
-export { openaiProvider } from "./providers/openai"
-export { openAiCompatibleLocalProvider } from "./providers/openai-compatible-local"
-export { ollamaProvider } from "./providers/ollama"
-export { openrouterProvider } from "./providers/openrouter"
-export { vercelProvider } from "./providers/vercel"
-export { zaiCodingPlanProvider } from "./providers/zai-coding-plan"
-export { zaiProvider } from "./providers/zai"
-
-// Auth
-export type {
-  ResolvedAuth,
-  ApiKeyAuth,
-  OAuthAuth,
-  NoAuth,
-} from "./lib/auth/types"
-export {
-  AuthStorage,
-  type StoredAuth,
-  type StoredApiKey,
-  type StoredOAuth,
-} from "./lib/auth/storage"
-export { resolveEnvAuth } from "./lib/auth/env"
-export { ModelAuth, ModelAuthLive } from "./lib/auth/service"
+// Core types
+export type { ModelSpec } from "./model/model-spec"
+export type { BoundModel } from "./model/bound-model"
+export type { OptionDef, InferCallOptions } from "./options/option"
 
 // Prompt
-export type { ToolCallId } from "./lib/prompt/ids"
-export type {
-  TextPart,
-  ImagePart,
-  ToolCallPart,
-  JsonValue,
-  PromptPart,
-} from "./lib/prompt/parts"
+export { Prompt, type TerminalMessages } from "./prompt/prompt"
+export { PromptBuilder } from "./prompt/prompt-builder"
 export type {
   UserMessage,
   AssistantMessage,
   ToolResultMessage,
   Message,
-  UserPart,
-  ToolResultPart,
   TerminalMessage,
-} from "./lib/prompt/messages"
-export { Prompt, type PromptShape } from "./lib/prompt/prompt"
-export { PromptBuilder } from "./lib/prompt/prompt-builder"
+} from "./prompt/messages"
+export type { TextPart, ImagePart, ToolCallPart, JsonValue } from "./prompt/parts"
+export type { ToolCallId } from "./prompt/ids"
 
 // Tools
-export type { ToolDefinition } from "./lib/tools/tool-definition"
-export { defineTool } from "./lib/tools/tool-definition"
+export type { ToolDefinition } from "./tools/tool-definition"
+export { defineTool } from "./tools/tool-definition"
 
 // Response
-export type { ResponseUsage } from "./lib/response/usage"
-export type { ResponseStreamEvent } from "./lib/response/events"
+export type { ResponseStreamEvent } from "./response/events"
+export type { ResponseUsage } from "./response/usage"
 
 // Errors
 export {
-  NotConfigured,
   AuthFailed,
   RateLimited,
   UsageLimitExceeded,
@@ -84,53 +39,18 @@ export {
   InvalidRequest,
   TransportError,
   ParseError,
-  type ModelError,
-} from "./lib/errors/model-error"
-export { classifyGenericError, type ErrorClassifier } from "./lib/errors/classify"
-
-// Codec + Driver
-export type { Codec, EncodeOptions } from "./lib/codec/codec"
-export { nativeChatCompletionsCodec } from "./lib/codec/native-chat-completions"
-export type { Driver } from "./lib/driver/driver"
-export { openAIChatCompletionsDriver } from "./lib/driver/openai-chat-completions"
-
-// Execution
-export type { BoundModel } from "./lib/execution/bound-model"
-export { bindModel } from "./lib/execution/bind"
-export { execute } from "./lib/execution/execute"
-
-// Tracing
-export { AiTracer, NoopAiTracer, NoopAiTracerLive } from "./lib/tracing/tracer"
-
-// Catalogue
-export { ModelCatalogue, ModelCatalogueLive, makeModelCatalogueLive } from "./catalogues/catalogue"
-export { CatalogueCache, type CachedData } from "./catalogues/cache"
-export {
-  CatalogueConfig,
-  type ProviderOptions,
-  type DiscoveredModel,
-  type DiscoveryStatus,
-} from "./catalogues/config"
-export type { CatalogueSource, CatalogueError } from "./catalogues/types"
-export {
-  CatalogueTransportError,
-  CatalogueAuthError,
-  CatalogueSchemaError,
-} from "./catalogues/types"
-export { mergeProviderModels } from "./catalogues/merge"
-export { staticCatalogueSource } from "./catalogues/static/source"
-export { modelsDevCatalogueSource } from "./catalogues/models-dev/source"
-export { openRouterCatalogueSource } from "./catalogues/openrouter/source"
-export { localDiscoveryCatalogueSource } from "./catalogues/local-discovery/source"
+} from "./errors/model-error"
+export type { ConnectionError, StreamError } from "./errors/model-error"
+export { defaultClassifyConnectionError, defaultClassifyStreamError } from "./errors/classify"
+export type { HttpConnectionFailure, StreamFailure } from "./errors/failure"
 
 // Wire types
-export type {
-  ChatCompletionsRequest,
-  ChatCompletionsStreamChunk,
-  ChatMessage,
-  ChatTool,
-} from "./lib/wire/chat-completions"
+export type { ChatCompletionsRequest, ChatCompletionsStreamChunk } from "./wire/chat-completions"
 
-// Advanced utilities
-export * from "./lib/jsonish/types"
-export * from "./lib/jsonish/parser"
+// Codec
+export type { Codec } from "./codec/codec"
+export { nativeChatCompletionsCodec } from "./codec/native-chat-completions/index"
+
+// Jsonish
+export { createStreamingJsonParser } from "./jsonish/parser"
+export type { StreamingJsonParser, ParsedValue } from "./jsonish/types"
