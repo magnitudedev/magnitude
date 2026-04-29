@@ -21,7 +21,9 @@
       "@magnitudedev/providers": ["./packages/providers/src"],
       "@magnitudedev/tools": ["./packages/tools/src"],
       "@magnitudedev/xml-act": ["./packages/xml-act/src"],
-      "@magnitudedev/telemetry": ["./packages/telemetry/src"]
+      "@magnitudedev/telemetry": ["./packages/telemetry/src"],
+      "@magnitudedev/ai": ["./packages/ai/src"],
+      "@magnitudedev/magnitude-client": ["./packages/magnitude-client/src"]
     },
     "plugins": [
       { "name": "@effect/language-service" }
