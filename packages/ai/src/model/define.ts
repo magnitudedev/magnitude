@@ -24,8 +24,6 @@ export interface ModelDefineConfig<
   readonly modelId: string
   readonly endpoint: string
   readonly path: string
-  readonly contextWindow: number
-  readonly maxOutputTokens: number
   readonly codec: Codec<TWireReq, TWireChunk>
   readonly buildWireRequest: (
     prompt: Prompt,
@@ -56,8 +54,6 @@ export function modelDefine<
   const spec: ModelSpec<TCallOptions, TConnectionError, TStreamError> = {
     modelId: config.modelId,
     endpoint: config.endpoint,
-    contextWindow: config.contextWindow,
-    maxOutputTokens: config.maxOutputTokens,
 
     bind: (args) => modelBind(spec, args.auth, args.defaults),
 

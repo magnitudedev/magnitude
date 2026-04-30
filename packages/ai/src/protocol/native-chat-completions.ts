@@ -40,8 +40,6 @@ interface NativeChatCompletionsModelConfig<
 > {
   readonly modelId: string
   readonly endpoint: string
-  readonly contextWindow: number
-  readonly maxOutputTokens: number
   readonly options: TOptions
 
   readonly compose?: (
@@ -120,8 +118,6 @@ function model<
     modelId: config.modelId,
     endpoint: config.endpoint,
     path: "/chat/completions",
-    contextWindow: config.contextWindow,
-    maxOutputTokens: config.maxOutputTokens,
     codec: nativeChatCompletionsCodec,
     doneSignal: "[DONE]",
     decodePayload: decodeChatCompletionsPayload,

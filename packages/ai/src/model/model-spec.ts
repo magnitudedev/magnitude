@@ -14,8 +14,6 @@ export interface ModelSpec<
 > {
   readonly modelId: string
   readonly endpoint: string
-  readonly contextWindow: number
-  readonly maxOutputTokens: number
 
   /** Bind this spec with auth and optional default options to create a BoundModel. */
   readonly bind: (args: {

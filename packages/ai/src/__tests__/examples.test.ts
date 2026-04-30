@@ -29,11 +29,8 @@ const noTools: readonly ToolDefinition[] = []
 // ---------------------------------------------------------------------------
 describe("Fireworks MiniMax with reasoning effort", () => {
   const minimaxM27 = NativeChatCompletions.model({
-    id: "fireworks/minimax-m2.7",
     modelId: "accounts/fireworks/models/minimax-m2.7",
     endpoint: "https://api.fireworks.ai/inference/v1",
-    contextWindow: 196_000,
-    maxOutputTokens: 196_000,
     options: {
       ...NativeChatCompletions.options,
       reasoningEffort: Option.define(
@@ -43,9 +40,7 @@ describe("Fireworks MiniMax with reasoning effort", () => {
   })
 
   it("creates a valid model spec", () => {
-    expect(minimaxM27.id).toBe("fireworks/minimax-m2.7")
-    expect(minimaxM27.contextWindow).toBe(196_000)
-    expect(minimaxM27.maxOutputTokens).toBe(196_000)
+    expect(minimaxM27.modelId).toBe("accounts/fireworks/models/minimax-m2.7")
   })
 
   it("binds with auth and accepts typed options", () => {
@@ -69,11 +64,8 @@ describe("Fireworks MiniMax with reasoning effort", () => {
 // ---------------------------------------------------------------------------
 describe("Magnitude gateway — Kimi K2.6 with grammar", () => {
   const kimiK26 = NativeChatCompletions.model({
-    id: "magnitude/kimi-k2.6",
     modelId: "kimi-k2.6",
     endpoint: "https://app.magnitude.dev/api/v1",
-    contextWindow: 262_000,
-    maxOutputTokens: 262_000,
     options: {
       ...NativeChatCompletions.options,
       grammar: Option.define(
@@ -99,11 +91,8 @@ describe("DeepSeek — thinking toggle with compose", () => {
   type DeepSeekThinking = { type: "enabled" } | { type: "disabled" }
 
   const deepseekV4 = NativeChatCompletions.model({
-    id: "deepseek/deepseek-v4-pro",
     modelId: "deepseek-v4-pro",
     endpoint: "https://api.deepseek.com/v1",
-    contextWindow: 262_144,
-    maxOutputTokens: 131_072,
     options: {
       ...NativeChatCompletions.options,
       thinking: Option.define(
@@ -119,7 +108,7 @@ describe("DeepSeek — thinking toggle with compose", () => {
   })
 
   it("creates spec with compose", () => {
-    expect(deepseekV4.id).toBe("deepseek/deepseek-v4-pro")
+    expect(deepseekV4.modelId).toBe("deepseek-v4-pro")
   })
 
   it("accepts thinking option", () => {
@@ -136,11 +125,8 @@ describe("DeepSeek — thinking toggle with compose", () => {
 // ---------------------------------------------------------------------------
 describe("Required option", () => {
   const deepseekReasoner = NativeChatCompletions.model({
-    id: "deepseek/deepseek-reasoner",
     modelId: "deepseek-reasoner",
     endpoint: "https://api.deepseek.com/v1",
-    contextWindow: 262_144,
-    maxOutputTokens: 131_072,
     options: {
       ...NativeChatCompletions.options,
       thinking: Option.required(
@@ -169,7 +155,6 @@ describe("Required option", () => {
 // ---------------------------------------------------------------------------
 describe("Custom error classification", () => {
   class MyRateLimitError extends Data.TaggedError("MyRateLimitError")<{
-    readonly sourceId: string
     readonly status: number
     readonly message: string
     readonly retryAfterMs: number
@@ -179,31 +164,27 @@ describe("Custom error classification", () => {
   type CustomConnectionError = ConnectionError | MyRateLimitError
 
   const myModel = NativeChatCompletions.model({
-    id: "custom/model",
     modelId: "model-v1",
     endpoint: "https://api.custom.com/v1",
-    contextWindow: 100_000,
-    maxOutputTokens: 50_000,
     options: { ...NativeChatCompletions.options },
     classifyConnectionError: (failure: HttpConnectionFailure): CustomConnectionError => {
       if (failure.status === 429) {
         const parsed = JSON.parse(failure.body)
         return new MyRateLimitError({
-          sourceId: "custom",
           status: failure.status,
           message: parsed.message,
           retryAfterMs: parsed.retry_after_ms,
           quotaRemaining: parsed.quota_remaining,
         })
       }
-      return defaultClassifyConnectionError("custom", failure)
+      return defaultClassifyConnectionError(failure)
     },
     classifyStreamError: (failure: StreamFailure) =>
-      defaultClassifyStreamError("custom", failure),
+      defaultClassifyStreamError(failure),
   })
 
   it("model spec has custom error types", () => {
-    expect(myModel.id).toBe("custom/model")
+    expect(myModel.modelId).toBe("model-v1")
 
     const model = myModel.bind({ auth: Auth.bearer("test-key") })
 
@@ -229,11 +210,8 @@ describe("Custom error classification", () => {
 // ---------------------------------------------------------------------------
 describe("Testing with mock HttpClient", () => {
   const spec = NativeChatCompletions.model({
-    id: "test/model",
     modelId: "test-model",
     endpoint: "http://localhost:8080",
-    contextWindow: 100_000,
-    maxOutputTokens: 50_000,
     options: { ...NativeChatCompletions.options },
   })
 
