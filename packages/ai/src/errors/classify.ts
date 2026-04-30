@@ -99,28 +99,26 @@ function getErrorCode(text: string): string | null {
 }
 
 export function defaultClassifyConnectionError(
-  sourceId: string,
   failure: HttpConnectionFailure,
 ): ConnectionError {
   const body = failure.body
   const lower = body.toLowerCase()
 
   if (hasPattern(lower, CONTEXT_LIMIT_PATTERNS)) {
-    return new ContextLimitExceeded({ sourceId, status: failure.status, message: getErrorMessage(body) })
+    return new ContextLimitExceeded({ status: failure.status, message: getErrorMessage(body) })
   }
 
   if (failure.status === 401 || failure.status === 403 || hasPattern(lower, AUTH_SIGNAL_PATTERNS)) {
-    return new AuthFailed({ sourceId, status: failure.status, message: getErrorMessage(body) })
+    return new AuthFailed({ status: failure.status, message: getErrorMessage(body) })
   }
 
   if (failure.status === 429) {
     const code = getErrorCode(body)?.toLowerCase()
     if ((code && hasPattern(code, USAGE_LIMIT_PATTERNS)) || hasPattern(lower, USAGE_LIMIT_PATTERNS)) {
-      return new UsageLimitExceeded({ sourceId, status: failure.status, message: getErrorMessage(body) })
+      return new UsageLimitExceeded({ status: failure.status, message: getErrorMessage(body) })
     }
 
     return new RateLimited({
-      sourceId,
       status: failure.status,
       message: getErrorMessage(body),
       retryAfterMs: parseRetryAfterMs(failure.headers),
@@ -128,11 +126,10 @@ export function defaultClassifyConnectionError(
   }
 
   if (failure.status >= 400 && failure.status < 500) {
-    return new InvalidRequest({ sourceId, status: failure.status, message: getErrorMessage(body) })
+    return new InvalidRequest({ status: failure.status, message: getErrorMessage(body) })
   }
 
   return new TransportError({
-    sourceId,
     status: failure.status,
     message: getErrorMessage(body),
     retryable: failure.status >= 500,
@@ -140,15 +137,14 @@ export function defaultClassifyConnectionError(
 }
 
 export function defaultClassifyStreamError(
-  sourceId: string,
   failure: StreamFailure,
 ): StreamError {
   switch (failure._tag) {
     case "ReadFailure":
-      return new TransportError({ sourceId, status: null, message: String(failure.cause), retryable: true })
+      return new TransportError({ status: null, message: String(failure.cause), retryable: true })
     case "SseParseFailure":
-      return new ParseError({ sourceId, message: `SSE parse failure: ${failure.payload}` })
+      return new ParseError({ message: `SSE parse failure: ${failure.payload}` })
     case "ChunkDecodeFailure":
-      return new ParseError({ sourceId, message: `Chunk decode failure: ${String(failure.cause)}` })
+      return new ParseError({ message: `Chunk decode failure: ${String(failure.cause)}` })
   }
 }

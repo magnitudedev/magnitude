@@ -167,7 +167,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             outcome: { _tag: 'UnexpectedError', message: 'Fork layer not initialized', detail: { _tag: 'CortexDefect' } },
             inputTokens: null, outputTokens: null,
             cacheReadTokens: null, cacheWriteTokens: null,
-            providerId: boundModel.model.providerId, modelId: boundModel.model.id,
+            providerId: boundModel.model.providerId, modelId: boundModel.model.modelId,
           })
           return
         }
@@ -227,7 +227,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               outcome: mapEngineErrorToOutcome(err),
               inputTokens: null, outputTokens: null,
               cacheReadTokens: null, cacheWriteTokens: null,
-              providerId: boundModel.model.providerId, modelId: boundModel.model.id,
+              providerId: boundModel.model.providerId, modelId: boundModel.model.modelId,
             })
             return null as EngineStream | null
           })),
@@ -288,7 +288,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               outcome: mapEngineErrorToOutcome(err),
               inputTokens: null, outputTokens: null,
               cacheReadTokens: null, cacheWriteTokens: null,
-              providerId: boundModel.model.providerId, modelId: boundModel.model.id,
+              providerId: boundModel.model.providerId, modelId: boundModel.model.modelId,
             })
             return null
           })),
@@ -308,7 +308,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           cacheReadTokens:  executeResult.usage?.cacheReadTokens ?? null,
           cacheWriteTokens: executeResult.usage?.cacheWriteTokens ?? null,
           providerId: boundModel.model.providerId,
-          modelId:    boundModel.model.id,
+          modelId:    boundModel.model.modelId,
         })
       }).pipe(
         Effect.onInterrupt(() => Effect.gen(function* () {

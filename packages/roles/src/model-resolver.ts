@@ -1,9 +1,9 @@
-import type { AuthApplicator, BoundModel, ModelSpec } from '@magnitudedev/ai'
-import type { RoleId } from '@magnitudedev/magnitude-client'
+import type { AuthApplicator, BoundModel } from '@magnitudedev/ai'
+import type { MagnitudeModelSpec, MagnitudeConnectionError, MagnitudeStreamError, RoleId } from '@magnitudedev/magnitude-client'
 import { createRoleSpec } from '@magnitudedev/magnitude-client'
 import type { Slot } from './types'
 
-/** Maps role slot to magnitude-client RoleId. */
+/** Maps role slot to magnitude-client role ID. */
 const SLOT_TO_ROLE: Record<Slot, RoleId> = {
   leader: 'leader',
   scout: 'scout',
@@ -16,42 +16,37 @@ const SLOT_TO_ROLE: Record<Slot, RoleId> = {
 }
 
 /**
- * A model override entry with an explicit auth applicator.
+ * A model override entry with explicit auth.
  */
 export interface ModelOverrideEntry {
-  readonly spec: ModelSpec<any, any, any>
+  readonly spec: MagnitudeModelSpec
   readonly auth?: AuthApplicator
 }
 
 /**
- * Per-slot model overrides. Each entry can be a bare ModelSpec (uses defaultAuth)
+ * Per-slot model overrides. Each entry can be a bare MagnitudeModelSpec (uses default auth)
  * or a ModelOverrideEntry with its own auth.
  */
-export type ModelOverrides = Partial<Record<Slot, ModelSpec<any, any, any> | ModelOverrideEntry>>
+export type ModelOverrides = Partial<Record<Slot, MagnitudeModelSpec | ModelOverrideEntry>>
 
-function isOverrideEntry(value: ModelSpec<any, any, any> | ModelOverrideEntry): value is ModelOverrideEntry {
+function isOverrideEntry(value: MagnitudeModelSpec | ModelOverrideEntry): value is ModelOverrideEntry {
   return typeof value === 'object' && value !== null && 'spec' in value
 }
 
 /**
  * Resolve a bound model for a given slot.
- *
- * Priority:
- * 1. Override for the slot (if provided)
- * 2. Default magnitude-client role spec
  */
 export function resolveModel(
   slot: Slot,
   endpoint: string,
   auth: AuthApplicator,
   overrides?: ModelOverrides,
-): BoundModel<any, any, any> {
+): BoundModel<{}, MagnitudeConnectionError, MagnitudeStreamError> {
   if (overrides?.[slot]) {
     const override = overrides[slot]!
     if (isOverrideEntry(override)) {
       return override.spec.bind({ auth: override.auth ?? auth })
     }
-    // Bare ModelSpec
     return override.bind({ auth })
   }
 

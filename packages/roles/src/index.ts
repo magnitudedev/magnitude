@@ -20,6 +20,9 @@ export type { PromptTemplate } from './prompt'
 export type { ModelOverrideEntry, ModelOverrides } from './model-resolver'
 export { resolveModel } from './model-resolver'
 
+// Re-export model types from magnitude-client for convenience
+export type { MagnitudeModelSpec, MagnitudeConnectionError, MagnitudeStreamError } from '@magnitudedev/magnitude-client'
+
 // Roles
 export {
   createRoles,

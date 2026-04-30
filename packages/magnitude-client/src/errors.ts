@@ -59,7 +59,6 @@ export function tryParseErrorBody(body: string): MagnitudeApiError | null {
 // --- Classifier ---
 
 export function classifyMagnitudeConnectionError(
-  sourceId: string,
   failure: HttpConnectionFailure,
 ): MagnitudeConnectionError {
   const parsed = tryParseErrorBody(failure.body)
@@ -83,15 +82,15 @@ export function classifyMagnitudeConnectionError(
       case "model_not_grammar_compatible":
         return new ModelNotGrammarCompatible({
           message: parsed.error.message,
-          model: sourceId,
+          model: parsed.error.message,
         })
       case "role_not_found":
         return new RoleNotFound({
           message: parsed.error.message,
-          role: sourceId,
+          role: parsed.error.message,
         })
     }
   }
 
-  return defaultClassifyConnectionError(sourceId, failure)
+  return defaultClassifyConnectionError(failure)
 }

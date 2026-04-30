@@ -10,5 +10,5 @@ export {
   classifyMagnitudeConnectionError,
   type MagnitudeConnectionError,
 } from "./errors"
-export { createRoleSpec } from "./models"
+export { createRoleSpec, createMagnitudeCompatibleSpec, type MagnitudeModelSpec, type MagnitudeStreamError, type MagnitudeCompatibleSpecConfig } from "./models"
 export { createMagnitudeClient, type MagnitudeClientConfig } from "./client"

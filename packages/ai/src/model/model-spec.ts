@@ -12,7 +12,6 @@ export interface ModelSpec<
   TConnectionError = ConnectionError,
   TStreamError = StreamError,
 > {
-  readonly id: string
   readonly modelId: string
   readonly endpoint: string
   readonly contextWindow: number

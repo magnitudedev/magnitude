@@ -38,7 +38,6 @@ interface NativeChatCompletionsModelConfig<
   TConnectionError = ConnectionError,
   TStreamError = StreamError,
 > {
-  readonly id: string
   readonly modelId: string
   readonly endpoint: string
   readonly contextWindow: number
@@ -107,9 +106,9 @@ function model<
   type TCallOptions = InferCallOptions<TOptions>
 
   const classifyConnection = config.classifyConnectionError
-    ?? ((f: HttpConnectionFailure) => defaultClassifyConnectionError(config.id, f))
+    ?? ((f: HttpConnectionFailure) => defaultClassifyConnectionError(f))
   const classifyStream = config.classifyStreamError
-    ?? ((f: StreamFailure) => defaultClassifyStreamError(config.id, f))
+    ?? ((f: StreamFailure) => defaultClassifyStreamError(f))
 
   return modelDefine<
     TCallOptions,
@@ -118,14 +117,12 @@ function model<
     TConnectionError,
     TStreamError
   >({
-    id: config.id,
     modelId: config.modelId,
     endpoint: config.endpoint,
     path: "/chat/completions",
     contextWindow: config.contextWindow,
     maxOutputTokens: config.maxOutputTokens,
     codec: nativeChatCompletionsCodec,
-    sourceId: config.id,
     doneSignal: "[DONE]",
     decodePayload: decodeChatCompletionsPayload,
 

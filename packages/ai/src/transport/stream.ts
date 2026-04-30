@@ -12,7 +12,6 @@ export interface ExecuteHttpStreamConfig<TWireReq, TWireChunk> {
   readonly auth: AuthApplicator
   readonly extraHeaders?: Record<string, string>
   readonly decodePayload: (raw: string) => Effect.Effect<TWireChunk, Error>
-  readonly sourceId: string
   readonly doneSignal?: string
 }
 

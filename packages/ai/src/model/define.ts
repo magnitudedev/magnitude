@@ -21,7 +21,6 @@ export interface ModelDefineConfig<
   TConnectionError,
   TStreamError,
 > {
-  readonly id: string
   readonly modelId: string
   readonly endpoint: string
   readonly path: string
@@ -36,7 +35,6 @@ export interface ModelDefineConfig<
   readonly classifyConnectionError: (failure: HttpConnectionFailure) => TConnectionError
   readonly classifyStreamError: (failure: StreamFailure) => TStreamError
   readonly decodePayload: (raw: string) => Effect.Effect<TWireChunk, Error>
-  readonly sourceId: string
   readonly doneSignal?: string
 }
 
@@ -56,7 +54,6 @@ export function modelDefine<
   const url = joinUrl(config.endpoint, config.path)
 
   const spec: ModelSpec<TCallOptions, TConnectionError, TStreamError> = {
-    id: config.id,
     modelId: config.modelId,
     endpoint: config.endpoint,
     contextWindow: config.contextWindow,
@@ -81,7 +78,6 @@ export function modelDefine<
         body: wireRequest,
         auth,
         decodePayload: config.decodePayload,
-        sourceId: config.sourceId,
         doneSignal: config.doneSignal,
       })
 
