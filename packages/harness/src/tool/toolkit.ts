@@ -15,7 +15,6 @@ function typedKeys<T extends Record<string, unknown>>(obj: T): (keyof T & string
 interface ToolkitEntryBase {
   readonly tool: { readonly definition: { readonly name: string } }
   readonly state?: StateModel | undefined
-  readonly group?: string
 }
 
 export interface ToolkitEntry<
@@ -24,7 +23,6 @@ export interface ToolkitEntry<
 > {
   readonly tool: TTool
   readonly state?: TStateModel
-  readonly group?: string
 }
 
 // --- Toolkit ---
@@ -94,7 +92,7 @@ class ToolkitImpl<T extends Record<string, ToolkitEntryBase>> implements Toolkit
 
 // Constraint uses a structural minimum to accept both erased and concrete tools.
 // The `const T` inference captures the full concrete types.
-export function defineToolkit<const T extends Record<string, { readonly tool: { readonly definition: { readonly name: string } }; readonly state?: StateModel; readonly group?: string }>>(entries: T): Toolkit<T> {
+export function defineToolkit<const T extends Record<string, { readonly tool: { readonly definition: { readonly name: string } }; readonly state?: StateModel }>>(entries: T): Toolkit<T> {
   return new ToolkitImpl(entries)
 }
 

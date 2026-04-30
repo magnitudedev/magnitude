@@ -6,7 +6,6 @@ export interface ExecuteHookContext {
   readonly toolCallId: ToolCallId
   readonly toolName: string
   readonly toolKey: string
-  readonly group: string
   readonly input: unknown
 }
 

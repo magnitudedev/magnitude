@@ -27,7 +27,6 @@ interface ToolCallAccumulator {
   readonly toolCallId: ToolCallId
   readonly toolName: string
   readonly toolKey: string
-  readonly group: string
   readonly streamingPartial: StreamingPartial<unknown>
   readonly streamState: unknown
   readonly streamHook: StreamHook<unknown, unknown, unknown, unknown, unknown> | undefined
@@ -40,12 +39,12 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
 
   // Build lookup maps from toolkit
   const toolNameToKey = new Map<string, string>()
-  const toolKeyToEntry = new Map<string, { tool: HarnessToolErased; group: string }>()
+  const toolKeyToEntry = new Map<string, { tool: HarnessToolErased }>()
   for (const key of toolkit.keys) {
     const entry = toolkit.entries[key]
     const tool = entry.tool as HarnessToolErased
     toolNameToKey.set(tool.definition.name, key)
-    toolKeyToEntry.set(key, { tool, group: entry.group ?? "" })
+    toolKeyToEntry.set(key, { tool })
   }
 
   // Build cached outcomes map from initial engine state
@@ -90,7 +89,6 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
     toolCallId: ToolCallId,
     toolName: string,
     toolKey: string,
-    group: string,
     input: unknown,
   ): Effect.Effect<void> {
     const lookup = toolKeyToEntry.get(toolKey)
@@ -106,13 +104,13 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
       return Effect.gen(function* () {
         yield* emit({
           _tag: "ToolExecutionStarted",
-          toolCallId, toolName, toolKey, group,
+          toolCallId, toolName, toolKey,
           input,
           cached: true,
         })
         yield* emit({
           _tag: "ToolExecutionEnded",
-          toolCallId, toolName, toolKey, group,
+          toolCallId, toolName, toolKey,
           result: cached.result,
         })
         const parts = yield* provideLayer(formatToolResult(toolCallId, toolName, toolKey, cached.result, hooks))
@@ -121,7 +119,7 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
     }
 
     // beforeExecute hook
-    const hookCtx: ExecuteHookContext = { toolCallId, toolName, toolKey, group, input }
+    const hookCtx: ExecuteHookContext = { toolCallId, toolName, toolKey, input }
 
     return Effect.gen(function* () {
       const decision = hooks?.beforeExecute
@@ -131,12 +129,12 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
       if (decision._tag === "Reject") {
         yield* emit({
           _tag: "ToolExecutionStarted",
-          toolCallId, toolName, toolKey, group,
+          toolCallId, toolName, toolKey,
           input,
           cached: false,
         })
         const result: ToolResult = { _tag: "Rejected", rejection: decision.rejection }
-        yield* emit({ _tag: "ToolExecutionEnded", toolCallId, toolName, toolKey, group, result })
+        yield* emit({ _tag: "ToolExecutionEnded", toolCallId, toolName, toolKey, result })
         const parts = yield* provideLayer(formatToolResult(toolCallId, toolName, toolKey, result, hooks))
         yield* emit({ _tag: "ToolResultFormatted", toolCallId, toolName, toolKey, parts })
         terminalOverride = { _tag: "GateRejected", toolCallId, toolName }
@@ -147,7 +145,7 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
 
       yield* emit({
         _tag: "ToolExecutionStarted",
-        toolCallId, toolName, toolKey, group,
+        toolCallId, toolName, toolKey,
         input: effectiveInput,
         cached: false,
       })
@@ -170,7 +168,7 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
         }),
       )
 
-      yield* emit({ _tag: "ToolExecutionEnded", toolCallId, toolName, toolKey, group, result })
+      yield* emit({ _tag: "ToolExecutionEnded", toolCallId, toolName, toolKey, result })
 
       // afterExecute hook
       if (hooks?.afterExecute) {
@@ -222,7 +220,6 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           toolKey,
-          group: entry.group,
           streamingPartial: {},
           streamState: entry.tool.stream?.initial,
           streamHook: entry.tool.stream,
@@ -234,7 +231,6 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           toolKey,
-          group: entry.group,
         })
       }
 
@@ -317,7 +313,6 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
               toolCallId: acc.toolCallId,
               toolName: acc.toolName,
               toolKey: acc.toolKey,
-              group: acc.group,
               detail: decodeResult.error,
             })
             terminalOverride = {
@@ -337,7 +332,7 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
 
           // Fork tool execution concurrently
           const fiber = yield* Effect.fork(
-            executeTool(acc.toolCallId, acc.toolName, acc.toolKey, acc.group, decodeResult.input),
+            executeTool(acc.toolCallId, acc.toolName, acc.toolKey, decodeResult.input),
           )
           toolFibers.set(acc.toolCallId, fiber)
         })
@@ -379,7 +374,6 @@ export function dispatch(config: DispatchConfig): Effect.Effect<void> {
           toolCallId,
           toolName: acc?.toolName ?? "",
           toolKey: acc?.toolKey ?? "",
-          group: acc?.group ?? "",
           result: { _tag: "Interrupted" },
         })
       }

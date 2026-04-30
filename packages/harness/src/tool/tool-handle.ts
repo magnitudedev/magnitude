@@ -54,7 +54,6 @@ function buildHandle(
             toolCallId: event.toolCallId,
             toolName: event.toolName,
             toolKey: event.toolKey,
-            group: event.group,
             result: { _tag: 'Error', error: typeof event.detail === 'string' ? event.detail : String(event.detail) },
           } satisfies ToolExecutionEnded
         : event
@@ -67,7 +66,6 @@ function buildHandle(
         toolCallId,
         toolName: '',
         toolKey,
-        group: '',
         result: { _tag: 'Interrupted' },
       } satisfies ToolExecutionEnded
       return buildHandle(toolCallId, toolKey, reduce(state, interruptEvent), reduce)

@@ -32,7 +32,6 @@ export interface ToolInputStarted {
   readonly toolCallId: ToolCallId
   readonly toolName: string
   readonly toolKey: string
-  readonly group: string
 }
 
 export interface ToolInputFieldChunk {
@@ -64,7 +63,6 @@ export interface ToolExecutionStarted<TInput = unknown> {
   readonly toolCallId: ToolCallId
   readonly toolName: string
   readonly toolKey: string
-  readonly group: string
   readonly input: TInput
   readonly cached: boolean
 }
@@ -74,7 +72,6 @@ export interface ToolExecutionEnded<TOutput = unknown, TError = unknown> {
   readonly toolCallId: ToolCallId
   readonly toolName: string
   readonly toolKey: string
-  readonly group: string
   readonly result: ToolResult<TOutput, TError>
 }
 
@@ -132,7 +129,6 @@ export interface ToolInputDecodeFailure {
   readonly toolCallId: ToolCallId
   readonly toolName: string
   readonly toolKey: string
-  readonly group: string
   readonly detail: unknown
 }
 
