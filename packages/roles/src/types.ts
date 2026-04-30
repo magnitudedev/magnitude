@@ -1,194 +1,52 @@
-import type { ToolCatalog, CatalogKeys, CatalogTool } from '@magnitudedev/tools'
-import { Effect, Layer } from 'effect'
-import type { Schema } from '@effect/schema'
-import type { ThinkingLens } from './thinking-lens'
+import type { ExecuteHookContext, InterceptorDecision } from '@magnitudedev/harness'
+import type { Effect } from 'effect'
+import type { PromptTemplate } from './prompt'
 
-// =============================================================================
-// Tools
-// =============================================================================
+export type Slot = 'leader' | 'scout' | 'architect' | 'engineer' | 'critic' | 'scientist' | 'artisan' | 'advisor'
 
-export type ToolNames<T> = T extends ToolCatalog<infer E> ? keyof E & string : never
+export const SLOTS: readonly Slot[] = ['leader', 'scout', 'architect', 'engineer', 'critic', 'scientist', 'artisan', 'advisor'] as const
 
-type ExtractToolInput<TTool> =
-  TTool extends { readonly inputSchema: Schema.Schema<infer I, any, any> } ? I : never
-
-type ExtractToolOutput<TTool> =
-  TTool extends { readonly outputSchema: Schema.Schema<infer O, any, any> } ? O : never
-
-export type ToolInput<T, K extends string> = ExtractToolInput<CatalogTool<T, K>>
-
-export type ToolOutput<T, K extends string> = ExtractToolOutput<CatalogTool<T, K>>
-
-// =============================================================================
-// Tool Policy
-// =============================================================================
-
-/** Terminal policy decision */
-export type Decision =
-  | { readonly decision: 'allow' }
-  | { readonly decision: 'deny'; readonly reason: string }
-
-/** A policy handler — returns Effect because interception may involve async exchanges (e.g. approval) */
-export type PolicyHandler<TInput, TCtx> = (input: TInput, ctx: TCtx) => Effect.Effect<Decision | null>
-
-/** A fragment is a partial handler map over a toolset. '*' matches any tool. */
-export type PolicyFragment<T extends ToolCatalog, TCtx> = {
-  [K in ToolNames<T> | '*']?: K extends '*'
-    ? PolicyHandler<unknown, TCtx>
-    : K extends ToolNames<T>
-      ? PolicyHandler<ToolInput<T, K>, TCtx>
-      : never
+export function isSlot(value: string): value is Slot {
+  return (SLOTS as readonly string[]).includes(value)
 }
 
-/** A policy is an ordered array of fragments. All fragments evaluate; deny > allow > implicit deny. */
-export type Policy<T extends ToolCatalog, TCtx> = PolicyFragment<T, TCtx>[]
-
-// =============================================================================
-// Turn Policy
-// =============================================================================
-
-export interface TurnContext<TCtx = Record<string, never>> {
-  readonly toolsCalled: string[]
-  readonly lastTool: string | null
-  readonly messagesSent: readonly { readonly id: string; readonly taskId: string | null }[]
-  readonly error?: unknown
-  readonly cancelled?: boolean
-  readonly state: TCtx
+export interface PolicyContext {
+  readonly cwd: string
+  readonly workspacePath: string
+  readonly disableShellSafeguards?: boolean
+  readonly disableCwdSafeguards?: boolean
 }
 
-export type TurnDecision = 'continue' | 'idle'
+export type PolicyRule = (ctx: ExecuteHookContext & { policyContext: PolicyContext }) =>
+  Effect.Effect<InterceptorDecision | null>
 
-export type TurnResult = {
-  readonly action: TurnDecision
-  readonly reminder?: string
-}
+export interface RoleDefinition {
+  /** Role identity — same as the slot it fills. */
+  readonly id: Slot
 
-export interface TurnPolicy<TTools extends ToolCatalog, TCtx = Record<string, never>> {
-  decide: (ctx: TurnContext<TCtx> & { tools: CatalogKeys<TTools>[] }) => TurnResult
-}
+  /** System prompt template. Render with runtime vars (e.g. SKILLS_SECTION) to get final text. */
+  readonly prompt: PromptTemplate<'SKILLS_SECTION'>
 
-// =============================================================================
-// Observables
-// =============================================================================
-
-export type ObservationPart =
-  | { readonly type: 'text'; readonly text: string }
-  | { readonly type: 'image'; readonly base64: string; readonly mediaType: string; readonly width: number; readonly height: number }
-
-export interface ObservableConfig<R = never> {
-  readonly name: string
-  readonly observe: () => Effect.Effect<ObservationPart[], never, R>
-}
-
-export interface BoundObservable {
-  readonly name: string
-  readonly observe: () => Effect.Effect<ObservationPart[]>
-}
-
-// =============================================================================
-// Roles
-// =============================================================================
-
-export interface ForkSetupContext {
-  forkId: string
-  cwd: string
-  workspacePath: string
-}
-
-
-
-export interface RoleBase<
-  TTools extends ToolCatalog,
-  TSlot extends string,
-  TProvides = never,
-  TRequirements = never,
-  RObs = never
-> {
-  readonly id: string
-  readonly slot: TSlot
-  readonly tools: TTools
-  readonly systemPrompt: string
-  readonly lenses: ThinkingLens[]
-  readonly observables?: readonly ObservableConfig<RObs>[]
-  readonly lifecyclePrompts?: {
-    readonly parentOnSpawn?: (agentIds: readonly string[]) => string
-    readonly parentOnIdle?: (agentIds: readonly string[]) => string
-  }
+  /** Where messages go by default ('user' for lead, 'parent' for subagents). */
   readonly defaultRecipient: 'user' | 'parent'
-  readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
-  readonly initialContext: { parentConversation?: boolean }
-  readonly spawnable?: boolean
-  readonly setup?: (ctx: ForkSetupContext) => Effect.Effect<Layer.Layer<TProvides>, never, TRequirements>
-  readonly teardown?: (ctx: ForkSetupContext) => Effect.Effect<void, never, TRequirements>
-}
 
-export interface RoleConfig<
-  TTools extends ToolCatalog,
-  TSlot extends string,
-  TCtx,
-  TProvides = never,
-  TRequirements = never,
-  RObs = never
-> extends RoleBase<TTools, TSlot, TProvides, TRequirements, RObs> {
-  readonly policy: Policy<TTools, TCtx>
-  readonly turn: TurnPolicy<TTools, TCtx>
-}
+  /** Protocol mode — affects prompt structure and available agent tools. */
+  readonly protocolRole: 'lead' | 'subagent'
 
-export interface RoleDefinitionConcrete<
-  TTools extends ToolCatalog,
-  TSlot extends string,
-  TCtx,
-  TProvides,
-  TRequirements,
-  RObs
-> extends RoleBase<TTools, TSlot, TProvides, TRequirements, RObs> {
-  readonly observables: readonly ObservableConfig<RObs>[]
+  /** Whether this role can be spawned as a worker by the lead. */
   readonly spawnable: boolean
 
-  readonly policy: Policy<TTools, TCtx>
-  readonly getTurn: (ctx: TurnContext<unknown>) => TurnResult
-}
+  /** Policy rules — evaluated by the agent to build a beforeExecute hook. */
+  readonly policy: PolicyRule[]
 
-export interface RoleDefinitionErased {
-  readonly id: string
-  readonly slot: string
-  readonly tools: ToolCatalog
-  readonly systemPrompt: string
-  readonly lenses: ThinkingLens[]
-  readonly observables: readonly ObservableConfig<unknown>[]
-  readonly spawnable: boolean
-  readonly lifecyclePrompts?: {
-    readonly parentOnSpawn?: (agentIds: readonly string[]) => string
-    readonly parentOnIdle?: (agentIds: readonly string[]) => string
+  /** Lifecycle prompts shown to parent/user at spawn/completion. */
+  readonly lifecycle?: {
+    readonly parentOnSpawn?: string
+    readonly parentOnIdle?: string
   }
-  readonly defaultRecipient: 'user' | 'parent'
-  readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
-  readonly initialContext: { parentConversation?: boolean }
-  readonly policy: unknown
-  getTurn(ctx: TurnContext<unknown>): TurnResult
-  setup?(ctx: ForkSetupContext): Effect.Effect<unknown, unknown, unknown>
-  teardown?(ctx: ForkSetupContext): Effect.Effect<void, unknown, unknown>
+
+  /** Initial context flags. */
+  readonly initialContext: {
+    readonly parentConversation: boolean
+  }
 }
-
-export type RoleDefinition<
-  TTools = never,
-  TSlot extends string = string,
-  TCtx = unknown,
-  TProvides = unknown,
-  TRequirements = unknown,
-  RObs = unknown
-> = [TTools] extends [never]
-  ? RoleDefinitionErased
-  : RoleDefinitionConcrete<TTools & ToolCatalog, TSlot, TCtx, TProvides, TRequirements, RObs>
-
-export type SlotOf<R extends Record<string, RoleDefinition>> =
-  R[keyof R]['slot']
-
-export type RoleId<R extends Record<string, RoleDefinition>> =
-  keyof R & string
-
-export type ProvidesOf<R extends Record<string, RoleDefinition>> =
-  R[keyof R] extends RoleDefinition<ToolCatalog, string, unknown, infer P, unknown> ? P : never
-
-export type RequirementsOf<R extends Record<string, RoleDefinition>> =
-  R[keyof R] extends RoleDefinition<ToolCatalog, string, unknown, unknown, infer Req> ? Req : never

@@ -9,7 +9,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@magnitudedev/tools": "workspace:*",
+    "@magnitudedev/harness": "workspace:*",
+    "@magnitudedev/magnitude-client": "workspace:*",
+    "@magnitudedev/ai": "workspace:*",
+    "@magnitudedev/shell-classifier": "workspace:*",
     "effect": "^3.19.6"
   },
   "devDependencies": {

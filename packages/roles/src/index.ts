@@ -1,30 +1,34 @@
-export type {
-  ToolNames,
-  ToolInput,
-  ToolOutput,
-  Decision,
-  PolicyHandler,
-  PolicyFragment,
-  Policy,
-  TurnContext,
-  TurnDecision,
-  TurnResult,
-  TurnPolicy,
-  ObservationPart,
-  ObservableConfig,
-  BoundObservable,
-  ForkSetupContext,
-  RoleConfig,
-  RoleDefinition,
-  SlotOf,
-  RoleId,
-  ProvidesOf,
-  RequirementsOf,
-} from './types'
-export type { ThinkingLens } from './thinking-lens'
+// Types
+export type { Slot, PolicyContext, PolicyRule, RoleDefinition } from './types'
+export { SLOTS, isSlot } from './types'
 
-export { observe, idle } from './helpers'
+// Policy
+export {
+  denyForbiddenCommands,
+  denyMutatingGit,
+  denyWritesOutside,
+  denyMassDestructiveIn,
+  allowAll,
+  evaluatePolicy,
+} from './policy'
 
-export { defineRole, defineRoleSet } from './define'
-export { createObservable, bindObservable } from './observable'
-export { defineThinkingLens } from './thinking-lens'
+// Prompt
+export { definePrompt } from './prompt'
+export type { PromptTemplate } from './prompt'
+
+// Model resolution
+export type { ModelOverrideEntry, ModelOverrides } from './model-resolver'
+export { resolveModel } from './model-resolver'
+
+// Roles
+export {
+  createRoles,
+  createLeaderRole,
+  createScoutRole,
+  createArchitectRole,
+  createEngineerRole,
+  createCriticRole,
+  createScientistRole,
+  createArtisanRole,
+  createAdvisorRole,
+} from './roles/index'
