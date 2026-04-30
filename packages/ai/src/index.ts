@@ -16,6 +16,7 @@ export type {
   UserMessage,
   AssistantMessage,
   ToolResultMessage,
+  ToolResultPart,
   Message,
   TerminalMessage,
 } from "./prompt/messages"

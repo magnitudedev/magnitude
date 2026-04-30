@@ -1,0 +1,21 @@
+{
+  "name": "@magnitudedev/harness",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@magnitudedev/ai": "workspace:*",
+    "@effect/platform": "^0.96.0",
+    "@effect/schema": "^0.75.5",
+
+    "effect": "^3.19.6"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
