@@ -5,7 +5,7 @@
 </p>
 
 **Frontier coding at half the cost**  
-Magnitude is a coding agent that runs 90% on open models, escalating to frontier models only when the work demands it.
+Magnitude is a coding agent that runs on 90% open models, escalating to frontier models only when the work demands it.
 
 <p align="center">
   <img src="interface.png" alt="Magnitude interface" width="100%" />
