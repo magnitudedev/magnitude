@@ -4,8 +4,8 @@
   <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a> <a href="https://app.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/%F0%9F%96%A5-Dashboard-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="Dashboard" /></a> <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/-Follow%20Magnitude-000000?style=flat-square&labelColor=000000&color=gray&logo=x&logoColor=white" alt="Follow Magnitude" /></a> <a href="https://discord.gg/VcdpMh9tTy" target="_blank"><img src="https://img.shields.io/badge/-Join%20Community-gray?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2" alt="Join Community" /></a>
 </p>
 
-**Frontier coding at half the cost**  
-Magnitude is a coding agent that runs on 90% open models, escalating to frontier models only when the work demands it.
+**Frontier coding without frontier prices**  
+Magnitude is a coding agent that runs entirely on open models. Built-in model routing keeps costs low without sacrificing performance.
 
 <p align="center">
   <img src="interface.png" alt="Magnitude interface" width="100%" />
