@@ -1,0 +1,5 @@
+---
+"@magnitudedev/cli": patch
+---
+
+init

@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["bun", "svelte"],
+    "moduleResolution": "bundler"
+  },
+  "include": ["src", "vite.config.ts", "svelte.config.js"]
+}

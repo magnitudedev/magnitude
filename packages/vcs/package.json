@@ -1,0 +1,23 @@
+{
+  "name": "@magnitudedev/vcs",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@magnitudedev/harness": "workspace:*",
+    "@magnitudedev/event-core": "workspace:*",
+    "diff": "^8.0.2",
+    "effect": "^3.21.2",
+    "ignore": "^7.0.5",
+    "just-git": "^1.7.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

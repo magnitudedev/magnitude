@@ -1,0 +1,22 @@
+node_modules
+.turbo
+dist
+/bin
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+release-artifacts
+/jobs
+packages/agent/tmp
+packages/ripgrep/bin
+*.tsbuildinfo
+notes
+.motel-data
+
+# Web / Desktop
+web/dist
+web/node_modules
+desktop/out
+desktop/node_modules

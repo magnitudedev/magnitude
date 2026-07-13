@@ -1,0 +1,34 @@
+{
+  "name": "@magnitudedev/acn",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "dev": "bun run ../version/scripts/generate-version.ts --dev && bun run src/binary.ts serve --register --debug",
+    "dev:run": "bun run src/binary.ts serve --register --debug",
+    "build:binary": "bun run scripts/build-binary.ts",
+    "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/cli": "^0.75.2",
+    "@effect/opentelemetry": "^0.63.0",
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-bun": "^0.90.0",
+    "@effect/rpc": "0.75.1",
+    "@magnitudedev/agent": "workspace:*",
+    "@magnitudedev/generate-id": "workspace:*",
+    "@magnitudedev/sdk": "workspace:*",
+
+    "@magnitudedev/protocol": "workspace:*",
+    "@magnitudedev/ripgrep": "workspace:*",
+    "@magnitudedev/roles": "workspace:*",
+    "@magnitudedev/skills": "workspace:*",
+    "@magnitudedev/storage": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
+    "@magnitudedev/version": "workspace:*",
+    "effect": "^3.21.2",
+    "fast-json-patch": "^3.1.1"
+  }
+}

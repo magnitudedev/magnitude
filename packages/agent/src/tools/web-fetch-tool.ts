@@ -1,0 +1,89 @@
+/**
+ * Web Fetch Tool
+ *
+ * Fetches content from a URL and returns it as cleaned markdown.
+ */
+
+import { Effect, Schedule, Schema } from 'effect'
+import { defineHarnessTool } from '@magnitudedev/harness'
+import { extractHtml } from '@magnitudedev/dom-extract'
+import { ToolErrorSchema } from './errors'
+
+const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
+const TIMEOUT_MS = 30_000
+
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
+const ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+const ACCEPT_LANG = 'en-US,en;q=0.9'
+
+const retryPolicy = Schedule.exponential('500 millis').pipe(
+  Schedule.compose(Schedule.recurs(2)),
+)
+
+const WebFetchErrorSchema = ToolErrorSchema('WebFetchError', {})
+
+const fetchPage = (url: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS)
+
+      try {
+        const response = await fetch(url, {
+          signal: controller.signal,
+          headers: { 'User-Agent': USER_AGENT, 'Accept': ACCEPT, 'Accept-Language': ACCEPT_LANG },
+          redirect: 'follow',
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} ${response.statusText}`)
+        }
+
+        const contentLength = response.headers.get('content-length')
+        if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
+          throw new Error('Response too large (exceeds 5MB limit)')
+        }
+
+        const raw = await response.text()
+        if (raw.length > MAX_RESPONSE_SIZE) {
+          throw new Error('Response too large (exceeds 5MB limit)')
+        }
+
+        const contentType = response.headers.get('content-type') || ''
+        const content = contentType.includes('text/html') ? extractHtml(raw) : raw
+
+        return { url: response.url || url, content }
+      } finally {
+        clearTimeout(timeout)
+      }
+    },
+    catch: (e) => ({
+      _tag: 'WebFetchError' as const,
+      message: e instanceof Error ? e.message : String(e),
+    }),
+  })
+
+export const webFetchTool = defineHarnessTool({
+  definition: {
+    name: 'web_fetch',
+    description: 'Fetch the content of a URL. Returns the page content as cleaned markdown for you to read directly. Use this instead of running curl or wget in the shell.',
+    inputSchema: Schema.Struct({
+      url: Schema.String.annotations({ description: 'URL to fetch content from' }),
+    }),
+    outputSchema: Schema.Struct({
+      url: Schema.String,
+      content: Schema.String,
+    }),
+  },
+  errorSchema: WebFetchErrorSchema,
+  execute: ({ url }, _ctx) => {
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return Effect.fail({
+        _tag: 'WebFetchError' as const,
+        message: 'URL must start with http:// or https://',
+      })
+    }
+
+    return fetchPage(url).pipe(Effect.retry(retryPolicy))
+  },
+})

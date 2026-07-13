@@ -1,0 +1,3 @@
+# Checkpoint System
+
+You have a private checkpoint system that records your work. Checkpoints are created automatically when you or your workers make changes to the project directory. The checkpoint system does not track the scratchpad. The `--- HH:MM:SS ---` timestamps in your conversation mark turn boundaries — use them with `checkpoint_rollback` and `checkpoint_changes` to undo or review your work. These operate on your checkpoints only, not the user's git repository.

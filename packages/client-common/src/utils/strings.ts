@@ -1,0 +1,510 @@
+import stringWidth from 'string-width'
+import type { InputMentionSegment, InputPasteSegment, InputValue } from '../types/store'
+
+// Re-export InputValue type for backwards compatibility
+export type { InputValue } from '../types/store'
+
+export const LIST_BULLET_GLYPH = '• '
+
+/** Max number of lines to show in collapsed previews */
+export const PREVIEW_LINE_CAP = 3
+
+export function wrapTextToVisualLines(text: string, maxWidth: number): string[] {
+  const safeWidth = Math.max(1, Math.floor(maxWidth))
+  const segments = text.split('\n')
+  const lines: string[] = []
+
+  for (const segment of segments) {
+    if (segment.length === 0) {
+      lines.push('')
+      continue
+    }
+
+    let current = ''
+    let currentWidth = 0
+
+    for (const char of segment) {
+      const charWidth = Math.max(1, stringWidth(char))
+      if (currentWidth + charWidth > safeWidth) {
+        lines.push(current)
+        current = char
+        currentWidth = charWidth
+      } else {
+        current += char
+        currentWidth += charWidth
+      }
+    }
+
+    lines.push(current)
+  }
+
+  return lines
+}
+
+export function getDisplayWidth(text: string): number {
+  return stringWidth(text)
+}
+
+export function truncateToDisplayWidth(
+  text: string,
+  maxWidth: number,
+  ellipsis = '…',
+): string {
+  const safeWidth = Math.max(0, Math.floor(maxWidth))
+  if (safeWidth === 0) return ''
+  if (text.length <= safeWidth) return text
+  const ellipsisWidth = getDisplayWidth(ellipsis)
+  if (safeWidth <= ellipsisWidth) {
+    let clippedEllipsis = ''
+    let width = 0
+    for (const char of ellipsis) {
+      const charWidth = Math.max(1, stringWidth(char))
+      if (width + charWidth > safeWidth) break
+      clippedEllipsis += char
+      width += charWidth
+    }
+    return clippedEllipsis
+  }
+
+  const contentWidth = safeWidth - ellipsisWidth
+  let output = ''
+  let width = 0
+  for (const char of text) {
+    const charWidth = Math.max(1, stringWidth(char))
+    if (width + charWidth > contentWidth) break
+    output += char
+    width += charWidth
+  }
+
+  return output + ellipsis
+}
+
+export function padEndToDisplayWidth(text: string, targetWidth: number): string {
+  const safeWidth = Math.max(0, Math.floor(targetWidth))
+  let output = text
+  while (getDisplayWidth(output) < safeWidth) {
+    output += ' '
+  }
+  return output
+}
+
+export function formatPastePlaceholder(charCount: number): string {
+  return `[${charCount.toLocaleString()} characters pasted]`
+}
+
+function sortSegments(segments: InputPasteSegment[]): InputPasteSegment[] {
+  return [...segments].sort((a, b) => a.start - b.start)
+}
+
+function sortMentionSegments(
+  segments: InputMentionSegment[],
+): InputMentionSegment[] {
+  return [...segments].sort((a, b) => a.start - b.start)
+}
+
+export function insertPasteSegment(
+  input: InputValue,
+  pastedText: string,
+  id: string,
+): InputValue {
+  const placeholder = formatPastePlaceholder(pastedText.length)
+  const insertAt = Math.max(0, Math.min(input.cursorPosition, input.text.length))
+  const before = input.text.slice(0, insertAt)
+  const after = input.text.slice(insertAt)
+  const delta = placeholder.length
+
+  const shifted = input.pasteSegments.map((segment) => {
+    if (segment.end <= insertAt) return segment
+    return {
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    }
+  })
+
+  return {
+    ...input,
+    text: before + placeholder + after,
+    cursorPosition: insertAt + delta,
+    lastEditDueToNav: false,
+    selectedPasteSegmentId: null,
+    pasteSegments: sortSegments([
+      ...shifted,
+      {
+        id,
+        placeholder,
+        content: pastedText,
+        start: insertAt,
+        end: insertAt + delta,
+      },
+    ]),
+  }
+}
+
+export function reconstituteInputText(input: InputValue): string {
+  if (input.pasteSegments.length === 0) return input.text
+
+  const segments = sortSegments(input.pasteSegments)
+  let cursor = 0
+  let output = ''
+
+  for (const segment of segments) {
+    if (segment.start > cursor) {
+      output += input.text.slice(cursor, segment.start)
+    }
+    output += segment.content
+    cursor = segment.end
+  }
+
+  if (cursor < input.text.length) {
+    output += input.text.slice(cursor)
+  }
+
+  return output
+}
+
+export function applyTextEditWithSegments(
+  input: InputValue,
+  start: number,
+  end: number,
+  insertedText: string,
+): InputValue {
+  const safeStart = Math.max(0, Math.min(start, input.text.length))
+  const safeEnd = Math.max(safeStart, Math.min(end, input.text.length))
+
+  let effectiveStart = safeStart
+  let effectiveEnd = safeEnd
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= safeStart || segment.start >= safeEnd)
+    if (!overlaps) continue
+    effectiveStart = Math.min(effectiveStart, segment.start)
+    effectiveEnd = Math.max(effectiveEnd, segment.end)
+  }
+
+  const nextText =
+    input.text.slice(0, effectiveStart) +
+    insertedText +
+    input.text.slice(effectiveEnd)
+
+  const removed = effectiveEnd - effectiveStart
+  const inserted = insertedText.length
+  const delta = inserted - removed
+
+  const remainingSegments: InputPasteSegment[] = []
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= effectiveStart || segment.start >= effectiveEnd)
+    if (overlaps) {
+      continue
+    }
+    if (segment.end <= effectiveStart) {
+      remainingSegments.push(segment)
+      continue
+    }
+    remainingSegments.push({
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    })
+  }
+
+  const proposedCursor = effectiveStart + inserted
+  let nextCursor = proposedCursor
+  for (const segment of remainingSegments) {
+    if (nextCursor > segment.start && nextCursor < segment.end) {
+      nextCursor = segment.end
+      break
+    }
+  }
+
+  return {
+    ...input,
+    text: nextText,
+    cursorPosition: nextCursor,
+    lastEditDueToNav: false,
+    pasteSegments: sortSegments(remainingSegments),
+    selectedPasteSegmentId: null,
+  }
+}
+
+export function insertMentionSegment(
+  input: InputValue,
+  mention: { path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } },
+  id: string,
+  replaceStart: number,
+  replaceEnd: number,
+): InputValue {
+  const safeStart = Math.max(0, Math.min(replaceStart, input.text.length))
+  const safeEnd = Math.max(safeStart, Math.min(replaceEnd, input.text.length))
+  const lineRangeSuffix =
+    mention.lineRange && mention.contentType !== 'directory'
+      ? `:${mention.lineRange.start}-${mention.lineRange.end}`
+      : ''
+  const placeholder = `@${mention.path}${lineRangeSuffix}`
+  const before = input.text.slice(0, safeStart)
+  const after = input.text.slice(safeEnd)
+  const removed = safeEnd - safeStart
+  const inserted = placeholder.length
+  const delta = inserted - removed
+
+  const shiftedPasteSegments = input.pasteSegments.map((segment) => {
+    if (segment.end <= safeStart) return segment
+    return {
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    }
+  })
+
+  const shiftedMentionSegments = input.mentionSegments.map((segment) => {
+    if (segment.end <= safeStart) return segment
+    return {
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    }
+  })
+
+  return {
+    ...input,
+    text: before + placeholder + after,
+    cursorPosition: safeStart + inserted,
+    lastEditDueToNav: false,
+    pasteSegments: sortSegments(shiftedPasteSegments),
+    mentionSegments: sortMentionSegments([
+      ...shiftedMentionSegments,
+      {
+        id,
+        path: mention.path,
+        contentType: mention.contentType,
+        lineRange: mention.lineRange,
+        start: safeStart,
+        end: safeStart + inserted,
+      },
+    ]),
+    selectedPasteSegmentId: null,
+    selectedMentionSegmentId: null,
+  }
+}
+
+export function applyTextEditWithPastesAndMentions(
+  input: InputValue,
+  start: number,
+  end: number,
+  insertedText: string,
+): InputValue {
+  const safeStart = Math.max(0, Math.min(start, input.text.length))
+  const safeEnd = Math.max(safeStart, Math.min(end, input.text.length))
+
+  let effectiveStart = safeStart
+  let effectiveEnd = safeEnd
+
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= safeStart || segment.start >= safeEnd)
+    if (!overlaps) continue
+    effectiveStart = Math.min(effectiveStart, segment.start)
+    effectiveEnd = Math.max(effectiveEnd, segment.end)
+  }
+
+  for (const segment of input.mentionSegments) {
+    const overlaps = !(segment.end <= safeStart || segment.start >= safeEnd)
+    if (!overlaps) continue
+    effectiveStart = Math.min(effectiveStart, segment.start)
+    effectiveEnd = Math.max(effectiveEnd, segment.end)
+  }
+
+  const nextText =
+    input.text.slice(0, effectiveStart) +
+    insertedText +
+    input.text.slice(effectiveEnd)
+
+  const removed = effectiveEnd - effectiveStart
+  const inserted = insertedText.length
+  const delta = inserted - removed
+
+  const remainingPasteSegments: InputPasteSegment[] = []
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= effectiveStart || segment.start >= effectiveEnd)
+    if (overlaps) continue
+    if (segment.end <= effectiveStart) {
+      remainingPasteSegments.push(segment)
+      continue
+    }
+    remainingPasteSegments.push({
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    })
+  }
+
+  const remainingMentionSegments: InputMentionSegment[] = []
+  for (const segment of input.mentionSegments) {
+    const overlaps = !(segment.end <= effectiveStart || segment.start >= effectiveEnd)
+    if (overlaps) continue
+    if (segment.end <= effectiveStart) {
+      remainingMentionSegments.push(segment)
+      continue
+    }
+    remainingMentionSegments.push({
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    })
+  }
+
+  const proposedCursor = effectiveStart + inserted
+  let nextCursor = proposedCursor
+  for (const segment of sortSegments(remainingPasteSegments)) {
+    if (nextCursor > segment.start && nextCursor < segment.end) {
+      nextCursor = segment.end
+      break
+    }
+  }
+  for (const segment of sortMentionSegments(remainingMentionSegments)) {
+    if (nextCursor > segment.start && nextCursor < segment.end) {
+      nextCursor = segment.end
+      break
+    }
+  }
+
+  return {
+    ...input,
+    text: nextText,
+    cursorPosition: nextCursor,
+    lastEditDueToNav: false,
+    pasteSegments: sortSegments(remainingPasteSegments),
+    mentionSegments: sortMentionSegments(remainingMentionSegments),
+    selectedPasteSegmentId: null,
+    selectedMentionSegmentId: null,
+  }
+}
+
+export function reconstituteInputTextWithMentions(
+  input: InputValue,
+): {
+  text: string
+  mentions: Array<{ path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }>
+} {
+  const text = reconstituteInputText(input)
+  const seen = new Set<string>()
+  const mentions: Array<{
+    path: string
+    contentType: 'text' | 'directory'
+    lineRange?: { start: number; end: number }
+  }> = []
+
+  for (const segment of input.mentionSegments) {
+    const path = segment.path.trim()
+    const key = `${path}|${segment.contentType}`
+    if (!path || seen.has(key)) continue
+    seen.add(key)
+    mentions.push({
+      path: segment.path,
+      contentType: segment.contentType,
+      lineRange: segment.lineRange,
+    })
+  }
+
+  return { text, mentions }
+}
+
+/**
+ * Truncate a command to a single line for display.
+ * Flattens newlines to spaces, collapses whitespace, truncates with '...' if over maxLen.
+ */
+export function shortenCommandPreview(commandText: string, maxLen: number): string {
+  const singleLine = commandText.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim()
+  if (singleLine.length > maxLen) {
+    return singleLine.slice(0, maxLen - 3) + '...'
+  }
+  return singleLine
+}
+
+/**
+ * Find indices where substring characters appear in string (for fuzzy matching).
+ */
+export function locateSubsequence(
+  source: string,
+  query: string,
+): number[] | null {
+  let sourceIndex = 0
+  let queryIndex = 0
+  const matchedIndices: number[] = []
+
+  while (sourceIndex < source.length && queryIndex < query.length) {
+    if (source[sourceIndex] === query[queryIndex]) {
+      matchedIndices.push(sourceIndex)
+      queryIndex++
+    }
+    sourceIndex++
+  }
+
+  return queryIndex >= query.length ? matchedIndices : null
+}
+
+/**
+ * Truncate text to a maximum number of lines, adding '...' if truncated.
+ * Returns the input unchanged if it's null/undefined/empty.
+ */
+export function clipTextLines(
+  text: string | null | undefined,
+  maxVisibleLines: number,
+): string | null | undefined {
+  if (!text) return text
+  const lines = text.split('\n')
+  if (lines.length > maxVisibleLines) {
+    return lines.slice(0, maxVisibleLines).join('\n').trimEnd() + '...'
+  }
+  return text
+}
+
+/**
+ * Format a timestamp as HH:MM (no seconds)
+ */
+export function formatShortTimestamp(ts: number): string {
+  const date = new Date(ts)
+  const minutes = date.getMinutes().toString().padStart(2, '0')
+  const hours = date.getHours().toString().padStart(2, '0')
+  return `${hours}:${minutes}`
+}
+
+/**
+ * Format a timestamp as HH:MM:SS
+ */
+export function formatFullTimestamp(ts: number): string {
+  const date = new Date(ts)
+  const seconds = date.getSeconds().toString().padStart(2, '0')
+  const minutes = date.getMinutes().toString().padStart(2, '0')
+  const hours = date.getHours().toString().padStart(2, '0')
+  return `${hours}:${minutes}:${seconds}`
+}
+
+// ---------------------------------------------------------------------------
+// Line range utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Expand a single-line spec by ±10 lines, clamped to [1, totalLines].
+ * If totalLines is unknown (undefined), clamps only to minimum of 1.
+ *
+ * Examples:
+ *   expandLineRange({ start: 42, end: 42 }, 200)  → { start: 32, end: 52 }
+ *   expandLineRange({ start: 5, end: 5 }, 100)    → { start: 1, end: 15 }
+ *   expandLineRange({ start: 1, end: 1 }, 50)     → { start: 1, end: 11 }
+ *   expandLineRange({ start: 100, end: 100 }, 50) → { start: 41, end: 50 }
+ *   expandLineRange({ start: 10, end: 20 }, 100)  → { start: 10, end: 20 }  // no change
+ */
+export function expandLineRange(
+  lineRange: { start: number; end: number },
+  totalLines?: number,
+): { start: number; end: number } {
+  // Only expand single-line specs (start === end)
+  if (lineRange.start !== lineRange.end) {
+    return lineRange;
+  }
+
+  const line = lineRange.start;
+  const start = Math.max(1, line - 10);
+  const end = totalLines !== undefined ? Math.min(totalLines, line + 10) : line + 10;
+
+  return { start, end };
+}

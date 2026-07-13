@@ -1,0 +1,21 @@
+{
+  "name": "@magnitudedev/storage",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bunx --bun vitest run src/types/session.test.ts"
+  },
+  "dependencies": {
+    "@magnitudedev/scratchpad": "workspace:*",
+    "@effect/platform": "^0.83.0 || ^0.84.0",
+    "effect": "^3.21.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "vitest": "^3.2.4"
+  }
+}

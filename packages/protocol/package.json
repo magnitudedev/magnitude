@@ -1,0 +1,13 @@
+{
+  "name": "@magnitudedev/protocol",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@magnitudedev/utils": "workspace:*",
+    "effect": "^3.21.2",
+    "@effect/rpc": "0.75.1"
+  }
+}

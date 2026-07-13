@@ -1,0 +1,3 @@
+## Available skills
+
+Skills provide detailed methodologies for specific types of work. Use the `skill` tool to activate a skill and load its full guidance into context.

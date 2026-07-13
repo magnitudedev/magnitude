@@ -1,0 +1,520 @@
+/* Global styles — scrollbars, animations, resets */
+/* Spec §11 keyframes + Appendix scrollbar styles */
+
+@import "./vars.css";
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--fg-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--fg-placeholder);
+  opacity: 1;
+}
+
+:root[data-desktop-platform="darwin"] {
+  --bg-sidebar-window: rgba(22, 25, 31, 0.86);
+  --border-sidebar: rgba(30, 41, 59, 0.68);
+}
+
+:root[data-desktop-platform="darwin"],
+:root[data-desktop-platform="darwin"] body,
+:root[data-desktop-platform="darwin"] #root {
+  background: transparent;
+}
+
+.sidebar-window-drag-region {
+  display: none;
+}
+
+:root[data-desktop-platform="darwin"] .sidebar-window-drag-region {
+  display: block;
+  height: 38px;
+  flex-shrink: 0;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+:root[data-desktop-platform="darwin"] .sidebar-header {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+:root[data-desktop-platform="darwin"] .chat-title-bar {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+:root[data-desktop-platform="darwin"] button,
+:root[data-desktop-platform="darwin"] input,
+:root[data-desktop-platform="darwin"] select,
+:root[data-desktop-platform="darwin"] textarea,
+:root[data-desktop-platform="darwin"] [role="button"],
+:root[data-desktop-platform="darwin"] .search-input-container,
+:root[data-desktop-platform="darwin"] .session-item,
+:root[data-desktop-platform="darwin"] .session-list,
+:root[data-desktop-platform="darwin"] .sidebar-account,
+:root[data-desktop-platform="darwin"] .sidebar-resize-handle {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.chat-title-bar {
+  height: 44px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border-subtle);
+  user-select: none;
+}
+
+.chat-title-bar-title {
+  min-width: 0;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-primary);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+/* Scrollbars — spec Appendix */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-default) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-hover);
+}
+
+/* Animations — spec §11 */
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes thinking-pulse {
+  0% {
+    opacity: 0.6;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  51%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes compacting-wave {
+  0% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes context-pulse {
+  0%,
+  100% {
+    opacity: 0.7;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes slide-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* Animation utility classes */
+.animate-pulse-dot {
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+.animate-thinking-pulse {
+  animation: thinking-pulse 0.8s ease-in-out infinite alternate;
+}
+.animate-blink {
+  animation: blink 1s step-end infinite;
+}
+.animate-toast-in {
+  animation: toast-in 150ms ease-out;
+}
+.animate-fade-in {
+  animation: fade-in 100ms ease-out;
+}
+.animate-slide-in-right {
+  animation: slide-in-right 150ms ease-out;
+}
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+.animate-shimmer {
+  animation: shimmer 1.5s infinite;
+}
+
+/* Focus indicator — 1px dashed outline on buttons (spec Appendix: Accessibility) */
+button:focus-visible {
+  outline: 1px dashed var(--accent-primary);
+  outline-offset: 1px;
+}
+
+/* Focus indicator for interactive elements (non-button/input) */
+[tabindex]:focus-visible {
+  outline: 1px dashed var(--accent-primary);
+  outline-offset: 1px;
+}
+
+/* ── Interaction utility classes ── */
+/* Replace inline onMouseEnter/onMouseLeave style mutation, which desyncs
+   React's vdom from the actual DOM and causes flicker on re-render. */
+
+/* Transparent background that elevates on hover */
+.hover-surface {
+  background: transparent;
+}
+.hover-surface:hover {
+  background: var(--bg-surface-elevated);
+}
+
+/* Surface background that elevates on hover (e.g. submit button) */
+.hover-surface-raised {
+  background: var(--bg-surface);
+}
+.hover-surface-raised:hover {
+  background: var(--bg-surface-elevated);
+}
+
+.composer-send-button {
+  background: var(--bg-surface);
+}
+.composer-send-button:hover {
+  background: var(--bg-surface);
+}
+.composer-send-arrow {
+  transition: color 100ms;
+}
+.composer-send-button[data-can-send="true"]:hover .composer-send-arrow {
+  color: var(--fg-primary) !important;
+}
+
+/* Transparent → flat surface on hover (header icon buttons) */
+.hover-surface-flat:hover {
+  background: var(--bg-surface);
+}
+
+/* Transparent background that tints red on hover (destructive ghost items) */
+.hover-danger {
+  background: transparent;
+}
+.hover-danger:hover {
+  background: var(--tint-error);
+}
+
+/* Danger button — transparent → error tint on hover, text → fg-primary (bordered danger buttons) */
+.hover-danger-button {
+  background: transparent;
+}
+.hover-danger-button:hover {
+  background: var(--tint-error-hover);
+  color: var(--fg-primary);
+}
+
+/* Text color elevates on hover (close buttons, icon buttons) */
+.hover-fg {
+  color: var(--fg-secondary);
+}
+.hover-fg:hover {
+  color: var(--fg-primary);
+}
+
+/* Tertiary text → secondary on hover (disclosure toggles) */
+.hover-fg-tertiary {
+  color: var(--fg-tertiary);
+}
+.hover-fg-tertiary:hover {
+  color: var(--fg-secondary);
+}
+
+/* Copy button — tertiary → primary on hover, unless already copied (success color) */
+.hover-fg-copy {
+  color: var(--fg-tertiary);
+}
+.hover-fg-copy:hover {
+  color: var(--fg-primary);
+}
+.hover-fg-copy[data-copied="true"] {
+  color: var(--accent-success);
+}
+.hover-fg-copy[data-copied="true"]:hover {
+  color: var(--accent-success);
+}
+
+/* Primary button — slight opacity reduction on hover (when not disabled) */
+.hover-opacity[data-disabled="false"]:hover {
+  opacity: 0.9;
+}
+
+/* Outline button — border + color elevate on hover */
+.hover-outline {
+  border-color: var(--border-default);
+  color: var(--fg-secondary);
+}
+.hover-outline:hover {
+  border-color: var(--border-hover);
+  color: var(--fg-primary);
+}
+
+/* Border + color shift to accent on hover (load-previous, new-session) */
+.hover-border-accent {
+  border-color: var(--border-default);
+  color: var(--fg-secondary);
+}
+.hover-border-accent:hover {
+  border-color: var(--accent-primary);
+  color: var(--fg-primary);
+}
+
+/* Markdown link — underline on hover */
+.md-link {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+.md-link:hover {
+  text-decoration: underline;
+}
+
+/* Input focus border — transitions to accent when not in error state */
+.hover-focus-border {
+  border-color: var(--border-default);
+}
+.hover-focus-border:focus {
+  border-color: var(--accent-primary);
+}
+.hover-focus-border[data-error="true"] {
+  border-color: var(--accent-error);
+}
+
+/* ── Shared structural classes ── */
+
+/* Popover / floating menu container */
+.popover {
+  position: absolute;
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  z-index: 30;
+}
+
+/* Menu item — row in a dropdown / popup menu.
+   Use data-selected="true" for the active/selected row. */
+.menu-item {
+  height: 32px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  background: transparent;
+  border-left: 2px solid transparent;
+}
+.menu-item:hover {
+  background: var(--bg-surface-elevated);
+}
+.menu-item[data-selected="true"] {
+  background: var(--bg-surface);
+  border-left-color: var(--accent-primary);
+}
+
+/* Session list item — extends with selected + hover states.
+   Use data-selected="true" for the active session. */
+.session-item {
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+  transition: background 100ms;
+  background: transparent;
+  border-left: none;
+  display: flex;
+}
+.session-item:hover {
+  background: var(--bg-surface-elevated);
+}
+.session-item[data-selected="true"] {
+  background: var(--bg-surface-elevated);
+}
+/* When selected, hover should not change background (already elevated) */
+.session-item[data-selected="true"]:hover {
+  background: var(--bg-surface-elevated);
+}
+
+/* Respect prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Responsive behavior — spec §12 ── */
+
+/* ≤640px: Hide docked sidebar (JS toggles overlay mode) */
+@media (max-width: 640px) {
+  .sessions-sidebar:not([data-overlay]) {
+    display: none;
+  }
+  .sidebar-resize-handle {
+    display: none;
+  }
+}
+
+/* <800px: File viewer — full-width overlay instead of docked panel */
+@media (max-width: 800px) {
+  .file-viewer-panel {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+}
+
+/* <700px: Settings/Usage panels — full width */
+@media (max-width: 700px) {
+  .settings-panel {
+    width: 90vw !important;
+    max-width: 90vw !important;
+  }
+}
+
+/* <600px: Hide task list token counts */
+@media (max-width: 600px) {
+  .task-row-token-count {
+    display: none;
+  }
+}
+
+/* <500px: Hide model summary in chat header */
+@media (max-width: 500px) {
+  .chat-header-model {
+    display: none;
+  }
+}
+
+/* ≤640px: Composer — reduce padding for narrow screens */
+@media (max-width: 640px) {
+  .composer-box {
+    padding: 8px !important;
+  }
+}

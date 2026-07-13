@@ -1,0 +1,19 @@
+/**
+ * Non-color CSS variables — fonts, rgba overlays, and other values
+ * that cannot be derived from palette.ts.
+ *
+ * All color values are generated at runtime from palette.ts via
+ * `generate-css-vars.ts` and injected as CSS custom properties on `:root`.
+ *
+ * Spec §7.2 (color system) and §7.3 (typography).
+ */
+
+:root {
+  /* Backgrounds — non-palette rgba values */
+  --bg-overlay: rgba(0, 0, 0, 0.72); /* modal backdrop */
+
+  /* Fonts */
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-logo: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}

@@ -1,0 +1,96 @@
+import { useMemo } from "react"
+import { Atom, useAtomMount, useAtomSet } from "@effect-atom/atom-react"
+import { Cause, Effect, Fiber, Layer, Stream } from "effect"
+import { RpcClient } from "@effect/rpc"
+import { FetchHttpClient } from "@effect/platform"
+import {
+  MagnitudeRpcs,
+  recoveringProtocolLayer,
+  type ActiveSessionStatus,
+  type ActiveSessionStatuses,
+  type ActiveSessionStatusesWireEvent,
+  type DaemonSpawnerTag,
+} from "@magnitudedev/sdk"
+import { usePlatform } from "../platform/platform-context"
+
+export type ActiveSessionStatusById = Readonly<Record<string, ActiveSessionStatus>>
+
+export const activeSessionStatusesAtom = Atom.make<ActiveSessionStatusById>({})
+
+interface ActiveSessionStatusCallbacks {
+  readonly onSnapshot: (snapshot: ActiveSessionStatuses) => void
+}
+
+let currentFiber: Fiber.RuntimeFiber<void, unknown> | null = null
+
+const buildStreamLayer = (daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>) =>
+  recoveringProtocolLayer().pipe(
+    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, daemonSpawnerLayer)),
+  )
+
+const isSnapshot = (event: ActiveSessionStatusesWireEvent): event is ActiveSessionStatuses =>
+  !("_tag" in event && event._tag === "heartbeat")
+
+const toStatusById = (snapshot: ActiveSessionStatuses): ActiveSessionStatusById => {
+  const byId: Record<string, ActiveSessionStatus> = {}
+  for (const status of snapshot.sessions) {
+    byId[status.sessionId] = status
+  }
+  return byId
+}
+
+export function subscribeActiveSessionStatuses(
+  daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>,
+  callbacks: ActiveSessionStatusCallbacks,
+): void {
+  interruptActiveSessionStatuses()
+
+  const effect = Effect.gen(function* () {
+    const client = yield* RpcClient.make(MagnitudeRpcs)
+    yield* client.StreamActiveSessionStatuses({}).pipe(
+      Stream.filter(isSnapshot),
+      Stream.tap((snapshot) => Effect.sync(() => callbacks.onSnapshot(snapshot))),
+      Stream.runDrain,
+    )
+  }).pipe(
+    Effect.catchAllCause((cause) =>
+      Effect.logError(`StreamActiveSessionStatuses error: ${Cause.pretty(cause)}`),
+    ),
+    Effect.scoped,
+    Effect.provide(buildStreamLayer(daemonSpawnerLayer)),
+  )
+
+  currentFiber = Effect.runFork(effect)
+}
+
+export function interruptActiveSessionStatuses(): void {
+  if (currentFiber) {
+    Effect.runFork(Fiber.interrupt(currentFiber))
+    currentFiber = null
+  }
+}
+
+export function useActiveSessionStatusesSubscription(): void {
+  const platform = usePlatform()
+  const setStatuses = useAtomSet(activeSessionStatusesAtom)
+
+  const subscriptionAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          subscribeActiveSessionStatuses(platform.daemonSpawnerLayer, {
+            onSnapshot: (snapshot) => setStatuses(toStatusById(snapshot)),
+          })
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              interruptActiveSessionStatuses()
+              setStatuses({})
+            }),
+          )
+        }),
+      ),
+    [platform.daemonSpawnerLayer, setStatuses],
+  )
+
+  useAtomMount(subscriptionAtom)
+}

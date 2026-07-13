@@ -1,0 +1,18 @@
+import { describe, test, expect } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+describe('AgentLifecycle lifecycle wiring', () => {
+  test('worker_user_killed disposes fork', () => {
+    const source = readFileSync(join(import.meta.dir, '..', 'agent-lifecycle.ts'), 'utf8')
+    expect(source.includes('worker_user_killed: (event')).toBe(true)
+    expect(source.includes('yield* execManager.disposeFork(event.forkId)')).toBe(true)
+  })
+
+  test('worker_idle_closed disposes fork without waking coordinator fork', () => {
+    const source = readFileSync(join(import.meta.dir, '..', 'agent-lifecycle.ts'), 'utf8')
+    expect(source.includes('worker_idle_closed: (event)')).toBe(true)
+    expect(source.includes('yield* execManager.disposeFork(event.forkId)')).toBe(true)
+    expect(source.includes("worker_idle_closed: (event) => Effect.gen(function* () {\n      const execManager = yield* ExecutionManager\n      yield* execManager.disposeFork(event.forkId)\n    }).pipe(Effect.orDie),")).toBe(true)
+  })
+})
