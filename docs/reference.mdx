@@ -1,0 +1,112 @@
+---
+title: Reference
+description: "Commands, shortcuts, configuration, and file layout"
+icon: book-open
+---
+
+## Slash commands
+
+| Command | Aliases | Description |
+|---|---|---|
+| `/new` | | Start a new conversation |
+| `/resume` | | Open recent conversations |
+| `/exit` | `/quit`, `/q` | Exit Magnitude |
+| `/bash` | | Enter bash mode |
+| `/init` | | Generate AGENTS.md for your project |
+| `/settings` | `/s` | Open settings |
+| `/usage` | | View balance, spend, and top-up history |
+
+Type `/` to see all available commands with autocomplete.
+
+## Keyboard shortcuts
+
+| Shortcut | Context | Action |
+|---|---|---|
+| `Enter` | Chat input | Send message |
+| `Shift+Enter` | Chat input | New line |
+| `Ctrl+C` | Streaming | Interrupt |
+| `Ctrl+C` | Idle (2x) | Exit |
+| `Esc` | Running agents | Interrupt agents (2x to kill all) |
+| `Ctrl+R` | Any | Toggle recent conversations |
+
+### Multiline input
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+A` | Jump to start of line |
+| `Ctrl+E` | Jump to end of line |
+| `Ctrl+U` | Delete everything before cursor on current line |
+| `Ctrl+K` | Delete everything after cursor on current line |
+| `Ctrl+W` | Delete the word before cursor |
+| `Ctrl+D` | Delete the word after cursor |
+| `Ctrl+Y` | Paste back the last deleted text |
+
+## File mentions
+
+Type `@` in the input to mention files or directories. A picker appears with project file autocomplete. Mentioned files are included as context for the agent.
+
+You can also paste or drag images into the input. Large text pastes (over 1000 characters) are automatically collapsed into paste segments.
+
+## Workspace
+
+Each session runs inside a workspace, referenced as `$M`. The workspace is per-session and ephemeral. Agents use it for scratch work, plans, and shared context between workers.
+
+Assistant messages can include clickable file links:
+
+- Project files: `[app](cli/src/app.tsx)`
+- Workspace files: `[plan]($M/plan.md)`
+- Heading links: `[Approach]($M/plan.md#Approach)`
+
+## Sessions
+
+Magnitude saves every conversation automatically. Resume in three ways:
+
+- `magnitude --resume` resumes the most recent session immediately
+- `/resume` opens a picker of recent conversations
+- `Ctrl+R` opens the same recent conversations overlay
+
+When a conversation gets long, Magnitude compacts context automatically using LLM-driven summarization. The session continues without interruption. Each agent compacts its context independently.
+
+### Session inspection
+
+Inspect past sessions from the command line:
+
+```bash
+bun session list                                    # list recent sessions
+bun session events <id>                             # list events for a session
+bun session search <keyword> --last 5               # search across recent sessions
+```
+
+## AGENTS.md
+
+Run `/init` to generate an `AGENTS.md` file in your project. This is project context the agents read when working in your repo: conventions, architecture notes, what to do and what to avoid.
+
+Edit `AGENTS.md` like any other file. The agents will pick up your changes on the next session.
+
+## API key
+
+Run `/settings` (or `/s`) to update your API key. You can also set it as an environment variable:
+
+```sh
+export MAGNITUDE_API_KEY=...
+```
+
+## Bash mode
+
+Run shell commands directly without leaving Magnitude. Enter bash mode with `/bash` or by starting your input with `!`.
+
+## The .magnitude directory
+
+Magnitude creates `~/.magnitude/` automatically to store local state.
+
+| Path | Purpose |
+|---|---|
+| `auth.json` | Stored credentials (file permissions `600`) |
+| `config.json` | Preferences and global settings |
+| `sessions/` | Conversation history |
+| `logs/` | CLI and event logs |
+| `traces/` | Debug trace data when tracing is enabled |
+
+Delete `auth.json` to clear saved credentials and re-authenticate.
+
+You can also drop a `.magnitude/` directory inside your project for project-scoped state.

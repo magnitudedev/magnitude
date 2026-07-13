@@ -1,0 +1,38 @@
+---
+title: Benchmark
+description: "Terminal-Bench 2.1 results"
+icon: chart-column
+---
+
+Terminal-Bench 2.1 is the latest version of the standard agentic coding benchmark: 89 tasks, 5 trials each, 445 total runs. We ran Magnitude alongside Claude Code and OpenCode, all using the same model (GLM-5.2), and compared against Anthropic's official Claude Code + Opus 4.8 run from the tbench.ai leaderboard.
+
+## Results
+
+| Agent | Model | Success Rate | Cost / success |
+|---|---|---|---|
+| Claude Code | Opus 4.8 | **78.9%** (351/445) | ~$1.20 |
+| **Magnitude** | GLM-5.2 | **75.5%** (336/445) | **$0.42** |
+| Claude Code | GLM-5.2 | 70.8% (315/445) | $0.60 |
+| OpenCode | GLM-5.2 | 50.8% (226/445) | $0.59 |
+
+Magnitude is the highest-performing GLM-5.2 agent, beating Claude Code on the same model by 4.7 points, with the best cost per successful trial (\$0.42). Against Claude Code on Opus 4.8, Magnitude trails by 3.4 points but at roughly one-third the cost per success.
+
+## Cost efficiency
+
+| Cost component | Magnitude | Claude Code | OpenCode |
+|---|---|---|---|
+| Uncached input | $23.11 | $92.74 | $38.11 |
+| Cached input | $79.69 | $54.68 | $68.96 |
+| Output | $39.04 | $43.09 | $27.10 |
+| **Total** | **$141.84** | **$190.51** | **$134.17** |
+
+The Opus 4.8 run costs ~\$420.67 (corrected from tbench.ai; see methodology), nearly 3x Magnitude's cost for a 3.4 point improvement.
+
+## Methodology
+
+- **Benchmark:** Terminal-Bench 2.1, 89 tasks, 5 trials each, 445 total
+- **Infrastructure:** All GLM-5.2 runs on identical task set via Fireworks serverless endpoint
+- **Success classification:** `verifier_result.rewards.reward > 0` = pass
+- **GLM-5.2 cost:** `(uncached_input × \$1.40 + cached_input × \$0.14 + output × \$4.40) / 1M`
+- **Opus 4.8 cost:** Corrected from tbench.ai leaderboard, which charged cached input at \$0/M instead of the real \$0.50/M cache-read rate. Corrected total adds ~\$132.58 in cache-read costs. This is a floor; 6 trials are missing from tbench.ai data.
+
