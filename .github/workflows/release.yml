@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    branches: [main, release/alpha, release/beta]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            os: macos-latest
+            artifact: release-darwin-arm64
+          - target: bun-darwin-x64
+            os: macos-15-intel
+            artifact: release-darwin-x64
+          - target: bun-linux-x64-baseline
+            os: ubuntu-latest
+            artifact: release-linux-x64
+          - target: bun-linux-arm64
+            os: ubuntu-24.04-arm
+            artifact: release-linux-arm64
+          - target: bun-windows-x64
+            os: windows-latest
+            artifact: release-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+      - run: bun run scripts/build-release-artifacts.ts ${{ matrix.target }} release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify release artifact count
+        shell: bash
+        run: |
+          test "$(find release -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = "2"
+          CLI_TARBALL=$(find release -maxdepth 1 -name 'magnitude-*.tar.gz' ! -name 'magnitude-acn-*.tar.gz' -print)
+          ACN_TARBALL=$(find release -maxdepth 1 -name 'magnitude-acn-*.tar.gz' -print)
+          tar -tzf "$CLI_TARBALL"
+          tar -tzf "$ACN_TARBALL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*.tar.gz
+
+  release:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+
+      - name: Verify downloaded release assets
+        shell: bash
+        run: |
+          CLI_COUNT=$(find release-artifacts -name 'magnitude-*.tar.gz' ! -name 'magnitude-acn-*.tar.gz' | wc -l | tr -d ' ')
+          ACN_COUNT=$(find release-artifacts -name 'magnitude-acn-*.tar.gz' | wc -l | tr -d ' ')
+          test "$CLI_COUNT" = "5"
+          test "$ACN_COUNT" = "5"
+          find release-artifacts -name '*.tar.gz' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Changesets
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          publish: bun run publish
+          createGithubReleases: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Attach binaries to GitHub Release
+        if: steps.changesets.outputs.published == 'true'
+        shell: bash
+        run: |
+          VERSION=$(node -e "console.log(require('./packages/cli/package.json').version)")
+          TAG="@magnitudedev/cli@${VERSION}"
+          for f in release-artifacts/**/*.tar.gz; do
+            gh release upload "$TAG" "$f" --clobber
+          done
+          gh release upload "$TAG" SHA256SUMS --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+

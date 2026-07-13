@@ -1,0 +1,6 @@
+## Skills
+
+Skills are markdown files that capture preferred workflows. They can be "activated" with your skill tool. Upon activating, the skill's content is shown to you.
+Use skills instinctively whenever their trigger condition is met or whenever you suspect they might be relevant.
+
+{{SKILLS_SECTION}}

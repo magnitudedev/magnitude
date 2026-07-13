@@ -1,0 +1,15 @@
+diff --git a/index-nkrr8a4c.js b/index-nkrr8a4c.js
+index e63fb1c9c947b533fedb1a8d6b1b149ca48b0594..149f2257547cf13b25076bb0b6c382b3218ef371 100644
+--- a/index-nkrr8a4c.js
++++ b/index-nkrr8a4c.js
+@@ -15165,7 +15165,9 @@ class RootRenderable extends Renderable {
+     if (!this.visible)
+       return;
+     for (const renderable of this._ctx.getLifecyclePasses()) {
+-      renderable.onLifecyclePass?.call(renderable);
++      if (!renderable.isDestroyed) {
++        renderable.onLifecyclePass?.call(renderable);
++      }
+     }
+     if (this.yogaNode.isDirty()) {
+       this.calculateLayout();

@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/react",
+    "paths": {
+      "@magnitudedev/agent": ["./packages/agent/src"],
+      "@magnitudedev/roles": ["./packages/roles/src"],
+      "@magnitudedev/roles/constants": ["./packages/roles/src/constants"],
+      "@magnitudedev/event-core": ["./packages/event-core/src"],
+
+      "@magnitudedev/ai": ["./packages/ai/src"],
+      "@magnitudedev/providers": ["./packages/providers/src"],
+
+      "@magnitudedev/scratchpad": ["./packages/scratchpad/src"],
+      "@magnitudedev/protocol": ["./packages/protocol/src"],
+      "@magnitudedev/sdk": ["./packages/sdk/src"],
+      "@magnitudedev/storage": ["./packages/storage/src"],
+      "@magnitudedev/acn": ["./packages/acn/src"],
+      "@magnitudedev/version": ["./packages/version/src"],
+      "@magnitudedev/utils": ["./packages/utils/src"],
+      "@magnitudedev/utils/*": ["./packages/utils/src/*"],
+      "@magnitudedev/generate-id": ["./packages/generate-id/src"],
+      "@magnitudedev/ripgrep": ["./packages/ripgrep/src"],
+      "@magnitudedev/client-common": ["./packages/client-common/src"]
+    },
+    "plugins": [
+      { "name": "@effect/language-service" }
+    ]
+    },
+    "$schema": "https://raw.githubusercontent.com/Effect-TS/language-service/refs/heads/main/schema.json"
+}

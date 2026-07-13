@@ -1,0 +1,61 @@
+/**
+ * sage-core Public API
+ *
+ * Core Concepts:
+ * - Event: Persisted fact, replayed during hydration
+ * - Signal: Ephemeral notification, NOT replayed
+ * - FSM: Type-safe state machine with Data.TaggedClass
+ * - Projection: Stateful handler for events + signals
+ * - Worker: Stateless effect handler for events or signals
+ * - EventEngine: Composition of projections and workers
+ */
+
+// Core types
+export * from './types'
+export { HydrationContext } from './core/hydration-context'
+export { EventSinkTag, makeEventSinkLayer, type EventSinkService } from './core/event-sink'
+export { InterruptCoordinator, InterruptCoordinatorLive, type InterruptBaseline, type InterruptCoordinator as InterruptCoordinatorService } from './core/interrupt-coordinator'
+export { ProjectionBusTag, makeProjectionBusLayer, type ProjectionBusService } from './core/projection-bus'
+export { AmbientServiceTag, makeAmbientServiceLayer, type AmbientService } from './core/ambient-service'
+export { WorkerBusTag, makeWorkerBusLayer, type WorkerBusService } from './core/worker-bus'
+export { EventBusCoreTag, makeEventBusCoreLayer, type EventBusCoreService, type BaseEvent, type Timestamped } from './core/event-bus-core'
+export { EventCursorSchema, cursorFromEvent, isCursorEvent, type EventCursor } from './core/event-cursor'
+export {
+  FrameworkError,
+  FrameworkErrorPubSub,
+  FrameworkErrorPubSubLive,
+  FrameworkErrorReporter,
+  FrameworkErrorReporterLive,
+  type FrameworkErrorReporterService
+} from './core/framework-error'
+
+// Main API modules
+export * as Ambient from './ambient/index'
+export * as Signal from './signal/index'
+// FSM has been moved to @magnitudedev/utils
+// export * as FSM from './fsm/index'
+export * as Projection from './projection/index'
+export * as Worker from './worker/index'
+export * as EventEngine from './event-engine/index'
+export { type ProjectionSnapshotEnvelope } from './event-engine/index'
+export {
+  ProjectionSnapshotServiceTag,
+  ProjectionSnapshotEnvelopeInvalid,
+  ProjectionSnapshotProjectionSetMismatch,
+  ProjectionSnapshotProjectionInvalid,
+  type ProjectionSnapshotInvalid,
+  type ProjectionSnapshotRestorePlan,
+  type ProjectionSnapshotService
+} from './event-engine/index'
+export * as Surface from './surface/index'
+export * as Display from './display/index'
+export * as Addressed from './addressed/index'
+export * as Introspection from './introspection/index'
+// Flow is unused legacy — commented out
+// export * as Flow from './flow/index'
+export * as Fork from './fork/index'
+
+// Convenience exports
+export { type PublishFn, type WorkerReadFn } from './worker/index'
+export { type ReadFn, type AmbientReader } from './projection/index'
+export { type ForkedState } from './projection/defineForked'

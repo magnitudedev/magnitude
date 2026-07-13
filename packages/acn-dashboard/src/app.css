@@ -1,0 +1,614 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #101114;
+  color: #e7e9ee;
+  --bg: #101114;
+  --panel: #17191f;
+  --panel-2: #1e2129;
+  --border: #30343f;
+  --muted: #8e96a8;
+  --text: #e7e9ee;
+  --blue: #5ca7ff;
+  --green: #5bd49b;
+  --yellow: #f3c969;
+  --red: #ff746f;
+  --purple: #c38cff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+button,
+select {
+  font: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+main {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  background: var(--bg);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 64px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: #14161b;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.mark {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 4px rgba(91, 212, 155, 0.13);
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+h2 {
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+h3 {
+  margin: 14px;
+  font-size: 14px;
+}
+
+.brand p {
+  margin-top: 2px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+select,
+.controls button {
+  height: 34px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 6px;
+}
+
+select {
+  min-width: 220px;
+  padding: 0 10px;
+}
+
+.controls button {
+  min-width: 34px;
+  padding: 0 11px;
+  cursor: pointer;
+}
+
+.controls button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.controls .icon-button {
+  width: 34px;
+  padding: 0;
+}
+
+.controls .danger {
+  border-color: rgba(255, 116, 111, 0.55);
+  color: var(--red);
+  background: rgba(255, 116, 111, 0.09);
+}
+
+.status {
+  min-width: 82px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.status[data-state="live"] {
+  color: var(--green);
+  border-color: rgba(91, 212, 155, 0.45);
+}
+
+.status[data-state="error"] {
+  color: var(--red);
+  border-color: rgba(255, 116, 111, 0.45);
+}
+
+.banner {
+  padding: 8px 16px;
+  color: #260f0f;
+  background: var(--red);
+  font-size: 13px;
+}
+
+.notice {
+  padding: 8px 16px;
+  color: var(--green);
+  background: rgba(91, 212, 155, 0.1);
+  border-bottom: 1px solid rgba(91, 212, 155, 0.22);
+  font-size: 13px;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: 240px 260px minmax(720px, 1fr);
+  flex: 1;
+  min-height: 0;
+}
+
+.sessions,
+.clients,
+.dashboard {
+  min-width: 0;
+  min-height: 0;
+}
+
+.sessions,
+.clients {
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  background: #13151a;
+}
+
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pane-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.empty {
+  padding: 20px 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.session-list,
+.client-list,
+.projection-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.session-list button,
+.client-list button,
+.projection-list button {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 0;
+  border-bottom: 1px solid rgba(48, 52, 63, 0.65);
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.session-list button:hover,
+.session-list button.selected,
+.client-list button:hover,
+.client-list button.active,
+.client-list button.locked,
+.projection-list button:hover,
+.projection-list button.selected {
+  background: var(--panel-2);
+}
+
+.client-list button.active {
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
+.client-list button.locked {
+  background: rgba(92, 167, 255, 0.12);
+}
+
+.session-list strong,
+.client-list strong,
+.projection-list strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-list span,
+.session-list small,
+.client-list span,
+.client-list small,
+.projection-list span,
+.projection-list small {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.summary-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.metric {
+  padding: 12px 14px;
+  background: var(--panel);
+}
+
+.metric span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.metric strong {
+  display: block;
+  margin-top: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 18px;
+}
+
+.tabs {
+  display: flex;
+  min-height: 42px;
+  border-bottom: 1px solid var(--border);
+  background: #14161b;
+}
+
+.tabs button {
+  min-width: 132px;
+  padding: 0 16px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.tabs button:hover,
+.tabs button.active {
+  color: var(--text);
+  background: var(--panel);
+}
+
+.tabs button.active {
+  box-shadow: inset 0 -2px 0 var(--blue);
+}
+
+.atlas-layout {
+  display: grid;
+  grid-template-columns: minmax(480px, 1fr) 340px;
+  flex: 1;
+  min-height: 0;
+}
+
+.atlas-panel,
+.atlas-inspector,
+.projection-browser,
+.json-panel,
+.activity-panel {
+  min-width: 0;
+  min-height: 0;
+}
+
+.atlas-panel,
+.json-panel,
+.activity-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.atlas-inspector {
+  overflow: auto;
+  border-left: 1px solid var(--border);
+  background: #13151a;
+  padding-bottom: 16px;
+}
+
+.map-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.map-head div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.map-head span,
+.map-head em {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.projection-inspection {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+}
+
+.projection-browser {
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  background: #13151a;
+}
+
+.json-panel pre {
+  flex: 1;
+  min-height: 0;
+  margin: 14px;
+}
+
+.atlas-inspector dl {
+  display: grid;
+  gap: 8px;
+  margin: 14px;
+}
+
+.atlas-inspector dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.atlas-inspector dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+pre {
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0c0d10;
+  color: #d7dbe5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.activity-section {
+  display: grid;
+  gap: 12px;
+  margin: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.activity-section h3 {
+  margin: 0;
+}
+
+.activity-group {
+  display: grid;
+  gap: 6px;
+}
+
+.activity-group.padded {
+  overflow: auto;
+  padding: 14px;
+}
+
+.activity-group small {
+  color: var(--muted);
+}
+
+.item-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.item-list span,
+.pin-row,
+.secondary-action {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.item-list span {
+  padding: 5px 7px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.pin-row {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+button.pin-row {
+  cursor: pointer;
+}
+
+.pin-row.consumer {
+  border-left: 3px solid var(--blue);
+}
+
+.pin-row.producer {
+  border-left: 3px solid var(--purple);
+}
+
+.secondary-action {
+  margin: 0 14px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.rpc-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  flex: 1;
+  min-height: 0;
+}
+
+.activity-panel + .activity-panel {
+  border-left: 1px solid var(--border);
+}
+
+.call {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: inherit;
+  text-decoration: none;
+}
+
+.call strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.call em,
+.call small {
+  color: var(--muted);
+  font-style: normal;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.call small {
+  grid-column: 1 / -1;
+}
+
+.call.command {
+  border-left: 3px solid var(--blue);
+}
+
+.call.stream {
+  border-left: 3px solid var(--purple);
+}
+
+.call.running {
+  background: #111827;
+}
+
+.call.error {
+  border-color: rgba(255, 109, 109, 0.55);
+}
+
+@media (max-width: 1100px) {
+  .workspace,
+  .atlas-layout,
+  .projection-inspection,
+  .rpc-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sessions,
+  .clients,
+  .projection-browser,
+  .atlas-inspector {
+    max-height: 260px;
+    border-left: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .summary-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tabs {
+    overflow-x: auto;
+  }
+}

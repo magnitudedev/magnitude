@@ -1,0 +1,5 @@
+export { compilePatchMap } from './compiled-map'
+export { diffDecoded } from './diff'
+export { applyDecodedPatch } from './apply'
+export { PatchEncodeError, PatchDecodeError, PatchNavigationError, PatchSchemaError } from './types'
+export type { PatchApplyError, Path, DecodedPatchOp, DecodedValue, DecodedSome, DecodedNone, CompiledField, CompiledMap, JsonSubSchema, InnerSubSchema } from './types'

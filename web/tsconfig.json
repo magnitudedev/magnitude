@@ -1,0 +1,19 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "noEmit": true,
+    "paths": {
+      "@magnitudedev/web": ["./src/index.tsx"],
+      "@magnitudedev/sdk": ["../packages/sdk/src"],
+      "@magnitudedev/sdk/*": ["../packages/sdk/src/*"],
+      "@magnitudedev/client-common": ["../packages/client-common/src"],
+      "@magnitudedev/generate-id": ["../packages/generate-id/src"],
+
+      "@magnitudedev/providers": ["../packages/providers/src"],
+      "@magnitudedev/ai": ["../packages/ai/src"]
+    }
+  },
+  "include": ["src"]
+}

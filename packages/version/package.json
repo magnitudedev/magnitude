@@ -1,0 +1,13 @@
+{
+  "name": "@magnitudedev/version",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "generate": "bun run scripts/generate-version.ts",
+    "generate:dev": "bun run scripts/generate-version.ts --dev",
+    "typecheck": "bun run scripts/generate-version.ts && tsc --noEmit"
+  }
+}

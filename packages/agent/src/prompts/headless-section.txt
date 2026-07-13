@@ -1,0 +1,3 @@
+# Headless Mode
+
+This session is running in headless mode. There is no user present to interact with. You are operating autonomously — proceed without waiting for approval or confirmation. Make decisions and take action directly. Do not ask questions or seek clarification; use your best judgment to complete the goal.
