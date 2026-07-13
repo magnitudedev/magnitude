@@ -63,6 +63,4 @@ export type ComposerProps = {
   selectedFileOpen: boolean
   onCloseFilePanel: () => void
   onInputHasTextChange: (hasText: boolean) => void
-  restoredQueuedInputText: string | null
-  onRestoredQueuedInputHandled: () => void
 }

@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState, useRef, useSyncExternalStore } from 'react'
+import { memo, useCallback, useMemo, useState, useSyncExternalStore } from 'react'
 import { subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
@@ -6,9 +6,7 @@ import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import type { BalanceResponse, UsagePeriod } from '@magnitudedev/sdk'
 import { useAgentClient } from '@magnitudedev/client-common'
-import { logger } from '@magnitudedev/logger'
-import { Effect, Runtime, Option } from 'effect'
-import { Result, useAtomValue } from '@effect-atom/atom-react'
+import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
 
 interface UsageOverlayProps {
   isVisible: boolean
@@ -126,44 +124,26 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
   const theme = useTheme()
   const client = useAgentClient()
   const runtimeResult = useAtomValue(client.runtime)
-  const [data, setData] = useState<BalanceResponse['data'] | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const [period, setPeriod] = useState<UsagePeriod>('7d')
-  const [loadingTick, setLoadingTick] = useState(0)
-  const [refreshing, setRefreshing] = useState(false)
 
   const tz = useMemo(getLocalTimeZone, [])
-  const prevLoadKeyRef = useRef<string>('')
-
-  // Load (and reload on period change) — ref-based imperative (no useEffect)
   const runtimeReady = Result.isSuccess(runtimeResult)
-  const loadKey = `${isVisible}:${runtimeReady ? 'c' : 'n'}:${period}:${tz}`
-  if (prevLoadKeyRef.current !== loadKey) {
-    prevLoadKeyRef.current = loadKey
-    if (isVisible && runtimeReady) {
-      const run = Runtime.runPromise(runtimeResult.value)
-      setError(null)
-      setRefreshing(prev => prev || data === null)
-      setLoadingTick(t => t + 1)
-      void run(Effect.flatMap(client, (c) => c('GetBalance', { period, days: DAILY_DAYS, tz })))
-        .then((res: BalanceResponse) => {
-          setData(res.data)
-          setRefreshing(false)
-        })
-        .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err)
-          logger.warn({ err: msg }, 'Failed to fetch balance')
-          setError(msg)
-          setRefreshing(false)
-        })
-    }
-  }
+
+  const balanceAtom = useMemo(
+    () => isVisible && runtimeReady
+      ? client.query('GetBalance', { period, days: DAILY_DAYS, tz })
+      : Atom.make<Result.Result<BalanceResponse, never>>(() => Result.initial()),
+    [client, isVisible, period, runtimeReady, tz],
+  )
+  const result = useAtomValue(balanceAtom)
+
+  const loading = Result.isInitial(result)
+  const error = Result.isFailure(result) ? 'Failed to load usage data' : null
+  const data = Result.isSuccess(result) ? result.value.data : null
 
   // Loading dots animation via tick store (400ms ≈ 5 ticks per step)
   const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
-  if (isVisible && data === null) {
-    setLoadingTick(tick)
-  }
+  const loadingTick = isVisible && data === null ? tick : 0
 
   const periodIndex = PERIODS.findIndex(p => p.id === period)
 
@@ -217,7 +197,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
             data={data}
             period={period}
             onPeriodChange={setPeriod}
-            refreshing={refreshing}
+            loading={loading}
           />
         )}
       </box>
@@ -229,10 +209,10 @@ interface BalanceBodyProps {
   data: BalanceResponse['data']
   period: UsagePeriod
   onPeriodChange: (p: UsagePeriod) => void
-  refreshing: boolean
+  loading: boolean
 }
 
-function BalanceBody({ data, period, onPeriodChange, refreshing }: BalanceBodyProps) {
+function BalanceBody({ data, period, onPeriodChange, loading }: BalanceBodyProps) {
   const theme = useTheme()
   const { balance, autoReload, hasPaymentMethod, recentTopups, usage } = data
 
@@ -296,11 +276,11 @@ function BalanceBody({ data, period, onPeriodChange, refreshing }: BalanceBodyPr
 
       {/* Period summary */}
       <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
-        <text style={{ fg: refreshing ? theme.muted : theme.foreground }}>
+        <text style={{ fg: loading ? theme.muted : theme.foreground }}>
           {`${usage.totals.requestCount} reqs  ·  ${formatDollars(totalCostCents)} spend  ·  ${formatTokens(usage.totals.inputTokens)} in / ${formatTokens(usage.totals.outputTokens)} out`}
         </text>
-        {refreshing && (
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{'  (refreshing…)'}</text>
+        {loading && (
+          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{'  (loading…)'}</text>
         )}
       </box>
 

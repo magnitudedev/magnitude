@@ -1,5 +1,7 @@
 import { TextAttributes } from '@opentui/core'
 import { blue, red, slate, subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import { Atom, useAtomMount } from '@effect-atom/atom-react'
+import { Effect } from 'effect'
 import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useTheme } from '../../hooks/use-theme'
 import { useLocalWidth } from '../../hooks/use-local-width'
@@ -25,16 +27,6 @@ const EXPANDED_ROWS = 25
 
 export function getVisibleTasks(tasks: readonly TaskDisplayRow[], expanded: boolean): readonly TaskDisplayRow[] {
   return expanded ? tasks : tasks.slice(-COLLAPSED_ROWS)
-}
-
-export function scheduleInitialTaskListSnap(
-  scrollToBottom: () => void,
-  schedule: typeof setTimeout = setTimeout,
-  cancel: typeof clearTimeout = clearTimeout,
-): () => void {
-  const t1 = schedule(scrollToBottom, 0)
-  const t2 = schedule(scrollToBottom, 50)
-  return () => { cancel(t1); cancel(t2) }
 }
 
 const PULSE_BLUE_SHADES = [
@@ -424,17 +416,20 @@ export function TaskList({
     return rootSummaries.find((root) => root.task.taskId === rootTask.taskId) ?? null
   }, [expanded, rootSummaries, realTasksOnly, visibleTasks])
 
-  // Initial snap on expand — ref-based imperative (no useEffect)
-  const prevExpandedRef = useRef(false)
-  const prevTaskCountRef = useRef(0)
-  if (prevExpandedRef.current !== expanded || (expanded && prevTaskCountRef.current !== tasks.length)) {
-    prevExpandedRef.current = expanded
-    prevTaskCountRef.current = tasks.length
-    if (expanded) {
-      scheduleInitialTaskListSnap(snapExpandedToBottom)
-      snapExpandedToBottom()
-    }
-  }
+  // Initial snap on expand — useAtomMount lifecycle (post-commit, ref is populated)
+  const snapAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (!expanded) return
+          snapExpandedToBottom()
+          yield* Effect.sleep('50 millis')
+          snapExpandedToBottom()
+        }),
+      ),
+    [expanded, tasks.length, snapExpandedToBottom],
+  )
+  useAtomMount(snapAtom)
 
   if (visibleAllTasks.length === 0) return null
 

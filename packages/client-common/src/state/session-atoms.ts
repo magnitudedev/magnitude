@@ -12,6 +12,7 @@ import { Atom } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import type { SessionOptions } from "@magnitudedev/sdk"
 import type { BashResult } from "../utils/bash-executor"
+import type { MentionAttachment } from "@magnitudedev/sdk"
 
 /**
  * The agent-host CWD that will be used when creating a new session.
@@ -56,6 +57,25 @@ export const messageHistoryAtom = Atom.make<string[]>([])
  * This is composer-local state, delivered as a side-band display stream event.
  */
 export const restoredQueuedInputTextAtom = Atom.make<string | null>(null)
+
+/**
+ * Composer text content.
+ * The composer reads and writes this atom directly. Restored queued input
+ * writes here instead of triggering a reactive sync.
+ */
+export const composerTextAtom = Atom.make("")
+
+/**
+ * Composer attachment pills.
+ * Restored queued input clears attachments by resetting this atom.
+ */
+export const composerAttachmentsAtom = Atom.make<MentionAttachment[]>([])
+
+/**
+ * Composer history navigation index.
+ * -1 means not navigating history; restored input resets this to -1.
+ */
+export const composerHistoryIndexAtom = Atom.make(-1)
 
 /**
  * Bash mode active flag for the composer.

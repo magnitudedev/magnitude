@@ -26,7 +26,7 @@ import {
   subscribeEphemeralMessage,
   getEphemeralMessageSnapshot,
 } from '@magnitudedev/client-common'
-import type { SessionOptions, SlotProfiles } from '@magnitudedev/sdk'
+import type { SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
 import { useSessionStartup, type SessionStart } from './hooks/use-session-startup'
 import { useTerminalBgDetection } from './hooks/use-terminal-bg-detection'
@@ -92,12 +92,6 @@ function CliAppGates(props: CliAppProps): ReactNode {
       <MagnitudeLoginScreen
         onSubmit={saveApiKey}
         onExit={exitApp}
-        loadSlotProfiles={async (): Promise<SlotProfiles | null> => {
-          if (!Result.isSuccess(runtimeResult)) return null
-          return Runtime.runPromise(runtimeResult.value)(
-            Effect.flatMap(client, (c) => c('ListPublicSlotProfiles', {}))
-          ) as Promise<SlotProfiles | null>
-        }}
       />
     )
   }

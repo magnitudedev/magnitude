@@ -1,6 +1,6 @@
-import { useEffect } from "react"
-import { Option } from "effect"
-import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Option, Effect } from "effect"
+import { useMemo } from "react"
+import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
   selectedCwdAtom,
   sessionCreateOptionsAtom,
@@ -25,32 +25,31 @@ export function useSessionPreload(): void {
     { mode: "promise" },
   )
 
-  useEffect(() => {
-    if (selectedSessionId || !selectedCwd) return
-    if (!runtimeReady) return
-
-    let active = true
-    const payload = {
-      cwd: selectedCwd,
-      options: sessionCreateOptions,
-      draftOwnerId: Option.some(getDraftSessionOwnerId()),
-    }
-    preloadSession({
-      payload,
-      reactivityKeys: [],
-    }).catch((error: unknown) => {
-      if (!active) return
-      console.debug("[SessionPreload] preload failed:", error)
-    })
-
-    return () => {
-      active = false
-      releaseSessionPreload({
-        payload,
-        reactivityKeys: [],
-      }).catch(() => {
-        // Best-effort cleanup; ACN also has owner replacement, TTL, and startup sweeps.
-      })
-    }
-  }, [selectedSessionId, selectedCwd, sessionCreateOptions, runtimeReady, preloadSession, releaseSessionPreload])
+  const preloadAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (selectedSessionId || !selectedCwd || !runtimeReady) return
+          const payload = {
+            cwd: selectedCwd,
+            options: sessionCreateOptions,
+            draftOwnerId: Option.some(getDraftSessionOwnerId()),
+          }
+          yield* Effect.promise(() =>
+            preloadSession({ payload, reactivityKeys: [] }).catch((error: unknown) => {
+              console.debug("[SessionPreload] preload failed:", error)
+            }),
+          )
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() =>
+              releaseSessionPreload({ payload, reactivityKeys: [] }).catch(() => {
+                // Best-effort cleanup; ACN also has owner replacement, TTL, and startup sweeps.
+              }),
+            ),
+          )
+        }),
+      ),
+    [selectedSessionId, selectedCwd, sessionCreateOptions, runtimeReady, preloadSession, releaseSessionPreload],
+  )
+  useAtomMount(preloadAtom)
 }

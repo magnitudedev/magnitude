@@ -1,6 +1,6 @@
 /**
  * Session startup — resolves the initial session and handles one-shot
- * session-level work, all reactively off atoms. Owns:
+ * session-level work reactively off atoms. Owns:
  *
  * 1. Initial session resolution: --resume <id>, --resume latest (query
  *    ListSessions), or new (null). Selects the display controller session once.
@@ -8,13 +8,13 @@
  *    registration, session logger, terminal title.
  * 3. One-shot --prompt / --goal send after the first display arrives.
  *
- * No useEffect: one-shot work is guarded by refs (spec §5.6 rule 11),
- * reactions are render-time ref-compares against atom values — the same
- * pattern the web app uses for responsive sidebar sync.
+ * Reads use client.query() (declarative). Mutations use useAtomSet with
+ * { mode: "promise" } where the return value is needed. No runRpc, no
+ * Runtime.runPromise, no as casts.
  */
-import { useRef, useCallback } from 'react'
-import { Effect, Option, Runtime } from 'effect'
-import { useAtomValue, useAtomSet, Result } from '@effect-atom/atom-react'
+import { useMemo } from 'react'
+import { Effect, Option } from 'effect'
+import { useAtomValue, useAtomSet, Result, Atom, useAtomMount } from '@effect-atom/atom-react'
 import { useRenderer } from '@opentui/react'
 import { logger, initLogger } from '@magnitudedev/logger'
 import {
@@ -26,11 +26,12 @@ import {
   useHasReceivedDisplay,
   useSelectedSessionId,
   pendingUserSubmitAtom,
-  loadSkillCommands,
   registerSkillCommands,
   getDraftSessionOwnerId,
 } from '@magnitudedev/client-common'
 import { setLastSessionId } from '../state/last-session'
+import type { ListSessionsResult } from '@magnitudedev/sdk'
+import type { SkillListEntry } from '@magnitudedev/sdk'
 
 export type SessionStart =
   | { _tag: 'new' }
@@ -43,6 +44,8 @@ export interface SessionStartupParams {
   goal: string | undefined
 }
 
+const idleAtom = Atom.make(() => null)
+
 export function useSessionStartup({ sessionStart, initialPrompt, goal }: SessionStartupParams): void {
   const client = useAgentClient()
   const renderer = useRenderer()
@@ -53,133 +56,195 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal }: Session
   const hasReceivedDisplay = useHasReceivedDisplay()
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
   const runtimeResult = useAtomValue(client.runtime)
+  const sessionTitle = useDisplayState((state) => state.session.title)
 
-  const runRpc = useCallback(<A, E, R>(effect: Effect.Effect<A, E, R>): Promise<A> => {
-    if (!Result.isSuccess(runtimeResult)) {
-      return Promise.reject(new Error('AgentClient runtime not ready'))
-    }
-    return Runtime.runPromise(runtimeResult.value)(effect as Effect.Effect<A, E, never>)
-  }, [runtimeResult])
+  // ── 1. Latest session query — declarative, only for --latest ──────────
+  const latestSessionAtom = useMemo(
+    () =>
+      sessionStart._tag === 'latest' && Result.isSuccess(runtimeResult)
+        ? client.query('ListSessions', {
+            cwd: Option.some(process.cwd()),
+            query: Option.none(),
+            cursor: Option.none(),
+            limit: 1,
+          }, { reactivityKeys: ['sessions'] })
+        : idleAtom,
+    [client, sessionStart, runtimeResult],
+  )
+  const latestSessionResult = useAtomValue(latestSessionAtom)
 
-  // ── 1. Initial session resolution — one-shot, waits for runtime ready ──
-  const resolvedStartRef = useRef(false)
-  if (!resolvedStartRef.current && Result.isSuccess(runtimeResult)) {
-    resolvedStartRef.current = true
-    if (sessionStart._tag === 'resume') {
-      controller.selectSession(sessionStart.sessionId)
-    } else if (sessionStart._tag === 'latest') {
-      void runRpc(Effect.flatMap(client, (c) =>
-        c('ListSessions', { cwd: Option.some(process.cwd()), query: Option.none(), cursor: Option.none(), limit: 1 })
-      )).then((result) => {
-        const latest = result.items[0]
-        if (latest) controller.selectSession(latest.sessionId)
-        // No sessions to resume — the null-session empty state stands.
-      }).catch((error) => {
-        logger.error(
-          { error: error instanceof Error ? error.message : String(error) },
-          'Failed to resolve latest session'
-        )
-      })
-    }
-    // 'new' leaves the controller without a selected session; the first send
-    // lazily creates and selects the session.
-  }
+  // Select the latest session once the query resolves
+  const initSessionAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (sessionStart._tag === 'resume') {
+            controller.selectSession(sessionStart.sessionId)
+          } else if (sessionStart._tag === 'latest' && latestSessionResult && Result.isSuccess(latestSessionResult)) {
+            const latest = (latestSessionResult.value as ListSessionsResult).items[0]
+            if (latest) controller.selectSession(latest.sessionId)
+          }
+        }),
+      ),
+    [sessionStart, controller, latestSessionResult],
+  )
+  useAtomMount(initSessionAtom)
 
   // ── 2. Session attach side effects — react to session change ──────────
-  const prevSessionIdRef = useRef<string | null | undefined>(undefined)
-  if (prevSessionIdRef.current !== sessionId) {
-    prevSessionIdRef.current = sessionId
-    setLastSessionId(sessionId)
-    if (sessionId) {
-      initLogger(sessionId)
-    }
-  }
+  const sessionAttachAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          setLastSessionId(sessionId)
+          if (sessionId) {
+            initLogger(sessionId)
+          }
+        }),
+      ),
+    [sessionId],
+  )
+  useAtomMount(sessionAttachAtom)
 
-  // ── 2b. Skills loading — react to cwd change (skills are cwd-scoped) ──
-  const prevCwdRef = useRef<string | null | undefined>(undefined)
-  if (prevCwdRef.current !== selectedCwd) {
-    prevCwdRef.current = selectedCwd
-    if (selectedCwd) {
-      loadSkillCommands({
-        listSkills: (cwd: string) => runRpc(Effect.flatMap(client, (c) => c('ListSkills', { cwd }))),
-      }, selectedCwd).then((commands) => {
-        if (commands.length > 0) registerSkillCommands(commands)
-      }).catch((error) => {
-        logger.error(
-          { error: error instanceof Error ? error.message : String(error) },
-          'Failed to load skills'
-        )
-      })
-    }
-  }
+  // ── 2b. Skills query — declarative, reacts to cwd change ──────────────
+  const skillsAtom = useMemo(
+    () =>
+      selectedCwd && Result.isSuccess(runtimeResult)
+        ? client.query('ListSkills', { cwd: selectedCwd }, { reactivityKeys: ['skills'] })
+        : idleAtom,
+    [client, selectedCwd, runtimeResult],
+  )
+  const skillsResult = useAtomValue(skillsAtom)
+
+  // Register/unregister skill commands based on the query result
+  const skillRegistrationAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (!skillsResult || !Result.isSuccess(skillsResult)) return
+          const entries: readonly SkillListEntry[] = (skillsResult.value as { skills?: SkillListEntry[] }).skills ?? []
+          const commands = entries.map((s) => ({
+            id: s.name,
+            label: s.name,
+            description: s.description,
+            source: 'skill' as const,
+            skillPath: s.path,
+          }))
+          if (commands.length > 0) registerSkillCommands(commands)
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              registerSkillCommands([])
+            }),
+          )
+        }),
+      ),
+    [skillsResult],
+  )
+  useAtomMount(skillRegistrationAtom)
 
   // ── Terminal title tracks the display projection's session title ───────
-  // The title is already streamed in display state — no RPC needed.
-  const sessionTitle = useDisplayState((state) => state.session.title)
-  const prevTitleRef = useRef<string | null | undefined>(undefined)
-  const effectiveTitle = sessionId ? (sessionTitle ?? 'Magnitude') : 'Magnitude'
-  if (prevTitleRef.current !== effectiveTitle) {
-    prevTitleRef.current = effectiveTitle
-    renderer.setTerminalTitle(effectiveTitle)
-  }
+  const titleAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          const title = sessionId ? (sessionTitle ?? 'Magnitude') : 'Magnitude'
+          renderer.setTerminalTitle(title)
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              renderer.setTerminalTitle('Magnitude')
+            }),
+          )
+        }),
+      ),
+    [renderer, sessionId, sessionTitle],
+  )
+  useAtomMount(titleAtom)
 
-  // ── 3. One-shot --prompt / --goal after first display ─────────────────
-  // With an existing session, sends into it. With none, creates the session
-  // with the prompt/goal as initial content (the lazy-activation path).
-  const initialWorkSentRef = useRef(false)
-  if (hasReceivedDisplay && !initialWorkSentRef.current && Result.isSuccess(runtimeResult)) {
-    const goalObjective = goal?.trim()
-    const prompt = initialPrompt?.trim()
-    if (goalObjective || prompt) {
-      initialWorkSentRef.current = true
-      setPendingUserSubmit(true)
-      const initial = goalObjective
-        ? { _tag: 'goal' as const, objective: goalObjective }
-        : {
-            _tag: 'message' as const,
-            messageId: Option.none<string>(),
-            content: prompt!,
-            visibleMessage: Option.some(prompt!),
-            taskMode: false,
-            attachments: [],
-          }
-      const work = sessionId
-        ? (goalObjective
-            ? runRpc(Effect.flatMap(client, (c) => c('StartGoal', { sessionId, objective: goalObjective })))
-            : runRpc(Effect.flatMap(client, (c) =>
-                c('SendMessage', {
-                  sessionId,
-                  messageId: Option.none<string>(),
-                  content: prompt!,
-                  visibleMessage: Option.some(prompt!),
-                  taskMode: false,
-                  attachments: [],
+  // ── 3. One-shot --prompt / --goal — true mutations needing return value
+  const startGoalMutation = useAtomSet(client.mutation('StartGoal'), { mode: 'promise' })
+  const sendMessageMutation = useAtomSet(client.mutation('SendMessage'), { mode: 'promise' })
+  const createSessionMutation = useAtomSet(client.mutation('CreateSession'), { mode: 'promise' })
+
+  const initialWorkAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (!hasReceivedDisplay || !Result.isSuccess(runtimeResult)) return
+          const goalObjective = goal?.trim()
+          const prompt = initialPrompt?.trim()
+          if (!goalObjective && !prompt) return
+
+          setPendingUserSubmit(true)
+          const initial = goalObjective
+            ? { _tag: 'goal' as const, objective: goalObjective }
+            : {
+                _tag: 'message' as const,
+                messageId: Option.none<string>(),
+                content: prompt!,
+                visibleMessage: Option.some(prompt!),
+                taskMode: false,
+                attachments: [],
+              }
+
+          const work = sessionId
+            ? goalObjective
+              ? startGoalMutation({
+                  payload: { sessionId, objective: goalObjective },
+                  reactivityKeys: ['sessions'],
                 })
-              )))
-        : runRpc(Effect.flatMap(client, (c) =>
-            c('CreateSession', {
-              cwd: selectedCwd ?? process.cwd(),
-              sessionId: Option.none(),
-              initial: Option.some(initial),
-              options: sessionCreateOptions,
-              draftOwnerId: Option.some(getDraftSessionOwnerId()),
-            })
-          )).then((result) => {
-            if (result._tag === 'created') {
-              controller.selectSession(result.metadata.sessionId)
-            } else if (result._tag === 'created_message_failed') {
-              controller.selectSession(result.sessionId)
-            }
-            // failed: do nothing — the catch handler will log the error
-            setPendingUserSubmit(false)
-          })
-      void work.catch((error) => {
-        logger.error(
-          { error: error instanceof Error ? error.message : String(error) },
-          'Failed to send initial prompt/goal'
-        )
-        setPendingUserSubmit(false)
-      })
-    }
-  }
+              : sendMessageMutation({
+                  payload: {
+                    sessionId,
+                    messageId: Option.none<string>(),
+                    content: prompt!,
+                    visibleMessage: Option.some(prompt!),
+                    taskMode: false,
+                    attachments: [],
+                  },
+                  reactivityKeys: ['sessions'],
+                })
+            : createSessionMutation({
+                payload: {
+                  cwd: selectedCwd ?? process.cwd(),
+                  sessionId: Option.none(),
+                  initial: Option.some(initial),
+                  options: sessionCreateOptions,
+                  draftOwnerId: Option.some(getDraftSessionOwnerId()),
+                },
+                reactivityKeys: ['sessions'],
+              }).then((result) => {
+                if (result._tag === 'created') {
+                  controller.selectSession(result.metadata.sessionId)
+                } else if (result._tag === 'created_message_failed') {
+                  controller.selectSession(result.sessionId)
+                }
+                setPendingUserSubmit(false)
+              })
+
+          yield* Effect.promise(() =>
+            work.catch((error) => {
+              logger.error(
+                { error: error instanceof Error ? error.message : String(error) },
+                'Failed to send initial prompt/goal',
+              )
+              setPendingUserSubmit(false)
+            }),
+          )
+        }),
+      ),
+    [
+      hasReceivedDisplay,
+      goal,
+      initialPrompt,
+      sessionId,
+      selectedCwd,
+      runtimeResult,
+      sessionCreateOptions,
+      controller,
+      setPendingUserSubmit,
+      startGoalMutation,
+      sendMessageMutation,
+      createSessionMutation,
+    ],
+  )
+  useAtomMount(initialWorkAtom)
 }

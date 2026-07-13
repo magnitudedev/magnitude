@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useRef } from 'react'
+import { memo, useState, useCallback, useMemo, useRef } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../../hooks/use-theme'
@@ -6,10 +6,10 @@ import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import { BOX_CHARS } from '../../utils/ui-constants'
 import { writeTextToClipboard } from '../../utils/clipboard'
-import { green, orange, rose } from '@magnitudedev/client-common'
-import { LOGO_LINES } from '@magnitudedev/client-common'
-import type { SlotProfile, SlotProfiles } from '@magnitudedev/sdk'
+import { green, orange, rose, LOGO_LINES, useAgentClient } from '@magnitudedev/client-common'
+import type { SlotProfile } from '@magnitudedev/sdk'
 import { SLOT_IDS, SLOT_DISPLAY_NAMES } from '@magnitudedev/sdk'
+import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
 
 import type { BorderCharacters } from '@opentui/core'
 import type { SlotId } from '@magnitudedev/sdk'
@@ -65,33 +65,27 @@ function padEnd(s: string, length: number): string {
 interface MagnitudeLoginScreenProps {
   onSubmit: (key: string) => Promise<void> | void
   onExit: () => void
-  loadSlotProfiles: () => Promise<SlotProfiles | null>
 }
 
 export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   onSubmit,
   onExit,
-  loadSlotProfiles,
 }: MagnitudeLoginScreenProps) {
   const theme = useTheme()
+  const client = useAgentClient()
   const [apiKey, setApiKey] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [continueHovered, setContinueHovered] = useState(false)
   const [copyHovered, setCopyHovered] = useState(false)
-  const [slotProfiles, setSlotProfiles] = useState<Partial<Record<SlotId, SlotProfile>> | null>(null)
   const urlCopy = useCopyFeedback()
-  const profilesLoadedRef = useRef(false)
 
-  // Load slot profiles once on mount — ref-based imperative (no useEffect)
-  if (!profilesLoadedRef.current) {
-    profilesLoadedRef.current = true
-    void loadSlotProfiles().then((profiles) => {
-      setSlotProfiles(profiles)
-    }).catch(() => {
-      // Graceful fallback: do nothing, slotProfiles stays null
-    })
-  }
+  const slotProfilesAtom = useMemo(
+    () => client.query('ListPublicSlotProfiles', {}, { reactivityKeys: ['config'] }),
+    [client],
+  )
+  const profilesResult = useAtomValue(slotProfilesAtom)
+  const slotProfiles = Result.isSuccess(profilesResult) ? profilesResult.value : null
 
   const handleSubmit = useCallback(async () => {
     if (submitting) return

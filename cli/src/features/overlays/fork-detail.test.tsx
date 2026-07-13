@@ -34,7 +34,6 @@ let filePanelState = {
 const selectedFileProviderCalls: Array<any> = []
 
 let ForkDetailOverlay: typeof import('./fork-detail').ForkDetailOverlay
-let scheduleInitialForkOverlaySnap: typeof import('./fork-detail').scheduleInitialForkOverlaySnap
 
 beforeEach(async () => {
   selectedFileProviderCalls.length = 0
@@ -92,7 +91,7 @@ beforeEach(async () => {
     FileViewerPanel: ({ filePath }: { filePath: string }) => <text>[file-viewer:{filePath}]</text>,
   }))
 
-  ;({ ForkDetailOverlay, scheduleInitialForkOverlaySnap } = await import('./fork-detail'))
+  ;({ ForkDetailOverlay } = await import('./fork-detail'))
 })
 
 afterEach(() => {
@@ -168,32 +167,8 @@ test('enables sticky bottom-follow semantics on the overlay scrollbox', async ()
   expect(html).toContain('stickyStart="bottom"')
 })
 
-test('mount snap helper schedules immediate + deferred bottom snaps and executes both', () => {
-  const scheduled: Array<{ fn: () => void, delay: number, id: number }> = []
-  const canceled: number[] = []
-  let nextId = 1
-  let snapCount = 0
-
-  const cleanup = scheduleInitialForkOverlaySnap(
-    () => { snapCount += 1 },
-    ((fn: (...args: any[]) => void, delay?: number) => {
-      const id = nextId++
-      scheduled.push({ fn: () => fn(), delay: delay ?? 0, id })
-      return id as unknown as ReturnType<typeof setTimeout>
-    }) as typeof setTimeout,
-    ((id: ReturnType<typeof setTimeout>) => {
-      canceled.push(id as unknown as number)
-    }) as typeof clearTimeout,
-  )
-
-  expect(scheduled.map((t) => t.delay)).toEqual([0, 50])
-
-  scheduled[0]?.fn()
-  scheduled[1]?.fn()
-  expect(snapCount).toBe(2)
-
-  cleanup()
-  expect(canceled).toEqual([scheduled[0]!.id, scheduled[1]!.id])
+test('mount snap helper is no longer exported', () => {
+  expect(typeof (globalThis as Record<string, unknown>).scheduleInitialForkOverlaySnap).toBe('undefined')
 })
 
 test('routes overlay message file clicks to overlay-local openFile handler', async () => {

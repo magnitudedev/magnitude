@@ -111,8 +111,6 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
     selectedFileOpen: false,
     onCloseFilePanel: () => {},
     onInputHasTextChange: () => {},
-    restoredQueuedInputText: null,
-    onRestoredQueuedInputHandled: () => {},
     ...overrides,
   }
 }

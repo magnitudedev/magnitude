@@ -25,7 +25,6 @@ import {
   bashModeAtom,
   useDisplayViewController,
   composerHasContentAtom,
-  restoredQueuedInputTextAtom,
   type CommandContext,
 } from '@magnitudedev/client-common'
 import type { RawMessageAttachment } from '@magnitudedev/sdk'
@@ -53,8 +52,6 @@ export function ComposerContainer({
   const setBashMode = useAtomSet(bashModeAtom)
   const setShowRecentChats = useAtomSet(showRecentChatsOverlayAtom)
   const setComposerHasContent = useAtomSet(composerHasContentAtom)
-  const restoredQueuedInputText = useAtomValue(restoredQueuedInputTextAtom)
-  const setRestoredQueuedInputText = useAtomSet(restoredQueuedInputTextAtom)
   const { displayMode, expandedForkStack } = useDisplayViewController()
   const selectedFilePath = useAtomValue(selectedFilePathAtom)
   const setSelectedFilePath = useAtomSet(selectedFilePathAtom)
@@ -168,8 +165,6 @@ export function ComposerContainer({
       selectedFileOpen={selectedFilePath !== null}
       onCloseFilePanel={() => setSelectedFilePath(null)}
       onInputHasTextChange={setComposerHasContent}
-      restoredQueuedInputText={restoredQueuedInputText}
-      onRestoredQueuedInputHandled={() => setRestoredQueuedInputText(null)}
     />
   )
 }
