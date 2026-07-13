@@ -1,0 +1,710 @@
+import React, { memo, useRef, useState } from 'react'
+import stringWidth from 'string-width'
+import {
+  TextAttributes,
+  type LineInfo,
+  type MouseEvent as OTMouseEvent,
+  type TextBufferView,
+  type TextRenderable,
+} from '@opentui/core'
+import { useRenderer } from '@opentui/react'
+import type {
+  Block,
+  Span,
+  CodeBlock,
+  ListBlock,
+  BlockquoteBlock,
+  TableBlock,
+  HighlightRange,
+} from './blocks'
+import { computeTableLayoutPlan } from './table-layout'
+import { useStableCallback } from '../hooks/use-stable-callback'
+import { useTheme } from '../hooks/use-theme'
+import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
+import { buildMarkdownColorPalette } from '../utils/theme'
+import { useCopyFeedback, type MarkdownPalette } from '@magnitudedev/client-common'
+import { writeTextToClipboard } from '../utils/clipboard'
+import { BOX_CHARS } from '../utils/ui-constants'
+
+const COPY_FEEDBACK_RESET_MS = 2000
+
+function spanAttributes(span: Span): number | undefined {
+  let attrs = 0
+  if (span.bold) attrs |= TextAttributes.BOLD
+  if (span.italic) attrs |= TextAttributes.ITALIC
+  if (span.dim) attrs |= TextAttributes.DIM
+  return attrs || undefined
+}
+
+const SpanRenderer = memo(function SpanRenderer({
+  spans,
+  foreground,
+  onOpenArtifact,
+  onOpenFile,
+  showCursor,
+  id,
+}: {
+  spans: Span[]
+  foreground: string
+  onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
+  showCursor?: boolean
+  id?: string
+}) {
+  const theme = useTheme()
+  const renderer = useRenderer()
+  // Always-true mounted guard — call sites fire from live event handlers only.
+  const mountedRef = useRef(true)
+  const textRef = useRef<TextRenderable | null>(null)
+  const pressStartedRef = useRef<number | null>(null)
+  const [hoveredZone, setHoveredZone] = useState<number | null>(null)
+
+  const hitZones: Array<
+    | { kind: 'artifact'; charStart: number; charEnd: number; name: string; section?: string }
+    | { kind: 'file'; charStart: number; charEnd: number; path: string; section?: string }
+    | { kind: 'url'; charStart: number; charEnd: number; url: string }
+  > = []
+  let charOffset = 0
+  const elements: React.ReactNode[] = []
+
+  for (let i = 0; i < spans.length; i++) {
+    const span = spans[i]
+    const attrs = spanAttributes(span)
+
+    if (span.fileRef) {
+      const zoneIdx = hitZones.length
+      hitZones.push({
+        kind: 'file',
+        charStart: charOffset,
+        charEnd: charOffset + span.text.length,
+        path: span.fileRef.path,
+        section: span.fileRef.section,
+      })
+
+      const isHovered = hoveredZone === zoneIdx
+      const baseAttrs = attrs ?? 0
+      elements.push(
+        <span key={i} fg={isHovered ? theme.link : theme.primary} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
+          {span.text}
+        </span>,
+      )
+      charOffset += span.text.length
+      continue
+    }
+
+    if (span.url) {
+      const displayText = `${span.text}↗`
+      const zoneIdx = hitZones.length
+      hitZones.push({
+        kind: 'url',
+        charStart: charOffset,
+        charEnd: charOffset + displayText.length,
+        url: span.url,
+      })
+
+      const isHovered = hoveredZone === zoneIdx
+      const baseAttrs = attrs ?? 0
+      elements.push(
+        <span key={i} fg={isHovered ? theme.link : theme.primary} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
+          {displayText}
+        </span>,
+      )
+      charOffset += displayText.length
+      continue
+    }
+
+    if (span.ref) {
+      const displayLabel = span.ref.label ?? (span.ref.section ? `${span.ref.name}#${span.ref.section}` : span.ref.name)
+      const displayText = `[≡ ${displayLabel}]`
+
+      const zoneIdx = hitZones.length
+      hitZones.push({
+        kind: 'artifact',
+        charStart: charOffset,
+        charEnd: charOffset + displayText.length,
+        name: span.ref.name,
+        section: span.ref.section,
+      })
+
+      const isHovered = hoveredZone === zoneIdx
+      elements.push(
+        <span key={i} fg={isHovered ? theme.link : theme.primary} attributes={TextAttributes.UNDERLINE}>
+          {displayText}
+        </span>,
+      )
+      charOffset += displayText.length
+      continue
+    }
+
+    if (span.fg || span.bg || attrs) {
+      elements.push(
+        <span key={i} fg={span.fg ?? foreground} bg={span.bg} attributes={attrs}>
+          {span.text}
+        </span>,
+      )
+    } else {
+      elements.push(span.text)
+    }
+    charOffset += span.text.length
+  }
+
+  if (showCursor) {
+    elements.push(<span key="cursor" fg={foreground}>▍</span>)
+  }
+
+  const hitTest = (event: OTMouseEvent): number | null => {
+    if (hitZones.length === 0) return null
+    return safeRenderableAccess(
+      textRef.current,
+      (el) => {
+        const localX = event.x - el.x
+        const localY = event.y - el.y
+        const view = (el as unknown as Record<string, unknown>).textBufferView as TextBufferView
+        const info: LineInfo = view.lineInfo
+        if (localY < 0 || localY >= info.lineStartCols.length) return null
+        const charIndex = info.lineStartCols[localY] + localX
+        for (let i = 0; i < hitZones.length; i++) {
+          if (charIndex >= hitZones[i].charStart && charIndex < hitZones[i].charEnd) return i
+        }
+        return null
+      },
+      {
+        mountedRef,
+        fallback: null,
+      },
+    )
+  }
+
+  const handleMouseDown = useStableCallback((event: OTMouseEvent) => {
+    const hit = hitTest(event)
+    if (hit !== null) pressStartedRef.current = hit
+  })
+
+  const handleMouseUp = useStableCallback((event: OTMouseEvent) => {
+    const hit = hitTest(event)
+    if (hit !== null && hit === pressStartedRef.current) {
+      safeRenderableCall(
+        renderer,
+        (r) => r.clearSelection(),
+        { mountedRef },
+      )
+      const zone = hitZones[hit]
+      if (zone.kind === 'file') {
+        onOpenFile?.(zone.path, zone.section)
+      } else if (zone.kind === 'url') {
+        const isMac = process.platform === 'darwin'
+        Bun.spawn([isMac ? 'open' : 'xdg-open', zone.url])
+      } else {
+        onOpenArtifact?.(zone.name, zone.section)
+      }
+    }
+    pressStartedRef.current = null
+  })
+
+  const handleMouseMove = useStableCallback((event: OTMouseEvent) => {
+    const hit = hitTest(event)
+    setHoveredZone(hit)
+    if (hit !== null) {
+      renderer.setMousePointer('pointer')
+    } else {
+      renderer.setMousePointer('default')
+    }
+  })
+
+  const handleMouseOut = useStableCallback(() => {
+    setHoveredZone(null)
+    pressStartedRef.current = null
+    renderer.setMousePointer('default')
+  })
+
+  if (hitZones.length === 0) {
+    return (
+      <text id={id} style={{ fg: foreground, wrapMode: 'word' }}>
+        {elements}
+      </text>
+    )
+  }
+
+  return (
+    <text
+      id={id}
+      ref={(el: TextRenderable | null) => {
+        textRef.current = el
+      }}
+      style={{ fg: foreground, wrapMode: 'word' }}
+      onMouseDown={handleMouseDown}
+      onMouseUp={handleMouseUp}
+      onMouseMove={handleMouseMove}
+      onMouseOut={handleMouseOut}
+    >
+      {elements}
+    </text>
+  )
+})
+
+function CodeLine({ spans, fallbackFg }: { spans: Span[]; fallbackFg: string }) {
+  if (spans.length === 0) return ' '
+  return (
+    <>
+      {spans.map((span, idx) => {
+        const attrs = spanAttributes(span)
+        return span.fg || span.bg || attrs ? (
+          <span key={idx} fg={span.fg ?? fallbackFg} bg={span.bg} attributes={attrs}>
+            {span.text}
+          </span>
+        ) : (
+          <React.Fragment key={idx}>{span.text}</React.Fragment>
+        )
+      })}
+    </>
+  )
+}
+
+function CodeBlockView({
+  block,
+  foreground,
+  palette,
+  id,
+}: {
+  block: CodeBlock
+  foreground: string
+  palette: MarkdownPalette
+  id?: string
+}) {
+  const theme = useTheme()
+  const renderer = useRenderer()
+  const [isHovered, setIsHovered] = useState(false)
+  const { copied, triggerCopy } = useCopyFeedback(COPY_FEEDBACK_RESET_MS)
+
+  const handleCopy = async (e: { stopPropagation?: () => void }) => {
+    e.stopPropagation?.()
+    try {
+      await writeTextToClipboard(block.rawCode)
+      triggerCopy()
+    } catch {
+      // Clipboard write failed — no feedback shown.
+    }
+  }
+
+  return (
+    <box
+      id={id}
+      style={{ flexDirection: 'column', position: 'relative' }}
+      onMouseOver={() => { setIsHovered(true); renderer.setMousePointer('pointer') }}
+      onMouseOut={() => { setIsHovered(false); renderer.setMousePointer('default') }}
+      onMouseDown={handleCopy}
+    >
+      <text style={{ fg: palette.codeBorderColor }}>
+        ┌ <span fg={palette.codeHeaderFg} attributes={TextAttributes.DIM}>{block.language || ''}</span>
+      </text>
+      <box
+        style={{
+          flexDirection: 'row',
+          borderStyle: 'single',
+          border: ['left'],
+          borderColor: palette.codeBorderColor,
+          customBorderChars: BOX_CHARS,
+          paddingLeft: 1,
+          paddingRight: 2,
+        }}
+      >
+        <box style={{ flexGrow: 1, flexDirection: 'row' }}>
+          <text style={{ flexGrow: 1 }}>
+            {block.lines.map((line, lineIdx) => (
+              <React.Fragment key={lineIdx}>
+                <CodeLine spans={line} fallbackFg={foreground} />
+                {lineIdx < block.lines.length - 1 && '\n'}
+              </React.Fragment>
+            ))}
+          </text>
+        </box>
+      </box>
+      <text style={{ fg: copied ? theme.success : foreground }}>
+        <span fg={palette.codeBorderColor}>└</span>
+        {isHovered && (copied ? ' [Copied ✔]' : ' [Copy ⧉ ]')}
+      </text>
+    </box>
+  )
+}
+
+function MermaidBlockView({
+  ascii,
+  foreground,
+  palette,
+  id,
+}: {
+  ascii: string
+  foreground: string
+  palette: MarkdownPalette
+  id?: string
+}) {
+  return (
+    <box id={id} style={{ flexDirection: 'column' }}>
+      <text style={{ fg: palette.codeBorderColor }}>
+        ┌ <span fg={palette.codeHeaderFg} attributes={TextAttributes.DIM}>mermaid</span>
+      </text>
+      <box
+        style={{
+          flexDirection: 'row',
+          borderStyle: 'single',
+          border: ['left'],
+          borderColor: palette.codeBorderColor,
+          customBorderChars: BOX_CHARS,
+          paddingLeft: 1,
+          paddingRight: 2,
+        }}
+      >
+        <text style={{ fg: foreground }}>{ascii}</text>
+      </box>
+      <text style={{ fg: foreground }}>
+        <span fg={palette.codeBorderColor}>└</span>
+      </text>
+    </box>
+  )
+}
+
+function itemContentWithMarker(item: ListBlock['items'][number]): Block[] {
+  const [first, ...rest] = item.content
+  if (!first) {
+    return [{ type: 'paragraph', content: [{ text: item.marker, fg: item.markerFg }], source: { start: 0, end: 0 } }]
+  }
+  if (first.type === 'paragraph' || first.type === 'heading') {
+    return [
+      {
+        ...first,
+        content: [{ text: item.marker, fg: item.markerFg }, ...first.content],
+      },
+      ...rest,
+    ]
+  }
+  return [
+    { type: 'paragraph', content: [{ text: item.marker, fg: item.markerFg }], source: { start: 0, end: 0 } },
+    ...item.content,
+  ]
+}
+
+function ListBlockView({
+  block,
+  foreground,
+  palette,
+  contentWidth,
+  onOpenArtifact,
+  onOpenFile,
+}: {
+  block: ListBlock
+  foreground: string
+  palette: MarkdownPalette
+  contentWidth: number
+  onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
+}) {
+  return (
+    <box style={{ flexDirection: 'column' }}>
+      {block.items.map((item, idx) => {
+        const markerWidth = stringWidth(item.marker)
+        const [first, ...rest] = itemContentWithMarker(item)
+        return (
+          <box key={idx} style={{ flexDirection: 'column' }}>
+            {first && (
+              <BlockRenderer
+                blocks={[first]}
+                foreground={foreground}
+                palette={palette}
+                contentWidth={contentWidth}
+                onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
+              />
+            )}
+            {rest.length > 0 && (
+              <box style={{ paddingLeft: markerWidth }}>
+                <BlockRenderer
+                  blocks={rest}
+                  foreground={foreground}
+                  palette={palette}
+                  contentWidth={Math.max(10, contentWidth - markerWidth)}
+                  onOpenArtifact={onOpenArtifact}
+                  onOpenFile={onOpenFile}
+                />
+              </box>
+            )}
+          </box>
+        )
+      })}
+    </box>
+  )
+}
+
+function BlockquoteView({
+  block,
+  foreground,
+  palette,
+  contentWidth,
+  onOpenArtifact,
+  onOpenFile,
+}: {
+  block: BlockquoteBlock
+  foreground: string
+  palette: MarkdownPalette
+  contentWidth: number
+  onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
+}) {
+  return (
+    <box style={{ flexDirection: 'row' }}>
+      <text style={{ fg: palette.blockquoteBorderFg, flexShrink: 0 }}>{'> '}</text>
+      <box style={{ flexDirection: 'column', flexGrow: 1 }}>
+        <BlockRenderer
+          blocks={block.content}
+          foreground={foreground}
+          palette={palette}
+          contentWidth={Math.max(10, contentWidth - 2)}
+          onOpenArtifact={onOpenArtifact}
+          onOpenFile={onOpenFile}
+        />
+      </box>
+    </box>
+  )
+}
+
+function TableRow({
+  cells,
+  foreground,
+  borderColor,
+  headerColor,
+  header,
+}: {
+  cells: Array<{ spans: Span[] } | undefined>
+  foreground: string
+  borderColor: string
+  headerColor: string
+  header?: boolean
+}) {
+  return (
+    <text style={{ fg: foreground }}>
+      <span fg={borderColor}>│</span>
+      {cells.map((cell, idx) => (
+        <React.Fragment key={idx}>
+          <span> </span>
+          {(cell?.spans ?? []).map((span, si) => {
+            const attrs = header ? TextAttributes.BOLD : spanAttributes(span)
+            return (
+              <span
+                key={si}
+                fg={header ? paletteOr(headerColor, span.fg ?? foreground) : (span.fg ?? foreground)}
+                bg={span.bg}
+                attributes={attrs}
+              >
+                {span.text}
+              </span>
+            )
+          })}
+          <span fg={borderColor}> │</span>
+        </React.Fragment>
+      ))}
+    </text>
+  )
+}
+
+function paletteOr(primary: string | undefined, fallback: string): string {
+  return primary ?? fallback
+}
+
+function TableView({
+  block,
+  foreground,
+  palette,
+  contentWidth,
+  id,
+}: {
+  block: TableBlock
+  foreground: string
+  palette: MarkdownPalette
+  contentWidth: number
+  id?: string
+}) {
+  const plan = computeTableLayoutPlan({
+    headers: block.headers,
+    rows: block.rows,
+    alignments: block.alignments,
+    availableWidth: Math.max(10, contentWidth),
+    wrapMode: 'word',
+    widthMode: 'full',
+    fitter: 'proportional',
+    minColumnWidth: 3,
+    cellPadding: 1,
+    borders: { outer: true, inner: true },
+  })
+  const widths = plan.columnWidths
+  const sep = (left: string, mid: string, right: string) =>
+    `${left}${widths.map((w) => '─'.repeat(w + 2)).join(mid)}${right}`
+
+  return (
+    <box id={id} style={{ flexDirection: 'column' }}>
+      <text style={{ fg: palette.dividerFg }}>{sep('┌', '┬', '┐')}</text>
+      {Array.from({ length: plan.headers.height }).map((_, lineIdx) => (
+        <TableRow
+          key={`h-${lineIdx}`}
+          cells={plan.headers.cells.map((cell) => cell.lines[lineIdx])}
+          foreground={foreground}
+          borderColor={palette.dividerFg}
+          headerColor={palette.headingFg[3]}
+          header
+        />
+      ))}
+      <text style={{ fg: palette.dividerFg }}>{sep('├', '┼', '┤')}</text>
+      {plan.rows.map((row, idx) => (
+        <React.Fragment key={idx}>
+          {Array.from({ length: row.height }).map((_, lineIdx) => (
+            <TableRow
+              key={`${idx}-${lineIdx}`}
+              cells={row.cells.map((cell) => cell.lines[lineIdx])}
+              foreground={foreground}
+              borderColor={palette.dividerFg}
+              headerColor={palette.headingFg[3]}
+            />
+          ))}
+        </React.Fragment>
+      ))}
+      <text style={{ fg: palette.dividerFg }}>{sep('└', '┴', '┘')}</text>
+    </box>
+  )
+}
+
+function blockHasHighlight(block: Block, highlights: HighlightRange[]): boolean {
+  if (!('source' in block)) return false
+  return highlights.some((r) => r.start < block.source.end && r.end > block.source.start)
+}
+
+export const BlockRenderer = memo(function BlockRenderer({
+  blocks,
+  foreground,
+  palette,
+  contentWidth: explicitContentWidth,
+  onOpenArtifact,
+  onOpenFile,
+  showCursor,
+  highlightAnchorId,
+  highlights,
+}: {
+  blocks: Block[]
+  foreground: string
+  palette?: MarkdownPalette
+  contentWidth?: number
+  onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
+  showCursor?: boolean
+  highlightAnchorId?: string
+  highlights?: HighlightRange[]
+}) {
+  const theme = useTheme()
+  const contentWidth = explicitContentWidth ?? 79
+  const resolvedPalette = palette ?? buildMarkdownColorPalette(theme)
+  let didAssignHighlightAnchor = false
+
+  const maybeAnchorId = (block: Block) => {
+    if (!highlightAnchorId || !highlights?.length || didAssignHighlightAnchor || !blockHasHighlight(block, highlights)) {
+      return undefined
+    }
+    didAssignHighlightAnchor = true
+    return highlightAnchorId
+  }
+
+  // Only attach measurement ref at top level (no explicit width = top level)
+  const content = blocks.map((block, idx) => {
+        const isLast = idx === blocks.length - 1
+        const anchorId = maybeAnchorId(block)
+
+        switch (block.type) {
+          case 'paragraph':
+            return (
+              <SpanRenderer
+                key={idx}
+                spans={block.content}
+                foreground={foreground}
+                onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
+                showCursor={showCursor && isLast}
+                id={anchorId}
+              />
+            )
+          case 'heading':
+            return (
+              <SpanRenderer
+                key={idx}
+                spans={block.content}
+                foreground={foreground}
+                onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
+                id={block.slug ? `section-${block.slug}` : anchorId}
+                showCursor={showCursor && isLast}
+              />
+            )
+          case 'code':
+            return (
+              <CodeBlockView
+                key={idx}
+                block={block}
+                foreground={foreground}
+                palette={resolvedPalette}
+                id={anchorId}
+              />
+            )
+          case 'list':
+            return (
+              <ListBlockView
+                key={idx}
+                block={block}
+                foreground={foreground}
+                palette={resolvedPalette}
+                contentWidth={contentWidth}
+                onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
+              />
+            )
+          case 'blockquote':
+            return (
+              <BlockquoteView
+                key={idx}
+                block={block}
+                foreground={foreground}
+                palette={resolvedPalette}
+                contentWidth={contentWidth}
+                onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
+              />
+            )
+          case 'table':
+            return (
+              <TableView
+                key={idx}
+                block={block}
+                foreground={foreground}
+                palette={resolvedPalette}
+                contentWidth={contentWidth}
+                id={anchorId}
+              />
+            )
+          case 'divider':
+            return (
+              <text key={idx} id={anchorId} style={{ fg: resolvedPalette.dividerFg }}>
+                {'─'.repeat(Math.max(10, Math.min(contentWidth, 80)))}
+              </text>
+            )
+          case 'mermaid':
+            return (
+              <MermaidBlockView
+                key={idx}
+                ascii={block.ascii}
+                foreground={foreground}
+                palette={resolvedPalette}
+                id={anchorId}
+              />
+            )
+          case 'spacer':
+            if (block.lines <= 0) return null
+            return <text key={idx}>{block.lines > 1 ? '\n'.repeat(block.lines - 1) : ''}</text>
+        }
+      })
+
+  return <>{content}</>
+})

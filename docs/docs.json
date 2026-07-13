@@ -1,0 +1,96 @@
+{
+    "$schema": "https://mintlify.com/docs.json",
+    "name": "Magnitude",
+    "theme": "linden",
+    "description": "The best coding agent for open models",
+    "logo": {
+        "light": "/wordmark-black.svg",
+        "dark": "/wordmark-white.svg"
+    },
+    "favicon": "/logo.svg",
+    "icons": {
+        "library": "lucide"
+    },
+    "fonts": {
+        "heading": {
+            "family": "Martian Mono",
+            "weight": 700
+        },
+        "body": {
+            "family": "Inter"
+        }
+    },
+    "colors": {
+        "primary": "#0369a1",
+        "light": "#0ea5e9",
+        "dark": "#075985"
+    },
+    "background": {
+        "color": {
+            "dark": "#0f1826"
+        }
+    },
+    "navbar": {
+        "links": [
+            {
+                "label": "Join community",
+                "href": "https://discord.gg/EHt48pPWdC"
+            }
+        ],
+        "primary": {
+            "type": "button",
+            "label": "Get started",
+            "href": "https://app.magnitude.dev"
+        }
+    },
+    "navigation": {
+        "global": {
+            "anchors": [
+                {
+                    "anchor": "GitHub",
+                    "icon": "github",
+                    "href": "https://github.com/magnitudedev/magnitude"
+                },
+                {
+                    "anchor": "Community",
+                    "icon": "discord",
+                    "href": "https://discord.gg/EHt48pPWdC"
+                },
+                {
+                    "anchor": "Contact",
+                    "icon": "mail",
+                    "href": "mailto:founders@magnitude.dev"
+                }
+            ]
+        },
+        "pages": [
+            "why-magnitude",
+            "get-started",
+            "benchmark",
+            "pricing",
+            "reference"
+        ]
+    },
+    "styling": {
+        "codeblocks": {
+            "theme": {
+                "light": "github-light",
+                "dark": "github-dark"
+            }
+        }
+    },
+    "search": {
+        "prompt": "Search or ask..."
+    },
+    "seo": {
+        "indexing": "all"
+    },
+    "contextual": {
+        "options": [
+            "copy",
+            "view",
+            "chatgpt",
+            "claude"
+        ]
+    }
+}

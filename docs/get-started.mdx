@@ -1,0 +1,62 @@
+---
+title: Get Started
+description: "Sign up, install, and start coding with Magnitude"
+icon: rocket
+---
+
+## Install
+
+<Steps>
+  <Step title="Sign up">
+    Go to [app.magnitude.dev](https://app.magnitude.dev) and sign up for an API key. \$5 of free credits to start, no card required.
+  </Step>
+  <Step title="Install the CLI">
+    <Tabs>
+      <Tab title="npm">
+        ```sh
+        npm i -g @magnitudedev/cli
+        ```
+      </Tab>
+      <Tab title="bun">
+        ```sh
+        bun add -g @magnitudedev/cli
+        ```
+      </Tab>
+      <Tab title="pnpm">
+        ```sh
+        pnpm add -g @magnitudedev/cli
+        ```
+      </Tab>
+      <Tab title="yarn">
+        ```sh
+        yarn global add @magnitudedev/cli
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+  <Step title="Run it">
+    From any project directory:
+
+    ```sh
+    magnitude
+    ```
+
+    Paste your API key when prompted. That's it.
+  </Step>
+</Steps>
+
+Need Magnitude hosted in your own VPC or data center? See [Pricing](/pricing) or [talk to us](https://calendly.com/tom-magnitude/30min).
+
+## Windows
+
+Magnitude requires WSL on Windows. We don't currently support native Windows.
+
+```powershell
+wsl --install
+```
+
+Restart, then run `wsl` and follow the install steps above.
+
+## Terminal
+
+Magnitude renders best in a modern terminal emulator like [Ghostty](https://ghostty.org) or [Kitty](https://sw.kovidgoyal.net/kitty/). The default macOS Terminal.app has limited color support and may look off.

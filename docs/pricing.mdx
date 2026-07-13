@@ -1,0 +1,39 @@
+---
+title: Pricing
+description: "Enterprise hosting and cloud pass-through pricing"
+icon: badge-dollar-sign
+---
+
+## Enterprise
+
+We host Magnitude in your VPC or data center, optionally air-gapped. Your code never goes to Anthropic, OpenAI, or anyone else.
+
+- We deploy and tune the model serving stack inside your environment
+- SSO, RBAC, spend controls, audit logs
+- Founder-level support
+
+[Talk to us →](https://calendly.com/tom-magnitude/30min)
+
+## Cloud
+
+Runs on our infrastructure, nothing to host. Zero data retention on your prompts and code. Sign up at [app.magnitude.dev](https://app.magnitude.dev) and get **\$5 of free credits** to start, no card required.
+
+### How it works
+
+- **Pass-through pricing.** Each request is charged at the model's actual per-token cost with no markup.
+- **Top-ups.** Add credits in multiples of \$5 (presets at \$10, \$20, \$50, custom up to \$500). Stripe processing fees are passed through as a separate line item.
+- **Auto-reload (optional).** Off by default. Turn it on and set a threshold, top-up amount, and monthly cap. When your balance drops below the threshold, we charge your card for the configured amount.
+
+Manage all of this on the [billing page](https://app.magnitude.dev/billing) in the console. Run `/usage` in the CLI to check your balance, recent spend, top-up history, and auto-reload status.
+
+### Per-token pricing
+
+Pricing per 1M tokens, identical to what the underlying provider charges us.
+
+| Model | Input/1M | Cached input/1M | Output/1M |
+|---|---|---|---|
+| GLM 5.2 | $1.40 | $0.14 | $4.40 |
+| Kimi K2.7 Code | $0.95 | $0.16 | $4.00 |
+| DeepSeek V4 Flash | $0.14 | $0.04 | $0.28 |
+
+
