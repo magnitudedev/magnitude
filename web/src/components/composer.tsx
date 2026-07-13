@@ -4,7 +4,7 @@
  * Textarea, submit/stop button, meta row, slash command menu,
  * file mention menu, attachment pills, bash mode.
  */
-import { useEffect, useState, useRef, useCallback, type ReactNode } from "react"
+import { useState, useRef, useCallback, type ReactNode } from "react"
 import {
   ArrowUp,
   Square,
@@ -17,7 +17,12 @@ import {
 import { useSlashCommands, useFileMentions, type MentionFileItem, type SlashCommandDefinition, type MentionSearchClient, mentionAttachmentFromSegment } from "@magnitudedev/client-common"
 import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import { toGenericKeyEvent, isSendKey, isEscapeKey } from "../utils/keyboard"
-import { messageHistoryAtom, restoredQueuedInputTextAtom } from "@magnitudedev/client-common"
+import {
+  messageHistoryAtom,
+  composerTextAtom,
+  composerAttachmentsAtom,
+  composerHistoryIndexAtom,
+} from "@magnitudedev/client-common"
 import type { MentionAttachment } from "@magnitudedev/sdk"
 
 export interface ComposerProps {
@@ -61,34 +66,18 @@ export function Composer({
   cwd = null,
   docked = false,
 }: ComposerProps): ReactNode {
-  const [text, setText] = useState("")
-  const [attachments, setAttachments] = useState<MentionAttachment[]>([])
+  const text = useAtomValue(composerTextAtom)
+  const setText = useAtomSet(composerTextAtom)
+  const attachments = useAtomValue(composerAttachmentsAtom)
+  const setAttachments = useAtomSet(composerAttachmentsAtom)
+  const historyIndex = useAtomValue(composerHistoryIndexAtom)
+  const setHistoryIndex = useAtomSet(composerHistoryIndexAtom)
+  const [savedDraft, setSavedDraft] = useState("")
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   // Message history navigation (spec §14.4: ↑/↓ in composer)
   const messageHistory = useAtomValue(messageHistoryAtom)
   const setMessageHistory = useAtomSet(messageHistoryAtom)
-  const restoredQueuedInputText = useAtomValue(restoredQueuedInputTextAtom)
-  const setRestoredQueuedInputText = useAtomSet(restoredQueuedInputTextAtom)
-  const historyIndexRef = useRef<number>(-1) // -1 = not navigating history
-  const savedDraftRef = useRef<string>("") // draft saved when entering history mode
-
-  useEffect(() => {
-    if (restoredQueuedInputText === null) return
-    setText(restoredQueuedInputText)
-    setAttachments([])
-    historyIndexRef.current = -1
-    savedDraftRef.current = ""
-    setRestoredQueuedInputText(null)
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current
-      if (!ta) return
-      ta.focus()
-      ta.setSelectionRange(restoredQueuedInputText.length, restoredQueuedInputText.length)
-      ta.style.height = "auto"
-      ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`
-    })
-  }, [restoredQueuedInputText, setRestoredQueuedInputText])
 
   // Slash commands
   const slashState = useSlashCommands(text, (cmdText: string) => {
@@ -99,7 +88,6 @@ export function Composer({
   })
 
   // File mentions
-  const cursorPos = useRef(0)
   const [cursorPosition, setCursorPosition] = useState(0)
 
   const mentionState = useFileMentions({
@@ -135,16 +123,8 @@ export function Composer({
         textareaRef.current?.setSelectionRange(newCursorPos, newCursorPos)
       })
     },
-    [text, cursorPosition],
+    [text, cursorPosition, setText, setAttachments],
   )
-
-  // Auto-resize textarea — called on input, not via effect
-  const autoResize = useCallback(() => {
-    const ta = textareaRef.current
-    if (!ta) return
-    ta.style.height = "auto"
-    ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`
-  }, [])
 
   const handleSubmit = useCallback(() => {
     const trimmed = text.trim()
@@ -163,11 +143,11 @@ export function Composer({
       prev[0] === trimmed ? prev : [trimmed, ...prev].slice(0, 100),
     )
     // Reset history navigation
-    historyIndexRef.current = -1
-    savedDraftRef.current = ""
+    setHistoryIndex(-1)
+    setSavedDraft("")
     setText("")
     setAttachments([])
-  }, [text, attachments, bashMode, onRunBash, onSend, setMessageHistory])
+  }, [text, attachments, bashMode, onRunBash, onSend, setMessageHistory, setHistoryIndex, setText, setAttachments])
 
   const canSend = text.trim().length > 0 || attachments.length > 0
 
@@ -202,22 +182,21 @@ export function Composer({
           || text.slice(0, e.currentTarget.selectionStart).indexOf("\n") === -1
         if (atFirstLine && messageHistory.length > 0) {
           e.preventDefault()
-          if (historyIndexRef.current === -1) {
+          if (historyIndex === -1) {
             // Entering history mode — save current draft
-            savedDraftRef.current = text
-            historyIndexRef.current = 0
-          } else if (historyIndexRef.current < messageHistory.length - 1) {
-            historyIndexRef.current++
+            setSavedDraft(text)
+            setHistoryIndex(0)
+          } else if (historyIndex < messageHistory.length - 1) {
+            setHistoryIndex(historyIndex + 1)
           }
-          const entry = messageHistory[historyIndexRef.current]
+          const entry = messageHistory[historyIndex === -1 ? 0 : historyIndex + 1]
           if (entry !== undefined) {
             setText(entry)
             requestAnimationFrame(() => {
               const ta = textareaRef.current
               if (ta) {
                 ta.setSelectionRange(entry.length, entry.length)
-                ta.style.height = "auto"
-                ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`
+                resizeTextarea(ta)
               }
             })
           }
@@ -226,37 +205,36 @@ export function Composer({
       }
 
       if (e.key === "ArrowDown" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
-        if (historyIndexRef.current !== -1) {
+        if (historyIndex !== -1) {
           // Only navigate forward when at the last line
           const cursorPos = e.currentTarget.selectionStart
           const afterCursor = text.slice(cursorPos)
           const atLastLine = afterCursor.indexOf("\n") === -1
           if (atLastLine) {
             e.preventDefault()
-            if (historyIndexRef.current > 0) {
-              historyIndexRef.current--
-              const entry = messageHistory[historyIndexRef.current]
+            if (historyIndex > 0) {
+              const nextIndex = historyIndex - 1
+              setHistoryIndex(nextIndex)
+              const entry = messageHistory[nextIndex]
               if (entry !== undefined) {
                 setText(entry)
                 requestAnimationFrame(() => {
                   const ta = textareaRef.current
                   if (ta) {
                     ta.setSelectionRange(entry.length, entry.length)
-                    ta.style.height = "auto"
-                    ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`
+                    resizeTextarea(ta)
                   }
                 })
               }
             } else {
               // Exit history mode — restore saved draft
-              const draft = savedDraftRef.current
-              historyIndexRef.current = -1
-              savedDraftRef.current = ""
-              setText(draft)
+              setHistoryIndex(-1)
+              setSavedDraft("")
+              setText(savedDraft)
               requestAnimationFrame(() => {
                 const ta = textareaRef.current
                 if (ta) {
-                  ta.setSelectionRange(draft.length, draft.length)
+                  ta.setSelectionRange(savedDraft.length, savedDraft.length)
                 }
               })
             }
@@ -283,16 +261,16 @@ export function Composer({
         return
       }
     },
-    [slashState, mentionState, canSend, isStreaming, bashMode, onInterrupt, onToggleBashMode, handleSubmit, messageHistory],
+    [slashState, mentionState, canSend, isStreaming, bashMode, onInterrupt, onToggleBashMode, handleSubmit, messageHistory, historyIndex, text, savedDraft, setText, setHistoryIndex, setSavedDraft],
   )
 
   const handleTextareaChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       setText(e.target.value)
       setCursorPosition(e.target.selectionStart)
-      autoResize()
+      resizeTextarea(e.target)
     },
-    [],
+    [setText],
   )
 
   const handleTextareaSelect = useCallback(
@@ -304,7 +282,7 @@ export function Composer({
 
   const removeAttachment = useCallback((index: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== index))
-  }, [])
+  }, [setAttachments])
 
   // Placeholder text
   const placeholder = bashMode
@@ -429,6 +407,11 @@ export function Composer({
       </div>
     </div>
   )
+}
+
+function resizeTextarea(ta: HTMLTextAreaElement) {
+  ta.style.height = "auto"
+  ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`
 }
 
 // ── Slash Command Menu ──
@@ -670,5 +653,3 @@ function AttachmentPill({
     </span>
   )
 }
-
-

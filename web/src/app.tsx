@@ -165,8 +165,7 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
     [client, cwdFilter, trimmedSearchQuery],
   )
   const firstPageResult = useAtomValue(firstPageAtom)
-  const runtimeResult = useAtomValue(client.runtime)
-  const runtime = Result.isSuccess(runtimeResult) ? runtimeResult.value : null
+  const listSessionsMutation = useAtomSet(client.mutation("ListSessions"), { mode: "promise" })
 
   useEffect(() => {
     sessionPageGenerationRef.current += 1
@@ -196,21 +195,19 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
   }, [firstPageResult])
 
   const loadMoreSessions = useCallback(async () => {
-    if (!runtime || sessionPage.loadingMore || !sessionPage.hasMore || !sessionPage.nextCursor) return
+    if (sessionPage.loadingMore || !sessionPage.hasMore || !sessionPage.nextCursor) return
     const generation = sessionPageGenerationRef.current
     setSessionPage((prev) => ({ ...prev, loadingMore: true }))
     try {
-      const run = Runtime.runPromise(runtime)
-      const page = await run(
-        Effect.flatMap(client, (c) =>
-          c("ListSessions", {
-            cwd: cwdFilter ? Option.some(cwdFilter) : Option.none(),
-            query: trimmedSearchQuery ? Option.some(trimmedSearchQuery) : Option.none(),
-            cursor: Option.some(sessionPage.nextCursor as string),
-            limit: SESSION_PAGE_SIZE,
-          }),
-        ),
-      ) as ListSessionsResult
+      const page = await listSessionsMutation({
+        payload: {
+          cwd: cwdFilter ? Option.some(cwdFilter) : Option.none(),
+          query: trimmedSearchQuery ? Option.some(trimmedSearchQuery) : Option.none(),
+          cursor: Option.some(sessionPage.nextCursor as string),
+          limit: SESSION_PAGE_SIZE,
+        },
+        reactivityKeys: ["sessions"],
+      })
       if (generation !== sessionPageGenerationRef.current) return
       setSessionPage((prev) => ({
         sessions: appendUniqueSessions(prev.sessions, page.items),
@@ -224,9 +221,8 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
       setSessionPage((prev) => ({ ...prev, loadingMore: false }))
     }
   }, [
-    client,
+    listSessionsMutation,
     cwdFilter,
-    runtime,
     sessionPage.hasMore,
     sessionPage.loadingMore,
     sessionPage.nextCursor,

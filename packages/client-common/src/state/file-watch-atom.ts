@@ -1,16 +1,22 @@
 /**
- * File watch subscription — managed WatchFile fiber.
+ * File watch reactivity bridge — subscribes to WatchFile for the selected
+ * file and invalidates the "files" reactivity key on each event.
  *
- * WatchFile is a resident stream (per SDK spec)
- * with the same liveness/reconnection handling as StreamDisplayView.
- * The recoveringProtocolLayer handles transport recovery.
+ * This makes `reactivityKeys: ["files"]` on ReadFile queries actually work:
+ * when a file changes on disk, the reactivity key is invalidated, and any
+ * atom query with that key re-executes.
  *
- * Module-level singleton — one file watch at a time (the file panel watches
- * one file). Interrupting the previous fiber before starting a new one.
+ * Uses `useAtomMount` — the atom runtime provides the `Reactivity` service.
+ * When the selected file changes, `useMemo` creates a new atom, `useAtomMount`
+ * mounts the new one and unmounts the old (interrupting the old watch stream).
+ * No manual fiber management.
  */
-import { Effect, Stream, Layer, Fiber, Cause } from "effect"
+import { useMemo } from "react"
+import { Atom, useAtomMount, useAtomValue } from "@effect-atom/atom-react"
+import { Effect, Stream, Cause, Layer } from "effect"
 import { RpcClient } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
+import * as Reactivity from "@effect/experimental/Reactivity"
 import {
   MagnitudeRpcs,
   recoveringProtocolLayer,
@@ -18,73 +24,52 @@ import {
   type WatchFileWireEvent,
   type WatchFileEvent,
 } from "@magnitudedev/sdk"
+import { usePlatform } from "../platform/platform-context"
+import { selectedCwdAtom, selectedFilePathAtom } from "./session-atoms"
 
-/** Callbacks for file watch lifecycle events */
-export interface FileWatchCallbacks {
-  /** Called when a file event (created/changed/removed) is received */
-  readonly onEvent: (event: WatchFileEvent) => void
-  /** Called when the watch stream fails with a non-interrupt error */
-  readonly onError: (message: string) => void
-}
-
-let currentFiber: Fiber.RuntimeFiber<void, unknown> | null = null
+const isFileEvent = (event: WatchFileWireEvent): event is WatchFileEvent =>
+  !("_tag" in event)
 
 const buildStreamLayer = (daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>) =>
   recoveringProtocolLayer().pipe(
     Layer.provide(Layer.mergeAll(FetchHttpClient.layer, daemonSpawnerLayer)),
   )
 
-const isFileEvent = (event: WatchFileWireEvent): event is WatchFileEvent =>
-  !("_tag" in event)
-
 /**
- * Subscribe to WatchFile for a session + path.
- * Interrupts the previous fiber if one is active.
+ * Subscribe to WatchFile for the selected file and invalidate the "files"
+ * reactivity key on each event. Mount this once at the app root.
  */
-export function subscribeFileWatch(
-  daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>,
-  cwd: string,
-  path: string,
-  callbacks: FileWatchCallbacks,
-): void {
-  interruptFileWatch()
+export function useFileWatchBridge(): void {
+  const platform = usePlatform()
+  const selectedCwd = useAtomValue(selectedCwdAtom)
+  const filePath = useAtomValue(selectedFilePathAtom)
 
-  const watchEffect = Effect.gen(function* () {
-    const client = yield* RpcClient.make(MagnitudeRpcs)
-    const stream = client.WatchFile({ cwd, path }).pipe(
-      Stream.filter(isFileEvent),
-      Stream.tap((event) =>
-        Effect.sync(() => callbacks.onEvent(event)),
+  const watchAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (!selectedCwd || !filePath) return
+
+          const layer = buildStreamLayer(platform.daemonSpawnerLayer)
+          const client = yield* RpcClient.make(MagnitudeRpcs).pipe(
+            Effect.provide(layer),
+          )
+
+          yield* client.WatchFile({ cwd: selectedCwd, path: filePath }).pipe(
+            Stream.filter(isFileEvent),
+            Stream.tap(() => Reactivity.invalidate(["files"])),
+            Stream.runDrain,
+          )
+        }).pipe(
+          Effect.catchAllCause((cause) =>
+            Cause.isInterruptedOnly(cause)
+              ? Effect.void
+              : Effect.logError(`[FileWatch] ${Cause.pretty(cause)}`),
+          ),
+        ),
       ),
-      Stream.runDrain,
-    )
-    yield* stream
-  }).pipe(
-    Effect.catchAllCause((cause) =>
-      Cause.isInterruptedOnly(cause)
-        ? Effect.void
-        : Effect.gen(function* () {
-            const failure = Cause.failureOption(cause)
-            const message = failure._tag === "Some" && failure.value instanceof Error
-              ? failure.value.message
-              : "File watch failed"
-            callbacks.onError(message)
-            yield* Effect.logError(`WatchFile error: ${cause}`)
-          }),
-    ),
-    Effect.scoped,
-    Effect.provide(buildStreamLayer(daemonSpawnerLayer)),
+    [platform.daemonSpawnerLayer, selectedCwd, filePath],
   )
 
-  currentFiber = Effect.runFork(watchEffect)
-}
-
-/**
- * Interrupt the current file watch fiber immediately.
- */
-export function interruptFileWatch(): void {
-  if (currentFiber) {
-    Effect.runFork(Fiber.interrupt(currentFiber))
-    currentFiber = null
-  }
+  useAtomMount(watchAtom)
 }

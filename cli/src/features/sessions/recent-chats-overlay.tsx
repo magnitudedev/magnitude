@@ -1,123 +1,55 @@
-import { memo, useState, useCallback, useRef, useSyncExternalStore } from 'react'
-import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { memo, useState, useCallback, useMemo, useRef, useSyncExternalStore } from 'react'
+import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
+import { AtomRef } from '@effect-atom/atom-react'
+import { Option } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
 import { subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
-import { safeRenderableAccess } from '../../utils/safe-renderable-access'
+
 import { Button } from '../../components/button'
 import { RecentChatEntry } from './recent-chat-entry'
-import type { RecentChat, RecentChatsPage } from '@magnitudedev/client-common'
+import type { RecentChat } from '@magnitudedev/client-common'
 
 interface RecentChatsOverlayProps {
   onClose: () => void
   onSelect: (chat: RecentChat) => void
-  loadPage: (offset: number, limit: number) => Promise<RecentChatsPage>
+  chats: RecentChat[]
+  hasMore: boolean
+  isLoading: boolean
+  loadMore: () => void
 }
 
-/** Approximate height of one chat entry row in terminal lines. */
-const ROW_HEIGHT = 1
 /** Threshold in pixels from the bottom to trigger loading more items. */
 const LOAD_MORE_THRESHOLD = 3
-/** Polling interval for scroll position checks (ms). */
-const SCROLL_POLL_INTERVAL = 150
-/** Minimum page size if viewport measurement isn't available yet. */
-const MIN_PAGE_SIZE = 10
 
 export const RecentChatsOverlay = memo(function RecentChatsOverlay({
   onClose,
   onSelect,
-  loadPage,
+  chats,
+  hasMore,
+  isLoading,
+  loadMore,
 }: RecentChatsOverlayProps) {
   const theme = useTheme()
   const [closeHover, setCloseHover] = useState(false)
-  const scrollboxRef = useRef<any>(null)
-
-  // Overlay-owned pagination state
-  const [chats, setChats] = useState<RecentChat[]>([])
-  const [hasMore, setHasMore] = useState(false)
-  const [isLoading, setIsLoading] = useState(false)
   const [selectedIndex, setSelectedIndex] = useState(0)
-  const [loadError, setLoadError] = useState<string | null>(null)
-  const pageSizeRef = useRef(MIN_PAGE_SIZE)
-  const loadingRef = useRef(false)
-  const chatsRef = useRef<RecentChat[]>([])
-  const measuredRef = useRef(false)
+  const scrollboxAtomRef = useMemo(
+    () => AtomRef.make<Option.Option<ScrollBoxRenderable>>(Option.none()),
+    [],
+  )
   const scrolledSinceLoad = useRef(false)
   const lastScrollTop = useRef(0)
-  const initializedRef = useRef(false)
 
-  // Keep chatsRef in sync (imperative, no useEffect)
-  chatsRef.current = chats
-
-  // Measure viewport and compute page size after mount
-  // Returns true if measurement succeeded
-  const measurePageSize = useCallback((): boolean => {
-    return safeRenderableAccess(
-      scrollboxRef.current,
-      (sb) => {
-        const viewportHeight = sb.viewport?.height ?? 0
-        if (viewportHeight > 0) {
-          pageSizeRef.current = Math.max(MIN_PAGE_SIZE, Math.floor(viewportHeight / ROW_HEIGHT))
-          measuredRef.current = true
-          return true
-        }
-        return false
-      },
-      { fallback: false },
-    ) ?? false
-  }, [])
-
-  // Internal load function — appends items starting at given offset
-  const doLoad = useCallback((offset: number, replace: boolean) => {
-    if (loadingRef.current) return
-    loadingRef.current = true
-    setIsLoading(true)
-    setLoadError(null)
-
-    loadPage(offset, pageSizeRef.current)
-      .then((page) => {
-        if (replace) {
-          setChats(page.items)
-          chatsRef.current = page.items
-        } else {
-          setChats(prev => {
-            const next = [...prev, ...page.items]
-            chatsRef.current = next
-            return next
-          })
-        }
-        setHasMore(page.hasMore)
-      })
-      .catch((err) => {
-        setLoadError(err instanceof Error ? err.message : 'Failed to load conversations')
-      })
-      .finally(() => {
-        loadingRef.current = false
-        setIsLoading(false)
-        // Reset scroll gate — user must scroll again before next load triggers
-        scrolledSinceLoad.current = false
-      })
-  }, [loadPage])
-
-  // On mount: measure viewport, then load first page (ref-based, no useEffect)
-  if (!initializedRef.current) {
-    initializedRef.current = true
-    setTimeout(() => {
-      measurePageSize()
-      doLoad(0, true)
-    }, 0)
-  }
-
-  // Infinite scroll: use animation tick for polling (150ms ≈ 2 ticks)
+  // Infinite scroll: use animation tick for polling (150ms ≈ 2 ticks).
+  // This is event-source-driven polling, not a reaction to state.
   const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
-  // Check scroll position every ~2 ticks (160ms)
   const lastPollTickRef = useRef(0)
   if (hasMore && tick !== lastPollTickRef.current && tick % 2 === 0) {
     lastPollTickRef.current = tick
-    if (!loadingRef.current) {
-      const result = safeRenderableAccess(
-        scrollboxRef.current,
-        (sb) => {
+    if (!isLoading) {
+      const result = Option.match(scrollboxAtomRef.value, {
+        onNone: () => false,
+        onSome: (sb) => {
           const viewportHeight = sb.viewport?.height ?? 0
           const scrollTop = sb.scrollTop ?? 0
           const scrollHeight = sb.scrollHeight ?? 0
@@ -131,11 +63,10 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
           if (!scrolledSinceLoad.current) return false
           return scrollHeight - scrollTop - viewportHeight <= LOAD_MORE_THRESHOLD
         },
-        { fallback: false },
-      )
+      })
 
       if (result) {
-        doLoad(chatsRef.current.length, false)
+        loadMore()
       }
     }
   }
@@ -201,7 +132,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
       </box>
 
       <scrollbox
-        ref={scrollboxRef}
+        ref={(sb: ScrollBoxRenderable | null) => { scrollboxAtomRef.set(Option.fromNullable(sb)) }}
         scrollX={false}
         scrollbarOptions={{ visible: false }}
         verticalScrollbarOptions={{
@@ -259,7 +190,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
       <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span attributes={TextAttributes.DIM}>
-            {isLoading ? 'Loading...' : loadError ? `Error: ${loadError}` : `${chats.length} conversation${chats.length === 1 ? '' : 's'}`}
+            {isLoading ? 'Loading...' : `${chats.length} conversation${chats.length === 1 ? '' : 's'}`}
           </span>
         </text>
       </box>

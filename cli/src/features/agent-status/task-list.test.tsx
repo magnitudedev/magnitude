@@ -38,7 +38,7 @@ vi.mock('../../components/button', () => ({
   ),
 }))
 
-const { TaskList, getVisibleTasks, scheduleInitialTaskListSnap } = await import('./task-list')
+const { TaskList, getVisibleTasks } = await import('./task-list')
 
 const noop = () => {}
 const theme = () => testTheme
@@ -203,32 +203,8 @@ test('collapsed mode helper keeps only the last six tasks before expansion', () 
   expect(lastTask?.kind === 'task' ? lastTask.title : null).toBe('Task 8')
 })
 
-test('initial expanded snap helper schedules immediate + deferred bottom snaps and cleans up', () => {
-  const scheduled: Array<{ fn: () => void, delay: number, id: number }> = []
-  const canceled: number[] = []
-  let nextId = 1
-  let snapCount = 0
-
-  const cleanup = scheduleInitialTaskListSnap(
-    () => { snapCount += 1 },
-    ((fn: (...args: any[]) => void, delay?: number) => {
-      const id = nextId++
-      scheduled.push({ fn: () => fn(), delay: delay ?? 0, id })
-      return id as unknown as ReturnType<typeof setTimeout>
-    }) as typeof setTimeout,
-    ((id: ReturnType<typeof setTimeout>) => {
-      canceled.push(id as unknown as number)
-    }) as typeof clearTimeout,
-  )
-
-  expect(scheduled.map((t) => t.delay)).toEqual([0, 50])
-
-  scheduled[0]?.fn()
-  scheduled[1]?.fn()
-  expect(snapCount).toBe(2)
-
-  cleanup()
-  expect(canceled).toEqual([scheduled[0]!.id, scheduled[1]!.id])
+test('initial expanded snap helper is no longer exported', () => {
+  expect(typeof (globalThis as Record<string, unknown>).scheduleInitialTaskListSnap).toBe('undefined')
 })
 
 test('default header shows Task (X completed, Y active) using not-completed active semantics', () => {

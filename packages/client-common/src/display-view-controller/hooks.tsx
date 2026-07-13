@@ -2,13 +2,13 @@ import {
   createContext,
   useCallback,
   useContext,
-  useEffect,
   useMemo,
   useRef,
   useSyncExternalStore,
   type ReactNode,
 } from "react"
-import { useAtomSet } from "@effect-atom/atom-react"
+import { Atom, useAtomMount, useAtomSet } from "@effect-atom/atom-react"
+import { Effect } from "effect"
 import type { DisplayState } from "@magnitudedev/sdk"
 import { usePlatform } from "../platform/platform-context"
 import {
@@ -20,7 +20,7 @@ import {
   type DisplayViewStore,
 } from "../sync/index"
 import { DisplayReaderContext, DisplaySpeculatorContext } from "../sync/use-display-view"
-import { restoredQueuedInputTextAtom } from "../state/session-atoms"
+import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom } from "../state/session-atoms"
 import { EMPTY_DISPLAY_STATE } from "../state/empty-display-state"
 import {
   DisplayViewControllerCore,
@@ -48,7 +48,9 @@ export function DisplayViewControllerProvider({
   initial = EMPTY_DISPLAY_STATE,
 }: DisplayViewControllerProviderProps): ReactNode {
   const platform = usePlatform()
-  const setRestoredQueuedInputText = useAtomSet(restoredQueuedInputTextAtom)
+  const setComposerText = useAtomSet(composerTextAtom)
+  const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
+  const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
   const store = useMemo(
     () => createDisplayViewStore(initial, EMPTY_DISPLAY_VIEW_SHAPE),
     [initial],
@@ -58,20 +60,39 @@ export function DisplayViewControllerProvider({
       new DisplayViewControllerCore({
         daemonSpawnerLayer: platform.daemonSpawnerLayer,
         displaySync: store,
-        onRestoreQueuedInputText: setRestoredQueuedInputText,
+        onRestoreQueuedInputText: (text) => {
+          if (text != null) {
+            setComposerText(text)
+            setComposerAttachments([])
+            setComposerHistoryIndex(-1)
+          } else {
+            setComposerText("")
+            setComposerAttachments([])
+            setComposerHistoryIndex(-1)
+          }
+        },
       }),
-    [platform.daemonSpawnerLayer, setRestoredQueuedInputText, store],
+    [platform.daemonSpawnerLayer, setComposerText, setComposerAttachments, setComposerHistoryIndex, store],
   )
 
-  useEffect(() => {
-    activeController = controller
-    return () => {
-      if (activeController === controller) {
-        activeController = null
-      }
-      controller.dispose()
-    }
-  }, [controller])
+  const lifecycleAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          activeController = controller
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              if (activeController === controller) {
+                activeController = null
+              }
+              controller.dispose()
+            }),
+          )
+        }),
+      ),
+    [controller],
+  )
+  useAtomMount(lifecycleAtom)
 
   return (
     <DisplayViewControllerContext.Provider value={controller}>

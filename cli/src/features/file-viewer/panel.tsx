@@ -1,9 +1,10 @@
-import { memo, useMemo, useRef } from 'react'
-import { TextAttributes } from '@opentui/core'
+import { memo, useMemo } from 'react'
+import { TextAttributes, type ScrollBoxRenderable, type Renderable } from '@opentui/core'
+import { Atom, AtomRef, useAtomMount } from '@effect-atom/atom-react'
+import { Effect, Option } from 'effect'
 import { useLocalWidth } from '../../hooks/use-local-width'
 import { useTheme } from '../../hooks/use-theme'
 import { usePanelStreaming } from '../../hooks/use-panel-streaming'
-import { useScrollToElement } from '../../hooks/use-scroll-to-element'
 import type { FilePanelStream } from '../../hooks/use-file-panel'
 import { StreamingMarkdownContent } from '../../markdown/markdown-content'
 import { highlightFile } from '../../markdown/highlight-file'
@@ -12,6 +13,30 @@ import { isMarkdownFile, renderCodeLines } from '../../utils/file-lang'
 import { highlightCodeLines } from '../../utils/file-panel-utils'
 import { BOX_CHARS } from '../../utils/ui-constants'
 import { CloseButton, CopyButton } from './panel-buttons'
+
+/**
+ * Compute the cumulative top offset of a renderable relative to a container.
+ * Walks the parent chain summing yoga computed tops.
+ */
+function computeOffsetFromContainer(target: Renderable, container: Renderable): number {
+  let offsetY = 0
+  let node: Renderable | null = target
+  while (node && node !== container) {
+    offsetY += node.getLayoutNode().getComputedTop()
+    node = node.parent
+  }
+  return offsetY
+}
+
+/** Scroll the scrollbox to bring a descendant element into view by ID. */
+function scrollDescendantIntoView(scrollbox: ScrollBoxRenderable, elementId: string): void {
+  const contentNode = scrollbox.content
+  if (!contentNode) return
+  const target = contentNode.findDescendantById(elementId)
+  if (!target) return
+  scrollbox.stickyScroll = false
+  scrollbox.scrollTo(computeOffsetFromContainer(target, contentNode))
+}
 
 interface FileViewerPanelProps {
   filePath: string
@@ -27,7 +52,16 @@ export const FileViewerPanel = memo(function FileViewerPanel({
 }: FileViewerPanelProps) {
   const theme = useTheme()
   const panel = useLocalWidth()
-  const scrollboxRef = useRef<any>(null)
+  const scrollboxAtomRef = useMemo(
+    () => AtomRef.make<Option.Option<ScrollBoxRenderable>>(Option.none()),
+    [],
+  )
+  const attachScrollbox = useMemo(
+    () => (sb: ScrollBoxRenderable | null) => {
+      scrollboxAtomRef.set(Option.fromNullable(sb))
+    },
+    [scrollboxAtomRef],
+  )
   const markdown = isMarkdownFile(filePath)
 
   const {
@@ -46,8 +80,39 @@ export const FileViewerPanel = memo(function FileViewerPanel({
     [markdown, scrollToSection],
   )
 
-  useScrollToElement(scrollboxRef, targetSectionId)
-  useScrollToElement(scrollboxRef, highlightAnchorId, [displayedContent])
+  // Scroll-to-element — useAtomMount lifecycle. Reads from AtomRef (reactive).
+  // Effect.sleep('50 millis') lets OpenTUI's async yoga layout settle before measuring.
+  const scrollToSectionAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (!targetSectionId) return
+          yield* Effect.sleep('50 millis')
+          Option.match(scrollboxAtomRef.value, {
+            onNone: () => {},
+            onSome: (sb) => scrollDescendantIntoView(sb, targetSectionId),
+          })
+        }),
+      ),
+    [targetSectionId, scrollboxAtomRef],
+  )
+  useAtomMount(scrollToSectionAtom)
+
+  const scrollToHighlightAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (!highlightAnchorId) return
+          yield* Effect.sleep('50 millis')
+          Option.match(scrollboxAtomRef.value, {
+            onNone: () => {},
+            onSome: (sb) => scrollDescendantIntoView(sb, highlightAnchorId),
+          })
+        }),
+      ),
+    [highlightAnchorId, displayedContent, scrollboxAtomRef],
+  )
+  useAtomMount(scrollToHighlightAtom)
 
   const headerLabel = scrollToSection && markdown
     ? `≡  ${filePath} > ${scrollToSection}`
@@ -89,7 +154,7 @@ export const FileViewerPanel = memo(function FileViewerPanel({
       </box>
 
       <scrollbox
-        ref={scrollboxRef}
+        ref={attachScrollbox}
         stickyScroll={!scrollToSection}
         stickyStart={isActivelyStreaming && !scrollToSection ? 'bottom' : 'top'}
         scrollX={false}

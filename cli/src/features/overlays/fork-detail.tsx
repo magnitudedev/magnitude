@@ -1,4 +1,6 @@
-import { memo, useState, useCallback, useRef } from 'react'
+import { memo, useState, useCallback, useRef, useMemo } from 'react'
+import { Atom, useAtomMount } from '@effect-atom/atom-react'
+import { Effect } from 'effect'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import type { ActionId } from '../../types/ui-actions'
@@ -32,16 +34,6 @@ interface ForkDetailOverlayProps {
 
 function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1)
-}
-
-export function scheduleInitialForkOverlaySnap(
-  scrollToBottom: () => void,
-  schedule: typeof setTimeout = setTimeout,
-  cancel: typeof clearTimeout = clearTimeout,
-): () => void {
-  const t1 = schedule(scrollToBottom, 0)
-  const t2 = schedule(scrollToBottom, 50)
-  return () => { cancel(t1); cancel(t2) }
 }
 
 export const ForkDetailOverlay = memo(function ForkDetailOverlay({
@@ -87,14 +79,21 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
     projectRoot,
   })
 
-  // On mount/open — snap to bottom after first paint/layout (ref-based, no useEffect)
-  const snappedRef = useRef(false)
-  if (!snappedRef.current) {
-    snappedRef.current = true
-    scheduleInitialForkOverlaySnap(
-      () => scrollboxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER),
-    )
-  }
+  // On mount/open — snap to bottom after first paint/layout (useAtomMount lifecycle, post-commit)
+  const snapAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          const scrollbox = scrollboxRef.current
+          if (!scrollbox) return
+          scrollbox.scrollTo(Number.MAX_SAFE_INTEGER)
+          yield* Effect.sleep('50 millis')
+          scrollbox.scrollTo(Number.MAX_SAFE_INTEGER)
+        }),
+      ),
+    [],
+  )
+  useAtomMount(snapAtom)
 
   const tokenEstimate = context?.tokenEstimate ?? 0
   const tokenUsage = tokenEstimate > 0 ? tokenEstimate : null

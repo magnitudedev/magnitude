@@ -13,7 +13,9 @@
  * exists, the top of the scrollback is a spacer that shows a loading line
  * whenever a page is in flight.
  */
-import { useCallback, useRef, useEffect, useSyncExternalStore, useMemo, type ReactNode } from 'react'
+import { useCallback, useRef, useSyncExternalStore, useMemo, type ReactNode } from 'react'
+import { Atom, useAtomMount } from '@effect-atom/atom-react'
+import { Effect } from 'effect'
 import { TextAttributes } from '@opentui/core'
 import { useAtomValue } from '@effect-atom/atom-react'
 import type { ScrollBoxRenderable } from '@opentui/core'
@@ -101,12 +103,6 @@ export function ChatTimelineContainer({
     [],
   )
 
-  const previousOverlayActiveRef = useRef(isOverlayActive)
-  if (isOverlayActive && !previousOverlayActiveRef.current) {
-    scrollControllerRef.current?.suspend()
-  }
-  previousOverlayActiveRef.current = isOverlayActive
-
   // Callback ref: the scrollbox's mount/unmount IS the controller's lifetime.
   const attachScrollbox = useCallback(
     (sb: ScrollBoxRenderable | null) => {
@@ -129,15 +125,27 @@ export function ChatTimelineContainer({
   // This is view lifecycle management (not scroll behavior): while suspended,
   // the controller preserves all state — window position, scroll distance,
   // followingBottom — so the user returns to exactly what they left.
-  useEffect(() => {
-    const controller = scrollControllerRef.current
-    if (!controller) return
-    if (isOverlayActive) {
-      controller.suspend()
-      return
-    }
-    controller.resume()
-  }, [isOverlayActive])
+  const suspendResumeAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          const controller = scrollControllerRef.current
+          if (!controller) return
+          if (isOverlayActive) {
+            controller.suspend()
+          } else {
+            controller.resume()
+          }
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              controller.resume()
+            }),
+          )
+        }),
+      ),
+    [isOverlayActive],
+  )
+  useAtomMount(suspendResumeAtom)
 
   return (
     <ChatScrollbox scrollRef={attachScrollbox} hasMoreBefore={hasMoreBefore}>

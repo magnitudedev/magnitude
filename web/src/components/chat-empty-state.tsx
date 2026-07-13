@@ -4,7 +4,7 @@
  * No session has been selected yet. The first message creates a session using
  * the agent-host working directory selected here.
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode, type UIEvent } from "react"
+import { useCallback, useMemo, useState, type ReactNode, type UIEvent } from "react"
 import { Folder, Loader2, Search } from "lucide-react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { formatCwdForDisplay, formatRelativeTime, selectedCwdAtom, useAgentClient } from "@magnitudedev/client-common"
@@ -97,11 +97,6 @@ function DirectoryPicker(): ReactNode {
     query: "",
     limit: DIRECTORY_PAGE_SIZE,
   })
-  const [lastLoaded, setLastLoaded] = useState<{
-    query: string
-    limit: number
-    candidates: readonly DirectoryCandidate[]
-  } | null>(null)
   const trimmedQuery = query.trim()
   const visibleLimit = limitState.query === trimmedQuery ? limitState.limit : DIRECTORY_PAGE_SIZE
 
@@ -115,39 +110,16 @@ function DirectoryPicker(): ReactNode {
   )
   const result = useAtomValue(directoriesAtom)
   const isLoading = Result.isInitial(result)
-  const successCandidates = Result.isSuccess(result)
-    ? (result.value as SearchDirectoriesResult).candidates
-    : null
 
-  useEffect(() => {
-    if (!successCandidates) return
-    setLastLoaded({
-      query: trimmedQuery,
-      limit: visibleLimit,
-      candidates: successCandidates,
-    })
-  }, [successCandidates, trimmedQuery, visibleLimit])
+  const candidates = Result.match(result, {
+    onInitial: () => [] as DirectoryCandidate[],
+    onFailure: (f) => (f.previousSuccess._tag === "Some" ? (f.previousSuccess.value.value as SearchDirectoriesResult).candidates : []),
+    onSuccess: (s) => (s.value as SearchDirectoriesResult).candidates,
+  })
 
-  const cachedCandidates = lastLoaded?.query === trimmedQuery ? lastLoaded.candidates : []
-  const candidates = successCandidates ?? cachedCandidates
-  const loadedLimit = successCandidates ? visibleLimit : lastLoaded?.query === trimmedQuery ? lastLoaded.limit : 0
+  const loadedLimit = Result.isSuccess(result) ? visibleLimit : 0
   const loadingMore = isLoading && candidates.length > 0 && visibleLimit > loadedLimit
-  const hasMore = Result.isSuccess(result)
-    ? candidates.length >= visibleLimit
-    : lastLoaded?.query === trimmedQuery
-      ? lastLoaded.candidates.length >= lastLoaded.limit
-      : false
-
-  useEffect(() => {
-    if (selectedCwd) return
-    if (candidates.length > 0) {
-      setSelectedCwd(candidates[0]!.path)
-      return
-    }
-    if (!Result.isInitial(result)) {
-      setSelectedCwd(".")
-    }
-  }, [candidates, selectedCwd, result, setSelectedCwd])
+  const hasMore = Result.isSuccess(result) && candidates.length >= visibleLimit
 
   const selectedPath = selectedCwd ?? candidates[0]?.path ?? "."
   const selectedCandidate = candidates.find((candidate) => candidate.path === selectedPath)

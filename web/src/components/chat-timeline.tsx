@@ -7,12 +7,13 @@
  */
 import {
   useCallback,
-  useEffect,
   useMemo,
   useRef,
   type CSSProperties,
   type ReactNode,
 } from "react"
+import { Atom, useAtomMount } from "@effect-atom/atom-react"
+import { Effect } from "effect"
 import {
   Download,
   FileDiff,
@@ -722,12 +723,24 @@ export function ChatTimeline({
   // an overlay. While suspended, the controller preserves all state — window
   // position, scroll distance, followingBottom — so the user returns to
   // exactly what they left.
-  useEffect(() => {
-    const controller = scrollControllerRef.current
-    if (!controller) return
-    if (!isVisible) controller.suspend()
-    else controller.resume()
-  }, [isVisible])
+  const suspendResumeAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          const controller = scrollControllerRef.current
+          if (!controller) return
+          if (!isVisible) controller.suspend()
+          else controller.resume()
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              controller.resume()
+            }),
+          )
+        }),
+      ),
+    [isVisible],
+  )
+  useAtomMount(suspendResumeAtom)
 
   const centerContent = isSessionLoading || (!isSessionLoading && isEmpty)
   const contentStyle: CSSProperties | undefined = centerContent

@@ -1,6 +1,8 @@
 import { TextAttributes } from '@opentui/core'
 
 import { useKeyboard, useRenderer } from '@opentui/react'
+import { Atom, useAtomMount } from '@effect-atom/atom-react'
+import { Effect } from 'effect'
 import {
   forwardRef,
   useCallback,
@@ -393,7 +395,6 @@ export const MultilineInput = forwardRef<
   const lastActivity = useMemo(() => Date.now(), [value, cursorPosition])
 
   const stickyColumnRef = useRef<number | null>(null)
-  const prevBulkInsertEpochRef = useRef(bulkInsertEpoch)
   const [suppressBottomFollowAutoScroll, setSuppressBottomFollowAutoScroll] = useState(false)
 
   // Refs to track latest value and cursor position synchronously for IME input handling.
@@ -431,11 +432,6 @@ export const MultilineInput = forwardRef<
     [cursorPosition],
   )
 
-  // Bulk insert epoch — ref-based (no useEffect)
-  if (bulkInsertEpoch !== prevBulkInsertEpochRef.current) {
-    prevBulkInsertEpochRef.current = bulkInsertEpoch
-    setSuppressBottomFollowAutoScroll(true)
-  }
 
   const textRef = useRef<TextRenderable | null>(null)
 
@@ -450,16 +446,53 @@ export const MultilineInput = forwardRef<
 
   const visualLineStarts = deriveVisualLineStarts(value, lineInfo)
 
-  // Focus/blur scrollbox when focused prop changes — ref-based (no useEffect)
-  const prevFocusedRef = useRef(focused)
-  if (prevFocusedRef.current !== focused) {
-    prevFocusedRef.current = focused
-    if (focused) {
-      safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.focus?.())
-    } else {
-      safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.blur?.())
-    }
-  }
+  // Auto-scroll to cursor when content changes — useAtomMount lifecycle (post-commit, ref is populated)
+  const cursorRow = Math.max(
+    0,
+    visualLineStarts.findLastIndex(
+      (lineStart) => lineStart <= cursorPosition,
+    ),
+  )
+
+  const cursorScrollAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (!focused) return
+          const scrollBox = scrollBoxRef.current
+          if (!scrollBox) return
+          const scrollMetrics = {
+            current: scrollBox.verticalScrollBar.scrollPosition,
+            viewportHeight: scrollBox.viewport.height,
+            scrollHeight: scrollBox.scrollHeight,
+          }
+          const scrollPosition = Math.min(
+            Math.max(
+              scrollMetrics.current,
+              Math.max(0, cursorRow - scrollMetrics.viewportHeight + 1),
+            ),
+            Math.min(scrollMetrics.scrollHeight - scrollMetrics.viewportHeight, cursorRow),
+          )
+          scrollBox.verticalScrollBar.scrollPosition = scrollPosition
+        }),
+      ),
+    [cursorPosition, focused, cursorRow],
+  )
+  useAtomMount(cursorScrollAtom)
+
+  // Suppress-bottom-follow cleanup — useAtomMount lifecycle resets the flag after the epoch
+  const suppressCleanupAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (suppressBottomFollowAutoScroll) {
+            setSuppressBottomFollowAutoScroll(false)
+          }
+        }),
+      ),
+    [suppressBottomFollowAutoScroll],
+  )
+  useAtomMount(suppressCleanupAtom)
 
   // Expose focus/blur for imperative use cases
   useImperativeHandle(
@@ -482,51 +515,6 @@ export const MultilineInput = forwardRef<
     }),
     [mountedRef],
   )
-
-  const cursorRow = Math.max(
-    0,
-    visualLineStarts.findLastIndex(
-      (lineStart) => lineStart <= cursorPosition,
-    ),
-  )
-
-  // Auto-scroll to cursor when content changes — ref-based imperative (no useEffect)
-  const prevCursorRef = useRef(cursorPosition)
-  if (prevCursorRef.current !== cursorPosition || suppressBottomFollowAutoScroll) {
-    prevCursorRef.current = cursorPosition
-    if (suppressBottomFollowAutoScroll) {
-      setSuppressBottomFollowAutoScroll(false)
-    } else {
-      const scrollMetrics = focused
-        ? safeRenderableAccess(
-            scrollBoxRef.current,
-            (scrollBox) => ({
-              current: scrollBox.verticalScrollBar.scrollPosition,
-              viewportHeight: scrollBox.viewport.height,
-              scrollHeight: scrollBox.scrollHeight,
-            }),
-            { fallback: null },
-          )
-        : null
-
-      if (scrollMetrics) {
-        const scrollPosition = Math.min(
-          Math.max(
-            scrollMetrics.current,
-            Math.max(0, cursorRow - scrollMetrics.viewportHeight + 1),
-          ),
-          Math.min(scrollMetrics.scrollHeight - scrollMetrics.viewportHeight, cursorRow),
-        )
-
-        safeRenderableCall(
-          scrollBoxRef.current,
-          (scrollBox) => {
-            scrollBox.verticalScrollBar.scrollPosition = scrollPosition
-          },
-        )
-      }
-    }
-  }
 
   const sortedPasteSegments = sortSegments(pasteSegments)
   const sortedMentionSegments = sortMentionSegments(mentionSegments)
@@ -2009,6 +1997,7 @@ export const MultilineInput = forwardRef<
   return (
     <scrollbox
       ref={scrollBoxRef}
+      focused={focused}
       scrollX={false}
       stickyScroll={!suppressBottomFollowAutoScroll}
       stickyStart="bottom"

@@ -9,8 +9,8 @@
  * CommandContext passed in — each app provides its own toast/recent-chats/etc.
  */
 import { useCallback, useEffect, useMemo, useRef } from "react"
-import { Option, Effect, Runtime } from "effect"
-import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+import { Option } from "effect"
+import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
 import { useDisplayState } from "../state/display-state-store"
 import { useSlotProfiles } from "./use-slot-profiles"
@@ -25,7 +25,9 @@ import {
   selectedFilePathAtom,
   pendingUserSubmitAtom,
   sessionActivationPromiseAtom,
-  restoredQueuedInputTextAtom,
+  composerTextAtom,
+  composerAttachmentsAtom,
+  composerHistoryIndexAtom,
   bashOutputsAtom,
   messageHistoryAtom,
   sessionCreateOptionsAtom,
@@ -95,7 +97,9 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const setUsageOpen = useAtomSet(usageOpenAtom)
   const setFilePath = useAtomSet(selectedFilePathAtom)
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
-  const setRestoredQueuedInputText = useAtomSet(restoredQueuedInputTextAtom)
+  const setComposerText = useAtomSet(composerTextAtom)
+  const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
+  const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
   const setSessionActivationPromise = useAtomSet(sessionActivationPromiseAtom)
   const sessionActivationPromise = useAtomValue(sessionActivationPromiseAtom)
   const activationPromiseRef = useRef<Promise<string> | null>(null)
@@ -137,28 +141,24 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     client.mutation("RunBash"),
     { mode: "promise" },
   )
-  // Mention client — reuses the AgentClient's runtime
-  const runtimeResult = useAtomValue(client.runtime)
-  const mentionClient = useMemo<MentionSearchClient | null>(() => {
-    if (!Result.isSuccess(runtimeResult)) return null
-    const runtime = runtimeResult.value
-    const run = Runtime.runPromise(runtime)
-    return {
-      async searchMentions(payload: Parameters<MentionSearchClient["searchMentions"]>[0]) {
-        return run(
-          Effect.flatMap(client, (c) =>
-            c("SearchMentions", {
-              cwd: payload.cwd,
-              query: payload.query,
-              ...(payload.limit !== undefined ? { limit: payload.limit } : {}),
-              ...(payload.visibleLimit !== undefined ? { visibleLimit: payload.visibleLimit } : {}),
-              ...(payload.includeRecent !== undefined ? { includeRecent: payload.includeRecent } : {}),
-            }),
-          ),
-        )
-      },
-    }
-  }, [client, runtimeResult])
+  const searchMentionsMutation = useAtomSet(
+    client.mutation("SearchMentions"),
+    { mode: "promise" },
+  )
+  // Mention client — uses mutation setter, no manual runtime extraction
+  const mentionClient = useMemo<MentionSearchClient>(() => ({
+    searchMentions(payload: Parameters<MentionSearchClient["searchMentions"]>[0]) {
+      return searchMentionsMutation({
+        payload: {
+          cwd: payload.cwd,
+          query: payload.query,
+          ...(payload.limit !== undefined ? { limit: payload.limit } : {}),
+          ...(payload.visibleLimit !== undefined ? { visibleLimit: payload.visibleLimit } : {}),
+          ...(payload.includeRecent !== undefined ? { includeRecent: payload.includeRecent } : {}),
+        },
+      })
+    },
+  }), [searchMentionsMutation])
 
   const toOptimisticDisplayAttachments = (attachments: readonly RawMessageAttachment[]): DisplayAttachment[] =>
     attachments.filter((attachment): attachment is MentionAttachment =>
@@ -223,7 +223,9 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
       setPendingUserSubmit(false)
       activationPromiseRef.current = null
       setSessionActivationPromise(null)
-      setRestoredQueuedInputText(opts?.visibleMessage ?? text)
+      setComposerText(opts?.visibleMessage ?? text)
+      setComposerAttachments([])
+      setComposerHistoryIndex(-1)
       commandContext.showSystemMessage(`Message failed to send: ${errMsg}`)
     }
 
@@ -308,7 +310,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     }
 
     void deliver().catch(rollback)
-  }, [selectedSessionId, selectedCwd, sessionActivationPromise, isStreaming, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setRestoredQueuedInputText, setSessionActivationPromise, setMessageHistory, sessionCreateOptions, commandContext])
+  }, [selectedSessionId, selectedCwd, sessionActivationPromise, isStreaming, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, setComposerAttachments, setComposerHistoryIndex, setSessionActivationPromise, setMessageHistory, sessionCreateOptions, commandContext])
 
   const handleInterrupt = useCallback(() => {
     if (!selectedSessionId) return

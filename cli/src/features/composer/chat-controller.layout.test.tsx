@@ -242,8 +242,6 @@ function makeProps(): ComposerProps {
     selectedFileOpen: false,
     onCloseFilePanel: noop,
     onInputHasTextChange: noop,
-    restoredQueuedInputText: null,
-    onRestoredQueuedInputHandled: noop,
   }
 }
 

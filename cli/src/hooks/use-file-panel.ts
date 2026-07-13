@@ -1,6 +1,5 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
-import { Effect, Runtime, Stream, Cause, Fiber } from 'effect'
-// Runtime import needed for the type annotation
+import { Effect, Stream, Cause, Fiber, Runtime } from 'effect'
 import { useAgentClient, selectedFilePathAtom } from '@magnitudedev/client-common'
 import { Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import { selectedFileSectionAtom } from '../state/cli-atoms'
@@ -58,12 +57,8 @@ export function useFilePanel({
 }: UseFilePanelParams): UseFilePanelResult {
   const atomClient = useAgentClient()
   const runtimeResult = useAtomValue(atomClient.runtime)
-  const runRpc = useCallback(<A, E, R>(effect: Effect.Effect<A, E, R>): Promise<A> => {
-    if (!Result.isSuccess(runtimeResult)) {
-      return Promise.reject(new Error('AgentClient runtime not ready'))
-    }
-    return Runtime.runPromise(runtimeResult.value)(effect as Effect.Effect<A, E, never>)
-  }, [runtimeResult])
+  const resolvePathMutation = useAtomSet(atomClient.mutation('ResolvePath'), { mode: 'promise' })
+  const readFileMutation = useAtomSet(atomClient.mutation('ReadFile'), { mode: 'promise' })
 
   // Selected file is atom state: the path is the shared selectedFilePathAtom
   // (any feature can open a file), the section anchor is CLI-only.
@@ -87,15 +82,13 @@ export function useFilePanel({
   const readFile = useCallback(async (path: string): Promise<string | null> => {
     if (!cwd) return null
     try {
-      const result = await runRpc(Effect.flatMap(atomClient, (c) =>
-        c('ReadFile', { cwd: cwd!, path })
-      )) as unknown as ReadFileResult
+      const result = await readFileMutation({ payload: { cwd, path } }) as ReadFileResult
       return result.content
     } catch (err) {
       logger.error({ path, error: err instanceof Error ? err.message : String(err) }, 'Failed to read file')
       return null
     }
-  }, [cwd, atomClient, runRpc])
+  }, [cwd, readFileMutation])
 
   // Resolve path when selectedFile changes — imperative during render
   if (prevFileRef.current !== selectedFile) {
@@ -106,9 +99,9 @@ export function useFilePanel({
     } else {
       void (async () => {
         try {
-          const result = await runRpc(Effect.flatMap(atomClient, (c) =>
-            c('ResolvePath', { cwd: cwd!, path: selectedFile.path, checkExists: true })
-          )) as unknown as ResolvePathResult
+          const result = await resolvePathMutation({
+            payload: { cwd: cwd!, path: selectedFile.path, checkExists: true },
+          }) as ResolvePathResult
           if (!result.exists) {
             logger.warn({ path: selectedFile.path, cwd: projectRoot }, 'Selected file does not exist')
             setSelectedFileResolvedPath(null)

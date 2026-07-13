@@ -1,17 +1,14 @@
 import { RGBA, TextAttributes, type KeyEvent } from '@opentui/core'
 import { useCallback, useRef, useState, useMemo } from 'react'
-import { Effect, Runtime } from 'effect'
 import type {
   MentionAttachment,
   RawImageAttachment,
   RawMessageAttachment,
+  ReadFileResult,
 } from '@magnitudedev/sdk'
 import { imageMediaTypeFromFilename, filenameWithImageExtension, useAgentClient, mentionAttachmentFromSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
-import { Result, useAtomValue } from '@effect-atom/atom-react'
-
 import { createId } from '@magnitudedev/generate-id'
 import path from 'path'
-
 import { BOX_CHARS } from '../../utils/ui-constants'
 import { orange } from '../../utils/theme'
 import { Button } from '../../components/button'
@@ -35,6 +32,8 @@ import {
 import { resolvePasteIntent, resolvePasteOutcomeFromApplyResult } from '@magnitudedev/client-common'
 import { applyPasteIntent } from '@magnitudedev/client-common'
 import { derivePasteEffects } from '@magnitudedev/client-common'
+import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom } from '@magnitudedev/client-common'
+import { useAtomSet, useAtomValue as useAtomValueClientCommon } from '@effect-atom/atom-react'
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
@@ -91,7 +90,6 @@ export function buildRestoredQueuedInputValue(restoredQueuedInputText: string): 
     cursorPosition: restoredQueuedInputText.length,
   }
 }
-
 
 type ReadPastedImageCandidate = (
   candidate: string,
@@ -205,65 +203,65 @@ export function Composer(props: ComposerProps) {
     selectedFileOpen,
     onCloseFilePanel,
     onInputHasTextChange,
-    restoredQueuedInputText,
-    onRestoredQueuedInputHandled,
   } = props
 
   const atomClient = useAgentClient()
-  const runtimeResult = useAtomValue(atomClient.runtime)
-  const runRpc = useCallback(<A, E, R>(effect: Effect.Effect<A, E, R>): Promise<A> => {
-    if (!Result.isSuccess(runtimeResult)) {
-      return Promise.reject(new Error('AgentClient runtime not ready'))
-    }
-    return Runtime.runPromise(runtimeResult.value)(effect as Effect.Effect<A, E, never>)
-  }, [runtimeResult])
+  const resolvePathMutation = useAtomSet(atomClient.mutation('ResolvePath'), { mode: 'promise' })
+  const readFileMutation = useAtomSet(atomClient.mutation('ReadFile'), { mode: 'promise' })
+  const searchMentionsMutation = useAtomSet(atomClient.mutation('SearchMentions'), { mode: 'promise' })
 
-  // Mention search client — uses the atom client runtime
-  const mentionClient = useMemo<MentionSearchClient | null>(() => {
-    if (!Result.isSuccess(runtimeResult)) return null
-    const run = Runtime.runPromise(runtimeResult.value)
-    return {
-      async searchMentions(payload) {
-        return run(Effect.flatMap(atomClient, (c) =>
-          c('SearchMentions', {
-            cwd: payload.cwd,
-            query: payload.query,
-            ...(payload.limit !== undefined ? { limit: payload.limit } : {}),
-            ...(payload.visibleLimit !== undefined ? { visibleLimit: payload.visibleLimit } : {}),
-            ...(payload.includeRecent !== undefined ? { includeRecent: payload.includeRecent } : {}),
-          })
-        ))
-      },
-    }
-  }, [atomClient, runtimeResult])
-  const [inputValue, setInputValue] = useState<InputValue>(EMPTY_INPUT)
+  const composerText = useAtomValueClientCommon(composerTextAtom)
+  const setComposerText = useAtomSet(composerTextAtom)
+  const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
+  const composerHistoryIndex = useAtomValueClientCommon(composerHistoryIndexAtom)
+  const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
+  // historyIndex: null = not navigating history, number = current index
+  const historyIndex = composerHistoryIndex === -1 ? null : composerHistoryIndex
+
+  // Mention search client — uses mutation setter
+  const mentionClient = useMemo<MentionSearchClient>(() => ({
+    searchMentions(payload) {
+      return searchMentionsMutation({
+        payload: {
+          cwd: payload.cwd,
+          query: payload.query,
+          ...(payload.limit !== undefined ? { limit: payload.limit } : {}),
+          ...(payload.visibleLimit !== undefined ? { visibleLimit: payload.visibleLimit } : {}),
+          ...(payload.includeRecent !== undefined ? { includeRecent: payload.includeRecent } : {}),
+        },
+      })
+    },
+  }), [searchMentionsMutation])
+
+  const [inputValue, setInputValue] = useState<InputValue>({
+    ...EMPTY_INPUT,
+    text: composerText,
+    cursorPosition: composerText.length,
+  })
   const [attachments, setAttachments] = useState<PendingImageAttachment[]>([])
   const [history, setHistory] = useState<string[]>([])
-  const [historyIndex, setHistoryIndex] = useState<number | null>(null)
   const [savedDraft, setSavedDraft] = useState('')
   const historySeededRef = useRef(false)
   const historyNavRef = useRef(false)
   const [nextEscWillKillAll, setNextEscWillKillAll] = useState(false)
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-
   const [bulkInsertEpoch, setBulkInsertEpoch] = useState(0)
   const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
   const multilineInputRef = useRef<MultilineInputHandle | null>(null)
 
+  // Sync inputValue from composerText atom when the atom changes externally (e.g. restored input).
+  // This is the local component's view of the text derived from the shared atom.
+  if (inputValue.text !== composerText || inputValue.cursorPosition !== composerText.length) {
+    setInputValue({
+      ...EMPTY_INPUT,
+      text: composerText,
+      cursorPosition: composerText.length,
+    })
+  }
+
   // onInputHasTextChange — imperative, no useEffect
   onInputHasTextChange?.(inputValue.text.trim().length > 0 || attachments.length > 0)
-
-  // Restored queued input — ref-based, no useEffect
-  const prevRestoredRef = useRef<string | null | undefined>(undefined)
-  if (prevRestoredRef.current !== restoredQueuedInputText) {
-    prevRestoredRef.current = restoredQueuedInputText
-    if (restoredQueuedInputText != null) {
-      setInputValue(buildRestoredQueuedInputValue(restoredQueuedInputText))
-      setBulkInsertEpoch((prev) => prev + 1)
-      onRestoredQueuedInputHandled?.()
-    }
-  }
 
   // Composer focus — imperative, no useEffect
   if (composerCanFocus) multilineInputRef.current?.focus()
@@ -305,17 +303,17 @@ export function Composer(props: ComposerProps) {
       .slice(-MAX_HISTORY)
 
     setHistory(seededHistory)
-    setHistoryIndex(null)
     historySeededRef.current = true
   }
 
-  const setComposerText = useCallback((text: string) => {
+  const setComposerTextValue = useCallback((text: string) => {
     setInputValue({
       ...EMPTY_INPUT,
       text,
       cursorPosition: text.length,
     })
-  }, [])
+    setComposerText(text)
+  }, [setComposerText])
 
   const addImageAttachment = useCallback(async () => {
     const result = await readClipboardBitmap()
@@ -348,11 +346,11 @@ export function Composer(props: ComposerProps) {
       },
       readPastedImageParams: {
         cwd,
-        resolvePath: (params) => runRpc(Effect.flatMap(atomClient, (c) => c('ResolvePath', params))),
-        readFile: (params) => runRpc(Effect.flatMap(atomClient, (c) => c('ReadFile', params))),
+        resolvePath: (params) => resolvePathMutation({ payload: params }),
+        readFile: (params) => readFileMutation({ payload: params }),
       },
     })
-  }, [atomClient, cwd, runRpc])
+  }, [cwd, resolvePathMutation, readFileMutation])
 
   const removeAttachment = useCallback((index: number) => {
     setAttachments(prev => prev.filter((_, i) => i !== index))
@@ -362,9 +360,11 @@ export function Composer(props: ComposerProps) {
     const handled = runSlashCommand(commandText)
     if (handled) {
       setInputValue(EMPTY_INPUT)
+      setComposerText('')
+      setComposerAttachments([])
       setAttachments([])
     }
-  }, [runSlashCommand])
+  }, [runSlashCommand, setComposerText, setComposerAttachments])
 
   const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }) => {
     // Image files selected via @mention become pending image inputs
@@ -372,17 +372,16 @@ export function Composer(props: ComposerProps) {
     const mediaType = item.contentType === 'text' ? imageMediaTypeFromFilename(item.path) : null
     if (mediaType) {
       if (cwd) {
-        void runRpc(Effect.flatMap(atomClient, (c) =>
-          c('ReadFile', { cwd, path: item.path, format: 'base64' })
-        )).then((read) => {
-          const result = read as { content: string; format: string }
-          if (result.format !== 'base64' || result.content.length === 0) return
-          const buffer = Buffer.from(result.content, 'base64')
+        void readFileMutation({
+          payload: { cwd, path: item.path, format: 'base64' },
+        }).then((read: ReadFileResult) => {
+          if (read.format !== 'base64' || read.content.length === 0) return
+          const buffer = Buffer.from(read.content, 'base64')
           const dims = extractImageDimensions(buffer)
           if (!dims) return
           const newAttachment: PendingImageAttachment = {
             type: 'raw_image_file',
-            data: result.content,
+            data: read.content,
             filename: filenameWithImageExtension(path.basename(item.path), mediaType),
             mediaType,
             width: dims.width,
@@ -411,7 +410,7 @@ export function Composer(props: ComposerProps) {
       if (atIndex < 0) return prev
       return insertMentionSegment(prev, { path: item.path, contentType: item.contentType, lineRange: item.lineRange }, createId(), atIndex, left.length)
     })
-  }, [atomClient, cwd, runRpc])
+  }, [cwd, readFileMutation])
 
   const onExpandDirectoryMention = useCallback((item: { path: string }) => {
     setInputValue(prev => {
@@ -453,63 +452,66 @@ export function Composer(props: ComposerProps) {
       if (historyIndex == null) {
         const nextIndex = history.length - 1
         setSavedDraft(inputValue.text)
-        setHistoryIndex(nextIndex)
+        setComposerHistoryIndex(nextIndex)
         historyNavRef.current = true
-        setComposerText(history[nextIndex] ?? '')
+        setComposerTextValue(history[nextIndex] ?? '')
         return true
       }
 
       const nextIndex = Math.max(0, historyIndex - 1)
-      setHistoryIndex(nextIndex)
+      setComposerHistoryIndex(nextIndex)
       historyNavRef.current = true
-      setComposerText(history[nextIndex] ?? '')
+      setComposerTextValue(history[nextIndex] ?? '')
       return true
     }
 
     if (key.name === 'down') {
       if (historyIndex == null) return false
       if (history.length === 0) {
-        setHistoryIndex(null)
+        setComposerHistoryIndex(-1)
         setSavedDraft('')
         historyNavRef.current = true
-        setComposerText(savedDraft)
+        setComposerTextValue(savedDraft)
         return true
       }
 
       if (historyIndex < history.length - 1) {
         const nextIndex = historyIndex + 1
-        setHistoryIndex(nextIndex)
+        setComposerHistoryIndex(nextIndex)
         historyNavRef.current = true
-        setComposerText(history[nextIndex] ?? '')
+        setComposerTextValue(history[nextIndex] ?? '')
         return true
       }
 
-      setHistoryIndex(null)
+      setComposerHistoryIndex(-1)
       historyNavRef.current = true
-      setComposerText(savedDraft)
+      setComposerTextValue(savedDraft)
       setSavedDraft('')
       return true
     }
 
     return false
-  }, [bashMode, widgetNavActive, fileMentions, slashCommands, handleWidgetKeyEvent, enterBashMode, exitBashMode, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId])
+  }, [bashMode, widgetNavActive, fileMentions, slashCommands, handleWidgetKeyEvent, enterBashMode, exitBashMode, history, historyIndex, inputValue.text, savedDraft, setComposerTextValue, setComposerHistoryIndex, selectedForkId])
 
   const handleInputChange = useCallback((value: InputValue) => {
     if (!bashMode && value.text === '!') {
       enterBashMode()
       setInputValue(EMPTY_INPUT)
-      setHistoryIndex(null)
+      setComposerText('')
+      setComposerHistoryIndex(-1)
       setSavedDraft('')
       return
     }
     if (historyNavRef.current) {
       historyNavRef.current = false
-    } else if (historyIndex != null && value.text !== (history[historyIndex] ?? '')) {
-      setHistoryIndex(null)
+    } else if (composerHistoryIndex !== -1 && value.text !== (history[composerHistoryIndex] ?? '')) {
+      setComposerHistoryIndex(-1)
       setSavedDraft('')
     }
     setInputValue(value)
-  }, [bashMode, historyIndex, history])
+    setComposerText(value.text)
+    setComposerHistoryIndex(composerHistoryIndex === -1 ? -1 : composerHistoryIndex)
+  }, [bashMode, composerHistoryIndex, history, enterBashMode, setComposerText, setComposerHistoryIndex])
 
   const handlePaste = useCallback(async (eventText?: string): Promise<boolean> => {
     const result = await handleChatControllerPaste({
@@ -524,10 +526,12 @@ export function Composer(props: ComposerProps) {
 
   const clearComposer = useCallback(() => {
     setInputValue(EMPTY_INPUT)
+    setComposerText('')
+    setComposerAttachments([])
     setAttachments([])
-    setHistoryIndex(null)
+    setComposerHistoryIndex(-1)
     setSavedDraft('')
-  }, [])
+  }, [setComposerText, setComposerAttachments, setComposerHistoryIndex])
 
   const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionInputs: MentionAttachment[] = []) => {
     if (bashMode) {
@@ -535,9 +539,7 @@ export function Composer(props: ComposerProps) {
       if (!trimmed) return
       await Promise.resolve(executeBash(trimmed))
       exitBashMode()
-      setInputValue(EMPTY_INPUT)
-      setHistoryIndex(null)
-      setSavedDraft('')
+      clearComposer()
       return
     }
     if (!modelsConfigured) return
@@ -547,8 +549,6 @@ export function Composer(props: ComposerProps) {
     const content = message
     const rawMessageAttachments: RawMessageAttachment[] = [...attachments, ...mentionInputs]
 
-    // handleSend is synchronous but can throw — e.g. optimistic mutation
-    // failure or setup error. Delivery errors are handled async via rollback.
     try {
       submitUserMessage({
         message: content,
@@ -564,20 +564,20 @@ export function Composer(props: ComposerProps) {
     if (historyText.length > 0) {
       setHistory(prev => [...prev, historyText].slice(-MAX_HISTORY))
     }
-    setHistoryIndex(null)
+    setComposerHistoryIndex(-1)
     setSavedDraft('')
     clearComposer()
   }, [bashMode, modelsConfigured, submitUserMessage, executeBash, clearSystemBanners, showToast, attachments, clearComposer])
 
   const handleInputSubmit = useCallback(async () => {
-    setHistoryIndex(null)
+    setComposerHistoryIndex(-1)
     setSavedDraft('')
     if (inputValue.text.trim() || attachments.length > 0) {
       const { text, mentions } = reconstituteInputTextWithMentions(inputValue)
       const mentionInputs = mentions.map(mentionAttachmentFromSegment)
       await handleSubmit(text, inputValue.text, mentionInputs)
     }
-  }, [inputValue, attachments.length, handleSubmit])
+  }, [inputValue, attachments.length, handleSubmit, setComposerHistoryIndex])
 
   return (
     <>
@@ -719,7 +719,7 @@ export function Composer(props: ComposerProps) {
           {displayMode === 'transcript' && (
             <>
               <text style={{ fg: theme.info }}>Transcript Mode</text>
-              <text style={{ fg: theme.muted }}>{' · '}</text>
+              <text style={{ fg: theme.muted }}>{' \u00b7 '}</text>
             </>
           )}
           <ContextUsageBar

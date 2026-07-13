@@ -5,13 +5,13 @@
  * Session switching goes through the shared session action contract; the
  * display view controller owns the stream transition. No remount.
  */
-import { useCallback, useRef, type ReactNode } from 'react'
-import { Effect, Option, Runtime } from 'effect'
-import { useAtomValue, useAtomSet, Result } from '@effect-atom/atom-react'
+import { useCallback, type ReactNode } from 'react'
+import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import {
   useAgentClient,
   useDisplayState,
   getFork,
+  usePaginatedSessions,
   useSessionsList,
   useRecentChatsNavigation,
   useSessionActions,
@@ -22,9 +22,7 @@ import {
   usageOpenAtom,
   sessionsToRecentChats,
   type RecentChat,
-  type RecentChatsPage,
 } from '@magnitudedev/client-common'
-import type { SessionMetadata } from '@magnitudedev/sdk'
 import { showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { hasConversationActivity } from '../../utils/start-state'
 import { RecentChatsWidget } from './recent-chats-widget'
@@ -95,33 +93,19 @@ export function RecentChatsWidgetView({ state }: { state: RecentChatsWidgetState
 }
 
 export function RecentChatsOverlayContainer(): ReactNode {
-  const client = useAgentClient()
-  const runtimeResult = useAtomValue(client.runtime)
   const setShowOverlay = useAtomSet(showRecentChatsOverlayAtom)
   const resumeSession = useResumeSession()
 
-  // The protocol pages by cursor; the overlay pages by offset. The cursor for
-  // the next page is threaded here — offset 0 restarts, any other offset
-  // continues from the last result's cursor.
-  const nextCursorRef = useRef<string | null>(null)
-
-  const loadPage = useCallback(async (offset: number, limit: number): Promise<RecentChatsPage> => {
-    if (!Result.isSuccess(runtimeResult)) return { items: [], hasMore: false }
-    const cursor = offset === 0 ? Option.none<string>() : Option.fromNullable(nextCursorRef.current)
-    const result = await Runtime.runPromise(runtimeResult.value)(
-      Effect.flatMap(client, (c) =>
-        c('ListSessions', { cwd: Option.none(), query: Option.none(), cursor, limit })
-      )
-    )
-    nextCursorRef.current = Option.getOrNull(result.nextCursor)
-    return { items: sessionsToRecentChats([...result.items]), hasMore: result.hasMore }
-  }, [client, runtimeResult])
+  const { sessions, loading, loadingMore, hasMore, loadMore } = usePaginatedSessions({ pageSize: 50 })
 
   return (
     <RecentChatsOverlay
       onClose={() => setShowOverlay(false)}
       onSelect={(chat) => resumeSession(chat.id)}
-      loadPage={loadPage}
+      chats={sessions}
+      hasMore={hasMore}
+      isLoading={loading || loadingMore}
+      loadMore={loadMore}
     />
   )
 }
