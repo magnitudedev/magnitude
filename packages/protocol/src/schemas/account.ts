@@ -65,6 +65,9 @@ export const ProviderInfoSchema = Schema.Struct({
   id: Schema.String,
   displayName: Schema.String,
   authStatus: AuthStatusSchema,
+  status: Schema.optional(Schema.Literal("ok", "loading", "not_found", "error")),
+  message: Schema.optional(Schema.String),
+  hint: Schema.optional(Schema.String),
 })
 export type ProviderInfo = Schema.Schema.Type<typeof ProviderInfoSchema>
 

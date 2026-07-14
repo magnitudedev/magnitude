@@ -7,9 +7,17 @@ export interface PatternEntry {
   readonly exclude?: readonly PatternSymbol[]
 }
 
+export interface ModelMetadataPattern {
+  readonly architectures?: readonly string[]
+  readonly tokenizerModels?: readonly string[]
+  readonly tokenizerPres?: readonly string[]
+}
+
 export interface Family {
   readonly familyId: string
   readonly patterns: readonly PatternEntry[]
+  /** Structured evidence used when a provider exposes model-file metadata. */
+  readonly metadataPatterns?: readonly ModelMetadataPattern[]
 }
 
 function matchPattern(

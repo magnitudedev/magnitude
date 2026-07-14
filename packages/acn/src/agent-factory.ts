@@ -12,6 +12,7 @@ import type { SessionError } from "@magnitudedev/protocol"
 import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
+import { resolveLlamaCppAuthFromStorage } from "./shared-client"
 
 export interface AgentFactoryApi {
   readonly createSession: (input: {
@@ -60,10 +61,16 @@ export const AgentFactoryLive = (options: {
             const magnitudeApiKey = apiKey
               || process.env.MAGNITUDE_API_KEY
               || process.env.MAGNITUDE_LOCAL_API_KEY
-            if (!magnitudeApiKey) return yield* toSessionError(input.sessionId, new Error("No Magnitude API key found"))
+            const llamacpp = yield* resolveLlamaCppAuthFromStorage(storage)
             const providerClient: ProviderClientShape = createProviderClient({
-              apiKey: magnitudeApiKey,
+              ...(magnitudeApiKey ? { apiKey: magnitudeApiKey } : {}),
               sessionId: input.sessionId,
+              ...(llamacpp
+                ? {
+                    llamacppEndpoint: llamacpp.endpoint,
+                    ...(llamacpp.apiKey ? { llamacppApiKey: llamacpp.apiKey } : {}),
+                  }
+                : {}),
             })
             return { persistenceLayer, sessionContext, providerClient }
           }).pipe(

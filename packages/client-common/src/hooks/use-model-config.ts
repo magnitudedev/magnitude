@@ -8,7 +8,7 @@ import { useMemo, useState } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
 import { SLOT_IDS, type SlotId } from "@magnitudedev/sdk"
-import type { ModelSummary, ModelConfigResponse, ModelList } from "@magnitudedev/sdk"
+import type { ModelSummary, ModelConfigResponse, ModelList, ProviderInfo } from "@magnitudedev/sdk"
 
 export interface ModelOption {
   providerId: string
@@ -26,6 +26,8 @@ export interface ModelOption {
 export interface UseModelConfigResult {
   /** All available models from provider (same list for every slot — slot is just a default recommendation) */
   models: readonly ModelOption[] | null
+  /** Provider connection and discovery status */
+  providers: readonly ProviderInfo[] | null
   /** Whether models are loading */
   modelsLoading: boolean
   /** Models error message */
@@ -89,6 +91,7 @@ export function useModelConfig(): UseModelConfigResult {
   }, [data])
 
   const configResponse = data?.modelConfig ?? null
+  const providers = data?.providers ?? null
 
   const slotConfig = useMemo(() => {
     if (!configResponse) return null
@@ -192,6 +195,7 @@ export function useModelConfig(): UseModelConfigResult {
 
   return {
     models,
+    providers,
     modelsLoading,
     modelsError,
     slotConfig,

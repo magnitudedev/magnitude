@@ -38,12 +38,15 @@ export {
 } from "./registry"
 export {
   type LlamaCppProviderInstance,
+  type LlamaCppDiscoveryResult,
   type LlamaCppModelInfo,
   type LlamaCppCallOptions,
   type LlamaCppToolChoice,
   type LlamaCppRawModel,
   type LlamaCppModelMeta,
   type LlamaCppClientConfig,
+  type ServerProps as LlamaCppServerProps,
+  type ServerStatus as LlamaCppServerStatus,
   createLlamaCppProvider,
   createLlamaCppCatalog,
   createLlamaCppCompatibleSpec,

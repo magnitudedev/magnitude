@@ -6,9 +6,14 @@ import {
   type BalanceResponse,
   type ProviderModel,
   type ProviderClientShape,
+  type ProviderRegistryInfo,
 } from "@magnitudedev/sdk"
 import { isEnvFlagOn } from "@magnitudedev/utils"
-import { SharedMagnitudeClientRef, makeClientWithKey } from "./shared-client"
+import {
+  SharedMagnitudeClientRef,
+  makeClientWithAuth,
+  resolveLlamaCppAuthFromStorage,
+} from "./shared-client"
 import {
   MagnitudeStorage,
   GlobalStorage,
@@ -96,6 +101,7 @@ function toModelSummary(model: ProviderModel): ModelSummary {
  */
 function buildModelList(
   models: readonly ProviderModel[],
+  providerInfos: readonly ProviderRegistryInfo[],
   storage: MagnitudeStorageShape,
   operation: string,
 ): Effect.Effect<ModelList, SessionError> {
@@ -103,19 +109,14 @@ function buildModelList(
     const modelConfig = yield* storage.config.getModelConfig().pipe(
       Effect.mapError(toAccountError(operation)),
     )
-    // Build provider info from unique provider IDs in the catalog
-    const seen = new Set<string>()
-    const providers: ProviderInfo[] = []
-    for (const model of models) {
-      if (!seen.has(model.providerId)) {
-        seen.add(model.providerId)
-        providers.push({
-          id: model.providerId,
-          displayName: model.providerId,
-          authStatus: "authenticated" as const,
-        })
-      }
-    }
+    const providers: ProviderInfo[] = providerInfos.map((provider) => ({
+      id: provider.id,
+      displayName: provider.displayName,
+      authStatus: provider.authStatus._tag,
+      ...(provider.status ? { status: provider.status } : {}),
+      ...(provider.message ? { message: provider.message } : {}),
+      ...(provider.hint ? { hint: provider.hint } : {}),
+    }))
     return {
       models: models.map(toModelSummary),
       providers,
@@ -196,8 +197,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         return null
       })
 
-      // Return the shared client if an API key is available, otherwise fail.
-      const authenticatedClient = (operation: string) =>
+      const magnitudeAuthenticatedClient = (operation: string) =>
         Effect.gen(function* () {
           const apiKey = yield* resolveApiKey
           if (!apiKey) return yield* noApiKey(operation)
@@ -210,9 +210,13 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
             yield* storage.auth.set(providerId, auth).pipe(
               Effect.mapError(toAccountError("update provider auth")),
             )
-            // For Magnitude provider, recreate the shared client with new key
-            if (providerId === "magnitude" && auth.type === "api") {
-              const newClient = yield* makeClientWithKey(auth.key).pipe(
+            if (
+              (providerId === "magnitude" && auth.type === "api")
+              || (providerId === "llamacpp" && auth.type === "endpoint")
+            ) {
+              const apiKey = yield* resolveApiKey
+              const llamacpp = yield* resolveLlamaCppAuthFromStorage(storage)
+              const newClient = yield* makeClientWithAuth(apiKey, llamacpp).pipe(
                 Effect.provideService(GlobalStorage, globalStorage),
               )
               yield* Ref.set(clientRef, newClient)
@@ -252,27 +256,31 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
 
         getCachedModelList: (providerId?: string) =>
           Effect.gen(function* () {
-            const client: ProviderClientShape = yield* authenticatedClient("get cached model list")
-            const models = yield* client.catalog.list.pipe(
+            const models = yield* sharedClient.catalog.list.pipe(
               Effect.provide(FetchHttpClient.layer),
               Effect.mapError(toAccountError("get cached model list")),
             )
-            return yield* buildModelList(models, storage, "get cached model list")
+            const providers = yield* sharedClient.listProviders.pipe(
+              Effect.provide(FetchHttpClient.layer),
+            )
+            return yield* buildModelList(models, providers, storage, "get cached model list")
           }),
 
         refreshCachedModelList: (providerId?: string) =>
           Effect.gen(function* () {
-            const client: ProviderClientShape = yield* authenticatedClient("refresh cached model list")
-            const models = yield* client.catalog.refresh.pipe(
+            const models = yield* sharedClient.catalog.refresh.pipe(
               Effect.provide(FetchHttpClient.layer),
               Effect.mapError(toAccountError("refresh cached model list")),
             )
-            return yield* buildModelList(models, storage, "refresh cached model list")
+            const providers = yield* sharedClient.listProviders.pipe(
+              Effect.provide(FetchHttpClient.layer),
+            )
+            return yield* buildModelList(models, providers, storage, "refresh cached model list")
           }),
 
         getBalance: (query) =>
           Effect.gen(function* () {
-            const client: ProviderClientShape = yield* authenticatedClient("get balance")
+            const client: ProviderClientShape = yield* magnitudeAuthenticatedClient("get balance")
             return yield* client.balance(query).pipe(
               Effect.provide(FetchHttpClient.layer),
               Effect.mapError(toAccountError("get balance")),

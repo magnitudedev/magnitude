@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
-import { classifyModelFamily } from "../../family-registry"
+import {
+  classifyModelFamily,
+  classifyModelFamilyFromMetadata,
+  modelFamilyMetadataConflicts,
+} from "../../family-registry"
 
 interface ClassifyCase {
   readonly id: string
@@ -26,6 +30,10 @@ const CASES: readonly ClassifyCase[] = [
   { id: "Qwen/Qwen3.5-9B", familyId: "qwen-3.5" },
   { id: "qwen3.5:35b", familyId: "qwen-3.5" },
   { id: "qwen3.6-35b-a3b", familyId: "qwen-3.5" },
+  {
+    id: "/Users/trg/models/qwen3.6-35b-mtp/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+    familyId: "qwen-3.5",
+  },
   { id: "qwen3.6-plus", familyId: "qwen-3.5" },
   { id: "qwen3.7-max", familyId: "qwen-3.5" },
 
@@ -134,5 +142,28 @@ describe("classifyModelFamily", () => {
 
   it("returns None for unknown models", () => {
     expect(Option.isNone(classifyModelFamily("unknown-model-xyz"))).toBe(true)
+  })
+
+  it("uses matching GGUF architecture and tokenizer evidence", () => {
+    expect(Option.getOrNull(classifyModelFamilyFromMetadata({
+      architecture: "qwen35moe",
+      tokenizerModel: "gpt2",
+      tokenizerPre: "qwen35",
+    }))).toBe("qwen-3.5")
+  })
+
+  it("does not classify from a pre-tokenizer identifier alone", () => {
+    expect(Option.isNone(classifyModelFamilyFromMetadata({
+      tokenizerModel: "gpt2",
+      tokenizerPre: "qwen35",
+    }))).toBe(true)
+  })
+
+  it("detects structured metadata that conflicts with a name match", () => {
+    expect(modelFamilyMetadataConflicts("qwen-3.5", {
+      architecture: "qwen35moe",
+      tokenizerModel: "gpt2",
+      tokenizerPre: "qwen2",
+    })).toBe(true)
   })
 })
