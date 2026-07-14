@@ -64,10 +64,11 @@ function effectiveModelForSlot(
   const models = selectableModels(modelConfig)
   const override = modelConfig?.slotConfig?.[slotId]
   if (override?.providerId && override.providerModelId) {
-    return models.find((model) =>
+    const overrideModel = models.find((model) =>
       model.providerId === override.providerId
       && model.providerModelId === override.providerModelId
-    ) ?? null
+    )
+    if (overrideModel) return overrideModel
   }
   return models.find((model) => model.slots?.includes(slotId)) ?? models[0] ?? null
 }
@@ -158,7 +159,7 @@ function ProviderRows({
             {editing && (
               <box style={{ flexDirection: 'column', paddingTop: 1 }}>
                 <box style={{ borderStyle: 'single', borderColor: error ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, width: 72 }}>
-                  <SingleLineInput value={inputValue} onChange={onInputChange} placeholder="API key" focused />
+                  <SingleLineInput value={inputValue} onChange={onInputChange} placeholder="API key" focused masked />
                 </box>
                 <box style={{ flexDirection: 'row', paddingTop: 1 }}>
                   <Button onClick={onSave}><text style={{ fg: theme.primary }}>{submitting ? '[Saving...]' : '[Save]'}</text></Button>
@@ -312,10 +313,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     if (!item) return
     if (dropdownTarget.field === 'model') {
       const model = item as ModelPickerItem
-      void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.id)
+      void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.id).catch(() => {})
     } else {
       const effort = item as ThinkingPickerItem
-      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, effort.value)
+      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, effort.value).catch(() => {})
     }
     closeDropdown()
   }, [dropdownTarget, dropdownItems, modelConfig, closeDropdown])
@@ -378,7 +379,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               onInputChange={(value) => { setInputValue(value); setError(null) }}
               onSave={() => { void handleSave() }}
               onDisconnect={() => { void handleDisconnect() }}
-              onRefresh={(providerId) => { void modelConfig?.refreshModels(providerId) }}
+              onRefresh={(providerId) => { void modelConfig?.refreshModels(providerId).catch(() => {}) }}
               refreshing={modelConfig?.refreshingModels ?? false}
               onCancel={cancelInline}
             />
@@ -387,8 +388,11 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           <box style={{ paddingTop: 1, paddingBottom: 1 }}><text style={{ fg: theme.border }}>{'─'.repeat(76)}</text></box>
           <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
             <text style={{ fg: theme.foreground, flexGrow: 1 }}><span attributes={TextAttributes.BOLD}>Models</span></text>
-            {modelConfig && <Button onClick={() => { void modelConfig.refreshModels() }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}><text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{modelConfig.refreshingModels ? '[Refreshing...]' : '[Refresh]'}</text></Button>}
+            {modelConfig && <Button onClick={() => { void modelConfig.refreshModels().catch(() => {}) }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}><text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{modelConfig.refreshingModels ? '[Refreshing...]' : '[Refresh]'}</text></Button>}
           </box>
+          {modelConfig?.modelsError && <text style={{ fg: theme.error }}>{modelConfig.modelsError}</text>}
+          {modelConfig?.refreshModelsError && <text style={{ fg: theme.error }}>{modelConfig.refreshModelsError}</text>}
+          {modelConfig?.updateError && <text style={{ fg: theme.error }}>{modelConfig.updateError}</text>}
 
           {SLOT_IDS.map((slotId) => {
             const selectedModel = effectiveModelForSlot(slotId, modelConfig)
@@ -424,7 +428,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                       const selected = index === dropdownIndex
                       const modelItem = modelOpen ? item as ModelPickerItem : null
                       const previous = modelOpen && index > 0 ? modelItems[index - 1] : null
-                      const showProvider = modelItem && previous?.providerId !== modelItem.providerId
+                      const showProvider = modelItem
+                        && (visibleIndex === 0 || previous?.providerId !== modelItem.providerId)
                       return (
                         <box key={modelItem ? JSON.stringify([modelItem.providerId, modelItem.id]) : item.id} style={{ flexDirection: 'column' }}>
                           {showProvider && <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>{modelItem.providerName}</span></text>}
@@ -444,8 +449,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           })}
 
           {modelConfig && (
-            <Button onClick={() => { void modelConfig.resetToDefaults() }} onMouseOver={() => setResetHovered(true)} onMouseOut={() => setResetHovered(false)}>
-              <text style={{ fg: resetHovered ? theme.foreground : theme.muted }}>[Reset defaults]</text>
+            <Button onClick={() => { void modelConfig.resetToDefaults().catch(() => {}) }} onMouseOver={() => setResetHovered(true)} onMouseOut={() => setResetHovered(false)}>
+              <text style={{ fg: resetHovered ? theme.foreground : theme.muted }}>{modelConfig.updating ? '[Updating...]' : '[Reset defaults]'}</text>
             </Button>
           )}
         </box>

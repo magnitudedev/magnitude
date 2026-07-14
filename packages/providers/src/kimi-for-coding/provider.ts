@@ -29,7 +29,7 @@ export function createKimiForCodingProvider(
   const auth = config.auth ?? Auth.bearer(config.apiKey ?? "")
   const catalog = createKimiForCodingCatalog()
   const classifyModelFamily: KimiForCodingProvider["classifyModelFamily"] = (model) =>
-    classifyModelFamilyFromEvidence({}, [model.upstreamFamily, model.displayName, model.providerModelId])
+    classifyModelFamilyFromEvidence({}, [model.providerModelId, model.displayName, model.upstreamFamily])
 
   const bindModel = (
     _providerModelId: string,

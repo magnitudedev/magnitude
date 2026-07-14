@@ -204,9 +204,9 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       // Semaphore to serialize config writes (§5.9)
       const configSemaphore = yield* Effect.makeSemaphore(1)
 
-      const rebuildProviderClient = Effect.gen(function* () {
+      const rebuildProviderClient = (warmCatalog = true) => Effect.gen(function* () {
         const resolved = yield* resolveProviderConfiguration(storage)
-        const newClient = yield* makeSharedProviderClient(resolved).pipe(
+        const newClient = yield* makeSharedProviderClient(resolved, { warmCatalog }).pipe(
           Effect.provideService(GlobalStorage, globalStorage),
         )
         yield* Ref.set(clientRef, newClient)
@@ -265,10 +265,29 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
                 reason: `${definition.displayName} requires ${definition.authKind} auth`,
               })
             }
-            yield* storage.auth.set(providerId, auth).pipe(
+            if (auth.type === "api" && !auth.key.trim()) {
+              return yield* new SessionOperationFailed({
+                operation: "update provider auth",
+                reason: `${definition.displayName} API key cannot be empty`,
+              })
+            }
+            if (auth.type === "endpoint" && !auth.endpoint.trim()) {
+              return yield* new SessionOperationFailed({
+                operation: "update provider auth",
+                reason: `${definition.displayName} endpoint cannot be empty`,
+              })
+            }
+            const normalizedAuth: ProviderAuth = auth.type === "api"
+              ? { type: "api", key: auth.key.trim() }
+              : {
+                  type: "endpoint",
+                  endpoint: auth.endpoint.trim(),
+                  ...(auth.apiKey?.trim() ? { apiKey: auth.apiKey.trim() } : {}),
+                }
+            yield* storage.auth.set(providerId, normalizedAuth).pipe(
               Effect.mapError(toAccountError("update provider auth")),
             )
-            yield* rebuildProviderClient
+            yield* rebuildProviderClient()
           }),
 
         getProviderAuth: (providerId) =>
@@ -292,7 +311,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
             yield* storage.auth.remove(providerId).pipe(
               Effect.mapError(toAccountError("remove provider auth")),
             )
-            yield* rebuildProviderClient
+            yield* rebuildProviderClient()
           }),
 
         getProviderAuthSummary: (providerId) =>
@@ -354,7 +373,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
 
         refreshCachedModelList: (providerId?: string) =>
           Effect.gen(function* () {
-            const refreshedClient = yield* rebuildProviderClient
+            const refreshedClient = yield* rebuildProviderClient(false)
             const models = yield* refreshedClient.catalog.refresh.pipe(
               Effect.provide(FetchHttpClient.layer),
               Effect.mapError(toAccountError("refresh cached model list")),

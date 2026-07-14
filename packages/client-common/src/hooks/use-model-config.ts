@@ -79,6 +79,8 @@ function toModelOption(model: ModelSummary): ModelOption {
 
 export function useModelConfig(): UseModelConfigResult {
   const client = useAgentClient()
+  const [updating, setUpdating] = useState(false)
+  const [updateError, setUpdateError] = useState<string | null>(null)
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [refreshModelsError, setRefreshModelsError] = useState<string | null>(null)
 
@@ -134,6 +136,31 @@ export function useModelConfig(): UseModelConfigResult {
     { mode: "promise" },
   )
 
+  const runUpdate = useMemo(
+    () => async (
+      slots: Partial<Record<SlotId, {
+        providerId?: string
+        providerModelId?: string
+        reasoningEffort?: string
+      }>>,
+    ): Promise<void> => {
+      setUpdating(true)
+      setUpdateError(null)
+      try {
+        await updateConfig({
+          payload: { slots },
+          reactivityKeys: ["modelConfig"],
+        })
+      } catch (error) {
+        setUpdateError(error instanceof Error ? error.message : "Failed to update model settings")
+        throw error
+      } finally {
+        setUpdating(false)
+      }
+    },
+    [updateConfig],
+  )
+
   const updateSlotModel = useMemo(
     () => async (slotId: SlotId, providerId: string | null, providerModelId: string | null): Promise<void> => {
       const current = configResponse?.slots[slotId] ?? {}
@@ -144,51 +171,38 @@ export function useModelConfig(): UseModelConfigResult {
         && selectedModel?.reasoningEfforts.includes(current.reasoningEffort)
         ? current.reasoningEffort
         : undefined
-      await updateConfig({
-        payload: {
-          slots: {
-            [slotId]: {
-              providerId: providerId ?? undefined,
-              providerModelId: providerModelId ?? undefined,
-              reasoningEffort,
-            },
-          },
+      await runUpdate({
+        [slotId]: {
+          providerId: providerId ?? undefined,
+          providerModelId: providerModelId ?? undefined,
+          reasoningEffort,
         },
-        reactivityKeys: ["modelConfig"],
       })
     },
-    [updateConfig, configResponse, data],
+    [runUpdate, configResponse, data],
   )
 
   const updateSlotReasoning = useMemo(
     () => async (slotId: SlotId, effort: string | null): Promise<void> => {
       const current = configResponse?.slots[slotId] ?? {}
-      await updateConfig({
-        payload: {
-          slots: {
-            [slotId]: {
-              providerId: current.providerId,
-              providerModelId: current.providerModelId,
-              reasoningEffort: effort ?? undefined,
-            },
-          },
+      await runUpdate({
+        [slotId]: {
+          providerId: current.providerId,
+          providerModelId: current.providerModelId,
+          reasoningEffort: effort ?? undefined,
         },
-        reactivityKeys: ["modelConfig"],
       })
     },
-    [updateConfig, configResponse],
+    [runUpdate, configResponse],
   )
 
   const resetToDefaults = useMemo(
     () => async (): Promise<void> => {
-      await updateConfig({
-        payload: {
-          slots: {},
-        },
-        reactivityKeys: ["modelConfig"],
-      })
+      await runUpdate(Object.fromEntries(
+        SLOT_IDS.map((slotId) => [slotId, {}]),
+      ) as Partial<Record<SlotId, {}>>)
     },
-    [updateConfig],
+    [runUpdate],
   )
 
   const refreshModels = useMemo(
@@ -220,8 +234,8 @@ export function useModelConfig(): UseModelConfigResult {
     updateSlotReasoning,
     resetToDefaults,
     refreshModels,
-    updating: false,
-    updateError: null,
+    updating,
+    updateError,
     refreshingModels,
     refreshModelsError,
   }

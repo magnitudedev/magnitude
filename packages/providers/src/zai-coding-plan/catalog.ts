@@ -9,9 +9,14 @@ export interface ZaiCodingPlanCatalogConfig extends ZaiCodingPlanClientConfig {
 }
 
 function withZaiReasoningControls(model: ZaiCodingPlanModelInfo): ZaiCodingPlanModelInfo {
-  return model.providerModelId.toLowerCase().startsWith("glm-5.2")
-    ? { ...model, reasoningEfforts: ["none", "high", "max"] }
-    : model
+  const modelId = model.providerModelId.toLowerCase()
+  if (modelId.startsWith("glm-5.2")) {
+    return { ...model, reasoningEfforts: ["none", "high", "max"] }
+  }
+  if (/^glm-(?:4\.[5-9]|5(?:$|[.-]))/.test(modelId)) {
+    return { ...model, reasoningEfforts: ["none", "high"] }
+  }
+  return model
 }
 
 export function createZaiCodingPlanCatalog(

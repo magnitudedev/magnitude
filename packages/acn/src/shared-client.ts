@@ -152,11 +152,13 @@ export const resolveProviderConfiguration = (
 
 /**
  * Build a fresh file-backed `ProviderClientShape` using the resolved provider
- * auth and the global model cache path. The catalog is intentionally refreshed
- * so the file cache is populated with every currently available provider.
+ * auth and global model cache path. By default the catalog is warmed while
+ * tolerating offline providers; explicit refresh callers can disable warming
+ * and perform one error-reporting refresh themselves.
  */
 export const makeSharedProviderClient = (
   resolved: ResolvedProviderConfiguration,
+  options?: { readonly warmCatalog?: boolean },
 ): Effect.Effect<ProviderClientShape, never, GlobalStorage> =>
   Effect.gen(function* () {
     const globalStorage = yield* GlobalStorage
@@ -176,10 +178,12 @@ export const makeSharedProviderClient = (
       { preserveProviderIds },
     )
     const fileBackedClient: ProviderClientShape = { ...client, catalog: fileCatalog }
-    yield* fileBackedClient.catalog.refresh.pipe(
-      Effect.provide(FetchHttpClient.layer),
-      Effect.ignore,
-    )
+    if (options?.warmCatalog !== false) {
+      yield* fileBackedClient.catalog.refresh.pipe(
+        Effect.provide(FetchHttpClient.layer),
+        Effect.ignore,
+      )
+    }
     return fileBackedClient
   })
 

@@ -247,4 +247,41 @@ describe("OpenAI-compatible catalog enrichment", () => {
       description: "Provider description",
     })
   })
+
+  it("uses provider-authoritative Kimi capability flags when metadata lags", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ data: [{
+        id: "kimi-k2.7-preview",
+        supports_reasoning: true,
+        supports_image_in: true,
+        supports_video_in: true,
+      }] }),
+    })
+    servers.push(server)
+    const provider: ModelsDevProvider = {
+      id: "kimi",
+      name: "Kimi",
+      models: {
+        "kimi-k2.7-preview": metadata("kimi-k2.7-preview", {
+          reasoning: true,
+          attachment: false,
+          modalities: { input: ["text"], output: ["text"] },
+        }),
+      },
+    }
+    const catalog = createOpenAiCompatibleCatalog({
+      providerId: "kimi",
+      endpoint: server.url.toString().replace(/\/$/, ""),
+      auth: Auth.none,
+      modelsDevProviderId: "kimi",
+      modelsDev: modelsDev(provider),
+    })
+
+    const result = await Effect.runPromise(catalog.list.pipe(Effect.provide(FetchHttpClient.layer)))
+
+    expect(result[0]?.reasoningEfforts).toEqual(["none", "high"])
+    expect(result[0]?.capabilities.vision).toBe(true)
+    expect(result[0]?.modalities?.input).toEqual(["text", "image", "video"])
+  })
 })

@@ -23,7 +23,7 @@ export function createZaiProvider(config: ZaiClientConfig): ZaiProviderInstance 
   const auth = config.auth ?? Auth.bearer(config.apiKey ?? "")
   const catalog = createZaiCatalog({ ...config, endpoint, auth })
   const classifyModelFamily: ZaiProvider["classifyModelFamily"] = (model) =>
-    classifyModelFamilyFromEvidence({}, [model.upstreamFamily, model.providerModelId, model.displayName])
+    classifyModelFamilyFromEvidence({}, [model.providerModelId, model.displayName, model.upstreamFamily])
 
   const bindModel = (
     providerModelId: string,
@@ -49,4 +49,3 @@ export function createZaiProvider(config: ZaiClientConfig): ZaiProviderInstance 
     },
   }
 }
-

@@ -22,7 +22,7 @@ export function createKimiApiProvider(config: KimiApiClientConfig): KimiApiProvi
   const endpoint = config.endpoint?.trim().replace(/\/+$/, "") || DEFAULT_KIMI_API_ENDPOINT
   const auth = config.auth ?? Auth.bearer(config.apiKey ?? "")
   const classifyModelFamily: KimiApiProvider["classifyModelFamily"] = (model) =>
-    classifyModelFamilyFromEvidence({}, [model.upstreamFamily, model.providerModelId, model.displayName])
+    classifyModelFamilyFromEvidence({}, [model.providerModelId, model.displayName, model.upstreamFamily])
   const catalog = createKimiApiCatalog({ ...config, endpoint, auth })
 
   const bindModel = (
@@ -49,4 +49,3 @@ export function createKimiApiProvider(config: KimiApiClientConfig): KimiApiProvi
     },
   }
 }
-

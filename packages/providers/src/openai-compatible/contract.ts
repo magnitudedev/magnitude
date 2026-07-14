@@ -17,6 +17,10 @@ export interface OpenAiCompatibleRawModel {
   readonly max_tokens?: number
   readonly description?: string
   readonly owned_by?: string
+  /** Provider-authoritative capability flags used by Kimi-compatible catalogs. */
+  readonly supports_reasoning?: boolean
+  readonly supports_image_in?: boolean
+  readonly supports_video_in?: boolean
   readonly supported_parameters?: readonly string[]
   readonly reasoning?: {
     readonly supported_efforts?: readonly string[] | null
