@@ -1,4 +1,4 @@
-import { Cause, Effect, Fiber, Queue, Ref, Scope, Schedule, Stream } from "effect"
+import { Cause, Effect, Fiber, Layer, Queue, Ref, Scope, Schedule, Stream } from "effect"
 import { RpcClient } from "@effect/rpc"
 import {
   forkIdToKey,
@@ -56,6 +56,7 @@ export interface DisplayViewControllerSnapshot {
 }
 
 export interface DisplayViewControllerOptions {
+  readonly protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>
   readonly displaySync: DisplaySyncSink
   readonly onRestoreQueuedInputText?: (text: string | null) => void
 }
@@ -65,7 +66,6 @@ type Listener = () => void
 type Command =
   | { readonly _tag: "set-shape"; readonly sessionId: string; readonly viewId: string; readonly shape: DisplayViewShape; readonly generation: number; readonly requestId: number }
   | { readonly _tag: "resync"; readonly sessionId: string; readonly viewId: string; readonly generation: number }
-  | { readonly _tag: "close-view"; readonly sessionId: string; readonly viewId: string }
 
 const viewIdForSession = (sessionId: string): string => `main:${sessionId}`
 
@@ -113,7 +113,7 @@ const initialSnapshot = (): DisplayViewControllerSnapshot => ({
 })
 
 export class DisplayViewControllerCore {
-  private readonly client: DisplayRpcClient
+  private readonly protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>
   private readonly displaySync: DisplaySyncSink
   private readonly onRestoreQueuedInputText: ((text: string | null) => void) | undefined
   private readonly listeners = new Set<Listener>()
@@ -126,101 +126,77 @@ export class DisplayViewControllerCore {
   private shapeRequestId = 0
   private lastRequestedShape: DisplayViewShape = EMPTY_DISPLAY_VIEW_SHAPE
 
-  private constructor(
-    client: DisplayRpcClient,
-    commandQueue: Queue.Queue<Command>,
-    commandFiber: Fiber.RuntimeFiber<void, never>,
-    options: DisplayViewControllerOptions,
-  ) {
-    this.client = client
-    this.commandQueue = commandQueue
-    this.commandFiber = commandFiber
+  constructor(options: DisplayViewControllerOptions) {
+    this.protocolLayer = options.protocolLayer
+    this.commandQueue = Effect.runSync(Queue.unbounded<Command>())
     this.displaySync = options.displaySync
     this.onRestoreQueuedInputText = options.onRestoreQueuedInputText
     this.resetAcceptedStore()
+
+    this.commandFiber = Effect.runFork(this.runCommandLoop())
   }
 
-  /**
-   * Factory — bakes in the protocol dependency. Creates one RpcClient from
-   * the shared protocol layer, one command queue + fiber, and returns the
-   * controller. The scope finalizer interrupts all fibers and shuts down
-   * the queue.
-   */
-  static make = (options: DisplayViewControllerOptions): Effect.Effect<
-    DisplayViewControllerCore,
-    never,
-    RpcClient.Protocol | Scope.Scope
-  > =>
-    Effect.gen(function* () {
-      const client = yield* RpcClient.make(MagnitudeRpcs)
-      const queue = yield* Queue.unbounded<Command>()
-
-      const controller = new DisplayViewControllerCore(client, queue, null!, options)
-
-      const commandFiber = yield* Effect.fork(
-        controller.runCommandLoop(),
-      )
-      controller.commandFiber = commandFiber
-
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          controller.dispose()
-        }),
-      )
-
-      return controller
-    })
+  /** Create an RpcClient from the shared protocol layer. */
+  private makeClient = (): Effect.Effect<DisplayRpcClient, unknown, Scope.Scope> =>
+    RpcClient.make(MagnitudeRpcs).pipe(Effect.provide(this.protocolLayer))
 
   /**
    * Single fiber drains the command queue serially — same serialization
-   * semantics as the old Promise commandChain, but proper Effect. The client
-   * is baked in from construction.
+   * semantics as the old Promise commandChain, but proper Effect. One
+   * RpcClient is created for the lifetime of the loop and reused for
+   * all commands.
    */
   private runCommandLoop = (): Effect.Effect<void, never, never> =>
-    Stream.fromQueue(this.commandQueue).pipe(
-      Stream.runForEach((cmd) =>
-        this.executeCommand(cmd).pipe(
-          Effect.catchAll((error) =>
-            Effect.logWarning(`Display view controller command failed (${cmd._tag})`).pipe(
-              Effect.annotateLogs({
-                error: error instanceof Error ? error.message : String(error),
-              }),
+    Effect.scoped(
+      Effect.gen(this, function* () {
+        const client = yield* RpcClient.make(MagnitudeRpcs).pipe(Effect.provide(this.protocolLayer))
+        yield* Stream.fromQueue(this.commandQueue).pipe(
+          Stream.runForEach((cmd) =>
+            this.executeCommand(client, cmd).pipe(
+              Effect.catchAll((error) =>
+                Effect.logWarning(`Display view controller command failed (${cmd._tag})`).pipe(
+                  Effect.annotateLogs({
+                    error: error instanceof Error ? error.message : String(error),
+                  }),
+                ),
+              ),
             ),
           ),
-        ),
-      ),
+        )
+      }),
     )
 
-  private executeCommand = (cmd: Command): Effect.Effect<void, unknown, never> => {
-    switch (cmd._tag) {
-      case "set-shape": {
-        if (!this.isCurrent(cmd.generation, cmd.sessionId)) return Effect.void
-        if (this.snapshot.phase !== "open" || cmd.requestId !== this.shapeRequestId) return Effect.void
-        return this.client.SetDisplayViewShape({ sessionId: cmd.sessionId, viewId: cmd.viewId, shape: cmd.shape }).pipe(
-          Effect.catchAll((error) =>
-            Effect.gen(this, function* () {
-              if (!this.isCurrent(cmd.generation, cmd.sessionId) || cmd.requestId !== this.shapeRequestId) return
-              yield* Effect.logWarning(
-                `Failed to set display view shape; reopening display stream: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              )
-              this.reopenStream(cmd.sessionId, "reconnecting")
-            }),
-          ),
-        )
+  private executeCommand = (
+    client: DisplayRpcClient,
+    cmd: Command,
+  ): Effect.Effect<void, unknown, never> =>
+    Effect.gen(this, function* () {
+      switch (cmd._tag) {
+        case "set-shape": {
+          if (!this.isCurrent(cmd.generation, cmd.sessionId)) return
+          if (this.snapshot.phase !== "open" || cmd.requestId !== this.shapeRequestId) return
+          yield* client.SetDisplayViewShape({ sessionId: cmd.sessionId, viewId: cmd.viewId, shape: cmd.shape }).pipe(
+            Effect.catchAll((error) =>
+              Effect.gen(this, function* () {
+                if (!this.isCurrent(cmd.generation, cmd.sessionId) || cmd.requestId !== this.shapeRequestId) return
+                yield* Effect.logWarning(
+                  `Failed to set display view shape; reopening display stream: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                )
+                this.reopenStream(cmd.sessionId, "reconnecting")
+              }),
+            ),
+          )
+          return
+        }
+        case "resync": {
+          if (!this.isCurrent(cmd.generation, cmd.sessionId)) return
+          yield* client.ResyncDisplayView({ sessionId: cmd.sessionId, viewId: cmd.viewId })
+          return
+        }
       }
-      case "resync": {
-        if (!this.isCurrent(cmd.generation, cmd.sessionId)) return Effect.void
-        return this.client.ResyncDisplayView({ sessionId: cmd.sessionId, viewId: cmd.viewId })
-      }
-      case "close-view": {
-        return this.client.CloseDisplayView({ sessionId: cmd.sessionId, viewId: cmd.viewId }).pipe(
-          Effect.catchAll(() => Effect.void),
-        )
-      }
-    }
-  }
+    })
 
   getSnapshot = (): DisplayViewControllerSnapshot => this.snapshot
 
@@ -307,8 +283,7 @@ export class DisplayViewControllerCore {
   }
 
   stop = (): void => {
-    if (this.disposed && this.snapshot.phase === "stopped") return
-    this.disposed = true
+    if (this.snapshot.phase === "stopped") return
     this.closeActiveView()
     this.setSnapshot({
       ...this.snapshot,
@@ -318,18 +293,18 @@ export class DisplayViewControllerCore {
   }
 
   dispose = (): void => {
+    if (this.disposed) return
     this.stop()
-    if (this.commandFiber) {
-      Effect.runFork(Fiber.interrupt(this.commandFiber))
-      this.commandFiber = null
-    }
+    // Queue.shutdown signals Stream.fromQueue to complete, letting the
+    // command loop drain remaining items and exit naturally — no need to
+    // interrupt the fiber.
     Effect.runSync(Queue.shutdown(this.commandQueue))
+    this.commandFiber = null
     this.listeners.clear()
   }
 
   private transitionToSession(sessionId: string): void {
     this.closeActiveView()
-    this.disposed = false
     this.setSnapshot({
       ...this.snapshot,
       selectedSessionId: sessionId,
@@ -444,7 +419,8 @@ export class DisplayViewControllerCore {
             if (!this.isCurrent(generation, sessionId)) return Stream.empty
             const shape = desiredShapeForSnapshot(this.snapshot)
             this.lastRequestedShape = shape
-            return this.client.StreamDisplayView({ sessionId, viewId, shape }).pipe(
+            const client = yield* this.makeClient()
+            return client.StreamDisplayView({ sessionId, viewId, shape }).pipe(
               Stream.filter(isDisplayEvent),
               Stream.tap((event) =>
                 Effect.gen(this, function* () {
@@ -563,12 +539,17 @@ export class DisplayViewControllerCore {
     this.shapeRequestId++
     this.lastRequestedShape = EMPTY_DISPLAY_VIEW_SHAPE
     if (!closeRemote || !selectedSessionId || !viewId) return
+    // Fire-and-forget — the stream is already interrupted and the generation
+    // bumped, so this doesn't need to be serialized with other commands.
     Effect.runFork(
-      Queue.offer(this.commandQueue, {
-        _tag: "close-view",
-        sessionId: selectedSessionId,
-        viewId,
-      }),
+      Effect.scoped(
+        Effect.gen(this, function* () {
+          const client = yield* this.makeClient()
+          yield* client.CloseDisplayView({ sessionId: selectedSessionId, viewId }).pipe(
+            Effect.catchAll(() => Effect.void),
+          )
+        }),
+      ),
     )
   }
 

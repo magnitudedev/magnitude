@@ -27,12 +27,11 @@ const protocolLayer: Layer.Layer<RpcClient.Protocol, never, never> = Layer.scope
   ),
 )
 
-const makeController = (): Promise<DisplayViewControllerCore> =>
-  Effect.runPromise(
-    DisplayViewControllerCore.make({
-      displaySync: createDisplayViewStore(EMPTY_DISPLAY_STATE, EMPTY_DISPLAY_VIEW_SHAPE),
-    }).pipe(Effect.scoped, Effect.provide(protocolLayer)),
-  )
+const makeController = (): DisplayViewControllerCore =>
+  new DisplayViewControllerCore({
+    protocolLayer,
+    displaySync: createDisplayViewStore(EMPTY_DISPLAY_STATE, EMPTY_DISPLAY_VIEW_SHAPE),
+  })
 
 const emptyTimeline = (): DisplayTimeline => ({
   mode: "idle",
@@ -43,8 +42,8 @@ const emptyTimeline = (): DisplayTimeline => ({
 })
 
 describe("DisplayViewControllerCore", () => {
-  it("derives worker shape from the visible fork stack", async () => {
-    const controller = await makeController()
+  it("derives worker shape from the visible fork stack", () => {
+    const controller = makeController()
 
     controller.pushFork("worker-a")
     const afterPush = controller.getSnapshot()
@@ -64,8 +63,8 @@ describe("DisplayViewControllerCore", () => {
     expect(Object.keys(desiredShapeForSnapshot(afterPop).timelines)).toEqual(["root"])
   })
 
-  it("replaces worker shape when fork stack changes instead of retaining old workers", async () => {
-    const controller = await makeController()
+  it("replaces worker shape when fork stack changes instead of retaining old workers", () => {
+    const controller = makeController()
 
     controller.setForkStack(["worker-a", "worker-b"])
     expect(Object.keys(desiredShapeForSnapshot(controller.getSnapshot()).timelines).sort()).toEqual([
