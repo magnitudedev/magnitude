@@ -5,7 +5,8 @@
  * provider-specific noise (no capability suffixes, no quantization lists,
  * no Bedrock version handling, no Ollama tag processing). It only:
  *
- * 1. Strips the path prefix (last segment after `/`, `@`, or non-decimal `.`)
+ * 1. Strips a terminal model artifact extension and path prefix
+ *    (last segment after `/`, `\\`, `@`, or non-decimal `.`)
  * 2. Lowercases
  * 3. Splits into typed atoms: literals, separators, decimal points
  *
@@ -26,24 +27,30 @@ function isAllDigits(value: string): boolean {
 }
 
 /**
- * Strip the path prefix: take the last segment after `/`, `@`, or `.`
- * (the Bedrock provider separator). A `.` followed by a digit is a decimal
- * point, not a provider separator, so it's preserved.
+ * Strip known artifact extensions, then take the last segment after a path
+ * separator, `@`, or `.` (the Bedrock provider separator). A `.` followed by
+ * a digit is a decimal point, not a provider separator, so it's preserved.
  */
 function stripPathPrefix(id: string): string {
-  const lastSlash = id.lastIndexOf("/")
-  const lastAt = id.lastIndexOf("@")
-  const lastDot = id.lastIndexOf(".")
+  const withoutArtifactExtension = id.replace(/\.(?:gguf|ggml|bin)$/i, "")
+  const lastSlash = Math.max(
+    withoutArtifactExtension.lastIndexOf("/"),
+    withoutArtifactExtension.lastIndexOf("\\"),
+  )
+  const lastAt = withoutArtifactExtension.lastIndexOf("@")
+  const lastDot = withoutArtifactExtension.lastIndexOf(".")
   let index = Math.max(lastSlash, lastAt)
-  if (lastDot !== -1 && lastDot < id.length - 1) {
-    const nextChar = id[lastDot + 1]
+  if (lastDot !== -1 && lastDot < withoutArtifactExtension.length - 1) {
+    const nextChar = withoutArtifactExtension[lastDot + 1]
     if (nextChar && /\d/.test(nextChar)) {
       // Decimal point followed by digit — not a provider separator.
     } else {
       index = Math.max(index, lastDot)
     }
   }
-  return index === -1 ? id : id.slice(index + 1)
+  return index === -1
+    ? withoutArtifactExtension
+    : withoutArtifactExtension.slice(index + 1)
 }
 
 /** Characters that act as segment separators. */

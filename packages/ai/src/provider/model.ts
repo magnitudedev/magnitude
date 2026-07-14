@@ -59,7 +59,7 @@ export interface ProviderModel {
   readonly providerModelId: string
   /** ID of the provider serving this model, e.g. "magnitude", "llamacpp" */
   readonly providerId: string
-  /** Model family ID this provider model maps to (always populated) */
+  /** Model family ID this provider model maps to; may be "unknown" when discovery is authoritative. */
   readonly modelFamilyId: string
   /** Display name (may differ from family name) */
   readonly displayName: string

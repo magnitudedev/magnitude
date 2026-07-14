@@ -9,12 +9,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-bun": "^0.90.0",
+    "@huggingface/gguf": "0.4.2",
     "@magnitudedev/ai": "workspace:*",
     "@magnitudedev/protocol": "workspace:*",
     "@magnitudedev/roles": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
-    "@effect/platform": "0.76.0",
-    "@effect/platform-bun": "0.76.0",
     "effect": "3.21.2"
   },
   "devDependencies": {

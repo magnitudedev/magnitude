@@ -16,15 +16,20 @@ export {
 } from "./errors"
 export type {
   LlamaCppModelInfo,
+  LlamaCppDiscoveryResult,
   LlamaCppRawModel,
   LlamaCppModelMeta,
   LlamaCppModelsResponse,
   LlamaCppToolChoice,
+  ServerProps,
+  ServerStatus,
 } from "./contract"
 export {
+  checkServerHealth,
   fetchModelList,
   fetchServerProps,
   deriveDisplayName,
   deriveContextWindow,
   detectVision,
 } from "./discovery"
+export type { CheckServerHealthOptions } from "./discovery"

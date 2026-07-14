@@ -54,6 +54,11 @@ const FAMILY_DEFINITIONS: readonly Family[] = [
       { pattern: [lit("qwen"), sep(), lit("3"), dot(), lit("7")], priority: 100 },
       { pattern: [lit("qwen"), sep(), lit("3"), dot(), ver()], priority: 90 },
     ],
+    metadataPatterns: [{
+      architectures: ["qwen35", "qwen35moe"],
+      tokenizerModels: ["gpt2"],
+      tokenizerPres: ["qwen35"],
+    }],
   },
   {
     familyId: "deepseek-v3",
@@ -281,6 +286,63 @@ export function getModelFamily(id: string): ModelFamily | null {
 export function classifyModelFamily(id: string): Option.Option<string> {
   const result = classify(id, FAMILY_DEFINITIONS)
   return result.matched ? Option.some(result.familyId) : Option.none()
+}
+
+export interface ModelFamilyMetadata {
+  readonly architecture?: string
+  readonly tokenizerModel?: string
+  readonly tokenizerPre?: string
+}
+
+function normalizeMetadataValue(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase()
+  return normalized || undefined
+}
+
+function metadataPatternMatches(
+  metadata: ModelFamilyMetadata,
+  pattern: NonNullable<Family["metadataPatterns"]>[number],
+): boolean {
+  const architecture = normalizeMetadataValue(metadata.architecture)
+  const tokenizerModel = normalizeMetadataValue(metadata.tokenizerModel)
+  const tokenizerPre = normalizeMetadataValue(metadata.tokenizerPre)
+
+  return (
+    (!pattern.architectures || (architecture !== undefined && pattern.architectures.includes(architecture))) &&
+    (!pattern.tokenizerModels || (tokenizerModel !== undefined && pattern.tokenizerModels.includes(tokenizerModel))) &&
+    (!pattern.tokenizerPres || (tokenizerPre !== undefined && pattern.tokenizerPres.includes(tokenizerPre)))
+  )
+}
+
+/** Classify only when all required structured metadata for a family agrees. */
+export function classifyModelFamilyFromMetadata(
+  metadata: ModelFamilyMetadata,
+): Option.Option<string> {
+  for (const family of FAMILY_DEFINITIONS) {
+    if (family.metadataPatterns?.some((pattern) => metadataPatternMatches(metadata, pattern))) {
+      return Option.some(family.familyId)
+    }
+  }
+  return Option.none()
+}
+
+/** Reject a name-based match when present structured metadata contradicts it. */
+export function modelFamilyMetadataConflicts(
+  familyId: string,
+  metadata: ModelFamilyMetadata,
+): boolean {
+  const family = FAMILY_DEFINITIONS.find((candidate) => candidate.familyId === familyId)
+  if (!family?.metadataPatterns?.length) return false
+
+  const architecture = normalizeMetadataValue(metadata.architecture)
+  const tokenizerModel = normalizeMetadataValue(metadata.tokenizerModel)
+  const tokenizerPre = normalizeMetadataValue(metadata.tokenizerPre)
+
+  return family.metadataPatterns.every((pattern) =>
+    (architecture !== undefined && pattern.architectures !== undefined && !pattern.architectures.includes(architecture)) ||
+    (tokenizerModel !== undefined && pattern.tokenizerModels !== undefined && !pattern.tokenizerModels.includes(tokenizerModel)) ||
+    (tokenizerPre !== undefined && pattern.tokenizerPres !== undefined && !pattern.tokenizerPres.includes(tokenizerPre)),
+  )
 }
 
 export { FAMILY_DEFINITIONS }

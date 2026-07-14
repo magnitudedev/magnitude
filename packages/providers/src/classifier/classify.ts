@@ -20,4 +20,4 @@ export function classify(
 }
 
 export { type Atom, atomizeModelId }
-export { type Family, type PatternEntry } from "./matcher"
+export { type Family, type ModelMetadataPattern, type PatternEntry } from "./matcher"

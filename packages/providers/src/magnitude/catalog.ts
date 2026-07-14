@@ -50,7 +50,10 @@ export function createMagnitudeCatalog(config: MagnitudeCatalogConfig): ModelCat
       const client = yield* HttpClient.HttpClient
 
       const headers = new Headers()
-      auth(headers)
+      yield* Effect.try({
+        try: () => auth(headers),
+        catch: (cause) => new ModelCatalogError({ message: "Magnitude authentication is not configured", cause }),
+      })
 
       const headerRecord: Record<string, string> = {}
       headers.forEach((value, key) => {

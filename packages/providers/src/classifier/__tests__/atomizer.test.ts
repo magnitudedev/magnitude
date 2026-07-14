@@ -20,6 +20,15 @@ const CASES: readonly AtomCase[] = [
   { id: "meta-llama/Llama-3.3-70B-Instruct", expected: "llama sep 3 dot 3 sep 70 b sep instruct" },
   { id: "meta.llama3-1-8b-instruct-v1:0", expected: "llama 3 sep 1 sep 8 b sep instruct sep v 1 sep 0" },
   { id: "meta/llama3-3@llama-3.3-70b-instruct", expected: "llama sep 3 dot 3 sep 70 b sep instruct" },
+  {
+    id: "/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+    expected: "qwen 3 dot 6 sep 35 b sep a 3 b sep ud sep q 6 sep k sep xl",
+  },
+  {
+    id: "C:\\Models\\Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+    expected: "meta sep llama sep 3 dot 1 sep 8 b sep instruct sep q 4 sep k sep m",
+  },
+  { id: "/legacy/llama-3-8b-q4_0.bin", expected: "llama sep 3 sep 8 b sep q 4 sep 0" },
 
   // Decimal points via `.` and `p`
   { id: "glm-5.2", expected: "glm sep 5 dot 2" },

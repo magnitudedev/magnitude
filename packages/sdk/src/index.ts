@@ -134,6 +134,7 @@ export {
   createProviderClient,
   type ProviderClientShape,
   type ProviderClientConfig,
+  type ProviderRegistryInfo,
   type ProviderRuntimeConfig,
   type ProviderRejection,
   type ProviderClientError,

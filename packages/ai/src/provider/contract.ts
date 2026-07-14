@@ -35,7 +35,8 @@ export interface Provider<
    * Classify a model into a known model family.
    * Takes the provider model without `modelFamilyId` (which is what
    * we're computing). Returns the family ID, or None if the model
-   * cannot be classified (in which case it is excluded from the catalog).
+   * cannot be classified. Each provider's catalog decides whether an
+   * unclassified model is excluded or surfaced with an unknown family.
    */
   readonly classifyModelFamily: (model: Omit<TModel, "modelFamilyId">) => Option.Option<string>
 }

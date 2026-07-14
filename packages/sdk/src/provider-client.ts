@@ -19,6 +19,7 @@ import {
   type FetchBalanceOptions,
   type BalanceResponse,
 } from "@magnitudedev/providers"
+import type { ProviderInfo as RegistryProviderInfo } from "@magnitudedev/providers"
 
 // =============================================================================
 // Re-exported types with provider-agnostic names
@@ -26,7 +27,12 @@ import {
 
 export type { ProviderRejection, BaseCallOptions, ProviderModelBindOptions, ProviderModel } from "@magnitudedev/ai"
 export type ProviderClientError = MagnitudeClientError
-export type ProviderClientConfig = MagnitudeClientConfig
+export type ProviderRegistryInfo = RegistryProviderInfo
+
+export interface ProviderClientConfig extends MagnitudeClientConfig {
+  readonly llamacppEndpoint?: string
+  readonly llamacppApiKey?: string
+}
 
 export type {
   MagnitudeModelInfo,
@@ -70,6 +76,7 @@ export interface ProviderRuntimeConfig {
  */
 export interface ProviderClientShape {
   readonly catalog: ModelCatalog<ProviderModel>
+  readonly listProviders: Effect.Effect<readonly ProviderRegistryInfo[], never, HttpClient.HttpClient>
   readonly sessionId: string | null
   readonly resolveModel: (
     providerId: string,
@@ -104,11 +111,10 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
   const magnitudeInstance: MagnitudeProviderInstance = createMagnitudeProvider(config)
   const sessionId = config?.sessionId ?? null
 
-  const llamacppInstance: LlamaCppProviderInstance | null = (() => {
-    const endpoint = process.env.LLAMACPP_ENDPOINT
-    if (!endpoint) return null
-    return createLlamaCppProvider({ endpoint })
-  })()
+  const llamacppInstance: LlamaCppProviderInstance = createLlamaCppProvider({
+    endpoint: config?.llamacppEndpoint,
+    apiKey: config?.llamacppApiKey,
+  })
 
   const registry = makeProviderRegistry({
     magnitude: magnitudeInstance,
@@ -117,6 +123,7 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
 
   return {
     catalog: registry.aggregatedCatalog,
+    listProviders: registry.listProviders,
     sessionId,
     resolveModel: (providerId, providerModelId, options) =>
       registry.resolveModel(providerId, providerModelId, options),

@@ -1,4 +1,5 @@
 import { Context, Effect, Layer } from "effect"
+import type * as HttpClient from "@effect/platform/HttpClient"
 import type {
   Provider,
   ModelCatalog,
@@ -20,11 +21,14 @@ export interface ProviderInfo {
   readonly id: string
   readonly displayName: string
   readonly authStatus: AuthStatus
+  readonly status?: "ok" | "loading" | "not_found" | "error"
+  readonly message?: string
+  readonly hint?: string
 }
 
 export interface ProviderRegistryService {
   readonly listProviderIds: Effect.Effect<readonly string[]>
-  readonly listProviders: Effect.Effect<readonly ProviderInfo[]>
+  readonly listProviders: Effect.Effect<readonly ProviderInfo[], never, HttpClient.HttpClient>
   readonly aggregatedCatalog: ModelCatalog<ProviderModel>
   /**
    * Resolve a model from any registered provider.
@@ -60,7 +64,6 @@ export function makeProviderRegistry(config: {
 
   if (config.llamacpp) {
     providers.set("llamacpp", config.llamacpp.provider)
-    providerInfos.push({ id: "llamacpp", displayName: "Llama.cpp", authStatus: { _tag: "no_auth_required" } })
   }
 
   const activeProviders = [...providers.values()].map((p) => ({ id: p.id, catalog: p.catalog }))
@@ -68,7 +71,21 @@ export function makeProviderRegistry(config: {
 
   return {
     listProviderIds: Effect.succeed([...providers.keys()]),
-    listProviders: Effect.succeed(providerInfos),
+    listProviders: Effect.gen(function* () {
+      const infos = [...providerInfos]
+      if (config.llamacpp) {
+        const result = yield* config.llamacpp.checkStatus
+        infos.push({
+          id: "llamacpp",
+          displayName: "Llama.cpp",
+          authStatus: { _tag: "no_auth_required" },
+          status: result.status,
+          ...(result.message ? { message: result.message } : {}),
+          ...(result.hint ? { hint: result.hint } : {}),
+        })
+      }
+      return infos
+    }),
     aggregatedCatalog,
     resolveModel: (providerId, providerModelId, options) =>
       Effect.gen(function* () {

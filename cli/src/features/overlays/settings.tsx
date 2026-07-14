@@ -171,6 +171,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     closeDropdown()
   }, [dropdownTarget, dropdownItems, modelConfig, closeDropdown])
 
+  const llamacppStatus = modelConfig?.providers?.find((provider) =>
+    provider.id === 'llamacpp' && provider.status && provider.status !== 'ok'
+  ) ?? null
+
   useKeyboard(useCallback((key: KeyEvent) => {
     if (!isVisible) return
 
@@ -257,11 +261,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               <Button onClick={beginDisconnect} onMouseOver={() => setDisconnectHovered(true)} onMouseOut={() => setDisconnectHovered(false)}>
                 <text style={{ fg: disconnectHovered ? theme.foreground : theme.muted }}>{'[Disconnect]'}</text>
               </Button>
-              {modelConfig && (
-                <Button onClick={() => { void modelConfig.refreshModels() }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}>
-                  <text style={{ fg: refreshHovered ? theme.foreground : theme.muted }}>{modelConfig.refreshingModels ? '[Refreshing...]' : '[Refresh models]'}</text>
-                </Button>
-              )}
             </box>
           </box>
         )}
@@ -320,14 +319,34 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       </box>
 
       {/* Model Selection */}
-      <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.foreground }}>
+      <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: 'row' }}>
+        <text style={{ fg: theme.foreground, flexGrow: 1 }}>
           <span attributes={TextAttributes.BOLD}>Model Selection</span>
         </text>
+        {modelConfig && (
+          <Button onClick={() => { void modelConfig.refreshModels() }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}>
+            <text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{modelConfig.refreshingModels ? '[Refreshing...]' : '[Refresh models]'}</text>
+          </Button>
+        )}
       </box>
 
       {/* Slot cards with inline dropdowns */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
+        {llamacppStatus?.status === 'not_found' && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{ fg: theme.warning }}>⚠ llama-server not detected. Start one with e.g. llama-server -m /path/to/model.gguf</text>
+          </box>
+        )}
+        {llamacppStatus?.status === 'loading' && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{ fg: theme.warning }}>◐ llama-server loading model...</text>
+          </box>
+        )}
+        {llamacppStatus?.status === 'error' && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{ fg: theme.error }}>✗ llama-server error: {llamacppStatus.message ?? 'Unknown error'}</text>
+          </box>
+        )}
         {SLOT_IDS.map((slotId) => {
           const label = SLOT_DISPLAY_NAMES[slotId]
           const description = SLOT_DESCRIPTIONS[slotId]

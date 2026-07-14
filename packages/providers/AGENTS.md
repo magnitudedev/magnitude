@@ -11,7 +11,9 @@ Provider system spans three packages:
 
 `BaseCallOptions`: `maxTokens`, `toolChoice`, `reasoningEffort`, `generateToolCallId`. Provider-specific options are baked at `bindModel` time via `wrapAsBaseModel` — consumers only see `BoundModel<BaseCallOptions>`.
 
-Unclassified models (no family match) are excluded from catalogs.
+Catalog eligibility is provider-specific. Hosted catalogs may exclude models
+they do not support. Local discovery providers must keep server-reported models
+visible and use an unknown family when best-effort classification fails.
 
 ## Model Family Classification
 
@@ -22,7 +24,7 @@ The shared classifier tokenizes model IDs into atoms and matches them against pa
 Rules:
 - Use flexible symbols, not exact string matching. `num`/`ver` match any numeric/version segment. `opt` matches optional segments. This lets one pattern cover variants like `glm-5.1`, `glm-5.2`, `provider/glm-5.1-instruct`.
 - Add new families by extending `FAMILY_DEFINITIONS` in the family registry, not by adding per-provider logic.
-- If a model ID cannot be classified by any pattern, it is excluded from the catalog. This is intentional — unknown models should not surface to users.
+- Family classification enriches catalog metadata; it is not a universal availability gate. In particular, local server aliases and filenames are arbitrary and must still surface when no pattern matches.
 - The classifier must not add provider-specific matching. Patterns use resilient symbols that are consistent and flexible enough to match the same family across different provider ID formats.
 
 ## New Provider Steps

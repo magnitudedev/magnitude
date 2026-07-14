@@ -27,25 +27,54 @@ const resolveApiKeyFromStorage = (
     return null
   })
 
+export interface LlamaCppAuthConfig {
+  readonly endpoint: string
+  readonly apiKey?: string
+}
+
+export const resolveLlamaCppAuthFromStorage = (
+  storage: MagnitudeStorageShape,
+): Effect.Effect<LlamaCppAuthConfig | null, never, never> =>
+  Effect.gen(function* () {
+    const auth = yield* storage.auth.get("llamacpp").pipe(
+      Effect.catchAll(() => Effect.succeed(null)),
+    )
+    if (auth?.type !== "endpoint") return null
+
+    const endpoint = auth.endpoint.trim()
+    if (!endpoint) return null
+    return {
+      endpoint,
+      ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+    }
+  })
+
 /**
- * Build a fresh file-backed `ProviderClientShape` using the given API key and
- * the global model cache path. The catalog is intentionally refreshed so the
- * file cache is populated with models fetched using the new key.
+ * Build a fresh file-backed `ProviderClientShape` using the resolved provider
+ * auth and the global model cache path. The catalog is intentionally refreshed
+ * so the file cache is populated with every currently available provider.
  */
-export const makeClientWithKey = (
+export const makeClientWithAuth = (
   apiKey: string | null,
+  llamacpp: LlamaCppAuthConfig | null,
 ): Effect.Effect<ProviderClientShape, never, GlobalStorage> =>
   Effect.gen(function* () {
     const globalStorage = yield* GlobalStorage
-    const client = createProviderClient(apiKey ? { apiKey } : {})
+    const client = createProviderClient({
+      ...(apiKey ? { apiKey } : {}),
+      ...(llamacpp
+        ? {
+            llamacppEndpoint: llamacpp.endpoint,
+            ...(llamacpp.apiKey ? { llamacppApiKey: llamacpp.apiKey } : {}),
+          }
+        : {}),
+    })
     const fileCatalog = makeFileBackedModelCatalog(client.catalog, globalStorage.paths.modelCacheFile)
     const fileBackedClient: ProviderClientShape = { ...client, catalog: fileCatalog }
-    if (apiKey) {
-      yield* fileBackedClient.catalog.refresh.pipe(
-        Effect.provide(FetchHttpClient.layer),
-        Effect.ignore,
-      )
-    }
+    yield* fileBackedClient.catalog.refresh.pipe(
+      Effect.provide(FetchHttpClient.layer),
+      Effect.ignore,
+    )
     return fileBackedClient
   })
 
@@ -65,7 +94,8 @@ export const SharedMagnitudeClientRefLive = Layer.effect(
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
     const apiKey = yield* resolveApiKeyFromStorage(storage)
-    const client = yield* makeClientWithKey(apiKey)
+    const llamacpp = yield* resolveLlamaCppAuthFromStorage(storage)
+    const client = yield* makeClientWithAuth(apiKey, llamacpp)
     return yield* Ref.make<ProviderClientShape>(client)
   }),
 )
@@ -94,6 +124,10 @@ const wrapClientRef = (
         return yield* client.catalog.refresh
       }),
     },
+    listProviders: Effect.gen(function* () {
+      const client = yield* ref.get
+      return yield* client.listProviders
+    }),
     sessionId: null,
     resolveModel: (providerId, providerModelId, options) =>
       Effect.gen(function* () {
