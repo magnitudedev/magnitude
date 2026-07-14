@@ -1,6 +1,7 @@
 import {
   NativeChatCompletions,
   Option,
+  type ChatCompletionsRequest,
   type ModelSpec,
   type BoundModel,
   type ImagePlaceholderConfig,
@@ -40,11 +41,51 @@ const llamacppOptions = {
   ),
 } as const
 
+type LlamaCppChatCompletionsRequest = Partial<ChatCompletionsRequest> & {
+  readonly chat_template_kwargs?: {
+    readonly enable_thinking?: boolean
+    readonly reasoning_effort?: string
+  }
+}
+
+/** Map Magnitude's generic effort setting to llama-server's template controls. */
+export function composeLlamaCppReasoningRequest(
+  wire: Partial<ChatCompletionsRequest>,
+): LlamaCppChatCompletionsRequest {
+  const withoutProviderDetails = {
+    ...wire,
+    messages: wire.messages?.map((message) => {
+      if (message.role !== "assistant" || message.reasoning_details === undefined) return message
+      const { reasoning_details: _reasoningDetails, ...rest } = message
+      return rest
+    }),
+  }
+  const effort = withoutProviderDetails.reasoning_effort as string | undefined
+  if (effort === undefined) return withoutProviderDetails
+
+  const { reasoning_effort: _reasoningEffort, ...rest } = withoutProviderDetails
+  if (effort === "default") return rest
+  if (effort === "none") {
+    return {
+      ...rest,
+      chat_template_kwargs: { enable_thinking: false },
+    }
+  }
+  return {
+    ...rest,
+    chat_template_kwargs: {
+      enable_thinking: true,
+      reasoning_effort: effort,
+    },
+  }
+}
+
 export function createLlamaCppCompatibleSpec(config: LlamaCppCompatibleSpecConfig) {
   return NativeChatCompletions.model({
     modelId: config.modelId,
     endpoint: config.endpoint,
     options: llamacppOptions,
+    compose: composeLlamaCppReasoningRequest,
     classifyRejectedResponse: classifyLlamaCppRejectedResponse,
   })
 }

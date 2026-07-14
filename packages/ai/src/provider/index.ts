@@ -8,6 +8,9 @@ export type {
   ModelFamily,
   ModelFamilyCapabilities,
   ModelPricingInfo,
+  ModelOpenWeightStatus,
+  ModelMetadataSource,
+  ModelModalities,
   ReasoningEffort,
 } from "./model"
 export type { ProviderModelCapabilities } from "../model/capabilities"

@@ -71,6 +71,7 @@ function contextEntryToAdvisorMessages(
     result.push({
       _tag: 'AssistantMessage',
       reasoning: Option.none(),
+      reasoningDetails: [],
       text: Option.some(text),
       toolCalls: Option.none(),
     })
@@ -256,6 +257,7 @@ export function advisorWindowToPrompt(input: AdvisorWindowPromptInput): Prompt {
         messages.push({
           _tag: 'AssistantMessage',
           reasoning: Option.none(),
+          reasoningDetails: [],
           text: Option.some(msg.content),
           toolCalls: Option.none(),
         })

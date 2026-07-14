@@ -9,6 +9,7 @@ import type {
 import {
   AssistantMessageSchema,
   JsonValueSchema,
+  mergeReasoningDetails,
   ToolCallPartSchema,
   ProviderToolCallIdSchema as AiProviderToolCallIdSchema,
   ToolCallIdSchema as AiToolCallIdSchema,
@@ -196,7 +197,7 @@ const canonicalAccumulatorInitial: CanonicalAccumulator = {
   toolCallInputs: new Map(),
   toolCallInputChunks: new Map(),
   readyToolCalls: new Set(),
-  assistantMessage: { _tag: "AssistantMessage", reasoning: Option.none(), text: Option.none(), toolCalls: Option.none() },
+  assistantMessage: { _tag: "AssistantMessage", reasoning: Option.none(), reasoningDetails: [], text: Option.none(), toolCalls: Option.none() },
   toolResults: [],
   outcome: null,
   usage: null,
@@ -210,6 +211,17 @@ function canonicalAccumulatorStep(state: CanonicalAccumulator, event: HarnessEve
         ...state,
         reasoning,
         assistantMessage: { ...state.assistantMessage, reasoning: Option.some(reasoning) },
+      }
+    }
+
+    case "ReasoningDetails": {
+      const reasoningDetails = mergeReasoningDetails(
+        state.assistantMessage.reasoningDetails,
+        event.details,
+      )
+      return {
+        ...state,
+        assistantMessage: { ...state.assistantMessage, reasoningDetails },
       }
     }
 

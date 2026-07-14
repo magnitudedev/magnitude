@@ -130,9 +130,24 @@ export function createLlamaCppCatalog(
           displayName,
           contextWindow,
           maxOutputTokens: Math.min(contextWindow, 8192),
-          capabilities: { vision },
+          capabilities: {
+            vision,
+            toolCalls: true,
+            structuredOutput: true,
+            grammar: true,
+            toolChoiceModes: ["auto", "none", "required", "named"],
+          },
           pricing: ZERO_PRICING,
           reasoningEfforts: ["none"],
+          ...(ggufMetadata
+            ? { metadataSource: "local_metadata" as const }
+            : raw.meta
+              ? { metadataSource: "provider" as const }
+              : {}),
+          modalities: {
+            input: vision ? ["text", "image"] : ["text"],
+            output: ["text"],
+          },
           ...(sourceModelPath ? { sourceModelPath } : {}),
           ...(metadataName ? { metadataName } : {}),
           ...(modelArchitecture ? { modelArchitecture } : {}),

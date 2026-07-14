@@ -1,6 +1,7 @@
 import type { ProviderModel, ModelProfile } from '@magnitudedev/ai'
 import { toModelProfile } from '@magnitudedev/ai'
 import type { SlotId } from './types'
+import { resolveReasoningEffort } from './constants'
 
 /**
  * User-facing per-slot config shape (subset that affects model resolution).
@@ -18,6 +19,7 @@ export interface ResolvedSlotModel {
   readonly providerId: string
   readonly providerModelId: string
   readonly profile: ModelProfile
+  readonly reasoningEfforts: readonly string[]
   readonly isUserOverride: boolean
   /** True when the user's override was not found in the catalog. */
   readonly isFallback: boolean
@@ -56,6 +58,7 @@ export function resolveSlotModel<T extends ProviderModel & { readonly slots?: re
         providerId: overrideEntry.providerId,
         providerModelId: overrideEntry.providerModelId,
         profile: toModelProfile(overrideEntry),
+        reasoningEfforts: overrideEntry.reasoningEfforts,
         isUserOverride: true,
         isFallback: false,
       }
@@ -65,6 +68,7 @@ export function resolveSlotModel<T extends ProviderModel & { readonly slots?: re
       providerId: defaultEntry.providerId,
       providerModelId: defaultEntry.providerModelId,
       profile: toModelProfile(defaultEntry),
+      reasoningEfforts: defaultEntry.reasoningEfforts,
       isUserOverride: true,
       isFallback: true,
     }
@@ -75,7 +79,10 @@ export function resolveSlotModel<T extends ProviderModel & { readonly slots?: re
     providerId: defaultEntry.providerId,
     providerModelId: defaultEntry.providerModelId,
     profile: toModelProfile(defaultEntry),
+    reasoningEfforts: defaultEntry.reasoningEfforts,
     isUserOverride: false,
     isFallback: false,
   }
 }
+
+export { resolveReasoningEffort }

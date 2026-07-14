@@ -70,6 +70,44 @@ async function collectEvents(
 // ---------------------------------------------------------------------------
 
 describe("decode — mid-stream error envelope", () => {
+  it("decodes the reasoning alias as thought events", async () => {
+    const chunks = Stream.fromIterable([
+      chunkFromData({
+        choices: [{ index: 0, delta: { reasoning: "thinking" }, finish_reason: null }],
+      }),
+      usageChunk(),
+    ])
+    const { events } = decode(chunks, { streamContext, toStreamFailure: (error) => error })
+
+    const result = await collectEvents(events)
+
+    expect(result.filter((event) => event._tag === "thought_delta")).toEqual([
+      { _tag: "thought_delta", text: "thinking" },
+    ])
+  })
+
+  it("emits provider reasoning details without interpreting them", async () => {
+    const details = [{
+      type: "reasoning.encrypted",
+      data: "opaque-signed-payload",
+      format: "provider-v1",
+      index: 0,
+    }]
+    const chunks = Stream.fromIterable([
+      chunkFromData({
+        choices: [{ index: 0, delta: { reasoning_details: details }, finish_reason: null }],
+      }),
+      usageChunk(),
+    ])
+    const { events } = decode(chunks, { streamContext, toStreamFailure: (error) => error })
+
+    const result = await collectEvents(events)
+
+    expect(result.filter((event) => event._tag === "reasoning_details")).toEqual([
+      { _tag: "reasoning_details", details },
+    ])
+  })
+
   it("emits stream_end with StreamFailed terminal when chunk has error field", async () => {
     const chunks = Stream.fromIterable([
       textChunk("Hello, "),

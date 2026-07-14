@@ -4,6 +4,7 @@ import {
   type ModelSpec,
   type BoundModel,
   type BaseCallOptions,
+  type ChatCompletionsRequest,
   type ToolChoice as AiToolChoice,
 } from "@magnitudedev/ai"
 import { classifyMagnitudeRejectedResponse } from "./errors"
@@ -44,11 +45,25 @@ const magnitudeOptions = {
   ),
 } as const
 
+function stripProviderReasoningDetails(
+  wire: Partial<ChatCompletionsRequest>,
+): Partial<ChatCompletionsRequest> {
+  return {
+    ...wire,
+    messages: wire.messages?.map((message) => {
+      if (message.role !== "assistant" || message.reasoning_details === undefined) return message
+      const { reasoning_details: _reasoningDetails, ...rest } = message
+      return rest
+    }),
+  }
+}
+
 export function createMagnitudeCompatibleSpec(config: MagnitudeCompatibleSpecConfig) {
   return NativeChatCompletions.model({
     modelId: config.modelId,
     endpoint: config.endpoint,
     options: magnitudeOptions,
+    compose: stripProviderReasoningDetails,
     classifyRejectedResponse: classifyMagnitudeRejectedResponse,
   })
 }

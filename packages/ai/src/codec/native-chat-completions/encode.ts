@@ -50,7 +50,7 @@ function encodeAssistantToolCall(toolCall: {
 }
 
 function encodeAssistantMessage(
-  message: { readonly _tag: "AssistantMessage"; readonly text: Option.Option<string>; readonly reasoning: Option.Option<string>; readonly toolCalls: Option.Option<readonly { readonly id: string; readonly providerToolCallId: ProviderToolCallId; readonly name: string; readonly input: unknown }[]> },
+  message: { readonly _tag: "AssistantMessage"; readonly text: Option.Option<string>; readonly reasoning: Option.Option<string>; readonly reasoningDetails: readonly import("../../prompt/parts").JsonValue[]; readonly toolCalls: Option.Option<readonly { readonly id: string; readonly providerToolCallId: ProviderToolCallId; readonly name: string; readonly input: unknown }[]> },
 ): ChatMessage {
   const content = Option.getOrElse(message.text, () => null)
   const reasoningContent = Option.getOrElse(message.reasoning, () => null)
@@ -60,6 +60,7 @@ function encodeAssistantMessage(
     role: "assistant",
     content,
     ...(reasoningContent !== null ? { reasoning_content: reasoningContent } : {}),
+    ...(message.reasoningDetails.length ? { reasoning_details: message.reasoningDetails } : {}),
     ...(Option.isSome(toolCalls) && toolCalls.value.length > 0 ? { tool_calls: toolCalls.value } : {}),
   }
 }

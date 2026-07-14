@@ -61,10 +61,18 @@ export type ModelConfigResponse = Schema.Schema.Type<typeof ModelConfigResponseS
 export const AuthStatusSchema = Schema.Literal("authenticated", "no_auth_required", "not_configured")
 export type AuthStatus = Schema.Schema.Type<typeof AuthStatusSchema>
 
+export const AuthSourceSchema = Schema.Literal("env", "file", "default", "none")
+export type AuthSource = Schema.Schema.Type<typeof AuthSourceSchema>
+
+export const ProviderAuthKindSchema = Schema.Literal("api", "endpoint", "none")
+export type ProviderAuthKind = Schema.Schema.Type<typeof ProviderAuthKindSchema>
+
 export const ProviderInfoSchema = Schema.Struct({
   id: Schema.String,
   displayName: Schema.String,
   authStatus: AuthStatusSchema,
+  authKind: Schema.optional(ProviderAuthKindSchema),
+  authSource: Schema.optional(AuthSourceSchema),
   status: Schema.optional(Schema.Literal("ok", "loading", "not_found", "error")),
   message: Schema.optional(Schema.String),
   hint: Schema.optional(Schema.String),
@@ -83,8 +91,22 @@ export const ModelSummarySchema = Schema.Struct({
   slots: Schema.optional(Schema.Array(SlotId)),
   contextWindow: Schema.Number,
   maxOutputTokens: Schema.Number,
-  capabilities: Schema.Struct({ vision: Schema.Boolean }),
+  capabilities: Schema.Struct({
+    vision: Schema.Boolean,
+    toolCalls: Schema.Boolean,
+    structuredOutput: Schema.Boolean,
+    grammar: Schema.Boolean,
+    toolChoiceModes: Schema.Array(Schema.Literal("auto", "none", "required", "named")),
+  }),
   reasoningEfforts: Schema.Array(Schema.String),
+  openWeightStatus: Schema.optional(Schema.Literal("open", "closed", "unknown")),
+  metadataSource: Schema.optional(Schema.Literal("provider", "models.dev", "official_fallback", "local_metadata")),
+  description: Schema.optional(Schema.String),
+  upstreamFamily: Schema.optional(Schema.String),
+  modalities: Schema.optional(Schema.Struct({
+    input: Schema.Array(Schema.String),
+    output: Schema.Array(Schema.String),
+  })),
   pricing: Schema.optional(Schema.Struct({
     input: Schema.Number,
     output: Schema.Number,
@@ -118,6 +140,16 @@ export const EndpointAuthSchema = Schema.Struct({
 
 export const ProviderAuthSchema = Schema.Union(ApiKeyAuthSchema, EndpointAuthSchema)
 export type ProviderAuth = Schema.Schema.Type<typeof ProviderAuthSchema>
+
+export const ProviderAuthSummarySchema = Schema.Struct({
+  providerId: Schema.String,
+  type: ProviderAuthKindSchema,
+  configured: Schema.Boolean,
+  source: AuthSourceSchema,
+  maskedKey: Schema.optional(Schema.String),
+  endpoint: Schema.optional(Schema.String),
+})
+export type ProviderAuthSummary = Schema.Schema.Type<typeof ProviderAuthSummarySchema>
 
 // ---------------------------------------------------------------------------
 // Balance

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { Effect, Stream } from 'effect'
+import { Effect, Schema, Stream } from 'effect'
 import * as HttpClient from '@effect/platform/HttpClient'
 import { Fork } from '@magnitudedev/event-core'
 import {
@@ -34,7 +34,7 @@ const { ForkContext } = Fork
 const profile: ModelProfile = {
   contextWindow: 100_000,
   maxOutputTokens: 4096,
-  capabilities: { vision: true },
+  capabilities: { vision: true, toolCalls: true, structuredOutput: true, grammar: true, toolChoiceModes: ['auto', 'none', 'required', 'named'] },
 }
 
 const testModelSpec: ModelSpec<BaseCallOptions> = {
@@ -50,6 +50,13 @@ const prompt = Prompt.from({
     parts: [{ _tag: 'TextPart', text: 'hello' }],
   }],
 })
+
+const tools: readonly ToolDefinition[] = [{
+  name: 'finish',
+  description: 'Finish the task',
+  inputSchema: Schema.Struct({ result: Schema.String }),
+  outputSchema: Schema.String,
+}]
 
 const modelTrace: ModelCallTrace = {
   modelId: 'test',
@@ -204,5 +211,48 @@ describe('makeAgentBoundModel tracing', () => {
     expect(calls).toHaveLength(1)
     expect(calls[0]?.hadTraceListener).toBe(false)
     expect(traceMock.traces).toEqual([])
+  })
+
+  it('uses a bounded grammar only when the served model explicitly supports grammar', async () => {
+    const { model, calls } = makeRawModel()
+    const wrapped = makeAgentBoundModel({
+      rawModel: model,
+      modelSource: { slotId: 'primary' },
+      modelId: 'test',
+      providerId: 'llamacpp',
+      profile,
+      debug: false,
+      agentId: 'agent-1',
+      maxToolCalls: 3,
+    })
+
+    await run(wrapped.model.stream(prompt, tools, { toolChoice: 'required' }))
+
+    expect(calls[0]?.options?.toolChoice).toMatchObject({ type: 'grammar' })
+  })
+
+  it('never sends grammar to a provider that declares grammar unsupported', async () => {
+    const { model, calls } = makeRawModel()
+    const wrapped = makeAgentBoundModel({
+      rawModel: model,
+      modelSource: { slotId: 'primary' },
+      modelId: 'test',
+      providerId: 'kimi-api',
+      profile: {
+        ...profile,
+        capabilities: {
+          ...profile.capabilities,
+          grammar: false,
+          toolChoiceModes: ['auto', 'none'],
+        },
+      },
+      debug: false,
+      agentId: 'agent-1',
+      maxToolCalls: 3,
+    })
+
+    await run(wrapped.model.stream(prompt, tools, { toolChoice: 'required' }))
+
+    expect(calls[0]?.options?.toolChoice).toBe('auto')
   })
 })

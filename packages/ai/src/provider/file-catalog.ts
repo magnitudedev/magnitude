@@ -57,6 +57,10 @@ export function makeFileBackedModelCatalog<T extends ProviderModel>(
   cachePath: string,
   fileTtlMs: number = 10 * 60 * 1000,
   inMemoryTtlMs: number = 5 * 60 * 1000,
+  options?: {
+    /** Keep stale entries for still-configured providers omitted by a partial refresh. */
+    readonly preserveProviderIds?: readonly string[]
+  },
 ): ModelCatalog<T> {
   let inMemory: readonly T[] | null = null
   let inMemoryFetchedAt = 0
@@ -112,7 +116,15 @@ export function makeFileBackedModelCatalog<T extends ProviderModel>(
     }).pipe(Effect.provide(PlatformFileLayer))
 
   const refresh: ModelCatalog<T>["refresh"] = Effect.gen(function* () {
-    const models: readonly T[] = yield* inner.refresh
+    const previous = inMemory ?? (yield* readFileCache)?.models ?? []
+    const refreshed: readonly T[] = yield* inner.refresh
+    const refreshedProviderIds = new Set(refreshed.map((model) => model.providerId))
+    const preserveProviderIds = new Set(options?.preserveProviderIds ?? [])
+    const preserved = previous.filter((model) =>
+      preserveProviderIds.has(model.providerId)
+      && !refreshedProviderIds.has(model.providerId)
+    )
+    const models = [...refreshed, ...preserved]
     inMemory = models
     inMemoryFetchedAt = Date.now()
     yield* writeFileCache(models)

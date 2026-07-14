@@ -294,12 +294,16 @@ function processChunk(
   const delta = choice.delta
 
   // Thought content
-  if (delta.reasoning_content) {
+  const reasoningDelta = delta.reasoning_content ?? delta.reasoning
+  if (reasoningDelta) {
     if (!nextState.thoughtOpen) {
       nextState = { ...nextState, thoughtOpen: true }
       events.push({ _tag: "thought_start", level: "medium" })
     }
-    events.push({ _tag: "thought_delta", text: delta.reasoning_content })
+    events.push({ _tag: "thought_delta", text: reasoningDelta })
+  }
+  if (delta.reasoning_details && delta.reasoning_details.length > 0) {
+    events.push({ _tag: "reasoning_details", details: delta.reasoning_details })
   }
 
   // Message content

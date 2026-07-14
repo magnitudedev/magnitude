@@ -61,6 +61,7 @@ export function assistantTurnProseOnly(
   return [{
     _tag: 'AssistantMessage',
     reasoning: Option.none(),
+    reasoningDetails: [],
     text: entry.turn.assistant.text,
     toolCalls: Option.none(),
   }]

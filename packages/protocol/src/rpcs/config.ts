@@ -9,6 +9,7 @@ import {
   SlotModelConfigSchema,
   ModelListSchema,
   ProviderAuthSchema,
+  ProviderAuthSummarySchema,
 } from "../schemas/account"
 
 export const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
@@ -34,6 +35,30 @@ export const ListProviderAuth = Rpc.make("ListProviderAuth", {
   payload: Schema.Struct({}),
   success: Schema.Struct({
     auths: Schema.Record({ key: Schema.String, value: ProviderAuthSchema }),
+  }),
+  error: SessionError
+})
+
+export const RemoveProviderAuth = Rpc.make("RemoveProviderAuth", {
+  payload: Schema.Struct({
+    providerId: Schema.String,
+  }),
+  success: Schema.Struct({}),
+  error: SessionError
+})
+
+export const GetProviderAuthSummary = Rpc.make("GetProviderAuthSummary", {
+  payload: Schema.Struct({
+    providerId: Schema.String,
+  }),
+  success: ProviderAuthSummarySchema,
+  error: SessionError
+})
+
+export const ListProviderAuthSummaries = Rpc.make("ListProviderAuthSummaries", {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({
+    auths: Schema.Array(ProviderAuthSummarySchema),
   }),
   error: SessionError
 })

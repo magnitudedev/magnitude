@@ -12,7 +12,7 @@ import type { SessionError } from "@magnitudedev/protocol"
 import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
-import { resolveLlamaCppAuth } from "./shared-client"
+import { resolveProviderConfiguration } from "./shared-client"
 
 export interface AgentFactoryApi {
   readonly createSession: (input: {
@@ -55,22 +55,11 @@ export const AgentFactoryLive = (options: {
             })).pipe(
               Effect.mapError((cause) => toSessionError(input.sessionId, cause)),
             )
-            const apiKey = yield* storage.auth.get("magnitude").pipe(
-              Effect.map((auth) => auth?.type === "api" ? auth.key : null),
-            )
-            const magnitudeApiKey = apiKey
-              || process.env.MAGNITUDE_API_KEY
-              || process.env.MAGNITUDE_LOCAL_API_KEY
-            const llamacpp = yield* resolveLlamaCppAuth(storage)
+            const providers = yield* resolveProviderConfiguration(storage)
             const providerClient: ProviderClientShape = createProviderClient({
-              ...(magnitudeApiKey ? { apiKey: magnitudeApiKey } : {}),
+              ...(providers.magnitudeApiKey ? { apiKey: providers.magnitudeApiKey } : {}),
               sessionId: input.sessionId,
-              ...(llamacpp
-                ? {
-                    llamacppEndpoint: llamacpp.endpoint,
-                    ...(llamacpp.apiKey ? { llamacppApiKey: llamacpp.apiKey } : {}),
-                  }
-                : {}),
+              providerConnections: providers.connections,
             })
             return { persistenceLayer, sessionContext, providerClient }
           }).pipe(

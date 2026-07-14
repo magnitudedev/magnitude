@@ -145,6 +145,7 @@ describe('observerWindowToPrompt', () => {
             assistant: {
               _tag: 'AssistantMessage',
               reasoning: Option.some('the exact thought text'),
+              reasoningDetails: [],
               text: Option.some('I found it.'),
               toolCalls: Option.some([
                 {
@@ -253,6 +254,7 @@ describe('observerWindowToPrompt', () => {
             assistant: {
               _tag: 'AssistantMessage',
               reasoning: Option.none(),
+              reasoningDetails: [],
               text: Option.none(),
               toolCalls: Option.some([{
                 _tag: 'ToolCallPart',

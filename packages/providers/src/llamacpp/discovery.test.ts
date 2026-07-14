@@ -211,6 +211,8 @@ describe("llama.cpp discovery", () => {
           tokenizerModel: "gpt2",
           tokenizerPre: "qwen35",
           modelFamilyId: "qwen-3.5",
+          metadataSource: "local_metadata",
+          modalities: { input: ["text"], output: ["text"] },
           baseModelNames: ["Qwen3.6 35B A3B"],
           baseModelRepositories: ["https://huggingface.co/Qwen/Qwen3.6-35B-A3B"],
         }),
@@ -419,6 +421,7 @@ describe("llama.cpp discovery", () => {
       id: "llamacpp",
       displayName: "Llama.cpp",
       authStatus: { _tag: "no_auth_required" },
+      authKind: "endpoint",
       status: "not_found",
       hint: "Start one with e.g. llama-server -m /path/to/model.gguf",
     }])

@@ -40,6 +40,40 @@ export const DEFAULT_REASONING_EFFORT: Readonly<Record<SlotId, string>> = {
   secondary: 'medium',
 }
 
+const REASONING_EFFORT_ORDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/** Resolve a requested/default effort to a value the selected model advertises. */
+export function resolveReasoningEffort(
+  model: { readonly reasoningEfforts: readonly string[] },
+  requested: string | undefined,
+  defaultEffort: string,
+): string {
+  const supported = model.reasoningEfforts
+  if (requested && supported.includes(requested)) return requested
+  if (supported.includes(defaultEffort)) return defaultEffort
+
+  const targetIndex = REASONING_EFFORT_ORDER.indexOf(
+    defaultEffort as (typeof REASONING_EFFORT_ORDER)[number],
+  )
+  if (targetIndex >= 0) {
+    const ranked = supported
+      .map((effort) => ({
+        effort,
+        index: REASONING_EFFORT_ORDER.indexOf(
+          effort as (typeof REASONING_EFFORT_ORDER)[number],
+        ),
+      }))
+      .filter((candidate) => candidate.index >= 0)
+    const closest = ranked.sort((left, right) =>
+      Math.abs(left.index - targetIndex) - Math.abs(right.index - targetIndex)
+      || left.index - right.index
+    )[0]
+    if (closest) return closest.effort
+  }
+
+  return supported[0] ?? defaultEffort
+}
+
 /** All slot IDs in canonical order. */
 export const SLOT_IDS = ['primary', 'secondary'] as const
 

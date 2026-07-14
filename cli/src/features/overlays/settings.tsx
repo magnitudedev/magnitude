@@ -1,40 +1,50 @@
-import { memo, useCallback, useState, useMemo } from 'react'
+import { memo, useCallback, useMemo, useState } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
-import type { AuthInfo } from './auth-display'
-import type { UseModelConfigResult } from '@magnitudedev/client-common'
-import { SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, DEFAULT_REASONING_EFFORT, type SlotId } from '@magnitudedev/sdk'
+import type { ModelOption, UseModelConfigResult } from '@magnitudedev/client-common'
+import {
+  DEFAULT_REASONING_EFFORT,
+  resolveReasoningEffort,
+  SLOT_DESCRIPTIONS,
+  SLOT_DISPLAY_NAMES,
+  SLOT_IDS,
+  type ProviderAuthSummary,
+  type ProviderInfo,
+  type SlotId,
+} from '@magnitudedev/sdk'
 
 interface SettingsOverlayProps {
   isVisible: boolean
   onClose: () => void
-  auth: AuthInfo
-  slots: ReadonlyArray<{
-    slotId: SlotId
-    label: string
-    description: string
-    modelDisplayName: string | null
-  }>
+  providerAuths: readonly ProviderAuthSummary[] | null
+  onSaveProviderApiKey: (providerId: string, key: string) => Promise<void>
+  onDisconnectProvider: (providerId: string) => Promise<void>
   modelConfig?: UseModelConfigResult
 }
-
-type Mode = 'view' | 'edit' | 'confirm-disconnect'
 
 type DropdownTarget =
   | { slotId: SlotId; field: 'model' }
   | { slotId: SlotId; field: 'thinking' }
   | null
 
-const REASONING_OPTIONS: { value: string; label: string }[] = [
-  { value: 'none', label: 'None' },
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'max', label: 'Max' },
-]
+interface ModelPickerItem {
+  id: string
+  providerId: string
+  providerName: string
+  label: string
+  rawId: string
+}
+
+interface ThinkingPickerItem {
+  id: string
+  label: string
+  value: string | null
+}
+
+const PICKER_WINDOW_SIZE = 6
 
 function formatContextWindow(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
@@ -42,116 +52,258 @@ function formatContextWindow(tokens: number): string {
   return `${tokens}`
 }
 
-function formatPricing(pricing: { input: number; output: number; cachedInput?: number }): string {
-  return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
+function formatLabel(value: string): string {
+  if (value === 'default') return 'Provider default'
+  return value.charAt(0).toUpperCase() + value.slice(1)
 }
 
-function maskApiKey(key: string): string {
-  const trimmed = key.trim()
-  if (trimmed.length <= 12) return '•'.repeat(Math.max(trimmed.length, 4))
-  const lastUnderscore = trimmed.lastIndexOf('_')
-  const head = lastUnderscore >= 0 && lastUnderscore < trimmed.length - 8
-    ? trimmed.slice(0, lastUnderscore + 1 + 4)
-    : trimmed.slice(0, 6)
-  const tail = trimmed.slice(-4)
-  return `${head}………${tail}`
+function effectiveModelForSlot(
+  slotId: SlotId,
+  modelConfig: UseModelConfigResult | undefined,
+): ModelOption | null {
+  const models = selectableModels(modelConfig)
+  const override = modelConfig?.slotConfig?.[slotId]
+  if (override?.providerId && override.providerModelId) {
+    return models.find((model) =>
+      model.providerId === override.providerId
+      && model.providerModelId === override.providerModelId
+    ) ?? null
+  }
+  return models.find((model) => model.slots?.includes(slotId)) ?? models[0] ?? null
+}
+
+function selectableModels(modelConfig: UseModelConfigResult | undefined): readonly ModelOption[] {
+  const healthyProviderIds = new Set((modelConfig?.providers ?? [])
+    .filter((provider) =>
+      provider.authStatus !== 'not_configured'
+      && (provider.status === undefined || provider.status === 'ok')
+    )
+    .map((provider) => provider.id))
+  return (modelConfig?.models ?? []).filter((model) => healthyProviderIds.has(model.providerId))
+}
+
+function ProviderRows({
+  providers,
+  auths,
+  editingProviderId,
+  disconnectProviderId,
+  inputValue,
+  submitting,
+  error,
+  onBeginEdit,
+  onBeginDisconnect,
+  onInputChange,
+  onSave,
+  onDisconnect,
+  onRefresh,
+  refreshing,
+  onCancel,
+}: {
+  providers: readonly ProviderInfo[] | null
+  auths: readonly ProviderAuthSummary[] | null
+  editingProviderId: string | null
+  disconnectProviderId: string | null
+  inputValue: string
+  submitting: boolean
+  error: string | null
+  onBeginEdit: (providerId: string) => void
+  onBeginDisconnect: (providerId: string) => void
+  onInputChange: (value: string) => void
+  onSave: () => void
+  onDisconnect: () => void
+  onRefresh: (providerId: string) => void
+  refreshing: boolean
+  onCancel: () => void
+}) {
+  const theme = useTheme()
+  if (providers === null) return <text style={{ fg: theme.muted }}>Loading providers...</text>
+
+  return (
+    <>
+      {providers.map((provider) => {
+        const auth = auths?.find((candidate) => candidate.providerId === provider.id)
+        const endpointProvider = provider.authKind === 'endpoint'
+        const configured = auth?.configured === true || provider.authStatus === 'authenticated'
+        const envManaged = auth?.source === 'env'
+        const editing = editingProviderId === provider.id
+        const confirming = disconnectProviderId === provider.id
+        const connectionFailed = provider.status === 'error' || provider.status === 'not_found'
+        const status = endpointProvider
+          ? provider.status === 'ok' ? 'Running' : provider.status === 'loading' ? 'Loading' : 'Unavailable'
+          : connectionFailed
+            ? 'Connection error'
+            : configured
+              ? `${provider.status === 'ok' ? 'Connected' : 'Configured'}${auth?.source && auth.source !== 'none' ? ` via ${auth.source}` : ''}`
+              : 'Not connected'
+        const healthy = configured && !connectionFailed && (!endpointProvider || provider.status === 'ok')
+        const statusColor = connectionFailed ? theme.error : healthy ? theme.success : theme.muted
+
+        return (
+          <box key={provider.id} style={{ flexDirection: 'column', paddingBottom: 1 }}>
+            <box style={{ flexDirection: 'row' }}>
+              <text style={{ fg: theme.foreground, width: 22 }}><span attributes={TextAttributes.BOLD}>{provider.displayName}</span></text>
+              <text style={{ fg: statusColor, flexGrow: 1 }}>{configured ? '● ' : '○ '}{status}</text>
+              {!endpointProvider && !envManaged && !editing && !confirming && (
+                <box style={{ flexDirection: 'row' }}>
+                  <Button onClick={() => onBeginEdit(provider.id)}><text style={{ fg: theme.primary }}>{configured ? '[Update]' : '[Connect]'}</text></Button>
+                  {configured && <><text> </text><Button onClick={() => onBeginDisconnect(provider.id)}><text style={{ fg: theme.muted }}>[Disconnect]</text></Button></>}
+                </box>
+              )}
+              {configured && !editing && !confirming && <><text> </text><Button onClick={() => onRefresh(provider.id)}><text style={{ fg: theme.muted }}>{refreshing ? '[...]' : '[Refresh]'}</text></Button></>}
+            </box>
+            {(auth?.maskedKey || auth?.endpoint) && (
+              <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>{auth.maskedKey ?? auth.endpoint}</span></text>
+            )}
+            {provider.message && <text style={{ fg: theme.error }}>{provider.message}</text>}
+            {editing && (
+              <box style={{ flexDirection: 'column', paddingTop: 1 }}>
+                <box style={{ borderStyle: 'single', borderColor: error ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, width: 72 }}>
+                  <SingleLineInput value={inputValue} onChange={onInputChange} placeholder="API key" focused />
+                </box>
+                <box style={{ flexDirection: 'row', paddingTop: 1 }}>
+                  <Button onClick={onSave}><text style={{ fg: theme.primary }}>{submitting ? '[Saving...]' : '[Save]'}</text></Button>
+                  <text> </text>
+                  <Button onClick={onCancel}><text style={{ fg: theme.muted }}>[Cancel]</text></Button>
+                </box>
+              </box>
+            )}
+            {confirming && (
+              <box style={{ flexDirection: 'row', paddingTop: 1 }}>
+                <Button onClick={onDisconnect}><text style={{ fg: theme.error }}>{submitting ? '[Disconnecting...]' : '[Confirm disconnect]'}</text></Button>
+                <text> </text>
+                <Button onClick={onCancel}><text style={{ fg: theme.muted }}>[Cancel]</text></Button>
+              </box>
+            )}
+            {(editing || confirming) && error && <text style={{ fg: theme.error }}>{error}</text>}
+          </box>
+        )
+      })}
+    </>
+  )
 }
 
 export const SettingsOverlay = memo(function SettingsOverlay({
   isVisible,
   onClose,
-  auth,
-  slots,
+  providerAuths,
+  onSaveProviderApiKey,
+  onDisconnectProvider,
   modelConfig,
 }: SettingsOverlayProps) {
   const theme = useTheme()
-  const [mode, setMode] = useState<Mode>('view')
+  const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
+  const [disconnectProviderId, setDisconnectProviderId] = useState<string | null>(null)
   const [inputValue, setInputValue] = useState('')
-  const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
-
-  const [updateHovered, setUpdateHovered] = useState(false)
-  const [disconnectHovered, setDisconnectHovered] = useState(false)
-  const [saveHovered, setSaveHovered] = useState(false)
-  const [cancelHovered, setCancelHovered] = useState(false)
-  const [confirmHovered, setConfirmHovered] = useState(false)
-  const [refreshHovered, setRefreshHovered] = useState(false)
-
-  // Dropdown state
+  const [error, setError] = useState<string | null>(null)
   const [dropdownTarget, setDropdownTarget] = useState<DropdownTarget>(null)
   const [dropdownIndex, setDropdownIndex] = useState(0)
-
-  // Per-slot hover state for model and thinking dropdown boxes
-  const [modelHovered, setModelHovered] = useState<Record<string, boolean>>({})
-  const [thinkingHovered, setThinkingHovered] = useState<Record<string, boolean>>({})
+  const [dropdownQuery, setDropdownQuery] = useState('')
+  const [refreshHovered, setRefreshHovered] = useState(false)
   const [resetHovered, setResetHovered] = useState(false)
 
-  const beginEdit = useCallback(() => {
-    setInputValue('')
-    setError(null)
-    setMode('edit')
-  }, [])
+  const providers = modelConfig?.providers ?? null
 
-  const beginDisconnect = useCallback(() => {
-    setError(null)
-    setMode('confirm-disconnect')
-  }, [])
-
-  const cancelInline = useCallback(() => {
-    setInputValue('')
-    setError(null)
-    setMode('view')
-  }, [])
-
-  const handleSave = useCallback(async () => {
-    if (submitting) return
-    const trimmed = inputValue.trim()
-    if (!trimmed) { setError('API key is required'); return }
-    setSubmitting(true)
-    try {
-      await auth.save(trimmed)
-      setInputValue('')
-      setMode('view')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save key')
-    } finally {
-      setSubmitting(false)
-    }
-  }, [auth, inputValue, submitting])
-
-  const handleConfirmDisconnect = useCallback(async () => {
-    if (submitting) return
-    setSubmitting(true)
-    try {
-      await auth.clear()
-      setMode('view')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to disconnect')
-    } finally {
-      setSubmitting(false)
-    }
-  }, [auth, submitting])
-
-  const dropdownItems = useMemo(() => {
-    if (!dropdownTarget) return []
-    if (dropdownTarget.field === 'model') {
-      const models = modelConfig?.models ?? []
-      return models.map(m => ({
-        id: m.providerModelId,
-        providerId: m.providerId,
-        label: `${m.displayName} · ${formatContextWindow(m.contextWindow)} ctx${m.pricing ? ` · ${formatPricing(m.pricing)}` : ''}`,
+  const modelItems = useMemo((): readonly ModelPickerItem[] => {
+    if (dropdownTarget?.field !== 'model') return []
+    const query = dropdownQuery.trim().toLowerCase()
+    const providerOrder = new Map((providers ?? []).map((provider, index) => [provider.id, index]))
+    return selectableModels(modelConfig)
+      .filter((model) => !query || [model.displayName, model.providerModelId, model.providerId, model.modelFamilyId].some((value) => value.toLowerCase().includes(query)))
+      .map((model) => ({
+        id: model.providerModelId,
+        providerId: model.providerId,
+        providerName: providers?.find((provider) => provider.id === model.providerId)?.displayName ?? model.providerId,
+        label: `${model.displayName} · ${formatContextWindow(model.contextWindow)} ctx`,
+        rawId: model.providerModelId,
       }))
-    }
-    return REASONING_OPTIONS.map(o => ({ id: o.value, label: o.label }))
+      .sort((left, right) =>
+        (providerOrder.get(left.providerId) ?? Number.MAX_SAFE_INTEGER) - (providerOrder.get(right.providerId) ?? Number.MAX_SAFE_INTEGER)
+        || left.label.localeCompare(right.label)
+      )
+  }, [dropdownTarget, dropdownQuery, modelConfig, providers])
+
+  const thinkingItems = useMemo((): readonly ThinkingPickerItem[] => {
+    if (dropdownTarget?.field !== 'thinking') return []
+    const model = effectiveModelForSlot(dropdownTarget.slotId, modelConfig)
+    const fallback = DEFAULT_REASONING_EFFORT[dropdownTarget.slotId]
+    const efforts = model?.reasoningEfforts.length ? model.reasoningEfforts : [fallback]
+    const resolvedDefault = model
+      ? resolveReasoningEffort(model, undefined, fallback)
+      : fallback
+    return [
+      {
+        id: 'default',
+        label: `${formatLabel(resolvedDefault)}${resolvedDefault === 'default' ? '' : ' (default)'}`,
+        value: null,
+      },
+      ...efforts
+        .filter((effort) => effort !== resolvedDefault)
+        .map((effort) => ({ id: effort, label: formatLabel(effort), value: effort })),
+    ]
   }, [dropdownTarget, modelConfig])
 
-  const openDropdown = useCallback((target: DropdownTarget) => {
+  const dropdownItems = dropdownTarget?.field === 'model' ? modelItems : thinkingItems
+  const windowStart = Math.max(0, Math.min(dropdownIndex - 2, dropdownItems.length - PICKER_WINDOW_SIZE))
+  const visibleDropdownItems = dropdownItems.slice(windowStart, windowStart + PICKER_WINDOW_SIZE)
+
+  const cancelInline = useCallback(() => {
+    setEditingProviderId(null)
+    setDisconnectProviderId(null)
+    setInputValue('')
+    setError(null)
+  }, [])
+
+  const beginEdit = useCallback((providerId: string) => {
+    cancelInline()
+    setEditingProviderId(providerId)
+  }, [cancelInline])
+
+  const beginDisconnect = useCallback((providerId: string) => {
+    cancelInline()
+    setDisconnectProviderId(providerId)
+  }, [cancelInline])
+
+  const handleSave = useCallback(async () => {
+    if (!editingProviderId || submitting) return
+    const key = inputValue.trim()
+    if (!key) { setError('API key is required'); return }
+    setSubmitting(true)
+    setError(null)
+    try {
+      await onSaveProviderApiKey(editingProviderId, key)
+      cancelInline()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Failed to save API key')
+    } finally {
+      setSubmitting(false)
+    }
+  }, [editingProviderId, inputValue, submitting, onSaveProviderApiKey, cancelInline])
+
+  const handleDisconnect = useCallback(async () => {
+    if (!disconnectProviderId || submitting) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      await onDisconnectProvider(disconnectProviderId)
+      cancelInline()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Failed to disconnect provider')
+    } finally {
+      setSubmitting(false)
+    }
+  }, [disconnectProviderId, submitting, onDisconnectProvider, cancelInline])
+
+  const openDropdown = useCallback((target: Exclude<DropdownTarget, null>) => {
     setDropdownTarget(target)
     setDropdownIndex(0)
+    setDropdownQuery('')
   }, [])
 
   const closeDropdown = useCallback(() => {
     setDropdownTarget(null)
+    setDropdownIndex(0)
+    setDropdownQuery('')
   }, [])
 
   const selectDropdownItem = useCallback((index: number) => {
@@ -159,351 +311,145 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     const item = dropdownItems[index]
     if (!item) return
     if (dropdownTarget.field === 'model') {
-      const modelItem = item as { id: string; providerId: string; label: string }
-      if (!modelItem.id) {
-        void modelConfig.updateSlotModel(dropdownTarget.slotId, null, null)
-      } else {
-        void modelConfig.updateSlotModel(dropdownTarget.slotId, modelItem.providerId, modelItem.id)
-      }
+      const model = item as ModelPickerItem
+      void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.id)
     } else {
-      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, item.id)
+      const effort = item as ThinkingPickerItem
+      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, effort.value)
     }
     closeDropdown()
   }, [dropdownTarget, dropdownItems, modelConfig, closeDropdown])
 
-  const unavailableProviders = modelConfig?.providers?.filter((provider) =>
-    provider.status && provider.status !== 'ok'
-  ) ?? []
-
   useKeyboard(useCallback((key: KeyEvent) => {
     if (!isVisible) return
-
     if (dropdownTarget) {
       if (key.name === 'escape') { key.preventDefault(); closeDropdown(); return }
-      if (key.name === 'up' || key.name === 'k') { key.preventDefault(); setDropdownIndex(i => Math.max(0, i - 1)); return }
-      if (key.name === 'down' || key.name === 'j') { key.preventDefault(); setDropdownIndex(i => Math.min(dropdownItems.length - 1, i + 1)); return }
+      if (key.name === 'up') { key.preventDefault(); setDropdownIndex((index) => Math.max(0, index - 1)); return }
+      if (key.name === 'down') { key.preventDefault(); setDropdownIndex((index) => Math.min(dropdownItems.length - 1, index + 1)); return }
       if (key.name === 'return' || key.name === 'enter') { key.preventDefault(); selectDropdownItem(dropdownIndex); return }
       return
     }
-
     if (key.name === 'escape') {
       key.preventDefault()
-      if (mode === 'edit' || mode === 'confirm-disconnect') { cancelInline(); return }
-      onClose()
+      if (editingProviderId || disconnectProviderId) cancelInline()
+      else onClose()
       return
     }
-    if (mode === 'edit' && (key.name === 'return' || key.name === 'enter') && !key.shift) {
+    if (editingProviderId && (key.name === 'return' || key.name === 'enter') && !key.shift) {
       key.preventDefault()
-      handleSave()
+      void handleSave()
     }
-  }, [isVisible, dropdownTarget, dropdownItems, dropdownIndex, mode, onClose, cancelInline, handleSave, closeDropdown, selectDropdownItem]))
+  }, [isVisible, dropdownTarget, dropdownItems.length, dropdownIndex, editingProviderId, disconnectProviderId, closeDropdown, selectDropdownItem, cancelInline, onClose, handleSave]))
 
   if (!isVisible) return null
 
   return (
     <box style={{ position: 'relative', flexDirection: 'column', height: '100%' }}>
-      {/* Header */}
       <box style={{ flexDirection: 'row', paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.primary, flexGrow: 1 }}>
-          <span attributes={TextAttributes.BOLD}>Settings</span>
-        </text>
-        <text style={{ fg: theme.muted }}>
-          <span attributes={TextAttributes.DIM}>Esc to close</span>
-        </text>
+        <text style={{ fg: theme.primary, flexGrow: 1 }}><span attributes={TextAttributes.BOLD}>Settings</span></text>
+        <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>Esc to close</span></text>
       </box>
+      <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}><text style={{ fg: theme.border }}>{'─'.repeat(80)}</text></box>
 
-      {/* Divider */}
-      <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
-      </box>
-
-      {/* Magnitude section */}
-      <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.foreground }}>
-          <span attributes={TextAttributes.BOLD}>Magnitude</span>
-        </text>
-      </box>
-
-      {/* Status / inline controls */}
-      <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexShrink: 0, flexDirection: 'column' }}>
-        {mode === 'view' && (auth.source === 'env' || auth.source === 'env-local') && (
-          <>
-            <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{'● Connected '}</text>
-              <text style={{ fg: theme.muted }}>{`via ${auth.envVarName} `}</text>
-              {auth.key && (
-                <text style={{ fg: theme.foreground }}>
-                  <span attributes={TextAttributes.DIM}>{`(${maskApiKey(auth.key)})`}</span>
-                </text>
-              )}
-            </box>
-            <text style={{ fg: theme.muted }}>
-              <span attributes={TextAttributes.DIM}>To change this key, update the env var and relaunch.</span>
-            </text>
-          </>
-        )}
-
-        {mode === 'view' && auth.source === 'config' && (
-          <box style={{ flexDirection: 'column' }}>
-            <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{'● Connected '}</text>
-              {auth.maskedKey && (
-                <text style={{ fg: theme.foreground }}>
-                  <span attributes={TextAttributes.DIM}>{`(${auth.maskedKey})`}</span>
-                </text>
-              )}
-            </box>
-            <box style={{ flexDirection: 'row', paddingTop: 1 }}>
-              <Button onClick={beginEdit} onMouseOver={() => setUpdateHovered(true)} onMouseOut={() => setUpdateHovered(false)}>
-                <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Update key]'}</text>
-              </Button>
-              <text> </text>
-              <Button onClick={beginDisconnect} onMouseOver={() => setDisconnectHovered(true)} onMouseOut={() => setDisconnectHovered(false)}>
-                <text style={{ fg: disconnectHovered ? theme.foreground : theme.muted }}>{'[Disconnect]'}</text>
-              </Button>
-            </box>
+      <scrollbox
+        scrollX={false}
+        scrollbarOptions={{ visible: false }}
+        verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }}
+        style={{
+          flexGrow: 1,
+          rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
+          wrapperOptions: { border: false, backgroundColor: 'transparent' },
+          contentOptions: { paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1 },
+        }}
+      >
+        <box style={{ flexDirection: 'column' }}>
+          <text style={{ fg: theme.foreground }}><span attributes={TextAttributes.BOLD}>Providers</span></text>
+          <box style={{ paddingTop: 1, flexDirection: 'column' }}>
+            <ProviderRows
+              providers={providers}
+              auths={providerAuths}
+              editingProviderId={editingProviderId}
+              disconnectProviderId={disconnectProviderId}
+              inputValue={inputValue}
+              submitting={submitting}
+              error={error}
+              onBeginEdit={beginEdit}
+              onBeginDisconnect={beginDisconnect}
+              onInputChange={(value) => { setInputValue(value); setError(null) }}
+              onSave={() => { void handleSave() }}
+              onDisconnect={() => { void handleDisconnect() }}
+              onRefresh={(providerId) => { void modelConfig?.refreshModels(providerId) }}
+              refreshing={modelConfig?.refreshingModels ?? false}
+              onCancel={cancelInline}
+            />
           </box>
-        )}
 
-        {mode === 'view' && auth.source === 'none' && (
-          <box style={{ flexDirection: 'row' }}>
-            <text style={{ fg: theme.muted }}>{'○ Not connected '}</text>
-            <text style={{ fg: theme.muted }}>{'· '}</text>
-            <Button onClick={beginEdit} onMouseOver={() => setUpdateHovered(true)} onMouseOut={() => setUpdateHovered(false)}>
-              <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Set API key]'}</text>
-            </Button>
+          <box style={{ paddingTop: 1, paddingBottom: 1 }}><text style={{ fg: theme.border }}>{'─'.repeat(76)}</text></box>
+          <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
+            <text style={{ fg: theme.foreground, flexGrow: 1 }}><span attributes={TextAttributes.BOLD}>Models</span></text>
+            {modelConfig && <Button onClick={() => { void modelConfig.refreshModels() }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}><text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{modelConfig.refreshingModels ? '[Refreshing...]' : '[Refresh]'}</text></Button>}
           </box>
-        )}
 
-        {mode === 'edit' && (
-          <box style={{ flexDirection: 'column' }}>
-            <box style={{ borderStyle: 'single', borderColor: error ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, flexShrink: 0, width: 80 }}>
-              <SingleLineInput value={inputValue} onChange={(v) => { setInputValue(v); setError(null) }} placeholder="Paste new API key" focused={true} />
-            </box>
-            {error && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{error}</text></box>}
-            <box style={{ flexDirection: 'row', paddingTop: 1 }}>
-              <Button onClick={handleSave} onMouseOver={() => setSaveHovered(true)} onMouseOut={() => setSaveHovered(false)}>
-                <text style={{ fg: saveHovered ? theme.primary : theme.foreground }}>{submitting ? '[Saving...]' : '[Save]'}</text>
-              </Button>
-              <text> </text>
-              <Button onClick={cancelInline} onMouseOver={() => setCancelHovered(true)} onMouseOut={() => setCancelHovered(false)}>
-                <text style={{ fg: cancelHovered ? theme.foreground : theme.muted }}>{'[Cancel]'}</text>
-              </Button>
-            </box>
-            <box style={{ paddingTop: 1 }}>
-              <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>Enter to save, Esc to cancel</span></text>
-            </box>
-          </box>
-        )}
+          {SLOT_IDS.map((slotId) => {
+            const selectedModel = effectiveModelForSlot(slotId, modelConfig)
+            const override = modelConfig?.slotConfig?.[slotId]
+            const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
+            const currentEffort = selectedModel
+              ? resolveReasoningEffort(selectedModel, override?.reasoningEffort, defaultEffort)
+              : defaultEffort
+            const modelOpen = dropdownTarget?.slotId === slotId && dropdownTarget.field === 'model'
+            const thinkingOpen = dropdownTarget?.slotId === slotId && dropdownTarget.field === 'thinking'
+            const providerName = providers?.find((provider) => provider.id === selectedModel?.providerId)?.displayName ?? selectedModel?.providerId
 
-        {mode === 'confirm-disconnect' && (
-          <box style={{ flexDirection: 'column' }}>
-            <text style={{ fg: theme.foreground }}>Disconnect this key? You will need to set another to reconnect.</text>
-            <box style={{ flexDirection: 'row', paddingTop: 1 }}>
-              <Button onClick={handleConfirmDisconnect} onMouseOver={() => setConfirmHovered(true)} onMouseOut={() => setConfirmHovered(false)}>
-                <text style={{ fg: confirmHovered ? theme.error : theme.foreground }}>{submitting ? '[Disconnecting...]' : '[Yes, disconnect]'}</text>
-              </Button>
-              <text> </text>
-              <Button onClick={cancelInline} onMouseOver={() => setCancelHovered(true)} onMouseOut={() => setCancelHovered(false)}>
-                <text style={{ fg: cancelHovered ? theme.foreground : theme.muted }}>{'[Cancel]'}</text>
-              </Button>
-            </box>
-            {error && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{error}</text></box>}
-          </box>
-        )}
-      </box>
+            return (
+              <box key={slotId} style={{ flexDirection: 'column', paddingBottom: 1 }}>
+                <text style={{ fg: theme.primary }}><span attributes={TextAttributes.BOLD}>{SLOT_DISPLAY_NAMES[slotId]}</span></text>
+                <box style={{ flexDirection: 'row' }}>
+                  <Button onClick={() => modelOpen ? closeDropdown() : openDropdown({ slotId, field: 'model' })} style={{ borderStyle: 'rounded', borderColor: modelOpen ? theme.primary : theme.border, width: 48, paddingLeft: 1, paddingRight: 1 }}>
+                    <text style={{ fg: theme.foreground, overflow: 'hidden' }}>{selectedModel ? `${selectedModel.displayName} · ${providerName}` : 'No model'} </text><text style={{ fg: theme.muted }}>▾</text>
+                  </Button>
+                  <text> </text>
+                  <Button onClick={() => thinkingOpen ? closeDropdown() : openDropdown({ slotId, field: 'thinking' })} style={{ borderStyle: 'rounded', borderColor: thinkingOpen ? theme.primary : theme.border, width: 18, paddingLeft: 1, paddingRight: 1 }}>
+                    <text style={{ fg: theme.foreground }}>{formatLabel(currentEffort)} </text><text style={{ fg: theme.muted }}>▾</text>
+                  </Button>
+                </box>
+                <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>{SLOT_DESCRIPTIONS[slotId]}</span></text>
 
-      {/* Divider */}
-      <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
-      </box>
-
-      {/* Model Selection */}
-      <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: 'row' }}>
-        <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-          <span attributes={TextAttributes.BOLD}>Model Selection</span>
-        </text>
-        {modelConfig && (
-          <Button onClick={() => { void modelConfig.refreshModels() }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}>
-            <text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{modelConfig.refreshingModels ? '[Refreshing...]' : '[Refresh models]'}</text>
-          </Button>
-        )}
-      </box>
-
-      {/* Slot cards with inline dropdowns */}
-      <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
-        {unavailableProviders.map((provider) => (
-          <box key={provider.id} style={{ paddingBottom: 1 }}>
-            <text style={{ fg: provider.status === 'error' ? theme.error : theme.warning }}>
-              {provider.status === 'not_found'
-                ? `⚠ ${provider.displayName} not detected.${provider.hint ? ` ${provider.hint}` : ''}`
-                : provider.status === 'loading'
-                  ? `◐ ${provider.message ?? `${provider.displayName} is loading models...`}`
-                  : `✗ ${provider.displayName}: ${provider.message ?? 'Unknown provider error'}`}
-            </text>
-          </box>
-        ))}
-        {SLOT_IDS.map((slotId) => {
-          const label = SLOT_DISPLAY_NAMES[slotId]
-          const description = SLOT_DESCRIPTIONS[slotId]
-          const models = modelConfig?.models ?? null
-          const currentOverride = modelConfig?.slotConfig?.[slotId] ?? null
-          const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
-          const currentEffort = currentOverride?.reasoningEffort ?? defaultEffort
-          const defaultModel = models?.find(m => m.slots?.includes(slotId)) ?? models?.[0] ?? null
-          const effectiveModel = currentOverride?.providerId && currentOverride.providerModelId
-            ? models?.find(m =>
-                m.providerId === currentOverride.providerId
-                && m.providerModelId === currentOverride.providerModelId
-              ) ?? null
-            : currentOverride?.providerModelId
-              ? models?.find(m => m.providerModelId === currentOverride.providerModelId) ?? null
-              : defaultModel
-          const modelLabel = effectiveModel
-            ? effectiveModel.displayName
-            : '—'
-          const thinkingLabel = REASONING_OPTIONS.find(o => o.value === currentEffort)?.label ?? '—'
-          const loading = modelConfig?.modelsLoading ?? false
-          const isThisDropdownOpen = dropdownTarget?.slotId === slotId
-
-          return (
-            <box key={slotId} style={{ flexDirection: 'column', paddingBottom: 1, position: 'relative', ...(isThisDropdownOpen ? { zIndex: 200 } : {}) }}>
-              <text style={{ fg: theme.primary }}>
-                <span attributes={TextAttributes.BOLD}>{label}</span>
-              </text>
-
-              {/* Dropdown boxes side by side */}
-              <box style={{ flexDirection: 'row', paddingTop: 0, ...(isThisDropdownOpen ? { zIndex: 200 } : {}) }}>
-                {/* Model dropdown — relative wrapper, dropdown floats below with absolute */}
-                {(() => {
-                  const w = 36; const pad = 2; const border = 2; const arrow = '▾'
-                  const maxLen = w - pad - border - arrow.length - 1
-                  const trunc = loading ? 'Loading...' : modelLabel.length > maxLen ? modelLabel.slice(0, maxLen - 1) + '…' : modelLabel
-                  const padded = trunc + ' '.repeat(Math.max(0, maxLen - trunc.length))
-                  const isOpen = isThisDropdownOpen && dropdownTarget?.field === 'model'
-                  return (
-                    <box style={{ position: 'relative', flexDirection: 'column', width: w, zIndex: 200 }}>
-                      <Button
-                        onClick={() => isOpen ? closeDropdown() : openDropdown({ slotId, field: 'model' })}
-                        onMouseOver={() => setModelHovered(prev => ({ ...prev, [slotId]: true }))}
-                        onMouseOut={() => setModelHovered(prev => ({ ...prev, [slotId]: false }))}
-                        style={{
-                          borderStyle: 'rounded',
-                          borderColor: isOpen || modelHovered[slotId] ? theme.primary : theme.border,
-                          paddingLeft: 1, paddingRight: 1, width: w, flexDirection: 'row',
-                        }}
-                      >
-                        <text style={{ fg: isOpen || modelHovered[slotId] ? theme.primary : theme.foreground, flexGrow: 1 }}>{padded}</text>
-                        <text style={{ fg: isOpen || modelHovered[slotId] ? theme.primary : theme.muted }}>{arrow}</text>
-                      </Button>
-                      {isOpen && (
-                        <box style={{
-                          position: 'absolute',
-                          top: 3,
-                          left: 0,
-                          zIndex: 200,
-                          flexDirection: 'column',
-                          borderStyle: 'rounded',
-                          borderColor: theme.primary,
-                          width: w,
-                          backgroundColor: theme.terminalDetectedBg,
-                        }}>
-                          {dropdownItems.length === 0 ? (
-                            <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>No models</span></text>
-                          ) : dropdownItems.map((item, index) => {
-                            const sel = index === dropdownIndex
-                            return (
-                              <Button key={`${'providerId' in item ? item.providerId : 'model'}:${item.id}`} onClick={() => selectDropdownItem(index)} onMouseOver={() => setDropdownIndex(index)}
-                                style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.terminalDetectedBg }}>
-                                <text style={{ fg: sel ? theme.primary : theme.foreground, overflow: 'hidden' }}>
-                                  {sel ? '▸ ' : '  '}{item.label.length > maxLen - 2 ? item.label.slice(0, maxLen - 3) + '…' : item.label}
-                                </text>
-                              </Button>
-                            )
-                          })}
+                {(modelOpen || thinkingOpen) && (
+                  <box style={{ flexDirection: 'column', borderStyle: 'single', borderColor: theme.primary, width: modelOpen ? 72 : 28, paddingLeft: 1, paddingRight: 1, marginTop: 1 }}>
+                    {modelOpen && <SingleLineInput value={dropdownQuery} onChange={(value) => { setDropdownQuery(value); setDropdownIndex(0) }} placeholder="Search models" focused />}
+                    {windowStart > 0 && <text style={{ fg: theme.muted }}>↑ {windowStart} more</text>}
+                    {visibleDropdownItems.map((item, visibleIndex) => {
+                      const index = windowStart + visibleIndex
+                      const selected = index === dropdownIndex
+                      const modelItem = modelOpen ? item as ModelPickerItem : null
+                      const previous = modelOpen && index > 0 ? modelItems[index - 1] : null
+                      const showProvider = modelItem && previous?.providerId !== modelItem.providerId
+                      return (
+                        <box key={modelItem ? JSON.stringify([modelItem.providerId, modelItem.id]) : item.id} style={{ flexDirection: 'column' }}>
+                          {showProvider && <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>{modelItem.providerName}</span></text>}
+                          <Button onClick={() => selectDropdownItem(index)} onMouseOver={() => setDropdownIndex(index)} style={{ flexDirection: 'column' }}>
+                            <text style={{ fg: selected ? theme.primary : theme.foreground }}>{selected ? '▸ ' : '  '}{item.label}</text>
+                            {modelItem && <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>  {modelItem.rawId}</span></text>}
+                          </Button>
                         </box>
-                      )}
-                    </box>
-                  )
-                })()}
-
-                <text> </text>
-
-                {/* Thinking dropdown — relative wrapper, dropdown floats below with absolute */}
-                {(() => {
-                  const w = 18; const pad = 2; const border = 2; const arrow = '▾'
-                  const fullLabel = thinkingLabel + (currentOverride?.reasoningEffort === undefined ? ' (def)' : '')
-                  const maxLen = w - pad - border - arrow.length - 1
-                  const trunc = fullLabel.length > maxLen ? fullLabel.slice(0, maxLen - 1) + '…' : fullLabel
-                  const padded = trunc + ' '.repeat(Math.max(0, maxLen - trunc.length))
-                  const isOpen = isThisDropdownOpen && dropdownTarget?.field === 'thinking'
-                  return (
-                    <box style={{ position: 'relative', flexDirection: 'column', width: w, zIndex: 200 }}>
-                      <Button
-                        onClick={() => isOpen ? closeDropdown() : openDropdown({ slotId, field: 'thinking' })}
-                        onMouseOver={() => setThinkingHovered(prev => ({ ...prev, [slotId]: true }))}
-                        onMouseOut={() => setThinkingHovered(prev => ({ ...prev, [slotId]: false }))}
-                        style={{
-                          borderStyle: 'rounded',
-                          borderColor: isOpen || thinkingHovered[slotId] ? theme.primary : theme.border,
-                          paddingLeft: 1, paddingRight: 1, width: w, flexDirection: 'row',
-                        }}
-                      >
-                        <text style={{ fg: isOpen || thinkingHovered[slotId] ? theme.primary : theme.foreground, flexGrow: 1 }}>{padded}</text>
-                        <text style={{ fg: isOpen || thinkingHovered[slotId] ? theme.primary : theme.muted }}>{arrow}</text>
-                      </Button>
-                      {isOpen && (
-                        <box style={{
-                          position: 'absolute',
-                          top: 3,
-                          left: 0,
-                          zIndex: 200,
-                          flexDirection: 'column',
-                          borderStyle: 'rounded',
-                          borderColor: theme.primary,
-                          width: w,
-                          backgroundColor: theme.terminalDetectedBg,
-                        }}>
-                          {dropdownItems.map((item, index) => {
-                            const sel = index === dropdownIndex
-                            return (
-                              <Button key={item.id} onClick={() => selectDropdownItem(index)} onMouseOver={() => setDropdownIndex(index)}
-                                style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.terminalDetectedBg }}>
-                                <text style={{ fg: sel ? theme.primary : theme.foreground }}>
-                                  {sel ? '▸ ' : '  '}{item.label}
-                                </text>
-                              </Button>
-                            )
-                          })}
-                        </box>
-                      )}
-                    </box>
-                  )
-                })()}
+                      )
+                    })}
+                    {dropdownItems.length === 0 && <text style={{ fg: theme.muted }}>No matching models</text>}
+                    {windowStart + PICKER_WINDOW_SIZE < dropdownItems.length && <text style={{ fg: theme.muted }}>↓ {dropdownItems.length - windowStart - PICKER_WINDOW_SIZE} more</text>}
+                  </box>
+                )}
               </box>
+            )
+          })}
 
-              <text style={{ fg: theme.muted }}>
-                <span attributes={TextAttributes.DIM}>{description}</span>
-              </text>
-            </box>
-          )
-        })}
-
-        {modelConfig && (
-          <box style={{ paddingTop: 1 }}>
-            <Button
-              onClick={() => { void modelConfig.resetToDefaults() }}
-              onMouseOver={() => setResetHovered(true)}
-              onMouseOut={() => setResetHovered(false)}
-            >
-              <text style={{ fg: resetHovered ? theme.foreground : theme.muted }}>
-                {'[Reset to defaults]'}
-              </text>
+          {modelConfig && (
+            <Button onClick={() => { void modelConfig.resetToDefaults() }} onMouseOver={() => setResetHovered(true)} onMouseOut={() => setResetHovered(false)}>
+              <text style={{ fg: resetHovered ? theme.foreground : theme.muted }}>[Reset defaults]</text>
             </Button>
-          </box>
-        )}
-      </box>
-
+          )}
+        </box>
+      </scrollbox>
     </box>
   )
 })

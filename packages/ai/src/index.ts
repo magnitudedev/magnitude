@@ -28,6 +28,7 @@ export {
   AssistantMessageSchema,
   ToolResultMessageSchema,
   MessageSchema,
+  mergeReasoningDetails,
 } from "./prompt/messages"
 export type { TextPart, ImagePart, ImageMediaType, ToolCallPart, JsonValue } from "./prompt/parts"
 export {

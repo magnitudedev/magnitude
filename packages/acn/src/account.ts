@@ -2,6 +2,7 @@ import { FetchHttpClient } from "@effect/platform"
 import { Cause, Context, Effect, Layer, Ref } from "effect"
 import {
   ProviderClient,
+  SUPPORTED_PROVIDER_DEFINITIONS,
   type BalanceQuery,
   type BalanceResponse,
   type ProviderModel,
@@ -12,7 +13,7 @@ import { isEnvFlagOn } from "@magnitudedev/utils"
 import {
   SharedProviderClientRef,
   makeSharedProviderClient,
-  resolveLlamaCppAuth,
+  resolveProviderConfiguration,
 } from "./shared-client"
 import {
   MagnitudeStorage,
@@ -30,6 +31,7 @@ import {
   type ModelList,
   type ProviderInfo,
   type ProviderAuth,
+  type ProviderAuthSummary,
   type SlotId,
 } from "@magnitudedev/protocol"
 import { SessionStore } from "./session-store"
@@ -37,6 +39,7 @@ import { SessionStore } from "./session-store"
 import {
   SLOT_IDS,
   DEFAULT_REASONING_EFFORT,
+  resolveReasoningEffort,
   resolveSlotModel,
   type UserSlotConfig,
 } from "@magnitudedev/roles"
@@ -45,6 +48,9 @@ export interface AccountApi {
   readonly updateProviderAuth: (providerId: string, auth: ProviderAuth) => Effect.Effect<void, SessionError>
   readonly getProviderAuth: (providerId: string) => Effect.Effect<ProviderAuth | null, SessionError>
   readonly listProviderAuth: Effect.Effect<Readonly<Record<string, ProviderAuth>>, SessionError>
+  readonly removeProviderAuth: (providerId: string) => Effect.Effect<void, SessionError>
+  readonly getProviderAuthSummary: (providerId: string) => Effect.Effect<ProviderAuthSummary, SessionError>
+  readonly listProviderAuthSummaries: Effect.Effect<readonly ProviderAuthSummary[], SessionError>
   readonly listPublicSlotProfiles: Effect.Effect<SlotProfiles | null, SessionError>
   readonly updateModelConfig: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, SessionError>
   readonly getCachedModelList: (providerId?: string) => Effect.Effect<ModelList, SessionError>
@@ -86,8 +92,21 @@ function toModelSummary(model: ProviderModel): ModelSummary {
     ...(slots && slots.length > 0 ? { slots: [...slots] } : {}),
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
-    capabilities: { vision: model.capabilities.vision ?? false },
+    capabilities: {
+      vision: model.capabilities.vision,
+      toolCalls: model.capabilities.toolCalls,
+      structuredOutput: model.capabilities.structuredOutput,
+      grammar: model.capabilities.grammar,
+      toolChoiceModes: [...model.capabilities.toolChoiceModes],
+    },
     reasoningEfforts: [...model.reasoningEfforts],
+    ...(model.openWeightStatus ? { openWeightStatus: model.openWeightStatus } : {}),
+    ...(model.metadataSource ? { metadataSource: model.metadataSource } : {}),
+    ...(model.description ? { description: model.description } : {}),
+    ...(model.upstreamFamily ? { upstreamFamily: model.upstreamFamily } : {}),
+    ...(model.modalities ? {
+      modalities: { input: [...model.modalities.input], output: [...model.modalities.output] },
+    } : {}),
     pricing: model.pricing ? {
       input: model.pricing.input,
       output: model.pricing.output,
@@ -113,6 +132,8 @@ function buildModelList(
       id: provider.id,
       displayName: provider.displayName,
       authStatus: provider.authStatus._tag,
+      ...(provider.authKind ? { authKind: provider.authKind } : {}),
+      ...(provider.authSource ? { authSource: provider.authSource } : {}),
       ...(provider.status ? { status: provider.status } : {}),
       ...(provider.message ? { message: provider.message } : {}),
       ...(provider.hint ? { hint: provider.hint } : {}),
@@ -145,7 +166,11 @@ function slotProfilesFromModels(
     const model = models.find((m) => m.providerId === resolved.providerId && m.providerModelId === resolved.providerModelId)
     if (!model) continue
 
-    const reasoningEffort = userSlotConfig?.reasoningEffort ?? DEFAULT_REASONING_EFFORT[slotId]
+    const reasoningEffort = resolveReasoningEffort(
+      model,
+      userSlotConfig?.reasoningEffort,
+      DEFAULT_REASONING_EFFORT[slotId],
+    )
 
     out[slotId] = {
       slotId,
@@ -179,22 +204,18 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       // Semaphore to serialize config writes (§5.9)
       const configSemaphore = yield* Effect.makeSemaphore(1)
 
-      const resolveApiKey = Effect.gen(function* () {
-        const useLocal = isEnvFlagOn(process.env.MAGNITUDE_USE_LOCAL)
-        if (useLocal) {
-          const localKey = process.env.MAGNITUDE_LOCAL_API_KEY
-          if (localKey?.trim()) return localKey
-        }
-
-        const stored = yield* storage.auth.get("magnitude").pipe(
-          Effect.catchAll(() => Effect.succeed(undefined)),
+      const rebuildProviderClient = Effect.gen(function* () {
+        const resolved = yield* resolveProviderConfiguration(storage)
+        const newClient = yield* makeSharedProviderClient(resolved).pipe(
+          Effect.provideService(GlobalStorage, globalStorage),
         )
-        if (stored?.type === "api" && stored.key.trim()) return stored.key
+        yield* Ref.set(clientRef, newClient)
+        return newClient
+      })
 
-        const envKey = process.env.MAGNITUDE_API_KEY
-        if (envKey?.trim()) return envKey
-
-        return null
+      const resolveApiKey = Effect.gen(function* () {
+        const resolved = yield* resolveProviderConfiguration(storage)
+        return resolved.magnitudeApiKey
       })
 
       const magnitudeAuthenticatedClient = (operation: string) =>
@@ -217,7 +238,8 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       ) => {
         const modelProviderIds = new Set(models.map((model) => model.providerId))
         const hasMismatch = providers.some((provider) =>
-          provider.status !== undefined
+          provider.authKind === "endpoint"
+          && provider.status !== undefined
           && modelProviderIds.has(provider.id) !== (provider.status === "ok")
         )
         return !hasMismatch
@@ -228,20 +250,25 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       return {
         updateProviderAuth: (providerId, auth) =>
           Effect.gen(function* () {
+            const definition = SUPPORTED_PROVIDER_DEFINITIONS.find(
+              (candidate) => candidate.id === providerId,
+            )
+            if (!definition) {
+              return yield* new SessionOperationFailed({
+                operation: "update provider auth",
+                reason: `Unsupported provider: ${providerId}`,
+              })
+            }
+            if (definition.authKind !== auth.type) {
+              return yield* new SessionOperationFailed({
+                operation: "update provider auth",
+                reason: `${definition.displayName} requires ${definition.authKind} auth`,
+              })
+            }
             yield* storage.auth.set(providerId, auth).pipe(
               Effect.mapError(toAccountError("update provider auth")),
             )
-            if (
-              (providerId === "magnitude" && auth.type === "api")
-              || (providerId === "llamacpp" && auth.type === "endpoint")
-            ) {
-              const apiKey = yield* resolveApiKey
-              const llamacpp = yield* resolveLlamaCppAuth(storage)
-              const newClient = yield* makeSharedProviderClient(apiKey, llamacpp).pipe(
-                Effect.provideService(GlobalStorage, globalStorage),
-              )
-              yield* Ref.set(clientRef, newClient)
-            }
+            yield* rebuildProviderClient
           }),
 
         getProviderAuth: (providerId) =>
@@ -252,6 +279,36 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
 
         listProviderAuth: storage.auth.loadAll().pipe(
           Effect.mapError(toAccountError("list provider auth")),
+        ),
+
+        removeProviderAuth: (providerId) =>
+          Effect.gen(function* () {
+            if (!SUPPORTED_PROVIDER_DEFINITIONS.some((candidate) => candidate.id === providerId)) {
+              return yield* new SessionOperationFailed({
+                operation: "remove provider auth",
+                reason: `Unsupported provider: ${providerId}`,
+              })
+            }
+            yield* storage.auth.remove(providerId).pipe(
+              Effect.mapError(toAccountError("remove provider auth")),
+            )
+            yield* rebuildProviderClient
+          }),
+
+        getProviderAuthSummary: (providerId) =>
+          resolveProviderConfiguration(storage).pipe(
+            Effect.map((resolved) => resolved.authSummaries.find(
+              (summary) => summary.providerId === providerId,
+            ) ?? {
+              providerId,
+              type: "none" as const,
+              configured: false,
+              source: "none" as const,
+            }),
+          ),
+
+        listProviderAuthSummaries: resolveProviderConfiguration(storage).pipe(
+          Effect.map((resolved) => resolved.authSummaries),
         ),
 
         listPublicSlotProfiles: Effect.tryPromise({
@@ -289,16 +346,26 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
               providers,
               "reconcile discoverable provider model cache",
             )
-            return yield* buildModelList(models, providers, storage, "get cached model list")
+            const selectedModels = providerId
+              ? models.filter((model) => model.providerId === providerId)
+              : models
+            return yield* buildModelList(selectedModels, providers, storage, "get cached model list")
           }),
 
         refreshCachedModelList: (providerId?: string) =>
           Effect.gen(function* () {
-            const models = yield* refreshModels("refresh cached model list")
-            const providers = yield* sharedClient.listProviders.pipe(
+            const refreshedClient = yield* rebuildProviderClient
+            const models = yield* refreshedClient.catalog.refresh.pipe(
+              Effect.provide(FetchHttpClient.layer),
+              Effect.mapError(toAccountError("refresh cached model list")),
+            )
+            const providers = yield* refreshedClient.listProviders.pipe(
               Effect.provide(FetchHttpClient.layer),
             )
-            return yield* buildModelList(models, providers, storage, "refresh cached model list")
+            const selectedModels = providerId
+              ? models.filter((model) => model.providerId === providerId)
+              : models
+            return yield* buildModelList(selectedModels, providers, storage, "refresh cached model list")
           }),
 
         getBalance: (query) =>

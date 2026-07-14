@@ -9,7 +9,7 @@ import type { ModelProfile } from '@magnitudedev/ai'
 const DEFAULT_TEST_PROFILE: ModelProfile = {
   contextWindow: 200_000,
   maxOutputTokens: 32_768,
-  capabilities: { vision: true },
+  capabilities: { vision: true, toolCalls: true, structuredOutput: true, grammar: true, toolChoiceModes: ['auto', 'none', 'required', 'named'] },
 }
 
 export function makeTestModelResolver(config: TestModelConfig = {}): Layer.Layer<AgentModelResolver> {

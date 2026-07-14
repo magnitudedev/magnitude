@@ -275,6 +275,7 @@ function observerTurnToMessages(entry: Extract<WindowEntry, { type: 'observer_tu
     const assistantMsg: AiMessage = {
       _tag: 'AssistantMessage',
       reasoning: Option.none(),
+      reasoningDetails: [],
       text: Option.none(),
       toolCalls: Option.some([{
         _tag: 'ToolCallPart',
@@ -299,6 +300,7 @@ function observerTurnToMessages(entry: Extract<WindowEntry, { type: 'observer_tu
   const assistantMsg: AiMessage = {
     _tag: 'AssistantMessage',
     reasoning: Option.none(),
+    reasoningDetails: [],
     text: Option.none(),
     toolCalls: Option.some([{
       _tag: 'ToolCallPart',

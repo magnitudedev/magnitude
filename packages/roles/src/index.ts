@@ -20,7 +20,7 @@ export type { PromptTemplate } from './prompt'
 export type { ModelProfile } from '@magnitudedev/ai'
 
 // Slot resolution
-export { resolveSlotModel } from './slot-resolution'
+export { resolveReasoningEffort, resolveSlotModel } from './slot-resolution'
 export type { UserSlotConfig, ResolvedSlotModel } from './slot-resolution'
 
 // Roles
