@@ -110,7 +110,6 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
     isBlockingOverlayActive: false,
     selectedFileOpen: false,
     onCloseFilePanel: () => {},
-    onInputHasTextChange: () => {},
     ...overrides,
   }
 }

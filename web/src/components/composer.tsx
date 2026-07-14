@@ -4,7 +4,7 @@
  * Textarea, submit/stop button, meta row, slash command menu,
  * file mention menu, attachment pills, bash mode.
  */
-import { useState, useRef, useCallback, type ReactNode } from "react"
+import { useState, useRef, useCallback, useMemo, type ReactNode } from "react"
 import {
   ArrowUp,
   Square,
@@ -15,7 +15,8 @@ import {
   Sparkles,
 } from "lucide-react"
 import { useSlashCommands, useFileMentions, type MentionFileItem, type SlashCommandDefinition, type MentionSearchClient, mentionAttachmentFromSegment } from "@magnitudedev/client-common"
-import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
+import { useAtomValue, useAtomSet, useAtomMount, Atom } from "@effect-atom/atom-react"
+import { Effect } from "effect"
 import { toGenericKeyEvent, isSendKey, isEscapeKey } from "../utils/keyboard"
 import {
   messageHistoryAtom,
@@ -74,6 +75,30 @@ export function Composer({
   const setHistoryIndex = useAtomSet(composerHistoryIndexAtom)
   const [savedDraft, setSavedDraft] = useState("")
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  // Track what the user last typed so we can distinguish external restore
+  // (queued input / rollback) from normal user input.
+  const lastUserTextRef = useRef("")
+
+  // Cursor/focus restore on external `composerTextAtom` changes (queued input
+  // restore, send-failure rollback). useAtomMount — the change originates from
+  // the server (display controller), not a user action.
+  const restoreFocusAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          // `text` is captured from useAtomValue; if it differs from what the
+          // user last typed, it's an external restore.
+          if (text && text !== lastUserTextRef.current && textareaRef.current) {
+            if (document.activeElement !== textareaRef.current) {
+              textareaRef.current.focus()
+              textareaRef.current.setSelectionRange(text.length, text.length)
+            }
+          }
+        }),
+      ),
+    [text],
+  )
+  useAtomMount(restoreFocusAtom)
 
   // Message history navigation (spec §14.4: ↑/↓ in composer)
   const messageHistory = useAtomValue(messageHistoryAtom)
@@ -85,6 +110,7 @@ export function Composer({
       onSlashCommand(cmdText)
     }
     setText("")
+    lastUserTextRef.current = ""
   })
 
   // File mentions
@@ -112,6 +138,7 @@ export function Composer({
       const replacement = `@${item.path}`
       const newText = text.slice(0, atIdx) + replacement + after
       setText(newText)
+      lastUserTextRef.current = newText
       // Add as attachment mention
       const attachment = mentionAttachmentFromSegment(item)
       setAttachments((prev) => [...prev, attachment])
@@ -134,6 +161,7 @@ export function Composer({
       onRunBash(trimmed)
       setText("")
       setAttachments([])
+      lastUserTextRef.current = ""
       return
     }
 
@@ -147,6 +175,9 @@ export function Composer({
     setSavedDraft("")
     setText("")
     setAttachments([])
+    // Keep lastUserTextRef in sync so the restore-focus Effect doesn't
+    // re-focus after submit clears text.
+    lastUserTextRef.current = ""
   }, [text, attachments, bashMode, onRunBash, onSend, setMessageHistory, setHistoryIndex, setText, setAttachments])
 
   const canSend = text.trim().length > 0 || attachments.length > 0
@@ -186,19 +217,33 @@ export function Composer({
             // Entering history mode — save current draft
             setSavedDraft(text)
             setHistoryIndex(0)
+            const entry = messageHistory[0]
+            if (entry !== undefined) {
+              setText(entry)
+              lastUserTextRef.current = entry
+              requestAnimationFrame(() => {
+                const ta = textareaRef.current
+                if (ta) {
+                  ta.setSelectionRange(entry.length, entry.length)
+                  resizeTextarea(ta)
+                }
+              })
+            }
           } else if (historyIndex < messageHistory.length - 1) {
-            setHistoryIndex(historyIndex + 1)
-          }
-          const entry = messageHistory[historyIndex === -1 ? 0 : historyIndex + 1]
-          if (entry !== undefined) {
-            setText(entry)
-            requestAnimationFrame(() => {
-              const ta = textareaRef.current
-              if (ta) {
-                ta.setSelectionRange(entry.length, entry.length)
-                resizeTextarea(ta)
-              }
-            })
+            const nextIndex = historyIndex + 1
+            setHistoryIndex(nextIndex)
+            const entry = messageHistory[nextIndex]
+            if (entry !== undefined) {
+              setText(entry)
+              lastUserTextRef.current = entry
+              requestAnimationFrame(() => {
+                const ta = textareaRef.current
+                if (ta) {
+                  ta.setSelectionRange(entry.length, entry.length)
+                  resizeTextarea(ta)
+                }
+              })
+            }
           }
           return
         }
@@ -218,6 +263,7 @@ export function Composer({
               const entry = messageHistory[nextIndex]
               if (entry !== undefined) {
                 setText(entry)
+                lastUserTextRef.current = entry
                 requestAnimationFrame(() => {
                   const ta = textareaRef.current
                   if (ta) {
@@ -231,6 +277,7 @@ export function Composer({
               setHistoryIndex(-1)
               setSavedDraft("")
               setText(savedDraft)
+              lastUserTextRef.current = savedDraft
               requestAnimationFrame(() => {
                 const ta = textareaRef.current
                 if (ta) {
@@ -266,6 +313,7 @@ export function Composer({
 
   const handleTextareaChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+      lastUserTextRef.current = e.target.value
       setText(e.target.value)
       setCursorPosition(e.target.selectionStart)
       resizeTextarea(e.target)

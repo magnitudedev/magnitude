@@ -4,7 +4,6 @@ import {
   selectedCwdAtom,
   pendingUserSubmitAtom,
   sessionActivationPromiseAtom,
-  restoredQueuedInputTextAtom,
   bashOutputsAtom,
 } from "../state/session-atoms"
 import { clearSystemMessages } from "../stores/system-message-store"
@@ -32,13 +31,11 @@ export function useSessionActions(): SessionActions {
   const setSelectedCwd = useAtomSet(selectedCwdAtom)
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
   const setSessionActivationPromise = useAtomSet(sessionActivationPromiseAtom)
-  const setRestoredQueuedInputText = useAtomSet(restoredQueuedInputTextAtom)
   const setBashOutputs = useAtomSet(bashOutputsAtom)
 
   const resetSessionLocalState = useCallback(() => {
     setPendingUserSubmit(false)
     setSessionActivationPromise(null)
-    setRestoredQueuedInputText(null)
     setBashOutputs([])
     displaySpeculator.clear()
     clearSystemMessages()
@@ -46,7 +43,6 @@ export function useSessionActions(): SessionActions {
     displaySpeculator,
     setPendingUserSubmit,
     setSessionActivationPromise,
-    setRestoredQueuedInputText,
     setBashOutputs,
   ])
 

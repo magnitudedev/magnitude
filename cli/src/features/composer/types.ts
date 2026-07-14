@@ -62,5 +62,4 @@ export type ComposerProps = {
   isBlockingOverlayActive: boolean
   selectedFileOpen: boolean
   onCloseFilePanel: () => void
-  onInputHasTextChange: (hasText: boolean) => void
 }

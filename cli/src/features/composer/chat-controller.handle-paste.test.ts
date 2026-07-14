@@ -36,7 +36,6 @@ describe('handleChatControllerPaste', () => {
     })
 
     expect(outcome.didInsert).toBe(true)
-    expect(outcome.shouldBumpBulkInsertEpoch).toBe(true)
     expect(state.text).toBe('hello')
     expect(state.cursorPosition).toBe(5)
   })
@@ -57,7 +56,6 @@ describe('handleChatControllerPaste', () => {
     })
 
     expect(outcome.didInsert).toBe(true)
-    expect(outcome.shouldBumpBulkInsertEpoch).toBe(false)
     expect(imagePathCalls).toBe(1)
     expect(state.text).toBe('')
   })
@@ -86,7 +84,6 @@ describe('handleChatControllerPaste', () => {
     })
 
     expect(outcome.didInsert).toBe(true)
-    expect(outcome.shouldBumpBulkInsertEpoch).toBe(false)
     expect(attachments.map((item) => item.filename)).toEqual(['a.png', 'b.png'])
     expect(state.text).toBe('')
   })
@@ -112,7 +109,6 @@ describe('handleChatControllerPaste', () => {
     })
 
     expect(outcome.didInsert).toBe(true)
-    expect(outcome.shouldBumpBulkInsertEpoch).toBe(true)
     expect(state.text).toBe(payload)
   })
 

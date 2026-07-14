@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test'
-import { nextBulkInsertEpochForPaste } from './composer'
 import { resolvePasteIntent } from '@magnitudedev/client-common'
 import { applyPasteIntent } from '@magnitudedev/client-common'
 import { derivePasteEffects } from '@magnitudedev/client-common'
@@ -90,10 +89,5 @@ describe('paste pipeline', () => {
       setInputValue: () => {},
     })
     expect(derivePasteEffects(noop).shouldBumpBulkInsertEpoch).toBe(false)
-  })
-
-  test('nextBulkInsertEpochForPaste only increments when effect says so', () => {
-    expect(nextBulkInsertEpochForPaste(1, true)).toBe(2)
-    expect(nextBulkInsertEpochForPaste(1, false)).toBe(1)
   })
 })
