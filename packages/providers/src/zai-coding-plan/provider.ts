@@ -29,7 +29,7 @@ export function createZaiCodingPlanProvider(
   const auth = config.auth ?? Auth.bearer(config.apiKey ?? "")
   const catalog = createZaiCodingPlanCatalog({ ...config, endpoint, auth })
   const classifyModelFamily: ZaiCodingPlanProvider["classifyModelFamily"] = (model) =>
-    classifyModelFamilyFromEvidence({}, [model.upstreamFamily, model.providerModelId, model.displayName])
+    classifyModelFamilyFromEvidence({}, [model.providerModelId, model.displayName, model.upstreamFamily])
 
   const bindModel = (
     providerModelId: string,

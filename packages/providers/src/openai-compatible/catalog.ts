@@ -51,6 +51,15 @@ function parseLiveModels(body: unknown): readonly OpenAiCompatibleRawModel[] | n
       ...(typeof entry.max_tokens === "number" ? { max_tokens: entry.max_tokens } : {}),
       ...(typeof entry.description === "string" ? { description: entry.description } : {}),
       ...(typeof entry.owned_by === "string" ? { owned_by: entry.owned_by } : {}),
+      ...(typeof entry.supports_reasoning === "boolean"
+        ? { supports_reasoning: entry.supports_reasoning }
+        : {}),
+      ...(typeof entry.supports_image_in === "boolean"
+        ? { supports_image_in: entry.supports_image_in }
+        : {}),
+      ...(typeof entry.supports_video_in === "boolean"
+        ? { supports_video_in: entry.supports_video_in }
+        : {}),
       ...(supportedParameters ? { supported_parameters: supportedParameters } : {}),
       ...(rawReasoning
         ? {
@@ -102,8 +111,8 @@ function reasoningEfforts(
       ? unique.filter((effort) => effort !== "none")
       : unique
   }
-  if (!metadata?.reasoning) return ["default"]
-  const options = metadata.reasoning_options ?? []
+  if (raw.supports_reasoning === false) return ["default"]
+  const options = metadata?.reasoning_options ?? []
   const values = options
     .filter((option) => option.type === "effort")
     .flatMap((option) => option.values ?? [])
@@ -111,7 +120,8 @@ function reasoningEfforts(
     .filter((value, index, all) => all.indexOf(value) === index)
   const hasToggle = options.some((option) => option.type === "toggle")
   if (values.length > 0) return hasToggle ? ["none", ...values] : values
-  return hasToggle ? ["none", "high"] : ["default"]
+  if (hasToggle || raw.supports_reasoning === true) return ["none", "high"]
+  return ["default"]
 }
 
 function enrichModel(
@@ -137,6 +147,16 @@ function enrichModel(
     ?? metadata?.limit.output
     ?? config.defaultMaxOutputTokens
     ?? Math.min(contextWindow, 32_768)
+  const providerInputModalities = [
+    "text",
+    ...(raw.supports_image_in ? ["image"] : []),
+    ...(raw.supports_video_in ? ["video"] : []),
+  ]
+  const hasProviderModalities = raw.supports_image_in !== undefined
+    || raw.supports_video_in !== undefined
+  const inputModalities = hasProviderModalities
+    ? [...new Set([...providerInputModalities, ...(metadata?.modalities.input ?? [])])]
+    : metadata?.modalities.input
 
   return {
     providerId: config.providerId,
@@ -146,7 +166,7 @@ function enrichModel(
     contextWindow,
     maxOutputTokens,
     capabilities: {
-      vision: metadata?.modalities.input.includes("image") ?? false,
+      vision: raw.supports_image_in ?? metadata?.modalities.input.includes("image") ?? false,
       toolCalls: metadata?.tool_call ?? true,
       structuredOutput: metadata?.structured_output ?? false,
       grammar: false,
@@ -166,7 +186,14 @@ function enrichModel(
       ? { description: raw.description ?? metadata?.description }
       : {}),
     ...(metadata?.family ? { upstreamFamily: metadata.family } : {}),
-    ...(metadata ? { modalities: metadata.modalities } : {}),
+    ...(inputModalities
+      ? {
+          modalities: {
+            input: inputModalities,
+            output: metadata?.modalities.output ?? ["text"],
+          },
+        }
+      : {}),
   }
 }
 

@@ -29,9 +29,9 @@ export function createDeepSeekProvider(
   const auth = config.auth ?? Auth.bearer(config.apiKey ?? "")
   const classifyModelFamily: DeepSeekProvider["classifyModelFamily"] = (model) =>
     classifyModelFamilyFromEvidence({}, [
-      model.upstreamFamily,
       model.providerModelId,
       model.displayName,
+      model.upstreamFamily,
     ])
   const catalog = createDeepSeekCatalog({ ...config, endpoint, auth })
 

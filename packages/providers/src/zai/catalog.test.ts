@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest"
 import { FetchHttpClient } from "@effect/platform"
 import { Effect } from "effect"
 import type { ModelsDevClient } from "../catalog/models-dev"
+import { createZaiCodingPlanCatalog } from "../zai-coding-plan/catalog"
 import { createZaiCatalog } from "./catalog"
 
 const servers: Bun.Server<unknown>[] = []
@@ -51,5 +52,32 @@ describe("Z.AI catalog", () => {
     const result = await Effect.runPromise(catalog.list.pipe(Effect.provide(FetchHttpClient.layer)))
 
     expect(result[0]?.reasoningEfforts).toEqual(["none", "high", "max"])
+  })
+
+  it("exposes GLM thinking controls for coding-plan models missing exact metadata", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ data: [{ id: "glm-4.6" }] }),
+    })
+    servers.push(server)
+
+    const provider = {
+      id: "zai-coding-plan",
+      name: "GLM Coding Plan",
+      models: {},
+    } as const
+    const modelsDev: ModelsDevClient = {
+      getProvider: () => Effect.succeed(provider),
+      refresh: Effect.succeed({ "zai-coding-plan": provider }),
+    }
+    const catalog = createZaiCodingPlanCatalog({
+      endpoint: server.url.toString().replace(/\/$/, ""),
+      auth: () => {},
+      modelsDev,
+    })
+
+    const result = await Effect.runPromise(catalog.list.pipe(Effect.provide(FetchHttpClient.layer)))
+
+    expect(result[0]?.reasoningEfforts).toEqual(["none", "high"])
   })
 })
