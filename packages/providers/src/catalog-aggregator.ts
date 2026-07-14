@@ -13,10 +13,20 @@ import {
 export function makeAggregatedCatalog(
   providers: readonly { readonly id: string; readonly catalog: ModelCatalog<any> }[],
 ): ModelCatalog<ProviderModel> {
+  const lastSuccessful = new Map<string, readonly ProviderModel[]>()
+
+  const retain = (providerId: string, models: readonly ProviderModel[]) => {
+    lastSuccessful.set(providerId, models)
+    return models
+  }
+
   const list: ModelCatalog<ProviderModel>["list"] = Effect.gen(function* () {
     const results = yield* Effect.all(
       providers.map((p) =>
-        p.catalog.list.pipe(Effect.catchAll(() => Effect.succeed([] as readonly any[]))),
+        p.catalog.list.pipe(
+          Effect.map((models) => retain(p.id, models as readonly ProviderModel[])),
+          Effect.catchAll(() => Effect.succeed(lastSuccessful.get(p.id) ?? [])),
+        ),
       ),
     )
     return results.flat() as readonly ProviderModel[]
@@ -32,7 +42,10 @@ export function makeAggregatedCatalog(
   const refresh: ModelCatalog<ProviderModel>["refresh"] = Effect.gen(function* () {
     const results = yield* Effect.all(
       providers.map((p) =>
-        p.catalog.refresh.pipe(Effect.catchAll(() => Effect.succeed([] as readonly any[]))),
+        p.catalog.refresh.pipe(
+          Effect.map((models) => retain(p.id, models as readonly ProviderModel[])),
+          Effect.catchAll(() => Effect.succeed(lastSuccessful.get(p.id) ?? [])),
+        ),
       ),
     )
     return results.flat() as readonly ProviderModel[]

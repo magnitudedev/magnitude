@@ -3,7 +3,7 @@
  * recent chats, settings, usage, and worker fork detail. Visibility is pure
  * atom state; each overlay's data comes from shared hooks or display state.
  */
-import { useMemo, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import {
   useDisplayState,
@@ -17,10 +17,9 @@ import {
   selectedCwdAtom,
   useTimelineStatus,
 } from '@magnitudedev/client-common'
-import { forkIdToKey, ROLE_TO_SLOT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
-import { showRecentChatsOverlayAtom, authSourceAtom } from '../../state/cli-atoms'
+import { forkIdToKey, ROLE_TO_SLOT, isRoleId, type SlotId } from '@magnitudedev/sdk'
+import { showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import type { ActionId } from '../../types/ui-actions'
-import { deriveSettingsAuthInfo, type AuthInfo } from './auth-display'
 import { SettingsOverlay } from './settings'
 import { UsageOverlay } from './usage'
 import { ForkDetailOverlay } from './fork-detail'
@@ -53,27 +52,10 @@ export function AppOverlaysContainer({
   const selectedCwd = useAtomValue(selectedCwdAtom)
   const expandedForkId = controller.topForkId
 
-  const { apiKey, saveApiKey, disconnectApiKey } = useSettingsState()
-  const authSource = useAtomValue(authSourceAtom)
+  const settings = useSettingsState()
   const { profiles } = useSlotProfiles()
   const modelConfig = useModelConfig()
   const { pushFork, popFork } = controller
-
-  const auth: AuthInfo = useMemo(() => deriveSettingsAuthInfo({
-    apiKey,
-    authSource,
-    save: saveApiKey,
-    clear: disconnectApiKey,
-  }), [apiKey, authSource, saveApiKey, disconnectApiKey])
-
-  const slots = useMemo(() => {
-    return SLOT_IDS.map((slotId) => ({
-      slotId,
-      label: SLOT_DISPLAY_NAMES[slotId],
-      description: SLOT_DESCRIPTIONS[slotId],
-      modelDisplayName: profiles?.[slotId]?.modelDisplayName ?? null,
-    }))
-  }, [profiles])
 
   const forkActor = useDisplayState((state) =>
     expandedForkId ? state.actors[forkIdToKey(expandedForkId)] ?? null : null
@@ -94,8 +76,9 @@ export function AppOverlaysContainer({
       <SettingsOverlay
         isVisible
         onClose={() => setSettingsOpen(false)}
-        auth={auth}
-        slots={slots}
+        providerAuths={settings.providerAuths}
+        onSaveProviderApiKey={settings.saveProviderApiKey}
+        onDisconnectProvider={settings.disconnectProvider}
         modelConfig={modelConfig}
       />
     )

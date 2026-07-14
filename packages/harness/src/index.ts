@@ -38,6 +38,7 @@ export type {
   ToolEmission,
   ThoughtStart,
   ThoughtDelta,
+  ReasoningDetails,
   ThoughtEnd,
   MessageStart,
   MessageDelta,

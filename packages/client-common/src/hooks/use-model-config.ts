@@ -18,8 +18,13 @@ export interface ModelOption {
   slots?: readonly string[]
   contextWindow: number
   maxOutputTokens: number
-  capabilities: { vision: boolean }
+  capabilities: ModelSummary["capabilities"]
   reasoningEfforts: readonly string[]
+  openWeightStatus?: ModelSummary["openWeightStatus"]
+  metadataSource?: ModelSummary["metadataSource"]
+  description?: string
+  upstreamFamily?: string
+  modalities?: ModelSummary["modalities"]
   pricing: { input: number; output: number; cachedInput?: number } | null
 }
 
@@ -41,7 +46,7 @@ export interface UseModelConfigResult {
   /** Reset all overrides to defaults */
   resetToDefaults: () => Promise<void>
   /** Refresh the cached model list from the provider */
-  refreshModels: () => Promise<void>
+  refreshModels: (providerId?: string) => Promise<void>
   /** Whether a mutation is in progress */
   updating: boolean
   /** Mutation error message */
@@ -61,8 +66,13 @@ function toModelOption(model: ModelSummary): ModelOption {
     ...(model.slots ? { slots: model.slots } : {}),
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
-    capabilities: { vision: model.capabilities.vision },
+    capabilities: model.capabilities,
     reasoningEfforts: model.reasoningEfforts,
+    ...(model.openWeightStatus ? { openWeightStatus: model.openWeightStatus } : {}),
+    ...(model.metadataSource ? { metadataSource: model.metadataSource } : {}),
+    ...(model.description ? { description: model.description } : {}),
+    ...(model.upstreamFamily ? { upstreamFamily: model.upstreamFamily } : {}),
+    ...(model.modalities ? { modalities: model.modalities } : {}),
     pricing: model.pricing ?? null,
   }
 }
@@ -127,20 +137,27 @@ export function useModelConfig(): UseModelConfigResult {
   const updateSlotModel = useMemo(
     () => async (slotId: SlotId, providerId: string | null, providerModelId: string | null): Promise<void> => {
       const current = configResponse?.slots[slotId] ?? {}
+      const selectedModel = data?.models.find((model) =>
+        model.providerId === providerId && model.providerModelId === providerModelId
+      )
+      const reasoningEffort = current.reasoningEffort
+        && selectedModel?.reasoningEfforts.includes(current.reasoningEffort)
+        ? current.reasoningEffort
+        : undefined
       await updateConfig({
         payload: {
           slots: {
             [slotId]: {
               providerId: providerId ?? undefined,
               providerModelId: providerModelId ?? undefined,
-              reasoningEffort: current.reasoningEffort,
+              reasoningEffort,
             },
           },
         },
         reactivityKeys: ["modelConfig"],
       })
     },
-    [updateConfig, configResponse],
+    [updateConfig, configResponse, data],
   )
 
   const updateSlotReasoning = useMemo(
@@ -175,13 +192,13 @@ export function useModelConfig(): UseModelConfigResult {
   )
 
   const refreshModels = useMemo(
-    () => async (): Promise<void> => {
+    () => async (providerId?: string): Promise<void> => {
       setRefreshingModels(true)
       setRefreshModelsError(null)
       try {
         await refreshMutation({
-          payload: {},
-          reactivityKeys: ["modelConfig"],
+          payload: providerId ? { providerId } : {},
+          reactivityKeys: ["modelConfig", "providerAuth"],
         })
       } catch (err) {
         setRefreshModelsError(err instanceof Error ? err.message : "Failed to refresh models")

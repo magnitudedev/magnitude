@@ -570,7 +570,7 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
       // those chunks become future prompt history.
       const completedTurn: CompletedTurn = {
         turnId: event.turnId,
-        assistant: shouldCommitAssistantContent ? canonicalState.assistantMessage : { _tag: 'AssistantMessage', reasoning: Option.none(), text: Option.none(), toolCalls: Option.none() },
+        assistant: shouldCommitAssistantContent ? canonicalState.assistantMessage : { _tag: 'AssistantMessage', reasoning: Option.none(), reasoningDetails: [], text: Option.none(), toolCalls: Option.none() },
         toolResults: shouldCommitAssistantContent ? [...canonicalState.toolResults] : [],
         feedback,
         clean: outcome._tag === 'Completed',

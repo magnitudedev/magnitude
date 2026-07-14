@@ -10,6 +10,7 @@ export {
   isRoleId,
   ROLE_TO_SLOT,
   DEFAULT_REASONING_EFFORT,
+  resolveReasoningEffort,
   SLOT_IDS,
   SLOT_DISPLAY_NAMES,
   SLOT_DESCRIPTIONS,

@@ -36,7 +36,7 @@ const { ForkContext } = Fork
 const profile: ModelProfile = {
   contextWindow: 100_000,
   maxOutputTokens: 4096,
-  capabilities: { vision: true },
+  capabilities: { vision: true, toolCalls: true, structuredOutput: true, grammar: true, toolChoiceModes: ['auto', 'none', 'required', 'named'] },
 }
 
 const testModelSpec: ModelSpec<BaseCallOptions> = {
@@ -142,6 +142,7 @@ function makeWindowFixture(): ForkWindowState {
         assistant: {
           _tag: 'AssistantMessage',
           reasoning: Option.none(),
+          reasoningDetails: [],
           text: Option.some('I am wiring the tool.'),
           toolCalls: Option.some([
             {
@@ -188,6 +189,7 @@ function makeWindowFixture(): ForkWindowState {
         assistant: {
           _tag: 'AssistantMessage',
           reasoning: Option.none(),
+          reasoningDetails: [],
           text: Option.none(),
           toolCalls: Option.some([{
             _tag: 'ToolCallPart',
@@ -337,8 +339,8 @@ describe('message_advisor execution', () => {
 describe('messageAdvisor toolkit registration', () => {
   it('keeps static advisor registration but removes it from effective toolkits while disabled', () => {
     const catalogModels: readonly MagnitudeModelInfo[] = [
-      { providerModelId: 'primary-model', providerId: 'magnitude', modelFamilyId: 'unknown', reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
-      { providerModelId: 'secondary-model', providerId: 'magnitude', modelFamilyId: 'unknown', reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+      { providerModelId: 'primary-model', providerId: 'magnitude', modelFamilyId: 'unknown', reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true, toolCalls: true, structuredOutput: true, grammar: true, toolChoiceModes: ['auto', 'none', 'required', 'named'] }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+      { providerModelId: 'secondary-model', providerId: 'magnitude', modelFamilyId: 'unknown', reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true, toolCalls: true, structuredOutput: true, grammar: true, toolChoiceModes: ['auto', 'none', 'required', 'named'] }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
     ]
     const config = buildConfigState(catalogModels, null, {
       softCapRatio: 0.9,

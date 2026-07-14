@@ -46,6 +46,7 @@ export type StreamEnd = {
 export type ResponseStreamEvent =
   | { readonly _tag: "thought_start"; readonly level: "low" | "medium" | "high" }
   | { readonly _tag: "thought_delta"; readonly text: string }
+  | { readonly _tag: "reasoning_details"; readonly details: readonly JsonValue[] }
   | { readonly _tag: "thought_end" }
   | { readonly _tag: "message_start" }
   | { readonly _tag: "message_delta"; readonly text: string }

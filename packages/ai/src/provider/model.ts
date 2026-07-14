@@ -17,6 +17,19 @@ export interface ModelPricingInfo {
   readonly cached_input: number | null
 }
 
+export type ModelOpenWeightStatus = "open" | "closed" | "unknown"
+
+export type ModelMetadataSource =
+  | "provider"
+  | "models.dev"
+  | "official_fallback"
+  | "local_metadata"
+
+export interface ModelModalities {
+  readonly input: readonly string[]
+  readonly output: readonly string[]
+}
+
 /**
  * Intrinsic model family capabilities — determined by the model architecture,
  * not by the provider serving it.
@@ -73,11 +86,21 @@ export interface ProviderModel {
   readonly pricing: ModelPricingInfo
   /**
    * Reasoning effort options available on this provider for this model.
-   * Always has at least one entry (e.g. ["none"] for non-reasoning models).
+   * Always has at least one entry (e.g. ["default"] when the provider exposes no control).
    * Read from the provider at catalog time. Plain strings — the UI
    * capitalizes them for display.
    */
   readonly reasoningEfforts: readonly string[]
+  /** Whether trained weights are publicly available. */
+  readonly openWeightStatus?: ModelOpenWeightStatus
+  /** Source used for catalog enrichment. */
+  readonly metadataSource?: ModelMetadataSource
+  /** Provider/catalog description, when available. */
+  readonly description?: string
+  /** Upstream family label used as evidence by the shared classifier. */
+  readonly upstreamFamily?: string
+  /** Input/output modalities as served by this provider. */
+  readonly modalities?: ModelModalities
 }
 
 /** Re-exported for convenience. */

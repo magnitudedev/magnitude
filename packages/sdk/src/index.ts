@@ -103,7 +103,7 @@ export type {
 } from "@magnitudedev/protocol"
 export type * from "@magnitudedev/protocol"
 
-export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS } from "@magnitudedev/roles"
+export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT, resolveReasoningEffort, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS } from "@magnitudedev/roles"
 export type { RoleId, SlotId } from "@magnitudedev/roles"
 
 export { resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
@@ -134,6 +134,7 @@ export {
   createProviderClient,
   type ProviderClientShape,
   type ProviderClientConfig,
+  type ProviderConnectionConfig,
   type ProviderRegistryInfo,
   type ProviderRuntimeConfig,
   type ProviderRejection,
@@ -153,6 +154,9 @@ export {
   makeFileBackedModelCatalog,
   createMagnitudeCompatibleSpec,
   DEFAULT_LLAMACPP_ENDPOINT,
+  SUPPORTED_PROVIDER_DEFINITIONS,
+  type SupportedProviderDefinition,
+  type ProviderAuthKind,
   classifyMagnitudeRejectedResponse,
   tryParseErrorBody,
   type ParsedMagnitudeApiError,

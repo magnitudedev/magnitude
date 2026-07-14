@@ -44,7 +44,7 @@ export const AgentModelResolverLive = (debug?: boolean) =>
             maxTokens: options.maxTokensOverride ?? slotConfig.profile.maxOutputTokens,
             reasoningEffort: slotConfig.reasoningEffort,
           }
-          const capabilities = { vision: slotConfig.profile.capabilities.vision }
+          const capabilities = slotConfig.profile.capabilities
 
           const rawModel = yield* client.resolveModel(slotConfig.providerId, slotConfig.providerModelId, {
             defaults,

@@ -3,7 +3,9 @@ import {
   TraceListener,
   type BoundModel,
   type BaseCallOptions,
+  type ProviderModelCapabilities,
   type ToolCallId,
+  type ToolChoice,
   type ToolDefinition,
 } from '@magnitudedev/ai'
 import type { ModelProfile } from '@magnitudedev/ai'
@@ -91,6 +93,37 @@ type ToolChoiceMode = "auto" | "required"
 
 type CallOptionsWithToolIds = BaseCallOptions & {
   readonly generateToolCallId?: () => ToolCallId
+}
+
+function normalizeToolChoice(
+  toolChoice: ToolChoice | undefined,
+  capabilities: ProviderModelCapabilities,
+): ToolChoice | undefined {
+  if (toolChoice === undefined) return undefined
+
+  const modes = capabilities.toolChoiceModes
+  if (modes === undefined) return toolChoice
+
+  const fallbackMode = (): "auto" | "none" | "required" => {
+    if (modes.includes("auto")) return "auto"
+    if (modes.includes("required")) return "required"
+    return "none"
+  }
+
+  if (typeof toolChoice === "string") {
+    return modes.includes(toolChoice) ? toolChoice : fallbackMode()
+  }
+  if (toolChoice.type === "grammar") return capabilities.grammar ? toolChoice : fallbackMode()
+  if (capabilities.grammar) return toolChoice
+  if (toolChoice.type === "function") {
+    return modes.includes("named") ? toolChoice : fallbackMode()
+  }
+
+  const allowed = toolChoice.allowed_tools
+  if (allowed.tools.length === 1 && modes.includes("named")) {
+    return { type: "function", function: { name: allowed.tools[0].function.name } }
+  }
+  return modes.includes(allowed.mode) ? allowed.mode : fallbackMode()
 }
 
 /**
@@ -213,14 +246,26 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
     stream: (prompt, tools, options) =>
       Effect.gen(function* () {
         const callOptions = options as CallOptionsWithToolIds | undefined
+        const normalizedToolChoice = normalizeToolChoice(
+          callOptions?.toolChoice,
+          config.profile.capabilities,
+        )
+        const normalizedOptions = callOptions === undefined
+          ? undefined
+          : {
+              ...callOptions,
+              ...(normalizedToolChoice !== undefined ? { toolChoice: normalizedToolChoice } : {}),
+            }
         const grammarChoice = computeMaxToolCallsGrammar(
           tools,
-          callOptions?.toolChoice !== undefined ? Option.some(callOptions.toolChoice) : Option.none(),
-          config.maxToolCalls !== undefined ? Option.some(config.maxToolCalls) : Option.none(),
+          normalizedToolChoice !== undefined ? Option.some(normalizedToolChoice) : Option.none(),
+          config.profile.capabilities.grammar && config.maxToolCalls !== undefined
+              ? Option.some(config.maxToolCalls)
+              : Option.none(),
         )
         const effectiveOptions = Option.match(grammarChoice, {
-          onSome: (gc) => ({ ...callOptions, toolChoice: gc }),
-          onNone: () => callOptions,
+          onSome: (gc) => ({ ...normalizedOptions, toolChoice: gc }),
+          onNone: () => normalizedOptions,
         })
         const streamEffect = config.rawModel.stream(prompt, tools, effectiveOptions)
 

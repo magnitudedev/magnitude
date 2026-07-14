@@ -36,7 +36,7 @@ import { WindowProjection } from '../src/window'
 const profile: ModelProfile = {
   contextWindow: 100_000,
   maxOutputTokens: 4096,
-  capabilities: { vision: true },
+  capabilities: { vision: true, toolCalls: true, structuredOutput: true, grammar: true, toolChoiceModes: ['auto', 'none', 'required', 'named'] },
 }
 
 const testModelSpec: ModelSpec<BaseCallOptions> = {

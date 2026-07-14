@@ -67,7 +67,7 @@ describe("normalizeVision", () => {
   })
 
   it("leaves AssistantMessage unchanged", () => {
-    const assistant: AssistantMessage = { _tag: "AssistantMessage", reasoning: Option.none(), text: Option.some("hello"), toolCalls: Option.none() }
+    const assistant: AssistantMessage = { _tag: "AssistantMessage", reasoning: Option.none(), reasoningDetails: [], text: Option.some("hello"), toolCalls: Option.none() }
     const prompt = basePrompt([
       { _tag: "UserMessage", parts: [text("hi")] } as UserMessage,
       assistant,

@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import type { JsonSchemaObject } from "@magnitudedev/utils/schema"
+import { JsonValueSchema, type JsonSchemaObject, type JsonValue } from "@magnitudedev/utils/schema"
 
 export type ChatMessageRole = "system" | "user" | "assistant" | "tool"
 
@@ -39,6 +39,8 @@ export type ChatMessage =
       readonly role: "assistant"
       readonly content: string | null
       readonly reasoning_content?: string | null
+      readonly reasoning?: string | null
+      readonly reasoning_details?: readonly JsonValue[]
       readonly tool_calls?: readonly ChatToolCall[]
     }
   | {
@@ -117,6 +119,8 @@ const ChatChunkDelta = Schema.Struct({
   role: Schema.optional(Schema.NullOr(Schema.String)),
   content: Schema.optional(Schema.NullOr(Schema.String)),
   reasoning_content: Schema.optional(Schema.NullOr(Schema.String)),
+  reasoning: Schema.optional(Schema.NullOr(Schema.String)),
+  reasoning_details: Schema.optional(Schema.NullOr(Schema.Array(JsonValueSchema))),
   tool_calls: Schema.optional(Schema.NullOr(Schema.Array(ChatToolCallDelta))),
 })
 

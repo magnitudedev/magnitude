@@ -327,6 +327,9 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
         return emit({ _tag: "ThoughtDelta", text: event.text })
       }
 
+      case "reasoning_details":
+        return emit({ _tag: "ReasoningDetails", details: event.details })
+
       case "thought_end":
         return emit({ _tag: "ThoughtEnd" })
 

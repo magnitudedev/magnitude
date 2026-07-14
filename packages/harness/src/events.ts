@@ -224,6 +224,11 @@ export interface ThoughtDelta {
   readonly text: string
 }
 
+export interface ReasoningDetails {
+  readonly _tag: "ReasoningDetails"
+  readonly details: readonly JsonValue[]
+}
+
 export interface ThoughtEnd {
   readonly _tag: "ThoughtEnd"
 }
@@ -290,6 +295,7 @@ export type ToolLifecycleEvent<TInput = never, TOutput = never, TEmission = neve
 type HarnessEventErased =
   | ThoughtStart
   | ThoughtDelta
+  | ReasoningDetails
   | ThoughtEnd
   | MessageStart
   | MessageDelta
@@ -300,6 +306,7 @@ type HarnessEventErased =
 type HarnessEventConcrete<TInput, TOutput, TEmission, TError extends ToolError> =
   | ThoughtStart
   | ThoughtDelta
+  | ReasoningDetails
   | ThoughtEnd
   | MessageStart
   | MessageDelta

@@ -7,7 +7,17 @@ import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
   createMagnitudeProvider,
   createLlamaCppProvider,
+  createDeepSeekProvider,
+  createKimiApiProvider,
+  createKimiForCodingProvider,
+  createOpenRouterProvider,
+  createVercelProvider,
+  createZaiProvider,
+  createZaiCodingPlanProvider,
+  createModelsDevClient,
+  SUPPORTED_PROVIDER_DEFINITIONS,
   makeProviderRegistry,
+  type ConfiguredProviderInstance,
   type MagnitudeProviderInstance,
   type LlamaCppProviderInstance,
   type MagnitudeClientConfig,
@@ -30,8 +40,13 @@ export type ProviderClientError = MagnitudeClientError
 export type ProviderRegistryInfo = RegistryProviderInfo
 
 export interface ProviderClientConfig extends MagnitudeClientConfig {
-  readonly llamacppEndpoint?: string
-  readonly llamacppApiKey?: string
+  readonly providerConnections?: Readonly<Record<string, ProviderConnectionConfig>>
+}
+
+export interface ProviderConnectionConfig {
+  readonly apiKey?: string
+  readonly endpoint?: string
+  readonly authSource?: "env" | "file" | "default" | "none"
 }
 
 export type {
@@ -53,6 +68,11 @@ export {
   classifyMagnitudeRejectedResponse,
   tryParseErrorBody,
   type ParsedMagnitudeApiError,
+} from "@magnitudedev/providers"
+export {
+  SUPPORTED_PROVIDER_DEFINITIONS,
+  type SupportedProviderDefinition,
+  type ProviderAuthKind,
 } from "@magnitudedev/providers"
 export { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 export {
@@ -113,15 +133,68 @@ export class ProviderClient extends Context.Tag("ProviderClient")<
 export function createProviderClient(config?: ProviderClientConfig): ProviderClientShape {
   const magnitudeInstance: MagnitudeProviderInstance = createMagnitudeProvider(config)
   const sessionId = config?.sessionId ?? null
+  const connections = config?.providerConnections ?? {}
+  const modelsDev = createModelsDevClient()
 
   const llamacppInstance: LlamaCppProviderInstance = createLlamaCppProvider({
-    endpoint: config?.llamacppEndpoint,
-    apiKey: config?.llamacppApiKey,
+    endpoint: connections.llamacpp?.endpoint,
+    apiKey: connections.llamacpp?.apiKey,
+  })
+
+  const configuredProviders: ConfiguredProviderInstance[] = []
+  const addCloudProvider = (
+    providerId: string,
+    create: (connection: ProviderConnectionConfig) => { readonly provider: ConfiguredProviderInstance["provider"] },
+  ) => {
+    const connection = connections[providerId]
+    if (!connection?.apiKey?.trim()) return
+    const instance = create(connection)
+    configuredProviders.push({
+      provider: instance.provider,
+      authStatus: { _tag: "authenticated" },
+      authKind: "api",
+      authSource: connection.authSource ?? "file",
+    })
+  }
+
+  addCloudProvider("deepseek", (connection) => createDeepSeekProvider({ ...connection, modelsDev }))
+  addCloudProvider("kimi-api", (connection) => createKimiApiProvider({ ...connection, modelsDev }))
+  addCloudProvider("kimi-for-coding", (connection) => createKimiForCodingProvider(connection))
+  addCloudProvider("zai", (connection) => createZaiProvider({ ...connection, modelsDev }))
+  addCloudProvider("zai-coding-plan", (connection) => createZaiCodingPlanProvider({ ...connection, modelsDev }))
+  addCloudProvider("openrouter", (connection) => createOpenRouterProvider({ ...connection, modelsDev }))
+  addCloudProvider("vercel", (connection) => createVercelProvider({ ...connection, modelsDev }))
+
+  const magnitudeConfigured = Boolean(config?.apiKey?.trim() || config?.auth)
+  const providerDefinitions = SUPPORTED_PROVIDER_DEFINITIONS.map((definition) => {
+    const connection = connections[definition.id]
+    const configured = definition.id === "magnitude"
+      ? magnitudeConfigured
+      : definition.id === "llamacpp"
+        ? true
+        : Boolean(connection?.apiKey?.trim())
+    return {
+      id: definition.id,
+      displayName: definition.displayName,
+      authStatus: definition.id === "llamacpp"
+        ? { _tag: "no_auth_required" as const }
+        : configured
+          ? { _tag: "authenticated" as const }
+          : { _tag: "not_configured" as const, reason: "API key is not configured" },
+      authKind: definition.authKind,
+      authSource: definition.id === "llamacpp"
+        ? connections.llamacpp?.authSource ?? "default"
+        : definition.id === "magnitude"
+          ? connections.magnitude?.authSource ?? (magnitudeConfigured ? "file" as const : "none" as const)
+          : connection?.authSource ?? "none",
+    }
   })
 
   const registry = makeProviderRegistry({
-    magnitude: magnitudeInstance,
+    magnitude: magnitudeConfigured ? magnitudeInstance : null,
+    configuredProviders,
     discoverableProviders: [llamacppInstance],
+    providerDefinitions,
   })
 
   return {

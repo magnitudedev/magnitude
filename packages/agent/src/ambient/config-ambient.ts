@@ -18,7 +18,13 @@ import {
   type MagnitudeStorageShape,
   type ModelConfig,
 } from '@magnitudedev/storage'
-import { ROLE_TO_SLOT, SLOT_IDS, DEFAULT_REASONING_EFFORT, type RoleId } from '@magnitudedev/roles'
+import {
+  ROLE_TO_SLOT,
+  SLOT_IDS,
+  DEFAULT_REASONING_EFFORT,
+  resolveReasoningEffort,
+  type RoleId,
+} from '@magnitudedev/roles'
 
 import { OUTPUT_TOKEN_RESERVE } from '../constants'
 
@@ -70,8 +76,11 @@ export function buildConfigState<T extends ProviderModel & { readonly slots?: re
       throw new NoModelForSlotError(slotId)
     }
 
-    const reasoningEffort = userSlotConfig?.reasoningEffort
-      ?? DEFAULT_REASONING_EFFORT[slotId]
+    const reasoningEffort = resolveReasoningEffort(
+      { reasoningEfforts: resolved.reasoningEfforts },
+      userSlotConfig?.reasoningEffort,
+      DEFAULT_REASONING_EFFORT[slotId],
+    )
 
     const hardCap = resolved.profile.contextWindow - OUTPUT_TOKEN_RESERVE
     const { softCap } = computeContextLimits(hardCap, policy)

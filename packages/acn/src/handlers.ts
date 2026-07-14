@@ -279,6 +279,24 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           account.listProviderAuth.pipe(Effect.map((auths) => ({ auths })))
         ),
 
+      RemoveProviderAuth: ({ providerId }) =>
+        observeRpcDefects(
+          "RemoveProviderAuth",
+          account.removeProviderAuth(providerId).pipe(Effect.as({}))
+        ),
+
+      GetProviderAuthSummary: ({ providerId }) =>
+        observeRpcDefects(
+          "GetProviderAuthSummary",
+          account.getProviderAuthSummary(providerId)
+        ),
+
+      ListProviderAuthSummaries: () =>
+        observeRpcDefects(
+          "ListProviderAuthSummaries",
+          account.listProviderAuthSummaries.pipe(Effect.map((auths) => ({ auths })))
+        ),
+
       ListPublicSlotProfiles: () =>
         observeRpcDefects(
           "ListPublicSlotProfiles",
