@@ -24,6 +24,7 @@ export {
   MODEL_FAMILIES,
   getModelFamily,
   classifyModelFamily,
+  classifyModelFamilyFromEvidence,
   FAMILY_DEFINITIONS,
 } from "./family-registry"
 
@@ -31,6 +32,7 @@ export {
 export {
   ProviderRegistry,
   type ProviderRegistryService,
+  type DiscoverableProviderInstance,
   type ProviderInfo,
   type AuthStatus,
   makeProviderRegistry,
@@ -51,6 +53,7 @@ export {
   createLlamaCppCatalog,
   createLlamaCppCompatibleSpec,
   classifyLlamaCppRejectedResponse,
+  DEFAULT_LLAMACPP_ENDPOINT,
   PROVIDER_ID as LLAMACPP_PROVIDER_ID,
 } from "./llamacpp"
 export {

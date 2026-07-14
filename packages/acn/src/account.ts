@@ -10,9 +10,9 @@ import {
 } from "@magnitudedev/sdk"
 import { isEnvFlagOn } from "@magnitudedev/utils"
 import {
-  SharedMagnitudeClientRef,
-  makeClientWithAuth,
-  resolveLlamaCppAuthFromStorage,
+  SharedProviderClientRef,
+  makeSharedProviderClient,
+  resolveLlamaCppAuth,
 } from "./shared-client"
 import {
   MagnitudeStorage,
@@ -166,14 +166,14 @@ function slotProfilesFromModels(
 // Layer
 // =============================================================================
 
-export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | SharedMagnitudeClientRef | GlobalStorage> =
+export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | SharedProviderClientRef | GlobalStorage> =
   Layer.effect(
     Account,
     Effect.gen(function* () {
       const store = yield* SessionStore
       const sharedClient = yield* ProviderClient
       const storage = yield* MagnitudeStorage
-      const clientRef = yield* SharedMagnitudeClientRef
+      const clientRef = yield* SharedProviderClientRef
       const globalStorage = yield* GlobalStorage
 
       // Semaphore to serialize config writes (§5.9)
@@ -204,6 +204,27 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           return sharedClient
         })
 
+      const refreshModels = (operation: string) =>
+        sharedClient.catalog.refresh.pipe(
+          Effect.provide(FetchHttpClient.layer),
+          Effect.mapError(toAccountError(operation)),
+        )
+
+      const reconcileDiscoverableProviderModels = (
+        models: readonly ProviderModel[],
+        providers: readonly ProviderRegistryInfo[],
+        operation: string,
+      ) => {
+        const modelProviderIds = new Set(models.map((model) => model.providerId))
+        const hasMismatch = providers.some((provider) =>
+          provider.status !== undefined
+          && modelProviderIds.has(provider.id) !== (provider.status === "ok")
+        )
+        return !hasMismatch
+          ? Effect.succeed(models)
+          : refreshModels(operation)
+      }
+
       return {
         updateProviderAuth: (providerId, auth) =>
           Effect.gen(function* () {
@@ -215,8 +236,8 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
               || (providerId === "llamacpp" && auth.type === "endpoint")
             ) {
               const apiKey = yield* resolveApiKey
-              const llamacpp = yield* resolveLlamaCppAuthFromStorage(storage)
-              const newClient = yield* makeClientWithAuth(apiKey, llamacpp).pipe(
+              const llamacpp = yield* resolveLlamaCppAuth(storage)
+              const newClient = yield* makeSharedProviderClient(apiKey, llamacpp).pipe(
                 Effect.provideService(GlobalStorage, globalStorage),
               )
               yield* Ref.set(clientRef, newClient)
@@ -256,22 +277,24 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
 
         getCachedModelList: (providerId?: string) =>
           Effect.gen(function* () {
-            const models = yield* sharedClient.catalog.list.pipe(
+            const cachedModels = yield* sharedClient.catalog.list.pipe(
               Effect.provide(FetchHttpClient.layer),
               Effect.mapError(toAccountError("get cached model list")),
             )
             const providers = yield* sharedClient.listProviders.pipe(
               Effect.provide(FetchHttpClient.layer),
             )
+            const models = yield* reconcileDiscoverableProviderModels(
+              cachedModels,
+              providers,
+              "reconcile discoverable provider model cache",
+            )
             return yield* buildModelList(models, providers, storage, "get cached model list")
           }),
 
         refreshCachedModelList: (providerId?: string) =>
           Effect.gen(function* () {
-            const models = yield* sharedClient.catalog.refresh.pipe(
-              Effect.provide(FetchHttpClient.layer),
-              Effect.mapError(toAccountError("refresh cached model list")),
-            )
+            const models = yield* refreshModels("refresh cached model list")
             const providers = yield* sharedClient.listProviders.pipe(
               Effect.provide(FetchHttpClient.layer),
             )

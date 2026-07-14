@@ -152,6 +152,7 @@ export {
   type UsagePeriod,
   makeFileBackedModelCatalog,
   createMagnitudeCompatibleSpec,
+  DEFAULT_LLAMACPP_ENDPOINT,
   classifyMagnitudeRejectedResponse,
   tryParseErrorBody,
   type ParsedMagnitudeApiError,

@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Ref } from "effect"
 import {
   ProviderClient,
+  DEFAULT_LLAMACPP_ENDPOINT,
   createProviderClient,
   type ProviderClientShape,
 } from "@magnitudedev/sdk"
@@ -12,7 +13,7 @@ import { FetchHttpClient } from "@effect/platform"
  * Resolve the API key from environment + storage. Returns `null` when no key is
  * configured.
  */
-const resolveApiKeyFromStorage = (
+const resolveMagnitudeApiKeyFromStorage = (
   storage: MagnitudeStorageShape,
 ): Effect.Effect<string | null, never, never> =>
   Effect.gen(function* () {
@@ -27,26 +28,50 @@ const resolveApiKeyFromStorage = (
     return null
   })
 
-export interface LlamaCppAuthConfig {
+export interface EndpointProviderAuthConfig {
   readonly endpoint: string
   readonly apiKey?: string
 }
 
-export const resolveLlamaCppAuthFromStorage = (
+/** Resolve endpoint auth and seed a missing entry with the provider default. */
+export const resolveEndpointProviderAuthFromStorage = (
   storage: MagnitudeStorageShape,
-): Effect.Effect<LlamaCppAuthConfig | null, never, never> =>
+  providerId: string,
+  defaultConfig?: EndpointProviderAuthConfig,
+): Effect.Effect<EndpointProviderAuthConfig | null, never, never> =>
   Effect.gen(function* () {
-    const auth = yield* storage.auth.get("llamacpp").pipe(
-      Effect.catchAll(() => Effect.succeed(null)),
+    const read = yield* storage.auth.get(providerId).pipe(
+      Effect.map((auth) => ({ _tag: "success" as const, auth })),
+      Effect.catchAll(() => Effect.succeed({ _tag: "error" as const })),
     )
-    if (auth?.type !== "endpoint") return null
-
-    const endpoint = auth.endpoint.trim()
-    if (!endpoint) return null
-    return {
-      endpoint,
-      ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+    if (read._tag === "success" && read.auth?.type === "endpoint") {
+      const endpoint = read.auth.endpoint.trim()
+      if (endpoint) {
+        return {
+          endpoint,
+          ...(read.auth.apiKey ? { apiKey: read.auth.apiKey } : {}),
+        }
+      }
     }
+
+    if (read._tag === "success" && read.auth === undefined && defaultConfig) {
+      yield* storage.auth.set(providerId, {
+        type: "endpoint",
+        endpoint: defaultConfig.endpoint,
+        ...(defaultConfig.apiKey ? { apiKey: defaultConfig.apiKey } : {}),
+      }).pipe(
+        Effect.catchAll(() => Effect.logWarning("Failed to persist default provider endpoint").pipe(
+          Effect.annotateLogs({ providerId }),
+        )),
+      )
+    }
+
+    return defaultConfig ?? null
+  })
+
+export const resolveLlamaCppAuth = (storage: MagnitudeStorageShape) =>
+  resolveEndpointProviderAuthFromStorage(storage, "llamacpp", {
+    endpoint: DEFAULT_LLAMACPP_ENDPOINT,
   })
 
 /**
@@ -54,14 +79,14 @@ export const resolveLlamaCppAuthFromStorage = (
  * auth and the global model cache path. The catalog is intentionally refreshed
  * so the file cache is populated with every currently available provider.
  */
-export const makeClientWithAuth = (
-  apiKey: string | null,
-  llamacpp: LlamaCppAuthConfig | null,
+export const makeSharedProviderClient = (
+  magnitudeApiKey: string | null,
+  llamacpp: EndpointProviderAuthConfig | null,
 ): Effect.Effect<ProviderClientShape, never, GlobalStorage> =>
   Effect.gen(function* () {
     const globalStorage = yield* GlobalStorage
     const client = createProviderClient({
-      ...(apiKey ? { apiKey } : {}),
+      ...(magnitudeApiKey ? { apiKey: magnitudeApiKey } : {}),
       ...(llamacpp
         ? {
             llamacppEndpoint: llamacpp.endpoint,
@@ -84,18 +109,18 @@ export const makeClientWithAuth = (
  * runtime — specifically after `UpdateProviderAuth` — while the `ProviderClient`
  * service remains in context.
  */
-export class SharedMagnitudeClientRef extends Context.Tag("SharedMagnitudeClientRef")<
-  SharedMagnitudeClientRef,
+export class SharedProviderClientRef extends Context.Tag("SharedProviderClientRef")<
+  SharedProviderClientRef,
   Ref.Ref<ProviderClientShape>
 >() {}
 
-export const SharedMagnitudeClientRefLive = Layer.effect(
-  SharedMagnitudeClientRef,
+export const SharedProviderClientRefLive = Layer.effect(
+  SharedProviderClientRef,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
-    const apiKey = yield* resolveApiKeyFromStorage(storage)
-    const llamacpp = yield* resolveLlamaCppAuthFromStorage(storage)
-    const client = yield* makeClientWithAuth(apiKey, llamacpp)
+    const apiKey = yield* resolveMagnitudeApiKeyFromStorage(storage)
+    const llamacpp = yield* resolveLlamaCppAuth(storage)
+    const client = yield* makeSharedProviderClient(apiKey, llamacpp)
     return yield* Ref.make<ProviderClientShape>(client)
   }),
 )
@@ -150,13 +175,13 @@ const wrapClientRef = (
 
 /**
  * A single shared `ProviderClient` at the ACN daemon level. The underlying
- * client is held in `SharedMagnitudeClientRef` and can be recreated on auth
+ * client is held in `SharedProviderClientRef` and can be recreated on auth
  * change so subsequent calls use the new auth and refreshed model cache.
  */
-export const SharedMagnitudeClientLive = Layer.effect(
+export const SharedProviderClientLive = Layer.effect(
   ProviderClient,
   Effect.gen(function* () {
-    const ref = yield* SharedMagnitudeClientRef
+    const ref = yield* SharedProviderClientRef
     const initial = yield* ref.get
     return wrapClientRef(ref, initial.runtimeConfig)
   }),

@@ -345,4 +345,23 @@ export function modelFamilyMetadataConflicts(
   )
 }
 
+/** Resolve structured metadata first, then use non-conflicting name evidence. */
+export function classifyModelFamilyFromEvidence(
+  metadata: ModelFamilyMetadata,
+  candidates: readonly (string | undefined)[],
+): Option.Option<string> {
+  const structuredFamily = classifyModelFamilyFromMetadata(metadata)
+  if (Option.isSome(structuredFamily)) return structuredFamily
+
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    const family = classifyModelFamily(candidate)
+    if (
+      Option.isSome(family)
+      && !modelFamilyMetadataConflicts(family.value, metadata)
+    ) return family
+  }
+  return Option.none()
+}
+
 export { FAMILY_DEFINITIONS }

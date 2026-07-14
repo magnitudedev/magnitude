@@ -171,9 +171,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     closeDropdown()
   }, [dropdownTarget, dropdownItems, modelConfig, closeDropdown])
 
-  const llamacppStatus = modelConfig?.providers?.find((provider) =>
-    provider.id === 'llamacpp' && provider.status && provider.status !== 'ok'
-  ) ?? null
+  const unavailableProviders = modelConfig?.providers?.filter((provider) =>
+    provider.status && provider.status !== 'ok'
+  ) ?? []
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (!isVisible) return
@@ -332,21 +332,17 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
       {/* Slot cards with inline dropdowns */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
-        {llamacppStatus?.status === 'not_found' && (
-          <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.warning }}>⚠ llama-server not detected. Start one with e.g. llama-server -m /path/to/model.gguf</text>
+        {unavailableProviders.map((provider) => (
+          <box key={provider.id} style={{ paddingBottom: 1 }}>
+            <text style={{ fg: provider.status === 'error' ? theme.error : theme.warning }}>
+              {provider.status === 'not_found'
+                ? `⚠ ${provider.displayName} not detected.${provider.hint ? ` ${provider.hint}` : ''}`
+                : provider.status === 'loading'
+                  ? `◐ ${provider.message ?? `${provider.displayName} is loading models...`}`
+                  : `✗ ${provider.displayName}: ${provider.message ?? 'Unknown provider error'}`}
+            </text>
           </box>
-        )}
-        {llamacppStatus?.status === 'loading' && (
-          <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.warning }}>◐ llama-server loading model...</text>
-          </box>
-        )}
-        {llamacppStatus?.status === 'error' && (
-          <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.error }}>✗ llama-server error: {llamacppStatus.message ?? 'Unknown error'}</text>
-          </box>
-        )}
+        ))}
         {SLOT_IDS.map((slotId) => {
           const label = SLOT_DISPLAY_NAMES[slotId]
           const description = SLOT_DESCRIPTIONS[slotId]
@@ -354,8 +350,15 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           const currentOverride = modelConfig?.slotConfig?.[slotId] ?? null
           const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
           const currentEffort = currentOverride?.reasoningEffort ?? defaultEffort
-          const effectiveModelId = currentOverride?.providerModelId ?? models?.find(m => m.slots?.includes(slotId))?.providerModelId ?? models?.[0]?.providerModelId ?? null
-          const effectiveModel = models?.find(m => m.providerModelId === effectiveModelId) ?? null
+          const defaultModel = models?.find(m => m.slots?.includes(slotId)) ?? models?.[0] ?? null
+          const effectiveModel = currentOverride?.providerId && currentOverride.providerModelId
+            ? models?.find(m =>
+                m.providerId === currentOverride.providerId
+                && m.providerModelId === currentOverride.providerModelId
+              ) ?? null
+            : currentOverride?.providerModelId
+              ? models?.find(m => m.providerModelId === currentOverride.providerModelId) ?? null
+              : defaultModel
           const modelLabel = effectiveModel
             ? effectiveModel.displayName
             : '—'
@@ -410,7 +413,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                           ) : dropdownItems.map((item, index) => {
                             const sel = index === dropdownIndex
                             return (
-                              <Button key={item.id} onClick={() => selectDropdownItem(index)} onMouseOver={() => setDropdownIndex(index)}
+                              <Button key={`${'providerId' in item ? item.providerId : 'model'}:${item.id}`} onClick={() => selectDropdownItem(index)} onMouseOver={() => setDropdownIndex(index)}
                                 style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.terminalDetectedBg }}>
                                 <text style={{ fg: sel ? theme.primary : theme.foreground, overflow: 'hidden' }}>
                                   {sel ? '▸ ' : '  '}{item.label.length > maxLen - 2 ? item.label.slice(0, maxLen - 3) + '…' : item.label}

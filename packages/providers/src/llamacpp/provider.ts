@@ -15,11 +15,7 @@ import type {
   LlamaCppDiscoveryResult,
   LlamaCppModelInfo,
 } from "./contract"
-import {
-  classifyModelFamily as classifyModelFamilyRaw,
-  classifyModelFamilyFromMetadata,
-  modelFamilyMetadataConflicts,
-} from "../family-registry"
+import { classifyModelFamilyFromEvidence } from "../family-registry"
 
 export const PROVIDER_ID = "llamacpp" as const
 
@@ -30,7 +26,7 @@ export interface LlamaCppClientConfig {
   readonly auth?: (headers: Headers) => void
 }
 
-const DEFAULT_ENDPOINT = "http://127.0.0.1:8080"
+export const DEFAULT_LLAMACPP_ENDPOINT = "http://127.0.0.1:8080"
 
 export type LlamaCppProvider = Provider<LlamaCppModelInfo>
 
@@ -42,7 +38,7 @@ export interface LlamaCppProviderInstance {
 
 export function createLlamaCppProvider(config?: LlamaCppClientConfig): LlamaCppProviderInstance {
   const configuredEndpoint = config?.endpoint?.trim().replace(/\/+$/, "")
-  const endpoint = configuredEndpoint || DEFAULT_ENDPOINT
+  const endpoint = configuredEndpoint || DEFAULT_LLAMACPP_ENDPOINT
 
   const auth = config?.auth ?? (() => {
     const apiKey = config?.apiKey
@@ -54,16 +50,12 @@ export function createLlamaCppProvider(config?: LlamaCppClientConfig): LlamaCppP
 
   const classifyModelFamily = (
     model: Omit<LlamaCppModelInfo, "modelFamilyId">,
-  ): Option.Option<string> => {
-    const metadata = {
+  ): Option.Option<string> =>
+    classifyModelFamilyFromEvidence({
       architecture: model.modelArchitecture,
       tokenizerModel: model.tokenizerModel,
       tokenizerPre: model.tokenizerPre,
-    }
-    const structuredFamily = classifyModelFamilyFromMetadata(metadata)
-    if (Option.isSome(structuredFamily)) return structuredFamily
-
-    const candidates = [
+    }, [
       model.metadataName,
       ...(model.baseModelNames ?? []),
       ...(model.baseModelRepositories ?? []),
@@ -71,17 +63,7 @@ export function createLlamaCppProvider(config?: LlamaCppClientConfig): LlamaCppP
       model.displayName,
       model.providerModelId,
       model.modelArchitecture,
-    ]
-    for (const candidate of candidates) {
-      if (!candidate) continue
-      const family = classifyModelFamilyRaw(candidate)
-      if (
-        Option.isSome(family) &&
-        !modelFamilyMetadataConflicts(family.value, metadata)
-      ) return family
-    }
-    return Option.none()
-  }
+    ])
 
   const catalog = createLlamaCppCatalog({
     endpoint,

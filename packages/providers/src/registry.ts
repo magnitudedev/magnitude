@@ -9,7 +9,6 @@ import type {
   ProviderModelBindOptions,
 } from "@magnitudedev/ai"
 import type { MagnitudeProviderInstance } from "./magnitude/provider"
-import type { LlamaCppProviderInstance } from "./llamacpp"
 import { makeAggregatedCatalog } from "./catalog-aggregator"
 
 export type AuthStatus =
@@ -24,6 +23,16 @@ export interface ProviderInfo {
   readonly status?: "ok" | "loading" | "not_found" | "error"
   readonly message?: string
   readonly hint?: string
+}
+
+export interface DiscoverableProviderInstance {
+  readonly provider: Pick<Provider, "id" | "displayName" | "bindModel" | "catalog">
+  readonly authStatus?: AuthStatus
+  readonly checkStatus: Effect.Effect<{
+    readonly status: "ok" | "loading" | "not_found" | "error"
+    readonly message?: string
+    readonly hint?: string
+  }, never, HttpClient.HttpClient>
 }
 
 export interface ProviderRegistryService {
@@ -52,7 +61,7 @@ export class ProviderRegistry extends Context.Tag("ProviderRegistry")<
  */
 export function makeProviderRegistry(config: {
   readonly magnitude: MagnitudeProviderInstance | null
-  readonly llamacpp: LlamaCppProviderInstance | null
+  readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
 }): ProviderRegistryService {
   const providers = new Map<string, Pick<Provider, "id" | "bindModel" | "catalog">>()
   const providerInfos: ProviderInfo[] = []
@@ -62,8 +71,8 @@ export function makeProviderRegistry(config: {
     providerInfos.push({ id: "magnitude", displayName: "Magnitude", authStatus: { _tag: "authenticated" } })
   }
 
-  if (config.llamacpp) {
-    providers.set("llamacpp", config.llamacpp.provider)
+  for (const instance of config.discoverableProviders ?? []) {
+    providers.set(instance.provider.id, instance.provider)
   }
 
   const activeProviders = [...providers.values()].map((p) => ({ id: p.id, catalog: p.catalog }))
@@ -73,12 +82,12 @@ export function makeProviderRegistry(config: {
     listProviderIds: Effect.succeed([...providers.keys()]),
     listProviders: Effect.gen(function* () {
       const infos = [...providerInfos]
-      if (config.llamacpp) {
-        const result = yield* config.llamacpp.checkStatus
+      for (const instance of config.discoverableProviders ?? []) {
+        const result = yield* instance.checkStatus
         infos.push({
-          id: "llamacpp",
-          displayName: "Llama.cpp",
-          authStatus: { _tag: "no_auth_required" },
+          id: instance.provider.id,
+          displayName: instance.provider.displayName,
+          authStatus: instance.authStatus ?? { _tag: "no_auth_required" },
           status: result.status,
           ...(result.message ? { message: result.message } : {}),
           ...(result.hint ? { hint: result.hint } : {}),
@@ -98,5 +107,5 @@ export function makeProviderRegistry(config: {
 
 export const ProviderRegistryLive = (config: {
   readonly magnitude: MagnitudeProviderInstance | null
-  readonly llamacpp: LlamaCppProviderInstance | null
+  readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
 }) => Layer.succeed(ProviderRegistry, makeProviderRegistry(config))
