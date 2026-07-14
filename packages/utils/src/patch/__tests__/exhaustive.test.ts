@@ -672,7 +672,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
       path: ['optionField'],
       value: 'wrapped-val',
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(Option.isOption(result.optionField)).toBe(true)
     expect(Option.isSome(result.optionField)).toBe(true)
     expect(Option.getOrNull(result.optionField)).toBe('wrapped-val')
@@ -684,7 +684,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
       op: 'remove',
       path: ['optionField'],
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(Option.isOption(result.optionField)).toBe(true)
     expect(Option.isNone(result.optionField)).toBe(true)
   })
@@ -695,7 +695,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
       op: 'remove',
       path: ['defaultField'],
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(result.defaultField).toBe('default-val')
   })
 
@@ -707,7 +707,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
     }
     // nullableField is Schema.Union(String, Null) — not optional, not Option, not default
     // So remove should delete the key (or set to undefined)
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(result.nullableField).toBeUndefined()
   })
 
@@ -718,7 +718,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
       path: ['items', 1],
       value: 'b',
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(result.items).toEqual(['a', 'b', 'c'])
   })
 
@@ -728,7 +728,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
       op: 'remove',
       path: ['items', 1],
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(result.items).toEqual(['a', 'c'])
   })
 
@@ -739,7 +739,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
       path: ['items', 1],
       value: 'X',
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(result.items).toEqual(['a', 'X', 'c'])
   })
 
@@ -747,7 +747,7 @@ describe('Group 4: Apply correctness (FC4)', () => {
     const prev = makeOuter({ nestedOption: Option.some({ name: 'old', value: 1 }) })
     const next = makeOuter({ nestedOption: Option.some({ name: 'new', value: 2 }) })
     const ops = Effect.runSync(diffDecoded(prev, next, compiled))
-    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
     expect(result).toEqual(next)
     expect(Option.isOption(result.nestedOption)).toBe(true)
     expect(Option.isSome(result.nestedOption)).toBe(true)
@@ -784,7 +784,7 @@ describe('Group 5: Move (FC5)', () => {
       from: ['items', 0],
       to: ['items', 2],
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     // Move 'a' from index 0 to index 2: ['b', 'c', 'a', 'd']
     expect(result.items).toEqual(['b', 'c', 'a', 'd'])
   })
@@ -796,7 +796,7 @@ describe('Group 5: Move (FC5)', () => {
       from: ['items', 3],
       to: ['items', 0],
     }
-    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, [op], compiled))
     expect(result.items).toEqual(['d', 'a', 'b', 'c'])
   })
 
@@ -906,7 +906,7 @@ describe('Group 7: Structural sharing (FC9)', () => {
     const prev = makeOuter()
     const next = makeOuter({ title: 'new-title' })
     const ops = Effect.runSync(diffDecoded(prev, next, compiled))
-    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
     expect(result.items).toBe(prev.items)
     expect(result.records).toBe(prev.records)
     expect(result.unionField).toBe(prev.unionField)
@@ -1122,7 +1122,7 @@ describe('Group 8: Production DisplayViewSnapshot scenarios', () => {
     assertNoUndefined(ops)
     assertWireRoundTrip(ops)
     // Verify the result has Option.none
-    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as DVS
+    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
     const resultM1 = result.state.timelines.root.messages.byId.m1 as typeof m1
     expect(Option.isNone(resultM1.presentation)).toBe(true)
   })

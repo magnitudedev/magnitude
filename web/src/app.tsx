@@ -5,7 +5,7 @@
  * Wires the display view controller, session list, composer, and panels.
  *
  * Cold RPCs use useAgentClient().query() / .mutation() (effect-atom).
- * StreamDisplayView uses the ReferencePreservingStore (spec §6.1).
+ * StreamDisplayView uses the display view store (spec §6.1).
  * Local UI state uses plain atoms (spec §6.3).
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react"
