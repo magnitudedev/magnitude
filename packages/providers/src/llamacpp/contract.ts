@@ -70,6 +70,10 @@ export interface LlamaCppRawModel {
     readonly value?: string
     readonly args?: readonly string[]
   }
+  readonly architecture?: {
+    readonly input_modalities?: readonly string[]
+    readonly output_modalities?: readonly string[]
+  }
 }
 
 /**

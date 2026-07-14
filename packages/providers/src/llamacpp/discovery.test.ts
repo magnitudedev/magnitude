@@ -15,7 +15,9 @@ import {
   checkServerHealth,
   deriveContextWindow,
   deriveDisplayName,
+  deriveSourceModelPath,
   detectVision,
+  fetchModelList,
   fetchServerProps,
 } from "./discovery"
 import { createLlamaCppProvider } from "./provider"
@@ -111,7 +113,7 @@ describe("llama.cpp discovery", () => {
   })
 
   it("discovers absolute GGUF model paths", async () => {
-    const modelId = "/Users/trg/models/qwen3.6-35b-mtp/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
+    const modelId = "/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
     const client = responseClient((url) => {
       switch (new URL(url).pathname) {
         case "/health":
@@ -334,6 +336,62 @@ describe("llama.cpp discovery", () => {
       id: "acme/custom.model:v2",
       object: "model",
     })).toBe("custom.model:v2")
+
+    expect(deriveDisplayName({
+      id: "/models/private-build.gguf",
+      aliases: ["team-friendly-name"],
+      object: "model",
+    })).toBe("team-friendly-name")
+  })
+
+  it("rejects malformed model-list envelopes as a discovery error", async () => {
+    const client = responseClient(() => new Response(
+      JSON.stringify({ object: "list", data: {} }),
+      { status: 200 },
+    ))
+
+    const result = await Effect.runPromise(
+      fetchModelList({ endpoint: "http://127.0.0.1:8080" }).pipe(
+        Effect.either,
+        Effect.provideService(HttpClient.HttpClient, client),
+      ),
+    )
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left.message).toContain("did not contain a data array")
+    }
+  })
+
+  it("rejects non-empty model lists without valid model IDs", async () => {
+    const client = responseClient(() => new Response(
+      JSON.stringify({ object: "list", data: [{ object: "model" }] }),
+      { status: 200 },
+    ))
+
+    const result = await Effect.runPromise(
+      fetchModelList({ endpoint: "http://127.0.0.1:8080" }).pipe(
+        Effect.either,
+        Effect.provideService(HttpClient.HttpClient, client),
+      ),
+    )
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left.message).toContain("no valid model entries")
+    }
+  })
+
+  it("uses router model arguments and modalities", () => {
+    const raw = {
+      id: "router-model",
+      object: "model",
+      status: { args: ["llama-server", "-m=/models/router-model.gguf"] },
+      architecture: { input_modalities: ["text", "image"] },
+    }
+
+    expect(deriveSourceModelPath(raw, null, 2)).toBe("/models/router-model.gguf")
+    expect(detectVision(raw, null)).toBe(true)
   })
 
   it("keeps an unavailable provider visible without failing its catalog", async () => {
@@ -345,7 +403,10 @@ describe("llama.cpp discovery", () => {
       })),
     )
     const instance = createLlamaCppProvider()
-    const registry = makeProviderRegistry({ magnitude: null, llamacpp: instance })
+    const registry = makeProviderRegistry({
+      magnitude: null,
+      discoverableProviders: [instance],
+    })
 
     const [models, providers] = await Effect.runPromise(
       Effect.all([registry.aggregatedCatalog.list, registry.listProviders]).pipe(
@@ -393,7 +454,10 @@ describe("llama.cpp discovery", () => {
       },
     })
     const llamacpp = createLlamaCppProvider()
-    const registry = makeProviderRegistry({ magnitude, llamacpp })
+    const registry = makeProviderRegistry({
+      magnitude,
+      discoverableProviders: [llamacpp],
+    })
 
     const models = await Effect.runPromise(
       registry.aggregatedCatalog.refresh.pipe(

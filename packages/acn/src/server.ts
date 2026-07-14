@@ -16,7 +16,7 @@ import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
 import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
 import { AccountLive } from "./account"
-import { SharedMagnitudeClientLive, SharedMagnitudeClientRefLive } from "./shared-client"
+import { SharedProviderClientLive, SharedProviderClientRefLive } from "./shared-client"
 import { ActiveSessionStatusesLive } from "./active-session-statuses"
 import { AcnActivityTrackerLive, AcnRpcCommandActivityLive } from "./activity-tracker"
 import { DisplayViewStreamsLive } from "./display-view-streams"
@@ -172,12 +172,12 @@ const makeAcnServicesBase = (debug: boolean) => {
   )
 
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, services)
-  // SharedMagnitudeClientLive needs both MagnitudeStorage (from services) and
+  // SharedProviderClientLive needs both MagnitudeStorage (from services) and
   // GlobalStorage (from storageBase). Merge GlobalStorageLive alongside so
   // the service is in context.
   const withGlobalStorage = Layer.mergeAll(withRuntime, GlobalStorageLive)
-  const withSharedClientRef = Layer.provideMerge(SharedMagnitudeClientRefLive, withGlobalStorage)
-  const withSharedClient = Layer.provideMerge(SharedMagnitudeClientLive, withSharedClientRef)
+  const withSharedClientRef = Layer.provideMerge(SharedProviderClientRefLive, withGlobalStorage)
+  const withSharedClient = Layer.provideMerge(SharedProviderClientLive, withSharedClientRef)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withSharedClient)
   const withDestroyer = Layer.provideMerge(SessionDestroyerLive, withDrafts)
   return Layer.provideMerge(AcnActivityTrackerLive, withDestroyer)

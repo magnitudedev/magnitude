@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises"
+import { isAbsolute } from "node:path"
 import { Effect } from "effect"
 import { gguf, type MetadataValue } from "@huggingface/gguf"
 
@@ -38,9 +39,11 @@ function selectMetadata(metadata: Record<string, MetadataValue>): LocalGgufMetad
 
   for (const [key, value] of Object.entries(metadata)) {
     if (/^general\.base_model\.\d+\.name$/i.test(key)) {
-      baseModelNames.push(stringValue(value) ?? "")
+      const name = stringValue(value)
+      if (name) baseModelNames.push(name)
     } else if (/^general\.base_model\.\d+\.(?:repo_url|url)$/i.test(key)) {
-      baseModelRepositories.push(stringValue(value) ?? "")
+      const repository = stringValue(value)
+      if (repository) baseModelRepositories.push(repository)
     }
   }
 
@@ -74,7 +77,7 @@ function selectMetadata(metadata: Record<string, MetadataValue>): LocalGgufMetad
 export function readLocalGgufMetadata(
   modelPath: string | undefined,
 ): Effect.Effect<LocalGgufMetadata | null> {
-  if (!modelPath || !GGUF_EXTENSION.test(modelPath.trim())) {
+  if (!modelPath || !GGUF_EXTENSION.test(modelPath.trim()) || !isAbsolute(modelPath.trim())) {
     return Effect.succeed(null)
   }
 

@@ -55,7 +55,10 @@ export {
   type ParsedMagnitudeApiError,
 } from "@magnitudedev/providers"
 export { makeFileBackedModelCatalog } from "@magnitudedev/ai"
-export { createMagnitudeCompatibleSpec } from "@magnitudedev/providers"
+export {
+  createMagnitudeCompatibleSpec,
+  DEFAULT_LLAMACPP_ENDPOINT,
+} from "@magnitudedev/providers"
 
 // =============================================================================
 // Runtime config (provider-specific env vars read behind the boundary)
@@ -118,7 +121,7 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
 
   const registry = makeProviderRegistry({
     magnitude: magnitudeInstance,
-    llamacpp: llamacppInstance,
+    discoverableProviders: [llamacppInstance],
   })
 
   return {

@@ -135,12 +135,16 @@ export function makeFileBackedModelCatalog<T extends ProviderModel>(
     return yield* refresh
   })
 
-  const get: ModelCatalog<T>["get"] = (_providerId, providerModelId) =>
+  const get: ModelCatalog<T>["get"] = (providerId, providerModelId) =>
     Effect.gen(function* () {
       const models = yield* list
-      const model = models.find((m) => m.providerModelId === providerModelId)
+      const model = models.find(
+        (m) => m.providerId === providerId && m.providerModelId === providerModelId,
+      )
       if (!model) {
-        return yield* new ModelCatalogError({ message: `Model not found: ${providerModelId}` })
+        return yield* new ModelCatalogError({
+          message: `Model not found: ${providerId}/${providerModelId}`,
+        })
       }
       return model
     })

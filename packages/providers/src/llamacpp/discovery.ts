@@ -2,7 +2,6 @@ import { Data, Effect } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import type {
-  LlamaCppModelsResponse,
   LlamaCppRawModel,
   ServerProps,
   ServerStatus,
@@ -24,6 +23,54 @@ export class LlamaCppDiscoveryError extends Data.TaggedError("LlamaCppDiscoveryE
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function stringArray(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const strings = value.filter((entry): entry is string => typeof entry === "string")
+  return strings.length > 0 ? strings : undefined
+}
+
+function parseRawModel(value: unknown): LlamaCppRawModel | null {
+  if (!isRecord(value) || typeof value.id !== "string" || !value.id.trim()) return null
+
+  const status = isRecord(value.status) ? value.status : null
+  const architecture = isRecord(value.architecture) ? value.architecture : null
+  const aliases = stringArray(value.aliases)
+  const tags = stringArray(value.tags)
+  const statusArgs = stringArray(status?.args)
+  const inputModalities = stringArray(architecture?.input_modalities)
+  const outputModalities = stringArray(architecture?.output_modalities)
+  return {
+    id: value.id,
+    object: typeof value.object === "string" ? value.object : "model",
+    ...(typeof value.path === "string" ? { path: value.path } : {}),
+    ...(aliases ? { aliases } : {}),
+    ...(tags ? { tags } : {}),
+    ...(typeof value.created === "number" ? { created: value.created } : {}),
+    ...(typeof value.owned_by === "string" ? { owned_by: value.owned_by } : {}),
+    ...(value.meta === null
+      ? { meta: null }
+      : isRecord(value.meta)
+        ? { meta: value.meta }
+        : {}),
+    ...(status
+      ? {
+          status: {
+            ...(typeof status.value === "string" ? { value: status.value } : {}),
+            ...(statusArgs ? { args: statusArgs } : {}),
+          },
+        }
+      : {}),
+    ...(architecture
+      ? {
+          architecture: {
+            ...(inputModalities ? { input_modalities: inputModalities } : {}),
+            ...(outputModalities ? { output_modalities: outputModalities } : {}),
+          },
+        }
+      : {}),
+  }
 }
 
 function headersFromAuth(auth?: (headers: Headers) => void): Record<string, string> {
@@ -117,8 +164,21 @@ export function fetchModelList(
       })),
     )
 
-    const parsed = body as LlamaCppModelsResponse
-    return parsed.data
+    if (!isRecord(body) || !Array.isArray(body.data)) {
+      return yield* new LlamaCppDiscoveryError({
+        message: "Llama.cpp model list response did not contain a data array",
+      })
+    }
+
+    const models = body.data
+      .map(parseRawModel)
+      .filter((model): model is LlamaCppRawModel => model !== null)
+    if (body.data.length > 0 && models.length === 0) {
+      return yield* new LlamaCppDiscoveryError({
+        message: "Llama.cpp model list response contained no valid model entries",
+      })
+    }
+    return models
   })
 }
 
@@ -242,6 +302,10 @@ function modelPathFromArgs(args: readonly string[] | undefined): string | undefi
       const value = arg.slice("--model=".length).trim()
       if (value && GGUF_PATH.test(value)) return value
     }
+    if (arg.startsWith("-m=")) {
+      const value = arg.slice("-m=".length).trim()
+      if (value && GGUF_PATH.test(value)) return value
+    }
   }
   return undefined
 }
@@ -316,8 +380,11 @@ export function deriveDisplayName(
   sourceModelPath?: string,
 ): string {
   const ftype = raw.meta?.ftype ?? serverProps?.modelFtype
-  const aliasParsed = serverProps?.modelAlias
-    ? parseModelIdentifier(serverProps.modelAlias, ftype)
+  const rawAlias = raw.aliases?.find((alias) => alias.trim() && alias !== raw.id)
+    ?? raw.aliases?.find((alias) => alias.trim())
+  const serverAlias = serverProps?.modelAlias?.trim() || rawAlias
+  const aliasParsed = serverAlias
+    ? parseModelIdentifier(serverAlias, ftype)
     : undefined
   const pathParsed = sourceModelPath ? parseModelIdentifier(sourceModelPath, ftype) : undefined
   const idParsed = parseModelIdentifier(raw.id || "Unknown model", ftype)
@@ -353,6 +420,12 @@ export function deriveContextWindow(
 export function detectVision(raw: LlamaCppRawModel, serverProps: ServerProps | null): boolean {
   if (serverProps?.modalities) {
     return serverProps.modalities.vision ?? false
+  }
+
+  if (raw.architecture?.input_modalities) {
+    return raw.architecture.input_modalities.some((modality) =>
+      modality.toLowerCase() === "image" || modality.toLowerCase() === "video",
+    )
   }
 
   const arch = deriveModelArchitecture(raw)?.toLowerCase() ?? ""

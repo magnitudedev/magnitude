@@ -1,6 +1,7 @@
 export {
   createLlamaCppProvider,
   PROVIDER_ID,
+  DEFAULT_LLAMACPP_ENDPOINT,
   type LlamaCppProviderInstance,
   type LlamaCppClientConfig,
 } from "./provider"

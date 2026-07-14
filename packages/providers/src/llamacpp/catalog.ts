@@ -25,7 +25,11 @@ type LlamaCppModelWithoutFamily = Omit<LlamaCppModelInfo, "modelFamilyId">
 function isLoopbackEndpoint(endpoint: string): boolean {
   try {
     const hostname = new URL(endpoint).hostname.toLowerCase()
-    return ["localhost", "127.0.0.1", "[::1]", "::1", "0.0.0.0"].includes(hostname)
+    return hostname === "localhost"
+      || hostname === "0.0.0.0"
+      || hostname === "[::1]"
+      || hostname === "::1"
+      || /^127(?:\.\d{1,3}){3}$/.test(hostname)
   } catch {
     return false
   }
