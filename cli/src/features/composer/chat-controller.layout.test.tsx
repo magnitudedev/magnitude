@@ -88,7 +88,9 @@ vi.mock('@effect-atom/atom-react', async () => {
   const actual = await vi.importActual<typeof import('@effect-atom/atom-react')>('@effect-atom/atom-react')
   return {
     ...actual,
-    useAtomValue: () => actual.Result.initial(),
+    useAtomValue: () => '',
+    useAtomSet: () => () => {},
+    useAtomMount: () => {},
   }
 })
 
@@ -241,7 +243,6 @@ function makeProps(): ComposerProps {
     isBlockingOverlayActive: false,
     selectedFileOpen: false,
     onCloseFilePanel: noop,
-    onInputHasTextChange: noop,
   }
 }
 

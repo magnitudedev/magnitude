@@ -1,5 +1,7 @@
 import { RGBA, TextAttributes, type KeyEvent } from '@opentui/core'
 import { useCallback, useRef, useState, useMemo } from 'react'
+import { Effect } from 'effect'
+import { Atom, useAtomMount, useAtomSet, useAtomValue as useAtomValueClientCommon } from '@effect-atom/atom-react'
 import type {
   MentionAttachment,
   RawImageAttachment,
@@ -31,9 +33,7 @@ import {
 } from '@magnitudedev/client-common'
 import { resolvePasteIntent, resolvePasteOutcomeFromApplyResult } from '@magnitudedev/client-common'
 import { applyPasteIntent } from '@magnitudedev/client-common'
-import { derivePasteEffects } from '@magnitudedev/client-common'
-import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom } from '@magnitudedev/client-common'
-import { useAtomSet, useAtomValue as useAtomValueClientCommon } from '@effect-atom/atom-react'
+import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom, composerHasContentAtom } from '@magnitudedev/client-common'
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
@@ -58,7 +58,7 @@ export async function handleChatControllerPaste(args: {
   addClipboardImage: () => Promise<boolean>
   addImageFromFilePath: (rawPasteText: string) => Promise<boolean>
   setInputValue: (updater: (prev: InputValue) => InputValue) => void
-}): Promise<{ didInsert: boolean; shouldBumpBulkInsertEpoch: boolean }> {
+}): Promise<{ didInsert: boolean }> {
   const intent = await resolvePasteIntent({
     eventText: args.eventText,
     readClipboardText,
@@ -72,22 +72,8 @@ export async function handleChatControllerPaste(args: {
     setInputValue: args.setInputValue,
   })
 
-  const effects = derivePasteEffects(applyResult)
   return {
     didInsert: resolvePasteOutcomeFromApplyResult(applyResult),
-    shouldBumpBulkInsertEpoch: effects.shouldBumpBulkInsertEpoch,
-  }
-}
-
-export function nextBulkInsertEpochForPaste(previousEpoch: number, shouldBumpBulkInsertEpoch: boolean): number {
-  return shouldBumpBulkInsertEpoch ? previousEpoch + 1 : previousEpoch
-}
-
-export function buildRestoredQueuedInputValue(restoredQueuedInputText: string): InputValue {
-  return {
-    ...EMPTY_INPUT,
-    text: restoredQueuedInputText,
-    cursorPosition: restoredQueuedInputText.length,
   }
 }
 
@@ -202,7 +188,6 @@ export function Composer(props: ComposerProps) {
     isBlockingOverlayActive,
     selectedFileOpen,
     onCloseFilePanel,
-    onInputHasTextChange,
   } = props
 
   const atomClient = useAgentClient()
@@ -215,6 +200,7 @@ export function Composer(props: ComposerProps) {
   const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
   const composerHistoryIndex = useAtomValueClientCommon(composerHistoryIndexAtom)
   const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
+  const setComposerHasContent = useAtomSet(composerHasContentAtom)
   // historyIndex: null = not navigating history, number = current index
   const historyIndex = composerHistoryIndex === -1 ? null : composerHistoryIndex
 
@@ -245,23 +231,40 @@ export function Composer(props: ComposerProps) {
   const historyNavRef = useRef(false)
   const [nextEscWillKillAll, setNextEscWillKillAll] = useState(false)
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const [bulkInsertEpoch, setBulkInsertEpoch] = useState(0)
   const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
   const multilineInputRef = useRef<MultilineInputHandle | null>(null)
 
-  // Sync inputValue from composerText atom when the atom changes externally (e.g. restored input).
-  // This is the local component's view of the text derived from the shared atom.
-  if (inputValue.text !== composerText || inputValue.cursorPosition !== composerText.length) {
-    setInputValue({
-      ...EMPTY_INPUT,
-      text: composerText,
-      cursorPosition: composerText.length,
-    })
-  }
+  // Refs to mirror local state so the sync Effect reads the latest values
+  // without depending on them in the useMemo dep array (which would recreate
+  // the atom on every keystroke).
+  const inputValueRef = useRef(inputValue)
+  inputValueRef.current = inputValue
+  const attachmentsRef = useRef(attachments)
+  attachmentsRef.current = attachments
 
-  // onInputHasTextChange — imperative, no useEffect
-  onInputHasTextChange?.(inputValue.text.trim().length > 0 || attachments.length > 0)
+  // Sync inputValue from composerText atom when the atom changes externally
+  // (e.g. queued-input restore, send-failure rollback). useAtomMount is the
+  // sanctioned pattern for atom→local reconciliation when no single user
+  // action is the trigger. Gates strictly on text divergence (never cursor
+  // position) to avoid the feedback loop; preserves segments via ...prev.
+  const syncFromAtomAtom = useMemo(
+    () =>
+      Atom.make(
+        Effect.gen(function* () {
+          if (composerText !== inputValueRef.current.text) {
+            setInputValue((prev) => ({
+              ...prev,
+              text: composerText,
+              cursorPosition: composerText.length,
+            }))
+            setComposerHasContent(composerText.trim().length > 0 || attachmentsRef.current.length > 0)
+          }
+        }),
+      ),
+    [composerText, setComposerHasContent],
+  )
+  useAtomMount(syncFromAtomAtom)
 
   // Composer focus — imperative, no useEffect
   if (composerCanFocus) multilineInputRef.current?.focus()
@@ -334,9 +337,13 @@ export function Composer(props: ComposerProps) {
       width: scaled.width,
       height: scaled.height,
     }
-    setAttachments(prev => [...prev, newAttachment])
+    setAttachments(prev => {
+      const next = [...prev, newAttachment]
+      setComposerHasContent(next.length > 0 || inputValueRef.current.text.trim().length > 0)
+      return next
+    })
     return true
-  }, [])
+  }, [setComposerHasContent])
 
   const addImageAttachmentFromFilePath = useCallback(async (rawPasteText: string) => {
     return addImageAttachmentsFromPastedText({
@@ -353,8 +360,12 @@ export function Composer(props: ComposerProps) {
   }, [cwd, resolvePathMutation, readFileMutation])
 
   const removeAttachment = useCallback((index: number) => {
-    setAttachments(prev => prev.filter((_, i) => i !== index))
-  }, [])
+    setAttachments(prev => {
+      const next = prev.filter((_, i) => i !== index)
+      setComposerHasContent(next.length > 0 || inputValueRef.current.text.trim().length > 0)
+      return next
+    })
+  }, [setComposerHasContent])
 
   const executeSlashCommand = useCallback((commandText: string) => {
     const handled = runSlashCommand(commandText)
@@ -363,8 +374,9 @@ export function Composer(props: ComposerProps) {
       setComposerText('')
       setComposerAttachments([])
       setAttachments([])
+      setComposerHasContent(false)
     }
-  }, [runSlashCommand, setComposerText, setComposerAttachments])
+  }, [runSlashCommand, setComposerText, setComposerAttachments, setComposerHasContent])
 
   const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }) => {
     // Image files selected via @mention become pending image inputs
@@ -498,6 +510,7 @@ export function Composer(props: ComposerProps) {
       enterBashMode()
       setInputValue(EMPTY_INPUT)
       setComposerText('')
+      setComposerHasContent(false)
       setComposerHistoryIndex(-1)
       setSavedDraft('')
       return
@@ -510,8 +523,9 @@ export function Composer(props: ComposerProps) {
     }
     setInputValue(value)
     setComposerText(value.text)
+    setComposerHasContent(value.text.trim().length > 0 || attachmentsRef.current.length > 0)
     setComposerHistoryIndex(composerHistoryIndex === -1 ? -1 : composerHistoryIndex)
-  }, [bashMode, composerHistoryIndex, history, enterBashMode, setComposerText, setComposerHistoryIndex])
+  }, [bashMode, composerHistoryIndex, history, enterBashMode, setComposerText, setComposerHasContent, setComposerHistoryIndex])
 
   const handlePaste = useCallback(async (eventText?: string): Promise<boolean> => {
     const result = await handleChatControllerPaste({
@@ -520,7 +534,6 @@ export function Composer(props: ComposerProps) {
       addImageFromFilePath: addImageAttachmentFromFilePath,
       setInputValue,
     })
-    setBulkInsertEpoch((prev) => nextBulkInsertEpochForPaste(prev, result.shouldBumpBulkInsertEpoch))
     return result.didInsert
   }, [addImageAttachment, addImageAttachmentFromFilePath])
 
@@ -529,9 +542,10 @@ export function Composer(props: ComposerProps) {
     setComposerText('')
     setComposerAttachments([])
     setAttachments([])
+    setComposerHasContent(false)
     setComposerHistoryIndex(-1)
     setSavedDraft('')
-  }, [setComposerText, setComposerAttachments, setComposerHistoryIndex])
+  }, [setComposerText, setComposerAttachments, setComposerHasContent, setComposerHistoryIndex])
 
   const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionInputs: MentionAttachment[] = []) => {
     if (bashMode) {
@@ -646,7 +660,6 @@ export function Composer(props: ComposerProps) {
                     placeholder={bashMode ? 'Enter a command...' : status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
                     maxHeight={10}
                     minHeight={1}
-                    bulkInsertEpoch={bulkInsertEpoch}
                   />
                 </box>
               </box>

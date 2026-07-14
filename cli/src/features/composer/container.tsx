@@ -24,7 +24,6 @@ import {
   usageOpenAtom,
   bashModeAtom,
   useDisplayViewController,
-  composerHasContentAtom,
   type CommandContext,
 } from '@magnitudedev/client-common'
 import type { RawMessageAttachment } from '@magnitudedev/sdk'
@@ -51,7 +50,6 @@ export function ComposerContainer({
   const setUsageOpen = useAtomSet(usageOpenAtom)
   const setBashMode = useAtomSet(bashModeAtom)
   const setShowRecentChats = useAtomSet(showRecentChatsOverlayAtom)
-  const setComposerHasContent = useAtomSet(composerHasContentAtom)
   const { displayMode, expandedForkStack } = useDisplayViewController()
   const selectedFilePath = useAtomValue(selectedFilePathAtom)
   const setSelectedFilePath = useAtomSet(selectedFilePathAtom)
@@ -164,7 +162,6 @@ export function ComposerContainer({
       isBlockingOverlayActive={!composerCanFocus}
       selectedFileOpen={selectedFilePath !== null}
       onCloseFilePanel={() => setSelectedFilePath(null)}
-      onInputHasTextChange={setComposerHasContent}
     />
   )
 }

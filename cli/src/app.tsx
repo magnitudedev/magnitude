@@ -25,6 +25,7 @@ import {
   useSessionPreload,
   subscribeEphemeralMessage,
   getEphemeralMessageSnapshot,
+  useFileWatchBridge,
 } from '@magnitudedev/client-common'
 import type { SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
@@ -117,6 +118,7 @@ function CliAppGates(props: CliAppProps): ReactNode {
 
 function CliAppContent(props: CliAppProps): ReactNode {
   useSessionPreload()
+  useFileWatchBridge()
   useSessionStartup({
     sessionStart: props.sessionStart,
     initialPrompt: props.initialPrompt,

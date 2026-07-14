@@ -36,11 +36,6 @@ export const usageOpenAtom = Atom.make(false)
 export const selectedFilePathAtom = Atom.make<string | null>(null)
 
 /**
- * Composer draft content.
- */
-export const composerDraftAtom = Atom.make("")
-
-/**
  * API key verified flag.
  * false = not verified (show login screen). true = key is set, show main app.
  */
@@ -51,12 +46,6 @@ export const apiKeyVerifiedAtom = Atom.make(false)
  * Array of previously sent message texts, most recent first.
  */
 export const messageHistoryAtom = Atom.make<string[]>([])
-
-/**
- * Queued messages restored by the server after an interrupt.
- * This is composer-local state, delivered as a side-band display stream event.
- */
-export const restoredQueuedInputTextAtom = Atom.make<string | null>(null)
 
 /**
  * Composer text content.
@@ -104,18 +93,6 @@ export const composerHasContentAtom = Atom.make(false)
  * Guards against concurrent session creation from rapid submits.
  */
 export const pendingUserSubmitAtom = Atom.make(false)
-
-/**
- * True when the composer is allowed to receive focus.
- * Used to prevent focus stealing during streaming transitions.
- */
-export const composerCanFocusAtom = Atom.make(false)
-
-/**
- * Monotonic epoch incremented on bulk insert operations.
- * Used to trigger scroll recomputation when content is bulk-inserted.
- */
-export const bulkInsertEpochAtom = Atom.make(0)
 
 /**
  * Holds the in-flight session activation promise during lazy session

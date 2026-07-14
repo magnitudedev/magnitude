@@ -348,7 +348,6 @@ interface MultilineInputProps {
   mentionSegments?: InputMentionSegment[]
   selectedPasteSegmentId?: string | null
   selectedMentionSegmentId?: string | null
-  bulkInsertEpoch?: number
 }
 
 export type MultilineInputHandle = {
@@ -378,7 +377,6 @@ export const MultilineInput = forwardRef<
     mentionSegments = [],
     selectedPasteSegmentId = null,
     selectedMentionSegmentId = null,
-    bulkInsertEpoch = 0,
   }: MultilineInputProps,
   forwardedRef,
 ) {
@@ -2007,6 +2005,7 @@ export const MultilineInput = forwardRef<
         trackOptions: { width: 1 },
       }}
       onPaste={(event) => {
+        setSuppressBottomFollowAutoScroll(true)
         handlePasteEvent({ text: decodeNativePasteText(event) })
       }}
       onMouseDown={handleMouseDown}
