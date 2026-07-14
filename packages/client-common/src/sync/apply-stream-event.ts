@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect";
+import { Effect } from "effect";
 import { DisplayViewSnapshot, type StreamEvent } from "@magnitudedev/sdk";
 import { compilePatchMap, applyDecodedPatch } from "@magnitudedev/utils/patch";
 import type { DisplaySyncSink } from "./display-view-store";
@@ -35,8 +35,7 @@ export function applyStreamEvent(
       return Effect.gen(function* () {
         const prev = store.acceptedSnapshot();
         const result = yield* applyDecodedPatch(prev, event.ops, patchMap);
-        const revalidated = yield* Schema.validate(DisplayViewSnapshot)(result);
-        store.accept(revalidated);
+        store.accept(result);
       }).pipe(
         Effect.catchAll((error) =>
           Effect.gen(function* () {
