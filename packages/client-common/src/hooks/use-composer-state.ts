@@ -193,29 +193,31 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     setMessageHistory((prev: string[]) => [text, ...prev].slice(0, 50))
     setPendingUserSubmit(true)
 
-    const optimistic = displaySpeculator.mutate(
-      { owner: optimisticOwner, label: "send-message" },
-      (draft) => {
-        const cwd = selectedCwd ?? draft.state.session.cwd ?? ""
-        if (!activeSessionId && !draft.state.session.sessionId) {
-          draft.state.session = {
-            sessionId: `draft:${draftOwnerId}`,
-            title: null,
-            cwd,
-          }
-        }
-        draft.shape.timelines.root ??= timelineTail(INITIAL_ROOT_PAGE_SIZE)
-        draft.state.timelines.root ??= emptyTimeline()
-        draft.state.timelines.root = appendMessageToTimeline(draft.state.timelines.root, {
-          id: messageId,
-          type: activeSessionId && isStreaming ? "queued_user_message" : "user_message",
-          content: displayText,
-          timestamp: Date.now(),
-          taskMode,
-          attachments: displayAttachments,
-        })
-      },
-    )
+    // Optimistic speculator disabled — the real message arrives via stream.
+    // const optimistic = displaySpeculator.mutate(
+    //   { owner: optimisticOwner, label: "send-message" },
+    //   (draft) => {
+    //     const cwd = selectedCwd ?? draft.state.session.cwd ?? ""
+    //     if (!activeSessionId && !draft.state.session.sessionId) {
+    //       draft.state.session = {
+    //         sessionId: `draft:${draftOwnerId}`,
+    //         title: null,
+    //         cwd,
+    //       }
+    //     }
+    //     draft.shape.timelines.root ??= timelineTail(INITIAL_ROOT_PAGE_SIZE)
+    //     draft.state.timelines.root ??= emptyTimeline()
+    //     draft.state.timelines.root = appendMessageToTimeline(draft.state.timelines.root, {
+    //       id: messageId,
+    //       type: activeSessionId && isStreaming ? "queued_user_message" : "user_message",
+    //       content: displayText,
+    //       timestamp: Date.now(),
+    //       taskMode,
+    //       attachments: displayAttachments,
+    //     })
+    //   },
+    // )
+    const optimistic = { remove: () => {} }
 
     const rollback = (err: unknown): void => {
       const errMsg = err instanceof Error ? err.message : String(err)
