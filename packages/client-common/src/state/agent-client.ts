@@ -7,13 +7,9 @@
  * are transport details resolved inside the SDK protocol layer.
  */
 import { AtomRpc, Atom } from "@effect-atom/atom-react"
-import { FetchHttpClient } from "@effect/platform"
-import { Layer } from "effect"
-import {
-  MagnitudeRpcs,
-  recoveringProtocolLayer,
-  type DaemonSpawnerTag,
-} from "@magnitudedev/sdk"
+import { RpcClient } from "@effect/rpc"
+import type { Layer } from "effect"
+import { MagnitudeRpcs } from "@magnitudedev/sdk"
 
 /**
  * Placeholder class used as the type identifier for the AgentClient tag.
@@ -23,16 +19,17 @@ export class AgentClient {}
 export type AgentClientInstance = ReturnType<typeof createAgentClient>
 
 /**
- * Create an AgentClient AtomRpc tag backed by a `DaemonSpawner`.
- * Call this at renderer startup with the host's spawner layer, then pass
- * the result to Atom.runtime.addGlobalLayer(instance.layer).
+ * Create an AgentClient AtomRpc tag backed by a shared protocol layer.
+ *
+ * The protocol layer must be created once at startup (by the Platform) and
+ * passed here. This ensures all RPC consumers — AtomRpc mutations, the
+ * display controller, file-watch, session-statuses — share one resolver,
+ * one endpoint cache, one transport.
  */
-export function createAgentClient(daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>) {
+export function createAgentClient(protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>) {
   const tag = AtomRpc.Tag<AgentClient>()("AgentClient", {
     group: MagnitudeRpcs,
-    protocol: recoveringProtocolLayer().pipe(
-      Layer.provide(Layer.mergeAll(FetchHttpClient.layer, daemonSpawnerLayer)),
-    ),
+    protocol: protocolLayer,
   })
 
   // Register the tag's layer as a global layer so all atoms can access it

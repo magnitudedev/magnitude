@@ -5,7 +5,9 @@
  * `DaemonSpawner` delegates daemon lifecycle to Electron main over IPC.
  */
 import { Effect, Layer, Option } from "effect"
-import { DaemonSpawnFailed, DaemonSpawnerTag, type DaemonSpawner } from "@magnitudedev/sdk"
+import { FetchHttpClient } from "@effect/platform"
+import { RpcClient } from "@effect/rpc"
+import { DaemonSpawnFailed, DaemonSpawnerTag, recoveringProtocolLayer, type DaemonSpawner } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
 
@@ -73,9 +75,13 @@ function createDesktopDaemonSpawner(desktopApi: DesktopApi): DaemonSpawner {
 
 export function createDesktopPlatform(desktopApi: DesktopApi): Platform {
   api = desktopApi
+  const daemonSpawnerLayer = Layer.succeed(DaemonSpawnerTag, createDesktopDaemonSpawner(desktopApi))
+  const protocolLayer = recoveringProtocolLayer().pipe(
+    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, daemonSpawnerLayer)),
+  )
   return {
     id: "desktop",
-    daemonSpawnerLayer: Layer.succeed(DaemonSpawnerTag, createDesktopDaemonSpawner(desktopApi)),
+    protocolLayer,
     clipboard: desktopClipboard,
     storage: desktopStorage,
     notifications: desktopNotifications,

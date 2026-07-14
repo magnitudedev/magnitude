@@ -7,9 +7,11 @@
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
+import { RpcClient } from "@effect/rpc"
 import {
   DaemonSpawnerTag,
   makeLocalDaemonSpawner,
+  recoveringProtocolLayer,
   type DaemonSpawner,
   type SpawnProcess,
 } from "@magnitudedev/sdk"
@@ -101,9 +103,13 @@ export function createTerminalPlatform(options: TerminalPlatformOptions = {}): P
     ),
   )
 
+  const protocolLayer = recoveringProtocolLayer().pipe(
+    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, spawnerLayer)),
+  )
+
   return {
     id: "terminal",
-    daemonSpawnerLayer: spawnerLayer,
+    protocolLayer,
     clipboard: osc52Clipboard,
     storage: noopStorage,
     notifications: noopNotifications,

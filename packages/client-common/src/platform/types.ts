@@ -8,7 +8,7 @@
  */
 
 import type { Layer } from "effect"
-import type { DaemonSpawnerTag } from "@magnitudedev/sdk"
+import { RpcClient } from "@effect/rpc"
 import type { MenuAction } from "../types/menu-action"
 
 export type { MenuAction }
@@ -49,7 +49,7 @@ export interface TerminalCapabilities {
 
 export interface Platform {
   readonly id: "web" | "desktop" | "terminal"
-  readonly daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>
+  readonly protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>
   readonly clipboard: Clipboard
   readonly storage: Storage
   readonly notifications: Notification

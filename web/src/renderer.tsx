@@ -29,7 +29,7 @@ const root = createRoot(document.getElementById("root")!)
 
 async function main() {
   const platform = createBrowserPlatform("")
-  const agentClientTag = createAgentClient(platform.daemonSpawnerLayer)
+  const agentClientTag = createAgentClient(platform.protocolLayer)
 
   root.render(
     <PlatformProvider platform={platform}>
