@@ -1,4 +1,4 @@
-import { Effect, Exit, Option, Schema } from "effect";
+import { Effect, Exit, Option } from "effect";
 import {
   DisplayViewSnapshot,
   type DisplayMessage,
@@ -15,8 +15,6 @@ import {
   type DecodedValue,
   type Path,
 } from "@magnitudedev/utils/patch";
-import { ReferencePreservingStore } from "./store";
-import type { Transform } from "./share-refs";
 
 type Mutable<T> = T extends (...args: any[]) => any
   ? T
@@ -84,14 +82,6 @@ const nextSpeculativeId = (): string =>
 // Compile the patch map once for decoded-level diffing.
 const patchMap = compilePatchMap(DisplayViewSnapshot);
 
-function hasId(v: object): v is { id: string } {
-  return "id" in v && typeof v.id === "string";
-}
-
-function hasKey(v: object): v is { _key: string } {
-  return "_key" in v && typeof v._key === "string";
-}
-
 import type { DecodedSome, DecodedNone } from "@magnitudedev/utils/patch";
 
 function isDecodedOption(v: DecodedValue): v is DecodedSome | DecodedNone {
@@ -112,13 +102,6 @@ function isRecord(value: DecodedValue): value is Record<string, DecodedValue> {
     !isDecodedOption(value)
   );
 }
-
-const injectKeyTransform: Transform = (obj) => {
-  if (hasId(obj) && !hasKey(obj)) {
-    return { ...obj, _key: obj.id };
-  }
-  return obj;
-};
 
 // ---------------------------------------------------------------------------
 // Write key derivation from decoded patch ops
@@ -261,13 +244,9 @@ function deriveMutation(
   PatchApplyError
 > {
   return Effect.gen(function* () {
-    // Clone via Schema encode→decode round-trip — preserves Option identity.
-    const encoded = yield* Schema.encode(DisplayViewSnapshot)(base).pipe(
-      Effect.orDie
-    );
-    const draft: MutableDisplayViewSnapshot = yield* Schema.decode(
-      DisplayViewSnapshot
-    )(encoded).pipe(Effect.orDie);
+    // structuredClone preserves plain objects (including Option { _tag, value })
+    // without a full Schema encode→decode round-trip.
+    const draft: MutableDisplayViewSnapshot = structuredClone(base);
     apply(draft);
     const next: DisplayViewSnapshot = draft;
     const ops = yield* diffDecoded(base, next, patchMap);
@@ -279,46 +258,56 @@ function deriveMutation(
   });
 }
 
+/**
+ * SpeculativeDisplayViewStore holds accepted server state and a derived
+ * rendered state (accepted + speculative transactions).
+ *
+ * No separate reference-preserving store is needed: the patch applier
+ * (`applyDecodedPatch` / `diffDecoded`) already preserves references for
+ * everything outside the patch path, so accepted state arrives with stable
+ * object references for unchanged parts. `useDisplayView` selects slices via
+ * `useSyncExternalStore`, which skips re-renders when the selected value is
+ * `===` the previous one — so only components whose slice actually changed
+ * re-render.
+ */
 export class SpeculativeDisplayViewStore implements DisplayViewStore {
-  private readonly accepted: ReferencePreservingStore<DisplayViewSnapshot>;
-  private readonly rendered: ReferencePreservingStore<DisplayViewSnapshot>;
+  private accepted: DisplayViewSnapshot;
+  private rendered: DisplayViewSnapshot;
+  private listeners = new Set<() => void>();
   private transactions: SpeculativeDisplayTransaction[] = [];
 
-  constructor(initial: DisplayViewSnapshot, transform?: Transform) {
-    // The accepted store holds raw server values — NO transform.
-    // This ensures diffDecoded in accept() compares raw values without
-    // _key contamination from injectKeyTransform.
-    this.accepted = new ReferencePreservingStore<DisplayViewSnapshot>(initial);
-    // The rendered store applies the transform (e.g. _key injection) for UI.
-    this.rendered = new ReferencePreservingStore<DisplayViewSnapshot>(
-      initial,
-      transform
-    );
+  constructor(initial: DisplayViewSnapshot) {
+    this.accepted = initial;
+    this.rendered = initial;
   }
 
-  getSnapshot = (): DisplayViewSnapshot => this.rendered.get();
+  getSnapshot = (): DisplayViewSnapshot => this.rendered;
 
-  subscribe = (listener: () => void): (() => void) =>
-    this.rendered.subscribe(listener);
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); }
+  };
 
-  acceptedSnapshot = (): DisplayViewSnapshot => this.accepted.get();
+  acceptedSnapshot = (): DisplayViewSnapshot => this.accepted;
 
   accept = (next: DisplayViewSnapshot): void => {
     // Fast path: no speculative transactions → no conflict detection.
     if (this.transactions.length === 0) {
-      this.accepted.set(next);
-      this.rendered.set(next);
+      if (this.accepted === next) return;
+      this.accepted = next;
+      this.rendered = next;
+      this.notify();
       return;
     }
 
     // Slow path: transactions active → conflict detection via decoded diff.
-    const prevAccepted = this.accepted.get();
+    const prevAccepted = this.accepted;
     const authoritativeOps = Effect.runSyncExit(
       diffDecoded(prevAccepted, next, patchMap)
     );
     if (Exit.isFailure(authoritativeOps)) {
-      this.accepted.set(next);
-      this.rendered.set(next);
+      this.accepted = next;
+      this.recompute();
       return;
     }
     const authoritativeKeys = normalizeOps(
@@ -330,12 +319,12 @@ export class SpeculativeDisplayViewStore implements DisplayViewStore {
         (tx) => !hasWriteKeyConflict(tx.lastWriteKeys, authoritativeKeys)
       );
     }
-    this.accepted.set(next);
+    this.accepted = next;
     this.recompute();
   };
 
   resetAccepted = (next: DisplayViewSnapshot): void => {
-    this.accepted.set(next);
+    this.accepted = next;
     this.recompute();
   };
 
@@ -377,11 +366,12 @@ export class SpeculativeDisplayViewStore implements DisplayViewStore {
   clear = (): void => {
     if (this.transactions.length === 0) return;
     this.transactions = [];
-    this.rendered.set(this.accepted.get());
+    this.rendered = this.accepted;
+    this.notify();
   };
 
   private recompute(): void {
-    let rendered = this.accepted.get();
+    let rendered = this.accepted;
     const kept: SpeculativeDisplayTransaction[] = [];
 
     for (const tx of this.transactions) {
@@ -400,7 +390,13 @@ export class SpeculativeDisplayViewStore implements DisplayViewStore {
     if (kept.length !== this.transactions.length) {
       this.transactions = kept;
     }
-    this.rendered.set(rendered);
+    if (this.rendered === rendered) return;
+    this.rendered = rendered;
+    this.notify();
+  }
+
+  private notify(): void {
+    for (const l of this.listeners) l();
   }
 }
 
@@ -478,8 +474,5 @@ export function createDisplayViewStore(
   initial: DisplayState,
   shape: DisplayViewShape
 ): DisplayViewStore {
-  return new SpeculativeDisplayViewStore(
-    { shape, state: initial },
-    injectKeyTransform
-  );
+  return new SpeculativeDisplayViewStore({ shape, state: initial });
 }

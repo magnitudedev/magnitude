@@ -36,7 +36,7 @@ function checkInvariant(
   _label: string,
 ): void {
   const ops = Effect.runSync(diffDecoded(prev, next, compiled))
-  const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as Outer
+  const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
   expect(result).toEqual(next)
 }
 
@@ -186,7 +186,7 @@ describe('decoded patch pipeline — smoke', () => {
   it('structural sharing — unchanged refs preserved', () => {
     const next = { ...basePrev, title: 'new-title' }
     const ops = Effect.runSync(diffDecoded(basePrev, next, compiled))
-    const result = Effect.runSync(applyDecodedPatch(basePrev, ops, compiled)) as Outer
+    const result = Effect.runSync(applyDecodedPatch(basePrev, ops, compiled))
     // Unchanged array should keep same reference
     expect(result.items).toBe(basePrev.items)
     expect(result.records).toBe(basePrev.records)
@@ -244,7 +244,7 @@ describe('decoded patch pipeline — production DisplayViewSnapshot', () => {
     expect(ops).toEqual([
       { op: 'replace', path: ['state', 'timelines', 'root', 'messages', 'byId', 'm1', 'presentation', 'partialStdout'], value: 'hello world' },
     ])
-    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as DVS
+    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
     expect(result).toEqual(next)
   })
 
@@ -284,7 +284,7 @@ describe('decoded patch pipeline — production DisplayViewSnapshot', () => {
     })
 
     const ops = Effect.runSync(diffDecoded(prev, next, compiled))
-    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as DVS
+    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
     expect(result).toEqual(next)
   })
 
@@ -312,7 +312,7 @@ describe('decoded patch pipeline — production DisplayViewSnapshot', () => {
     }
 
     const ops = Effect.runSync(diffDecoded(prev, next, compiled))
-    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as DVS
+    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
     expect(result).toEqual(next)
   })
 
@@ -320,7 +320,7 @@ describe('decoded patch pipeline — production DisplayViewSnapshot', () => {
     const prev = makeSnapshot('hello')
     const next = makeSnapshot('hello world')
     const ops = Effect.runSync(diffDecoded(prev, next, compiled))
-    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled)) as DVS
+    const result = Effect.runSync(applyDecodedPatch(prev, ops, compiled))
     // Unchanged parts should keep same reference
     expect(result.state.session).toBe(prev.state.session)
     expect(result.state.tasks).toBe(prev.state.tasks)

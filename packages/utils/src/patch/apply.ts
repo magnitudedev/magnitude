@@ -305,12 +305,12 @@ export function applyDecodedPatch<A extends DecodedValue>(
   prev: A,
   ops: readonly DecodedPatchOp[],
   compiled: CompiledMap<DecodedValue>,
-): Effect.Effect<DecodedValue, PatchApplyError> {
+): Effect.Effect<A, PatchApplyError> {
   return Effect.gen(function* () {
     let current: DecodedValue = prev
     for (const op of ops) {
       current = yield* applyOp(current, op, compiled, current)
     }
-    return current
+    return current as A
   })
 }

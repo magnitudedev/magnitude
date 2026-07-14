@@ -229,10 +229,7 @@ describe('applyStreamEvent', () => {
       'view-1',
     ))
 
-    expect(store.getSnapshot().state.timelines.root?.presentation.entries).toEqual([{
-      ...entry,
-      _key: 'entry-1',
-    }])
+    expect(store.getSnapshot().state.timelines.root?.presentation.entries).toEqual([entry])
 
     Effect.runSync(applyStreamEvent(
       store,
@@ -251,7 +248,6 @@ describe('applyStreamEvent', () => {
 
     expect(store.getSnapshot().state.timelines.root?.presentation.entries[0]).toEqual({
       ...entry,
-      _key: 'entry-1',
       streaming: false,
     })
   })
