@@ -70,7 +70,7 @@ async function main() {
         : undefined
 
       const platform = createTerminalPlatform({ spawnCommand, debug: opts.debug })
-      const agentClientTag = createAgentClient(platform.daemonSpawnerLayer)
+      const agentClientTag = createAgentClient(platform.protocolLayer)
       const renderer = await createCliRenderer({
         exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
       })

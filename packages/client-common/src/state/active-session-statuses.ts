@@ -1,16 +1,14 @@
 import { useMemo } from "react"
 import { Atom, useAtomMount, useAtomSet } from "@effect-atom/atom-react"
-import { Cause, Effect, Fiber, Layer, Stream } from "effect"
+import { Cause, Effect, Fiber, Stream } from "effect"
 import { RpcClient } from "@effect/rpc"
-import { FetchHttpClient } from "@effect/platform"
 import {
   MagnitudeRpcs,
-  recoveringProtocolLayer,
   type ActiveSessionStatus,
   type ActiveSessionStatuses,
   type ActiveSessionStatusesWireEvent,
-  type DaemonSpawnerTag,
 } from "@magnitudedev/sdk"
+import type { Layer } from "effect"
 import { usePlatform } from "../platform/platform-context"
 
 export type ActiveSessionStatusById = Readonly<Record<string, ActiveSessionStatus>>
@@ -23,11 +21,6 @@ interface ActiveSessionStatusCallbacks {
 
 let currentFiber: Fiber.RuntimeFiber<void, unknown> | null = null
 
-const buildStreamLayer = (daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>) =>
-  recoveringProtocolLayer().pipe(
-    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, daemonSpawnerLayer)),
-  )
-
 const isSnapshot = (event: ActiveSessionStatusesWireEvent): event is ActiveSessionStatuses =>
   !("_tag" in event && event._tag === "heartbeat")
 
@@ -39,8 +32,13 @@ const toStatusById = (snapshot: ActiveSessionStatuses): ActiveSessionStatusById 
   return byId
 }
 
+/**
+ * Subscribe to the active session statuses stream using a shared protocol
+ * layer. The fiber is managed externally — interrupt via
+ * `interruptActiveSessionStatuses`.
+ */
 export function subscribeActiveSessionStatuses(
-  daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>,
+  protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
   callbacks: ActiveSessionStatusCallbacks,
 ): void {
   interruptActiveSessionStatuses()
@@ -57,7 +55,7 @@ export function subscribeActiveSessionStatuses(
       Effect.logError(`StreamActiveSessionStatuses error: ${Cause.pretty(cause)}`),
     ),
     Effect.scoped,
-    Effect.provide(buildStreamLayer(daemonSpawnerLayer)),
+    Effect.provide(protocolLayer),
   )
 
   currentFiber = Effect.runFork(effect)
@@ -78,7 +76,7 @@ export function useActiveSessionStatusesSubscription(): void {
     () =>
       Atom.make(
         Effect.gen(function* () {
-          subscribeActiveSessionStatuses(platform.daemonSpawnerLayer, {
+          subscribeActiveSessionStatuses(platform.protocolLayer, {
             onSnapshot: (snapshot) => setStatuses(toStatusById(snapshot)),
           })
           yield* Effect.addFinalizer(() =>
@@ -89,7 +87,7 @@ export function useActiveSessionStatusesSubscription(): void {
           )
         }),
       ),
-    [platform.daemonSpawnerLayer, setStatuses],
+    [platform.protocolLayer, setStatuses],
   )
 
   useAtomMount(subscriptionAtom)

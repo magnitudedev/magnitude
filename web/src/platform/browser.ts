@@ -5,7 +5,8 @@
  */
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { DaemonSpawnerTag, makeRemoteDaemonSpawner } from "@magnitudedev/sdk"
+import { RpcClient } from "@effect/rpc"
+import { DaemonSpawnerTag, makeRemoteDaemonSpawner, recoveringProtocolLayer } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 
 // Experimental File System Access API — only available in Chromium browsers.
@@ -109,12 +110,16 @@ const browserDialogs: Dialogs = {
 }
 
 export function createBrowserPlatform(proxyUrl: string = ""): Platform {
+  const daemonSpawnerLayer = Layer.effect(
+    DaemonSpawnerTag,
+    makeRemoteDaemonSpawner(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
+  )
+  const protocolLayer = recoveringProtocolLayer().pipe(
+    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, daemonSpawnerLayer)),
+  )
   return {
     id: "web",
-    daemonSpawnerLayer: Layer.effect(
-      DaemonSpawnerTag,
-      makeRemoteDaemonSpawner(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
-    ),
+    protocolLayer,
     clipboard: browserClipboard,
     storage: browserStorage,
     notifications: browserNotifications,

@@ -1,11 +1,8 @@
-import { Cause, Effect, Fiber, Layer, Ref, Runtime, Schedule, Stream } from "effect"
-import { FetchHttpClient } from "@effect/platform"
+import { Cause, Effect, Fiber, Queue, Ref, Scope, Schedule, Stream } from "effect"
 import { RpcClient } from "@effect/rpc"
 import {
   forkIdToKey,
   MagnitudeRpcs,
-  recoveringProtocolLayer,
-  type DaemonSpawnerTag,
   type DisplayTimeline,
   type DisplayViewShape,
   type StreamDisplayViewFailure,
@@ -59,19 +56,21 @@ export interface DisplayViewControllerSnapshot {
 }
 
 export interface DisplayViewControllerOptions {
-  readonly daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>
   readonly displaySync: DisplaySyncSink
   readonly onRestoreQueuedInputText?: (text: string | null) => void
 }
 
 type Listener = () => void
 
+type Command =
+  | { readonly _tag: "set-shape"; readonly sessionId: string; readonly viewId: string; readonly shape: DisplayViewShape; readonly generation: number; readonly requestId: number }
+  | { readonly _tag: "resync"; readonly sessionId: string; readonly viewId: string; readonly generation: number }
+  | { readonly _tag: "close-view"; readonly sessionId: string; readonly viewId: string }
+
 const viewIdForSession = (sessionId: string): string => `main:${sessionId}`
 
-const buildRpcLayer = (daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>) =>
-  recoveringProtocolLayer().pipe(
-    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, daemonSpawnerLayer)),
-  )
+const makeClient = () => RpcClient.make(MagnitudeRpcs)
+type DisplayRpcClient = Effect.Effect.Success<ReturnType<typeof makeClient>>
 
 const sameTimelineShape = (
   left: DisplayViewShape["timelines"][string],
@@ -114,23 +113,113 @@ const initialSnapshot = (): DisplayViewControllerSnapshot => ({
 })
 
 export class DisplayViewControllerCore {
-  private readonly daemonSpawnerLayer: Layer.Layer<DaemonSpawnerTag, never, never>
+  private readonly client: DisplayRpcClient
   private readonly displaySync: DisplaySyncSink
   private readonly onRestoreQueuedInputText: ((text: string | null) => void) | undefined
   private readonly listeners = new Set<Listener>()
   private snapshot: DisplayViewControllerSnapshot = initialSnapshot()
   private streamFiber: Fiber.RuntimeFiber<void, unknown> | null = null
-  private commandChain: Promise<void> = Promise.resolve()
+  private readonly commandQueue: Queue.Queue<Command>
+  private commandFiber: Fiber.RuntimeFiber<void, never> | null = null
   private disposed = false
   private streamGeneration = 0
   private shapeRequestId = 0
   private lastRequestedShape: DisplayViewShape = EMPTY_DISPLAY_VIEW_SHAPE
 
-  constructor(options: DisplayViewControllerOptions) {
-    this.daemonSpawnerLayer = options.daemonSpawnerLayer
+  private constructor(
+    client: DisplayRpcClient,
+    commandQueue: Queue.Queue<Command>,
+    commandFiber: Fiber.RuntimeFiber<void, never>,
+    options: DisplayViewControllerOptions,
+  ) {
+    this.client = client
+    this.commandQueue = commandQueue
+    this.commandFiber = commandFiber
     this.displaySync = options.displaySync
     this.onRestoreQueuedInputText = options.onRestoreQueuedInputText
     this.resetAcceptedStore()
+  }
+
+  /**
+   * Factory — bakes in the protocol dependency. Creates one RpcClient from
+   * the shared protocol layer, one command queue + fiber, and returns the
+   * controller. The scope finalizer interrupts all fibers and shuts down
+   * the queue.
+   */
+  static make = (options: DisplayViewControllerOptions): Effect.Effect<
+    DisplayViewControllerCore,
+    never,
+    RpcClient.Protocol | Scope.Scope
+  > =>
+    Effect.gen(function* () {
+      const client = yield* RpcClient.make(MagnitudeRpcs)
+      const queue = yield* Queue.unbounded<Command>()
+
+      const controller = new DisplayViewControllerCore(client, queue, null!, options)
+
+      const commandFiber = yield* Effect.fork(
+        controller.runCommandLoop(),
+      )
+      controller.commandFiber = commandFiber
+
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          controller.dispose()
+        }),
+      )
+
+      return controller
+    })
+
+  /**
+   * Single fiber drains the command queue serially — same serialization
+   * semantics as the old Promise commandChain, but proper Effect. The client
+   * is baked in from construction.
+   */
+  private runCommandLoop = (): Effect.Effect<void, never, never> =>
+    Stream.fromQueue(this.commandQueue).pipe(
+      Stream.runForEach((cmd) =>
+        this.executeCommand(cmd).pipe(
+          Effect.catchAll((error) =>
+            Effect.logWarning(`Display view controller command failed (${cmd._tag})`).pipe(
+              Effect.annotateLogs({
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            ),
+          ),
+        ),
+      ),
+    )
+
+  private executeCommand = (cmd: Command): Effect.Effect<void, unknown, never> => {
+    switch (cmd._tag) {
+      case "set-shape": {
+        if (!this.isCurrent(cmd.generation, cmd.sessionId)) return Effect.void
+        if (this.snapshot.phase !== "open" || cmd.requestId !== this.shapeRequestId) return Effect.void
+        return this.client.SetDisplayViewShape({ sessionId: cmd.sessionId, viewId: cmd.viewId, shape: cmd.shape }).pipe(
+          Effect.catchAll((error) =>
+            Effect.gen(this, function* () {
+              if (!this.isCurrent(cmd.generation, cmd.sessionId) || cmd.requestId !== this.shapeRequestId) return
+              yield* Effect.logWarning(
+                `Failed to set display view shape; reopening display stream: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              )
+              this.reopenStream(cmd.sessionId, "reconnecting")
+            }),
+          ),
+        )
+      }
+      case "resync": {
+        if (!this.isCurrent(cmd.generation, cmd.sessionId)) return Effect.void
+        return this.client.ResyncDisplayView({ sessionId: cmd.sessionId, viewId: cmd.viewId })
+      }
+      case "close-view": {
+        return this.client.CloseDisplayView({ sessionId: cmd.sessionId, viewId: cmd.viewId }).pipe(
+          Effect.catchAll(() => Effect.void),
+        )
+      }
+    }
   }
 
   getSnapshot = (): DisplayViewControllerSnapshot => this.snapshot
@@ -212,12 +301,9 @@ export class DisplayViewControllerCore {
     const { selectedSessionId, viewId } = this.snapshot
     const generation = this.streamGeneration
     if (!selectedSessionId || !viewId) return
-    this.enqueueCommand("resync", async () => {
-      if (!this.isCurrent(generation, selectedSessionId)) return
-      await this.runRpc((client) =>
-        client.ResyncDisplayView({ sessionId: selectedSessionId, viewId })
-      )
-    })
+    Effect.runFork(
+      Queue.offer(this.commandQueue, { _tag: "resync", sessionId: selectedSessionId, viewId, generation }),
+    )
   }
 
   stop = (): void => {
@@ -233,6 +319,11 @@ export class DisplayViewControllerCore {
 
   dispose = (): void => {
     this.stop()
+    if (this.commandFiber) {
+      Effect.runFork(Fiber.interrupt(this.commandFiber))
+      this.commandFiber = null
+    }
+    Effect.runSync(Queue.shutdown(this.commandQueue))
     this.listeners.clear()
   }
 
@@ -310,28 +401,16 @@ export class DisplayViewControllerCore {
     const requestId = ++this.shapeRequestId
     this.lastRequestedShape = shape
 
-    this.enqueueCommand("set-shape", async () => {
-      if (
-        !this.isCurrent(generation, selectedSessionId) ||
-        this.snapshot.phase !== "open" ||
-        requestId !== this.shapeRequestId
-      ) {
-        return
-      }
-      try {
-        await this.runRpc((client) =>
-          client.SetDisplayViewShape({ sessionId: selectedSessionId, viewId, shape })
-        )
-      } catch (error) {
-        if (!this.isCurrent(generation, selectedSessionId) || requestId !== this.shapeRequestId) return
-        console.warn(
-          `Failed to set display view shape; reopening display stream: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        )
-        this.reopenStream(selectedSessionId, "reconnecting")
-      }
-    })
+    Effect.runFork(
+      Queue.offer(this.commandQueue, {
+        _tag: "set-shape",
+        sessionId: selectedSessionId,
+        viewId,
+        shape,
+        generation,
+        requestId,
+      }),
+    )
   }
 
   private startStream(sessionId: string, phase: "opening" | "reconnecting"): void {
@@ -344,19 +423,19 @@ export class DisplayViewControllerCore {
       event._tag !== "heartbeat"
 
     const streamEffect = Effect.gen(this, function* () {
-      const client = yield* RpcClient.make(MagnitudeRpcs)
       const wasReconnecting = yield* Ref.make(phase === "reconnecting")
       let hasReceivedEvent = false
-      const rt = yield* Effect.runtime()
 
       const resync = (sid: string, targetViewId: string): void => {
         if (!this.isCurrent(generation, sessionId)) return
-        this.enqueueCommand("resync", async () => {
-          if (!this.isCurrent(generation, sessionId)) return
-          await Runtime.runPromise(rt)(
-            client.ResyncDisplayView({ sessionId: sid, viewId: targetViewId })
-          )
-        })
+        Effect.runFork(
+          Queue.offer(this.commandQueue, {
+            _tag: "resync",
+            sessionId: sid,
+            viewId: targetViewId,
+            generation,
+          }),
+        )
       }
 
       const buildStream = () =>
@@ -365,7 +444,7 @@ export class DisplayViewControllerCore {
             if (!this.isCurrent(generation, sessionId)) return Stream.empty
             const shape = desiredShapeForSnapshot(this.snapshot)
             this.lastRequestedShape = shape
-            return client.StreamDisplayView({ sessionId, viewId, shape }).pipe(
+            return this.client.StreamDisplayView({ sessionId, viewId, shape }).pipe(
               Stream.filter(isDisplayEvent),
               Stream.tap((event) =>
                 Effect.gen(this, function* () {
@@ -467,7 +546,6 @@ export class DisplayViewControllerCore {
             }),
       ),
       Effect.scoped,
-      Effect.provide(buildRpcLayer(this.daemonSpawnerLayer)),
     )
 
     this.streamFiber = Effect.runFork(streamEffect)
@@ -485,16 +563,13 @@ export class DisplayViewControllerCore {
     this.shapeRequestId++
     this.lastRequestedShape = EMPTY_DISPLAY_VIEW_SHAPE
     if (!closeRemote || !selectedSessionId || !viewId) return
-    this.enqueueCommand("close-view", async () => {
-      try {
-        await this.runRpc((client) =>
-          client.CloseDisplayView({ sessionId: selectedSessionId, viewId })
-        )
-      } catch {
-        // Best-effort cleanup. ACN also releases stream registrations when the
-        // interrupted stream detaches.
-      }
-    })
+    Effect.runFork(
+      Queue.offer(this.commandQueue, {
+        _tag: "close-view",
+        sessionId: selectedSessionId,
+        viewId,
+      }),
+    )
   }
 
   private interruptStream(): void {
@@ -505,32 +580,6 @@ export class DisplayViewControllerCore {
 
   private resetAcceptedStore(): void {
     this.displaySync.resetAccepted({ shape: EMPTY_DISPLAY_VIEW_SHAPE, state: EMPTY_DISPLAY_STATE })
-  }
-
-  private enqueueCommand(name: string, command: () => Promise<void>): void {
-    this.commandChain = this.commandChain
-      .then(command)
-      .catch((error: unknown) => {
-        console.warn(
-          `Display view controller command failed (${name}): ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        )
-      })
-  }
-
-  private async runRpc<A>(
-    run: (client: any) => Effect.Effect<A, unknown, never>,
-  ): Promise<A> {
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        const client = yield* RpcClient.make(MagnitudeRpcs)
-        return yield* run(client)
-      }).pipe(
-        Effect.scoped,
-        Effect.provide(buildRpcLayer(this.daemonSpawnerLayer)),
-      ),
-    )
   }
 
   private isCurrent(generation: number, sessionId: string): boolean {

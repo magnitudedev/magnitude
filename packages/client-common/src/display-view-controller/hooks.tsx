@@ -4,6 +4,7 @@ import {
   useContext,
   useMemo,
   useRef,
+  useState,
   useSyncExternalStore,
   type ReactNode,
 } from "react"
@@ -55,44 +56,46 @@ export function DisplayViewControllerProvider({
     () => createDisplayViewStore(initial, EMPTY_DISPLAY_VIEW_SHAPE),
     [initial],
   )
-  const controller = useMemo(
-    () =>
-      new DisplayViewControllerCore({
-        daemonSpawnerLayer: platform.daemonSpawnerLayer,
-        displaySync: store,
-        onRestoreQueuedInputText: (text) => {
-          if (text != null) {
-            setComposerText(text)
-            setComposerAttachments([])
-            setComposerHistoryIndex(-1)
-          } else {
-            setComposerText("")
-            setComposerAttachments([])
-            setComposerHistoryIndex(-1)
-          }
-        },
-      }),
-    [platform.daemonSpawnerLayer, setComposerText, setComposerAttachments, setComposerHistoryIndex, store],
-  )
+  const [controller, setController] = useState<DisplayViewControllerCore | null>(null)
 
-  const lifecycleAtom = useMemo(
+  const factoryAtom = useMemo(
     () =>
       Atom.make(
         Effect.gen(function* () {
+          const controller = yield* DisplayViewControllerCore.make({
+            displaySync: store,
+            onRestoreQueuedInputText: (text: string | null) => {
+              if (text != null) {
+                setComposerText(text)
+                setComposerAttachments([])
+                setComposerHistoryIndex(-1)
+              } else {
+                setComposerText("")
+                setComposerAttachments([])
+                setComposerHistoryIndex(-1)
+              }
+            },
+          }).pipe(Effect.provide(platform.protocolLayer))
+
           activeController = controller
+          setController(controller)
+
           yield* Effect.addFinalizer(() =>
             Effect.sync(() => {
               if (activeController === controller) {
                 activeController = null
               }
               controller.dispose()
+              setController(null)
             }),
           )
         }),
       ),
-    [controller],
+    [platform.protocolLayer, setComposerText, setComposerAttachments, setComposerHistoryIndex, store],
   )
-  useAtomMount(lifecycleAtom)
+  useAtomMount(factoryAtom)
+
+  if (!controller) return null
 
   return (
     <DisplayViewControllerContext.Provider value={controller}>

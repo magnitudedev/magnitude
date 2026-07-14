@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
-import { Layer } from "effect"
-import type { DaemonSpawnerTag, DisplayTimeline } from "@magnitudedev/sdk"
+import { Effect, Layer } from "effect"
+import { RpcClient } from "@effect/rpc"
+import type { DisplayTimeline } from "@magnitudedev/sdk"
 import {
   createDisplayViewStore,
   displayShapeFor,
@@ -15,16 +16,23 @@ import {
   timelineStatusFor,
 } from "./controller"
 
-const daemonSpawnerLayer = Layer.empty as unknown as Layer.Layer<DaemonSpawnerTag, never, never>
+const protocolLayer: Layer.Layer<RpcClient.Protocol, never, never> = Layer.scoped(
+  RpcClient.Protocol,
+  RpcClient.Protocol.make(() =>
+    Effect.succeed({
+      send: () => Effect.void,
+      supportsAck: false,
+      supportsTransferables: false,
+    }),
+  ),
+)
 
-const makeController = (): DisplayViewControllerCore =>
-  new DisplayViewControllerCore({
-    daemonSpawnerLayer,
-    displaySync: createDisplayViewStore(
-      EMPTY_DISPLAY_STATE,
-      EMPTY_DISPLAY_VIEW_SHAPE,
-    ),
-  })
+const makeController = (): Promise<DisplayViewControllerCore> =>
+  Effect.runPromise(
+    DisplayViewControllerCore.make({
+      displaySync: createDisplayViewStore(EMPTY_DISPLAY_STATE, EMPTY_DISPLAY_VIEW_SHAPE),
+    }).pipe(Effect.scoped, Effect.provide(protocolLayer)),
+  )
 
 const emptyTimeline = (): DisplayTimeline => ({
   mode: "idle",
@@ -35,8 +43,8 @@ const emptyTimeline = (): DisplayTimeline => ({
 })
 
 describe("DisplayViewControllerCore", () => {
-  it("derives worker shape from the visible fork stack", () => {
-    const controller = makeController()
+  it("derives worker shape from the visible fork stack", async () => {
+    const controller = await makeController()
 
     controller.pushFork("worker-a")
     const afterPush = controller.getSnapshot()
@@ -56,8 +64,8 @@ describe("DisplayViewControllerCore", () => {
     expect(Object.keys(desiredShapeForSnapshot(afterPop).timelines)).toEqual(["root"])
   })
 
-  it("replaces worker shape when fork stack changes instead of retaining old workers", () => {
-    const controller = makeController()
+  it("replaces worker shape when fork stack changes instead of retaining old workers", async () => {
+    const controller = await makeController()
 
     controller.setForkStack(["worker-a", "worker-b"])
     expect(Object.keys(desiredShapeForSnapshot(controller.getSnapshot()).timelines).sort()).toEqual([

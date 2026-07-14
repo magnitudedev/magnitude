@@ -3,7 +3,7 @@
  * provides it to components via React context.
  *
  * At renderer startup:
- * 1. Call createAgentClient(daemonSpawnerLayer) — this creates the AtomRpc.Tag and
+ * 1. Call createAgentClient(protocolLayer) — this creates the AtomRpc.Tag and
  *    calls Atom.runtime.addGlobalLayer(tag.layer)
  * 2. Wrap the app in <AgentClientProvider tag={tag}>
  * 3. Components use useAgentClient() to call .query() and .mutation()

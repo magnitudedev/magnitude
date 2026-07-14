@@ -62,7 +62,7 @@ function renderDaemonError(message: string) {
 
 function renderApp() {
   const platform = createDesktopPlatform(desktopApi)
-  const agentClientTag = createAgentClient(platform.daemonSpawnerLayer)
+  const agentClientTag = createAgentClient(platform.protocolLayer)
   root.render(
     <PlatformProvider platform={platform}>
       <RegistryProvider defaultIdleTTL={5000}>
