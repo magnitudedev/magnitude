@@ -11,6 +11,7 @@ import {
   useComposerState,
   useInterruptActions,
   useSessionActions,
+  useModelConfig,
   useSlotProfiles,
   useDisplayState,
   getFork,
@@ -33,6 +34,7 @@ import { showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
 import { INIT_PROMPT } from '../../commands/init-prompt'
 import { Composer } from './composer'
+import { allowProviderMessageSend, hasExplicitModelSlots } from './provider-send-guard'
 
 export function ComposerContainer({
   chatColumnWidth,
@@ -59,6 +61,20 @@ export function ComposerContainer({
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
   const { startNewSession } = useSessionActions()
+  const { slotConfig } = useModelConfig()
+
+  // The onboarding snapshot and model configuration are invalidated by the
+  // same activation mutation, but they are separate RPC projections. During
+  // the transition out of onboarding, the snapshot can briefly retain its
+  // pre-activation value while GetCachedModelList already contains the slots
+  // that were just persisted. Explicit slots are sufficient proof that a
+  // provider is configured; provider availability failures belong to the send
+  // path and must be surfaced as their real error, not as "not configured".
+  const canSendMessages = modelsConfigured || hasExplicitModelSlots(slotConfig)
+
+  const showErrorToast = useCallback((message: string) => {
+    addEphemeralMessage(message, theme.error)
+  }, [theme.error])
 
   // Slash commands may trigger a send (skills, /init) — the hook that owns
   // sending is constructed with this context, so route through a ref.
@@ -84,7 +100,8 @@ export function ComposerContainer({
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
-    if (modelsConfigured) composer.handleSend(text)
+    if (!allowProviderMessageSend(canSendMessages, showErrorToast)) return
+    composer.handleSend(text)
   }
 
   const { interrupt, interruptAll } = useInterruptActions()
@@ -128,7 +145,7 @@ export function ComposerContainer({
       status={rootTimeline?.mode ?? 'idle'}
       hasRunningForks={(rootActor?.work.activeChildCount ?? 0) > 0}
       bashMode={composer.bashMode}
-      modelsConfigured={modelsConfigured}
+      modelsConfigured={canSendMessages}
       modelSummary={{
         role: rootRoleLabel,
         model: composer.model || '-',

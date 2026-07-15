@@ -37,6 +37,7 @@ import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom, co
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
+import { allowProviderMessageSend } from './provider-send-guard'
 
 export type PendingImageAttachment = RawImageAttachment
 
@@ -556,7 +557,7 @@ export function Composer(props: ComposerProps) {
       clearComposer()
       return
     }
-    if (!modelsConfigured) return
+    if (!allowProviderMessageSend(modelsConfigured, showToast)) return
 
     clearSystemBanners()
 
