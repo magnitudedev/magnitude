@@ -24,7 +24,9 @@ describe("local inference recommendation policy", () => {
     [64, "Qwen3.6 35B-A3B"],
     [96, "Qwen3.6 35B-A3B"],
     [128, "NVIDIA Nemotron 3 Super 120B-A12B"],
-    [640, "GLM 5.2"],
+    [256, "DeepSeek V4 Flash 284B-A13B"],
+    [512, "NVIDIA Nemotron 3 Ultra 550B-A55B"],
+    [640, "GLM 5.2 753B-A40B"],
   ])("returns a deterministic balanced tier for %i GiB", (gib, expected) => {
     const recommendation = recommendLocalModels(cpu(gib))[0]
     expect(recommendation?.displayName).toBe(expected)
@@ -45,8 +47,46 @@ describe("local inference recommendation policy", () => {
     const recommendations = recommendLocalModels(cpu(64))
     const lighter = recommendations.find((item) => item.badge === "lighter")
 
-    expect(lighter?.displayName).toBe("Gemma 4 26B-A4B")
+    expect(lighter?.displayName).toBe("Gemma 4 12B")
     expect(lighter?.contextTokens).toBe(131_072)
+  })
+
+  test("returns three distinct models whenever three fit", () => {
+    for (const gib of [16, 24, 32, 48, 64, 128, 256, 512, 640]) {
+      const recommendations = recommendLocalModels(cpu(gib))
+      expect(recommendations, `${gib} GiB`).toHaveLength(3)
+      expect(new Set(recommendations.map((item) => item.catalogModelId.split(":")[0])).size, `${gib} GiB`).toBe(3)
+    }
+  })
+
+  test("keeps Qwen3.5 122B alongside Nemotron Super in the workstation tier", () => {
+    const recommendations = recommendLocalModels(cpu(128))
+    const names = recommendations.map((item) => item.displayName)
+    expect(names).toContain("NVIDIA Nemotron 3 Super 120B-A12B")
+    expect(names).toContain("Qwen3.5 122B-A10B")
+    expect(recommendations.find((item) => item.badge === "lighter")?.displayName).toBe("Qwen3.6 35B-A3B")
+  })
+
+  test("uses DeepSeek as the meaningful smaller step below GLM without changing the Ultra tier", () => {
+    expect(recommendLocalModels(cpu(512)).find((item) => item.badge === "lighter")?.displayName).toBe(
+      "Qwen3.5 122B-A10B",
+    )
+    expect(recommendLocalModels(cpu(640)).find((item) => item.badge === "lighter")?.displayName).toBe(
+      "DeepSeek V4 Flash 284B-A13B",
+    )
+  })
+
+  test("uses the higher-fidelity badge only for another quant of the primary model", () => {
+    for (let gib = 12; gib <= 640; gib += 4) {
+      const recommendations = recommendLocalModels(cpu(gib))
+      const primary = recommendations.find((item) => item.badge === "recommended")
+      const higherFidelity = recommendations.find((item) => item.badge === "higher_fidelity")
+      if (higherFidelity) {
+        expect(higherFidelity.catalogModelId.split(":")[0], `${gib} GiB`).toBe(
+          primary?.catalogModelId.split(":")[0],
+        )
+      }
+    }
   })
 
   test("uses the named stable OS reserve", () => {
@@ -135,6 +175,8 @@ describe("local inference recommendation policy", () => {
 
   test("treats very large models as normal capacity-gated recommendations", () => {
     expect(recommendLocalModels(cpu(128))[0]?.quantization.bitsClass).toBe("mxfp4")
-    expect(recommendLocalModels(cpu(640))[0]?.displayName).toBe("GLM 5.2")
+    expect(recommendLocalModels(cpu(256))[0]?.displayName).toBe("DeepSeek V4 Flash 284B-A13B")
+    expect(recommendLocalModels(cpu(512))[0]?.displayName).toBe("NVIDIA Nemotron 3 Ultra 550B-A55B")
+    expect(recommendLocalModels(cpu(640))[0]?.displayName).toBe("GLM 5.2 753B-A40B")
   })
 })

@@ -33,6 +33,7 @@ export interface LocalModelCatalogEntry {
   readonly architecture: "dense" | "moe"
   readonly totalParametersBillions?: number
   readonly activeParametersBillions?: number
+  readonly effectiveParametersBillions?: number
   readonly modelMaximumContextTokens: number
   /** Contexts supported by the model and covered by the conservative estimator. */
   readonly supportedContextTokens: readonly number[]

@@ -24,7 +24,11 @@ vi.mock("../../hooks/use-theme", () => ({
 vi.mock("../../components/button", () => ({
   Button: ({ children }: { children?: unknown }) => <button>{children as never}</button>,
 }))
-const { LocalInferenceOnboardingView } = await import("./screen")
+const {
+  LOCAL_MODEL_SECTION_WIDTH,
+  LocalInferenceOnboardingView,
+  localModelSectionRule,
+} = await import("./screen")
 
 const snapshot: LocalInferenceOnboardingSnapshot = {
   schemaVersion: 2,
@@ -128,6 +132,15 @@ test("renders stable capacity and exact recommendation metadata without an API-k
   expect(html).not.toContain("Paste your API key")
 })
 
+test("ends every model section heading at the same column", () => {
+  for (const label of ["RUNNING NOW", "DOWNLOADED", "POSSIBLE DOWNLOADS", "RECOMMENDED DOWNLOADS"]) {
+    expect(`${label}  ${localModelSectionRule(label)}`).toHaveLength(LOCAL_MODEL_SECTION_WIDTH)
+  }
+  expect(localModelSectionRule("RUNNING NOW").length).toBeGreaterThan(
+    localModelSectionRule("POSSIBLE DOWNLOADS").length,
+  )
+})
+
 test("shows recommendations while the CTO-owned llama.cpp bootstrap boundary is pending", () => {
   const html = renderToStaticMarkup(
     <LocalInferenceOnboardingView
@@ -222,7 +235,7 @@ test("separates running inventory from possible downloads", () => {
   expect(html).toContain("Q6_K · 32.6 GB · 35.5B parameters · 200K context")
   expect(html).not.toContain("Server-reported Q6 fidelity")
   expect(html).toContain("Already Running")
-  expect(html).toContain("Higher Fidelity Option")
+  expect(html).toContain("Recommended")
   expect(html).not.toContain("cpu or unified")
   expect(html).not.toContain("unknown")
 })
