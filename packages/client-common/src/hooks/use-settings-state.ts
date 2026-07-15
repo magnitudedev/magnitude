@@ -22,6 +22,10 @@ export interface UseSettingsStateResult {
   keyAlreadySet: boolean
   /** Whether the query is loading */
   loading: boolean
+  /** Whether provider auth is being changed */
+  saving: boolean
+  /** Authoritative provider-auth mutation failure */
+  saveError: string | null
   /** Save a new API key */
   saveApiKey: (key: string) => Promise<void>
   /** Disconnect (clear) the API key */
@@ -50,10 +54,17 @@ export function useSettingsState(): UseSettingsStateResult {
     client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
   )
 
+  const updateProviderAuthAtom = client.mutation("UpdateProviderAuth")
+  const updateProviderAuthResult = useAtomValue(updateProviderAuthAtom)
   const updateProviderAuth = useAtomSet(
-    client.mutation("UpdateProviderAuth"),
+    updateProviderAuthAtom,
     { mode: "promise" },
   )
+
+  const saving = Result.isWaiting(updateProviderAuthResult)
+  const saveError = Result.isFailure(updateProviderAuthResult)
+    ? "Failed to update the Magnitude API key"
+    : null
 
   const loading = Result.isInitial(result)
   const keyAlreadySet = Result.match(result, {
@@ -93,5 +104,5 @@ export function useSettingsState(): UseSettingsStateResult {
     setApiKeyVerified(false)
   }
 
-  return { apiKey, keyAlreadySet, loading, saveApiKey, disconnectApiKey }
+  return { apiKey, keyAlreadySet, loading, saving, saveError, saveApiKey, disconnectApiKey }
 }

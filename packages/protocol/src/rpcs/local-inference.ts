@@ -4,6 +4,7 @@ import { SessionError } from "../errors"
 import {
   LocalInferenceOnboardingSnapshot,
   LocalInferenceUsageSelection,
+  LocalModelDownloadProgress,
   LocalModelDownloadWireEvent,
 } from "../schemas/local-inference"
 
@@ -28,6 +29,12 @@ export const ConfigureLocalInferenceUsage = Rpc.make(
 export const StartLocalModelDownload = Rpc.make("StartLocalModelDownload", {
   payload: Schema.Struct({ configurationId: Schema.String }),
   success: Schema.Struct({ operationId: Schema.String }),
+  error: SessionError,
+})
+
+export const GetLocalModelDownloadProgress = Rpc.make("GetLocalModelDownloadProgress", {
+  payload: Schema.Struct({ operationId: Schema.String }),
+  success: Schema.NullOr(LocalModelDownloadProgress),
   error: SessionError,
 })
 

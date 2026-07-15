@@ -345,6 +345,12 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localInference.startDownload(configurationId),
         ),
 
+      GetLocalModelDownloadProgress: ({ operationId }) =>
+        observeRpcDefects(
+          "GetLocalModelDownloadProgress",
+          localInference.getDownloadProgress(operationId),
+        ),
+
       SubscribeLocalModelDownload: ({ operationId }) =>
         observeRpcStreamDefects(
           "SubscribeLocalModelDownload",

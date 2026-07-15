@@ -67,6 +67,8 @@ interface MagnitudeLoginScreenProps {
   onExit: () => void
   onBack?: () => void
   onSkip?: () => Promise<void> | void
+  busy?: boolean
+  error?: string | null
 }
 
 export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
@@ -74,12 +76,13 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   onExit,
   onBack,
   onSkip,
+  busy = false,
+  error: serverError = null,
 }: MagnitudeLoginScreenProps) {
   const theme = useTheme()
   const client = useAgentClient()
   const [apiKey, setApiKey] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [submitting, setSubmitting] = useState(false)
+  const [validationError, setValidationError] = useState<string | null>(null)
   const [continueHovered, setContinueHovered] = useState(false)
   const [copyHovered, setCopyHovered] = useState(false)
   const [skipHovered, setSkipHovered] = useState(false)
@@ -92,33 +95,28 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   const profilesResult = useAtomValue(slotProfilesAtom)
   const slotProfiles = Result.isSuccess(profilesResult) ? profilesResult.value : null
 
-  const handleSubmit = useCallback(async () => {
-    if (submitting) return
+  const error = validationError ?? serverError
+
+  const handleSubmit = useCallback(() => {
+    if (busy) return
     const trimmed = apiKey.trim()
     if (!trimmed) {
-      setError('API key is required')
+      setValidationError('API key is required')
       return
     }
-    setSubmitting(true)
+    setValidationError(null)
     try {
-      await onSubmit(trimmed)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save key')
-      setSubmitting(false)
-    }
-  }, [apiKey, onSubmit, submitting])
+      void Promise.resolve(onSubmit(trimmed)).catch(() => {})
+    } catch {}
+  }, [apiKey, busy, onSubmit])
 
-  const handleSkip = useCallback(async () => {
-    if (!onSkip || submitting) return
-    setSubmitting(true)
-    setError(null)
+  const handleSkip = useCallback(() => {
+    if (!onSkip || busy) return
+    setValidationError(null)
     try {
-      await onSkip()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to finish model setup')
-      setSubmitting(false)
-    }
-  }, [onSkip, submitting])
+      void Promise.resolve(onSkip()).catch(() => {})
+    } catch {}
+  }, [busy, onSkip])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.name === 'escape' && onSkip) {
@@ -251,7 +249,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
             value={apiKey}
             onChange={(v) => {
               setApiKey(v)
-              setError(null)
+              setValidationError(null)
             }}
             placeholder="Paste API key here"
             focused={true}
@@ -279,7 +277,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
               paddingRight: 1,
             }}>
               <text style={{ fg: continueHovered ? theme.primary : theme.foreground }}>
-                {submitting ? 'Saving...' : 'Connect Cloud (Enter)'}
+                {busy ? 'Saving...' : 'Connect Cloud (Enter)'}
               </text>
             </box>
           </Button>
