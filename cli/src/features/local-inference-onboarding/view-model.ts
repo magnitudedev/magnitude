@@ -63,10 +63,15 @@ export const selectionMetadata = (selection: LocalInferenceSelection): string =>
   const active = selection.kind === "recommendation"
     ? selection.recommendation.activeParametersBillions
     : selection.choice.activeParametersBillions
+  const effective = selection.kind === "recommendation"
+    ? selection.recommendation.effectiveParametersBillions
+    : selection.choice.effectiveParametersBillions
   const parameters = total === undefined
     ? null
     : active !== undefined
     ? `${formatBillions(total)} total / ${formatBillions(active)} active`
+    : effective !== undefined
+      ? `${formatBillions(total)} total / ${formatBillions(effective)} effective`
     : `${formatBillions(total)} parameters`
   const quant = selection.kind === "recommendation"
     ? selection.recommendation.quantization.format

@@ -142,6 +142,17 @@ const artifactBytes = (item: EvaluatedLocalConfiguration): number =>
   item.entry.files.reduce((total, file) => total + file.sizeBytes, 0)
 
 /**
+ * Curated one-step-down choices for tiers where raw byte minimization creates
+ * an unhelpfully large capability jump. Values are model IDs, not artifacts,
+ * so the policy still chooses the best fitting context and quant for that
+ * smaller model on the detected machine.
+ */
+const CURATED_SMALLER_MODEL = new Map<string, string>([
+  ["nemotron-3-super-120b-a12b", "qwen3.6-35b-a3b"],
+  ["glm-5.2", "deepseek-v4-flash"],
+])
+
+/**
  * Context is a property of the selected model artifact, not a reason to pick a
  * different artifact. Collapse each model/quant to its largest fitting context
  * before comparing alternatives such as the lighter recommendation.
@@ -179,6 +190,9 @@ const toRecommendation = (
     architecture: entry.architecture,
     ...(entry.totalParametersBillions !== undefined ? { totalParametersBillions: entry.totalParametersBillions } : {}),
     ...(entry.activeParametersBillions !== undefined ? { activeParametersBillions: entry.activeParametersBillions } : {}),
+    ...(entry.effectiveParametersBillions !== undefined
+      ? { effectiveParametersBillions: entry.effectiveParametersBillions }
+      : {}),
     quantization: {
       format: entry.quantization.format,
       bitsClass: entry.quantization.bitsClass,
@@ -222,8 +236,16 @@ export const recommendLocalModels = (
     { item: recommended, badge: "recommended" },
   ]
 
-  const lighter = largestContextPerArtifact(pool)
-    .filter((item) => item.entry.id !== recommended.entry.id)
+  const smallerPool = largestContextPerArtifact(pool)
+    .filter((item) => item.entry.modelId !== recommended.entry.modelId)
+    .filter((item) => artifactBytes(item) < artifactBytes(recommended))
+  const curatedSmallerModelId = CURATED_SMALLER_MODEL.get(recommended.entry.modelId)
+  const curatedSmaller = curatedSmallerModelId
+    ? smallerPool
+      .filter((item) => item.entry.modelId === curatedSmallerModelId)
+      .sort(recommendedOrder)[0]
+    : undefined
+  const lighter = curatedSmaller ?? smallerPool
     .filter((item) => item.entry.modelQualityRank >= recommended.entry.modelQualityRank - 20)
     .sort((a, b) => artifactBytes(a) - artifactBytes(b) || recommendedOrder(a, b))[0]
   if (lighter) choices.push({ item: lighter, badge: "lighter" })
@@ -233,17 +255,22 @@ export const recommendLocalModels = (
     .filter((item) => item.entry.modelId === recommended.entry.modelId)
     .filter((item) => item.entry.quantization.fidelityRank > recommended.entry.quantization.fidelityRank)
     .sort((a, b) => b.contextTokens - a.contextTokens || b.entry.quantization.fidelityRank - a.entry.quantization.fidelityRank)[0]
-  const nearbyModelHigherFidelity = recommended.entry.modelQualityRank >= 40
-    ? [...pool]
-      .filter((item) => item.entry.id !== recommended.entry.id && item.entry.id !== lighter?.entry.id)
-      .filter((item) => item.entry.modelQualityRank >= recommended.entry.modelQualityRank - 10)
-      .filter((item) => item.entry.quantization.fidelityRank > recommended.entry.quantization.fidelityRank)
-      .sort((a, b) => b.contextTokens - a.contextTokens
-        || b.entry.quantization.fidelityRank - a.entry.quantization.fidelityRank
-        || b.entry.modelQualityRank - a.entry.modelQualityRank)[0]
-    : undefined
-  const higherFidelity = sameModelHigherFidelity ?? nearbyModelHigherFidelity
-  if (higherFidelity) choices.push({ item: higherFidelity, badge: "higher_fidelity" })
+  if (sameModelHigherFidelity) choices.push({ item: sameModelHigherFidelity, badge: "higher_fidelity" })
+
+  // Keep the onboarding choice useful even when the primary artifact is
+  // already the highest-fidelity quant. Prefer a third distinct model so the
+  // cards represent real capability/weight trade-offs, then fall back to a
+  // distinct quant only when fewer than three model families fit.
+  while (choices.length < 3) {
+    const chosenEntryIds = new Set(choices.map(({ item }) => item.entry.id))
+    const chosenModelIds = new Set(choices.map(({ item }) => item.entry.modelId))
+    const remaining = largestContextPerArtifact(pool)
+      .filter((item) => !chosenEntryIds.has(item.entry.id))
+      .sort(recommendedOrder)
+    const alternative = remaining.find((item) => !chosenModelIds.has(item.entry.modelId)) ?? remaining[0]
+    if (!alternative) break
+    choices.push({ item: alternative, badge: "alternative" })
+  }
 
   return choices.slice(0, 3).map(({ item, badge }) => toRecommendation(item, badge))
 }

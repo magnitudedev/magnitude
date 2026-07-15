@@ -28,11 +28,15 @@ describe("local model catalog", () => {
     }
   })
 
-  test("contains the corrected Qwen3.6 35B family and no stale large Qwen3.5 or GLM 5", () => {
+  test("contains the current Qwen and Gemma families without invented model sizes", () => {
     expect(LOCAL_MODEL_CATALOG.some((entry) => entry.modelId === "qwen3.6-35b-a3b")).toBe(true)
     expect(LOCAL_MODEL_CATALOG.some((entry) => entry.modelId.includes("qwen3.5-35"))).toBe(false)
+    expect(LOCAL_MODEL_CATALOG.some((entry) => entry.family === "qwen3")).toBe(false)
+    expect(LOCAL_MODEL_CATALOG.some((entry) => entry.displayName === "Qwen3.5 12B")).toBe(false)
+    expect(LOCAL_MODEL_CATALOG.some((entry) => entry.displayName === "Gemma 4 E2B")).toBe(true)
+    expect(LOCAL_MODEL_CATALOG.some((entry) => entry.displayName === "Gemma 4 12B")).toBe(true)
     expect(LOCAL_MODEL_CATALOG.some((entry) => entry.displayName === "GLM 5")).toBe(false)
-    expect(LOCAL_MODEL_CATALOG.some((entry) => entry.displayName === "GLM 5.2")).toBe(true)
+    expect(LOCAL_MODEL_CATALOG.some((entry) => entry.displayName === "GLM 5.2 753B-A40B")).toBe(true)
   })
 
   test("pins the reviewed representative artifacts", () => {
@@ -52,7 +56,39 @@ describe("local model catalog", () => {
       quantAwareCheckpoint: true,
       bitsClass: "q4",
     })
+    expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "gemma-4-e2b-it-qat:UD-Q4_K_XL")).toMatchObject({
+      displayName: "Gemma 4 E2B",
+      totalParametersBillions: 5.1,
+      effectiveParametersBillions: 2.3,
+      modelMaximumContextTokens: 131_072,
+      files: [{ sizeBytes: 2_620_368_960 }],
+    })
+    expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "gemma-4-12b-it-qat:UD-Q4_K_XL")).toMatchObject({
+      displayName: "Gemma 4 12B",
+      totalParametersBillions: 11.95,
+      modelMaximumContextTokens: 262_144,
+      files: [{ sizeBytes: 6_716_355_328 }],
+    })
     expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "nemotron-3-super-120b-a12b:MXFP4_MOE")?.files).toHaveLength(3)
+  })
+
+  test("includes the restored workstation and very-large capacity tiers", () => {
+    expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "qwen3.5-122b-a10b:UD-Q4_K_XL")).toMatchObject({
+      totalParametersBillions: 122,
+      activeParametersBillions: 10,
+      files: expect.arrayContaining([expect.objectContaining({ sizeBytes: 49_640_779_424 })]),
+    })
+    expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "deepseek-v4-flash:UD-Q8_K_XL")).toMatchObject({
+      displayName: "DeepSeek V4 Flash 284B-A13B",
+      totalParametersBillions: 284,
+      activeParametersBillions: 13,
+      quantization: { bitsClass: "q8" },
+    })
+    expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "nemotron-3-ultra-550b-a55b:MXFP4_MOE")).toMatchObject({
+      totalParametersBillions: 550,
+      activeParametersBillions: 55,
+      files: expect.arrayContaining([expect.objectContaining({ sizeBytes: 47_459_816_960 })]),
+    })
   })
 
   test("does not present cross-model quant guidance as an exact artifact measurement", () => {
@@ -95,6 +131,7 @@ describe("local model catalog", () => {
     expect(nemotron?.quantization.fidelityEvidence).toContain("separate conversion")
     expect(glm?.quantization.fidelityLabel).toBe("Near-original fidelity in quantization tests")
     expect(glm?.totalParametersBillions).toBe(753)
+    expect(glm?.activeParametersBillions).toBe(40)
     expect(glm?.quantization.fidelityRank).toBe(40)
     expect(glm?.quantization.fidelityEvidence).toContain("Q8_0 defined as 100%")
     expect(glm?.quantization.fidelityEvidence).toContain("not BF16 fidelity or coding accuracy")

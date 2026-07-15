@@ -50,6 +50,7 @@ interface ArtifactInput {
   readonly architecture: "dense" | "moe"
   readonly totalParametersBillions: number
   readonly activeParametersBillions?: number
+  readonly effectiveParametersBillions?: number
   readonly modelMaximumContextTokens: number
   readonly repo: string
   readonly revision: string
@@ -76,6 +77,9 @@ const artifact = (input: ArtifactInput): LocalModelCatalogEntry => ({
   ...(input.activeParametersBillions !== undefined
     ? { activeParametersBillions: input.activeParametersBillions }
     : {}),
+  ...(input.effectiveParametersBillions !== undefined
+    ? { effectiveParametersBillions: input.effectiveParametersBillions }
+    : {}),
   modelMaximumContextTokens: input.modelMaximumContextTokens,
   supportedContextTokens: [16_384, 32_768, 65_536, 131_072],
   repo: input.repo,
@@ -97,13 +101,13 @@ const artifact = (input: ArtifactInput): LocalModelCatalogEntry => ({
 
 const qwenConventional = (
   common: Omit<ArtifactInput, "file" | "sizeBytes" | "sha256" | "format" | "bitsClass" | "fidelityRank" | "fidelityLabel" | "fidelityEvidence">,
-  variants: readonly [format: "UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL", size: number, sha256: string][],
-): LocalModelCatalogEntry[] => variants.map(([format, sizeBytes, sha256]) => {
+  variants: readonly [format: "UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL", file: string, size: number, sha256: string][],
+): LocalModelCatalogEntry[] => variants.map(([format, file, sizeBytes, sha256]) => {
   const bitsClass = format.slice(3, 5).toLowerCase() as "q4" | "q5" | "q6" | "q8"
   const fidelity = QUANT_TIER_FIDELITY[bitsClass]
   return artifact({
     ...common,
-    file: `${common.displayName.replaceAll(" ", "-")}-${format}.gguf`,
+    file,
     sizeBytes,
     sha256,
     format,
@@ -126,10 +130,10 @@ const QWEN_4B = qwenConventional({
   revision: "e87f176479d0855a907a41277aca2f8ee7a09523",
   modelQualityRank: 10,
 }, [
-  ["UD-Q4_K_XL", 2_912_109_728, "b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7"],
-  ["UD-Q5_K_XL", 3_250_869_408, "b4c36a8e14a80c21bcab5a067ce342b2e70e28f60b4aa95ad12203fa17b87426"],
-  ["UD-Q6_K_XL", 4_145_548_448, "87f58d94410b81429268d8389a3d686e6c6bffecf7852772720fbea059cbbb9d"],
-  ["UD-Q8_K_XL", 5_952_048_288, "e786a3c6570474c3885199bfb5adc54325aa7521a314e10b0aaefe16a54ba42f"],
+  ["UD-Q4_K_XL", "Qwen3.5-4B-UD-Q4_K_XL.gguf", 2_912_109_728, "b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7"],
+  ["UD-Q5_K_XL", "Qwen3.5-4B-UD-Q5_K_XL.gguf", 3_250_869_408, "b4c36a8e14a80c21bcab5a067ce342b2e70e28f60b4aa95ad12203fa17b87426"],
+  ["UD-Q6_K_XL", "Qwen3.5-4B-UD-Q6_K_XL.gguf", 4_145_548_448, "87f58d94410b81429268d8389a3d686e6c6bffecf7852772720fbea059cbbb9d"],
+  ["UD-Q8_K_XL", "Qwen3.5-4B-UD-Q8_K_XL.gguf", 5_952_048_288, "e786a3c6570474c3885199bfb5adc54325aa7521a314e10b0aaefe16a54ba42f"],
 ])
 
 const QWEN_9B = qwenConventional({
@@ -143,10 +147,10 @@ const QWEN_9B = qwenConventional({
   revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
   modelQualityRank: 20,
 }, [
-  ["UD-Q4_K_XL", 5_966_095_584, "6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293"],
-  ["UD-Q5_K_XL", 6_743_680_224, "96cf42ddb97f9572410a72b9ed6f2299b1e887ee08da4c2a6c01e897cfa9f673"],
-  ["UD-Q6_K_XL", 8_756_929_760, "33b0050fb9c19abcf815647a78464dad959a06dadaecb0b96af798669f9074d4"],
-  ["UD-Q8_K_XL", 12_974_040_288, "2c4e08e0e72c68d8c1835a26f5be4075894df9ea5be9cc20a246517afd6a0cb6"],
+  ["UD-Q4_K_XL", "Qwen3.5-9B-UD-Q4_K_XL.gguf", 5_966_095_584, "6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293"],
+  ["UD-Q5_K_XL", "Qwen3.5-9B-UD-Q5_K_XL.gguf", 6_743_680_224, "96cf42ddb97f9572410a72b9ed6f2299b1e887ee08da4c2a6c01e897cfa9f673"],
+  ["UD-Q6_K_XL", "Qwen3.5-9B-UD-Q6_K_XL.gguf", 8_756_929_760, "33b0050fb9c19abcf815647a78464dad959a06dadaecb0b96af798669f9074d4"],
+  ["UD-Q8_K_XL", "Qwen3.5-9B-UD-Q8_K_XL.gguf", 12_974_040_288, "2c4e08e0e72c68d8c1835a26f5be4075894df9ea5be9cc20a246517afd6a0cb6"],
 ])
 
 const QWEN_27B = qwenConventional({
@@ -160,10 +164,10 @@ const QWEN_27B = qwenConventional({
   revision: "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
   modelQualityRank: 45,
 }, [
-  ["UD-Q4_K_XL", 17_612_564_704, "ff6941ded525b34eb159496762c29dd0ec6e71dc31b74d57e75d871a03eec259"],
-  ["UD-Q5_K_XL", 20_038_256_864, "ac310abf2895aa397121bad6c0be89466af41f0f1606a21c1131b110eeb19d0e"],
-  ["UD-Q6_K_XL", 25_636_485_344, "8746881d40f280b1b6b858c656a347c754ed3d9cc8d2e1ad46b3635b87f611f8"],
-  ["UD-Q8_K_XL", 35_325_163_744, "19a2f4733a863088bc06665bf307dca95f7d4370b4d8690340cdff9992fe48c6"],
+  ["UD-Q4_K_XL", "Qwen3.6-27B-UD-Q4_K_XL.gguf", 17_612_564_704, "ff6941ded525b34eb159496762c29dd0ec6e71dc31b74d57e75d871a03eec259"],
+  ["UD-Q5_K_XL", "Qwen3.6-27B-UD-Q5_K_XL.gguf", 20_038_256_864, "ac310abf2895aa397121bad6c0be89466af41f0f1606a21c1131b110eeb19d0e"],
+  ["UD-Q6_K_XL", "Qwen3.6-27B-UD-Q6_K_XL.gguf", 25_636_485_344, "8746881d40f280b1b6b858c656a347c754ed3d9cc8d2e1ad46b3635b87f611f8"],
+  ["UD-Q8_K_XL", "Qwen3.6-27B-UD-Q8_K_XL.gguf", 35_325_163_744, "19a2f4733a863088bc06665bf307dca95f7d4370b4d8690340cdff9992fe48c6"],
 ])
 
 const QWEN_35B = qwenConventional({
@@ -178,10 +182,10 @@ const QWEN_35B = qwenConventional({
   revision: "a483e9e6cbd595906af30beda3187c2663a1118c",
   modelQualityRank: 50,
 }, [
-  ["UD-Q4_K_XL", 22_360_456_160, "707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450"],
-  ["UD-Q5_K_XL", 26_592_508_896, "25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506"],
-  ["UD-Q6_K_XL", 31_843_777_504, "f6b6c6d5cfa6f00d964eeb7add28eb14ce7481734d506b90681007678cd2c484"],
-  ["UD-Q8_K_XL", 38_451_182_560, "b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8"],
+  ["UD-Q4_K_XL", "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", 22_360_456_160, "707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450"],
+  ["UD-Q5_K_XL", "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf", 26_592_508_896, "25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506"],
+  ["UD-Q6_K_XL", "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf", 31_843_777_504, "f6b6c6d5cfa6f00d964eeb7add28eb14ce7481734d506b90681007678cd2c484"],
+  ["UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf", 38_451_182_560, "b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8"],
 ]).map((entry) => {
   if (entry.quantization.bitsClass !== "q4" && entry.quantization.bitsClass !== "q5") return entry
 
@@ -203,6 +207,49 @@ const QWEN_35B = qwenConventional({
 })
 
 const GEMMA_QAT: LocalModelCatalogEntry[] = [
+  artifact({
+    modelId: "gemma-4-e2b-it-qat",
+    family: "gemma-4",
+    displayName: "Gemma 4 E2B",
+    architecture: "dense",
+    totalParametersBillions: 5.1,
+    effectiveParametersBillions: 2.3,
+    modelMaximumContextTokens: 131_072,
+    repo: "unsloth/gemma-4-E2B-it-qat-GGUF",
+    revision: "2ea637031baa8dc847d64b5dbb7011fd6a445849",
+    file: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+    sizeBytes: 2_620_368_960,
+    sha256: "cd4526493dccbfd6791bee8822e37e30340074d1d4d9aada52ce09afefd6a33a",
+    format: "UD-Q4_K_XL",
+    bitsClass: "q4",
+    quantAwareCheckpoint: true,
+    fidelityRank: 58,
+    fidelityLabel: "Near-original fidelity from quantization-aware training",
+    fidelityEvidence: "Model-specific distribution evidence: the specialized Gemma 4 E2B QAT-to-GGUF conversion reported mean KLD 0.00173, compared with 0.05109 for a naive Q4_0 conversion. KLD measures output-distribution drift rather than downstream coding accuracy.",
+    fidelitySourceUrl: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/discussions/1",
+    modelQualityRank: 8,
+  }),
+  artifact({
+    modelId: "gemma-4-12b-it-qat",
+    family: "gemma-4",
+    displayName: "Gemma 4 12B",
+    architecture: "dense",
+    totalParametersBillions: 11.95,
+    modelMaximumContextTokens: 262_144,
+    repo: "unsloth/gemma-4-12B-it-qat-GGUF",
+    revision: "f18012b8f690e563b7f872cb764b4cb3de90b14a",
+    file: "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+    sizeBytes: 6_716_355_328,
+    sha256: "cc9ff072e0a8203429ed854e6662c17a6c2bc1e5dca5b475dd4736caaacbc165",
+    format: "UD-Q4_K_XL",
+    bitsClass: "q4",
+    quantAwareCheckpoint: true,
+    fidelityRank: 58,
+    fidelityLabel: "Near-original fidelity from quantization-aware training",
+    fidelityEvidence: "Checkpoint-level evidence: the Gemma 4 QAT family is designed to preserve similar quality to BF16 at Q4. This is the specialized UD-Q4_K_XL conversion of the 12B QAT checkpoint; no exact-artifact KLD or downstream coding delta is provided.",
+    fidelitySourceUrl: "https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF",
+    modelQualityRank: 30,
+  }),
   artifact({
     modelId: "gemma-4-26b-a4b-it-qat",
     family: "gemma-4",
@@ -295,13 +342,162 @@ const NEMOTRON_SUPER: LocalModelCatalogEntry = {
   modelQualityRank: 65,
 }
 
+const QWEN_122B: LocalModelCatalogEntry = {
+  id: "qwen3.5-122b-a10b:UD-Q4_K_XL",
+  modelId: "qwen3.5-122b-a10b",
+  family: "qwen3.5",
+  displayName: "Qwen3.5 122B-A10B",
+  architecture: "moe",
+  totalParametersBillions: 122,
+  activeParametersBillions: 10,
+  modelMaximumContextTokens: 262_144,
+  supportedContextTokens: [16_384, 32_768, 65_536, 131_072],
+  repo: "unsloth/Qwen3.5-122B-A10B-GGUF",
+  revision: "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+  quantTag: "UD-Q4_K_XL",
+  files: [
+    {
+      path: "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf",
+      sizeBytes: 10_943_552,
+      sha256: "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3",
+    },
+    {
+      path: "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00002-of-00003.gguf",
+      sizeBytes: 49_640_779_424,
+      sha256: "ecdbd42d43b0df9fa0ef9a584e09e95a43966ef03a122aba0b87a99d44d9ad98",
+    },
+    {
+      path: "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00003-of-00003.gguf",
+      sizeBytes: 27_378_273_056,
+      sha256: "13300e0f059e6fa21aa0fabde2a554f9deea366c0e54f268045769b214b28c97",
+    },
+  ],
+  quantization: {
+    format: "UD-Q4_K_XL",
+    bitsClass: "q4",
+    quantAwareCheckpoint: false,
+    fidelityRank: QUANT_TIER_FIDELITY.q4.rank,
+    fidelityLabel: QUANT_TIER_FIDELITY.q4.label,
+    fidelityEvidence: QUANT_TIER_FIDELITY.q4.evidence,
+    fidelitySourceUrl: QUANT_FIDELITY_STUDY,
+  },
+  license: APACHE_LICENSE,
+  // Same workstation-capacity quality tier as Nemotron 3 Super. The small
+  // one-point distinction only makes the more precisely evidenced default
+  // deterministic; both remain visible when they fit.
+  modelQualityRank: 64,
+}
+
+const DEEPSEEK_V4_FLASH: LocalModelCatalogEntry = {
+  id: "deepseek-v4-flash:UD-Q8_K_XL",
+  modelId: "deepseek-v4-flash",
+  family: "deepseek-v4",
+  displayName: "DeepSeek V4 Flash 284B-A13B",
+  architecture: "moe",
+  totalParametersBillions: 284,
+  activeParametersBillions: 13,
+  modelMaximumContextTokens: 1_048_576,
+  supportedContextTokens: [32_768, 65_536, 131_072],
+  repo: "unsloth/DeepSeek-V4-Flash-GGUF",
+  revision: "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+  quantTag: "UD-Q8_K_XL",
+  files: [
+    {
+      path: "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf",
+      sizeBytes: 5_256_608,
+      sha256: "0cecd47692e23e39de16598a4b40c4e1e53a3f2f56a965cc419fc136e9801494",
+    },
+    {
+      path: "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00002-of-00005.gguf",
+      sizeBytes: 49_215_492_960,
+      sha256: "cba9ebcaa33c238c98ddd2881bae4b0766fa46e0329413bec7b36e691d43c335",
+    },
+    {
+      path: "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00003-of-00005.gguf",
+      sizeBytes: 49_700_372_160,
+      sha256: "789aaf82287d21e77cb939fbf00da0452340d17768cff8494a6e575c14cb23bb",
+    },
+    {
+      path: "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00004-of-00005.gguf",
+      sizeBytes: 49_466_495_968,
+      sha256: "93bf0d35912e0d337265d28b43914321146a1498133202c430adf61070a2a391",
+    },
+    {
+      path: "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00005-of-00005.gguf",
+      sizeBytes: 13_481_997_024,
+      sha256: "60e6f48401428db11e9bba1f39886e2cdac40216270fcffa53bc9665b73bffae",
+    },
+  ],
+  quantization: {
+    format: "UD-Q8_K_XL",
+    bitsClass: "q8",
+    quantAwareCheckpoint: false,
+    fidelityRank: QUANT_TIER_FIDELITY.q8.rank,
+    fidelityLabel: QUANT_TIER_FIDELITY.q8.label,
+    fidelityEvidence: "Q8 guidance, not a measurement of this exact artifact. Q8 GGUF conversion minimizes additional distribution drift, while the source DeepSeek V4 Flash checkpoint already uses mixed FP4 and FP8 weights. No exact-GGUF KLD or downstream coding delta is provided.",
+    fidelitySourceUrl: "https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF",
+  },
+  license: {
+    id: "mit",
+    url: "https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF",
+    acknowledgementRequired: false,
+  },
+  modelQualityRank: 72,
+}
+
+const NEMOTRON_ULTRA: LocalModelCatalogEntry = {
+  id: "nemotron-3-ultra-550b-a55b:MXFP4_MOE",
+  modelId: "nemotron-3-ultra-550b-a55b",
+  family: "nemotron-3",
+  displayName: "NVIDIA Nemotron 3 Ultra 550B-A55B",
+  architecture: "moe",
+  totalParametersBillions: 550,
+  activeParametersBillions: 55,
+  modelMaximumContextTokens: 1_048_576,
+  supportedContextTokens: [32_768],
+  repo: "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
+  revision: "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6",
+  quantTag: "MXFP4_MOE",
+  files: [
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00001-of-00009.gguf", 7_872_128, "564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00002-of-00009.gguf", 46_357_384_032, "49bb6d0075c1926583a88b2cb7fa0c07e24918ae2c0505c200a8f93cb618453d"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00003-of-00009.gguf", 47_312_721_120, "e34d245dd2a370a487eea8e1818f59b6c827ca53603508f5e17760a6d7df5698"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00004-of-00009.gguf", 47_016_905_632, "789888c578495adfc18fdd4540d08dd5ef5a01ee1fb9b0e97081249eb8c2695d"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00005-of-00009.gguf", 47_459_816_960, "6d3fc88758edc68796fbab8e08dc069756bf8479574c342faa884266a95f7c91"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00006-of-00009.gguf", 47_016_905_632, "39c6bb6da37e3c278ce1dbef64e82abccaeec192563ce3ec37aeea6e14333d2c"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00007-of-00009.gguf", 47_312_721_120, "e9f7b068f256bf41b5265955fe7bb38eb6a1edbd9da67887d7f5675a789fdccc"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00008-of-00009.gguf", 47_016_905_664, "c950f4810dc569df2d3fafef790a4299a6ce8872c51b81c6b469720cf6017629"],
+    ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00009-of-00009.gguf", 22_770_053_920, "e88987d3747eddec4190373fd9628d6bd4f307d54ad2f42f509c52e76ccd13b9"],
+  ].map(([path, sizeBytes, sha256]) => ({
+    path: path as string,
+    sizeBytes: sizeBytes as number,
+    sha256: sha256 as string,
+  })),
+  quantization: {
+    format: "MXFP4_MOE",
+    bitsClass: "mxfp4",
+    quantAwareCheckpoint: false,
+    fidelityRank: 70,
+    fidelityLabel: "Near-original fidelity in benchmark comparisons",
+    fidelityEvidence: "Checkpoint-level benchmark evidence: the official NVFP4 checkpoint remains close to BF16 across coding, agentic, reasoning, and long-context evaluations, including SWE-Bench Verified 69.5 versus 70.7 and RULER 1M 94.0 versus 94.7. The MXFP4_MOE GGUF is a separate conversion, so those are not exact-GGUF measurements.",
+    fidelitySourceUrl: "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+  },
+  license: {
+    id: "openmdw-1.1",
+    url: "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+    acknowledgementRequired: false,
+  },
+  modelQualityRank: 76,
+}
+
 const GLM_52: LocalModelCatalogEntry = {
   id: "glm-5.2:UD-Q4_K_XL",
   modelId: "glm-5.2",
   family: "glm-5.2",
-  displayName: "GLM 5.2",
+  displayName: "GLM 5.2 753B-A40B",
   architecture: "moe",
   totalParametersBillions: 753,
+  activeParametersBillions: 40,
   modelMaximumContextTokens: 1_048_576,
   supportedContextTokens: [32_768],
   repo: "unsloth/GLM-5.2-GGUF",
@@ -349,7 +545,10 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
   ...GEMMA_QAT,
   ...QWEN_27B,
   ...QWEN_35B,
+  QWEN_122B,
   NEMOTRON_SUPER,
+  DEEPSEEK_V4_FLASH,
+  NEMOTRON_ULTRA,
   GLM_52,
 ]
 

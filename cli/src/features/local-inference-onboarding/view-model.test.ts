@@ -108,6 +108,22 @@ describe("local inference onboarding view model", () => {
     expect(recommendation && selectionFidelity(recommendation)).toBe("High fidelity with only minor quality loss")
   })
 
+  test("distinguishes Gemma effective parameters from MoE active parameters", () => {
+    const recommendation = buildLocalInferenceSelections({
+      ...snapshot,
+      recommendations: [{
+        ...snapshot.recommendations[0]!,
+        displayName: "Gemma 4 E2B",
+        totalParametersBillions: 5.1,
+        effectiveParametersBillions: 2.3,
+      }],
+    }).find((selection) => selection.kind === "recommendation")
+
+    expect(recommendation && selectionMetadata(recommendation)).toBe(
+      "UD-Q5_K_XL · 0.00 GB · 5.1B total / 2.3B effective · 32K context",
+    )
+  })
+
   test("gates only on versioned walkthrough completion or an explicit rerun", () => {
     expect(shouldShowLocalInferenceOnboarding(snapshot, false)).toBe(true)
     expect(shouldShowLocalInferenceOnboarding({

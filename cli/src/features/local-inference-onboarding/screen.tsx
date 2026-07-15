@@ -39,26 +39,18 @@ interface ModelSetupViewProps extends ModelSetupProps {
   readonly controller: ReturnType<typeof useLocalInferenceOnboarding>
 }
 
-const quantRank = (bitsClass: string): number => ({
-  q4: 4,
-  mxfp4: 4,
-  q5: 5,
-  q6: 6,
-  q8: 8,
-  fp8: 8,
-})[bitsClass] ?? 0
+export const LOCAL_MODEL_SECTION_WIDTH = 88
+const SECTION_LABEL_GAP = 2
+
+export const localModelSectionRule = (label: string): string =>
+  "─".repeat(Math.max(0, LOCAL_MODEL_SECTION_WIDTH - label.length - SECTION_LABEL_GAP))
 
 const recommendationBadge = (
   recommendation: LocalInferenceOnboardingSnapshot["recommendations"][number],
-  bestExistingQuantRank: number,
 ): string => {
-  if (recommendation.badge === "lighter") return "Lighter Weight Model"
+  if (recommendation.badge === "lighter") return "Smaller Model"
   if (recommendation.badge === "higher_fidelity") return "Higher Fidelity Option"
-  if (bestExistingQuantRank > 0) {
-    return quantRank(recommendation.quantization.bitsClass) > bestExistingQuantRank
-      ? "Higher Fidelity Option"
-      : "Alternative Option"
-  }
+  if (recommendation.badge === "alternative") return "Alternative Option"
   return "Recommended"
 }
 
@@ -168,12 +160,6 @@ export const LocalInferenceOnboardingView = memo(function LocalInferenceOnboardi
   const firstDownloadedIndex = selections.findIndex((selection) => selection.kind === "downloaded")
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
   const hasExistingModels = firstRunningIndex >= 0 || firstDownloadedIndex >= 0
-  const bestExistingQuantRank = Math.max(
-    0,
-    ...[...snapshot.running, ...snapshot.downloaded]
-      .filter((choice) => choice.compatible)
-      .map((choice) => quantRank(choice.quantization?.bitsClass ?? "other")),
-  )
 
   const confirm = useCallback(() => {
     if (!selected || controller.busy) return
@@ -305,9 +291,16 @@ export const LocalInferenceOnboardingView = memo(function LocalInferenceOnboardi
           return (
             <Fragment key={selection.id}>
               {sectionLabel && (
-                <box style={{ flexDirection: "row", paddingTop: index === 0 ? 0 : 1, paddingBottom: 1, flexShrink: 0 }}>
+                <box style={{
+                  flexDirection: "row",
+                  paddingTop: index === 0 ? 0 : 1,
+                  paddingBottom: 1,
+                  flexShrink: 0,
+                  width: "100%",
+                  maxWidth: LOCAL_MODEL_SECTION_WIDTH,
+                }}>
                   <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{sectionLabel}</text>
-                  <text style={{ fg: theme.border }}>  {'─'.repeat(48)}</text>
+                  <text style={{ fg: theme.border }}>  {localModelSectionRule(sectionLabel)}</text>
                 </box>
               )}
               <box
@@ -321,13 +314,15 @@ export const LocalInferenceOnboardingView = memo(function LocalInferenceOnboardi
                   marginBottom: 1,
                   flexDirection: "column",
                   flexShrink: 0,
+                  width: "100%",
+                  maxWidth: LOCAL_MODEL_SECTION_WIDTH,
                 }}
               >
                 <box style={{ flexDirection: "row" }}>
                   <text style={{ fg: isSelected ? theme.primary : theme.muted }}>{isSelected ? "› " : "  "}</text>
                   <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{selectionTitle(selection)}</text>
                   {recommendation && (
-                    <text style={{ fg: theme.primary }}>  {recommendationBadge(recommendation, bestExistingQuantRank)}</text>
+                    <text style={{ fg: theme.primary }}>  {recommendationBadge(recommendation)}</text>
                   )}
                   {!recommendation && (
                     <text style={{ fg: theme.primary }}>
