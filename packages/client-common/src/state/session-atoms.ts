@@ -36,12 +36,6 @@ export const usageOpenAtom = Atom.make(false)
 export const selectedFilePathAtom = Atom.make<string | null>(null)
 
 /**
- * API key verified flag.
- * false = not verified (show login screen). true = key is set, show main app.
- */
-export const apiKeyVerifiedAtom = Atom.make(false)
-
-/**
  * Message history for composer up/down navigation.
  * Array of previously sent message texts, most recent first.
  */
@@ -93,13 +87,6 @@ export const composerHasContentAtom = Atom.make(false)
  * Guards against concurrent session creation from rapid submits.
  */
 export const pendingUserSubmitAtom = Atom.make(false)
-
-/**
- * Holds the in-flight session activation promise during lazy session
- * creation. Enables concurrent submit deduplication — callers await the
- * same promise instead of creating duplicate sessions.
- */
-export const sessionActivationPromiseAtom = Atom.make<Promise<string> | null>(null)
 
 /**
  * Bash command outputs — shared so both apps can render bash output.

@@ -46,7 +46,7 @@ export function scanHfCache(
     if (!exists) return []
 
     const entries = yield* fs.readDirectory(cacheDir).pipe(
-      Effect.catchAll(() => Effect.succeed([] as readonly string[])),
+      Effect.catchAll(() => Effect.succeed<readonly string[]>([])),
     )
 
     const results: LocalModelInfo[] = []
@@ -63,7 +63,7 @@ export function scanHfCache(
       if (!snapshotsExist) continue
 
       const commits = yield* fs.readDirectory(snapshotsDir).pipe(
-        Effect.catchAll(() => Effect.succeed([] as readonly string[])),
+        Effect.catchAll(() => Effect.succeed<readonly string[]>([])),
       )
 
       for (const commit of commits) {

@@ -1,15 +1,15 @@
 import { describe, expect, test } from "vitest"
 import type {
-  LocalInferenceCapabilities,
   LocalInferenceUsageSelection,
 } from "@magnitudedev/protocol"
+import type { LlamaCppHostProfile } from "@magnitudedev/llamacpp"
 import { LOCAL_MODEL_CATALOG } from "./catalog"
 import {
   GIB,
   estimateRuntimeBytes,
   parallelSlotsForUsage,
   recommendLocalModels,
-  stableCapacityFromCapabilities,
+  stableCapacityFromHost,
   systemCapacityBudget,
 } from "./recommendations"
 import type { StableInferenceCapacity } from "./types"
@@ -179,59 +179,52 @@ describe("local inference recommendation policy", () => {
   })
 
   test("transient free RAM and VRAM cannot change profile-aware recommendations", () => {
-    const capabilities = (free: number): LocalInferenceCapabilities => ({
-      binary: { identity: "managed-test-binary" },
-      system: { totalMemoryBytes: 64 * GIB },
-      accelerators: [{
-        id: "CUDA0",
-        backend: "CUDA",
-        description: "pre-Blackwell RTX",
-        capacityBytes: 24 * GIB,
-        capacityKind: "physical-device-memory",
-        memoryDomainId: "pci:1",
+    const host = (free: number): LlamaCppHostProfile => ({
+      system: { totalMemoryBytes: 64 * GIB, cpuModel: null, logicalCores: 12 },
+      memoryDomains: [{
+        id: "pci:1",
+        kind: "physical_device",
+        stableCapacityBytes: 24 * GIB,
         sharesSystemMemory: false,
         currentFreeBytes: free,
+        devices: [{ backend: "CUDA", name: "pre-Blackwell RTX" }],
+        splitGroupId: null,
       }],
+      runtimeProbe: "complete",
       warnings: [],
     })
     const busy = recommendLocalModels(
-      stableCapacityFromCapabilities(capabilities(512 * 1024 ** 2)),
+      stableCapacityFromHost(host(512 * 1024 ** 2)),
       SUBAGENT_THREE,
     )
     const idle = recommendLocalModels(
-      stableCapacityFromCapabilities(capabilities(23 * GIB)),
+      stableCapacityFromHost(host(23 * GIB)),
       SUBAGENT_THREE,
     )
     expect(busy).toEqual(idle)
   })
 
   test("does not double-count Apple unified memory or duplicate backend domains", () => {
-    const capabilities: LocalInferenceCapabilities = {
-      binary: { identity: "managed-metal-binary" },
-      system: { totalMemoryBytes: 32 * GIB },
-      accelerators: [
+    const host: LlamaCppHostProfile = {
+      system: { totalMemoryBytes: 32 * GIB, cpuModel: null, logicalCores: 10 },
+      memoryDomains: [
         {
-          id: "MTL0",
-          backend: "Metal",
-          description: "Apple GPU",
-          capacityBytes: 28 * GIB,
-          capacityKind: "recommended-working-set",
-          memoryDomainId: "unified:0",
+          id: "unified:0",
+          kind: "unified_working_set",
+          stableCapacityBytes: 28 * GIB,
+          currentFreeBytes: null,
           sharesSystemMemory: true,
-        },
-        {
-          id: "Vulkan0",
-          backend: "Vulkan",
-          description: "same Apple GPU",
-          capacityBytes: 30 * GIB,
-          capacityKind: "recommended-working-set",
-          memoryDomainId: "unified:0",
-          sharesSystemMemory: true,
+          devices: [
+            { backend: "Metal", name: "Apple GPU" },
+            { backend: "Vulkan", name: "same Apple GPU" },
+          ],
+          splitGroupId: null,
         },
       ],
+      runtimeProbe: "complete",
       warnings: [],
     }
-    const stable = stableCapacityFromCapabilities(capabilities)
+    const stable = stableCapacityFromHost(host)
     expect(stable.acceleratorDomains).toHaveLength(1)
     expect(stable.acceleratorDomains[0]?.capacityBytes).toBe(28 * GIB)
     expect(recommendLocalModels(stable, MAIN_ONE)[0]?.displayName).toBe("Qwen3.6 27B")
@@ -266,7 +259,7 @@ describe("local inference recommendation policy", () => {
     for (const usage of ALL_USAGE) {
       for (const recommendation of recommendLocalModels(cpu(64), usage)) {
         expect(recommendation.configurationId).toContain(recommendation.catalogModelId)
-        expect(recommendation.configurationId).toContain(recommendation.revision)
+        expect(recommendation.configurationId).toMatch(/@[0-9a-f]{40}@/)
         expect(recommendation.configurationId).toContain(`@role-${usage.localModelRole}`)
         expect(recommendation.configurationId).toContain(`@sessions-${usage.sessionConcurrency}`)
         expect(recommendation.configurationId).toContain(

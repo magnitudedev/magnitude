@@ -1,16 +1,9 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { Effect } from "effect"
-import {
-  GGUFValueType,
-  serializeGgufMetadata,
-  type GGUFTypedMetadata,
-} from "@huggingface/gguf"
+import { Effect, Option } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
+import { Prompt } from "@magnitudedev/ai"
 import {
   checkServerHealth,
   deriveContextWindow,
@@ -20,7 +13,7 @@ import {
   fetchModelList,
   fetchServerProps,
 } from "./discovery"
-import { createLlamaCppProvider } from "./provider"
+import { createLlamaCppProvider, makeFixedEndpointBackend } from "./provider"
 import { makeProviderRegistry } from "../registry"
 import { createMagnitudeProvider } from "../magnitude/provider"
 
@@ -32,26 +25,43 @@ function responseClient(
   )
 }
 
-async function writeGgufFixture(
-  path: string,
-  values: Readonly<Record<string, string>>,
-): Promise<void> {
-  const entries = Object.fromEntries(
-    Object.entries(values).map(([key, value]) => [
-      key,
-      { value, type: GGUFValueType.STRING },
-    ]),
-  )
-  const metadata = {
-    version: { value: 3, type: GGUFValueType.UINT32 },
-    tensor_count: { value: 0n, type: GGUFValueType.UINT64 },
-    kv_count: { value: BigInt(Object.keys(entries).length), type: GGUFValueType.UINT64 },
-    ...entries,
-  } as GGUFTypedMetadata
-  await writeFile(path, serializeGgufMetadata(metadata))
-}
-
 describe("llama.cpp discovery", () => {
+  it("resolves the current serving connection for every inference call", async () => {
+    let resolutions = 0
+    const requestedUrls: string[] = []
+    const backend = {
+      listModels: Effect.succeed([]),
+      resolveConnection: () => Effect.sync(() => ({
+        baseUrl: `http://connection-${++resolutions}`,
+        apiKey: Option.none(),
+      })),
+      status: Effect.succeed({ status: "ok" as const }),
+    }
+    const client = HttpClient.make((request) => {
+      requestedUrls.push(request.url)
+      return Effect.fail(new HttpClientError.RequestError({
+        request,
+        reason: "Transport",
+        cause: new Error("intentional test failure"),
+      }))
+    })
+    const prompt = Prompt.from({
+      messages: [{ _tag: "UserMessage", parts: [{ _tag: "TextPart", text: "hello" }] }],
+    })
+
+    await Effect.runPromise(Effect.gen(function* () {
+      const bound = yield* createLlamaCppProvider(backend).provider.bindModel("model")
+      yield* bound.stream(prompt, []).pipe(Effect.exit)
+      yield* bound.stream(prompt, []).pipe(Effect.exit)
+    }).pipe(Effect.provideService(HttpClient.HttpClient, client)))
+
+    expect(resolutions).toBe(2)
+    expect(requestedUrls).toEqual([
+      "http://connection-1/v1/chat/completions",
+      "http://connection-2/v1/chat/completions",
+    ])
+  })
+
   it("maps ready and loading health responses", async () => {
     const readyClient = responseClient(() => new Response(
       JSON.stringify({ status: "ok" }),
@@ -103,7 +113,7 @@ describe("llama.cpp discovery", () => {
     })
 
     const result = await Effect.runPromise(
-      createLlamaCppProvider().checkStatus.pipe(
+      createLlamaCppProvider(makeFixedEndpointBackend()).checkStatus.pipe(
         Effect.provideService(HttpClient.HttpClient, client),
       ),
     )
@@ -141,7 +151,7 @@ describe("llama.cpp discovery", () => {
     })
 
     const result = await Effect.runPromise(
-      createLlamaCppProvider().checkStatus.pipe(
+      createLlamaCppProvider(makeFixedEndpointBackend()).checkStatus.pipe(
         Effect.provideService(HttpClient.HttpClient, client),
       ),
     )
@@ -158,112 +168,98 @@ describe("llama.cpp discovery", () => {
     ])
   })
 
-  it("reads embedded GGUF names and tokenizer-family evidence from renamed files", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "magnitude-gguf-"))
-    const modelPath = join(directory, "opaque-local-build-Q4_K_M.gguf")
-    await writeGgufFixture(modelPath, {
-      "general.name": "Qwen3.6-35B-A3B",
-      "general.basename": "Qwen3.6",
-      "general.size_label": "35B-A3B",
-      "general.architecture": "qwen35moe",
-      "tokenizer.ggml.model": "gpt2",
-      "tokenizer.ggml.pre": "qwen35",
-      "general.base_model.0.name": "Qwen3.6 35B A3B",
-      "general.base_model.0.repo_url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B",
+  it("uses endpoint metadata without opening server-reported model paths", async () => {
+    const client = responseClient((url) => {
+      switch (new URL(url).pathname) {
+        case "/health":
+          return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+        case "/v1/models":
+          return new Response(JSON.stringify({
+            object: "list",
+            data: [{
+              id: "opaque-model-alias",
+              object: "model",
+              meta: {
+                n_ctx: 32_768,
+                "general.name": "Qwen3.6-35B-A3B",
+                "general.architecture": "qwen35moe",
+                "tokenizer.ggml.model": "gpt2",
+                "tokenizer.ggml.pre": "qwen35",
+              },
+            }],
+          }), { status: 200 })
+        case "/props":
+          return new Response(JSON.stringify({
+            default_generation_settings: { n_ctx: 32_768 },
+            model_alias: "opaque-model-alias",
+            model_ftype: "Q4_K",
+            model_path: "/path/that/need/not/exist/model-Q4_K_M.gguf",
+            modalities: { vision: false, audio: false },
+          }), { status: 200 })
+        default:
+          return new Response("", { status: 404 })
+      }
     })
 
-    try {
-      const client = responseClient((url) => {
-        switch (new URL(url).pathname) {
-          case "/health":
-            return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
-          case "/v1/models":
-            return new Response(JSON.stringify({
-              object: "list",
-              data: [{ id: "opaque-model-alias", object: "model", meta: { n_ctx: 32_768 } }],
-            }), { status: 200 })
-          case "/props":
-            return new Response(JSON.stringify({
-              default_generation_settings: { n_ctx: 32_768 },
-              model_alias: "opaque-model-alias",
-              model_ftype: "Q4_K",
-              model_path: modelPath,
-              modalities: { vision: false, audio: false },
-            }), { status: 200 })
-          default:
-            return new Response("", { status: 404 })
-        }
-      })
+    const result = await Effect.runPromise(
+      createLlamaCppProvider(makeFixedEndpointBackend()).catalog.list.pipe(
+        Effect.provideService(HttpClient.HttpClient, client),
+      ),
+    )
 
-      const result = await Effect.runPromise(
-        createLlamaCppProvider().catalog.list.pipe(
-          Effect.provideService(HttpClient.HttpClient, client),
-        ),
-      )
-
-      expect(result).toEqual([
-        expect.objectContaining({
-          providerModelId: "opaque-model-alias",
-          sourceModelPath: modelPath,
-          displayName: "Qwen3.6-35B-A3B (Q4_K_M)",
-          metadataName: "Qwen3.6-35B-A3B",
-          modelArchitecture: "qwen35moe",
-          tokenizerModel: "gpt2",
-          tokenizerPre: "qwen35",
-          modelFamilyId: "qwen-3.5",
-          baseModelNames: ["Qwen3.6 35B A3B"],
-          baseModelRepositories: ["https://huggingface.co/Qwen/Qwen3.6-35B-A3B"],
-        }),
-      ])
-    } finally {
-      await rm(directory, { recursive: true, force: true })
-    }
+    expect(result).toEqual([
+      expect.objectContaining({
+        providerModelId: "opaque-model-alias",
+        displayName: "Qwen3.6-35B-A3B (Q4_K_M)",
+        metadataName: "Qwen3.6-35B-A3B",
+        modelArchitecture: "qwen35moe",
+        tokenizerModel: "gpt2",
+        tokenizerPre: "qwen35",
+        modelFamilyId: "qwen-3.5",
+      }),
+    ])
   })
 
-  it("does not trust a Qwen name when embedded tokenizer metadata conflicts", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "magnitude-gguf-"))
-    const modelPath = join(directory, "renamed.gguf")
-    await writeGgufFixture(modelPath, {
-      "general.name": "Qwen3.6-35B-A3B",
-      "general.architecture": "qwen35moe",
-      "tokenizer.ggml.model": "gpt2",
-      "tokenizer.ggml.pre": "qwen2",
+  it("does not trust a Qwen name when endpoint tokenizer metadata conflicts", async () => {
+    const client = responseClient((url) => {
+      switch (new URL(url).pathname) {
+        case "/health":
+          return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+        case "/v1/models":
+          return new Response(JSON.stringify({
+            object: "list",
+            data: [{
+              id: "opaque",
+              object: "model",
+              meta: {
+                n_ctx: 8_192,
+                "general.name": "Qwen3.6-35B-A3B",
+                "general.architecture": "qwen35moe",
+                "tokenizer.ggml.model": "gpt2",
+                "tokenizer.ggml.pre": "qwen2",
+              },
+            }],
+          }), { status: 200 })
+        case "/props":
+          return new Response(JSON.stringify({
+            default_generation_settings: { n_ctx: 8_192 },
+            modalities: { vision: false, audio: false },
+          }), { status: 200 })
+        default:
+          return new Response("", { status: 404 })
+      }
     })
 
-    try {
-      const client = responseClient((url) => {
-        switch (new URL(url).pathname) {
-          case "/health":
-            return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
-          case "/v1/models":
-            return new Response(JSON.stringify({
-              object: "list",
-              data: [{ id: "opaque", object: "model", meta: { n_ctx: 8_192 } }],
-            }), { status: 200 })
-          case "/props":
-            return new Response(JSON.stringify({
-              default_generation_settings: { n_ctx: 8_192 },
-              model_path: modelPath,
-              modalities: { vision: false, audio: false },
-            }), { status: 200 })
-          default:
-            return new Response("", { status: 404 })
-        }
-      })
+    const models = await Effect.runPromise(
+      createLlamaCppProvider(makeFixedEndpointBackend()).catalog.list.pipe(
+        Effect.provideService(HttpClient.HttpClient, client),
+      ),
+    )
 
-      const models = await Effect.runPromise(
-        createLlamaCppProvider().catalog.list.pipe(
-          Effect.provideService(HttpClient.HttpClient, client),
-        ),
-      )
-
-      expect(models[0]).toEqual(expect.objectContaining({
-        displayName: "Qwen3.6-35B-A3B",
-        modelFamilyId: "unknown",
-      }))
-    } finally {
-      await rm(directory, { recursive: true, force: true })
-    }
+    expect(models[0]).toEqual(expect.objectContaining({
+      displayName: "Qwen3.6-35B-A3B",
+      modelFamilyId: "unknown",
+    }))
   })
 
   it("keeps arbitrary unclassified aliases in the catalog", async () => {
@@ -290,7 +286,7 @@ describe("llama.cpp discovery", () => {
     })
 
     const result = await Effect.runPromise(
-      createLlamaCppProvider().catalog.list.pipe(
+      createLlamaCppProvider(makeFixedEndpointBackend()).catalog.list.pipe(
         Effect.provideService(HttpClient.HttpClient, client),
       ),
     )
@@ -359,7 +355,7 @@ describe("llama.cpp discovery", () => {
 
     expect(result._tag).toBe("Left")
     if (result._tag === "Left") {
-      expect(result.left.message).toContain("did not contain a data array")
+      expect(result.left.message).toContain("did not match the llama.cpp contract")
     }
   })
 
@@ -378,7 +374,7 @@ describe("llama.cpp discovery", () => {
 
     expect(result._tag).toBe("Left")
     if (result._tag === "Left") {
-      expect(result.left.message).toContain("no valid model entries")
+      expect(result.left.message).toContain("did not match the llama.cpp contract")
     }
   })
 
@@ -402,7 +398,7 @@ describe("llama.cpp discovery", () => {
         cause: new Error("connection refused"),
       })),
     )
-    const instance = createLlamaCppProvider()
+    const instance = createLlamaCppProvider(makeFixedEndpointBackend())
     const registry = makeProviderRegistry({
       magnitude: null,
       discoverableProviders: [instance],
@@ -420,7 +416,8 @@ describe("llama.cpp discovery", () => {
       displayName: "Llama.cpp",
       authStatus: { _tag: "no_auth_required" },
       status: "not_found",
-      hint: "Start one with e.g. llama-server -m /path/to/model.gguf",
+      message: "Connection failed",
+      hint: "Start llama-server or configure a different endpoint",
     }])
   })
 
@@ -453,7 +450,7 @@ describe("llama.cpp discovery", () => {
         throw new Error("No Magnitude API key")
       },
     })
-    const llamacpp = createLlamaCppProvider()
+    const llamacpp = createLlamaCppProvider(makeFixedEndpointBackend())
     const registry = makeProviderRegistry({
       magnitude,
       discoverableProviders: [llamacpp],

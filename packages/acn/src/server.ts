@@ -1,22 +1,25 @@
 import { BunHttpServer, BunFileSystem, BunPath, BunCommandExecutor } from "@effect/platform-bun"
-import { HttpServerResponse } from "@effect/platform"
+import { FetchHttpClient, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
-import { Effect, Layer, Runtime } from "effect"
+import { Effect, Layer, Option, Runtime, Secret } from "effect"
 import {
   StorageLive,
+  MagnitudeStorage,
   GlobalStorageLive,
   ProjectStorageLiveFromCwd,
   VersionLive,
+  defaultGlobalStorageRoot,
 } from "@magnitudedev/storage"
+import { LlamaCppLive } from "@magnitudedev/llamacpp"
 import { MagnitudeRpcs } from "@magnitudedev/protocol"
 import { HandlersLive } from "./handlers"
 import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
 import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
 import { AccountLive } from "./account"
-import { SharedProviderClientLive, SharedProviderClientRefLive } from "./shared-client"
+import { ProviderClientRegistryLive, SharedProviderClientLive } from "./shared-client"
 import { ActiveSessionStatusesLive } from "./active-session-statuses"
 import { AcnActivityTrackerLive, AcnRpcCommandActivityLive } from "./activity-tracker"
 import { DisplayViewStreamsLive } from "./display-view-streams"
@@ -27,9 +30,13 @@ import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import {
-  LlamaCppRuntimeBridgeEndpointTestLive,
-  LocalInferenceOnboardingLive,
+  LocalInferenceLive,
+  LocalModelProviderBackendLive,
+  LocalModelConfigurationLive,
+  ModelConfigurationPropagationLive,
 } from "./local-inference"
+import { OnboardingLive } from "./onboarding"
+import { resolveLlamaCppAuth } from "./shared-client"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
@@ -106,13 +113,6 @@ const RpcRoute = RpcServer.layerHttpRouter({
 const AllDebugRoutes = Layer.mergeAll(CorsMiddleware, OptionsRoute, HealthRoute, RpcRoute, AcnIntrospectionRoutes(true))
 const AllBaseRoutes = Layer.mergeAll(CorsMiddleware, OptionsRoute, HealthRoute, RpcRoute, AcnIntrospectionRoutes(false))
 
-function AllRoutes(debug: true): typeof AllDebugRoutes
-function AllRoutes(debug: false): typeof AllBaseRoutes
-function AllRoutes(debug: boolean): typeof AllDebugRoutes | typeof AllBaseRoutes
-function AllRoutes(debug: boolean) {
-  return debug ? AllDebugRoutes : AllBaseRoutes
-}
-
 const AcnProcessHandlersLive = Layer.scopedDiscard(
   Effect.gen(function* () {
     const runtime = yield* Effect.runtime<never>()
@@ -156,73 +156,105 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
 
 const makeAcnServicesBase = (debug: boolean) => {
   const storageBase = Layer.mergeAll(
-    GlobalStorageLive,
     VersionLive(ACN_VERSION),
     ProjectStorageLiveFromCwd(process.cwd()),
-    BunFileSystem.layer,
-    BunPath.layer,
   )
 
   const storageLayer = StorageLive.pipe(
     Layer.provide(storageBase)
   )
 
-  const services = Layer.mergeAll(
+  const storageServices = Layer.mergeAll(
     SessionStoreLive,
     SessionRuntimeOptionsStoreLive,
-    AgentFactoryLive({ debug, version: ACN_VERSION }),
   ).pipe(
     Layer.provideMerge(storageLayer)
   )
 
-  const withRuntime = Layer.provideMerge(AgentRuntimeLive, services)
-  // SharedProviderClientLive needs both MagnitudeStorage (from services) and
-  // GlobalStorage (from storageBase). Merge GlobalStorageLive alongside so
-  // the service is in context.
-  const withGlobalStorage = Layer.mergeAll(withRuntime, GlobalStorageLive)
-  const withSharedClientRef = Layer.provideMerge(SharedProviderClientRefLive, withGlobalStorage)
-  const withSharedClient = Layer.provideMerge(SharedProviderClientLive, withSharedClientRef)
+  const localServices = addLocalInferenceServices(storageServices)
+  const withFactory = Layer.provideMerge(
+    AgentFactoryLive({ debug, version: ACN_VERSION }),
+    localServices,
+  )
+  const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
+  const withPropagation = Layer.provideMerge(ModelConfigurationPropagationLive, withRuntime)
+  const withSharedClient = Layer.provideMerge(SharedProviderClientLive, withPropagation)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withSharedClient)
   const withDestroyer = Layer.provideMerge(SessionDestroyerLive, withDrafts)
   return Layer.provideMerge(AcnActivityTrackerLive, withDestroyer)
 }
 
-const localInferenceRuntimeBridgeLayer = () => LlamaCppRuntimeBridgeEndpointTestLive
+const llamaCppPackageLayer = () => {
+  const root = defaultGlobalStorageRoot()
+  return Layer.unwrapEffect(Effect.gen(function* () {
+    const storage = yield* MagnitudeStorage
+    return LlamaCppLive({
+      distribution: {
+        managedRoot: `${root}/llamacpp/distribution`,
+        ...(process.env.LLAMA_CPP_SERVER_PATH?.trim()
+          ? { configuredExecutable: process.env.LLAMA_CPP_SERVER_PATH.trim() }
+          : {}),
+      },
+      modelStore: {
+        ownedRoot: `${root}/llamacpp/models`,
+      },
+      runtime: {
+        runtimeRoot: `${root}/llamacpp/runtime`,
+        externalConnections: () => resolveLlamaCppAuth(storage).pipe(
+          Effect.map((auth) => auth
+            ? [{
+                connectionId: "llamacpp",
+                connection: {
+                  baseUrl: auth.endpoint,
+                  apiKey: auth.apiKey
+                    ? Option.some(Secret.fromString(auth.apiKey))
+                    : Option.none(),
+                },
+              }]
+            : []),
+        ),
+      },
+    })
+  }))
+}
 
-const AcnBaseServicesLayer = (debug: boolean) => {
-  const withActivity = makeAcnServicesBase(debug)
-  const withCommandTracking = Layer.provideMerge(AcnRpcCommandActivityLive, withActivity)
+const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {
+  const withPackage = Layer.provideMerge(llamaCppPackageLayer(), base)
+  const withConfiguration = Layer.provideMerge(LocalModelConfigurationLive, withPackage)
+  const withOnboarding = Layer.provideMerge(OnboardingLive, withConfiguration)
+  const withBackend = Layer.provideMerge(LocalModelProviderBackendLive, withOnboarding)
+  const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withBackend)
+  return Layer.provideMerge(LocalInferenceLive, withProviderClients)
+}
+
+const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
+  const withCommandTracking = Layer.provideMerge(AcnRpcCommandActivityLive, services)
   const withCommands = Layer.provideMerge(SessionCommandsLive, withCommandTracking)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
   const withAccount = Layer.provideMerge(AccountLive, withLifecycle)
-  // TODO(llamacpp-package-integration, CTO-owned): Replace this temporary
-  // attach-only endpoint layer with the final managed LlamaCppRuntimeBridge.
-  // Do not add download or lifecycle ownership to the endpoint preview bridge.
-  const withLlamaCppBridge = Layer.provideMerge(localInferenceRuntimeBridgeLayer(), withAccount)
-  const withLocalInference = Layer.provideMerge(LocalInferenceOnboardingLive, withLlamaCppBridge)
-  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withLocalInference)
+  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withAccount)
   const withStreams = Layer.provideMerge(DisplayViewStreamsLive, withActiveSessionStatuses)
   return withStreams
 }
 
-const AcnDebugServicesLayer = (debug: boolean) => {
-  const withActivity = makeAcnServicesBase(debug)
-  const withDisplayIntrospection = Layer.provideMerge(AcnDisplayViewIntrospectorLive, withActivity)
-  const withIntrospection = Layer.provideMerge(AcnIntrospectorLive, withDisplayIntrospection)
-  const withCommandTracking = Layer.provideMerge(AcnRpcCommandActivityLive, withIntrospection)
-  const withCommands = Layer.provideMerge(SessionCommandsLive, withCommandTracking)
-  const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
-  const withAccount = Layer.provideMerge(AccountLive, withLifecycle)
-  // Keep debug and production on the same mechanism adapter selection.
-  const withLlamaCppBridge = Layer.provideMerge(localInferenceRuntimeBridgeLayer(), withAccount)
-  const withLocalInference = Layer.provideMerge(LocalInferenceOnboardingLive, withLlamaCppBridge)
-  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withLocalInference)
-  const withStreams = Layer.provideMerge(DisplayViewStreamsLive, withActiveSessionStatuses)
-  return withStreams
+const AcnBaseServicesLayer = () => addCommonAcnServices(makeAcnServicesBase(false))
+
+const AcnDebugServicesLayer = () => {
+  const withActivity = makeAcnServicesBase(true)
+  const withDisplayIntrospection = Layer.provideMerge(
+    AcnDisplayViewIntrospectorLive,
+    withActivity,
+  )
+  return addCommonAcnServices(
+    Layer.provideMerge(AcnIntrospectorLive, withDisplayIntrospection),
+  )
 }
 
-const AcnServerBaseLayer = (options: AcnServerOptions) =>
-  HttpLayerRouter.serve(AllRoutes(false)).pipe(
+const makeAcnApplication = <A, E, R>(
+  routes: Layer.Layer<A, E, R>,
+  options: AcnServerOptions,
+  debug: boolean,
+) => HttpLayerRouter.serve(routes).pipe(
     // HandlersLive consumes the ACN services directly.
     Layer.provide(HandlersLive),
     // DaemonLifecycle needs runtime/activity + HttpServer + FileSystem.
@@ -230,49 +262,32 @@ const AcnServerBaseLayer = (options: AcnServerOptions) =>
       DaemonLifecycleLive({
         version: ACN_VERSION,
         register: options.register ?? false,
-        debug: false,
+        debug,
         idleTimeoutMinutes: 30,
         checkIntervalSeconds: 60,
         dataDir: defaultDataDir(),
       })
     ),
     Layer.provide(AcnProcessHandlersLive),
-    Layer.provide(AcnBaseServicesLayer(false)),
-    // CommandExecutor (used by ops.ts) requires FileSystem, so provide it before BunFileSystem
-    Layer.provide(BunCommandExecutor.layer),
-    // FileSystem (shared by Daemon + CommandExecutor)
-    Layer.provide(BunFileSystem.layer),
-    Layer.provide(BunPath.layer),
-    // HttpServer (shared by Daemon + HttpLayerRouter.serve)
-    Layer.provide(BunHttpServer.layer({ port: 0, hostname: "127.0.0.1", idleTimeout: 255 })),
-    // OTLP tracing — only active when MAGNITUDE_OTEL_ENDPOINT or
-    // MAGNITUDE_OTEL=1 is set. Exports all RPC + HTTP spans to motel (or
-    // any OTLP-compatible collector). Zero overhead when disabled.
-    Layer.provide(TracingLayer)
   )
 
-const AcnServerDebugLayer = (options: AcnServerOptions) =>
-  HttpLayerRouter.serve(AllRoutes(true)).pipe(
-    // HandlersLive consumes the ACN services directly.
-    Layer.provide(HandlersLive),
-    // DaemonLifecycle needs runtime/activity + HttpServer + FileSystem.
-    Layer.provide(
-      DaemonLifecycleLive({
-        version: ACN_VERSION,
-        register: options.register ?? false,
-        debug: true,
-        idleTimeoutMinutes: 30,
-        checkIntervalSeconds: 60,
-        dataDir: defaultDataDir(),
-      })
-    ),
-    Layer.provide(AcnProcessHandlersLive),
-    Layer.provide(AcnDebugServicesLayer(true)),
+const makeAcnServerLayer = (options: AcnServerOptions, debug: boolean) => {
+  const application = debug
+    ? makeAcnApplication(AllDebugRoutes, options, true).pipe(
+        Layer.provide(AcnDebugServicesLayer()),
+      )
+    : makeAcnApplication(AllBaseRoutes, options, false).pipe(
+        Layer.provide(AcnBaseServicesLayer()),
+      )
+
+  return application.pipe(
+    Layer.provide(GlobalStorageLive),
     // CommandExecutor (used by ops.ts) requires FileSystem, so provide it before BunFileSystem
     Layer.provide(BunCommandExecutor.layer),
     // FileSystem (shared by Daemon + CommandExecutor)
     Layer.provide(BunFileSystem.layer),
     Layer.provide(BunPath.layer),
+    Layer.provide(FetchHttpClient.layer),
     // HttpServer (shared by Daemon + HttpLayerRouter.serve)
     Layer.provide(BunHttpServer.layer({ port: 0, hostname: "127.0.0.1", idleTimeout: 255 })),
     // OTLP tracing — only active when MAGNITUDE_OTEL_ENDPOINT or
@@ -280,6 +295,7 @@ const AcnServerDebugLayer = (options: AcnServerOptions) =>
     // any OTLP-compatible collector). Zero overhead when disabled.
     Layer.provide(TracingLayer)
   )
+}
 
 export const AcnServerLayer = (options: AcnServerOptions = {}): Layer.Layer<never, never, never> =>
-  options.debug ? AcnServerDebugLayer(options) : AcnServerBaseLayer(options)
+  makeAcnServerLayer(options, options.debug === true)

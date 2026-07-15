@@ -4,11 +4,11 @@
  * Derives everything from the `GetCachedModelList` RPC (models, slot profiles,
  * and user config all in one response).
  */
-import { useMemo, useState } from "react"
+import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
 import { SLOT_IDS, type SlotId } from "@magnitudedev/sdk"
-import type { ModelSummary, ModelConfigResponse, ModelList, ProviderInfo } from "@magnitudedev/sdk"
+import type { ModelSummary, ProviderInfo } from "@magnitudedev/sdk"
 
 export interface ModelOption {
   providerId: string
@@ -35,13 +35,13 @@ export interface UseModelConfigResult {
   /** Current user config per slot */
   slotConfig: Record<SlotId, { providerId?: string; providerModelId?: string; reasoningEffort?: string }> | null
   /** Update a slot's model (null clears override) */
-  updateSlotModel: (slotId: SlotId, providerId: string | null, providerModelId: string | null) => Promise<void>
+  updateSlotModel: (slotId: SlotId, providerId: string | null, providerModelId: string | null) => void
   /** Update a slot's reasoning effort (null clears override) */
-  updateSlotReasoning: (slotId: SlotId, effort: string | null) => Promise<void>
+  updateSlotReasoning: (slotId: SlotId, effort: string | null) => void
   /** Reset all overrides to defaults */
-  resetToDefaults: () => Promise<void>
+  resetToDefaults: () => void
   /** Refresh the cached model list from the provider */
-  refreshModels: () => Promise<void>
+  refreshModels: () => void
   /** Whether a mutation is in progress */
   updating: boolean
   /** Mutation error message */
@@ -69,12 +69,11 @@ function toModelOption(model: ModelSummary): ModelOption {
 
 export function useModelConfig(): UseModelConfigResult {
   const client = useAgentClient()
-  const [refreshingModels, setRefreshingModels] = useState(false)
-  const [refreshModelsError, setRefreshModelsError] = useState<string | null>(null)
-
-  const result = useAtomValue(
-    client.query("GetCachedModelList", {}, { reactivityKeys: ["modelConfig"] }),
+  const queryAtom = useMemo(
+    () => client.query("GetCachedModelList", {}, { reactivityKeys: ["modelConfig"] }),
+    [client],
   )
+  const result = useAtomValue(queryAtom)
 
   const modelsLoading = Result.isInitial(result)
   const modelsError = Result.isFailure(result) ? "Failed to load available models" : null
@@ -82,7 +81,7 @@ export function useModelConfig(): UseModelConfigResult {
   const data = Result.match(result, {
     onInitial: () => null,
     onFailure: () => null,
-    onSuccess: (success) => success.value as ModelList,
+    onSuccess: (success) => success.value,
   })
 
   const models = useMemo(() => {
@@ -114,20 +113,17 @@ export function useModelConfig(): UseModelConfigResult {
 
   // ── Mutations ──
 
-  const updateConfig = useAtomSet(
-    client.mutation("UpdateModelConfig"),
-    { mode: "promise" },
-  )
-
-  const refreshMutation = useAtomSet(
-    client.mutation("RefreshCachedModelList"),
-    { mode: "promise" },
-  )
+  const updateConfigAtom = useMemo(() => client.mutation("UpdateModelConfig"), [client])
+  const refreshMutationAtom = useMemo(() => client.mutation("RefreshCachedModelList"), [client])
+  const updateConfigResult = useAtomValue(updateConfigAtom)
+  const refreshMutationResult = useAtomValue(refreshMutationAtom)
+  const updateConfig = useAtomSet(updateConfigAtom)
+  const refreshMutation = useAtomSet(refreshMutationAtom)
 
   const updateSlotModel = useMemo(
-    () => async (slotId: SlotId, providerId: string | null, providerModelId: string | null): Promise<void> => {
+    () => (slotId: SlotId, providerId: string | null, providerModelId: string | null): void => {
       const current = configResponse?.slots[slotId] ?? {}
-      await updateConfig({
+      updateConfig({
         payload: {
           slots: {
             [slotId]: {
@@ -144,9 +140,9 @@ export function useModelConfig(): UseModelConfigResult {
   )
 
   const updateSlotReasoning = useMemo(
-    () => async (slotId: SlotId, effort: string | null): Promise<void> => {
+    () => (slotId: SlotId, effort: string | null): void => {
       const current = configResponse?.slots[slotId] ?? {}
-      await updateConfig({
+      updateConfig({
         payload: {
           slots: {
             [slotId]: {
@@ -163,8 +159,8 @@ export function useModelConfig(): UseModelConfigResult {
   )
 
   const resetToDefaults = useMemo(
-    () => async (): Promise<void> => {
-      await updateConfig({
+    () => (): void => {
+      updateConfig({
         payload: {
           slots: {},
         },
@@ -175,20 +171,11 @@ export function useModelConfig(): UseModelConfigResult {
   )
 
   const refreshModels = useMemo(
-    () => async (): Promise<void> => {
-      setRefreshingModels(true)
-      setRefreshModelsError(null)
-      try {
-        await refreshMutation({
-          payload: {},
-          reactivityKeys: ["modelConfig"],
-        })
-      } catch (err) {
-        setRefreshModelsError(err instanceof Error ? err.message : "Failed to refresh models")
-        throw err
-      } finally {
-        setRefreshingModels(false)
-      }
+    () => (): void => {
+      refreshMutation({
+        payload: {},
+        reactivityKeys: ["modelConfig"],
+      })
     },
     [refreshMutation],
   )
@@ -203,9 +190,9 @@ export function useModelConfig(): UseModelConfigResult {
     updateSlotReasoning,
     resetToDefaults,
     refreshModels,
-    updating: false,
-    updateError: null,
-    refreshingModels,
-    refreshModelsError,
+    updating: Result.isWaiting(updateConfigResult),
+    updateError: Result.isFailure(updateConfigResult) ? "Failed to update model configuration" : null,
+    refreshingModels: Result.isWaiting(refreshMutationResult),
+    refreshModelsError: Result.isFailure(refreshMutationResult) ? "Failed to refresh models" : null,
   }
 }

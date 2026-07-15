@@ -10,6 +10,7 @@ import * as Shell from "./shell"
 import * as Events from "./events"
 import * as Stream from "./stream"
 import * as LocalInference from "./local-inference"
+import * as Onboarding from "./onboarding"
 import { AcnRpcCommandActivity } from "./middleware"
 
 export const MagnitudeRpcs = RpcGroup.make(
@@ -39,13 +40,16 @@ export const MagnitudeRpcs = RpcGroup.make(
   Config.GetCachedModelList.middleware(AcnRpcCommandActivity),
   Config.RefreshCachedModelList.middleware(AcnRpcCommandActivity),
   Config.GetBalance.middleware(AcnRpcCommandActivity),
-  LocalInference.GetLocalInferenceOnboardingSnapshot.middleware(AcnRpcCommandActivity),
+  LocalInference.GetLocalInferenceState.middleware(AcnRpcCommandActivity),
   LocalInference.ConfigureLocalInferenceUsage.middleware(AcnRpcCommandActivity),
-  LocalInference.StartLocalModelDownload.middleware(AcnRpcCommandActivity),
-  LocalInference.GetLocalModelDownloadProgress.middleware(AcnRpcCommandActivity),
-  LocalInference.CancelLocalModelDownload.middleware(AcnRpcCommandActivity),
+  LocalInference.InstallLocalInferenceDistribution.middleware(AcnRpcCommandActivity),
+  LocalInference.DownloadLocalModel.middleware(AcnRpcCommandActivity),
   LocalInference.ActivateLocalModel.middleware(AcnRpcCommandActivity),
-  LocalInference.CompleteCliModelSetupOnboarding.middleware(AcnRpcCommandActivity),
+  LocalInference.DeleteLocalModel.middleware(AcnRpcCommandActivity),
+  LocalInference.RestartLocalInference.middleware(AcnRpcCommandActivity),
+  LocalInference.DisableLocalInference.middleware(AcnRpcCommandActivity),
+  Onboarding.GetOnboardingState.middleware(AcnRpcCommandActivity),
+  Onboarding.CompleteOnboardingFlow.middleware(AcnRpcCommandActivity),
   Files.ListFiles.middleware(AcnRpcCommandActivity),
   Files.ReadFile.middleware(AcnRpcCommandActivity),
   Files.CheckFileExists.middleware(AcnRpcCommandActivity),
@@ -64,5 +68,4 @@ export const MagnitudeRpcs = RpcGroup.make(
   // Long-running subscriptions
   Session.StreamActiveSessionStatuses,
   Events.StreamEvents,
-  LocalInference.SubscribeLocalModelDownload,
 )

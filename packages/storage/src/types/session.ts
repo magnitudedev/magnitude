@@ -88,8 +88,8 @@ export const MemoryExtractionJobRecordSchema = Schema.Struct({
 export type MemoryExtractionJobRecord = Schema.Schema.Type<typeof MemoryExtractionJobRecordSchema>
 
 export interface CwdIndex {
-  cwd: string
-  sessionIds: string[]
+  readonly cwd: string
+  readonly sessionIds: readonly string[]
 }
 
 export interface SessionDiscoveryOptions {

@@ -2,7 +2,7 @@ import { Schema } from 'effect'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {
-    default: () => null as A | null,
+    default: (): A | null => null,
   })
 
 export const ContextLimitPolicySchema = Schema.Struct({
@@ -43,14 +43,48 @@ export const ModelConfigSchema = Schema.Struct({
 })
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 
+export const OnboardingFlowIdSchema = Schema.Literal('model_setup')
+export type OnboardingFlowId = Schema.Schema.Type<typeof OnboardingFlowIdSchema>
+
+export const OnboardingCompletionSchema = Schema.Struct({
+  version: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  completedAt: Schema.String,
+})
+export type OnboardingCompletion = Schema.Schema.Type<typeof OnboardingCompletionSchema>
+
 export const OnboardingConfigSchema = Schema.Struct({
-  completedAt: Schema.optional(Schema.String),
+  completions: Schema.optional(
+    Schema.partial(Schema.Record({ key: OnboardingFlowIdSchema, value: OnboardingCompletionSchema })),
+  ),
 })
 export type OnboardingConfig = Schema.Schema.Type<typeof OnboardingConfigSchema>
 
-export const LocalInferenceConfigSchema = Schema.Struct({
+export const LocalInferenceUsageSelectionSchema = Schema.Struct({
   localModelRole: Schema.Literal('main', 'subagent'),
   sessionConcurrency: Schema.Literal('one', 'up_to_three'),
+})
+export type LocalInferenceUsageSelection = Schema.Schema.Type<typeof LocalInferenceUsageSelectionSchema>
+
+export const DurableLocalModelBindingSchema = Schema.Union(
+  Schema.TaggedStruct('Managed', {
+    selectionId: Schema.String,
+    artifactId: Schema.String,
+    providerModelId: Schema.String,
+    contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
+    parallelSlots: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  }),
+  Schema.TaggedStruct('External', {
+    selectionId: Schema.String,
+    endpointConfigId: Schema.String,
+    providerModelId: Schema.String,
+    contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  }),
+)
+export type DurableLocalModelBinding = Schema.Schema.Type<typeof DurableLocalModelBindingSchema>
+
+export const LocalInferenceConfigSchema = Schema.Struct({
+  usage: Schema.optional(LocalInferenceUsageSelectionSchema),
+  binding: Schema.optional(DurableLocalModelBindingSchema),
 })
 export type LocalInferenceConfig = Schema.Schema.Type<typeof LocalInferenceConfigSchema>
 

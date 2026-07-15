@@ -523,9 +523,8 @@ export const SessionDraftsLive: Layer.Layer<
           // Skip preloading (in-flight startup) and claiming (owned by a claimer).
           if (entry._tag !== "ready") continue
           if (now - entry.touchedAt < READY_DRAFT_TTL_MS) continue
-          // Check if the draft has messages — if so, skip. The draft is a
-          // real session that was never promoted (e.g. promote failed after
-          // sendUserMessage succeeded). Startup cleanup will promote it.
+          // Preserve drafts containing messages. Promotion remains owned by
+          // the normal claim/send flow; a TTL sweep must never delete user data.
           const meta = yield* store.readMeta(entry.sessionId)
           if (meta && (meta.messageCount ?? 0) > 0) continue
           const removed = yield* removeReadyEntry(entry)
@@ -535,34 +534,27 @@ export const SessionDraftsLive: Layer.Layer<
         }
       })
 
-      // One-time startup cleanup: scan the store for orphaned draft sessions
-      // left from a previous daemon that crashed or was killed. Safe because
-      // no claims exist on startup (draft map is empty, no runtime entries).
+      // Retained for an explicit maintenance/migration path. Do not run this
+      // during layer construction: it enumerates every historical session.
       const cleanupOrphanedDrafts = Effect.fn("acn.session-drafts.cleanup-orphaned-drafts")(function* () {
         const draftIds = yield* store.listDraftSessionIds()
         for (const sessionId of draftIds) {
           const meta = yield* store.readMeta(sessionId)
           if (!meta) {
-            // Store entry disappeared between list and read — skip
             yield* store.deleteSessionFiles(sessionId)
             continue
           }
           if ((meta.messageCount ?? 0) > 0) {
-            // Draft has messages — promote to visible. This is a real session
-            // that was never promoted (e.g. promote failed after sendUserMessage
-            // succeeded, then the daemon died).
             yield* store.promoteDraft(sessionId)
           } else {
-            // Empty orphaned draft — delete
             yield* store.deleteSessionFiles(sessionId)
           }
         }
       })
 
-      // Run startup cleanup before serving requests
-      yield* cleanupOrphanedDrafts().pipe(
-        Effect.catchAll(logDraftLifecycleError("Failed to clean up orphaned draft sessions", {})),
-      )
+      // Intentionally disabled: a daemon must not scan all session metadata
+      // before it can serve requests.
+      // yield* cleanupOrphanedDrafts()
 
       yield* Effect.forkIn(
         Effect.forever(

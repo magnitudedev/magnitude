@@ -1,5 +1,7 @@
 import { FetchHttpClient } from "@effect/platform"
-import { Cause, Context, Effect, Layer, Ref } from "effect"
+import * as HttpClient from "@effect/platform/HttpClient"
+import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
+import { Cause, Context, Effect, Layer, Schema } from "effect"
 import {
   ProviderClient,
   type BalanceQuery,
@@ -7,25 +9,19 @@ import {
   type ProviderModel,
   type ProviderClientShape,
   type ProviderRegistryInfo,
+  MagnitudeModelListResponseSchema,
+  toMagnitudeModelInfo,
 } from "@magnitudedev/sdk"
 import { isEnvFlagOn } from "@magnitudedev/utils"
-import {
-  SharedProviderClientRef,
-  makeSharedProviderClient,
-  resolveLlamaCppAuth,
-} from "./shared-client"
+import { ProviderClientRegistry } from "./shared-client"
 import {
   MagnitudeStorage,
-  GlobalStorage,
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
 import {
   SessionOperationFailed,
   type SessionError,
   type SlotProfiles,
-  type SlotProfile,
-  type SlotModelConfig,
-  type ModelConfigResponse,
   type ModelSummary,
   type ModelList,
   type ProviderInfo,
@@ -38,7 +34,6 @@ import {
   SLOT_IDS,
   DEFAULT_REASONING_EFFORT,
   resolveSlotModel,
-  type UserSlotConfig,
 } from "@magnitudedev/roles"
 
 export interface AccountApi {
@@ -46,7 +41,6 @@ export interface AccountApi {
   readonly getProviderAuth: (providerId: string) => Effect.Effect<ProviderAuth | null, SessionError>
   readonly listProviderAuth: Effect.Effect<Readonly<Record<string, ProviderAuth>>, SessionError>
   readonly listPublicSlotProfiles: Effect.Effect<SlotProfiles | null, SessionError>
-  readonly updateModelConfig: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, SessionError>
   readonly getCachedModelList: (providerId?: string) => Effect.Effect<ModelList, SessionError>
   readonly refreshCachedModelList: (providerId?: string) => Effect.Effect<ModelList, SessionError>
   readonly getBalance: (query?: BalanceQuery) => Effect.Effect<BalanceResponse, SessionError>
@@ -73,17 +67,25 @@ const noApiKey = (operation: string): SessionError =>
 // Pure mapping helpers
 // =============================================================================
 
+const isSlotId = (value: unknown): value is SlotId =>
+  value === "primary" || value === "secondary"
+
+const slotsForModel = (model: ProviderModel): readonly SlotId[] => {
+  if (!("slots" in model) || !Array.isArray(model.slots)) return []
+  return model.slots.filter(isSlotId)
+}
+
 /**
  * Map a `ProviderModel` → `ModelSummary` for the protocol layer.
  */
 function toModelSummary(model: ProviderModel): ModelSummary {
-  const slots = (model as ProviderModel & { readonly slots?: readonly SlotId[] }).slots
+  const slots = slotsForModel(model)
   return {
     providerId: model.providerId,
     providerModelId: model.providerModelId,
     modelFamilyId: model.modelFamilyId,
     displayName: model.displayName,
-    ...(slots && slots.length > 0 ? { slots: [...slots] } : {}),
+    ...(slots.length > 0 ? { slots: [...slots] } : {}),
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
     capabilities: { vision: model.capabilities.vision ?? false },
@@ -121,7 +123,7 @@ function buildModelList(
       models: models.map(toModelSummary),
       providers,
       slotProfiles: slotProfilesFromModels(models, modelConfig),
-      modelConfig: { slots: modelConfig?.slots ?? {} } as ModelConfigResponse,
+      modelConfig: { slots: modelConfig?.slots ?? {} },
     }
   })
 }
@@ -136,48 +138,53 @@ function slotProfilesFromModels(
     readonly slots?: Partial<Record<SlotId, { readonly providerId?: string; readonly providerModelId?: string; readonly reasoningEffort?: string }>>
   } | null,
 ): SlotProfiles {
-  const out: Record<string, SlotProfile> = {}
+  const routableModels = models.map((model) => ({
+    ...model,
+    slots: slotsForModel(model),
+  }))
+  let profiles: SlotProfiles = {}
   for (const slotId of SLOT_IDS) {
     const userSlotConfig = userConfig?.slots?.[slotId]
 
-    const resolved = resolveSlotModel(models, userSlotConfig as UserSlotConfig | undefined, slotId)
+    const resolved = resolveSlotModel(routableModels, userSlotConfig, slotId)
     if (!resolved) continue
-    const model = models.find((m) => m.providerId === resolved.providerId && m.providerModelId === resolved.providerModelId)
+    const model = routableModels.find((candidate) =>
+      candidate.providerId === resolved.providerId
+      && candidate.providerModelId === resolved.providerModelId)
     if (!model) continue
 
     const reasoningEffort = userSlotConfig?.reasoningEffort ?? DEFAULT_REASONING_EFFORT[slotId]
 
-    out[slotId] = {
-      slotId,
-      providerId: resolved.providerId,
-      providerModelId: resolved.providerModelId,
-      modelDisplayName: model.displayName,
-      contextWindow: model.contextWindow,
-      maxOutputTokens: model.maxOutputTokens,
-      capabilities: { vision: model.capabilities.vision ?? false },
-      reasoningEffort,
-      isUserOverride: resolved.isUserOverride,
+    profiles = {
+      ...profiles,
+      [slotId]: {
+        slotId,
+        providerId: resolved.providerId,
+        providerModelId: resolved.providerModelId,
+        modelDisplayName: model.displayName,
+        contextWindow: model.contextWindow,
+        maxOutputTokens: model.maxOutputTokens,
+        capabilities: { vision: model.capabilities.vision ?? false },
+        reasoningEffort,
+        isUserOverride: resolved.isUserOverride,
+      },
     }
   }
-  return out as SlotProfiles
+  return profiles
 }
 
 // =============================================================================
 // Layer
 // =============================================================================
 
-export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | SharedProviderClientRef | GlobalStorage> =
+export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | ProviderClientRegistry> =
   Layer.effect(
     Account,
     Effect.gen(function* () {
       const store = yield* SessionStore
       const sharedClient = yield* ProviderClient
       const storage = yield* MagnitudeStorage
-      const clientRef = yield* SharedProviderClientRef
-      const globalStorage = yield* GlobalStorage
-
-      // Semaphore to serialize config writes (§5.9)
-      const configSemaphore = yield* Effect.makeSemaphore(1)
+      const providerClients = yield* ProviderClientRegistry
 
       const resolveApiKey = Effect.gen(function* () {
         const useLocal = isEnvFlagOn(process.env.MAGNITUDE_USE_LOCAL)
@@ -187,7 +194,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         }
 
         const stored = yield* storage.auth.get("magnitude").pipe(
-          Effect.catchAll(() => Effect.succeed(undefined)),
+          Effect.catchAll(() => Effect.void),
         )
         if (stored?.type === "api" && stored.key.trim()) return stored.key
 
@@ -231,17 +238,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
             yield* storage.auth.set(providerId, auth).pipe(
               Effect.mapError(toAccountError("update provider auth")),
             )
-            if (
-              (providerId === "magnitude" && auth.type === "api")
-              || (providerId === "llamacpp" && auth.type === "endpoint")
-            ) {
-              const apiKey = yield* resolveApiKey
-              const llamacpp = yield* resolveLlamaCppAuth(storage)
-              const newClient = yield* makeSharedProviderClient(apiKey, llamacpp).pipe(
-                Effect.provideService(GlobalStorage, globalStorage),
-              )
-              yield* Ref.set(clientRef, newClient)
-            }
+            yield* providerClients.refreshAll
           }),
 
         getProviderAuth: (providerId) =>
@@ -254,25 +251,24 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           Effect.mapError(toAccountError("list provider auth")),
         ),
 
-        listPublicSlotProfiles: Effect.tryPromise({
-          try: async () => {
-            // Fetch public model list without auth, then build slot profiles.
+        listPublicSlotProfiles: Effect.gen(function* () {
+            const client = yield* HttpClient.HttpClient
             const useLocal = isEnvFlagOn(process.env.MAGNITUDE_USE_LOCAL)
             const baseUrl = process.env.MAGNITUDE_ENDPOINT
               ?? (useLocal ? "http://localhost:3000/api/v1" : "https://app.magnitude.dev/api/v1")
-            const response = await fetch(`${baseUrl}/public/models`)
-            if (!response.ok) return null
-            const body = await response.json() as { data: readonly ProviderModel[] }
-            return slotProfilesFromModels(body.data, null)
-          },
-          catch: toAccountError("list public slot profiles"),
-        }),
-
-        updateModelConfig: (slots) =>
-          configSemaphore.withPermits(1)(
-            storage.config.updateModelConfig(slots).pipe(
-              Effect.mapError(toAccountError("update model config")),
-            ),
+            const response = yield* client.execute(HttpClientRequest.get(`${baseUrl}/public/models`))
+            if (response.status < 200 || response.status >= 300) return null
+            const body = yield* response.json.pipe(
+              Effect.flatMap(Schema.decodeUnknown(MagnitudeModelListResponseSchema)),
+            )
+            const models = body.data.map((raw) => ({
+              ...toMagnitudeModelInfo(raw),
+              modelFamilyId: "unknown",
+            }))
+            return slotProfilesFromModels(models, null)
+          }).pipe(
+            Effect.provide(FetchHttpClient.layer),
+            Effect.mapError(toAccountError("list public slot profiles")),
           ),
 
         getCachedModelList: (providerId?: string) =>

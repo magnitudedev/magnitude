@@ -1,55 +1,60 @@
 import type { ApiKeyState } from '@magnitudedev/client-common'
 import type { AuthSource } from '../../state/cli-atoms'
 
-type AuthAction = (key: string) => Promise<void>
-type ClearAuthAction = () => Promise<void>
+type AuthAction = (key: string) => void
+type ClearAuthAction = () => void
 
 /** Auth display info for the settings overlay. */
-export type AuthInfo =
+interface AuthActions {
+  readonly save: AuthAction
+  readonly clear: ClearAuthAction
+  readonly saving: boolean
+  readonly error: string | null
+}
+
+export type AuthInfo = AuthActions & (
   | {
     source: 'config'
     key: null
     maskedKey: string | null
     envVarName: null
-    save: AuthAction
-    clear: ClearAuthAction
   }
   | {
     source: 'env' | 'env-local'
     key: string
     maskedKey: null
     envVarName: string
-    save: AuthAction
-    clear: ClearAuthAction
   }
   | {
     source: 'none'
     key: null
     maskedKey: null
     envVarName: null
-    save: AuthAction
-    clear: ClearAuthAction
-  }
+  })
 
 export function deriveSettingsAuthInfo({
   apiKey,
   authSource,
   save,
   clear,
+  saving = false,
+  error = null,
 }: {
   apiKey: ApiKeyState
   authSource: AuthSource
   save: AuthAction
   clear: ClearAuthAction
+  saving?: boolean
+  error?: string | null
 }): AuthInfo {
+  const actions = { save, clear, saving, error }
   if (authSource.source === 'env-local') {
     return {
       source: 'env-local',
       key: authSource.key,
       maskedKey: null,
       envVarName: authSource.envVarName,
-      save,
-      clear,
+      ...actions,
     }
   }
 
@@ -59,8 +64,7 @@ export function deriveSettingsAuthInfo({
       key: null,
       maskedKey: apiKey.maskedKey ?? null,
       envVarName: null,
-      save,
-      clear,
+      ...actions,
     }
   }
 
@@ -70,8 +74,7 @@ export function deriveSettingsAuthInfo({
       key: authSource.key,
       maskedKey: null,
       envVarName: authSource.envVarName,
-      save,
-      clear,
+      ...actions,
     }
   }
 
@@ -80,7 +83,6 @@ export function deriveSettingsAuthInfo({
     key: null,
     maskedKey: null,
     envVarName: null,
-    save,
-    clear,
+    ...actions,
   }
 }

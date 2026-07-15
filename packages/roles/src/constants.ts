@@ -15,7 +15,7 @@ export type RoleId = 'leader' | 'scout' | 'architect' | 'engineer' | 'critic' | 
 export const ROLE_IDS: readonly RoleId[] = ['leader', 'scout', 'architect', 'engineer', 'critic', 'scientist', 'artisan', 'advisor'] as const
 
 export function isRoleId(value: string): value is RoleId {
-  return (ROLE_IDS as readonly string[]).includes(value)
+  return ROLE_IDS.some((roleId) => roleId === value)
 }
 
 // ---------------------------------------------------------------------------

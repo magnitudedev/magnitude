@@ -62,7 +62,10 @@ describe('createDisplayViewStore', () => {
     ]), makeShape())
 
     const state = store.getSnapshot().state
-    expect(state.timelines.root.messages.byId['m1']?.content).toBe('hi')
+    expect(state.timelines.root.messages.byId['m1']).toMatchObject({
+      type: 'user_message',
+      content: 'hi',
+    })
   })
 
   it('notifies subscribers on accept', () => {
@@ -109,12 +112,18 @@ describe('createDisplayViewStore', () => {
       { owner: 'test', label: 'append' },
       (draft) => {
         draft.state.timelines.root.messages.byId['m2'] = userMessage('m2', 'world', 2)
-        draft.state.timelines.root.messages.order.push('m2')
+        draft.state.timelines.root.messages.order = [
+          ...draft.state.timelines.root.messages.order,
+          'm2',
+        ]
       },
     )
 
     // Should see the speculative message
-    expect(store.getSnapshot().state.timelines.root.messages.byId['m2']?.content).toBe('world')
+    expect(store.getSnapshot().state.timelines.root.messages.byId['m2']).toMatchObject({
+      type: 'user_message',
+      content: 'world',
+    })
 
     handle.remove()
 
@@ -131,7 +140,10 @@ describe('createDisplayViewStore', () => {
       { owner: 'test' },
       (draft) => {
         draft.state.timelines.root.messages.byId['m2'] = userMessage('m2', 'world', 2)
-        draft.state.timelines.root.messages.order.push('m2')
+        draft.state.timelines.root.messages.order = [
+          ...draft.state.timelines.root.messages.order,
+          'm2',
+        ]
       },
     )
 

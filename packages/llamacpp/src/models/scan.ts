@@ -68,7 +68,7 @@ function findGgufFiles(
 ): Effect.Effect<readonly string[], never, never> {
   return Effect.gen(function* () {
     const entries = yield* fs.readDirectory(dir).pipe(
-      Effect.catchAll(() => Effect.succeed([] as readonly string[])),
+      Effect.catchAll(() => Effect.succeed<readonly string[]>([])),
     )
 
     const results: string[] = []
@@ -180,5 +180,4 @@ function buildModelId(filePath: string, source: LocalModelSource): string {
   const dir = dirname(filePath)
   return `${dir}/${fileName}`
 }
-
 

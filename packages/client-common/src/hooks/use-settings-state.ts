@@ -4,11 +4,9 @@
  * GetProviderAuth query + UpdateProviderAuth mutation.
  * Both apps use this identically.
  */
-import { Option } from "effect"
+import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
-import { apiKeyVerifiedAtom } from "../state/session-atoms"
-import type { ProviderAuth } from "@magnitudedev/sdk"
 
 export interface ApiKeyState {
   readonly status: "none" | "loading" | "config"
@@ -22,14 +20,16 @@ export interface UseSettingsStateResult {
   keyAlreadySet: boolean
   /** Whether the query is loading */
   loading: boolean
+  /** Authoritative provider-auth query failure */
+  loadError: string | null
   /** Whether provider auth is being changed */
   saving: boolean
   /** Authoritative provider-auth mutation failure */
   saveError: string | null
   /** Save a new API key */
-  saveApiKey: (key: string) => Promise<void>
+  saveApiKey: (key: string) => void
   /** Disconnect (clear) the API key */
-  disconnectApiKey: () => Promise<void>
+  disconnectApiKey: () => void
 }
 
 function maskApiKey(key: string): string {
@@ -48,18 +48,16 @@ const MAGNITUDE_PROVIDER_ID = "magnitude"
 
 export function useSettingsState(): UseSettingsStateResult {
   const client = useAgentClient()
-  const setApiKeyVerified = useAtomSet(apiKeyVerifiedAtom)
 
-  const result = useAtomValue(
-    client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
+  const queryAtom = useMemo(
+    () => client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
+    [client],
   )
+  const result = useAtomValue(queryAtom)
 
-  const updateProviderAuthAtom = client.mutation("UpdateProviderAuth")
+  const updateProviderAuthAtom = useMemo(() => client.mutation("UpdateProviderAuth"), [client])
   const updateProviderAuthResult = useAtomValue(updateProviderAuthAtom)
-  const updateProviderAuth = useAtomSet(
-    updateProviderAuthAtom,
-    { mode: "promise" },
-  )
+  const updateProviderAuth = useAtomSet(updateProviderAuthAtom)
 
   const saving = Result.isWaiting(updateProviderAuthResult)
   const saveError = Result.isFailure(updateProviderAuthResult)
@@ -67,42 +65,53 @@ export function useSettingsState(): UseSettingsStateResult {
     : null
 
   const loading = Result.isInitial(result)
+  const loadError = Result.isFailure(result)
+    ? "Failed to read the Magnitude API key configuration"
+    : null
   const keyAlreadySet = Result.match(result, {
     onInitial: () => false,
     onFailure: () => false,
     onSuccess: (s) => {
-      const value = s.value as { auth: Option.Option<ProviderAuth> }
+      const value = s.value
       return value.auth._tag === "Some" && value.auth.value.type === "api" && value.auth.value.key.trim().length > 0
     },
   })
 
   const apiKey: ApiKeyState = Result.match(result, {
-    onInitial: () => ({ status: "loading" as const }),
-    onFailure: () => ({ status: "none" as const }),
+    onInitial: (): ApiKeyState => ({ status: "loading" }),
+    onFailure: (): ApiKeyState => ({ status: "none" }),
     onSuccess: (s) => {
-      const value = s.value as { auth: Option.Option<ProviderAuth> }
+      const value = s.value
       if (value.auth._tag === "Some" && value.auth.value.type === "api" && value.auth.value.key.trim().length > 0) {
-        return { status: "config" as const, maskedKey: maskApiKey(value.auth.value.key) }
+        return { status: "config", maskedKey: maskApiKey(value.auth.value.key) }
       }
-      return { status: "none" as const }
+      return { status: "none" }
     },
   })
 
-  async function saveApiKey(key: string): Promise<void> {
-    await updateProviderAuth({
+  function saveApiKey(key: string): void {
+    updateProviderAuth({
       payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key } },
       reactivityKeys: ["apiKey"],
     })
   }
 
-  async function disconnectApiKey(): Promise<void> {
+  function disconnectApiKey(): void {
     // Clear by setting an empty key — the server can handle this
-    await updateProviderAuth({
+    updateProviderAuth({
       payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: "" } },
       reactivityKeys: ["apiKey"],
     })
-    setApiKeyVerified(false)
   }
 
-  return { apiKey, keyAlreadySet, loading, saving, saveError, saveApiKey, disconnectApiKey }
+  return {
+    apiKey,
+    keyAlreadySet,
+    loading,
+    loadError,
+    saving,
+    saveError,
+    saveApiKey,
+    disconnectApiKey,
+  }
 }

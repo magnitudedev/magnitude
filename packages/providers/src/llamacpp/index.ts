@@ -1,9 +1,12 @@
 export {
   createLlamaCppProvider,
+  makeFixedEndpointBackend,
   PROVIDER_ID,
   DEFAULT_LLAMACPP_ENDPOINT,
-  type LlamaCppProviderInstance,
-  type LlamaCppClientConfig,
+  LlamaCppProviderBackendError,
+  type LlamaCppProviderComponents,
+  type LlamaCppProviderBackend,
+  type FixedLlamaCppEndpointConfig,
 } from "./provider"
 export { createLlamaCppCatalog } from "./catalog"
 export {
@@ -20,7 +23,6 @@ export type {
   LlamaCppDiscoveryResult,
   LlamaCppRawModel,
   LlamaCppModelMeta,
-  LlamaCppModelsResponse,
   LlamaCppToolChoice,
   ServerProps,
   ServerStatus,

@@ -33,7 +33,7 @@ export function useUsageState(): UseUsageStateResult {
 
   const loading = Result.isInitial(result)
   const error = Result.isFailure(result) ? "Failed to load usage data." : null
-  const data = Result.isSuccess(result) ? (result.value as BalanceResponse) : null
+  const data = Result.isSuccess(result) ? result.value : null
 
   return { loading, error, data, period, setPeriod }
 }

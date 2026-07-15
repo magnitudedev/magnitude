@@ -67,17 +67,23 @@ interface AccumulationState {
   extraSessions: SessionMetadata[]
   nextCursor: string | null
   hasMore: boolean
-  loadingMore: boolean
+}
+
+const uniqueSessions = (sessions: readonly SessionMetadata[]): SessionMetadata[] => {
+  const seen = new Set<string>()
+  return sessions.filter((session) => {
+    if (seen.has(session.sessionId)) return false
+    seen.add(session.sessionId)
+    return true
+  })
 }
 
 export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePaginatedSessionsResult {
   const client = useAgentClient()
-  const listSessionsMutation = useAtomSet(client.mutation("ListSessions"), { mode: "promise" })
-
-  const requestKey = useMemo(
-    () => `${params?.cwd ?? ""}:${params?.query ?? ""}`,
-    [params?.cwd, params?.query],
-  )
+  const listSessionsAtom = useMemo(() => client.mutation("ListSessions"), [client])
+  const listSessionsResult = useAtomValue(listSessionsAtom)
+  const listSessionsMutation = useAtomSet(listSessionsAtom, { mode: "promise" })
+  const loadingMore = Result.isWaiting(listSessionsResult)
 
   const firstPage = useSessionsList({
     cwd: params?.cwd,
@@ -91,33 +97,21 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
         extraSessions: [],
         nextCursor: firstPage.nextCursor,
         hasMore: firstPage.hasMore,
-        loadingMore: false,
       }),
-    [requestKey],
+    [params?.cwd, params?.query],
   )
   const [accumulation, setAccumulation] = useAtom(accumulationAtom)
-
-  // Seed nextCursor/hasMore from the first page when the accumulation atom is
-  // fresh (no extra sessions loaded yet) and the first page has resolved. This
-  // is a render-phase consistency correction, not a side effect: we only write
-  // when the derived state is inconsistent.
-  if (
-    accumulation.extraSessions.length === 0 &&
-    accumulation.nextCursor !== firstPage.nextCursor
-  ) {
-    setAccumulation((prev) => ({
-      ...prev,
-      nextCursor: firstPage.nextCursor,
-      hasMore: firstPage.hasMore,
-    }))
-  }
+  const nextCursor = accumulation.extraSessions.length === 0
+    ? firstPage.nextCursor
+    : accumulation.nextCursor
+  const hasMore = accumulation.extraSessions.length === 0
+    ? firstPage.hasMore
+    : accumulation.hasMore
 
   const loadMore = useCallback(() => {
-    if (accumulation.loadingMore || !accumulation.hasMore || !accumulation.nextCursor) return
+    if (loadingMore || !hasMore || !nextCursor) return
 
-    setAccumulation((prev) => ({ ...prev, loadingMore: true }))
-
-    const cursor = accumulation.nextCursor
+    const cursor = nextCursor
 
     void listSessionsMutation({
       payload: {
@@ -134,32 +128,35 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
           extraSessions: [...prev.extraSessions, ...page.items],
           nextCursor: page.nextCursor._tag === "Some" ? page.nextCursor.value : null,
           hasMore: page.hasMore,
-          loadingMore: false,
         }))
       })
       .catch(() => {
-        setAccumulation((prev) => ({ ...prev, loadingMore: false }))
+        // The mutation Result is the authoritative failure state; there is no
+        // local error mirror to update here.
       })
   }, [
     listSessionsMutation,
-    accumulation.loadingMore,
-    accumulation.hasMore,
-    accumulation.nextCursor,
+    loadingMore,
+    hasMore,
+    nextCursor,
     params?.cwd,
     params?.query,
     params?.pageSize,
     setAccumulation,
   ])
 
-  const sessions = sessionsToRecentChats([...firstPage.sessions, ...accumulation.extraSessions])
+  const sessions = sessionsToRecentChats(uniqueSessions([
+    ...firstPage.sessions,
+    ...accumulation.extraSessions,
+  ]))
 
   const loading = firstPage.loading && sessions.length === 0
 
   return {
     sessions,
     loading,
-    loadingMore: accumulation.loadingMore,
-    hasMore: accumulation.hasMore,
+    loadingMore,
+    hasMore,
     loadMore,
   }
 }

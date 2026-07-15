@@ -3,11 +3,12 @@
  *
  * Derives slot profiles from the `GetCachedModelList` RPC response.
  */
+import { useMemo } from "react"
 import { useAtomValue, Result } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
 import { useDisplayState } from "../state/display-state-store"
-import { ROLE_TO_SLOT, type SlotId } from "@magnitudedev/sdk"
-import type { SlotProfile, SlotProfiles, ModelList } from "@magnitudedev/sdk"
+import { isRoleId, ROLE_TO_SLOT, type SlotId } from "@magnitudedev/sdk"
+import type { SlotProfile, SlotProfiles } from "@magnitudedev/sdk"
 
 /**
  * Find the slot profile for a given slot ID.
@@ -36,27 +37,37 @@ export interface UseSlotProfilesResult {
   rootSlotId: SlotId
   /** Root agent's slot profile (null if not found) */
   rootProfile: SlotProfile | null
+  /** Whether the authoritative model configuration is still loading. */
+  loading: boolean
 }
 
 export function useSlotProfiles(): UseSlotProfilesResult {
   const client = useAgentClient()
 
-  const result = useAtomValue(
-    client.query("GetCachedModelList", {}, { reactivityKeys: ["modelConfig"] }),
+  const queryAtom = useMemo(
+    () => client.query("GetCachedModelList", {}, { reactivityKeys: ["modelConfig"] }),
+    [client],
   )
+  const result = useAtomValue(queryAtom)
 
   const profiles = Result.match(result, {
     onInitial: () => null,
     onFailure: () => null,
-    onSuccess: (success) =>
-      (success.value as ModelList).slotProfiles,
+    onSuccess: (success) => success.value.slotProfiles,
   })
 
   const rootRole = useDisplayState((state) => state.actors["root"]?.role ?? null)
   const rootRoleId = rootRole ?? "leader"
   const rootRoleLabel = formatRoleLabel(rootRoleId)
-  const rootSlotId: SlotId = ROLE_TO_SLOT[rootRoleId as keyof typeof ROLE_TO_SLOT] ?? "primary"
+  const rootSlotId: SlotId = isRoleId(rootRoleId) ? ROLE_TO_SLOT[rootRoleId] : "primary"
   const rootProfile = findSlotProfile(profiles, rootSlotId)
 
-  return { profiles, rootRoleId, rootRoleLabel, rootSlotId, rootProfile }
+  return {
+    profiles,
+    rootRoleId,
+    rootRoleLabel,
+    rootSlotId,
+    rootProfile,
+    loading: Result.isInitial(result),
+  }
 }

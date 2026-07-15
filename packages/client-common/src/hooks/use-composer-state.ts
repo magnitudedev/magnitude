@@ -8,9 +8,9 @@
  * Both apps use this identically. The only app-specific part is the
  * CommandContext passed in — each app provides its own toast/recent-chats/etc.
  */
-import { useCallback, useEffect, useMemo, useRef } from "react"
-import { Option } from "effect"
-import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
+import { useCallback, useMemo, useRef } from "react"
+import { Effect, Option } from "effect"
+import { Atom, useAtomMount, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
 import { useDisplayState } from "../state/display-state-store"
 import { useSlotProfiles } from "./use-slot-profiles"
@@ -24,7 +24,6 @@ import {
   usageOpenAtom,
   selectedFilePathAtom,
   pendingUserSubmitAtom,
-  sessionActivationPromiseAtom,
   composerTextAtom,
   composerAttachmentsAtom,
   composerHistoryIndexAtom,
@@ -100,8 +99,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const setComposerText = useAtomSet(composerTextAtom)
   const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
   const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
-  const setSessionActivationPromise = useAtomSet(sessionActivationPromiseAtom)
-  const sessionActivationPromise = useAtomValue(sessionActivationPromiseAtom)
   const activationPromiseRef = useRef<Promise<string> | null>(null)
   const activatedSessionIdRef = useRef<string | null>(null)
   const previousSelectedSessionIdRef = useRef<string | null>(selectedSessionId)
@@ -118,7 +115,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
   const isStreaming = rootActor?.work.phase === "working"
 
-  useEffect(() => {
+  const selectedSessionSyncAtom = useMemo(() => Atom.make(Effect.sync(() => {
     const previous = previousSelectedSessionIdRef.current
     previousSelectedSessionIdRef.current = selectedSessionId
     if (selectedSessionId) {
@@ -126,25 +123,19 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     } else if (previous !== null && activationPromiseRef.current === null) {
       activatedSessionIdRef.current = null
     }
-  }, [selectedSessionId])
+  })), [selectedSessionId])
+  useAtomMount(selectedSessionSyncAtom)
 
-  const sendMutation = useAtomSet(
-    client.mutation("SendMessage"),
-    { mode: "promise" },
-  )
-  const createSession = useAtomSet(
-    client.mutation("CreateSession"),
-    { mode: "promise" },
-  )
-  const interruptMutation = useAtomSet(client.mutation("Interrupt"))
-  const runBashMutation = useAtomSet(
-    client.mutation("RunBash"),
-    { mode: "promise" },
-  )
-  const searchMentionsMutation = useAtomSet(
-    client.mutation("SearchMentions"),
-    { mode: "promise" },
-  )
+  const sendAtom = useMemo(() => client.mutation("SendMessage"), [client])
+  const createSessionAtom = useMemo(() => client.mutation("CreateSession"), [client])
+  const interruptAtom = useMemo(() => client.mutation("Interrupt"), [client])
+  const runBashAtom = useMemo(() => client.mutation("RunBash"), [client])
+  const searchMentionsAtom = useMemo(() => client.mutation("SearchMentions"), [client])
+  const sendMutation = useAtomSet(sendAtom, { mode: "promise" })
+  const createSession = useAtomSet(createSessionAtom, { mode: "promise" })
+  const interruptMutation = useAtomSet(interruptAtom)
+  const runBashMutation = useAtomSet(runBashAtom, { mode: "promise" })
+  const searchMentionsMutation = useAtomSet(searchMentionsAtom, { mode: "promise" })
   // Mention client — uses mutation setter, no manual runtime extraction
   const mentionClient = useMemo<MentionSearchClient>(() => ({
     searchMentions(payload: Parameters<MentionSearchClient["searchMentions"]>[0]) {
@@ -224,7 +215,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
       optimistic.remove()
       setPendingUserSubmit(false)
       activationPromiseRef.current = null
-      setSessionActivationPromise(null)
       setComposerText(opts?.visibleMessage ?? text)
       setComposerAttachments([])
       setComposerHistoryIndex(-1)
@@ -249,7 +239,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
       }
 
       // No session — lazy activation with dedup
-      const inFlightActivation = activationPromiseRef.current ?? sessionActivationPromise
+      const inFlightActivation = activationPromiseRef.current
       if (inFlightActivation) {
         const sessionId = await inFlightActivation
         await sendMutation({
@@ -288,7 +278,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
           activatedSessionIdRef.current = result.metadata.sessionId
           displayController.selectSession(result.metadata.sessionId)
           activationPromiseRef.current = null
-          setSessionActivationPromise(null)
           return result.metadata.sessionId
         }
         if (result._tag === "created_message_failed") {
@@ -298,7 +287,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
           activatedSessionIdRef.current = result.sessionId
           displayController.selectSession(result.sessionId)
           activationPromiseRef.current = null
-          setSessionActivationPromise(null)
           commandContext.showSystemMessage(`Session created but promotion failed: ${result.error}`)
           return result.sessionId
         }
@@ -306,13 +294,12 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
         throw new Error(result.error)
       })
       activationPromiseRef.current = promise
-      setSessionActivationPromise(promise)
       await promise
       setPendingUserSubmit(false)
     }
 
     void deliver().catch(rollback)
-  }, [selectedSessionId, selectedCwd, sessionActivationPromise, isStreaming, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, setComposerAttachments, setComposerHistoryIndex, setSessionActivationPromise, setMessageHistory, sessionCreateOptions, commandContext])
+  }, [selectedSessionId, selectedCwd, isStreaming, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, setComposerAttachments, setComposerHistoryIndex, setMessageHistory, sessionCreateOptions, commandContext])
 
   const handleInterrupt = useCallback(() => {
     if (!selectedSessionId) return

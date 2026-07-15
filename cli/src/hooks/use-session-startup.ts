@@ -10,7 +10,7 @@
  *
  * Reads use client.query() (declarative). Mutations use useAtomSet with
  * { mode: "promise" } where the return value is needed. No runRpc, no
- * Runtime.runPromise, no as casts.
+ * Runtime.runPromise, and no unsafe casts.
  */
 import { useMemo } from 'react'
 import { Effect, Option } from 'effect'
@@ -27,11 +27,10 @@ import {
   useSelectedSessionId,
   pendingUserSubmitAtom,
   registerSkillCommands,
+  type SlashCommandDefinition,
   getDraftSessionOwnerId,
 } from '@magnitudedev/client-common'
 import { setLastSessionId } from '../state/last-session'
-import type { ListSessionsResult } from '@magnitudedev/sdk'
-import type { SkillListEntry } from '@magnitudedev/sdk'
 
 export type SessionStart =
   | { _tag: 'new' }
@@ -82,7 +81,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
           if (sessionStart._tag === 'resume') {
             controller.selectSession(sessionStart.sessionId)
           } else if (sessionStart._tag === 'latest' && latestSessionResult && Result.isSuccess(latestSessionResult)) {
-            const latest = (latestSessionResult.value as ListSessionsResult).items[0]
+            const latest = latestSessionResult.value.items[0]
             if (latest) controller.selectSession(latest.sessionId)
           }
         }),
@@ -122,12 +121,12 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
       Atom.make(
         Effect.gen(function* () {
           if (!skillsResult || !Result.isSuccess(skillsResult)) return
-          const entries: readonly SkillListEntry[] = (skillsResult.value as { skills?: SkillListEntry[] }).skills ?? []
-          const commands = entries.map((s) => ({
+          const entries = skillsResult.value
+          const commands: SlashCommandDefinition[] = entries.map((s) => ({
             id: s.name,
             label: s.name,
             description: s.description,
-            source: 'skill' as const,
+            source: 'skill',
             skillPath: s.path,
           }))
           if (commands.length > 0) registerSkillCommands(commands)
@@ -161,9 +160,12 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   useAtomMount(titleAtom)
 
   // ── 3. One-shot --prompt / --goal — true mutations needing return value
-  const startGoalMutation = useAtomSet(client.mutation('StartGoal'), { mode: 'promise' })
-  const sendMessageMutation = useAtomSet(client.mutation('SendMessage'), { mode: 'promise' })
-  const createSessionMutation = useAtomSet(client.mutation('CreateSession'), { mode: 'promise' })
+  const startGoalAtom = useMemo(() => client.mutation('StartGoal'), [client])
+  const sendMessageAtom = useMemo(() => client.mutation('SendMessage'), [client])
+  const createSessionAtom = useMemo(() => client.mutation('CreateSession'), [client])
+  const startGoalMutation = useAtomSet(startGoalAtom, { mode: 'promise' })
+  const sendMessageMutation = useAtomSet(sendMessageAtom, { mode: 'promise' })
+  const createSessionMutation = useAtomSet(createSessionAtom, { mode: 'promise' })
 
   const initialWorkAtom = useMemo(
     () =>
@@ -174,6 +176,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
           const goalObjective = goal?.trim()
           const prompt = initialPrompt?.trim()
           if (!goalObjective && !prompt) return
+          const messagePrompt = prompt ?? ''
 
           setPendingUserSubmit(true)
           const initial = goalObjective
@@ -181,8 +184,8 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
             : {
                 _tag: 'message' as const,
                 messageId: Option.none<string>(),
-                content: prompt!,
-                visibleMessage: Option.some(prompt!),
+                content: messagePrompt,
+                visibleMessage: Option.some(messagePrompt),
                 taskMode: false,
                 attachments: [],
               }
@@ -197,8 +200,8 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
                   payload: {
                     sessionId,
                     messageId: Option.none<string>(),
-                    content: prompt!,
-                    visibleMessage: Option.some(prompt!),
+                    content: messagePrompt,
+                    visibleMessage: Option.some(messagePrompt),
                     taskMode: false,
                     attachments: [],
                   },

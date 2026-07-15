@@ -8,6 +8,7 @@
 import type { RoleId } from "./roles"
 import type { SlotId } from "@magnitudedev/roles"
 import type { ProviderModel, ReasoningEffort, ModelPricingInfo } from "@magnitudedev/ai"
+import { Schema } from "effect"
 
 export type { ReasoningEffort, ModelPricingInfo } from "@magnitudedev/ai"
 export type { ProviderModelCapabilities as ModelCapabilities } from "@magnitudedev/ai"
@@ -24,27 +25,46 @@ export interface MagnitudeModelInfo extends ProviderModel {
   readonly type?: "utility"
 }
 
-/** Raw model shape from the Magnitude API (/models endpoint). */
-export interface MagnitudeRawModel {
-  readonly id: string
-  readonly object: "model"
-  readonly owned_by: string
-  readonly displayName: string
-  readonly roles: readonly RoleId[]
-  readonly slots: readonly SlotId[]
-  readonly tiers?: readonly string[]
-  readonly type?: "utility"
-  readonly contextWindow: number
-  readonly maxOutputTokens: number
-  readonly capabilities?: { readonly vision: boolean }
-  readonly pricing?: ModelPricingInfo
-  readonly reasoningEfforts?: readonly string[]
-}
+const MagnitudeRoleIdSchema: Schema.Schema<RoleId> = Schema.Literal(
+  "leader",
+  "scout",
+  "architect",
+  "engineer",
+  "critic",
+  "scientist",
+  "artisan",
+  "advisor",
+)
 
-export interface ModelListResponse {
-  readonly object: "list"
-  readonly data: readonly MagnitudeRawModel[]
-}
+const MagnitudeSlotIdSchema: Schema.Schema<SlotId> = Schema.Literal("primary", "secondary")
+
+/** Validated raw model shape returned by Magnitude model-list endpoints. */
+export const MagnitudeRawModelSchema = Schema.Struct({
+  id: Schema.String,
+  object: Schema.Literal("model"),
+  owned_by: Schema.String,
+  displayName: Schema.String,
+  roles: Schema.Array(MagnitudeRoleIdSchema),
+  slots: Schema.Array(MagnitudeSlotIdSchema),
+  tiers: Schema.optional(Schema.Array(Schema.String)),
+  type: Schema.optional(Schema.Literal("utility")),
+  contextWindow: Schema.Number,
+  maxOutputTokens: Schema.Number,
+  capabilities: Schema.optional(Schema.Struct({ vision: Schema.Boolean })),
+  pricing: Schema.optional(Schema.Struct({
+    input: Schema.Number,
+    output: Schema.Number,
+    cached_input: Schema.NullOr(Schema.Number),
+  })),
+  reasoningEfforts: Schema.optional(Schema.Array(Schema.String)),
+})
+export type MagnitudeRawModel = Schema.Schema.Type<typeof MagnitudeRawModelSchema>
+
+export const MagnitudeModelListResponseSchema = Schema.Struct({
+  object: Schema.Literal("list"),
+  data: Schema.Array(MagnitudeRawModelSchema),
+})
+export type ModelListResponse = Schema.Schema.Type<typeof MagnitudeModelListResponseSchema>
 
 export type ToolChoice =
   | "none"

@@ -1,5 +1,5 @@
-import type { UsagePeriod } from "@magnitudedev/protocol"
-export type { UsagePeriod }
+/** Periods accepted by Magnitude's account-usage API. */
+export type UsagePeriod = "24h" | "3d" | "7d" | "14d" | "30d" | "all"
 
 export interface BalanceResponse {
   readonly data: {

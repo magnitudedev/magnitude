@@ -1,188 +1,170 @@
 import { Context, Effect, Layer, Ref } from "effect"
+import { FetchHttpClient } from "@effect/platform"
 import {
   ProviderClient,
-  DEFAULT_LLAMACPP_ENDPOINT,
   createProviderClient,
   type ProviderClientShape,
 } from "@magnitudedev/sdk"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
-import { GlobalStorage, MagnitudeStorage, type MagnitudeStorageShape } from "@magnitudedev/storage"
-import { FetchHttpClient } from "@effect/platform"
+import {
+  GlobalStorage,
+  MagnitudeStorage,
+  type AuthStorageShape,
+  type MagnitudeStorageShape,
+} from "@magnitudedev/storage"
+import { LocalModelProviderBackend } from "./local-inference/provider-backend"
 
-/**
- * Resolve the API key from environment + storage. Returns `null` when no key is
- * configured.
- */
-const resolveMagnitudeApiKeyFromStorage = (
+const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,
-): Effect.Effect<string | null, never, never> =>
-  Effect.gen(function* () {
-    const auth = yield* storage.auth.get("magnitude").pipe(
-      Effect.catchAll(() => Effect.succeed(null)),
-    )
-    if (auth?.type === "api" && auth.key.trim()) return auth.key
-
-    const envKey = process.env.MAGNITUDE_API_KEY
-    if (envKey?.trim()) return envKey
-
-    return null
-  })
+): Effect.Effect<string | null> => Effect.gen(function* () {
+  const auth = yield* storage.auth.get("magnitude").pipe(Effect.orElseSucceed(() => null))
+  if (auth?.type === "api" && auth.key.trim()) return auth.key
+  const environmentKey = process.env.MAGNITUDE_API_KEY
+  return environmentKey?.trim() ? environmentKey : null
+})
 
 export interface EndpointProviderAuthConfig {
   readonly endpoint: string
   readonly apiKey?: string
 }
 
-/** Resolve endpoint auth and seed a missing entry with the provider default. */
-export const resolveEndpointProviderAuthFromStorage = (
-  storage: MagnitudeStorageShape,
-  providerId: string,
-  defaultConfig?: EndpointProviderAuthConfig,
-): Effect.Effect<EndpointProviderAuthConfig | null, never, never> =>
-  Effect.gen(function* () {
-    const read = yield* storage.auth.get(providerId).pipe(
-      Effect.map((auth) => ({ _tag: "success" as const, auth })),
-      Effect.catchAll(() => Effect.succeed({ _tag: "error" as const })),
-    )
-    if (read._tag === "success" && read.auth?.type === "endpoint") {
-      const endpoint = read.auth.endpoint.trim()
-      if (endpoint) {
-        return {
-          endpoint,
-          ...(read.auth.apiKey ? { apiKey: read.auth.apiKey } : {}),
-        }
-      }
-    }
-
-    if (read._tag === "success" && read.auth === undefined && defaultConfig) {
-      yield* storage.auth.set(providerId, {
-        type: "endpoint",
-        endpoint: defaultConfig.endpoint,
-        ...(defaultConfig.apiKey ? { apiKey: defaultConfig.apiKey } : {}),
-      }).pipe(
-        Effect.catchAll(() => Effect.logWarning("Failed to persist default provider endpoint").pipe(
-          Effect.annotateLogs({ providerId }),
-        )),
-      )
-    }
-
-    return defaultConfig ?? null
-  })
-
-export const resolveLlamaCppAuth = (storage: MagnitudeStorageShape) =>
-  resolveEndpointProviderAuthFromStorage(storage, "llamacpp", {
-    endpoint: DEFAULT_LLAMACPP_ENDPOINT,
-  })
-
-/**
- * Build a fresh file-backed `ProviderClientShape` using the resolved provider
- * auth and the global model cache path. The catalog is intentionally refreshed
- * so the file cache is populated with every currently available provider.
- */
-export const makeSharedProviderClient = (
-  magnitudeApiKey: string | null,
-  llamacpp: EndpointProviderAuthConfig | null,
-): Effect.Effect<ProviderClientShape, never, GlobalStorage> =>
-  Effect.gen(function* () {
-    const globalStorage = yield* GlobalStorage
-    const client = createProviderClient({
-      ...(magnitudeApiKey ? { apiKey: magnitudeApiKey } : {}),
-      ...(llamacpp
-        ? {
-            llamacppEndpoint: llamacpp.endpoint,
-            ...(llamacpp.apiKey ? { llamacppApiKey: llamacpp.apiKey } : {}),
-          }
-        : {}),
-    })
-    const fileCatalog = makeFileBackedModelCatalog(client.catalog, globalStorage.paths.modelCacheFile)
-    const fileBackedClient: ProviderClientShape = { ...client, catalog: fileCatalog }
-    yield* fileBackedClient.catalog.refresh.pipe(
-      Effect.provide(FetchHttpClient.layer),
-      Effect.ignore,
-    )
-    return fileBackedClient
-  })
-
-/**
- * Mutable reference to the current shared ACN `ProviderClientShape`. This
- * lets the client be recreated (with a fresh, key-appropriate model cache) at
- * runtime — specifically after `UpdateProviderAuth` — while the `ProviderClient`
- * service remains in context.
- */
-export class SharedProviderClientRef extends Context.Tag("SharedProviderClientRef")<
-  SharedProviderClientRef,
-  Ref.Ref<ProviderClientShape>
->() {}
-
-export const SharedProviderClientRefLive = Layer.effect(
-  SharedProviderClientRef,
-  Effect.gen(function* () {
-    const storage = yield* MagnitudeStorage
-    const apiKey = yield* resolveMagnitudeApiKeyFromStorage(storage)
-    const llamacpp = yield* resolveLlamaCppAuth(storage)
-    const client = yield* makeSharedProviderClient(apiKey, llamacpp)
-    return yield* Ref.make<ProviderClientShape>(client)
-  }),
-)
-
-/**
- * Build a wrapper client that delegates all calls to the current value of the
- * shared client ref. This means consumers that `yield* ProviderClient` always
- * see the latest client after `UpdateProviderAuth` recreates it.
- */
-const wrapClientRef = (
-  ref: Ref.Ref<ProviderClientShape>,
-  runtimeConfig: ProviderClientShape["runtimeConfig"],
-): ProviderClientShape => {
-  return {
-    catalog: {
-      list: Effect.gen(function* () {
-        const client = yield* ref.get
-        return yield* client.catalog.list
-      }),
-      get: (providerId, providerModelId) => Effect.gen(function* () {
-        const client = yield* ref.get
-        return yield* client.catalog.get(providerId, providerModelId)
-      }),
-      refresh: Effect.gen(function* () {
-        const client = yield* ref.get
-        return yield* client.catalog.refresh
-      }),
-    },
-    listProviders: Effect.gen(function* () {
-      const client = yield* ref.get
-      return yield* client.listProviders
-    }),
-    sessionId: null,
-    resolveModel: (providerId, providerModelId, options) =>
-      Effect.gen(function* () {
-        const client = yield* ref.get
-        return yield* client.resolveModel(providerId, providerModelId, options)
-      }),
-    webSearch: (query, schema) =>
-      Effect.gen(function* () {
-        const client = yield* ref.get
-        return yield* client.webSearch(query, schema)
-      }),
-    balance: (query) =>
-      Effect.gen(function* () {
-        const client = yield* ref.get
-        return yield* client.balance(query)
-      }),
-    runtimeConfig,
-  }
+interface EndpointProviderAuthStorage {
+  readonly auth: Pick<AuthStorageShape, "get">
 }
 
-/**
- * A single shared `ProviderClient` at the ACN daemon level. The underlying
- * client is held in `SharedProviderClientRef` and can be recreated on auth
- * change so subsequent calls use the new auth and refreshed model cache.
- */
-export const SharedProviderClientLive = Layer.effect(
-  ProviderClient,
+/** Resolve endpoint auth without mutating storage during inspection. */
+export const resolveEndpointProviderAuthFromStorage = (
+  storage: EndpointProviderAuthStorage,
+  providerId: string,
+  defaultConfig?: EndpointProviderAuthConfig,
+): Effect.Effect<EndpointProviderAuthConfig | null> => Effect.gen(function* () {
+  const read = yield* storage.auth.get(providerId).pipe(Effect.either)
+  if (read._tag === "Right" && read.right?.type === "endpoint") {
+    const endpoint = read.right.endpoint.trim()
+    if (endpoint) {
+      return {
+        endpoint,
+        ...(read.right.apiKey ? { apiKey: read.right.apiKey } : {}),
+      }
+    }
+  }
+  return defaultConfig ?? null
+})
+
+export const resolveLlamaCppAuth = (storage: EndpointProviderAuthStorage) =>
+  resolveEndpointProviderAuthFromStorage(storage, "llamacpp")
+
+interface ProviderClientEntry {
+  readonly sessionId: string | null
+  readonly ref: Ref.Ref<ProviderClientShape>
+  readonly client: ProviderClientShape
+}
+
+export const makeDelegatingProviderClient = (
+  ref: Ref.Ref<ProviderClientShape>,
+  runtimeConfig: ProviderClientShape["runtimeConfig"],
+  sessionId: string | null,
+): ProviderClientShape => ({
+  catalog: {
+    list: Ref.get(ref).pipe(Effect.flatMap((client) => client.catalog.list)),
+    get: (providerId, providerModelId) => Ref.get(ref).pipe(
+      Effect.flatMap((client) => client.catalog.get(providerId, providerModelId)),
+    ),
+    refresh: Ref.get(ref).pipe(Effect.flatMap((client) => client.catalog.refresh)),
+  },
+  listProviders: Ref.get(ref).pipe(Effect.flatMap((client) => client.listProviders)),
+  sessionId,
+  resolveModel: (providerId, providerModelId, options) => Ref.get(ref).pipe(
+    Effect.flatMap((client) => client.resolveModel(providerId, providerModelId, options)),
+  ),
+  webSearch: (query, schema) => Ref.get(ref).pipe(
+    Effect.flatMap((client) => client.webSearch(query, schema)),
+  ),
+  balance: (query) => Ref.get(ref).pipe(Effect.flatMap((client) => client.balance(query))),
+  runtimeConfig,
+})
+
+export interface ProviderClientRegistryApi {
+  readonly shared: ProviderClientShape
+  readonly session: (sessionId: string) => Effect.Effect<ProviderClientShape>
+  readonly refreshAll: Effect.Effect<void>
+  readonly remove: (sessionId: string) => Effect.Effect<void>
+}
+
+export class ProviderClientRegistry extends Context.Tag("ProviderClientRegistry")<
+  ProviderClientRegistry,
+  ProviderClientRegistryApi
+>() {}
+
+export const ProviderClientRegistryLive: Layer.Layer<
+  ProviderClientRegistry,
+  never,
+  MagnitudeStorage | GlobalStorage | LocalModelProviderBackend
+> = Layer.effect(
+  ProviderClientRegistry,
   Effect.gen(function* () {
-    const ref = yield* SharedProviderClientRef
-    const initial = yield* ref.get
-    return wrapClientRef(ref, initial.runtimeConfig)
+    const storage = yield* MagnitudeStorage
+    const globalStorage = yield* GlobalStorage
+    const llamacppBackend = yield* LocalModelProviderBackend
+    const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
+    const lock = yield* Effect.makeSemaphore(1)
+
+    const makeConcrete = (sessionId: string | null) => Effect.gen(function* () {
+      const apiKey = yield* resolveMagnitudeApiKey(storage)
+      const client = createProviderClient({
+        ...(apiKey ? { apiKey } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        llamacppBackend,
+      })
+      const catalog = makeFileBackedModelCatalog(client.catalog, globalStorage.paths.modelCacheFile)
+      const fileBacked: ProviderClientShape = { ...client, catalog }
+      yield* catalog.refresh.pipe(
+        Effect.provide(FetchHttpClient.layer),
+        Effect.catchAll((cause) => Effect.logWarning("Provider catalog refresh failed").pipe(
+          Effect.annotateLogs({ sessionId: sessionId ?? "shared", cause: String(cause) }),
+        )),
+      )
+      return fileBacked
+    })
+
+    const makeEntry = (sessionId: string | null) => Effect.gen(function* () {
+      const concrete = yield* makeConcrete(sessionId)
+      const ref = yield* Ref.make(concrete)
+      return {
+        sessionId,
+        ref,
+        client: makeDelegatingProviderClient(ref, concrete.runtimeConfig, sessionId),
+      } satisfies ProviderClientEntry
+    })
+
+    const sharedEntry = yield* makeEntry(null)
+    yield* Ref.set(entries, new Map([["shared", sharedEntry]]))
+
+    return ProviderClientRegistry.of({
+      shared: sharedEntry.client,
+      session: (sessionId) => lock.withPermits(1)(Effect.gen(function* () {
+        const key = `session:${sessionId}`
+        const current = yield* Ref.get(entries)
+        const existing = current.get(key)
+        if (existing) return existing.client
+        const entry = yield* makeEntry(sessionId)
+        yield* Ref.set(entries, new Map(current).set(key, entry))
+        return entry.client
+      })),
+      refreshAll: lock.withPermits(1)(Effect.gen(function* () {
+        const current = yield* Ref.get(entries)
+        yield* Effect.forEach(current.values(), (entry) => makeConcrete(entry.sessionId).pipe(
+          Effect.flatMap((replacement) => Ref.set(entry.ref, replacement)),
+        ), { concurrency: 4, discard: true })
+      })),
+      remove: (sessionId) => lock.withPermits(1)(Ref.update(entries, (current) => {
+        const next = new Map(current)
+        next.delete(`session:${sessionId}`)
+        return next
+      })),
+    })
   }),
 )
+
+export const SharedProviderClientLive: Layer.Layer<ProviderClient, never, ProviderClientRegistry> =
+  Layer.effect(ProviderClient, Effect.map(ProviderClientRegistry, (registry) => registry.shared))
