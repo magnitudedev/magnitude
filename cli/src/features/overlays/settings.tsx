@@ -19,6 +19,8 @@ interface SettingsOverlayProps {
     modelDisplayName: string | null
   }>
   modelConfig?: UseModelConfigResult
+  onManageLocalModels: () => void
+  onConfigureCloud: () => void
 }
 
 type Mode = 'view' | 'edit' | 'confirm-disconnect'
@@ -63,6 +65,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   auth,
   slots,
   modelConfig,
+  onManageLocalModels,
+  onConfigureCloud,
 }: SettingsOverlayProps) {
   const theme = useTheme()
   const [mode, setMode] = useState<Mode>('view')
@@ -76,6 +80,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const [cancelHovered, setCancelHovered] = useState(false)
   const [confirmHovered, setConfirmHovered] = useState(false)
   const [refreshHovered, setRefreshHovered] = useState(false)
+  const [localSetupHovered, setLocalSetupHovered] = useState(false)
+  const [cloudSetupHovered, setCloudSetupHovered] = useState(false)
 
   // Dropdown state
   const [dropdownTarget, setDropdownTarget] = useState<DropdownTarget>(null)
@@ -192,11 +198,21 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       onClose()
       return
     }
+    if (mode === 'view' && key.name === 'l') {
+      key.preventDefault()
+      onManageLocalModels()
+      return
+    }
+    if (mode === 'view' && key.name === 'c') {
+      key.preventDefault()
+      onConfigureCloud()
+      return
+    }
     if (mode === 'edit' && (key.name === 'return' || key.name === 'enter') && !key.shift) {
       key.preventDefault()
       handleSave()
     }
-  }, [isVisible, dropdownTarget, dropdownItems, dropdownIndex, mode, onClose, cancelInline, handleSave, closeDropdown, selectDropdownItem]))
+  }, [isVisible, dropdownTarget, dropdownItems, dropdownIndex, mode, onClose, onConfigureCloud, onManageLocalModels, cancelInline, handleSave, closeDropdown, selectDropdownItem]))
 
   if (!isVisible) return null
 
@@ -311,6 +327,36 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             {error && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{error}</text></box>}
           </box>
         )}
+      </box>
+
+      {/* Divider */}
+      <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
+        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
+      </box>
+
+      {/* Inference source setup */}
+      <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
+        <text style={{ fg: theme.foreground }}>
+          <span attributes={TextAttributes.BOLD}>Inference sources</span>
+        </text>
+        <text style={{ fg: theme.muted }}>Download or attach local models, or configure Magnitude Cloud fallback.</text>
+        <box style={{ flexDirection: 'row', paddingTop: 1 }}>
+          <Button
+            onClick={onManageLocalModels}
+            onMouseOver={() => setLocalSetupHovered(true)}
+            onMouseOut={() => setLocalSetupHovered(false)}
+          >
+            <text style={{ fg: localSetupHovered ? theme.primary : theme.muted }}>{'[Manage local models · L]'}</text>
+          </Button>
+          <text> </text>
+          <Button
+            onClick={onConfigureCloud}
+            onMouseOver={() => setCloudSetupHovered(true)}
+            onMouseOut={() => setCloudSetupHovered(false)}
+          >
+            <text style={{ fg: cloudSetupHovered ? theme.primary : theme.muted }}>{'[Configure Cloud fallback · C]'}</text>
+          </Button>
+        </box>
       </box>
 
       {/* Divider */}

@@ -26,6 +26,10 @@ import { SessionDestroyerLive } from "./session-destroyer"
 import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
+import {
+  LlamaCppRuntimeBridgeEndpointTestLive,
+  LocalInferenceOnboardingLive,
+} from "./local-inference"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
@@ -183,13 +187,20 @@ const makeAcnServicesBase = (debug: boolean) => {
   return Layer.provideMerge(AcnActivityTrackerLive, withDestroyer)
 }
 
+const localInferenceRuntimeBridgeLayer = () => LlamaCppRuntimeBridgeEndpointTestLive
+
 const AcnBaseServicesLayer = (debug: boolean) => {
   const withActivity = makeAcnServicesBase(debug)
   const withCommandTracking = Layer.provideMerge(AcnRpcCommandActivityLive, withActivity)
   const withCommands = Layer.provideMerge(SessionCommandsLive, withCommandTracking)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
   const withAccount = Layer.provideMerge(AccountLive, withLifecycle)
-  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withAccount)
+  // TODO(llamacpp-package-integration, CTO-owned): Replace this temporary
+  // attach-only endpoint layer with the final managed LlamaCppRuntimeBridge.
+  // Do not add download or lifecycle ownership to the endpoint preview bridge.
+  const withLlamaCppBridge = Layer.provideMerge(localInferenceRuntimeBridgeLayer(), withAccount)
+  const withLocalInference = Layer.provideMerge(LocalInferenceOnboardingLive, withLlamaCppBridge)
+  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withLocalInference)
   const withStreams = Layer.provideMerge(DisplayViewStreamsLive, withActiveSessionStatuses)
   return withStreams
 }
@@ -202,7 +213,10 @@ const AcnDebugServicesLayer = (debug: boolean) => {
   const withCommands = Layer.provideMerge(SessionCommandsLive, withCommandTracking)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
   const withAccount = Layer.provideMerge(AccountLive, withLifecycle)
-  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withAccount)
+  // Keep debug and production on the same mechanism adapter selection.
+  const withLlamaCppBridge = Layer.provideMerge(localInferenceRuntimeBridgeLayer(), withAccount)
+  const withLocalInference = Layer.provideMerge(LocalInferenceOnboardingLive, withLlamaCppBridge)
+  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withLocalInference)
   const withStreams = Layer.provideMerge(DisplayViewStreamsLive, withActiveSessionStatuses)
   return withStreams
 }

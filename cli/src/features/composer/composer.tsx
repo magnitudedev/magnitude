@@ -666,6 +666,20 @@ export function Composer(props: ComposerProps) {
               <box style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
                 {bashMode ? (
                   <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
+                ) : !modelsConfigured ? (
+                  <Button
+                    onClick={openSettings}
+                    onMouseOver={() => setModelLabelHovered(true)}
+                    onMouseOut={() => setModelLabelHovered(false)}
+                  >
+                    <text style={{
+                      fg: modelLabelHovered ? theme.primary : theme.foreground,
+                    }}>
+                      <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                        No provider configured
+                      </span>
+                    </text>
+                  </Button>
                 ) : (
                   <>
                     <Button

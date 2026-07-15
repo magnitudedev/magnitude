@@ -7,16 +7,15 @@
  * terminal layout. No feature logic, no rendering primitives beyond layout
  * boxes and the startup header slot.
  */
-import { useCallback, useSyncExternalStore, type ReactNode } from 'react'
+import { useCallback, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { TextAttributes } from '@opentui/core'
-import { Effect, Option, Runtime } from 'effect'
+import { Option } from 'effect'
 import { useAtomValue, useAtomSet, useAtomInitialValues, Result } from '@effect-atom/atom-react'
 import {
   useAgentClient,
   useDisplayViewController,
   useDisplayConnectionError,
   useSelectedSessionId,
-  useSettingsState,
   settingsOpenAtom,
   usageOpenAtom,
   selectedFilePathAtom,
@@ -39,7 +38,6 @@ import { SelectedFileProvider } from './hooks/use-file-viewer'
 import { BOX_CHARS } from './utils/ui-constants'
 import type { ActionId } from './types/ui-actions'
 
-import { MagnitudeLoginScreen } from './features/app-shell/login'
 import { FatalErrorScreen } from './features/app-shell/connection-error'
 import { WindowsWarningScreen } from './features/app-shell/windows-warning'
 import { AnimatedLogo } from './components/animated-logo'
@@ -49,6 +47,11 @@ import { WorkingTimerContainer, TaskListContainer } from './features/agent-statu
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
 import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/sessions/container'
+import {
+  ModelSetupOnboardingScreen,
+  PreparingLocalInferenceScreen,
+  shouldShowLocalInferenceOnboarding,
+} from './features/local-inference-onboarding'
 
 export type { SessionStart }
 
@@ -58,6 +61,7 @@ export interface CliAppProps {
   goal: string | undefined
   envAuth: AuthSource
   sessionOptions: SessionOptions
+  forceLocalInferenceSetup?: boolean
 }
 
 export function CliApp(props: CliAppProps): ReactNode {
@@ -70,14 +74,13 @@ export function CliApp(props: CliAppProps): ReactNode {
 }
 
 function CliAppGates(props: CliAppProps): ReactNode {
-  const { keyAlreadySet, loading: authLoading, saveApiKey } = useSettingsState()
-  const envAuth = useAtomValue(authSourceAtom)
+  const [forceSetup, setForceSetup] = useState(props.forceLocalInferenceSetup ?? false)
   const connectionError = useDisplayConnectionError()
   const client = useAgentClient()
-  const runtimeResult = useAtomValue(client.runtime)
+  const onboardingResult = useAtomValue(
+    client.query('GetLocalInferenceOnboardingSnapshot', {}, { reactivityKeys: ['localInference', 'modelConfig', 'apiKey'] }),
+  )
   const controller = useDisplayViewController()
-
-  const authenticated = envAuth.source !== 'none' || keyAlreadySet
   useTerminalBgDetection()
 
   const exitApp = useCallback(() => {
@@ -86,15 +89,6 @@ function CliAppGates(props: CliAppProps): ReactNode {
 
   if (process.platform === 'win32') {
     return <WindowsWarningScreen onExit={exitApp} />
-  }
-
-  if (!authLoading && !authenticated) {
-    return (
-      <MagnitudeLoginScreen
-        onSubmit={saveApiKey}
-        onExit={exitApp}
-      />
-    )
   }
 
   if (connectionError && !connectionError.reconnecting) {
@@ -113,16 +107,46 @@ function CliAppGates(props: CliAppProps): ReactNode {
     )
   }
 
-  return <CliAppContent {...props} />
+  if (Result.isInitial(onboardingResult)) {
+    return <PreparingLocalInferenceScreen />
+  }
+
+  if (Result.isFailure(onboardingResult)) {
+    return (
+      <FatalErrorScreen
+        error="Failed to inspect local inference capabilities."
+        onRetry={() => controller.retry()}
+        onQuit={exitApp}
+      />
+    )
+  }
+
+  if (shouldShowLocalInferenceOnboarding(onboardingResult.value, forceSetup)) {
+    return (
+      <ModelSetupOnboardingScreen
+        snapshot={onboardingResult.value}
+        onExit={exitApp}
+        onComplete={() => setForceSetup(false)}
+      />
+    )
+  }
+
+  return (
+    <CliAppContent
+      {...props}
+      modelsConfigured={onboardingResult.value.configuration.usable}
+    />
+  )
 }
 
-function CliAppContent(props: CliAppProps): ReactNode {
+function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean }): ReactNode {
   useSessionPreload()
   useFileWatchBridge()
   useSessionStartup({
     sessionStart: props.sessionStart,
     initialPrompt: props.initialPrompt,
     goal: props.goal,
+    modelsConfigured: props.modelsConfigured,
   })
 
   const theme = useTheme()
@@ -207,6 +231,7 @@ function CliAppContent(props: CliAppProps): ReactNode {
               chatColumnWidth={chatColumnWidth}
               widgetNavActive={widget.widgetNavActive}
               handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
+              modelsConfigured={props.modelsConfigured}
             />
           </box>
 
