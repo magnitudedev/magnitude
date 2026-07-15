@@ -3,10 +3,8 @@
  * recent chats, settings, usage, and worker fork detail. Visibility is pure
  * atom state; each overlay's data comes from shared hooks or display state.
  */
-import { useCallback, useMemo, type ReactNode } from 'react'
-import type { KeyEvent } from '@opentui/core'
-import { useKeyboard } from '@opentui/react'
-import { Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
+import { useMemo, type ReactNode } from 'react'
+import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import {
   useDisplayState,
   useSettingsState,
@@ -18,7 +16,6 @@ import {
   useDisplayViewController,
   selectedCwdAtom,
   useTimelineStatus,
-  useLocalInferenceSnapshot,
 } from '@magnitudedev/client-common'
 import { forkIdToKey, ROLE_TO_SLOT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
 import { showRecentChatsOverlayAtom, authSourceAtom, modelSetupRouteAtom, type ModelSetupRoute } from '../../state/cli-atoms'
@@ -28,7 +25,7 @@ import { SettingsOverlay } from './settings'
 import { UsageOverlay } from './usage'
 import { ForkDetailOverlay } from './fork-detail'
 import { RecentChatsOverlayContainer } from '../sessions/container'
-import { ModelSetupOnboardingScreen, PreparingLocalInferenceScreen } from '../local-inference-onboarding'
+import { ModelSetupScreen } from '../model-setup'
 
 export type ActiveOverlay = 'recent-chats' | 'model-setup' | 'settings' | 'usage' | 'fork' | 'none'
 
@@ -53,26 +50,9 @@ function ModelSetupSettingsContainer({
   readonly route: Exclude<ModelSetupRoute, 'closed'>
   readonly onClose: () => void
 }): ReactNode {
-  const snapshot = useLocalInferenceSnapshot()
-  const childHandlesKeyboard = Result.isSuccess(snapshot)
-  useKeyboard(useCallback((key: KeyEvent) => {
-    if (!childHandlesKeyboard && key.name === 'escape') {
-      key.preventDefault()
-      onClose()
-    }
-  }, [childHandlesKeyboard, onClose]))
-  if (Result.isInitial(snapshot)) return <PreparingLocalInferenceScreen />
-  if (Result.isFailure(snapshot)) {
-    return (
-      <box style={{ height: '100%', alignItems: 'center', justifyContent: 'center' }}>
-        <text>Failed to inspect local inference capabilities. Press Esc to return to Settings.</text>
-      </box>
-    )
-  }
   return (
-    <ModelSetupOnboardingScreen
+    <ModelSetupScreen
       key={route}
-      snapshot={snapshot.value}
       initialStep={route}
       mode="management"
       onExit={onClose}
@@ -96,7 +76,7 @@ export function AppOverlaysContainer({
   const selectedCwd = useAtomValue(selectedCwdAtom)
   const expandedForkId = controller.topForkId
 
-  const { apiKey, saveApiKey, disconnectApiKey } = useSettingsState()
+  const { apiKey, saveApiKey, disconnectApiKey, saving, saveError } = useSettingsState()
   const authSource = useAtomValue(authSourceAtom)
   const { profiles } = useSlotProfiles()
   const modelConfig = useModelConfig()
@@ -107,7 +87,9 @@ export function AppOverlaysContainer({
     authSource,
     save: saveApiKey,
     clear: disconnectApiKey,
-  }), [apiKey, authSource, saveApiKey, disconnectApiKey])
+    saving,
+    error: saveError,
+  }), [apiKey, authSource, saveApiKey, disconnectApiKey, saveError, saving])
 
   const slots = useMemo(() => {
     return SLOT_IDS.map((slotId) => ({

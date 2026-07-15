@@ -39,21 +39,24 @@ export {
   ProviderRegistryLive,
 } from "./registry"
 export {
-  type LlamaCppProviderInstance,
+  type LlamaCppProviderComponents,
   type LlamaCppDiscoveryResult,
   type LlamaCppModelInfo,
   type LlamaCppCallOptions,
   type LlamaCppToolChoice,
   type LlamaCppRawModel,
   type LlamaCppModelMeta,
-  type LlamaCppClientConfig,
+  type LlamaCppProviderBackend,
+  type FixedLlamaCppEndpointConfig,
   type ServerProps as LlamaCppServerProps,
   type ServerStatus as LlamaCppServerStatus,
   createLlamaCppProvider,
+  makeFixedEndpointBackend,
   createLlamaCppCatalog,
   createLlamaCppCompatibleSpec,
   classifyLlamaCppRejectedResponse,
   DEFAULT_LLAMACPP_ENDPOINT,
+  LlamaCppProviderBackendError,
   PROVIDER_ID as LLAMACPP_PROVIDER_ID,
 } from "./llamacpp"
 export {
@@ -73,7 +76,8 @@ export {
   MagnitudeClientError,
 } from "./magnitude/provider"
 export type { WebSearchResult, BalanceQuery } from "@magnitudedev/ai"
-export { createMagnitudeCatalog } from "./magnitude/catalog"
+export { createMagnitudeCatalog, toMagnitudeModelInfo } from "./magnitude/catalog"
+export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./magnitude/contract"
 export {
   createMagnitudeCompatibleSpec,
   type MagnitudeCallOptions,
@@ -87,6 +91,7 @@ export {
 } from "./magnitude/errors"
 export type {
   MagnitudeModelInfo,
+  MagnitudeRawModel,
   ModelListResponse,
   MagnitudeAdditionalOptions,
   MagnitudeApiError,

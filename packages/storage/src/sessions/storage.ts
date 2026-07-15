@@ -85,7 +85,7 @@ export function makeSessionStorage(): Effect.Effect<
           const result = yield* readStructuredFile(filePath, CwdIndexSchema).pipe(
             Effect.provideService(FileSystem.FileSystem, fs)
           );
-          const ids = result._tag === "Present" ? result.value.sessionIds : [];
+          const ids = result._tag === "Present" ? [...result.value.sessionIds] : [];
           if (!ids.includes(meta.sessionId)) {
             ids.unshift(meta.sessionId);
           }

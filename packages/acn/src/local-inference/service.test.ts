@@ -1,326 +1,575 @@
-import { describe, expect, test } from "vitest"
-import { Effect, Layer, Stream } from "effect"
-import type { LocalInferenceCapabilities, LocalModelChoice } from "@magnitudedev/protocol"
+import { describe, expect, it } from "vitest"
+import { Deferred, Effect, Fiber, Layer, Option, Stream } from "effect"
 import {
-  MagnitudeStorage,
-  type MagnitudeStorageShape,
-  type LocalInferenceConfig,
-  type ModelConfig,
-  type OnboardingConfig,
-} from "@magnitudedev/storage"
-import { Account, type AccountApi } from "../account"
-import { GIB } from "./recommendations"
-import { LlamaCppRuntimeBridge } from "./runtime-bridge"
-import { LocalInferenceOnboarding, LocalInferenceOnboardingLive } from "./service"
-import type {
-  LlamaCppHuggingFaceSource,
-  LlamaCppRuntimeBridgeShape,
-} from "./types"
+  LlamaCppDistribution,
+  LlamaCppHost,
+  LlamaCppModelStore,
+  LlamaCppRuntime,
+  DistributionInstallError,
+  LlamaCppModelStoreError,
+  LlamaCppRuntimeError,
+  type LlamaCppDistributionApi,
+  type LlamaCppHostApi,
+  type LlamaCppHostProfile,
+  type LlamaCppModelStoreApi,
+  type LlamaCppRuntimeApi,
+  type ModelArtifactSummary,
+} from "@magnitudedev/llamacpp"
+import type { DurableLocalModelBinding, LocalInferenceConfig } from "@magnitudedev/storage"
+import {
+  LocalInference,
+  LocalInferenceLive,
+  localInferenceErrorFromDistribution,
+  localInferenceErrorFromModelStore,
+  localInferenceErrorFromRuntime,
+  type LocalInferenceApi,
+} from "./service"
+import {
+  LocalModelConfiguration,
+  type LocalModelConfigurationApi,
+} from "./model-configuration"
 
-interface Harness {
-  readonly layer: Layer.Layer<LocalInferenceOnboarding>
-  readonly downloadedSources: LlamaCppHuggingFaceSource[]
-  readonly activatedSelections: unknown[]
-  readonly state: {
-    modelConfig: ModelConfig | null
-    onboarding: OnboardingConfig | null
-    localInference: LocalInferenceConfig | null
-  }
-}
-
-const capabilities: LocalInferenceCapabilities = {
-  binary: { identity: "managed-test-llama-server", version: "test" },
-  system: { totalMemoryBytes: 32 * GIB, cpuModel: "test cpu", logicalCores: 8 },
-  accelerators: [],
+const hostProfile: LlamaCppHostProfile = {
+  system: { totalMemoryBytes: 64 * 1024 ** 3, cpuModel: "test", logicalCores: 8 },
+  memoryDomains: [{
+    id: "system",
+    kind: "system",
+    stableCapacityBytes: 56 * 1024 ** 3,
+    currentFreeBytes: null,
+    sharesSystemMemory: false,
+    devices: [],
+    splitGroupId: null,
+  }],
+  runtimeProbe: "not_installed",
   warnings: [],
 }
 
-const makeHarness = (
-  inventory: readonly LocalModelChoice[] = [],
-  activatedContextTokens?: number,
-  hostedConfigured = false,
-  activatedParallelSlots?: number,
-): Harness => {
-  const downloadedSources: LlamaCppHuggingFaceSource[] = []
-  const activatedSelections: unknown[] = []
-  const state: Harness["state"] = { modelConfig: null, onboarding: null, localInference: null }
+const artifact = (modelId: string, source: ModelArtifactSummary["source"]): ModelArtifactSummary => ({
+  modelId,
+  source,
+  sizeBytes: 4 * 1024 ** 3,
+  metadata: {
+    displayName: "Discovered model",
+    architecture: "llama",
+    quantization: "Q4_K_M",
+    contextLength: 65_536,
+    parameterCount: null,
+    layerCount: 32,
+    tokenizerModel: null,
+    tokenizerPre: null,
+    baseModelNames: [],
+  },
+  hasVisionProjector: false,
+})
 
-  const storage = {
-    auth: {
-      get: () => Effect.succeed(hostedConfigured ? { type: "api" as const, key: "configured-key" } : undefined),
-    },
-    config: {
-      getModelConfig: () => Effect.succeed(state.modelConfig),
-      getOnboardingConfig: () => Effect.succeed(state.onboarding),
-      getLocalInferenceConfig: () => Effect.succeed(state.localInference),
-      setLocalInferenceConfig: (config: LocalInferenceConfig) => Effect.sync(() => {
-        state.localInference = config
-      }),
-      completeCliModelSetupOnboarding: (completedAt: string) => Effect.sync(() => {
-        state.onboarding = { completedAt }
-      }),
-    },
-  } as unknown as MagnitudeStorageShape
+const distribution: LlamaCppDistributionApi = {
+  inspect: Effect.succeed({ _tag: "Missing" }),
+  install: Stream.empty,
+}
 
-  const account = {
-    getCachedModelList: () => Effect.succeed({
-      slotProfiles: hostedConfigured ? { primary: {}, secondary: {} } : {},
-    }),
-    updateModelConfig: (slots: ModelConfig["slots"]) => Effect.sync(() => {
-      state.modelConfig = { slots }
-    }),
-  } as unknown as AccountApi
+const host: LlamaCppHostApi = {
+  inspect: Effect.succeed(hostProfile),
+  plan: (request) => Effect.succeed({
+    requiredBytes: request.modelBytes + request.contextBytesPerSlot * request.parallelSlots,
+    stableCapacityBytes: 56 * 1024 ** 3,
+    parallelSlots: request.parallelSlots,
+    gpuLayers: 0,
+    splitMode: "none",
+    fits: true,
+  }),
+}
 
-  const bridge: LlamaCppRuntimeBridgeShape = {
-    getReadiness: Effect.succeed({ status: "ready", canDownload: true, canActivate: true }),
-    getCapabilities: Effect.succeed(capabilities),
-    getInventory: Effect.succeed({ running: [], downloaded: inventory }),
-    startDownload: (source) => Effect.sync(() => {
-      downloadedSources.push(source)
-      return { operationId: "download-1" }
-    }),
-    subscribeDownload: () => Stream.empty,
-    cancelDownload: () => Effect.void,
-    activate: (selection) => Effect.sync(() => {
-      activatedSelections.push(selection)
-      return {
-        providerId: "llamacpp",
-        providerModelId: "local-test-model",
-        contextTokens: activatedContextTokens
-          ?? ("contextTokens" in selection ? selection.contextTokens : 32_768),
-        ...(activatedParallelSlots !== undefined ? { parallelSlots: activatedParallelSlots } : {}),
-      }
-    }),
-  }
-
-  const dependencies = Layer.mergeAll(
-    Layer.succeed(MagnitudeStorage, MagnitudeStorage.of(storage)),
-    Layer.succeed(Account, Account.of(account)),
-    Layer.succeed(LlamaCppRuntimeBridge, LlamaCppRuntimeBridge.of(bridge)),
-  )
-
+const makeConfiguration = (
+  initial: LocalInferenceConfig,
+  onActivate: (binding: DurableLocalModelBinding) => void = () => undefined,
+): LocalModelConfigurationApi => {
+  let current = initial
   return {
-    layer: LocalInferenceOnboardingLive.pipe(Layer.provide(dependencies)),
-    downloadedSources,
-    activatedSelections,
-    state,
+    get: Effect.sync(() => current),
+    updateUsage: (usage) => Effect.sync(() => { current = { ...current, usage } }),
+    updateSlots: () => Effect.void,
+    activateLocal: (binding) => Effect.sync(() => {
+      current = { ...current, binding }
+      onActivate(binding)
+    }),
+    disableLocal: Effect.sync(() => { current = { ...current, binding: undefined } }),
+    changes: Stream.empty,
   }
 }
 
-const run = <A, E>(harness: Harness, effect: Effect.Effect<A, E, LocalInferenceOnboarding>) =>
-  Effect.runPromise(effect.pipe(Effect.provide(harness.layer)))
+const localInferenceLayer = (
+  modelStore: LlamaCppModelStoreApi,
+  runtime: LlamaCppRuntimeApi,
+  configuration: LocalModelConfigurationApi,
+) => LocalInferenceLive.pipe(Layer.provide(Layer.mergeAll(
+  Layer.succeed(LlamaCppDistribution, distribution),
+  Layer.succeed(LlamaCppHost, host),
+  Layer.succeed(LlamaCppModelStore, modelStore),
+  Layer.succeed(LlamaCppRuntime, runtime),
+  Layer.succeed(LocalModelConfiguration, configuration),
+)))
 
-describe("LocalInferenceOnboarding service", () => {
-  test("waits for usage answers before generating deterministic recommendations", async () => {
-    const harness = makeHarness()
-    const snapshot = await run(
-      harness,
-      Effect.flatMap(LocalInferenceOnboarding, (service) => service.getSnapshot),
-    )
-    expect(snapshot.onboarding.required).toBe(true)
-    expect(snapshot.capabilities?.system.totalMemoryBytes).toBe(32 * GIB)
-    expect(snapshot.usage.selection).toBeUndefined()
-    expect(snapshot.recommendations).toEqual([])
+describe("LocalInference service", () => {
+  it("maps every package failure code into the closed product error vocabulary", () => {
+    const distributionCodes = [
+      ["unsupported_platform", "unsupported_platform"],
+      ["download_failed", "configuration_failed"],
+      ["integrity_failed", "integrity_failed"],
+      ["storage_failed", "configuration_failed"],
+    ] as const
+    for (const [code, expected] of distributionCodes) {
+      const mapped = localInferenceErrorFromDistribution(new DistributionInstallError({
+        operation: "install",
+        code,
+        stage: "resolving",
+        reason: code,
+      }))
+      expect(mapped.code).toBe(expected)
+    }
 
-    const configured = await run(
-      harness,
-      Effect.flatMap(LocalInferenceOnboarding, (service) => service.configureUsage({
-        localModelRole: "main",
-        sessionConcurrency: "one",
-      })),
-    )
-    expect(configured.usage.selection).toEqual({
-      localModelRole: "main",
-      sessionConcurrency: "one",
-    })
-    expect(configured.recommendations[0]).toMatchObject({
-      displayName: "Qwen3.6 27B",
-      contextTokens: 200_000,
-      quantization: { format: "UD-Q4_K_XL" },
-      servingProfile: { parallelSlots: 1, totalContextCapacityTokens: 200_000 },
-    })
+    const storeCodes = [
+      ["artifact_not_found", "artifact_unavailable"],
+      ["artifact_not_owned", "artifact_not_owned"],
+      ["invalid_plan", "invalid_selection"],
+      ["insufficient_space", "insufficient_disk_space"],
+      ["download_failed", "artifact_unavailable"],
+      ["integrity_failed", "integrity_failed"],
+      ["storage_failed", "configuration_failed"],
+    ] as const
+    for (const [code, expected] of storeCodes) {
+      const mapped = localInferenceErrorFromModelStore(new LlamaCppModelStoreError({
+        operation: "resolve",
+        code,
+        reason: code,
+      }))
+      expect(mapped.code).toBe(expected)
+    }
+
+    const runtimeCodes = [
+      ["distribution_unavailable", "distribution_missing"],
+      ["model_unavailable", "artifact_unavailable"],
+      ["external_unavailable", "external_server_unavailable"],
+      ["server_start_failed", "server_start_failed"],
+      ["server_timeout", "server_start_failed"],
+      ["identity_mismatch", "invalid_selection"],
+      ["context_mismatch", "context_mismatch"],
+      ["endpoint_failed", "runtime_probe_failed"],
+    ] as const
+    for (const [code, expected] of runtimeCodes) {
+      const mapped = localInferenceErrorFromRuntime(new LlamaCppRuntimeError({
+        operation: "ensure_serving",
+        code,
+        reason: code,
+      }))
+      expect(mapped.code).toBe(expected)
+    }
   })
 
-  test("requires the first-run walkthrough even when Cloud is already usable", async () => {
-    const harness = makeHarness([], undefined, true)
-    const snapshot = await run(
-      harness,
-      Effect.flatMap(LocalInferenceOnboarding, (service) => service.getSnapshot),
-    )
-    expect(snapshot.onboarding.required).toBe(true)
-    expect(snapshot.configuration.usable).toBe(true)
-  })
-
-  test("resolves an opaque configuration to an exact pinned Hugging Face source", async () => {
-    const harness = makeHarness()
-    await run(harness, Effect.gen(function* () {
-      const service = yield* LocalInferenceOnboarding
-      const snapshot = yield* service.configureUsage({
-        localModelRole: "main",
-        sessionConcurrency: "one",
-      })
-      yield* service.startDownload(snapshot.recommendations[0]!.configurationId)
-    }))
-    expect(harness.downloadedSources).toHaveLength(1)
-    expect(harness.downloadedSources[0]).toMatchObject({
-      repo: "unsloth/Qwen3.6-27B-GGUF",
-      revision: "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
-      quantTag: "UD-Q4_K_XL",
-      contextTokens: 200_000,
-      servingProfile: {
-        localModelRole: "main",
-        sessionConcurrency: "one",
-        parallelSlots: 1,
-        contextTokensPerSlot: 200_000,
-        totalContextCapacityTokens: 200_000,
+  it("composes install, recommendation, download, and activation through the four package contracts", async () => {
+    let distributionReady = false
+    let downloaded: ModelArtifactSummary | null = null
+    const ensured: unknown[] = []
+    const bindings: DurableLocalModelBinding[] = []
+    const flowDistribution: LlamaCppDistributionApi = {
+      inspect: Effect.sync(() => distributionReady
+        ? {
+            _tag: "Ready",
+            distribution: {
+              executablePath: "/runtime/llama-server",
+              directory: "/runtime",
+              build: 10011,
+              source: "managed",
+            },
+          }
+        : { _tag: "Missing" }),
+      install: Stream.make(
+        { _tag: "Resolving" as const },
+        {
+          _tag: "Ready" as const,
+          distribution: {
+            executablePath: "/runtime/llama-server",
+            directory: "/runtime",
+            build: 10011,
+            source: "managed" as const,
+          },
+        },
+      ).pipe(Stream.tap((event) => Effect.sync(() => {
+        if (event._tag === "Ready") distributionReady = true
+      }))),
+    }
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.sync(() => ({ artifacts: downloaded ? [downloaded] : [], warnings: [] })),
+      resolve: (modelId) => downloaded && downloaded.modelId === modelId
+        ? Effect.succeed({
+            ...downloaded,
+            primaryPath: `/models/${modelId}.gguf`,
+            shardPaths: [`/models/${modelId}.gguf`],
+            projectorPath: null,
+          })
+        : Effect.dieMessage(`Unknown artifact ${modelId}`),
+      download: (plan) => {
+        const artifactSummary: ModelArtifactSummary = {
+          modelId: plan.artifactId,
+          source: { _tag: "MagnitudeOwned", manifestId: plan.artifactId },
+          sizeBytes: plan.files.reduce((total, file) => total + file.sizeBytes, 0),
+          metadata: {
+            displayName: "Downloaded model",
+            architecture: "qwen",
+            quantization: "Q4_K_M",
+            contextLength: 262_144,
+            parameterCount: null,
+            layerCount: 32,
+            tokenizerModel: null,
+            tokenizerPre: null,
+            baseModelNames: [],
+          },
+          hasVisionProjector: false,
+        }
+        return Stream.make(
+          { _tag: "Resolving" as const, artifactId: plan.artifactId },
+          { _tag: "Ready" as const, artifact: artifactSummary },
+        ).pipe(Stream.tap((event) => Effect.sync(() => {
+          if (event._tag === "Ready") downloaded = artifactSummary
+        })))
       },
-      expectedFiles: [{
-        path: "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-        sha256: "ff6941ded525b34eb159496762c29dd0ec6e71dc31b74d57e75d871a03eec259",
-      }],
-    })
+      deleteOwned: () => Effect.void,
+    }
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.succeed({ managed: null, external: [] }),
+      ensureServing: (request) => Effect.sync(() => {
+        ensured.push(request)
+        return {
+          serverId: "managed-flow",
+          ownership: "managed" as const,
+          providerModelId: request.providerModelId,
+          configuredContextTokens: request.contextTokens,
+          metadata: { architecture: "qwen", quantization: "Q4_K_M", sizeBytes: downloaded?.sizeBytes ?? null },
+          connection: { baseUrl: "http://127.0.0.1:18080", apiKey: Option.none() },
+        }
+      }),
+      stopManaged: Effect.void,
+    }
+    const configuration = makeConfiguration({}, (binding) => bindings.push(binding))
+    const layer = LocalInferenceLive.pipe(Layer.provide(Layer.mergeAll(
+      Layer.succeed(LlamaCppDistribution, flowDistribution),
+      Layer.succeed(LlamaCppHost, host),
+      Layer.succeed(LlamaCppModelStore, modelStore),
+      Layer.succeed(LlamaCppRuntime, runtime),
+      Layer.succeed(LocalModelConfiguration, configuration),
+    )))
+
+    await Effect.runPromise(Effect.gen(function* () {
+      const service = yield* LocalInference
+      yield* service.installDistribution
+      yield* service.configureUsage({ localModelRole: "main", sessionConcurrency: "one" })
+      const recommended = (yield* service.state).recommendations[0]
+      if (!recommended) return yield* Effect.dieMessage("Expected a recommendation")
+      yield* service.downloadModel(recommended.configurationId)
+      const stored = (yield* service.state).choices.find(
+        (choice) => choice._tag === "StoredOwned" && choice.choiceId === recommended.configurationId,
+      )
+      if (!stored) return yield* Effect.dieMessage("Expected the downloaded recommendation to become a stored choice")
+      yield* service.activateModel(stored.choiceId)
+    }).pipe(Effect.provide(layer)))
+
+    expect(distributionReady).toBe(true)
+    expect(downloaded).not.toBeNull()
+    expect(ensured).toHaveLength(1)
+    expect(bindings).toHaveLength(1)
+    expect(bindings[0]).toMatchObject({ _tag: "Managed" })
   })
 
-  test("rejects client-supplied arbitrary artifact combinations", async () => {
-    const harness = makeHarness()
-    await expect(run(
-      harness,
-      Effect.flatMap(
-        LocalInferenceOnboarding,
-        (service) => service.startDownload("org/repo:Q4@ctx-999999"),
-      ),
-    )).rejects.toThrow("resolve local model configuration")
-    expect(harness.downloadedSources).toHaveLength(0)
-  })
-
-  test("keeps download progress as authoritative daemon state", async () => {
-    const harness = makeHarness()
-    const progress = await run(harness, Effect.gen(function* () {
-      const service = yield* LocalInferenceOnboarding
-      const snapshot = yield* service.configureUsage({
-        localModelRole: "main",
-        sessionConcurrency: "one",
-      })
-      const started = yield* service.startDownload(snapshot.recommendations[0]!.configurationId)
-      const queued = yield* service.getDownloadProgress(started.operationId)
-      yield* service.cancelDownload(started.operationId)
-      const cancelled = yield* service.getDownloadProgress(started.operationId)
-      return { queued, cancelled }
-    }))
-
-    expect(progress.queued).toMatchObject({
-      operationId: "download-1",
-      status: "queued",
-      completedBytes: 0,
-      selectionId: expect.any(String),
-    })
-    expect(progress.queued?.totalBytes).toBeGreaterThan(0)
-    expect(progress.cancelled?.status).toBe("cancelled")
-  })
-
-  test("activation configures both slots without completing the combined walkthrough", async () => {
-    const harness = makeHarness()
-    await run(harness, Effect.gen(function* () {
-      const service = yield* LocalInferenceOnboarding
-      const snapshot = yield* service.configureUsage({
-        localModelRole: "main",
-        sessionConcurrency: "one",
-      })
-      yield* service.activate(snapshot.recommendations[0]!.configurationId)
-    }))
-    expect(harness.activatedSelections).toHaveLength(1)
-    expect(harness.state.modelConfig?.slots).toEqual({
-      primary: { providerId: "llamacpp", providerModelId: "local-test-model" },
-      secondary: { providerId: "llamacpp", providerModelId: "local-test-model" },
-    })
-    expect(harness.state.onboarding).toBeNull()
-  })
-
-  test("completion is allowed after the user skips both optional providers", async () => {
-    const harness = makeHarness()
-    await run(harness, Effect.flatMap(
-      LocalInferenceOnboarding,
-      (service) => service.complete,
-    ))
-    expect(harness.state.modelConfig).toBeNull()
-    expect(harness.state.onboarding?.completedAt).toBeDefined()
-
-    const snapshot = await run(
-      harness,
-      Effect.flatMap(LocalInferenceOnboarding, (service) => service.getSnapshot),
+  it("activates only the explicitly selected external connection", async () => {
+    const ensured: unknown[] = []
+    const activated: DurableLocalModelBinding[] = []
+    let managedStops = 0
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.succeed({
+        managed: null,
+        external: [{
+          serverId: "llamacpp",
+          ownership: "external",
+          health: "ready",
+          models: [{ providerModelId: "external-model", contextTokens: 32_768 }],
+          build: "test",
+        }],
+      }),
+      ensureServing: (request) => Effect.sync(() => {
+        ensured.push(request)
+        return {
+          serverId: "llamacpp",
+          ownership: "external" as const,
+          providerModelId: "external-model",
+          configuredContextTokens: 32_768,
+          metadata: { architecture: null, quantization: null, sizeBytes: null },
+          connection: { baseUrl: "http://127.0.0.1:8080", apiKey: Option.none() },
+        }
+      }),
+      stopManaged: Effect.sync(() => { managedStops++ }),
+    }
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.succeed({ artifacts: [], warnings: [] }),
+      resolve: () => Effect.die("external activation must not resolve an artifact"),
+      download: () => Stream.empty,
+      deleteOwned: () => Effect.void,
+    }
+    const layer = localInferenceLayer(
+      modelStore,
+      runtime,
+      makeConfiguration({
+        usage: { localModelRole: "main", sessionConcurrency: "one" },
+        binding: {
+          _tag: "Managed",
+          selectionId: "previous",
+          artifactId: "previous-artifact",
+          providerModelId: "previous-model",
+          contextTokens: 32_768,
+          parallelSlots: 1,
+        },
+      }, (binding) => activated.push(binding)),
     )
-    expect(snapshot.onboarding.required).toBe(false)
-    expect(snapshot.configuration.usable).toBe(false)
+
+    const selectionId = await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.state).pipe(
+        Effect.flatMap((state) => {
+          const choice = state.choices.find((candidate) => candidate._tag === "RunningExternal")
+          return choice ? Effect.succeed(choice.choiceId) : Effect.dieMessage("missing external choice")
+        }),
+        Effect.provide(layer),
+      ),
+    )
+    await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.activateModel(selectionId)).pipe(Effect.provide(layer)),
+    )
+
+    expect(ensured).toEqual([{
+      _tag: "External",
+      connectionId: "llamacpp",
+      providerModelId: "external-model",
+      contextTokens: 32_768,
+    }])
+    expect(activated).toEqual([{
+      _tag: "External",
+      selectionId,
+      endpointConfigId: "llamacpp",
+      providerModelId: "external-model",
+      contextTokens: 32_768,
+    }])
+    expect(managedStops).toBe(1)
   })
 
-  test("rejects a silent context reduction before changing app configuration", async () => {
-    const harness = makeHarness([], 4_096)
-    await expect(run(harness, Effect.gen(function* () {
-      const service = yield* LocalInferenceOnboarding
-      const snapshot = yield* service.configureUsage({
-        localModelRole: "main",
-        sessionConcurrency: "one",
-      })
-      return yield* service.activate(snapshot.recommendations[0]!.configurationId)
-    }))).rejects.toThrow("silent context reduction")
-    expect(harness.state.modelConfig).toBeNull()
-    expect(harness.state.onboarding).toBeNull()
+  it("deletes an arbitrary Magnitude-owned stored choice without requiring a catalog entry", async () => {
+    const deleted: string[] = []
+    const owned = artifact("user-owned-artifact", {
+      _tag: "MagnitudeOwned",
+      manifestId: "user-owned-artifact",
+    })
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.succeed({ artifacts: [owned], warnings: [] }),
+      resolve: () => Effect.die("deletion must not resolve model contents"),
+      download: () => Stream.empty,
+      deleteOwned: (modelId) => Effect.sync(() => { deleted.push(modelId) }),
+    }
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.succeed({ managed: null, external: [] }),
+      ensureServing: () => Effect.die("deletion must not start a runtime"),
+      stopManaged: Effect.void,
+    }
+    const layer = localInferenceLayer(modelStore, runtime, makeConfiguration({}))
+    const selectionId = await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.state).pipe(
+        Effect.flatMap((state) => {
+          const choice = state.choices[0]
+          return choice?.compatible
+            ? Effect.succeed(choice.choiceId)
+            : Effect.dieMessage("missing compatible stored choice")
+        }),
+        Effect.provide(layer),
+      ),
+    )
+
+    await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.deleteModel(selectionId)).pipe(Effect.provide(layer)),
+    )
+
+    expect(deleted).toEqual(["user-owned-artifact"])
   })
 
-  test("filters discovered models against the selected context and parallel-slot requirements", async () => {
-    const discovered: LocalModelChoice = {
-      choiceId: "running:test",
-      source: "running",
-      displayName: "Test model",
-      providerModelId: "test-model",
+  it("treats activation of the durable active selection as idempotent", async () => {
+    const binding: DurableLocalModelBinding = {
+      _tag: "External",
+      selectionId: "active-selection",
+      endpointConfigId: "external",
+      providerModelId: "served-model",
+      contextTokens: 8192,
+    }
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.succeed({ artifacts: [], warnings: [] }),
+      resolve: () => Effect.die("idempotent activation must not resolve a model"),
+      download: () => Stream.empty,
+      deleteOwned: () => Effect.void,
+    }
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.die("idempotent activation must not probe the runtime"),
+      ensureServing: () => Effect.die("idempotent activation must not ensure a runtime"),
+      stopManaged: Effect.void,
+    }
+    const layer = localInferenceLayer(modelStore, runtime, makeConfiguration({ binding }))
+
+    await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.activateModel(binding.selectionId)).pipe(Effect.provide(layer)),
+    )
+  })
+
+  it("restarts an arbitrary managed artifact from its durable serving parameters", async () => {
+    const ensured: unknown[] = []
+    let stops = 0
+    const bindings: DurableLocalModelBinding[] = []
+    const stored = artifact("discovered-cache-artifact", {
+      _tag: "HuggingFaceCache",
+      repo: "example/model",
+      revision: "revision",
+    })
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.succeed({ artifacts: [stored], warnings: [] }),
+      resolve: () => Effect.succeed({
+        ...stored,
+        primaryPath: "/models/model.gguf",
+        shardPaths: ["/models/model.gguf"],
+        projectorPath: null,
+      }),
+      download: () => Stream.empty,
+      deleteOwned: () => Effect.void,
+    }
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.succeed({ managed: null, external: [] }),
+      ensureServing: (request) => Effect.sync(() => {
+        ensured.push(request)
+        return {
+          serverId: "managed-test",
+          ownership: "managed" as const,
+          providerModelId: request.providerModelId,
+          configuredContextTokens: request.contextTokens,
+          metadata: { architecture: null, quantization: null, sizeBytes: null },
+          connection: { baseUrl: "http://127.0.0.1:8080", apiKey: Option.none() },
+        }
+      }),
+      stopManaged: Effect.sync(() => { stops += 1 }),
+    }
+    const configuration = makeConfiguration({
+      usage: { localModelRole: "subagent", sessionConcurrency: "one" },
+    }, (binding) => bindings.push(binding))
+    const layer = localInferenceLayer(modelStore, runtime, configuration)
+    const selectionId = await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.state).pipe(
+        Effect.flatMap((state) => {
+          const choice = state.choices[0]
+          return choice ? Effect.succeed(choice.choiceId) : Effect.dieMessage("missing stored choice")
+        }),
+        Effect.provide(layer),
+      ),
+    )
+    await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.activateModel(selectionId)).pipe(Effect.provide(layer)),
+    )
+    await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.restart).pipe(Effect.provide(layer)),
+    )
+
+    expect(bindings).toHaveLength(1)
+    expect(bindings[0]).toMatchObject({
+      _tag: "Managed",
+      selectionId,
+      artifactId: "discovered-cache-artifact",
       contextTokens: 64_000,
       parallelSlots: 3,
-      fitClass: "unknown",
-      managed: false,
-      compatible: true,
-      explanation: "test",
-    }
-    const harness = makeHarness([discovered])
-
-    const subagentsOneSession = await run(
-      harness,
-      Effect.flatMap(LocalInferenceOnboarding, (service) => service.configureUsage({
-        localModelRole: "subagent",
-        sessionConcurrency: "one",
-      })),
-    )
-    expect(subagentsOneSession.downloaded[0]?.compatible).toBe(true)
-
-    const subagentsMultipleSessions = await run(
-      harness,
-      Effect.flatMap(LocalInferenceOnboarding, (service) => service.configureUsage({
-        localModelRole: "subagent",
-        sessionConcurrency: "up_to_three",
-      })),
-    )
-    expect(subagentsMultipleSessions.downloaded[0]?.compatible).toBe(false)
-
-    const mainOneSession = await run(
-      harness,
-      Effect.flatMap(LocalInferenceOnboarding, (service) => service.configureUsage({
-        localModelRole: "main",
-        sessionConcurrency: "one",
-      })),
-    )
-    expect(mainOneSession.downloaded[0]?.compatible).toBe(false)
+    })
+    expect(stops).toBe(1)
+    expect(ensured).toHaveLength(2)
+    expect(ensured[1]).toEqual(ensured[0])
   })
 
-  test("rejects a silent parallel-slot reduction before changing app configuration", async () => {
-    const harness = makeHarness([], undefined, false, 1)
-    await expect(run(harness, Effect.gen(function* () {
-      const service = yield* LocalInferenceOnboarding
-      const snapshot = yield* service.configureUsage({
-        localModelRole: "main",
-        sessionConcurrency: "up_to_three",
-      })
-      return yield* service.activate(snapshot.recommendations[0]!.configurationId)
-    }))).rejects.toThrow("silent slot reduction")
-    expect(harness.state.modelConfig).toBeNull()
-    expect(harness.state.onboarding).toBeNull()
+  it("clears durable configuration before stopping the managed runtime", async () => {
+    const events: string[] = []
+    const binding: DurableLocalModelBinding = {
+      _tag: "Managed",
+      selectionId: "selection",
+      artifactId: "artifact",
+      providerModelId: "local:model",
+      contextTokens: 8192,
+      parallelSlots: 1,
+    }
+    const configuration: LocalModelConfigurationApi = {
+      get: Effect.succeed({
+        usage: { localModelRole: "main", sessionConcurrency: "one" },
+        binding,
+      }),
+      updateUsage: () => Effect.void,
+      updateSlots: () => Effect.void,
+      activateLocal: () => Effect.void,
+      disableLocal: Effect.sync(() => { events.push("configuration") }),
+      changes: Stream.empty,
+    }
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.succeed({ managed: null, external: [] }),
+      ensureServing: () => Effect.die("disable must not ensure serving"),
+      stopManaged: Effect.sync(() => { events.push("runtime") }),
+    }
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.succeed({ artifacts: [], warnings: [] }),
+      resolve: () => Effect.die("disable must not resolve a model"),
+      download: () => Stream.empty,
+      deleteOwned: () => Effect.void,
+    }
+    const layer = localInferenceLayer(modelStore, runtime, configuration)
+
+    await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.disable).pipe(Effect.provide(layer)),
+    )
+
+    expect(events).toEqual(["configuration", "runtime"])
+  })
+
+  it("serializes configuration and runtime lifecycle operations", async () => {
+    const events: string[] = []
+    const started = await Effect.runPromise(Deferred.make<void>())
+    const release = await Effect.runPromise(Deferred.make<void>())
+    const configuration: LocalModelConfigurationApi = {
+      get: Effect.succeed({}),
+      updateUsage: () => Effect.sync(() => { events.push("usage:start") }).pipe(
+        Effect.zipRight(Deferred.succeed(started, undefined)),
+        Effect.zipRight(Deferred.await(release)),
+        Effect.zipRight(Effect.sync(() => { events.push("usage:end") })),
+      ),
+      updateSlots: () => Effect.void,
+      activateLocal: () => Effect.void,
+      disableLocal: Effect.sync(() => { events.push("disable") }),
+      changes: Stream.empty,
+    }
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.succeed({ managed: null, external: [] }),
+      ensureServing: () => Effect.die("configuration operations must not start a runtime"),
+      stopManaged: Effect.sync(() => { events.push("stop") }),
+    }
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.succeed({ artifacts: [], warnings: [] }),
+      resolve: () => Effect.die("configuration operations must not resolve models"),
+      download: () => Stream.empty,
+      deleteOwned: () => Effect.void,
+    }
+
+    await Effect.runPromise(Effect.gen(function* () {
+      const service = yield* LocalInference
+      const configuring = yield* service.configureUsage({ localModelRole: "main", sessionConcurrency: "one" }).pipe(Effect.fork)
+      yield* Deferred.await(started)
+      const disabling = yield* service.disable.pipe(Effect.fork)
+      yield* Effect.sleep("20 millis")
+      expect(events).toEqual(["usage:start"])
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(configuring)
+      yield* Fiber.join(disabling)
+    }).pipe(Effect.provide(localInferenceLayer(modelStore, runtime, configuration))))
+
+    expect(events).toEqual(["usage:start", "usage:end", "disable", "stop"])
   })
 })

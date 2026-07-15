@@ -1,10 +1,10 @@
 import type {
-  LocalInferenceCapabilities,
   LocalInferenceFitClass,
   LocalInferenceServingProfile,
   LocalInferenceUsageSelection,
   LocalModelRecommendation,
 } from "@magnitudedev/protocol"
+import type { LlamaCppHostProfile } from "@magnitudedev/llamacpp"
 import { LOCAL_MODEL_CATALOG, catalogFileUrl, catalogSourcePageUrl } from "./catalog"
 import type {
   EvaluatedLocalConfiguration,
@@ -23,11 +23,13 @@ export const parallelSlotsForUsage = (usage: LocalInferenceUsageSelection): numb
   return requestsPerSession * sessionMultiplier
 }
 
-const contextTargetsForUsage = (usage: LocalInferenceUsageSelection): readonly number[] =>
+export const contextTargetsForUsage = (
+  usage: LocalInferenceUsageSelection,
+): typeof MAIN_AGENT_CONTEXT_TARGETS | typeof SUBAGENT_CONTEXT_TARGETS =>
   usage.localModelRole === "main" ? MAIN_AGENT_CONTEXT_TARGETS : SUBAGENT_CONTEXT_TARGETS
 
 const minimumContextForUsage = (usage: LocalInferenceUsageSelection): number =>
-  contextTargetsForUsage(usage).at(-1)!
+  contextTargetsForUsage(usage).at(-1) ?? BASELINE_CONTEXT_TOKENS
 
 const servingProfile = (
   entry: LocalModelCatalogEntry,
@@ -45,25 +47,25 @@ const servingProfile = (
   }
 }
 
-export const stableCapacityFromCapabilities = (
-  capabilities: LocalInferenceCapabilities,
+export const stableCapacityFromHost = (
+  host: LlamaCppHostProfile,
 ): StableInferenceCapacity => {
   const domains = new Map<string, StableInferenceCapacity["acceleratorDomains"][number]>()
-  for (const accelerator of capabilities.accelerators) {
-    if (!accelerator.capacityBytes || accelerator.capacityBytes <= 0) continue
-    const current = domains.get(accelerator.memoryDomainId)
+  for (const memory of host.memoryDomains) {
+    if (memory.kind === "system" || memory.stableCapacityBytes <= 0) continue
+    const current = domains.get(memory.id)
     const next = {
-      memoryDomainId: accelerator.memoryDomainId,
-      capacityBytes: accelerator.capacityBytes,
-      sharesSystemMemory: accelerator.sharesSystemMemory,
-      preferredBackend: accelerator.backend,
-      ...(accelerator.modelSplitGroupId ? { modelSplitGroupId: accelerator.modelSplitGroupId } : {}),
+      memoryDomainId: memory.id,
+      capacityBytes: memory.stableCapacityBytes,
+      sharesSystemMemory: memory.sharesSystemMemory,
+      preferredBackend: memory.devices[0]?.backend ?? "unknown",
+      ...(memory.splitGroupId ? { modelSplitGroupId: memory.splitGroupId } : {}),
     } as const
     // Duplicate backend exposure of one physical domain is counted once.
-    if (!current || next.capacityBytes < current.capacityBytes) domains.set(accelerator.memoryDomainId, next)
+    if (!current || next.capacityBytes < current.capacityBytes) domains.set(memory.id, next)
   }
   return {
-    systemMemoryBytes: capabilities.system.totalMemoryBytes,
+    systemMemoryBytes: host.system.totalMemoryBytes,
     acceleratorDomains: [...domains.values()],
   }
 }
@@ -77,21 +79,39 @@ export const acceleratorCapacityBudget = (totalBytes: number): number =>
 /**
  * Conservative catalog estimate until measured llama.cpp profiles replace it.
  * It includes weights, compute/graph overhead, and context-scaled KV/runtime
- * overhead. The exact downloaded model is still authoritatively fitted by the
- * CTO-owned lifecycle integration before activation.
+ * overhead. The exact resolved artifact is still authoritatively fitted by
+ * `LlamaCppHost.plan` immediately before activation.
  */
 export const estimateRuntimeBytes = (
   entry: LocalModelCatalogEntry,
   contextTokensPerSlot: number,
   parallelSlots: number,
+): number => estimateRuntimeBytesForModel(
+  entry.files.reduce((total, file) => total + file.sizeBytes, 0),
+  contextTokensPerSlot,
+  parallelSlots,
+)
+
+export const estimateRuntimeBytesForModel = (
+  modelBytes: number,
+  contextTokensPerSlot: number,
+  parallelSlots: number,
 ): number => {
-  const weights = entry.files.reduce((total, file) => total + file.sizeBytes, 0)
-  const computeAndGraph = Math.max(768 * 1024 ** 2, weights * 0.04)
-  const contextAt32K = Math.max(GIB, weights * 0.06)
+  const computeAndGraph = Math.max(768 * 1024 ** 2, modelBytes * 0.04)
+  const contextAt32K = Math.max(GIB, modelBytes * 0.06)
   const totalContextTokens = contextTokensPerSlot * parallelSlots
   const contextAndKv = contextAt32K * (totalContextTokens / BASELINE_CONTEXT_TOKENS)
-  return Math.ceil(weights + computeAndGraph + contextAndKv)
+  return Math.ceil(modelBytes + computeAndGraph + contextAndKv)
 }
+
+export const estimateRuntimeOverheadPerSlot = (
+  modelBytes: number,
+  contextTokensPerSlot: number,
+  parallelSlots: number,
+): number => Math.max(
+  0,
+  (estimateRuntimeBytesForModel(modelBytes, contextTokensPerSlot, parallelSlots) - modelBytes) / parallelSlots,
+)
 
 const fitConfiguration = (
   capacity: StableInferenceCapacity,
@@ -241,9 +261,9 @@ const toRecommendation = (
       fidelityEvidence: entry.quantization.fidelityEvidence,
       fidelitySourceUrl: entry.quantization.fidelitySourceUrl,
     },
+    quantTag: entry.quantTag,
     repo: entry.repo,
     revision: entry.revision,
-    quantTag: entry.quantTag,
     files: entry.files.map((file) => ({
       ...file,
       downloadUrl: catalogFileUrl(entry, file.path),
@@ -299,7 +319,7 @@ export const recommendLocalModels = (
     .sort((a, b) => b.contextTokens - a.contextTokens || b.entry.quantization.fidelityRank - a.entry.quantization.fidelityRank)[0]
   if (sameModelHigherFidelity) choices.push({ item: sameModelHigherFidelity, badge: "higher_fidelity" })
 
-  // Keep the onboarding choice useful even when the primary artifact is
+  // Keep the selection set useful even when the primary artifact is
   // already the highest-fidelity quant. Prefer a third distinct model so the
   // cards represent real capability/weight trade-offs, then fall back to a
   // distinct quant only when fewer than three model families fit.

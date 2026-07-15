@@ -1,61 +1,7 @@
 import { Schema } from "effect"
-import { StreamHeartbeat } from "./events"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
-
-export const LocalInferenceCapacityKind = Schema.Literal(
-  "physical-device-memory",
-  "recommended-working-set",
-  "none",
-  "unknown",
-)
-export type LocalInferenceCapacityKind = Schema.Schema.Type<typeof LocalInferenceCapacityKind>
-
-export const LocalInferenceAccelerator = Schema.Struct({
-  id: Schema.String,
-  backend: Schema.String,
-  description: Schema.String,
-  capacityBytes: Schema.optional(NonNegativeNumber),
-  capacityKind: LocalInferenceCapacityKind,
-  memoryDomainId: Schema.String,
-  /** Present only when the managed backend can split one model across the named device group. */
-  modelSplitGroupId: Schema.optional(Schema.String),
-  sharesSystemMemory: Schema.Union(Schema.Boolean, Schema.Literal("unknown")),
-  /** Transient diagnostic only. Recommendation policy must never consume this field. */
-  currentFreeBytes: Schema.optional(NonNegativeNumber),
-})
-export type LocalInferenceAccelerator = Schema.Schema.Type<typeof LocalInferenceAccelerator>
-
-export const LocalInferenceWarning = Schema.Struct({
-  code: Schema.String,
-  message: Schema.String,
-})
-export type LocalInferenceWarning = Schema.Schema.Type<typeof LocalInferenceWarning>
-
-export const LocalInferenceCapabilities = Schema.Struct({
-  binary: Schema.Struct({
-    identity: Schema.String,
-    version: Schema.optional(Schema.String),
-  }),
-  system: Schema.Struct({
-    totalMemoryBytes: NonNegativeNumber,
-    cpuModel: Schema.optional(Schema.String),
-    logicalCores: Schema.optional(PositiveInteger),
-  }),
-  accelerators: Schema.Array(LocalInferenceAccelerator),
-  warnings: Schema.Array(LocalInferenceWarning),
-})
-export type LocalInferenceCapabilities = Schema.Schema.Type<typeof LocalInferenceCapabilities>
-
-export const LocalInferenceFitClass = Schema.Literal(
-  "full_accelerator",
-  "hybrid",
-  "cpu_or_unified",
-  "unknown",
-)
-export type LocalInferenceFitClass = Schema.Schema.Type<typeof LocalInferenceFitClass>
-
 export const LocalModelRole = Schema.Literal("main", "subagent")
 export type LocalModelRole = Schema.Schema.Type<typeof LocalModelRole>
 
@@ -79,6 +25,9 @@ export const LocalInferenceServingProfile = Schema.Struct({
 })
 export type LocalInferenceServingProfile = Schema.Schema.Type<typeof LocalInferenceServingProfile>
 
+export const LocalInferenceFitClass = Schema.Literal("full_accelerator", "hybrid", "cpu_or_unified", "unknown")
+export type LocalInferenceFitClass = Schema.Schema.Type<typeof LocalInferenceFitClass>
+
 export const LocalInferenceQuantization = Schema.Struct({
   format: Schema.String,
   bitsClass: Schema.Literal("q4", "q5", "q6", "q8", "fp8", "mxfp4", "other"),
@@ -89,13 +38,44 @@ export const LocalInferenceQuantization = Schema.Struct({
 })
 export type LocalInferenceQuantization = Schema.Schema.Type<typeof LocalInferenceQuantization>
 
-export const LocalInferenceArtifactFile = Schema.Struct({
-  path: Schema.String,
-  sizeBytes: NonNegativeNumber,
-  sha256: Schema.String,
-  downloadUrl: Schema.String,
+export const LocalInferenceWarning = Schema.Struct({
+  code: Schema.String,
+  message: Schema.String,
 })
-export type LocalInferenceArtifactFile = Schema.Schema.Type<typeof LocalInferenceArtifactFile>
+export type LocalInferenceWarning = Schema.Schema.Type<typeof LocalInferenceWarning>
+
+export const LocalInferenceDistributionState = Schema.Union(
+  Schema.TaggedStruct("Missing", {}),
+  Schema.TaggedStruct("Unsupported", { message: Schema.String }),
+  Schema.TaggedStruct("Invalid", { message: Schema.String }),
+  Schema.TaggedStruct("Ready", {
+    build: PositiveInteger,
+    source: Schema.Literal("managed", "configured"),
+  }),
+)
+export type LocalInferenceDistributionState = Schema.Schema.Type<typeof LocalInferenceDistributionState>
+
+export const LocalInferenceHostProfile = Schema.Struct({
+  systemMemoryBytes: NonNegativeNumber,
+  cpuModel: Schema.NullOr(Schema.String),
+  logicalCores: PositiveInteger,
+  memoryDomains: Schema.Array(Schema.Struct({
+    id: Schema.String,
+    kind: Schema.Literal("system", "physical_device", "unified_working_set"),
+    stableCapacityBytes: NonNegativeNumber,
+    currentFreeBytes: Schema.NullOr(NonNegativeNumber),
+    sharesSystemMemory: Schema.Boolean,
+    deviceNames: Schema.Array(Schema.String),
+    splitGroupId: Schema.NullOr(Schema.String),
+  })),
+})
+export type LocalInferenceHostProfile = Schema.Schema.Type<typeof LocalInferenceHostProfile>
+
+export const LocalInferenceHostState = Schema.Union(
+  Schema.TaggedStruct("Available", { profile: LocalInferenceHostProfile }),
+  Schema.TaggedStruct("Unavailable", { message: Schema.String }),
+)
+export type LocalInferenceHostState = Schema.Schema.Type<typeof LocalInferenceHostState>
 
 export const LocalModelRecommendation = Schema.Struct({
   configurationId: Schema.String,
@@ -108,10 +88,15 @@ export const LocalModelRecommendation = Schema.Struct({
   activeParametersBillions: Schema.optional(NonNegativeNumber),
   effectiveParametersBillions: Schema.optional(NonNegativeNumber),
   quantization: LocalInferenceQuantization,
+  quantTag: Schema.String,
   repo: Schema.String,
   revision: Schema.String,
-  quantTag: Schema.String,
-  files: Schema.Array(LocalInferenceArtifactFile),
+  files: Schema.Array(Schema.Struct({
+    path: Schema.String,
+    sizeBytes: NonNegativeNumber,
+    sha256: Schema.String,
+    downloadUrl: Schema.String,
+  })),
   totalDownloadBytes: NonNegativeNumber,
   sourcePageUrl: Schema.String,
   license: Schema.Struct({
@@ -124,81 +109,75 @@ export const LocalModelRecommendation = Schema.Struct({
   modelMaximumContextTokens: PositiveInteger,
   estimatedRuntimeBytes: NonNegativeNumber,
   stableCapacityBudgetBytes: NonNegativeNumber,
-  fitMarginBytes: NonNegativeNumber,
+  fitMarginBytes: Schema.Number.pipe(Schema.finite()),
   fitClass: LocalInferenceFitClass,
   constrainedContext: Schema.Boolean,
   explanation: Schema.String,
 })
 export type LocalModelRecommendation = Schema.Schema.Type<typeof LocalModelRecommendation>
 
-export const LocalModelChoice = Schema.Struct({
+const ChoiceFields = {
   choiceId: Schema.String,
-  source: Schema.Literal("running", "downloaded"),
   displayName: Schema.String,
   providerModelId: Schema.String,
-  serverId: Schema.optional(Schema.String),
-  cacheId: Schema.optional(Schema.String),
-  catalogModelId: Schema.optional(Schema.String),
-  quantization: Schema.optional(LocalInferenceQuantization),
-  sizeBytes: Schema.optional(NonNegativeNumber),
-  totalParametersBillions: Schema.optional(NonNegativeNumber),
-  activeParametersBillions: Schema.optional(NonNegativeNumber),
-  effectiveParametersBillions: Schema.optional(NonNegativeNumber),
   contextTokens: PositiveInteger,
-  parallelSlots: Schema.optional(PositiveInteger),
-  servingProfile: Schema.optional(LocalInferenceServingProfile),
-  modelMaximumContextTokens: Schema.optional(PositiveInteger),
   fitClass: LocalInferenceFitClass,
-  managed: Schema.Boolean,
   compatible: Schema.Boolean,
   explanation: Schema.String,
-})
+  quantization: Schema.optional(LocalInferenceQuantization),
+  sizeBytes: Schema.optional(NonNegativeNumber),
+  servingProfile: Schema.optional(LocalInferenceServingProfile),
+}
+
+export const LocalModelChoice = Schema.Union(
+  Schema.TaggedStruct("RunningExternal", ChoiceFields),
+  Schema.TaggedStruct("RunningManaged", ChoiceFields),
+  Schema.TaggedStruct("StoredOwned", ChoiceFields),
+  Schema.TaggedStruct("StoredExternal", ChoiceFields),
+)
 export type LocalModelChoice = Schema.Schema.Type<typeof LocalModelChoice>
 
-export const LocalInferenceOnboardingSnapshot = Schema.Struct({
-  onboarding: Schema.Struct({
-    required: Schema.Boolean,
-    completedAt: Schema.optional(Schema.String),
+export const ActiveLocalBindingSummary = Schema.Union(
+  Schema.TaggedStruct("Managed", {
+    selectionId: Schema.String,
+    providerModelId: Schema.String,
+    contextTokens: PositiveInteger,
   }),
-  configuration: Schema.Struct({
-    usable: Schema.Boolean,
+  Schema.TaggedStruct("External", {
+    selectionId: Schema.String,
+    providerModelId: Schema.String,
+    contextTokens: PositiveInteger,
   }),
-  usage: Schema.Struct({
-    selection: Schema.optional(LocalInferenceUsageSelection),
-  }),
-  runtime: Schema.Struct({
-    status: Schema.Literal("ready", "integration_pending", "error"),
-    canDownload: Schema.Boolean,
-    canActivate: Schema.Boolean,
-    diagnostic: Schema.optional(Schema.String),
-  }),
-  capabilities: Schema.optional(LocalInferenceCapabilities),
-  running: Schema.Array(LocalModelChoice),
-  downloaded: Schema.Array(LocalModelChoice),
+)
+export type ActiveLocalBindingSummary = Schema.Schema.Type<typeof ActiveLocalBindingSummary>
+
+export const LocalInferenceErrorCode = Schema.Literal(
+  "distribution_missing",
+  "unsupported_platform",
+  "invalid_selection",
+  "artifact_unavailable",
+  "license_required",
+  "insufficient_disk_space",
+  "integrity_failed",
+  "artifact_not_owned",
+  "artifact_active",
+  "context_mismatch",
+  "server_start_failed",
+  "external_server_unavailable",
+  "configuration_failed",
+  "runtime_probe_failed",
+  "cancelled",
+)
+export type LocalInferenceErrorCode = Schema.Schema.Type<typeof LocalInferenceErrorCode>
+
+export const LocalInferenceState = Schema.Struct({
+  schemaVersion: Schema.Literal(3),
+  usage: Schema.NullOr(LocalInferenceUsageSelection),
+  activeBinding: Schema.NullOr(ActiveLocalBindingSummary),
+  distribution: LocalInferenceDistributionState,
+  host: LocalInferenceHostState,
+  choices: Schema.Array(LocalModelChoice),
   recommendations: Schema.Array(LocalModelRecommendation),
   warnings: Schema.Array(LocalInferenceWarning),
 })
-export type LocalInferenceOnboardingSnapshot = Schema.Schema.Type<typeof LocalInferenceOnboardingSnapshot>
-
-export const LocalModelDownloadProgress = Schema.Struct({
-  operationId: Schema.String,
-  status: Schema.Literal(
-    "queued",
-    "downloading",
-    "verifying",
-    "ready",
-    "failed",
-    "cancelled",
-  ),
-  completedBytes: NonNegativeNumber,
-  totalBytes: NonNegativeNumber,
-  currentFile: Schema.optional(Schema.String),
-  bytesPerSecond: Schema.optional(NonNegativeNumber),
-  resumable: Schema.Boolean,
-  message: Schema.optional(Schema.String),
-  selectionId: Schema.optional(Schema.String),
-})
-export type LocalModelDownloadProgress = Schema.Schema.Type<typeof LocalModelDownloadProgress>
-
-export const LocalModelDownloadWireEvent = Schema.Union(LocalModelDownloadProgress, StreamHeartbeat)
-export type LocalModelDownloadWireEvent = Schema.Schema.Type<typeof LocalModelDownloadWireEvent>
+export type LocalInferenceState = Schema.Schema.Type<typeof LocalInferenceState>

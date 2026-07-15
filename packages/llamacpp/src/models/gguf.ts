@@ -1,43 +1,32 @@
-import { Effect, Option, Schema } from "effect"
+import { Data, Effect, Option, Schema } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { gguf } from "@huggingface/gguf"
 import { GGMLFileQuantizationType } from "@huggingface/tasks"
-import type { ExpandedGgufMetadata } from "./types"
-
-// ── Output schema ──
-
-/**
- * Schema for the structured GGUF metadata we extract from the library's flat KV record.
- * All fields are optional except `chatTemplatePresent` and the two arrays (which default to empty).
- */
-export const ExpandedGgufMetadataSchema = Schema.Struct({
-  generalName: Schema.optional(Schema.String),
-  generalBasename: Schema.optional(Schema.String),
-  generalSizeLabel: Schema.optional(Schema.String),
-  generalFinetune: Schema.optional(Schema.String),
-  generalVersion: Schema.optional(Schema.String),
-  architecture: Schema.optional(Schema.String),
-  quantization: Schema.optional(Schema.String),
-  contextLength: Schema.optional(Schema.Number),
-  hiddenSize: Schema.optional(Schema.Number),
-  layerCount: Schema.optional(Schema.Number),
-  headCount: Schema.optional(Schema.Number),
-  vocabSize: Schema.optional(Schema.Number),
-  expertCount: Schema.optional(Schema.Number),
-  expertUsedCount: Schema.optional(Schema.Number),
-  feedForwardLength: Schema.optional(Schema.Number),
-  tokenizerModel: Schema.optional(Schema.String),
-  tokenizerPre: Schema.optional(Schema.String),
-  chatTemplate: Schema.optional(Schema.String),
-  chatTemplatePresent: Schema.Boolean,
-  parameterCount: Schema.optional(Schema.Number),
-  baseModelNames: Schema.Array(Schema.String),
-  baseModelRepositories: Schema.Array(Schema.String),
-})
+import {
+  ExpandedGgufMetadata as ExpandedGgufMetadataSchema,
+  type ExpandedGgufMetadata,
+} from "./types"
 
 // ── Field extraction from the library's typed metadata ──
 
 type TypedMetadata = Record<string, { value: unknown; type: number; subType?: number }>
+
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  typeof value === "object" && value !== null
+
+const normalizeTypedMetadata = (value: unknown): TypedMetadata => {
+  if (!isRecord(value)) return {}
+  const metadata: TypedMetadata = {}
+  for (const [key, candidate] of Object.entries(value)) {
+    if (!isRecord(candidate) || !("value" in candidate) || typeof candidate.type !== "number") continue
+    metadata[key] = {
+      value: candidate.value,
+      type: candidate.type,
+      ...(typeof candidate.subType === "number" ? { subType: candidate.subType } : {}),
+    }
+  }
+  return metadata
+}
 
 /** Decode a string field from the typed metadata record. */
 function str(tm: TypedMetadata, key: string): string | undefined {
@@ -76,9 +65,11 @@ function toStructuredMetadata(tm: TypedMetadata): unknown {
   const chatTemplate = str(tm, "tokenizer.chat_template")
 
   const fileType = num(tm, "general.file_type")
-  const quantization = fileType !== undefined
-    ? GGMLFileQuantizationType[fileType as GGMLFileQuantizationType]
-    : undefined
+  const quantization = fileType === undefined
+    ? undefined
+    : Object.entries(GGMLFileQuantizationType).find(
+      ([key, value]) => Number(key) === fileType && typeof value === "string",
+    )?.[1]
 
   return {
     generalName: str(tm, "general.name"),
@@ -120,6 +111,10 @@ interface CachedMetadata {
 
 const metadataCache = new Map<string, CachedMetadata>()
 
+class GgufReadError extends Data.TaggedError("GgufReadError")<{
+  readonly cause: unknown
+}> {}
+
 // ── Public API ──
 
 /**
@@ -153,20 +148,28 @@ export function readGgufMetadata(
 
     // Read via @huggingface/gguf (header only, ~1-20ms)
     const metadata = yield* Effect.tryPromise({
-      try: async () => {
+      try: async (): Promise<ExpandedGgufMetadata | null> => {
         const parsed = await gguf(filePath, {
           allowLocalFile: true,
           typedMetadata: true,
           computeParametersCount: true,
         })
-        const tm = parsed.typedMetadata as TypedMetadata
+        const tm = normalizeTypedMetadata(parsed.typedMetadata)
         const structured = toStructuredMetadata(tm)
         const decoded = decodeMetadata(structured)
         if (decoded._tag !== "Some") return null
         // parameterCount comes from the library's computation, not from metadata keys
-        return { ...decoded.value, parameterCount: parsed.parameterCount } as ExpandedGgufMetadata
+        const parameterCount = typeof parsed.parameterCount === "bigint"
+          ? Number(parsed.parameterCount)
+          : parsed.parameterCount
+        return {
+          ...decoded.value,
+          ...(typeof parameterCount === "number" && Number.isFinite(parameterCount)
+            ? { parameterCount }
+            : {}),
+        }
       },
-      catch: () => null as ExpandedGgufMetadata | null,
+      catch: (cause) => new GgufReadError({ cause }),
     }).pipe(Effect.catchAll(() => Effect.succeed(null)))
 
     metadataCache.set(filePath, { size, mtimeMs, metadata })

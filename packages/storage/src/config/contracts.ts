@@ -3,7 +3,7 @@ import { Context, Effect } from 'effect'
 
 import type { JsonError } from '../io/storage'
 import type { ResolvedContextLimitPolicy } from '../types/config'
-import type { ContextLimitPolicy, LocalInferenceConfig, MagnitudeConfig, ModelConfig, OnboardingConfig, SlotId, SlotModelConfig } from '../types'
+import type { ContextLimitPolicy, LocalInferenceConfig, MagnitudeConfig, ModelConfig, OnboardingConfig, OnboardingFlowId, SlotId, SlotModelConfig } from '../types'
 
 export interface ConfigStorageShape {
   readonly load: () => Effect.Effect<MagnitudeConfig, PlatformError | JsonError>
@@ -24,11 +24,10 @@ export interface ConfigStorageShape {
 
   readonly getOnboardingConfig: () => Effect.Effect<OnboardingConfig | null, PlatformError | JsonError>
   readonly getLocalInferenceConfig: () => Effect.Effect<LocalInferenceConfig | null, PlatformError | JsonError>
-  readonly setLocalInferenceConfig: (
-    config: LocalInferenceConfig
-  ) => Effect.Effect<void, PlatformError | JsonError>
-  readonly completeCliModelSetupOnboarding: (
-    completedAt: string
+  readonly completeOnboardingFlow: (
+    flowId: OnboardingFlowId,
+    version: number,
+    completedAt: string,
   ) => Effect.Effect<void, PlatformError | JsonError>
 }
 

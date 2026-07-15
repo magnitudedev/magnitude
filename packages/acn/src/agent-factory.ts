@@ -6,13 +6,12 @@ import {
   createCodingAgentSession,
   type CodingAgentSession,
 } from "@magnitudedev/agent"
-import { createProviderClient, type ProviderClientShape } from "@magnitudedev/sdk"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import type { SessionError } from "@magnitudedev/protocol"
 import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
-import { resolveLlamaCppAuth } from "./shared-client"
+import { ProviderClientRegistry } from "./shared-client"
 
 export interface AgentFactoryApi {
   readonly createSession: (input: {
@@ -32,11 +31,12 @@ export class AgentFactory extends Context.Tag("AgentFactory")<
 export const AgentFactoryLive = (options: {
   readonly debug: boolean
   readonly version: string
-}): Layer.Layer<AgentFactory, never, MagnitudeStorage> =>
+}): Layer.Layer<AgentFactory, never, MagnitudeStorage | ProviderClientRegistry> =>
   Layer.effect(
     AgentFactory,
     Effect.gen(function* () {
       const storage = yield* MagnitudeStorage
+      const providerClients = yield* ProviderClientRegistry
 
       return {
         createSession: Effect.fn("acn.agent-factory.create-session")(function* (input) {
@@ -55,23 +55,8 @@ export const AgentFactoryLive = (options: {
             })).pipe(
               Effect.mapError((cause) => toSessionError(input.sessionId, cause)),
             )
-            const apiKey = yield* storage.auth.get("magnitude").pipe(
-              Effect.map((auth) => auth?.type === "api" ? auth.key : null),
-            )
-            const magnitudeApiKey = apiKey
-              || process.env.MAGNITUDE_API_KEY
-              || process.env.MAGNITUDE_LOCAL_API_KEY
-            const llamacpp = yield* resolveLlamaCppAuth(storage)
-            const providerClient: ProviderClientShape = createProviderClient({
-              ...(magnitudeApiKey ? { apiKey: magnitudeApiKey } : {}),
-              sessionId: input.sessionId,
-              ...(llamacpp
-                ? {
-                    llamacppEndpoint: llamacpp.endpoint,
-                    ...(llamacpp.apiKey ? { llamacppApiKey: llamacpp.apiKey } : {}),
-                  }
-                : {}),
-            })
+            const providerClient = yield* providerClients.session(input.sessionId)
+            yield* Scope.addFinalizer(input.scope, providerClients.remove(input.sessionId))
             return { persistenceLayer, sessionContext, providerClient }
           }).pipe(
             Effect.mapError((cause) => toSessionError(input.sessionId, cause)),

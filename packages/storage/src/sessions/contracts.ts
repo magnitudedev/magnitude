@@ -71,7 +71,7 @@ export interface SessionStorageShape {
 
   readonly writeCwdIndex: (
     cwd: string,
-    sessionIds: string[]
+    sessionIds: readonly string[]
   ) => Effect.Effect<void, PlatformError | JsonError>
 
   readonly readEvents: <T>(

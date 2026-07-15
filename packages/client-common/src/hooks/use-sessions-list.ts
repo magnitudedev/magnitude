@@ -8,7 +8,7 @@ import { Option } from "effect"
 import { useMemo } from "react"
 import { useAtomValue, Result } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
-import type { ListSessionsResult, SessionMetadata } from "@magnitudedev/sdk"
+import type { SessionMetadata } from "@magnitudedev/sdk"
 
 export interface UseSessionsListParams {
   /** Filter by CWD. If undefined, lists all sessions across all CWDs. */
@@ -52,22 +52,22 @@ export function useSessionsList(params?: UseSessionsListParams): UseSessionsList
 
   const loading = Result.isInitial(result)
   const sessions = Result.match(result, {
-    onInitial: () => [] as SessionMetadata[],
-    onFailure: () => [] as SessionMetadata[],
-    onSuccess: (s) => [...(s.value as ListSessionsResult).items],
+    onInitial: (): SessionMetadata[] => [],
+    onFailure: (): SessionMetadata[] => [],
+    onSuccess: (s) => [...s.value.items],
   })
   const nextCursor = Result.match(result, {
     onInitial: () => null,
     onFailure: () => null,
     onSuccess: (s) => {
-      const cursor = (s.value as ListSessionsResult).nextCursor
+      const cursor = s.value.nextCursor
       return cursor._tag === "Some" ? cursor.value : null
     },
   })
   const hasMore = Result.match(result, {
     onInitial: () => false,
     onFailure: () => false,
-    onSuccess: (s) => (s.value as ListSessionsResult).hasMore,
+    onSuccess: (s) => s.value.hasMore,
   })
 
   return { loading, sessions, nextCursor, hasMore }

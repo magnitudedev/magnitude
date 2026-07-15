@@ -10,7 +10,6 @@ import { Cause, Chunk, Effect, Option, Schedule, Stream } from "effect";
 import { SessionCommands } from "./session-commands";
 import { SessionLifecycle } from "./session-lifecycle";
 import { Account } from "./account";
-import { AgentRuntime } from "./agent-runtime";
 import { ActiveSessionStatusesService } from "./active-session-statuses";
 import { DisplayViewStreams } from "./display-view-streams";
 import { ACN_VERSION } from "./version";
@@ -31,26 +30,29 @@ import {
   watchFile,
 } from "./ops";
 import type { AppEvent } from "@magnitudedev/agent";
-import { LocalInferenceOnboarding } from "./local-inference";
+import { LocalInference } from "./local-inference";
+import { LocalModelConfiguration } from "./local-inference/model-configuration";
+import { Onboarding } from "./onboarding";
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
     const account = yield* Account;
-    const agentRuntime = yield* AgentRuntime;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
-    const localInference = yield* LocalInferenceOnboarding;
+    const localInference = yield* LocalInference;
+    const modelConfiguration = yield* LocalModelConfiguration;
+    const onboarding = yield* Onboarding;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
     // Observe programming defects without changing the Cause. Expected domain
     // failures stay typed, defects stay defects, and interruption is preserved.
-    const observeRpcDefects = <A, R>(
+    const observeRpcDefects = <A, E, R>(
       label: string,
-      eff: Effect.Effect<A, SessionError, R>
-    ): Effect.Effect<A, SessionError, R> =>
+      eff: Effect.Effect<A, E, R>
+    ): Effect.Effect<A, E, R> =>
       eff.pipe(
         Effect.tapErrorCause((cause) =>
           Chunk.isEmpty(Cause.defects(cause))
@@ -61,10 +63,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         )
       );
 
-    const observeRpcStreamDefects = <A, R>(
+    const observeRpcStreamDefects = <A, E, R>(
       label: string,
-      stream: Stream.Stream<A, SessionError, R>
-    ): Stream.Stream<A, SessionError, R> =>
+      stream: Stream.Stream<A, E, R>
+    ): Stream.Stream<A, E, R> =>
       stream.pipe(
         Stream.tapErrorCause((cause) =>
           Chunk.isEmpty(Cause.defects(cause))
@@ -88,7 +90,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         .pipe(Effect.flatMap((context) => run(context)));
     // Liveness heartbeats: every long-lived stream emits one at a fixed
     // cadence so clients can distinguish "daemon dead" from "no events".
-    // The SDK filters them out before events reach consumers. Halts when the
+    // Consumers filter them when they need only domain events. Halts when the
     // source stream halts; source errors propagate untouched.
     const heartbeatEvent: StreamHeartbeat = { _tag: "heartbeat" };
     const withHeartbeat = <A, E, R>(
@@ -290,18 +292,13 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       UpdateModelConfig: ({ slots }) =>
         observeRpcDefects(
           "UpdateModelConfig",
-          Effect.gen(function* () {
-            // 1. Write config to file (serialized via Account's internal semaphore)
-            yield* account.updateModelConfig(slots ?? {});
-            // 2. Refresh all live sessions
-            const entries = yield* agentRuntime.getAllEntries();
-            yield* Effect.forEach(
-              entries,
-              (entry) => entry.session.refreshConfig(),
-              { concurrency: "unbounded" }
-            );
-            return {};
-          })
+          modelConfiguration.updateSlots(slots ?? {}).pipe(
+            Effect.mapError((error) => new SessionOperationFailed({
+              operation: error.operation,
+              reason: error.reason,
+            })),
+            Effect.as({}),
+          )
         ),
 
       GetCachedModelList: (payload) =>
@@ -326,62 +323,66 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           })
         ),
 
-      // CLI local-inference onboarding
-      GetLocalInferenceOnboardingSnapshot: () =>
+      // Local inference capability
+      GetLocalInferenceState: () =>
         observeRpcDefects(
-          "GetLocalInferenceOnboardingSnapshot",
-          localInference.getSnapshot,
+          "GetLocalInferenceState",
+          localInference.state,
         ),
 
-      ConfigureLocalInferenceUsage: (usage) =>
+      ConfigureLocalInferenceUsage: (selection) =>
         observeRpcDefects(
           "ConfigureLocalInferenceUsage",
-          localInference.configureUsage(usage),
+          localInference.configureUsage(selection).pipe(Effect.as({})),
         ),
 
-      StartLocalModelDownload: ({ configurationId }) =>
+      InstallLocalInferenceDistribution: () =>
         observeRpcDefects(
-          "StartLocalModelDownload",
-          localInference.startDownload(configurationId),
+          "InstallLocalInferenceDistribution",
+          localInference.installDistribution.pipe(Effect.as({})),
         ),
 
-      GetLocalModelDownloadProgress: ({ operationId }) =>
+      DownloadLocalModel: ({ configurationId }) =>
         observeRpcDefects(
-          "GetLocalModelDownloadProgress",
-          localInference.getDownloadProgress(operationId),
-        ),
-
-      SubscribeLocalModelDownload: ({ operationId }) =>
-        observeRpcStreamDefects(
-          "SubscribeLocalModelDownload",
-          withHeartbeat(localInference.subscribeDownload(operationId)),
-        ),
-
-      CancelLocalModelDownload: ({ operationId }) =>
-        observeRpcDefects(
-          "CancelLocalModelDownload",
-          localInference.cancelDownload(operationId).pipe(Effect.as({})),
+          "DownloadLocalModel",
+          localInference.downloadModel(configurationId).pipe(Effect.as({})),
         ),
 
       ActivateLocalModel: ({ selectionId }) =>
         observeRpcDefects(
           "ActivateLocalModel",
-          Effect.gen(function* () {
-            const activated = yield* localInference.activate(selectionId);
-            const entries = yield* agentRuntime.getAllEntries();
-            yield* Effect.forEach(
-              entries,
-              (entry) => entry.session.refreshConfig(),
-              { concurrency: "unbounded" },
-            );
-            return activated;
-          }),
+          localInference.activateModel(selectionId).pipe(Effect.as({})),
         ),
 
-      CompleteCliModelSetupOnboarding: () =>
+      DeleteLocalModel: ({ selectionId }) =>
         observeRpcDefects(
-          "CompleteCliModelSetupOnboarding",
-          localInference.complete.pipe(Effect.as({})),
+          "DeleteLocalModel",
+          localInference.deleteModel(selectionId).pipe(Effect.as({})),
+        ),
+
+      RestartLocalInference: () =>
+        observeRpcDefects(
+          "RestartLocalInference",
+          localInference.restart.pipe(Effect.as({})),
+        ),
+
+      DisableLocalInference: () =>
+        observeRpcDefects(
+          "DisableLocalInference",
+          localInference.disable.pipe(Effect.as({})),
+        ),
+
+      // Generic onboarding completion, independent of local inference
+      GetOnboardingState: () =>
+        observeRpcDefects(
+          "GetOnboardingState",
+          onboarding.state,
+        ),
+
+      CompleteOnboardingFlow: ({ flowId }) =>
+        observeRpcDefects(
+          "CompleteOnboardingFlow",
+          onboarding.complete(flowId).pipe(Effect.as({})),
         ),
 
       // Server-side operations
@@ -443,8 +444,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           sessionCommands.getRuntimeExecutionContext(sessionId).pipe(
             Effect.flatMap((context) =>
               runBash(context, command, stdin).pipe(
-                Effect.tap((result) =>
-                  sessionCommands.sendUserEvent(sessionId, {
+                Effect.tap((result) => {
+                  const event: Extract<AppEvent, { type: "user_bash_command" }> = {
                     type: "user_bash_command",
                     forkId: null,
                     timestamp: Date.now(),
@@ -459,8 +460,9 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
                       result.stderr.length > 50_000
                         ? result.stderr.slice(0, 50_000) + "\n[truncated]"
                         : result.stderr,
-                  } as Extract<AppEvent, { type: "user_bash_command" }>)
-                )
+                  }
+                  return sessionCommands.sendUserEvent(sessionId, event)
+                })
               )
             )
           )
@@ -484,7 +486,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           "ResyncDisplayView",
           displayStreams.requestDisplayViewSnapshot(sessionId, viewId).pipe(
             Effect.tap(() => recordDisplayViewResync(sessionId, viewId)),
-            Effect.map(() => "ok" as const)
+            Effect.map((): "ok" => "ok")
           )
         ),
 

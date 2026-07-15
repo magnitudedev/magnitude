@@ -7,12 +7,13 @@
  * terminal layout. No feature logic, no rendering primitives beyond layout
  * boxes and the startup header slot.
  */
-import { useCallback, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { useCallback, useSyncExternalStore, type ReactNode } from 'react'
 import { TextAttributes } from '@opentui/core'
-import { Option } from 'effect'
+import { Cause, Option } from 'effect'
 import { useAtomValue, useAtomSet, useAtomInitialValues, Result } from '@effect-atom/atom-react'
 import {
-  useLocalInferenceSnapshot,
+  useOnboardingState,
+  useSlotProfiles,
   useDisplayViewController,
   useDisplayConnectionError,
   useSelectedSessionId,
@@ -48,10 +49,9 @@ import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/cont
 import { FileViewerPanelContainer } from './features/file-viewer/container'
 import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/sessions/container'
 import {
-  ModelSetupOnboardingScreen,
-  PreparingLocalInferenceScreen,
-  shouldShowLocalInferenceOnboarding,
-} from './features/local-inference-onboarding'
+  ModelSetupScreen,
+  PreparingModelSetupScreen,
+} from './features/model-setup'
 
 export type { SessionStart }
 
@@ -74,9 +74,23 @@ export function CliApp(props: CliAppProps): ReactNode {
 }
 
 function CliAppGates(props: CliAppProps): ReactNode {
-  const [forceSetup, setForceSetup] = useState(props.forceLocalInferenceSetup ?? false)
+  return (
+    <CliEnvironmentGate>
+      {(exitApp) => (
+        <OnboardingGate
+          {...props}
+          onExitApp={exitApp}
+          forceSetup={props.forceLocalInferenceSetup ?? false}
+        />
+      )}
+    </CliEnvironmentGate>
+  )
+}
+
+function CliEnvironmentGate({ children }: {
+  readonly children: (exitApp: () => void) => ReactNode
+}): ReactNode {
   const connectionError = useDisplayConnectionError()
-  const onboardingResult = useLocalInferenceSnapshot()
   const controller = useDisplayViewController()
   useTerminalBgDetection()
 
@@ -104,34 +118,60 @@ function CliAppGates(props: CliAppProps): ReactNode {
     )
   }
 
-  if (Result.isInitial(onboardingResult)) {
-    return <PreparingLocalInferenceScreen />
+  return children(exitApp)
+}
+
+function OnboardingGate(
+  props: CliAppProps & {
+    readonly onExitApp: () => void
+    readonly forceSetup: boolean
+  },
+): ReactNode {
+  const onboarding = useOnboardingState()
+  const { profiles, loading: profilesLoading } = useSlotProfiles()
+  const controller = useDisplayViewController()
+
+  if (Result.isInitial(onboarding.state)) {
+    return <PreparingModelSetupScreen />
   }
 
-  if (Result.isFailure(onboardingResult)) {
+  if (Result.isFailure(onboarding.state)) {
     return (
       <FatalErrorScreen
-        error="Failed to inspect local inference capabilities."
+        error="Failed to read onboarding state."
         onRetry={() => controller.retry()}
-        onQuit={exitApp}
+        onQuit={props.onExitApp}
       />
     )
   }
 
-  if (shouldShowLocalInferenceOnboarding(onboardingResult.value, forceSetup)) {
+  const onboardingRequired = onboarding.state.value.flows.model_setup.required
+  const forcedSetupComplete = props.forceSetup && Result.isSuccess(onboarding.completeResult)
+  if (onboardingRequired || (props.forceSetup && !forcedSetupComplete)) {
+    const completionError = Result.isFailure(onboarding.completeResult)
+      ? Cause.pretty(onboarding.completeResult.cause)
+      : null
     return (
-      <ModelSetupOnboardingScreen
-        snapshot={onboardingResult.value}
-        onExit={exitApp}
-        onComplete={() => setForceSetup(false)}
+      <ModelSetupScreen
+        mode="onboarding"
+        onExit={props.onExitApp}
+        onComplete={() => onboarding.complete("model_setup")}
+        completing={Result.isWaiting(onboarding.completeResult)}
+        completionError={completionError}
       />
     )
   }
+
+  if (profilesLoading) {
+    return <PreparingModelSetupScreen />
+  }
+
+  const modelsConfigured = Boolean(profiles?.primary && profiles.secondary)
 
   return (
     <CliAppContent
       {...props}
-      modelsConfigured={onboardingResult.value.configuration.usable}
+      modelsConfigured={modelsConfigured}
     />
   )
 }

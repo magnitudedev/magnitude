@@ -5,6 +5,7 @@
  * mutation dispatchers. Both apps use this identically.
  */
 import { useAtomSet } from "@effect-atom/atom-react"
+import { useMemo } from "react"
 import { useAgentClient } from "../state/agent-client-context"
 import { useSelectedSessionId } from "../display-view-controller/hooks"
 
@@ -18,7 +19,8 @@ export interface UseInterruptActionsResult {
 export function useInterruptActions(): UseInterruptActionsResult {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptMutation = useAtomSet(client.mutation("Interrupt"))
+  const interruptAtom = useMemo(() => client.mutation("Interrupt"), [client])
+  const interruptMutation = useAtomSet(interruptAtom)
 
   function interrupt(forkId?: string | null): void {
     if (!selectedSessionId) return

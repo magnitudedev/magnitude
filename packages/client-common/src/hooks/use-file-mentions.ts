@@ -1,4 +1,6 @@
 import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { Atom, useAtomMount } from '@effect-atom/atom-react'
+import { Data, Effect } from 'effect'
 import type { MentionCandidate } from '@magnitudedev/sdk'
 import type { SearchMentionsResult } from '@magnitudedev/sdk'
 import type { KeyEvent } from '../types/key-event'
@@ -20,6 +22,10 @@ export interface MentionSearchClient {
 
 const MAX_RESULTS = 40
 const MAX_VISIBLE_RESULTS = 10
+
+class MentionSearchError extends Data.TaggedError('MentionSearchError')<{
+  readonly cause: unknown
+}> {}
 
 export type MentionFileItem = {
   path: string
@@ -92,10 +98,9 @@ export interface UseFileMentionsParams {
 // ---------------------------------------------------------------------------
 // Mention search store — powers the async fetch via useSyncExternalStore.
 //
-// The store is created once per hook instance (useRef) and updated with the
-// latest search inputs every render. When the effective search key changes,
-// it cancels the in-flight fetch and starts a new one, then notifies
-// subscribers. useSyncExternalStore reads the snapshot synchronously.
+// The store is created once per hook instance and contains display snapshots
+// only. An Effect-owned mounted task performs each search and is interrupted
+// when its input atom is replaced or the component unmounts.
 // ---------------------------------------------------------------------------
 
 interface SearchSnapshot {
@@ -114,71 +119,9 @@ const EMPTY_SNAPSHOT: SearchSnapshot = {
   loading: false,
 }
 
-interface SearchInputs {
-  isOpen: boolean
-  client: MentionSearchClient | null
-  cwd: string | null
-  rawQuery: string
-}
-
 class MentionSearchStore {
   private snapshot: SearchSnapshot = EMPTY_SNAPSHOT
   private listeners = new Set<() => void>()
-  private cancelToken: { cancelled: boolean } | null = null
-  private lastKey = ''
-
-  /** Inputs for the current/last search — set every render. */
-  updateInputs(inputs: SearchInputs): void {
-    const key = `${inputs.isOpen ? 1 : 0}:${inputs.client ? 1 : 0}:${inputs.cwd ?? ''}:${inputs.rawQuery}`
-
-    if (key === this.lastKey) return
-    this.lastKey = key
-
-    // Cancel any in-flight fetch.
-    if (this.cancelToken) {
-      this.cancelToken.cancelled = true
-      this.cancelToken = null
-    }
-
-    if (!inputs.isOpen || !inputs.client || !inputs.cwd) {
-      // Closed or no client — reset to empty.
-      this.setSnapshot(EMPTY_SNAPSHOT)
-      return
-    }
-
-    // Start a new fetch.
-    const token: { cancelled: boolean } = { cancelled: false }
-    this.cancelToken = token
-
-    this.setSnapshot({ ...this.snapshot, loading: true })
-
-    inputs.client.searchMentions({
-      cwd: inputs.cwd,
-      query: inputs.rawQuery,
-      limit: MAX_RESULTS,
-      visibleLimit: MAX_VISIBLE_RESULTS,
-      includeRecent: true,
-    }).then((result) => {
-      if (token.cancelled) return
-      this.setSnapshot({
-        items: result.candidates.map(toMentionFileItem),
-        recentItems: result.recentCandidates.map(toMentionFileItem),
-        overflowCount: result.overflowCount,
-        resolvedLineRange: result.lineRange,
-        loading: false,
-      })
-    }).catch((error) => {
-      if (token.cancelled) return
-      console.error('[use-file-mentions] Failed to search mentions:', error)
-      this.setSnapshot({
-        items: [],
-        recentItems: [],
-        overflowCount: 0,
-        resolvedLineRange: undefined,
-        loading: false,
-      })
-    })
-  }
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -187,7 +130,7 @@ class MentionSearchStore {
 
   getSnapshot = (): SearchSnapshot => this.snapshot
 
-  private setSnapshot(next: SearchSnapshot): void {
+  setSnapshot(next: SearchSnapshot): void {
     this.snapshot = next
     for (const listener of this.listeners) listener()
   }
@@ -201,27 +144,15 @@ export function useFileMentions({
   onConfirm,
   onExpandDirectory,
 }: UseFileMentionsParams): FileMentionsState {
-  const [selectedIndex, setSelectedIndex] = useState(0)
-  const [dismissedQuery, setDismissedQuery] = useState<string | null>(null)
-  const justConfirmedRef = useRef(false)
+  const [selection, setSelection] = useState({ signature: '', index: 0 })
+  const [dismissedInput, setDismissedInput] = useState<string | null>(null)
 
   const queryResult = useMemo(() => detectQuery(inputText, cursorPosition), [inputText, cursorPosition])
   const query = queryResult?.filePath ?? ''
   const rawQuery = queryResult?.raw ?? ''
 
-  // --- dismissedQuery / justConfirmedRef reset (was useEffect #1) ---
-  //
-  // When the query changes away from the dismissed value, clear dismissedQuery.
-  // When there's no query at all, reset justConfirmedRef.
-  // Done in the render phase via ref-diff instead of useEffect.
-  if (queryResult?.filePath !== dismissedQuery && dismissedQuery !== null) {
-    setDismissedQuery(null)
-  }
-  if (queryResult === null && justConfirmedRef.current) {
-    justConfirmedRef.current = false
-  }
-
-  const isOpen = queryResult !== null && queryResult.filePath !== dismissedQuery && !justConfirmedRef.current
+  const inputIdentity = `${cursorPosition}:${inputText}`
+  const isOpen = queryResult !== null && dismissedInput !== inputIdentity
 
   // --- Async search (was useEffect #2) ---
   //
@@ -234,37 +165,56 @@ export function useFileMentions({
   }
   const store = storeRef.current
 
-  // Feed inputs every render — the store diffs internally and only
-  // re-fetches when the key actually changes.
-  store.updateInputs({ isOpen, client, cwd, rawQuery })
+  const searchAtom = useMemo(() => Atom.make(
+    !isOpen || !client || !cwd
+      ? Effect.sync(() => store.setSnapshot(EMPTY_SNAPSHOT))
+      : Effect.gen(function* () {
+          store.setSnapshot({ ...store.getSnapshot(), loading: true })
+          const result = yield* Effect.tryPromise({
+            try: () => client.searchMentions({
+              cwd,
+              query: rawQuery,
+              limit: MAX_RESULTS,
+              visibleLimit: MAX_VISIBLE_RESULTS,
+              includeRecent: true,
+            }),
+            catch: (cause) => new MentionSearchError({ cause }),
+          })
+          store.setSnapshot({
+            items: result.candidates.map(toMentionFileItem),
+            recentItems: result.recentCandidates.map(toMentionFileItem),
+            overflowCount: result.overflowCount,
+            resolvedLineRange: result.lineRange,
+            loading: false,
+          })
+        }).pipe(
+          Effect.catchAll((cause) => Effect.logWarning('Mention search failed').pipe(
+            Effect.annotateLogs({ cause: String(cause) }),
+            Effect.zipRight(Effect.sync(() => store.setSnapshot(EMPTY_SNAPSHOT))),
+          )),
+        ),
+  ), [client, cwd, isOpen, rawQuery, store])
+  useAtomMount(searchAtom)
 
   const { items, recentItems, overflowCount, resolvedLineRange, loading } =
     useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
 
-  // --- selectedIndex reset/clamp (was useEffect #3) ---
-  //
-  // Reset to 0 when the items signature changes, clamp when out of bounds.
-  // Render-phase ref-diff pattern.
-  const prevSignatureRef = useRef<string>('')
   const signature = `${rawQuery}::${items.map(i => i.path).join(',')}`
-  if (signature !== prevSignatureRef.current) {
-    prevSignatureRef.current = signature
-    if (selectedIndex !== 0) {
-      setSelectedIndex(0)
-    }
-  } else if (items.length > 0 && selectedIndex >= items.length) {
-    setSelectedIndex(items.length - 1)
-  } else if (items.length === 0 && selectedIndex !== 0) {
-    setSelectedIndex(0)
-  }
+  const maximumIndex = Math.max(0, items.length - 1)
+  const selectedIndex = selection.signature === signature
+    ? Math.min(maximumIndex, Math.max(0, selection.index))
+    : 0
+  const setSelectedIndex = useCallback((index: number) => {
+    setSelection({ signature, index: Math.min(maximumIndex, Math.max(0, index)) })
+  }, [maximumIndex, signature])
 
   const moveUp = useCallback(() => {
-    setSelectedIndex(prev => Math.max(0, prev - 1))
-  }, [])
+    setSelectedIndex(selectedIndex - 1)
+  }, [selectedIndex, setSelectedIndex])
 
   const moveDown = useCallback(() => {
-    setSelectedIndex(prev => Math.min(Math.max(0, items.length - 1), prev + 1))
-  }, [items.length])
+    setSelectedIndex(selectedIndex + 1)
+  }, [selectedIndex, setSelectedIndex])
 
   const select = useCallback((): MentionFileItem | null => {
     return items[selectedIndex] ?? null
@@ -272,14 +222,13 @@ export function useFileMentions({
 
   const close = useCallback(() => {
     setSelectedIndex(0)
-    setDismissedQuery(query ?? null)
-  }, [query])
+    setDismissedInput(inputIdentity)
+  }, [inputIdentity, setSelectedIndex])
 
   const confirmSelection = useCallback((item: MentionFileItem) => {
-    justConfirmedRef.current = true
-    setDismissedQuery(query ?? null)
+    setDismissedInput(inputIdentity)
     if (onConfirm) onConfirm(item)
-  }, [onConfirm, query])
+  }, [inputIdentity, onConfirm])
 
   const handleKeyIntercept = useCallback((key: KeyEvent): boolean => {
     if (!isOpen) return false

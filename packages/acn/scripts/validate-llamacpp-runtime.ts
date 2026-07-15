@@ -1,51 +1,53 @@
-interface RawModel {
-  readonly id?: unknown
-  readonly meta?: {
-    readonly n_ctx?: unknown
-    readonly n_ctx_train?: unknown
-    readonly n_params?: unknown
-    readonly size?: unknown
-    readonly ftype?: unknown
-  }
-}
+import { Schema } from "effect"
 
-interface ModelList {
-  readonly data?: readonly RawModel[]
-}
+const RawModelSchema = Schema.Struct({
+  id: Schema.optional(Schema.Unknown),
+  meta: Schema.optional(Schema.Struct({
+    n_ctx: Schema.optional(Schema.Unknown),
+    n_ctx_train: Schema.optional(Schema.Unknown),
+    n_params: Schema.optional(Schema.Unknown),
+    size: Schema.optional(Schema.Unknown),
+    ftype: Schema.optional(Schema.Unknown),
+  })),
+})
 
-interface ServerProps {
-  readonly model_alias?: unknown
-  readonly model_ftype?: unknown
-  readonly model_path?: unknown
-  readonly build_info?: unknown
-  readonly default_generation_settings?: {
-    readonly n_ctx?: unknown
-  }
-  readonly chat_template_caps?: {
-    readonly supports_tool_calls?: unknown
-    readonly supports_tools?: unknown
-  }
-}
+const ModelListSchema = Schema.Struct({
+  data: Schema.optional(Schema.Array(RawModelSchema)),
+})
 
-interface ChatCompletion {
-  readonly choices?: readonly {
-    readonly finish_reason?: unknown
-    readonly message?: {
-      readonly content?: unknown
-      readonly reasoning_content?: unknown
-      readonly tool_calls?: readonly {
-        readonly function?: {
-          readonly name?: unknown
-          readonly arguments?: unknown
-        }
-      }[]
-    }
-  }[]
-  readonly timings?: {
-    readonly prompt_per_second?: unknown
-    readonly predicted_per_second?: unknown
-  }
-}
+const ServerPropsSchema = Schema.Struct({
+  model_alias: Schema.optional(Schema.Unknown),
+  model_ftype: Schema.optional(Schema.Unknown),
+  model_path: Schema.optional(Schema.Unknown),
+  build_info: Schema.optional(Schema.Unknown),
+  default_generation_settings: Schema.optional(Schema.Struct({
+    n_ctx: Schema.optional(Schema.Unknown),
+  })),
+  chat_template_caps: Schema.optional(Schema.Struct({
+    supports_tool_calls: Schema.optional(Schema.Unknown),
+    supports_tools: Schema.optional(Schema.Unknown),
+  })),
+})
+
+const ChatCompletionSchema = Schema.Struct({
+  choices: Schema.optional(Schema.Array(Schema.Struct({
+    finish_reason: Schema.optional(Schema.Unknown),
+    message: Schema.optional(Schema.Struct({
+      content: Schema.optional(Schema.Unknown),
+      reasoning_content: Schema.optional(Schema.Unknown),
+      tool_calls: Schema.optional(Schema.Array(Schema.Struct({
+        function: Schema.optional(Schema.Struct({
+          name: Schema.optional(Schema.Unknown),
+          arguments: Schema.optional(Schema.Unknown),
+        })),
+      }))),
+    })),
+  }))),
+  timings: Schema.optional(Schema.Struct({
+    prompt_per_second: Schema.optional(Schema.Unknown),
+    predicted_per_second: Schema.optional(Schema.Unknown),
+  })),
+})
 
 const endpointArgument = process.argv.find((argument) => argument.startsWith("--endpoint="))
 const endpoint = (endpointArgument?.slice("--endpoint=".length)
@@ -60,10 +62,11 @@ const headers = (json = false): Headers => {
   return result
 }
 
-const requestJson = async <T>(
+const requestJson = async <A, I>(
   path: string,
+  schema: Schema.Schema<A, I>,
   init?: RequestInit,
-): Promise<{ readonly body: T; readonly elapsedMs: number }> => {
+): Promise<{ readonly body: A; readonly elapsedMs: number }> => {
   const started = performance.now()
   const response = await fetch(`${endpoint}${path}`, {
     ...init,
@@ -75,7 +78,7 @@ const requestJson = async <T>(
   }
   try {
     return {
-      body: JSON.parse(text) as T,
+      body: Schema.decodeUnknownSync(schema)(JSON.parse(text)),
       elapsedMs: Math.round(performance.now() - started),
     }
   } catch {
@@ -91,7 +94,7 @@ const requireString = (value: unknown, description: string): string => {
 }
 
 const chat = async (model: string, body: Record<string, unknown>) =>
-  requestJson<ChatCompletion>("/v1/chat/completions", {
+  requestJson("/v1/chat/completions", ChatCompletionSchema, {
     method: "POST",
     headers: headers(true),
     body: JSON.stringify({
@@ -102,12 +105,14 @@ const chat = async (model: string, body: Record<string, unknown>) =>
     }),
   })
 
-const health = await requestJson<{ readonly status?: unknown }>("/health", { headers: headers() })
+const health = await requestJson("/health", Schema.Struct({
+  status: Schema.optional(Schema.Unknown),
+}), { headers: headers() })
 if (health.body.status !== "ok") throw new Error(`llama.cpp health is ${String(health.body.status)}`)
 
 const [{ body: models }, { body: props }] = await Promise.all([
-  requestJson<ModelList>("/v1/models", { headers: headers() }),
-  requestJson<ServerProps>("/props", { headers: headers() }),
+  requestJson("/v1/models", ModelListSchema, { headers: headers() }),
+  requestJson("/props", ServerPropsSchema, { headers: headers() }),
 ])
 if (!Array.isArray(models.data) || models.data.length === 0) {
   throw new Error("llama.cpp returned no loaded models from /v1/models")
@@ -150,19 +155,13 @@ for (const rawModel of models.data) {
   if (toolChoice?.finish_reason !== "tool_calls" || toolCall?.name !== "add_numbers") {
     throw new Error(`${model}: required tool call was not returned (finish_reason=${String(toolChoice?.finish_reason)})`)
   }
-  let toolArguments: unknown
   try {
-    toolArguments = JSON.parse(requireString(toolCall.arguments, "tool arguments"))
+    Schema.decodeUnknownSync(Schema.Struct({
+      a: Schema.Literal(2),
+      b: Schema.Literal(3),
+    }))(JSON.parse(requireString(toolCall.arguments, "tool arguments")))
   } catch (cause) {
-    throw new Error(`${model}: tool arguments were not valid JSON`, { cause })
-  }
-  if (
-    typeof toolArguments !== "object"
-    || toolArguments === null
-    || (toolArguments as Record<string, unknown>).a !== 2
-    || (toolArguments as Record<string, unknown>).b !== 3
-  ) {
-    throw new Error(`${model}: tool arguments were not {"a":2,"b":3}`)
+    throw new Error(`${model}: tool arguments were not {"a":2,"b":3}`, { cause })
   }
 
   results.push({
@@ -185,8 +184,7 @@ for (const rawModel of models.data) {
   })
 }
 
-// TODO(llamacpp-lifecycle-integration): The CTO-owned lifecycle layer should
-// load each selected catalog artifact on its target backend and invoke this
-// endpoint validator. This script intentionally does not start, stop, or
-// replace servers, so validation cannot race the daemon's server manager.
+// This manual validator observes an already active endpoint and is deliberately
+// read-only. Managed process lifecycle and activation identity are covered by
+// the LlamaCppRuntime integration tests, which own their scoped test processes.
 console.log(JSON.stringify({ endpoint, models: results }, null, 2))

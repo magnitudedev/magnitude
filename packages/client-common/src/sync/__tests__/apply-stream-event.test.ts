@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { Effect, Option, Schema } from 'effect'
 import {
   DisplayStateSchema,
+  DisplayTimelineSchema,
   StreamEventSchema,
   type DisplayMessage,
   type DisplayState,
@@ -9,7 +10,6 @@ import {
   type DisplayViewShape,
   type StreamEvent,
 } from '@magnitudedev/sdk'
-import { DisplayTimeline as DisplayTimelineSchema } from '@magnitudedev/protocol'
 import { applyStreamEvent } from '../apply-stream-event'
 import { appendMessageToTimeline, createDisplayViewStore } from '../display-view-store'
 

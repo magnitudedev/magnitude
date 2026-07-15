@@ -36,9 +36,7 @@ export function makeConfigStorage(): Effect.Effect<
         );
         if (result._tag === "Missing") return DEFAULT_CONFIG;
         if (result._tag === "Invalid") {
-          return yield* Effect.fail(
-            new SchemaDecodeError({ path: g.configFile, message: result.error.reason })
-          );
+          return yield* new SchemaDecodeError({ path: g.configFile, message: result.error.reason });
         }
         return result.value;
       });
@@ -89,15 +87,17 @@ export function makeConfigStorage(): Effect.Effect<
             // Merge provided slots into existing; drop slots with no overrides.
             const existingSlots = current.models?.slots ?? {};
             const merged = { ...existingSlots };
-            for (const [slotId, slotConfig] of Object.entries(slots)) {
+            for (const slotId of ["primary", "secondary"] as const) {
+              const slotConfig = slots[slotId];
+              if (!slotConfig) continue;
               if (
                 slotConfig.providerId ||
                 slotConfig.providerModelId ||
                 slotConfig.reasoningEffort
               ) {
-                merged[slotId as keyof typeof merged] = slotConfig;
+                merged[slotId] = slotConfig;
               } else {
-                delete merged[slotId as keyof typeof merged];
+                delete merged[slotId];
               }
             }
             yield* io.writeJsonFile(g.configFile, {
@@ -116,19 +116,7 @@ export function makeConfigStorage(): Effect.Effect<
       getLocalInferenceConfig: () =>
         readConfig().pipe(Effect.map((config) => config.localInference ?? null)),
 
-      setLocalInferenceConfig: (localInference) =>
-        io.withPathLock(
-          g.configFile,
-          Effect.gen(function* () {
-            const current = yield* readConfig();
-            yield* io.writeJsonFile(g.configFile, {
-              ...current,
-              localInference,
-            });
-          })
-        ),
-
-      completeCliModelSetupOnboarding: (completedAt) =>
+      completeOnboardingFlow: (flowId, version, completedAt) =>
         io.withPathLock(
           g.configFile,
           Effect.gen(function* () {
@@ -137,7 +125,10 @@ export function makeConfigStorage(): Effect.Effect<
               ...current,
               onboarding: {
                 ...current.onboarding,
-                completedAt,
+                completions: {
+                  ...current.onboarding?.completions,
+                  [flowId]: { version, completedAt },
+                },
               },
             });
           })

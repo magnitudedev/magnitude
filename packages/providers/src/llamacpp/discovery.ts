@@ -1,6 +1,6 @@
-import { Data, Effect } from "effect"
+import { Data, Effect, Option, Secret } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
-import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
+import { makeLlamaCppEndpointClient, type LlamaCppConnection } from "@magnitudedev/llamacpp/client"
 import type {
   LlamaCppRawModel,
   ServerProps,
@@ -21,67 +21,15 @@ export class LlamaCppDiscoveryError extends Data.TaggedError("LlamaCppDiscoveryE
   readonly cause?: unknown
 }> {}
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function stringArray(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  const strings = value.filter((entry): entry is string => typeof entry === "string")
-  return strings.length > 0 ? strings : undefined
-}
-
-function parseRawModel(value: unknown): LlamaCppRawModel | null {
-  if (!isRecord(value) || typeof value.id !== "string" || !value.id.trim()) return null
-
-  const status = isRecord(value.status) ? value.status : null
-  const architecture = isRecord(value.architecture) ? value.architecture : null
-  const aliases = stringArray(value.aliases)
-  const tags = stringArray(value.tags)
-  const statusArgs = stringArray(status?.args)
-  const inputModalities = stringArray(architecture?.input_modalities)
-  const outputModalities = stringArray(architecture?.output_modalities)
-  return {
-    id: value.id,
-    object: typeof value.object === "string" ? value.object : "model",
-    ...(typeof value.path === "string" ? { path: value.path } : {}),
-    ...(aliases ? { aliases } : {}),
-    ...(tags ? { tags } : {}),
-    ...(typeof value.created === "number" ? { created: value.created } : {}),
-    ...(typeof value.owned_by === "string" ? { owned_by: value.owned_by } : {}),
-    ...(value.meta === null
-      ? { meta: null }
-      : isRecord(value.meta)
-        ? { meta: value.meta }
-        : {}),
-    ...(status
-      ? {
-          status: {
-            ...(typeof status.value === "string" ? { value: status.value } : {}),
-            ...(statusArgs ? { args: statusArgs } : {}),
-          },
-        }
-      : {}),
-    ...(architecture
-      ? {
-          architecture: {
-            ...(inputModalities ? { input_modalities: inputModalities } : {}),
-            ...(outputModalities ? { output_modalities: outputModalities } : {}),
-          },
-        }
-      : {}),
-  }
-}
-
-function headersFromAuth(auth?: (headers: Headers) => void): Record<string, string> {
+function connectionFor(config: LlamaCppDiscoveryConfig): LlamaCppConnection {
   const headers = new Headers()
-  auth?.(headers)
-
-  const headerRecord: Record<string, string> = {}
-  headers.forEach((value, key) => {
-    headerRecord[key] = value
-  })
-  return headerRecord
+  config.auth?.(headers)
+  const authorization = headers.get("authorization")
+  const token = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]
+  return {
+    baseUrl: config.endpoint,
+    apiKey: token ? Option.some(Secret.fromString(token)) : Option.none(),
+  }
 }
 
 export function checkServerHealth(
@@ -90,39 +38,19 @@ export function checkServerHealth(
 ): Effect.Effect<ServerStatus, never, HttpClient.HttpClient> {
   const timeoutMs = options?.timeoutMs ?? 2_000
 
-  return Effect.gen(function* () {
-    const client = yield* HttpClient.HttpClient
-    const request = HttpClientRequest.get(`${endpoint}/health`)
-    const response = yield* client.execute(request).pipe(
-      Effect.timeout(`${timeoutMs} millis`),
-      Effect.catchAll(() => Effect.succeed(null)),
-    )
-
-    if (response === null) {
-      return { status: "not_found", endpoint }
-    }
-    if (response.status === 503) {
-      return { status: "loading", endpoint }
-    }
-    if (response.status === 200) {
-      const body = yield* response.json.pipe(Effect.orElseSucceed(() => null))
-      if (isRecord(body) && body.status === "ok") {
-        return { status: "ready", endpoint }
+  return makeLlamaCppEndpointClient({ baseUrl: endpoint, apiKey: Option.none() }).health.pipe(
+    Effect.timeout(`${timeoutMs} millis`),
+    Effect.orElseSucceed(() => ({ _tag: "Unavailable", message: "Connection timed out" } as const)),
+    Effect.map((health): ServerStatus => {
+      switch (health._tag) {
+        case "Ready": return { status: "ready", endpoint }
+        case "Loading": return { status: "loading", endpoint }
+        case "Unavailable": return health.message.startsWith("HTTP ")
+          ? { status: "error", endpoint, message: health.message }
+          : { status: "not_found", endpoint }
       }
-      return {
-        status: "error",
-        endpoint,
-        message: "llama-server returned an invalid health response",
-      }
-    }
-
-    const body = yield* response.text.pipe(Effect.orElseSucceed(() => ""))
-    return {
-      status: "error",
-      endpoint,
-      message: body.trim() || `llama-server returned HTTP ${response.status}`,
-    }
-  })
+    }),
+  )
 }
 
 /**
@@ -132,54 +60,10 @@ export function checkServerHealth(
 export function fetchModelList(
   config: LlamaCppDiscoveryConfig,
 ): Effect.Effect<readonly LlamaCppRawModel[], LlamaCppDiscoveryError, HttpClient.HttpClient> {
-  return Effect.gen(function* () {
-    const client = yield* HttpClient.HttpClient
-
-    const request = HttpClientRequest.get(`${config.endpoint}/v1/models`).pipe(
-      HttpClientRequest.setHeaders(headersFromAuth(config.auth)),
-    )
-
-    const response = yield* client
-      .execute(request)
-      .pipe(
-        Effect.mapError((cause) =>
-          new LlamaCppDiscoveryError({
-            message: `Failed to connect to Llama.cpp server at ${config.endpoint}`,
-            cause,
-          }),
-        ),
-      )
-
-    if (response.status < 200 || response.status >= 300) {
-      const body = yield* response.text.pipe(Effect.orElseSucceed(() => ""))
-      return yield* new LlamaCppDiscoveryError({
-        message: `Llama.cpp server returned HTTP ${response.status}: ${body}`,
-      })
-    }
-
-    const body = yield* response.json.pipe(
-      Effect.mapError((cause) => new LlamaCppDiscoveryError({
-        message: "Failed to read model list response",
-        cause,
-      })),
-    )
-
-    if (!isRecord(body) || !Array.isArray(body.data)) {
-      return yield* new LlamaCppDiscoveryError({
-        message: "Llama.cpp model list response did not contain a data array",
-      })
-    }
-
-    const models = body.data
-      .map(parseRawModel)
-      .filter((model): model is LlamaCppRawModel => model !== null)
-    if (body.data.length > 0 && models.length === 0) {
-      return yield* new LlamaCppDiscoveryError({
-        message: "Llama.cpp model list response contained no valid model entries",
-      })
-    }
-    return models
-  })
+  return makeLlamaCppEndpointClient(connectionFor(config)).models.pipe(
+    Effect.map((models): readonly LlamaCppRawModel[] => models),
+    Effect.mapError((cause) => new LlamaCppDiscoveryError({ message: cause.reason, cause })),
+  )
 }
 
 /**
@@ -189,49 +73,26 @@ export function fetchModelList(
 export function fetchServerProps(
   config: LlamaCppDiscoveryConfig,
 ): Effect.Effect<ServerProps | null, never, HttpClient.HttpClient> {
-  return Effect.gen(function* () {
-    const client = yield* HttpClient.HttpClient
-    const headers = headersFromAuth(config.auth)
-    const fetchPropsAt = (path: string) =>
-      client.execute(
-        HttpClientRequest.get(`${config.endpoint}${path}`).pipe(
-          HttpClientRequest.setHeaders(headers),
-        ),
-      ).pipe(Effect.catchAll(() => Effect.succeed(null)))
-
-    const primary = yield* fetchPropsAt("/props")
-    const response = primary && primary.status >= 200 && primary.status < 300
-      ? primary
-      : yield* fetchPropsAt("/v1/props")
-
-    if (response === null || response.status < 200 || response.status >= 300) return null
-
-    const body = yield* response.json.pipe(Effect.orElseSucceed(() => null))
-    if (!isRecord(body)) return null
-
-    const generationSettings = isRecord(body.default_generation_settings)
-      ? body.default_generation_settings
-      : null
-    const modalities = isRecord(body.modalities) ? body.modalities : null
-
-    return {
-      ...(typeof generationSettings?.n_ctx === "number"
-        ? { nCtx: generationSettings.n_ctx }
+  return makeLlamaCppEndpointClient(connectionFor(config)).props.pipe(
+    Effect.map((props): ServerProps => ({
+      ...(props.default_generation_settings?.n_ctx !== undefined
+        ? { nCtx: props.default_generation_settings.n_ctx }
         : {}),
-      ...(typeof body.model_alias === "string" ? { modelAlias: body.model_alias } : {}),
-      ...(typeof body.model_ftype === "string" ? { modelFtype: body.model_ftype } : {}),
-      ...(typeof body.model_path === "string" ? { modelPath: body.model_path } : {}),
-      ...(typeof body.chat_template === "string" ? { chatTemplate: body.chat_template } : {}),
-      ...(modalities
+      ...(props.model_alias !== undefined ? { modelAlias: props.model_alias } : {}),
+      ...(props.model_ftype !== undefined ? { modelFtype: props.model_ftype } : {}),
+      ...(props.model_path !== undefined ? { modelPath: props.model_path } : {}),
+      ...(props.chat_template !== undefined ? { chatTemplate: props.chat_template } : {}),
+      ...(props.modalities
         ? {
             modalities: {
-              ...(typeof modalities.vision === "boolean" ? { vision: modalities.vision } : {}),
-              ...(typeof modalities.audio === "boolean" ? { audio: modalities.audio } : {}),
+              ...(props.modalities.vision === undefined ? {} : { vision: props.modalities.vision }),
+              ...(props.modalities.audio === undefined ? {} : { audio: props.modalities.audio }),
             },
           }
         : {}),
-    }
-  })
+    })),
+    Effect.orElseSucceed(() => null),
+  )
 }
 
 const MODEL_ARTIFACT_EXTENSION = /\.(?:gguf|ggml|bin)$/i
@@ -293,7 +154,8 @@ function modelPathFromArgs(args: readonly string[] | undefined): string | undefi
   if (!args) return undefined
 
   for (let index = 0; index < args.length; index++) {
-    const arg = args[index]!
+    const arg = args[index]
+    if (arg === undefined) continue
     if (arg === "-m" || arg === "--model") {
       const value = args[index + 1]?.trim()
       if (value && GGUF_PATH.test(value)) return value

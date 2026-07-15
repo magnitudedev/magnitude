@@ -11,11 +11,19 @@ const MAX_TOOL_CALLS = 10
 
 const LEADER_TRAITS = ['ATTENTIVE', 'STRATEGIC', 'PROACTIVE', 'RESPECTFUL', 'GROUNDED', 'INTROSPECTIVE', 'TASK'] as const
 
+/**
+ * Resolves models against the current event-engine configuration ambient.
+ * The ambient is intentionally required at invocation time because it changes
+ * during a live session and is supplied by the event engine, not this layer.
+ *
+ * @effect-expect-leaking AmbientService
+ */
 export interface AgentModelResolverService {
   readonly resolvePrimary: (roleId: RoleId, agentId?: string) => Effect.Effect<AgentBoundModel, never, AmbientService>
   readonly resolveSecondary: (agentId?: string) => Effect.Effect<AgentBoundModel, never, AmbientService>
 }
 
+/** @effect-expect-leaking AmbientService */
 export class AgentModelResolver extends Context.Tag('AgentModelResolver')<
   AgentModelResolver,
   AgentModelResolverService

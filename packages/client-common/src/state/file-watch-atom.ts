@@ -12,16 +12,14 @@
  * No manual fiber management.
  */
 import { useMemo } from "react"
-import { Atom, useAtomMount, useAtomValue } from "@effect-atom/atom-react"
+import { useAtomMount, useAtomValue } from "@effect-atom/atom-react"
 import { Effect, Stream, Cause } from "effect"
-import { RpcClient } from "@effect/rpc"
 import * as Reactivity from "@effect/experimental/Reactivity"
 import {
-  MagnitudeRpcs,
   type WatchFileWireEvent,
   type WatchFileEvent,
 } from "@magnitudedev/sdk"
-import { usePlatform } from "../platform/platform-context"
+import { useAgentClient } from "./agent-client-context"
 import { selectedCwdAtom, selectedFilePathAtom } from "./session-atoms"
 
 const isFileEvent = (event: WatchFileWireEvent): event is WatchFileEvent =>
@@ -32,25 +30,24 @@ const isFileEvent = (event: WatchFileWireEvent): event is WatchFileEvent =>
  * reactivity key on each event. Mount this once at the app root.
  */
 export function useFileWatchBridge(): void {
-  const platform = usePlatform()
+  const client = useAgentClient()
   const selectedCwd = useAtomValue(selectedCwdAtom)
   const filePath = useAtomValue(selectedFilePathAtom)
 
   const watchAtom = useMemo(
     () =>
-      Atom.make(
+      client.runtime.atom(
         Effect.gen(function* () {
           if (!selectedCwd || !filePath) return
 
-          const client = yield* RpcClient.make(MagnitudeRpcs)
+          const rpc = yield* client
 
-          yield* client.WatchFile({ cwd: selectedCwd, path: filePath }).pipe(
+          yield* rpc("WatchFile", { cwd: selectedCwd, path: filePath }).pipe(
             Stream.filter(isFileEvent),
             Stream.tap(() => Reactivity.invalidate(["files"])),
             Stream.runDrain,
           )
         }).pipe(
-          Effect.provide(platform.protocolLayer),
           Effect.catchAllCause((cause) =>
             Cause.isInterruptedOnly(cause)
               ? Effect.void
@@ -58,7 +55,7 @@ export function useFileWatchBridge(): void {
           ),
         ),
       ),
-    [platform.protocolLayer, selectedCwd, filePath],
+    [client, selectedCwd, filePath],
   )
 
   useAtomMount(watchAtom)

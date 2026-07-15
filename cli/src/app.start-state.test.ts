@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, test } from 'vitest'
 import { hasConversationActivity } from './utils/start-state'
 
 test('hasConversationActivity is true when there are display messages', () => {

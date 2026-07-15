@@ -1,170 +1,78 @@
-// ── Errors ──
-export * as LlamaCppErrors from "./errors"
-export {
-  LlamaCppBinaryNotFound,
-  LlamaCppBinaryVersionTooOld,
-  LlamaCppBinaryDownloadFailed,
-  LlamaCppBinaryValidationFailed,
-  LlamaCppUnsupportedPlatform,
-  LlamaCppHardwareError,
-  LlamaCppModelNotFound,
-  LlamaCppModelDownloadFailed,
-  LlamaCppGatedModelAccessDenied,
-  LlamaCppHfTokenMissing,
-  LlamaCppServerStartFailed,
-  LlamaCppServerTimeout,
-  LlamaCppServerOutOfMemory,
-  LlamaCppEndpointError,
-  LlamaCppPortUnavailable,
-  LlamaCppDetectionFailed,
-} from "./errors"
+import { Layer } from "effect"
+import type * as CommandExecutor from "@effect/platform/CommandExecutor"
+import type * as FileSystem from "@effect/platform/FileSystem"
+import type * as HttpClient from "@effect/platform/HttpClient"
+import type * as Path from "@effect/platform/Path"
+import type {
+  LlamaCppDistributionConfig,
+  LlamaCppModelStoreConfig,
+  LlamaCppRuntimeConfig,
+} from "./contracts"
+import { LlamaCppDistributionLive } from "./distribution"
+import { LlamaCppHostLive } from "./host"
+import { LlamaCppModelStoreLive } from "./model-store"
+import { LlamaCppRuntimeLive } from "./runtime"
 
-// ── Version ──
+export {
+  LlamaCppDistribution,
+  LlamaCppDistributionLive,
+  type LlamaCppDistributionApi,
+} from "./distribution"
+export {
+  LlamaCppHost,
+  LlamaCppHostLive,
+  type LlamaCppHostApi,
+} from "./host"
+export {
+  LlamaCppModelStore,
+  LlamaCppModelStoreLive,
+  type LlamaCppModelStoreApi,
+} from "./model-store"
+export {
+  LlamaCppRuntime,
+  LlamaCppRuntimeLive,
+  type LlamaCppRuntimeApi,
+} from "./runtime"
+export * from "./contracts"
+export {
+  DistributionInspectionError,
+  DistributionInstallError,
+  LlamaCppHostError,
+  LlamaCppModelStoreError,
+  LlamaCppRuntimeError,
+  LlamaCppEndpointClientError,
+} from "./errors"
+export { DEFAULT_LLAMACPP_RELEASE } from "./release-manifest"
 export {
   MINIMUM_LLMACPP_VERSION,
   RECOMMENDED_LLMACPP_VERSION,
   meetsMinimum,
   parseVersionNumber,
-  buildNumberToTag,
-  tagToBuildNumber,
 } from "./version"
 
-// ── Paths ──
-export {
-  llamacppDataDir,
-  cachedBinaryDir,
-  cachedBinaryPath,
-  versionMarkerPath,
-  downloadTmpDir,
-  presetDir,
-} from "./paths"
+export interface LlamaCppConfig {
+  readonly distribution: LlamaCppDistributionConfig
+  readonly modelStore: LlamaCppModelStoreConfig
+  readonly runtime: LlamaCppRuntimeConfig
+}
 
-// ── Platform ──
-export {
-  detectPlatform,
-  realArch,
-  assetName,
-  downloadUrl,
-  GpuPreference,
-  PlatformAsset,
-  PlatformInfo,
-} from "./platform"
+type LlamaCppPlatform =
+  | FileSystem.FileSystem
+  | Path.Path
+  | CommandExecutor.CommandExecutor
+  | HttpClient.HttpClient
 
-// ── Binary ──
-export {
-  LlamaCppBinary,
-  makeLlamaCppBinary,
-  type LlamaCppBinaryApi,
-  type LlamaCppBinaryDeps,
-} from "./binary/resolve"
-
-export { validateBinary } from "./binary/validate"
-export { downloadBinary } from "./binary/download"
-export { BinarySource, ResolvedBinary, BinaryStatus, DownloadResult } from "./binary/types"
-
-// ── Hardware ──
-export {
-  LlamaCppHardware,
-  makeLlamaCppHardware,
-  type LlamaCppHardwareApi,
-} from "./hardware/detect"
-
-export {
-  computeLimits,
-  categorizeFit,
-  assessHeuristic,
-  assessWithFitPrint,
-  parseFitPrintOutput,
-} from "./hardware/fit"
-
-export { parseListDevicesOutput } from "./hardware/detect"
-
-export { getCpuInfo, getMemoryInfo } from "./hardware/os-info"
-
-export {
-  ModelFitCategory,
-  GpuDevice,
-  CpuInfo,
-  MemoryInfo,
-  HardwareInfo,
-  DevicePlacement,
-  ModelFitAssessment,
-  AssessModelFitParams,
-} from "./hardware/types"
-
-// ── Model Store ──
-export {
-  LlamaCppModelStore,
-  makeLlamaCppModelStore,
-  type LlamaCppModelStoreApi,
-  type LlamaCppModelStoreDeps,
-} from "./models/store"
-
-export { scanHfCache, parseRepoFolder, hfCacheDir } from "./models/hf-cache"
-export { scanDirectory } from "./models/scan"
-export { readGgufMetadata } from "./models/gguf"
-export { groupShards } from "./models/shard"
-export { pairMmproj } from "./models/mmproj"
-export { resolveHfToken } from "./models/hf-token"
-export { makeDownloadRegistry, type DownloadRegistry } from "./models/download-registry"
-export {
-  listRepoGgufFiles,
-  downloadModelStream,
-  cancelModelDownload,
-  hfCachePathForFile,
-  incompletePath,
-} from "./models/download"
-
-export {
-  LocalModelInfo,
-  LocalModelSource,
-  ExpandedGgufMetadata,
-  ShardGroup,
-  DownloadModelParams,
-  DownloadModelResult,
-  DownloadProgress,
-  DownloadStatus,
-  DownloadState,
-  RepoGgufFile,
-  DiscoverOptions,
-  DownloadEvent,
-} from "./models/types"
-
-// ── Inference ──
-export {
-  LlamaCppInference,
-  makeLlamaCppInference,
-  type LlamaCppInferenceApi,
-  type LlamaCppInferenceDeps,
-} from "./inference/inference"
-
-export {
-  LlamaCppInstances,
-  makeLlamaCppInstances,
-  type LlamaCppInstancesApi,
-  type LlamaCppInstancesDeps,
-} from "./inference/instances"
-
-export {
-  ServerMode,
-  InstanceHealth,
-  InstanceCapabilities,
-  InstanceModelStatus,
-  InstanceModelRef,
-  InstanceInfo,
-  InstanceOptions,
-  ModelAvailability,
-  LoadType,
-  LoadedModel,
-  AvailableModel,
-  EnsureModelOptions,
-  PresetDefaults,
-  DetectedServer,
-} from "./inference/types"
-
-export { fingerprintServer } from "./inference/fingerprint"
-export { findFreePort } from "./inference/ports"
-export { generatePreset, writePreset } from "./inference/router"
-export { waitForReady, detectOom, parseListeningPort, OOM_PATTERNS } from "./inference/health"
-export { LlamaCppDetector, makeLlamaCppDetector, type LlamaCppDetectorApi } from "./inference/detector"
-export { LlamaCppServer, makeLlamaCppServer, type LlamaCppServerApi, type ServerHandle } from "./inference/server"
+export const LlamaCppLive = (config: LlamaCppConfig) => {
+  const distribution = LlamaCppDistributionLive(config.distribution)
+  const modelStore = LlamaCppModelStoreLive(config.modelStore)
+  const base = Layer.merge(distribution, modelStore)
+  const withHost = Layer.provideMerge(LlamaCppHostLive, base)
+  return Layer.provideMerge(LlamaCppRuntimeLive(config.runtime), withHost) satisfies Layer.Layer<
+    import("./distribution").LlamaCppDistribution
+      | import("./host").LlamaCppHost
+      | import("./model-store").LlamaCppModelStore
+      | import("./runtime").LlamaCppRuntime,
+    never,
+    LlamaCppPlatform
+  >
+}

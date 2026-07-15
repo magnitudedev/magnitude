@@ -1,6 +1,7 @@
 export * from "./types"
 export * from "./catalog"
 export * from "./recommendations"
-export * from "./runtime-bridge"
 export * from "./service"
-
+export * from "./model-configuration"
+export * from "./model-configuration-propagation"
+export * from "./provider-backend"

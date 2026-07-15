@@ -1,7 +1,7 @@
-import { Effect, Option } from "effect"
+import { Effect, Option, Schema } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
-import type { MagnitudeModelInfo, MagnitudeRawModel, ModelListResponse } from "./contract"
+import { MagnitudeModelListResponseSchema, type MagnitudeModelInfo, type MagnitudeRawModel } from "./contract"
 import { ModelCatalogError, type ModelCatalog, type ModelCatalogConfig } from "@magnitudedev/ai"
 
 type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
@@ -10,7 +10,7 @@ type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
  * Map a raw Magnitude API model to a MagnitudeModelInfo (without modelFamilyId).
  * The API returns `id`; ProviderModel uses `providerModelId`.
  */
-function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWithoutFamily {
+export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWithoutFamily {
   return {
     providerModelId: raw.id,
     providerId: "magnitude",
@@ -77,10 +77,12 @@ export function createMagnitudeCatalog(config: MagnitudeCatalogConfig): ModelCat
         Effect.mapError((cause) => new ModelCatalogError({ message: "Failed to read models response", cause })),
       )
 
-      const rawModels = (body as ModelListResponse).data
+      const rawModels = yield* Schema.decodeUnknown(MagnitudeModelListResponseSchema)(body).pipe(
+        Effect.mapError((cause) => new ModelCatalogError({ message: "Invalid models response", cause })),
+      )
 
       const classified: MagnitudeModelInfo[] = []
-      for (const raw of rawModels) {
+      for (const raw of rawModels.data) {
         const model = toMagnitudeModelInfo(raw)
         const familyOption = classify(model)
         if (Option.isNone(familyOption)) continue

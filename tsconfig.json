@@ -30,7 +30,8 @@
       "@magnitudedev/generate-id": ["./packages/generate-id/src"],
       "@magnitudedev/ripgrep": ["./packages/ripgrep/src"],
       "@magnitudedev/client-common": ["./packages/client-common/src"],
-      "@magnitudedev/llamacpp": ["./packages/llamacpp/src"]
+      "@magnitudedev/llamacpp": ["./packages/llamacpp/src"],
+      "@magnitudedev/llamacpp/*": ["./packages/llamacpp/src/*"]
     },
     "plugins": [
       { "name": "@effect/language-service" }

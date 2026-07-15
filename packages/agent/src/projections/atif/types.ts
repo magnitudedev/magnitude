@@ -3,7 +3,7 @@
  * Native Magnitude projection types mirroring the Harbor ATIF spec.
  */
 
-import { Schema } from 'effect'
+import { Option, Schema } from 'effect'
 import { JsonValueSchema } from '@magnitudedev/ai'
 import { ROLE_IDS } from '../../agents/role-validation'
 
@@ -146,9 +146,7 @@ export type AtifFinalMetrics = typeof AtifFinalMetricsSchema.Type
 // Trajectory
 // =============================================================================
 
-export interface AtifTrajectory extends Schema.Schema.Type<typeof AtifTrajectorySchema> {}
-
-export const AtifTrajectorySchema = Schema.Struct({
+const AtifTrajectoryFields = {
   schema_version: Schema.Literal('ATIF-v1.7'),
   session_id: Schema.optionalWith(Schema.String, { as: 'Option', exact: true }),
   trajectory_id: Schema.optionalWith(Schema.String, { as: 'Option', exact: true }),
@@ -158,7 +156,28 @@ export const AtifTrajectorySchema = Schema.Struct({
   final_metrics: Schema.optionalWith(AtifFinalMetricsSchema, { as: 'Option', exact: true }),
   continued_trajectory_ref: Schema.optionalWith(Schema.String, { as: 'Option', exact: true }),
   extra: Schema.optionalWith(JsonRecordSchema, { as: 'Option', exact: true }),
-  subagent_trajectories: Schema.optionalWith(Schema.Array(Schema.suspend((): typeof AtifTrajectorySchema => AtifTrajectorySchema)), { as: 'Option', exact: true }),
+}
+
+const AtifTrajectoryBaseSchema = Schema.Struct(AtifTrajectoryFields)
+type AtifTrajectoryBase = Schema.Schema.Type<typeof AtifTrajectoryBaseSchema>
+type AtifTrajectoryBaseEncoded = Schema.Schema.Encoded<typeof AtifTrajectoryBaseSchema>
+
+export interface AtifTrajectory extends AtifTrajectoryBase {
+  readonly subagent_trajectories: Option.Option<ReadonlyArray<AtifTrajectory>>
+}
+
+interface AtifTrajectoryEncoded extends AtifTrajectoryBaseEncoded {
+  readonly subagent_trajectories?: ReadonlyArray<AtifTrajectoryEncoded>
+}
+
+export const AtifTrajectorySchema: Schema.Schema<AtifTrajectory, AtifTrajectoryEncoded> = Schema.Struct({
+  ...AtifTrajectoryFields,
+  subagent_trajectories: Schema.optionalWith(
+    Schema.Array(Schema.suspend(
+      (): Schema.Schema<AtifTrajectory, AtifTrajectoryEncoded> => AtifTrajectorySchema,
+    )),
+    { as: 'Option', exact: true },
+  ),
 })
 
 // =============================================================================

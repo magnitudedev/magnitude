@@ -15,7 +15,6 @@ import {
   selectedCwdAtom,
   selectedFilePathAtom,
 } from "../state/session-atoms"
-import type { ReadFileResult, ResolvePathResult } from "@magnitudedev/sdk"
 import type { FilePanelStream, FileOperationStatus } from "../utils/file-panel-utils"
 
 export type { FilePanelStream, FileOperationStatus }
@@ -79,14 +78,14 @@ export function useFilePanelState(): UseFilePanelStateResult {
   const resolveResult = useAtomValue(resolvePathAtom)
 
   const fileExists = resolveResult !== null && Result.isSuccess(resolveResult)
-    ? (resolveResult.value as ResolvePathResult).exists
+    ? resolveResult.value.exists
     : false
 
   const resolvedPath = Option.isSome(filePath)
     && resolveResult !== null
     && Result.isSuccess(resolveResult)
     && fileExists
-      ? Option.some((resolveResult.value as ResolvePathResult).resolved)
+      ? Option.some(resolveResult.value.resolved)
       : Option.none()
 
   // ReadFile — gated on resolvedPath to skip the RPC when the file doesn't exist.
@@ -130,7 +129,7 @@ export function useFilePanelState(): UseFilePanelStateResult {
   const content = Option.isSome(filePath)
     && readResult !== null
     && Result.isSuccess(readResult)
-      ? Option.some((readResult.value as ReadFileResult).content)
+      ? Option.some(readResult.value.content)
       : Option.none()
 
   return {

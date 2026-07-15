@@ -22,6 +22,9 @@ function checkPortFree(port: number): Effect.Effect<boolean, never, never> {
     server.listen(port, "127.0.0.1", () => {
       server.close(() => resume(Effect.succeed(true)))
     })
+    return Effect.sync(() => {
+      if (server.listening) server.close()
+    })
   })
 }
 
@@ -33,6 +36,9 @@ function getOsPort(): Effect.Effect<number, never, never> {
       const addr = server.address()
       const port = addr && typeof addr === "object" ? addr.port : 0
       server.close(() => resume(Effect.succeed(port)))
+    })
+    return Effect.sync(() => {
+      if (server.listening) server.close()
     })
   })
 }

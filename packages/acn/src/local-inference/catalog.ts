@@ -9,6 +9,20 @@ const APACHE_LICENSE = {
 const UNSLOTH_FIDELITY_SOURCE = "https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs"
 const QUANT_FIDELITY_STUDY = "https://arxiv.org/abs/2606.19558"
 const PRODUCT_CONTEXT_TARGETS = [64_000, 100_000, 200_000] as const
+const QWEN_CONVENTIONAL_BITS = {
+  "UD-Q4_K_XL": "q4",
+  "UD-Q5_K_XL": "q5",
+  "UD-Q6_K_XL": "q6",
+  "UD-Q8_K_XL": "q8",
+} satisfies Record<"UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL", "q4" | "q5" | "q6" | "q8">
+
+const catalogFiles = (
+  files: readonly (readonly [path: string, sizeBytes: number, sha256: string])[],
+): LocalModelCatalogEntry["files"] => files.map(([path, sizeBytes, sha256]) => ({
+  path,
+  sizeBytes,
+  sha256,
+}))
 
 /**
  * Cross-model guidance for an Unsloth Dynamic quant tier when no measurement of
@@ -104,7 +118,7 @@ const qwenConventional = (
   common: Omit<ArtifactInput, "file" | "sizeBytes" | "sha256" | "format" | "bitsClass" | "fidelityRank" | "fidelityLabel" | "fidelityEvidence">,
   variants: readonly [format: "UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL", file: string, size: number, sha256: string][],
 ): LocalModelCatalogEntry[] => variants.map(([format, file, sizeBytes, sha256]) => {
-  const bitsClass = format.slice(3, 5).toLowerCase() as "q4" | "q5" | "q6" | "q8"
+  const bitsClass = QWEN_CONVENTIONAL_BITS[format]
   const fidelity = QUANT_TIER_FIDELITY[bitsClass]
   return artifact({
     ...common,
@@ -459,7 +473,7 @@ const NEMOTRON_ULTRA: LocalModelCatalogEntry = {
   repo: "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
   revision: "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6",
   quantTag: "MXFP4_MOE",
-  files: [
+  files: catalogFiles([
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00001-of-00009.gguf", 7_872_128, "564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39"],
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00002-of-00009.gguf", 46_357_384_032, "49bb6d0075c1926583a88b2cb7fa0c07e24918ae2c0505c200a8f93cb618453d"],
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00003-of-00009.gguf", 47_312_721_120, "e34d245dd2a370a487eea8e1818f59b6c827ca53603508f5e17760a6d7df5698"],
@@ -469,11 +483,7 @@ const NEMOTRON_ULTRA: LocalModelCatalogEntry = {
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00007-of-00009.gguf", 47_312_721_120, "e9f7b068f256bf41b5265955fe7bb38eb6a1edbd9da67887d7f5675a789fdccc"],
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00008-of-00009.gguf", 47_016_905_664, "c950f4810dc569df2d3fafef790a4299a6ce8872c51b81c6b469720cf6017629"],
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00009-of-00009.gguf", 22_770_053_920, "e88987d3747eddec4190373fd9628d6bd4f307d54ad2f42f509c52e76ccd13b9"],
-  ].map(([path, sizeBytes, sha256]) => ({
-    path: path as string,
-    sizeBytes: sizeBytes as number,
-    sha256: sha256 as string,
-  })),
+  ]),
   quantization: {
     format: "MXFP4_MOE",
     bitsClass: "mxfp4",
@@ -504,7 +514,7 @@ const GLM_52: LocalModelCatalogEntry = {
   repo: "unsloth/GLM-5.2-GGUF",
   revision: "abc55e72527792c6e77069c99b4cb7de16fa9f23",
   quantTag: "UD-Q4_K_XL",
-  files: [
+  files: catalogFiles([
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00001-of-00011.gguf", 9_423_744, "3256ac8c290273f0965ff39e93a8bcd07dc99bcd23e923bd4b7306ef39061038"],
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00002-of-00011.gguf", 49_433_942_336, "aaedfb89d314d6967a80005b93a9c460a494babc6c3e4f0138e21891e21572e1"],
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00003-of-00011.gguf", 48_566_415_136, "a2b45b63075b2e1bc8a73c9ce531ccea54c03001286a80f77454871aa93fdca8"],
@@ -516,11 +526,7 @@ const GLM_52: LocalModelCatalogEntry = {
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00009-of-00011.gguf", 48_566_415_136, "7f6be8ce1c9dcb973ede026b7341657f8add8617f386f77cc165ff697cf9620d"],
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00010-of-00011.gguf", 48_566_415_136, "6a26bf391e6f1de947e63016d11ada565f7476a06cb90b444f6db334baa949f9"],
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00011-of-00011.gguf", 29_314_424_736, "27032b927daa606872d887c56631c5278a788b39d219784b262e1df3d4cb851e"],
-  ].map(([path, sizeBytes, sha256]) => ({
-    path: path as string,
-    sizeBytes: sizeBytes as number,
-    sha256: sha256 as string,
-  })),
+  ]),
   quantization: {
     format: "UD-Q4_K_XL",
     bitsClass: "q4",
@@ -558,5 +564,9 @@ export const LOCAL_MODEL_CATALOG_BY_ID = new Map(LOCAL_MODEL_CATALOG.map((entry)
 export const catalogFileUrl = (entry: LocalModelCatalogEntry, path: string): string =>
   `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${path.split("/").map(encodeURIComponent).join("/")}`
 
-export const catalogSourcePageUrl = (entry: LocalModelCatalogEntry): string =>
-  `https://huggingface.co/${entry.repo}/blob/${entry.revision}/${entry.files[0]!.path.split("/").map(encodeURIComponent).join("/")}`
+export const catalogSourcePageUrl = (entry: LocalModelCatalogEntry): string => {
+  const firstFile = entry.files[0]
+  return firstFile
+    ? `https://huggingface.co/${entry.repo}/blob/${entry.revision}/${firstFile.path.split("/").map(encodeURIComponent).join("/")}`
+    : `https://huggingface.co/${entry.repo}/tree/${entry.revision}`
+}

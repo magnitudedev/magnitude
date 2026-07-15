@@ -1,12 +1,15 @@
 import { memo, useCallback, useState, useMemo } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
+import { Atom, useAtomMount } from '@effect-atom/atom-react'
+import { Effect } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
 import type { UseModelConfigResult } from '@magnitudedev/client-common'
 import { SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, DEFAULT_REASONING_EFFORT, type SlotId } from '@magnitudedev/sdk'
+import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 
 interface SettingsOverlayProps {
   isVisible: boolean
@@ -24,6 +27,7 @@ interface SettingsOverlayProps {
 }
 
 type Mode = 'view' | 'edit' | 'confirm-disconnect'
+type PendingAuthAction = 'save' | 'clear' | null
 
 type DropdownTarget =
   | { slotId: SlotId; field: 'model' }
@@ -72,7 +76,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const [mode, setMode] = useState<Mode>('view')
   const [inputValue, setInputValue] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [submitting, setSubmitting] = useState(false)
+  const [pendingAuthAction, setPendingAuthAction] = useState<PendingAuthAction>(null)
+  const displayedAuthError = error ?? auth.error
 
   const [updateHovered, setUpdateHovered] = useState(false)
   const [disconnectHovered, setDisconnectHovered] = useState(false)
@@ -109,34 +114,39 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     setMode('view')
   }, [])
 
-  const handleSave = useCallback(async () => {
-    if (submitting) return
+  const handleSave = useCallback(() => {
+    if (auth.saving) return
     const trimmed = inputValue.trim()
     if (!trimmed) { setError('API key is required'); return }
-    setSubmitting(true)
-    try {
-      await auth.save(trimmed)
-      setInputValue('')
-      setMode('view')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save key')
-    } finally {
-      setSubmitting(false)
-    }
-  }, [auth, inputValue, submitting])
+    setPendingAuthAction('save')
+    auth.save(trimmed)
+  }, [auth, inputValue])
 
-  const handleConfirmDisconnect = useCallback(async () => {
-    if (submitting) return
-    setSubmitting(true)
-    try {
-      await auth.clear()
+  const handleConfirmDisconnect = useCallback(() => {
+    if (auth.saving) return
+    setPendingAuthAction('clear')
+    auth.clear()
+  }, [auth])
+
+  const authCompletionAtom = useMemo(
+    () => Atom.make(Effect.sync(() => {
+      if (!pendingAuthAction || auth.saving) return
+      if (auth.error) {
+        setPendingAuthAction(null)
+        return
+      }
+      const completed = pendingAuthAction === 'save'
+        ? auth.source === 'config'
+        : auth.source === 'none'
+      if (!completed) return
+      setPendingAuthAction(null)
+      setInputValue('')
+      setError(null)
       setMode('view')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to disconnect')
-    } finally {
-      setSubmitting(false)
-    }
-  }, [auth, submitting])
+    })),
+    [auth.error, auth.saving, auth.source, pendingAuthAction],
+  )
+  useAtomMount(authCompletionAtom)
 
   const dropdownItems = useMemo(() => {
     if (!dropdownTarget) return []
@@ -162,20 +172,17 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
   const selectDropdownItem = useCallback((index: number) => {
     if (!dropdownTarget || !modelConfig) return
-    const item = dropdownItems[index]
-    if (!item) return
     if (dropdownTarget.field === 'model') {
-      const modelItem = item as { id: string; providerId: string; label: string }
-      if (!modelItem.id) {
-        void modelConfig.updateSlotModel(dropdownTarget.slotId, null, null)
-      } else {
-        void modelConfig.updateSlotModel(dropdownTarget.slotId, modelItem.providerId, modelItem.id)
-      }
+      const model = modelConfig.models?.[index]
+      if (!model) return
+      void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.providerModelId)
     } else {
-      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, item.id)
+      const option = REASONING_OPTIONS[index]
+      if (!option) return
+      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, option.value)
     }
     closeDropdown()
-  }, [dropdownTarget, dropdownItems, modelConfig, closeDropdown])
+  }, [dropdownTarget, modelConfig, closeDropdown])
 
   const unavailableProviders = modelConfig?.providers?.filter((provider) =>
     provider.status && provider.status !== 'ok'
@@ -198,14 +205,11 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       onClose()
       return
     }
-    if (mode === 'view' && key.name === 'l') {
+    const inferenceSourceAction = mode === 'view' ? getInferenceSourceAction(key.name) : null
+    if (inferenceSourceAction) {
       key.preventDefault()
-      onManageLocalModels()
-      return
-    }
-    if (mode === 'view' && key.name === 'c') {
-      key.preventDefault()
-      onConfigureCloud()
+      if (inferenceSourceAction === 'local') onManageLocalModels()
+      else onConfigureCloud()
       return
     }
     if (mode === 'edit' && (key.name === 'return' || key.name === 'enter') && !key.shift) {
@@ -293,13 +297,13 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
         {mode === 'edit' && (
           <box style={{ flexDirection: 'column' }}>
-            <box style={{ borderStyle: 'single', borderColor: error ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, flexShrink: 0, width: 80 }}>
+            <box style={{ borderStyle: 'single', borderColor: displayedAuthError ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, flexShrink: 0, width: 80 }}>
               <SingleLineInput value={inputValue} onChange={(v) => { setInputValue(v); setError(null) }} placeholder="Paste new API key" focused={true} />
             </box>
-            {error && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{error}</text></box>}
+            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{displayedAuthError}</text></box>}
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
               <Button onClick={handleSave} onMouseOver={() => setSaveHovered(true)} onMouseOut={() => setSaveHovered(false)}>
-                <text style={{ fg: saveHovered ? theme.primary : theme.foreground }}>{submitting ? '[Saving...]' : '[Save]'}</text>
+                <text style={{ fg: saveHovered ? theme.primary : theme.foreground }}>{auth.saving ? '[Saving...]' : '[Save]'}</text>
               </Button>
               <text> </text>
               <Button onClick={cancelInline} onMouseOver={() => setCancelHovered(true)} onMouseOut={() => setCancelHovered(false)}>
@@ -317,14 +321,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             <text style={{ fg: theme.foreground }}>Disconnect this key? You will need to set another to reconnect.</text>
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
               <Button onClick={handleConfirmDisconnect} onMouseOver={() => setConfirmHovered(true)} onMouseOut={() => setConfirmHovered(false)}>
-                <text style={{ fg: confirmHovered ? theme.error : theme.foreground }}>{submitting ? '[Disconnecting...]' : '[Yes, disconnect]'}</text>
+                <text style={{ fg: confirmHovered ? theme.error : theme.foreground }}>{auth.saving ? '[Disconnecting...]' : '[Yes, disconnect]'}</text>
               </Button>
               <text> </text>
               <Button onClick={cancelInline} onMouseOver={() => setCancelHovered(true)} onMouseOut={() => setCancelHovered(false)}>
                 <text style={{ fg: cancelHovered ? theme.foreground : theme.muted }}>{'[Cancel]'}</text>
               </Button>
             </box>
-            {error && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{error}</text></box>}
+            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{displayedAuthError}</text></box>}
           </box>
         )}
       </box>
@@ -346,7 +350,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             onMouseOver={() => setLocalSetupHovered(true)}
             onMouseOut={() => setLocalSetupHovered(false)}
           >
-            <text style={{ fg: localSetupHovered ? theme.primary : theme.muted }}>{'[Manage local models · L]'}</text>
+            <text style={{ fg: localSetupHovered ? theme.primary : theme.muted }}>{`[${INFERENCE_SOURCE_ACTIONS.local.label} · ${INFERENCE_SOURCE_ACTIONS.local.key.toUpperCase()}]`}</text>
           </Button>
           <text> </text>
           <Button
@@ -354,7 +358,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             onMouseOver={() => setCloudSetupHovered(true)}
             onMouseOut={() => setCloudSetupHovered(false)}
           >
-            <text style={{ fg: cloudSetupHovered ? theme.primary : theme.muted }}>{'[Configure Cloud fallback · C]'}</text>
+            <text style={{ fg: cloudSetupHovered ? theme.primary : theme.muted }}>{`[${INFERENCE_SOURCE_ACTIONS.cloud.label} · ${INFERENCE_SOURCE_ACTIONS.cloud.key.toUpperCase()}]`}</text>
           </Button>
         </box>
       </box>
