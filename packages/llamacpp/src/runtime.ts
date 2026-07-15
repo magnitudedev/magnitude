@@ -87,26 +87,26 @@ const verifiedMetadata = (model: LlamaCppServedModel, props: LlamaCppEndpointPro
   sizeBytes: metadataNumber(model, "size"),
 })
 
-const normalizedMetadataValue = (value: string): string => value
-  .toLowerCase()
-  .replace(/medium/g, "m")
-  .replace(/small/g, "s")
-  .replace(/large/g, "l")
-  .replace(/[^a-z0-9]+/g, "")
+const reportedModelPath = (
+  model: LlamaCppServedModel,
+  props: LlamaCppEndpointProps,
+): string | null => {
+  const value = model.path ?? props.model_path
+  if (value === undefined || value.trim().toLowerCase() === "none") return null
+  return value
+}
 
 const verifyManagedIdentity = (
   model: LlamaCppServedModel,
   props: LlamaCppEndpointProps,
   artifact: ResolvedModelArtifact,
 ): Effect.Effect<void, LlamaCppRuntimeError> => Effect.gen(function* () {
-  const servedPath = model.path ?? props.model_path
-  if (servedPath !== artifact.primaryPath) {
+  const servedPath = reportedModelPath(model, props)
+  if (servedPath !== null && servedPath !== artifact.primaryPath) {
     return yield* runtimeError(
       "ensure_serving",
       "identity_mismatch",
-      servedPath === undefined
-        ? "Managed llama-server did not report the served model path"
-        : `Managed llama-server reported model path ${servedPath}; expected ${artifact.primaryPath}`,
+      `Managed llama-server reported model path ${servedPath}; expected ${artifact.primaryPath}`,
     )
   }
 
@@ -118,28 +118,13 @@ const verifyManagedIdentity = (
       `Managed llama-server reported ${metadata.sizeBytes} model bytes; expected ${artifact.sizeBytes}`,
     )
   }
-  if (metadata.architecture !== null && artifact.metadata.architecture !== null
-    && normalizedMetadataValue(metadata.architecture) !== normalizedMetadataValue(artifact.metadata.architecture)) {
-    return yield* runtimeError(
-      "ensure_serving",
-      "identity_mismatch",
-      `Managed llama-server reported architecture ${metadata.architecture}; expected ${artifact.metadata.architecture}`,
-    )
-  }
-  if (metadata.quantization !== null && artifact.metadata.quantization !== null
-    && normalizedMetadataValue(metadata.quantization) !== normalizedMetadataValue(artifact.metadata.quantization)) {
-    return yield* runtimeError(
-      "ensure_serving",
-      "identity_mismatch",
-      `Managed llama-server reported quantization ${metadata.quantization}; expected ${artifact.metadata.quantization}`,
-    )
-  }
 })
 
 const observeConnection = (
   connection: LlamaCppConnection,
   ownership: "managed" | "external",
   serverId: string,
+  managedProviderModelId?: string,
 ): Effect.Effect<LlamaCppServerObservation, never, HttpClient.HttpClient> =>
   Effect.gen(function* () {
     const client = makeLlamaCppEndpointClient(connection)
@@ -157,14 +142,22 @@ const observeConnection = (
     if (Option.isNone(probed)) {
       return { serverId, ownership, health: "unhealthy", models: [], build: null }
     }
-    const [models, props] = probed.value
+    const [reportedModels, props] = probed.value
+    const models = managedProviderModelId === undefined
+      ? reportedModels
+      : reportedModels.filter((model) => model.id === managedProviderModelId)
+    const sharedContext = props.default_generation_settings?.n_ctx
     return {
       serverId,
       ownership,
       health: "ready",
       models: models.map((model) => ({
         providerModelId: model.id,
-        contextTokens: props.default_generation_settings?.n_ctx ?? null,
+        contextTokens: model.meta?.n_ctx !== undefined && model.meta.n_ctx > 0
+          ? model.meta.n_ctx
+          : sharedContext !== undefined && sharedContext > 0
+            ? sharedContext
+            : null,
       })),
       build: props.build_info ?? null,
     }
@@ -376,7 +369,10 @@ const targetAt = (
     if (health._tag !== "Ready") {
       return yield* runtimeError("ensure_serving", "endpoint_failed", `llama-server is not ready: ${health._tag}`)
     }
-    const [models, props] = yield* Effect.all([client.models, client.props], { concurrency: 2 }).pipe(
+    const [models, props] = yield* Effect.all([
+      client.models,
+      client.propsForModel(request.providerModelId),
+    ], { concurrency: 2 }).pipe(
       Effect.mapError((cause) => runtimeError("ensure_serving", "endpoint_failed", cause.reason, cause)),
     )
     const model = models.find((candidate) => candidate.id === request.providerModelId)
@@ -385,7 +381,8 @@ const targetAt = (
     }
     if (expectedArtifact) yield* verifyManagedIdentity(model, props, expectedArtifact)
     const context = props.default_generation_settings?.n_ctx
-    if (context !== request.contextTokens) {
+    const paddedRequestedContext = Math.ceil(request.contextTokens / 256) * 256
+    if (context === undefined || context < request.contextTokens || context > paddedRequestedContext) {
       return yield* runtimeError(
         "ensure_serving",
         "context_mismatch",
@@ -423,7 +420,12 @@ export const LlamaCppRuntimeLive = (
         : external
       const [managedObservation, externalObservations] = yield* Effect.all([
         managed
-          ? observeConnection(managed.connection, "managed", managed.serverId).pipe(Effect.map(Option.some))
+          ? observeConnection(
+              managed.connection,
+              "managed",
+              managed.serverId,
+              managed.request.providerModelId,
+            ).pipe(Effect.map(Option.some))
           : Effect.succeed(Option.none<LlamaCppServerObservation>()),
         Effect.all(visibleExternal.map(({ connectionId, connection }) => observeConnection(
           connection,

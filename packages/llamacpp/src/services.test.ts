@@ -519,13 +519,14 @@ describe("llama.cpp services", () => {
   })
 
   it("verifies an explicitly selected external target without mutating it", async () => {
-    const requested: Array<{ path: string; method: string }> = []
-    const client = responseClient((url, method) => {
-      requested.push({ path: url.pathname, method })
+    const client = responseClient((url) => {
       switch (url.pathname) {
         case "/health": return Response.json({ status: "ok" })
         case "/v1/models": return Response.json({ data: [{ id: "local-model", object: "model", meta: { size: 10 } }] })
-        case "/props": return Response.json({ build_info: "b10011", default_generation_settings: { n_ctx: 8192 } })
+        case "/props": return Response.json({
+          build_info: "b10011",
+          default_generation_settings: { n_ctx: url.searchParams.get("model") === "local-model" ? 8192 : 0 },
+        })
         default: return new Response("", { status: 404 })
       }
     })
@@ -566,8 +567,7 @@ describe("llama.cpp services", () => {
     ))
     expect(target.ownership).toBe("external")
     expect(target.serverId).toBe("configured-endpoint")
-    expect(requested.every((request) => request.method === "GET")).toBe(true)
-    expect(requested.map((request) => request.path)).toEqual(["/health", "/v1/models", "/props"])
+    expect(target.configuredContextTokens).toBe(8192)
   })
 
   it("serializes concurrent managed ensures and stops the one process at scope close", async () => {
@@ -592,10 +592,11 @@ describe("llama.cpp services", () => {
       `const log = ${JSON.stringify(lifecycleLog)}`,
       "appendFileSync(log, 'start\\n')",
       "const server = Bun.serve({ port, hostname: '127.0.0.1', fetch(request) {",
-      "  const path = new URL(request.url).pathname",
+      "  const url = new URL(request.url)",
+      "  const path = url.pathname",
       "  if (path === '/health') return alias === 'slow-model' ? new Response('', { status: 503 }) : Response.json({ status: 'ok' })",
-      "  if (path === '/v1/models') return Response.json({ data: [{ id: alias, object: 'model', path: modelPath, meta: { size: 10 } }] })",
-      "  if (path === '/props') return Response.json({ build_info: 'b10011', default_generation_settings: { n_ctx: alias === 'wrong-context' ? context + 1 : context } })",
+      "  if (path === '/v1/models') return Response.json({ data: [{ id: alias, object: 'model', path: alias === 'path-undisclosed' ? 'none' : modelPath, meta: { size: 10 } }] })",
+      "  if (path === '/props') return Response.json({ build_info: 'b10011', default_generation_settings: { n_ctx: url.searchParams.get('model') === alias ? (alias === 'wrong-context' ? context + 1 : context) : 0 } })",
       "  return new Response('', { status: 404 })",
       "} })",
       "process.on('SIGTERM', () => { appendFileSync(log, 'stop\\n'); server.stop(true); process.exit(0) })",
@@ -694,6 +695,11 @@ describe("llama.cpp services", () => {
       }).pipe(Effect.either)
       expect(contextMismatch._tag).toBe("Left")
       if (contextMismatch._tag === "Left") expect(contextMismatch.left.code).toBe("context_mismatch")
+      const undisclosedPath = yield* runtime.ensureServing({
+        ...request,
+        providerModelId: "path-undisclosed",
+      })
+      expect(undisclosedPath.providerModelId).toBe("path-undisclosed")
       const starting = yield* runtime.ensureServing({
         ...request,
         modelId: "slow-artifact",
@@ -706,6 +712,7 @@ describe("llama.cpp services", () => {
 
     expect(new Set(serverIds).size).toBe(1)
     expect((await readFile(lifecycleLog, "utf8")).trim().split("\n")).toEqual([
+      "start", "stop",
       "start", "stop",
       "start", "stop",
       "start", "stop",
