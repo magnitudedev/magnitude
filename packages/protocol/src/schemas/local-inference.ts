@@ -30,7 +30,6 @@ export type LocalInferenceFitClass = Schema.Schema.Type<typeof LocalInferenceFit
 
 export const LocalInferenceQuantization = Schema.Struct({
   format: Schema.String,
-  bitsClass: Schema.Literal("q4", "q5", "q6", "q8", "fp8", "mxfp4", "other"),
   quantAwareCheckpoint: Schema.Boolean,
   fidelityLabel: Schema.String,
   fidelityEvidence: Schema.String,

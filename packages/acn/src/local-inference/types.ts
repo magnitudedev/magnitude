@@ -17,8 +17,6 @@ export interface StableInferenceCapacity {
   readonly acceleratorDomains: readonly StableAcceleratorDomain[]
 }
 
-export type QuantBitsClass = "q4" | "q5" | "q6" | "q8" | "fp8" | "mxfp4" | "other"
-
 export interface LocalModelCatalogEntry {
   readonly id: string
   readonly modelId: string
@@ -40,7 +38,6 @@ export interface LocalModelCatalogEntry {
   }[]
   readonly quantization: {
     readonly format: string
-    readonly bitsClass: QuantBitsClass
     readonly quantAwareCheckpoint: boolean
     readonly fidelityRank: number
     readonly fidelityLabel: string

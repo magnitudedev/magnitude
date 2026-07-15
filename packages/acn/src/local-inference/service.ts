@@ -2,6 +2,7 @@ import { Context, Effect, Layer, Stream } from "effect"
 import {
   LocalInferenceError,
   type LocalInferenceHostProfile,
+  type LocalInferenceQuantization,
   type LocalInferenceState,
   type LocalInferenceUsageSelection,
   type LocalModelChoice,
@@ -19,9 +20,10 @@ import {
   type LlamaCppHostProfile,
   type ModelArtifactSummary,
   type ModelFitPlan,
+  type ServedModelObservation,
 } from "@magnitudedev/llamacpp"
 import type { DurableLocalModelBinding } from "@magnitudedev/storage"
-import { LOCAL_MODEL_CATALOG } from "./catalog"
+import { catalogEntryForModelReferences, LOCAL_MODEL_CATALOG } from "./catalog"
 import {
   artifactIdForCatalogEntry,
   providerModelIdForArtifact,
@@ -138,6 +140,26 @@ const downloadPlanFor = (configuration: EvaluatedLocalConfiguration): ArtifactDo
 const entryForArtifactId = (artifactId: string): LocalModelCatalogEntry | null =>
   LOCAL_MODEL_CATALOG.find((entry) => artifactIdForCatalogEntry(entry) === artifactId) ?? null
 
+const entryForObservedModel = (model: ServedModelObservation): LocalModelCatalogEntry | null => {
+  return catalogEntryForModelReferences([model.modelPath, model.providerModelId])
+}
+
+const catalogQuantization = (entry: LocalModelCatalogEntry): LocalInferenceQuantization => ({
+  format: entry.quantization.format,
+  quantAwareCheckpoint: entry.quantization.quantAwareCheckpoint,
+  fidelityLabel: entry.quantization.fidelityLabel,
+  fidelityEvidence: entry.quantization.fidelityEvidence,
+  fidelitySourceUrl: entry.quantization.fidelitySourceUrl,
+})
+
+const observedQuantization = (format: string): LocalInferenceQuantization => ({
+  format,
+  quantAwareCheckpoint: false,
+  fidelityLabel: `${format} quantization`,
+  fidelityEvidence: "Quantization format reported by the running llama.cpp server; no curated artifact match was found.",
+  fidelitySourceUrl: "https://github.com/ggml-org/llama.cpp",
+})
+
 const hostToWire = (host: LlamaCppHostProfile): LocalInferenceHostProfile => ({
   systemMemoryBytes: host.system.totalMemoryBytes,
   cpuModel: host.system.cpuModel,
@@ -180,7 +202,6 @@ const storedChoice = (
       ? {
           quantization: {
             format: artifact.metadata.quantization,
-            bitsClass: "other" as const,
             quantAwareCheckpoint: false,
             fidelityLabel: "Discovered model",
             fidelityEvidence: "No curated fidelity evidence is available for this artifact.",
@@ -544,14 +565,26 @@ export const LocalInferenceLive: Layer.Layer<
           if (server.ownership === "managed" && choices.some(
             (choice) => choice.providerModelId === model.providerModelId,
           )) continue
+          const catalogEntry = entryForObservedModel(model)
+          const quantization = catalogEntry
+            ? catalogQuantization(catalogEntry)
+            : model.quantization === null
+              ? null
+              : observedQuantization(model.quantization)
+          const sizeBytes = model.sizeBytes ?? catalogEntry?.files.reduce(
+            (total, file) => total + file.sizeBytes,
+            0,
+          )
           const common = {
             choiceId: runningModelChoiceId(server.serverId, model.providerModelId),
-            displayName: model.providerModelId,
+            displayName: catalogEntry?.displayName ?? model.displayName ?? model.providerModelId,
             providerModelId: model.providerModelId,
             contextTokens: model.contextTokens ?? 32_768,
             fitClass: "unknown" as const,
             compatible: model.contextTokens !== null,
             explanation: server.ownership === "external" ? "External server; observed read-only." : "Magnitude-managed running model.",
+            ...(quantization === null ? {} : { quantization }),
+            ...(sizeBytes === undefined || sizeBytes === null ? {} : { sizeBytes }),
           }
           choices.push(server.ownership === "external"
             ? { _tag: "RunningExternal", ...common }

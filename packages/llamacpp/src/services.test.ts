@@ -522,7 +522,17 @@ describe("llama.cpp services", () => {
     const client = responseClient((url) => {
       switch (url.pathname) {
         case "/health": return Response.json({ status: "ok" })
-        case "/v1/models": return Response.json({ data: [{ id: "local-model", object: "model", meta: { size: 10 } }] })
+        case "/v1/models": return Response.json({ data: [{
+          id: "local-model",
+          object: "model",
+          path: "/models/local-model.gguf",
+          meta: {
+            n_ctx: 8192,
+            size: 10,
+            ftype: "Q6_K",
+            "general.name": "Local Model",
+          },
+        }] })
         case "/props": return Response.json({
           build_info: "b10011",
           default_generation_settings: { n_ctx: url.searchParams.get("model") === "local-model" ? 8192 : 0 },
@@ -557,17 +567,28 @@ describe("llama.cpp services", () => {
         },
       }]),
     }).pipe(Layer.provide(dependencies))
-    const target = await Effect.runPromise(Effect.scoped(
-      Effect.flatMap(LlamaCppRuntime, (runtime) => runtime.ensureServing({
+    const { snapshot, target } = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const runtime = yield* LlamaCppRuntime
+      const snapshot = yield* runtime.inspect
+      const target = yield* runtime.ensureServing({
         _tag: "External",
         connectionId: "configured-endpoint",
         providerModelId: "local-model",
         contextTokens: 8192,
-      })).pipe(Effect.provide(runtimeLayer)),
-    ))
+      })
+      return { snapshot, target }
+    }).pipe(Effect.provide(runtimeLayer))))
     expect(target.ownership).toBe("external")
     expect(target.serverId).toBe("configured-endpoint")
     expect(target.configuredContextTokens).toBe(8192)
+    expect(snapshot.external[0]?.models).toEqual([{
+      providerModelId: "local-model",
+      modelPath: "/models/local-model.gguf",
+      displayName: "Local Model",
+      contextTokens: 8192,
+      quantization: "Q6_K",
+      sizeBytes: 10,
+    }])
   })
 
   it("serializes concurrent managed ensures and stops the one process at scope close", async () => {

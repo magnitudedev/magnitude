@@ -255,7 +255,6 @@ const toRecommendation = (
       : {}),
     quantization: {
       format: entry.quantization.format,
-      bitsClass: entry.quantization.bitsClass,
       quantAwareCheckpoint: entry.quantization.quantAwareCheckpoint,
       fidelityLabel: entry.quantization.fidelityLabel,
       fidelityEvidence: entry.quantization.fidelityEvidence,

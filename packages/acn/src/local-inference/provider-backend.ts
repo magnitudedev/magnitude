@@ -10,6 +10,7 @@ import {
   LlamaCppRuntime,
 } from "@magnitudedev/llamacpp"
 import type { DurableLocalModelBinding } from "@magnitudedev/storage"
+import { catalogEntryForModelReferences } from "./catalog"
 import { LocalModelConfiguration } from "./model-configuration"
 import { providerModelIdForArtifact } from "./identity"
 import { estimateRuntimeOverheadPerSlot } from "./recommendations"
@@ -77,10 +78,27 @@ export const LocalModelProviderBackendLive: Layer.Layer<
         }]
       }
 
+      const catalogEntry = catalogEntryForModelReferences([binding.providerModelId])
+      const observedDisplayName = catalogEntry
+        ? null
+        : yield* runtime.inspect.pipe(
+          Effect.map((runtimeSnapshot) => {
+            const servers = [
+              ...(runtimeSnapshot.managed ? [runtimeSnapshot.managed] : []),
+              ...runtimeSnapshot.external,
+            ]
+            return servers
+              .flatMap((server) => server.models)
+              .find((model) => model.providerModelId === binding.providerModelId)
+              ?.displayName ?? null
+          }),
+          Effect.catchAll(() => Effect.succeed(null)),
+        )
+
       return [{
         providerId: "llamacpp" as const,
         providerModelId: binding.providerModelId,
-        displayName: binding.providerModelId,
+        displayName: catalogEntry?.displayName ?? observedDisplayName ?? binding.providerModelId,
         modelFamilyId: "unknown",
         contextWindow: binding.contextTokens,
         maxOutputTokens: Math.min(binding.contextTokens, 8192),

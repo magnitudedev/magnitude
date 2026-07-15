@@ -60,7 +60,14 @@ describe("LocalModelProviderBackend", () => {
           serverId: "llamacpp",
           ownership: "external",
           health: "ready",
-          models: [{ providerModelId: "external-model", contextTokens: 48_000 }],
+          models: [{
+            providerModelId: "external-model",
+            modelPath: null,
+            displayName: "Server model",
+            contextTokens: 48_000,
+            quantization: null,
+            sizeBytes: null,
+          }],
           build: "test",
         }],
       }),
@@ -100,6 +107,7 @@ describe("LocalModelProviderBackend", () => {
     expect(catalog).toEqual([expect.objectContaining({
       providerId: "llamacpp",
       providerModelId: "external-model",
+      displayName: "Server model",
       contextWindow: 48_000,
       serverContextSize: 48_000,
     })])
@@ -110,6 +118,51 @@ describe("LocalModelProviderBackend", () => {
       providerModelId: "external-model",
       contextTokens: 48_000,
     }])
+  })
+
+  it("uses the curated display name for a known external model path", async () => {
+    const providerModelId = "/Users/test/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
+    const externalConfiguration: LocalModelConfigurationApi = {
+      ...configuration,
+      get: Effect.succeed({
+        usage: { localModelRole: "main", sessionConcurrency: "one" },
+        binding: {
+          _tag: "External",
+          selectionId: "known-external-choice",
+          endpointConfigId: "llamacpp",
+          providerModelId,
+          contextTokens: 200_192,
+        },
+      }),
+    }
+    let inspections = 0
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.sync(() => {
+        inspections += 1
+        return { managed: null, external: [] }
+      }),
+      ensureServing: () => Effect.die("catalog inspection must not start the runtime"),
+      stopManaged: Effect.void,
+    }
+    const backendLayer = LocalModelProviderBackendLive.pipe(Layer.provide(Layer.mergeAll(
+      Layer.succeed(LlamaCppHost, host),
+      Layer.succeed(LlamaCppModelStore, models),
+      Layer.succeed(LlamaCppRuntime, runtime),
+      Layer.succeed(LocalModelConfiguration, externalConfiguration),
+    )))
+
+    const catalog = await Effect.runPromise(
+      Effect.flatMap(LocalModelProviderBackend, (backend) => backend.listModels).pipe(
+        Effect.provide(Layer.merge(backendLayer, FetchHttpClient.layer)),
+      ),
+    )
+
+    expect(catalog).toEqual([expect.objectContaining({
+      providerModelId,
+      displayName: "Qwen3.6 35B-A3B",
+      contextWindow: 200_192,
+    })])
+    expect(inspections).toBe(0)
   })
 
   it("advertises only the active managed binding", async () => {

@@ -54,7 +54,7 @@ describe("local model catalog", () => {
     })
     expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "gemma-4-26b-a4b-it-qat:UD-Q4_K_XL")?.quantization).toMatchObject({
       quantAwareCheckpoint: true,
-      bitsClass: "q4",
+      format: "UD-Q4_K_XL",
     })
     expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "gemma-4-e2b-it-qat:UD-Q4_K_XL")).toMatchObject({
       displayName: "Gemma 4 E2B",
@@ -82,7 +82,7 @@ describe("local model catalog", () => {
       displayName: "DeepSeek V4 Flash 284B-A13B",
       totalParametersBillions: 284,
       activeParametersBillions: 13,
-      quantization: { bitsClass: "q8" },
+      quantization: { format: "UD-Q8_K_XL" },
     })
     expect(LOCAL_MODEL_CATALOG.find((entry) => entry.id === "nemotron-3-ultra-550b-a55b:MXFP4_MOE")).toMatchObject({
       totalParametersBillions: 550,
