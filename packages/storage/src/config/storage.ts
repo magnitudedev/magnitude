@@ -109,6 +109,25 @@ export function makeConfigStorage(): Effect.Effect<
             });
           })
         ),
+
+      getOnboardingConfig: () =>
+        readConfig().pipe(Effect.map((config) => config.onboarding ?? null)),
+
+      completeCliModelSetupOnboarding: (version, completedAt) =>
+        io.withPathLock(
+          g.configFile,
+          Effect.gen(function* () {
+            const current = yield* readConfig();
+            yield* io.writeJsonFile(g.configFile, {
+              ...current,
+              onboarding: {
+                ...current.onboarding,
+                cliModelSetupVersion: version,
+                completedAt,
+              },
+            });
+          })
+        ),
     };
   });
 }

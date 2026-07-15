@@ -9,7 +9,9 @@
     "dev": "bun run ../version/scripts/generate-version.ts --dev && bun run src/binary.ts serve --register --debug",
     "dev:run": "bun run src/binary.ts serve --register --debug",
     "build:binary": "bun run scripts/build-binary.ts",
-    "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit"
+    "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit",
+    "validate:local-model-catalog": "bun run scripts/validate-local-model-catalog.ts",
+    "validate:llamacpp-runtime": "bun run scripts/validate-llamacpp-runtime.ts"
   },
   "dependencies": {
     "@effect/cli": "^0.75.2",

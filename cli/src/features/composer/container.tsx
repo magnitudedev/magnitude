@@ -38,10 +38,12 @@ export function ComposerContainer({
   chatColumnWidth,
   widgetNavActive,
   handleWidgetKeyEvent,
+  modelsConfigured,
 }: {
   chatColumnWidth: number
   widgetNavActive: boolean
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
+  modelsConfigured: boolean
 }): ReactNode {
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
@@ -81,7 +83,9 @@ export function ComposerContainer({
   }), [startNewSession, setShowRecentChats, setBashMode, setSettingsOpen, setUsageOpen, theme.error])
 
   const composer = useComposerState(commandContext)
-  sendRef.current = (text: string) => composer.handleSend(text)
+  sendRef.current = (text: string) => {
+    if (modelsConfigured) composer.handleSend(text)
+  }
 
   const { interrupt, interruptAll } = useInterruptActions()
   const { profiles, rootRoleLabel, rootProfile } = useSlotProfiles()
@@ -124,7 +128,7 @@ export function ComposerContainer({
       status={rootTimeline?.mode ?? 'idle'}
       hasRunningForks={(rootActor?.work.activeChildCount ?? 0) > 0}
       bashMode={composer.bashMode}
-      modelsConfigured
+      modelsConfigured={modelsConfigured}
       modelSummary={{
         role: rootRoleLabel,
         model: composer.model || '-',

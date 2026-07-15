@@ -255,3 +255,11 @@ test('composer shell renders without an embedded task list (task list is the Age
   expect(html).not.toContain('vertical:╹')
   expect(html).not.toContain('horizontal:▀')
 })
+
+test('shows a single no-provider label instead of model and reasoning effort', () => {
+  const html = render(<Composer {...makeProps()} modelsConfigured={false} />)
+
+  expect(html).toContain('No provider configured')
+  expect(html).not.toContain('>model<')
+  expect(html).not.toContain('>high<')
+})

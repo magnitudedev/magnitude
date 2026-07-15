@@ -46,6 +46,7 @@ async function main() {
     .option('--goal <objective>', 'Start a goal for the session')
     .option('--solo', 'Run without worker/task tools')
     .option('--system-override <text>', 'Override leader system prompt with raw text')
+    .option('--setup', 'Rerun Local Models and Cloud Fallback setup')
 
     .action(async (opts) => {
 
@@ -102,6 +103,7 @@ async function main() {
                   initialPrompt={opts.prompt}
                   goal={opts.goal}
                   envAuth={resolveEnvAuth()}
+                  forceLocalInferenceSetup={opts.setup ?? false}
                   sessionOptions={{
                     disableShellSafeguards: opts.disableShellSafeguards ?? false,
                     disableCwdSafeguards: opts.disableCwdSafeguards ?? false,

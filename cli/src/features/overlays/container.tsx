@@ -3,8 +3,10 @@
  * recent chats, settings, usage, and worker fork detail. Visibility is pure
  * atom state; each overlay's data comes from shared hooks or display state.
  */
-import { useMemo, type ReactNode } from 'react'
-import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
+import { useCallback, useMemo, type ReactNode } from 'react'
+import type { KeyEvent } from '@opentui/core'
+import { useKeyboard } from '@opentui/react'
+import { Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import {
   useDisplayState,
   useSettingsState,
@@ -16,28 +18,72 @@ import {
   useDisplayViewController,
   selectedCwdAtom,
   useTimelineStatus,
+  useAgentClient,
 } from '@magnitudedev/client-common'
 import { forkIdToKey, ROLE_TO_SLOT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
-import { showRecentChatsOverlayAtom, authSourceAtom } from '../../state/cli-atoms'
+import { showRecentChatsOverlayAtom, authSourceAtom, modelSetupRouteAtom, type ModelSetupRoute } from '../../state/cli-atoms'
 import type { ActionId } from '../../types/ui-actions'
 import { deriveSettingsAuthInfo, type AuthInfo } from './auth-display'
 import { SettingsOverlay } from './settings'
 import { UsageOverlay } from './usage'
 import { ForkDetailOverlay } from './fork-detail'
 import { RecentChatsOverlayContainer } from '../sessions/container'
+import { ModelSetupOnboardingScreen, PreparingLocalInferenceScreen } from '../local-inference-onboarding'
 
-export type ActiveOverlay = 'recent-chats' | 'settings' | 'usage' | 'fork' | 'none'
+export type ActiveOverlay = 'recent-chats' | 'model-setup' | 'settings' | 'usage' | 'fork' | 'none'
 
 export function useActiveOverlay(): ActiveOverlay {
   const showRecentChats = useAtomValue(showRecentChatsOverlayAtom)
   const settingsOpen = useAtomValue(settingsOpenAtom)
+  const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
   const { expandedForkStack } = useDisplayViewController()
   return showRecentChats ? 'recent-chats'
+    : modelSetupRoute !== 'closed' ? 'model-setup'
     : settingsOpen ? 'settings'
     : usageOpen ? 'usage'
     : expandedForkStack.length > 0 ? 'fork'
     : 'none'
+}
+
+function ModelSetupSettingsContainer({
+  route,
+  onClose,
+}: {
+  readonly route: Exclude<ModelSetupRoute, 'closed'>
+  readonly onClose: () => void
+}): ReactNode {
+  const client = useAgentClient()
+  const snapshot = useAtomValue(
+    client.query('GetLocalInferenceOnboardingSnapshot', {}, {
+      reactivityKeys: ['localInference', 'modelConfig', 'apiKey'],
+    }),
+  )
+  const childHandlesKeyboard = Result.isSuccess(snapshot)
+  useKeyboard(useCallback((key: KeyEvent) => {
+    if (!childHandlesKeyboard && key.name === 'escape') {
+      key.preventDefault()
+      onClose()
+    }
+  }, [childHandlesKeyboard, onClose]))
+  if (Result.isInitial(snapshot)) return <PreparingLocalInferenceScreen />
+  if (Result.isFailure(snapshot)) {
+    return (
+      <box style={{ height: '100%', alignItems: 'center', justifyContent: 'center' }}>
+        <text>Failed to inspect local inference capabilities. Press Esc to return to Settings.</text>
+      </box>
+    )
+  }
+  return (
+    <ModelSetupOnboardingScreen
+      key={route}
+      snapshot={snapshot.value}
+      initialStep={route}
+      mode="management"
+      onExit={onClose}
+      onComplete={onClose}
+    />
+  )
 }
 
 export function AppOverlaysContainer({
@@ -48,6 +94,8 @@ export function AppOverlaysContainer({
   const active = useActiveOverlay()
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
   const setUsageOpen = useAtomSet(usageOpenAtom)
+  const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
+  const setModelSetupRoute = useAtomSet(modelSetupRouteAtom)
   const controller = useDisplayViewController()
   const displayMode = controller.displayMode
   const selectedCwd = useAtomValue(selectedCwdAtom)
@@ -89,6 +137,15 @@ export function AppOverlaysContainer({
     return <RecentChatsOverlayContainer />
   }
 
+  if (active === 'model-setup' && modelSetupRoute !== 'closed') {
+    return (
+      <ModelSetupSettingsContainer
+        route={modelSetupRoute}
+        onClose={() => setModelSetupRoute('closed')}
+      />
+    )
+  }
+
   if (active === 'settings') {
     return (
       <SettingsOverlay
@@ -97,6 +154,8 @@ export function AppOverlaysContainer({
         auth={auth}
         slots={slots}
         modelConfig={modelConfig}
+        onManageLocalModels={() => setModelSetupRoute('local')}
+        onConfigureCloud={() => setModelSetupRoute('cloud')}
       />
     )
   }

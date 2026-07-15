@@ -31,6 +31,7 @@ import {
   watchFile,
 } from "./ops";
 import type { AppEvent } from "@magnitudedev/agent";
+import { LocalInferenceOnboarding } from "./local-inference";
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
@@ -40,6 +41,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const agentRuntime = yield* AgentRuntime;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
+    const localInference = yield* LocalInferenceOnboarding;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -322,6 +324,52 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
             ...(payload.days !== undefined ? { days: payload.days } : {}),
             ...(payload.tz !== undefined ? { tz: payload.tz } : {}),
           })
+        ),
+
+      // CLI local-inference onboarding
+      GetLocalInferenceOnboardingSnapshot: () =>
+        observeRpcDefects(
+          "GetLocalInferenceOnboardingSnapshot",
+          localInference.getSnapshot,
+        ),
+
+      StartLocalModelDownload: ({ configurationId }) =>
+        observeRpcDefects(
+          "StartLocalModelDownload",
+          localInference.startDownload(configurationId),
+        ),
+
+      SubscribeLocalModelDownload: ({ operationId }) =>
+        observeRpcStreamDefects(
+          "SubscribeLocalModelDownload",
+          withHeartbeat(localInference.subscribeDownload(operationId)),
+        ),
+
+      CancelLocalModelDownload: ({ operationId }) =>
+        observeRpcDefects(
+          "CancelLocalModelDownload",
+          localInference.cancelDownload(operationId).pipe(Effect.as({})),
+        ),
+
+      ActivateLocalModel: ({ selectionId }) =>
+        observeRpcDefects(
+          "ActivateLocalModel",
+          Effect.gen(function* () {
+            const activated = yield* localInference.activate(selectionId);
+            const entries = yield* agentRuntime.getAllEntries();
+            yield* Effect.forEach(
+              entries,
+              (entry) => entry.session.refreshConfig(),
+              { concurrency: "unbounded" },
+            );
+            return activated;
+          }),
+        ),
+
+      CompleteCliModelSetupOnboarding: () =>
+        observeRpcDefects(
+          "CompleteCliModelSetupOnboarding",
+          localInference.complete.pipe(Effect.as({})),
         ),
 
       // Server-side operations

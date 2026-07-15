@@ -43,9 +43,16 @@ export const ModelConfigSchema = Schema.Struct({
 })
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 
+export const OnboardingConfigSchema = Schema.Struct({
+  cliModelSetupVersion: Schema.optional(Schema.Number.pipe(Schema.int(), Schema.positive())),
+  completedAt: Schema.optional(Schema.String),
+})
+export type OnboardingConfig = Schema.Schema.Type<typeof OnboardingConfigSchema>
+
 export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   models: Schema.optional(ModelConfigSchema),
+  onboarding: Schema.optional(OnboardingConfigSchema),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

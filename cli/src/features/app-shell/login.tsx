@@ -6,7 +6,7 @@ import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import { BOX_CHARS } from '../../utils/ui-constants'
 import { writeTextToClipboard } from '../../utils/clipboard'
-import { green, orange, rose, LOGO_LINES, useAgentClient } from '@magnitudedev/client-common'
+import { green, orange, rose, useAgentClient } from '@magnitudedev/client-common'
 import type { SlotProfile } from '@magnitudedev/sdk'
 import { SLOT_IDS, SLOT_DISPLAY_NAMES } from '@magnitudedev/sdk'
 import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
@@ -65,11 +65,15 @@ function padEnd(s: string, length: number): string {
 interface MagnitudeLoginScreenProps {
   onSubmit: (key: string) => Promise<void> | void
   onExit: () => void
+  onBack?: () => void
+  onSkip?: () => Promise<void> | void
 }
 
 export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   onSubmit,
   onExit,
+  onBack,
+  onSkip,
 }: MagnitudeLoginScreenProps) {
   const theme = useTheme()
   const client = useAgentClient()
@@ -78,6 +82,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   const [submitting, setSubmitting] = useState(false)
   const [continueHovered, setContinueHovered] = useState(false)
   const [copyHovered, setCopyHovered] = useState(false)
+  const [skipHovered, setSkipHovered] = useState(false)
   const urlCopy = useCopyFeedback()
 
   const slotProfilesAtom = useMemo(
@@ -103,8 +108,30 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
     }
   }, [apiKey, onSubmit, submitting])
 
+  const handleSkip = useCallback(async () => {
+    if (!onSkip || submitting) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      await onSkip()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to finish model setup')
+      setSubmitting(false)
+    }
+  }, [onSkip, submitting])
+
   useKeyboard(useCallback((key: KeyEvent) => {
-    if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+    if (key.name === 'escape' && onSkip) {
+      key.preventDefault()
+      void handleSkip()
+      return
+    }
+    if (key.name === 'left' && onBack) {
+      key.preventDefault()
+      onBack()
+      return
+    }
+    if (key.ctrl && key.name === 'c') {
       key.preventDefault()
       onExit()
       return
@@ -114,36 +141,28 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
       handleSubmit()
       return
     }
-  }, [onExit, handleSubmit]))
+  }, [onBack, onExit, onSkip, handleSkip, handleSubmit]))
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
-      {/* Hero row: logo + brand */}
+      {/* Compact header keeps setup usable in a standard 80x24 terminal. */}
       <box style={{
-        flexDirection: 'row',
+        flexDirection: 'column',
         paddingLeft: 2,
         paddingRight: 2,
         paddingTop: 1,
         paddingBottom: 1,
         flexShrink: 0,
       }}>
-        {/* Left: ASCII logo */}
         <box style={{ flexDirection: 'column' }}>
-          {LOGO_LINES.map((line, i) => (
-            <text key={i} style={{ fg: theme.primary }}>{line}</text>
-          ))}
-        </box>
-
-        {/* Right: Brand text + roles table */}
-        <box style={{ flexDirection: 'column', paddingLeft: 4, justifyContent: 'flex-start', paddingTop: 1 }}>
           <text style={{ fg: theme.primary }}>
-            <span attributes={TextAttributes.BOLD}>MAGNITUDE</span>
+            <span attributes={TextAttributes.BOLD}>MAGNITUDE CLOUD FALLBACK</span>
           </text>
           <text style={{ fg: theme.foreground }}>
-            <span attributes={TextAttributes.BOLD}>Frontier coding without frontier prices</span>
+            <span attributes={TextAttributes.BOLD}>Use models that are too large for this machine</span>
           </text>
           <text style={{ fg: theme.muted }}>
-            Runs entirely on open models with built-in model routing
+            Optional cloud inference alongside, or instead of, local models
           </text>
 
           {/* Slot profiles list (conditional) — inside right column with gap */}
@@ -260,7 +279,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
               paddingRight: 1,
             }}>
               <text style={{ fg: continueHovered ? theme.primary : theme.foreground }}>
-                {submitting ? 'Saving...' : 'Continue (Enter)'}
+                {submitting ? 'Saving...' : 'Connect Cloud (Enter)'}
               </text>
             </box>
           </Button>
@@ -270,10 +289,42 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
         <box style={{ paddingTop: 2 }}>
           <text style={{ fg: theme.muted }}>
             <span attributes={TextAttributes.DIM}>
-              Prefer environment variables? Press Esc to exit, set MAGNITUDE_API_KEY, then relaunch.
+              {onBack
+                ? 'Press ← to return to local model setup.'
+                : 'Prefer environment variables? Press Esc to exit, set MAGNITUDE_API_KEY, then relaunch.'}
             </span>
           </text>
         </box>
+      </box>
+
+      <box style={{
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        paddingLeft: 2,
+        paddingRight: 2,
+        paddingBottom: 1,
+        flexShrink: 0,
+      }}>
+        <text style={{ fg: theme.muted }}>← back to local models · Ctrl+C close</text>
+        {onSkip && (
+          <Button
+            onClick={handleSkip}
+            onMouseOver={() => setSkipHovered(true)}
+            onMouseOut={() => setSkipHovered(false)}
+          >
+            <box style={{
+              borderStyle: 'single',
+              borderColor: skipHovered ? theme.primary : theme.border,
+              customBorderChars: BOX_CHARS,
+              paddingLeft: 1,
+              paddingRight: 1,
+            }}>
+              <text style={{ fg: skipHovered ? theme.primary : theme.foreground }}>
+                Skip for now (Esc)
+              </text>
+            </box>
+          </Button>
+        )}
       </box>
     </box>
   )

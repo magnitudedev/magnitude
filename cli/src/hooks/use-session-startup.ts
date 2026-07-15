@@ -42,11 +42,12 @@ export interface SessionStartupParams {
   sessionStart: SessionStart
   initialPrompt: string | undefined
   goal: string | undefined
+  modelsConfigured: boolean
 }
 
 const idleAtom = Atom.make(() => null)
 
-export function useSessionStartup({ sessionStart, initialPrompt, goal }: SessionStartupParams): void {
+export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsConfigured }: SessionStartupParams): void {
   const client = useAgentClient()
   const renderer = useRenderer()
   const controller = useDisplayViewControllerCore()
@@ -169,6 +170,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal }: Session
       Atom.make(
         Effect.gen(function* () {
           if (!hasReceivedDisplay || !Result.isSuccess(runtimeResult)) return
+          if (!modelsConfigured) return
           const goalObjective = goal?.trim()
           const prompt = initialPrompt?.trim()
           if (!goalObjective && !prompt) return
@@ -233,6 +235,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal }: Session
       ),
     [
       hasReceivedDisplay,
+      modelsConfigured,
       goal,
       initialPrompt,
       sessionId,

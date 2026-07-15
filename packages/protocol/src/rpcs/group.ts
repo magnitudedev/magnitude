@@ -9,6 +9,7 @@ import * as Skills from "./skills"
 import * as Shell from "./shell"
 import * as Events from "./events"
 import * as Stream from "./stream"
+import * as LocalInference from "./local-inference"
 import { AcnRpcCommandActivity } from "./middleware"
 
 export const MagnitudeRpcs = RpcGroup.make(
@@ -38,6 +39,11 @@ export const MagnitudeRpcs = RpcGroup.make(
   Config.GetCachedModelList.middleware(AcnRpcCommandActivity),
   Config.RefreshCachedModelList.middleware(AcnRpcCommandActivity),
   Config.GetBalance.middleware(AcnRpcCommandActivity),
+  LocalInference.GetLocalInferenceOnboardingSnapshot.middleware(AcnRpcCommandActivity),
+  LocalInference.StartLocalModelDownload.middleware(AcnRpcCommandActivity),
+  LocalInference.CancelLocalModelDownload.middleware(AcnRpcCommandActivity),
+  LocalInference.ActivateLocalModel.middleware(AcnRpcCommandActivity),
+  LocalInference.CompleteCliModelSetupOnboarding.middleware(AcnRpcCommandActivity),
   Files.ListFiles.middleware(AcnRpcCommandActivity),
   Files.ReadFile.middleware(AcnRpcCommandActivity),
   Files.CheckFileExists.middleware(AcnRpcCommandActivity),
@@ -56,4 +62,5 @@ export const MagnitudeRpcs = RpcGroup.make(
   // Long-running subscriptions
   Session.StreamActiveSessionStatuses,
   Events.StreamEvents,
+  LocalInference.SubscribeLocalModelDownload,
 )
