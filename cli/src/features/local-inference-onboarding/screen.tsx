@@ -132,7 +132,7 @@ export const ModelSetupOnboardingView = memo(function ModelSetupOnboardingView({
   const [sessionConcurrency, setSessionConcurrency] = useState<LocalSessionConcurrency>(
     snapshot.usage.selection?.sessionConcurrency ?? "one",
   )
-  const effectiveSnapshot = controller.usageSnapshot ?? snapshot
+  const effectiveSnapshot = controller.snapshot ?? snapshot
 
   const finish = useCallback(
     () => finishModelSetup(mode, controller.completeOnboarding, onComplete),
@@ -150,6 +150,8 @@ export const ModelSetupOnboardingView = memo(function ModelSetupOnboardingView({
         }}
         onExit={onExit}
         onBack={() => setStep("local")}
+        busy={controller.busy}
+        error={controller.error}
       />
     )
   }
@@ -185,6 +187,15 @@ export const ModelSetupOnboardingView = memo(function ModelSetupOnboardingView({
         error={controller.error}
       />
     )
+  }
+
+  const effectiveUsage = effectiveSnapshot.usage.selection
+  if (
+    controller.snapshotLoading
+    || effectiveUsage?.localModelRole !== localModelRole
+    || effectiveUsage?.sessionConcurrency !== sessionConcurrency
+  ) {
+    return <PreparingLocalInferenceScreen />
   }
 
   return (

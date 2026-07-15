@@ -193,6 +193,31 @@ describe("LocalInferenceOnboarding service", () => {
     expect(harness.downloadedSources).toHaveLength(0)
   })
 
+  test("keeps download progress as authoritative daemon state", async () => {
+    const harness = makeHarness()
+    const progress = await run(harness, Effect.gen(function* () {
+      const service = yield* LocalInferenceOnboarding
+      const snapshot = yield* service.configureUsage({
+        localModelRole: "main",
+        sessionConcurrency: "one",
+      })
+      const started = yield* service.startDownload(snapshot.recommendations[0]!.configurationId)
+      const queued = yield* service.getDownloadProgress(started.operationId)
+      yield* service.cancelDownload(started.operationId)
+      const cancelled = yield* service.getDownloadProgress(started.operationId)
+      return { queued, cancelled }
+    }))
+
+    expect(progress.queued).toMatchObject({
+      operationId: "download-1",
+      status: "queued",
+      completedBytes: 0,
+      selectionId: expect.any(String),
+    })
+    expect(progress.queued?.totalBytes).toBeGreaterThan(0)
+    expect(progress.cancelled?.status).toBe("cancelled")
+  })
+
   test("activation configures both slots without completing the combined walkthrough", async () => {
     const harness = makeHarness()
     await run(harness, Effect.gen(function* () {

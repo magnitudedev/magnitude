@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Ref, Stream } from "effect"
 import {
   SessionOperationFailed,
   type LocalInferenceOnboardingSnapshot,
@@ -23,6 +23,9 @@ export interface LocalInferenceOnboardingApi {
     usage: LocalInferenceUsageSelection,
   ) => Effect.Effect<LocalInferenceOnboardingSnapshot, SessionError>
   readonly startDownload: (configurationId: string) => Effect.Effect<{ readonly operationId: string }, SessionError>
+  readonly getDownloadProgress: (
+    operationId: string,
+  ) => Effect.Effect<LocalModelDownloadProgress | null, SessionError>
   readonly subscribeDownload: (operationId: string) => Stream.Stream<LocalModelDownloadProgress, SessionError>
   readonly cancelDownload: (operationId: string) => Effect.Effect<void, SessionError>
   readonly activate: (selectionId: string) => Effect.Effect<{
@@ -103,6 +106,16 @@ export const LocalInferenceOnboardingLive: Layer.Layer<
     const bridge = yield* LlamaCppRuntimeBridge
     const storage = yield* MagnitudeStorage
     const account = yield* Account
+    const downloadProgress = yield* Ref.make(new Map<string, LocalModelDownloadProgress>())
+
+    const storeDownloadProgress = (progress: LocalModelDownloadProgress) => Ref.update(
+      downloadProgress,
+      (current) => {
+        const next = new Map(current)
+        next.set(progress.operationId, progress)
+        return next
+      },
+    )
 
     const hasUsableConfiguration = Effect.gen(function* () {
       const modelConfig = yield* storage.config.getModelConfig().pipe(
@@ -204,13 +217,36 @@ export const LocalInferenceOnboardingLive: Layer.Layer<
         Effect.flatMap(() => getSnapshot),
       ),
 
-      startDownload: (configurationId) =>
-        getConfiguration(bridge, storage, configurationId).pipe(
-          Effect.flatMap((configuration) => bridge.startDownload(makeSource(configuration))),
-        ),
+      startDownload: (configurationId) => Effect.gen(function* () {
+        const configuration = yield* getConfiguration(bridge, storage, configurationId)
+        const started = yield* bridge.startDownload(makeSource(configuration))
+        yield* storeDownloadProgress({
+          operationId: started.operationId,
+          status: "queued",
+          completedBytes: 0,
+          totalBytes: configuration.entry.files.reduce((total, file) => total + file.sizeBytes, 0),
+          resumable: true,
+          selectionId: configurationId,
+        })
+        return started
+      }),
 
-      subscribeDownload: (operationId) => bridge.subscribeDownload(operationId),
-      cancelDownload: (operationId) => bridge.cancelDownload(operationId),
+      getDownloadProgress: (operationId) => Ref.get(downloadProgress).pipe(
+        Effect.map((current) => current.get(operationId) ?? null),
+      ),
+
+      subscribeDownload: (operationId) => bridge.subscribeDownload(operationId).pipe(
+        Stream.tap(storeDownloadProgress),
+      ),
+      cancelDownload: (operationId) => bridge.cancelDownload(operationId).pipe(
+        Effect.zipRight(Ref.update(downloadProgress, (current) => {
+          const existing = current.get(operationId)
+          if (!existing) return current
+          const next = new Map(current)
+          next.set(operationId, { ...existing, status: "cancelled" })
+          return next
+        })),
+      ),
 
       activate: (selectionId) => Effect.gen(function* () {
         const inventory = yield* bridge.getInventory

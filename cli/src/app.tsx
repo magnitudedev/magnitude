@@ -12,7 +12,7 @@ import { TextAttributes } from '@opentui/core'
 import { Option } from 'effect'
 import { useAtomValue, useAtomSet, useAtomInitialValues, Result } from '@effect-atom/atom-react'
 import {
-  useAgentClient,
+  useLocalInferenceSnapshot,
   useDisplayViewController,
   useDisplayConnectionError,
   useSelectedSessionId,
@@ -76,10 +76,7 @@ export function CliApp(props: CliAppProps): ReactNode {
 function CliAppGates(props: CliAppProps): ReactNode {
   const [forceSetup, setForceSetup] = useState(props.forceLocalInferenceSetup ?? false)
   const connectionError = useDisplayConnectionError()
-  const client = useAgentClient()
-  const onboardingResult = useAtomValue(
-    client.query('GetLocalInferenceOnboardingSnapshot', {}, { reactivityKeys: ['localInference', 'modelConfig', 'apiKey'] }),
-  )
+  const onboardingResult = useLocalInferenceSnapshot()
   const controller = useDisplayViewController()
   useTerminalBgDetection()
 

@@ -18,7 +18,7 @@ import {
   useDisplayViewController,
   selectedCwdAtom,
   useTimelineStatus,
-  useAgentClient,
+  useLocalInferenceSnapshot,
 } from '@magnitudedev/client-common'
 import { forkIdToKey, ROLE_TO_SLOT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
 import { showRecentChatsOverlayAtom, authSourceAtom, modelSetupRouteAtom, type ModelSetupRoute } from '../../state/cli-atoms'
@@ -53,12 +53,7 @@ function ModelSetupSettingsContainer({
   readonly route: Exclude<ModelSetupRoute, 'closed'>
   readonly onClose: () => void
 }): ReactNode {
-  const client = useAgentClient()
-  const snapshot = useAtomValue(
-    client.query('GetLocalInferenceOnboardingSnapshot', {}, {
-      reactivityKeys: ['localInference', 'modelConfig', 'apiKey'],
-    }),
-  )
+  const snapshot = useLocalInferenceSnapshot()
   const childHandlesKeyboard = Result.isSuccess(snapshot)
   useKeyboard(useCallback((key: KeyEvent) => {
     if (!childHandlesKeyboard && key.name === 'escape') {

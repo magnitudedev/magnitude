@@ -42,6 +42,7 @@ export const MagnitudeRpcs = RpcGroup.make(
   LocalInference.GetLocalInferenceOnboardingSnapshot.middleware(AcnRpcCommandActivity),
   LocalInference.ConfigureLocalInferenceUsage.middleware(AcnRpcCommandActivity),
   LocalInference.StartLocalModelDownload.middleware(AcnRpcCommandActivity),
+  LocalInference.GetLocalModelDownloadProgress.middleware(AcnRpcCommandActivity),
   LocalInference.CancelLocalModelDownload.middleware(AcnRpcCommandActivity),
   LocalInference.ActivateLocalModel.middleware(AcnRpcCommandActivity),
   LocalInference.CompleteCliModelSetupOnboarding.middleware(AcnRpcCommandActivity),
