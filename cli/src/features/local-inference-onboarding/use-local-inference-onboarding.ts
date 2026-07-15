@@ -5,6 +5,8 @@ import { RpcClient } from "@effect/rpc"
 import * as Reactivity from "@effect/experimental/Reactivity"
 import {
   MagnitudeRpcs,
+  type LocalInferenceOnboardingSnapshot,
+  type LocalInferenceUsageSelection,
   type LocalModelDownloadProgress,
   type LocalModelDownloadWireEvent,
 } from "@magnitudedev/sdk"
@@ -31,7 +33,9 @@ export function useLocalInferenceOnboarding() {
   const [progress, setProgress] = useState<LocalModelDownloadProgress | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [usageSnapshot, setUsageSnapshot] = useState<LocalInferenceOnboardingSnapshot | null>(null)
 
+  const configureUsageMutation = useAtomSet(client.mutation("ConfigureLocalInferenceUsage"), { mode: "promise" })
   const startDownloadMutation = useAtomSet(client.mutation("StartLocalModelDownload"), { mode: "promise" })
   const cancelDownloadMutation = useAtomSet(client.mutation("CancelLocalModelDownload"), { mode: "promise" })
   const activateMutation = useAtomSet(client.mutation("ActivateLocalModel"), { mode: "promise" })
@@ -126,6 +130,15 @@ export function useLocalInferenceOnboarding() {
     return result !== undefined
   }, [activateMutation, run])
 
+  const configureUsage = useCallback(async (usage: LocalInferenceUsageSelection) => {
+    const result = await run(() => configureUsageMutation({
+      payload: usage,
+      reactivityKeys: ["localInference"],
+    }))
+    if (result) setUsageSnapshot(result)
+    return result
+  }, [configureUsageMutation, run])
+
   const configureCloud = useCallback(async (key: string) => {
     await settings.saveApiKey(key)
   }, [settings.saveApiKey])
@@ -144,6 +157,8 @@ export function useLocalInferenceOnboarding() {
     progress,
     error,
     busy,
+    usageSnapshot,
+    configureUsage,
     startDownload,
     cancelDownload,
     activate,

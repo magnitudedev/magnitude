@@ -84,7 +84,12 @@ export const selectionMetadata = (selection: LocalInferenceSelection): string =>
   const contextTokens = selection.kind === "recommendation"
     ? selection.recommendation.contextTokens
     : selection.choice.contextTokens
-  return [quant, size, parameters, `${formatContext(contextTokens)} context`]
+  const context = selection.kind === "recommendation"
+    ? selection.recommendation.servingProfile.parallelSlots === 1
+      ? `${formatContext(contextTokens)} context`
+      : `${formatContext(contextTokens)} each · up to ${selection.recommendation.servingProfile.parallelSlots} local ${selection.recommendation.servingProfile.localModelRole === "main" ? "agents" : "subagents"}`
+    : `${formatContext(contextTokens)} context`
+  return [quant, size, parameters, context]
     .filter((value): value is string => value !== null)
     .join(" · ")
 }

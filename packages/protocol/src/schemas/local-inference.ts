@@ -56,6 +56,29 @@ export const LocalInferenceFitClass = Schema.Literal(
 )
 export type LocalInferenceFitClass = Schema.Schema.Type<typeof LocalInferenceFitClass>
 
+export const LocalModelRole = Schema.Literal("main", "subagent")
+export type LocalModelRole = Schema.Schema.Type<typeof LocalModelRole>
+
+export const LocalSessionConcurrency = Schema.Literal("one", "up_to_three")
+export type LocalSessionConcurrency = Schema.Schema.Type<typeof LocalSessionConcurrency>
+
+export const LocalInferenceUsageSelection = Schema.Struct({
+  localModelRole: LocalModelRole,
+  sessionConcurrency: LocalSessionConcurrency,
+})
+export type LocalInferenceUsageSelection = Schema.Schema.Type<typeof LocalInferenceUsageSelection>
+
+export const LocalInferenceServingProfile = Schema.Struct({
+  localModelRole: LocalModelRole,
+  sessionConcurrency: LocalSessionConcurrency,
+  parallelSlots: PositiveInteger,
+  contextTokensPerSlot: PositiveInteger,
+  totalContextCapacityTokens: PositiveInteger,
+  slotAllocation: Schema.Literal("uniform"),
+  runtimeProfileId: Schema.String,
+})
+export type LocalInferenceServingProfile = Schema.Schema.Type<typeof LocalInferenceServingProfile>
+
 export const LocalInferenceQuantization = Schema.Struct({
   format: Schema.String,
   bitsClass: Schema.Literal("q4", "q5", "q6", "q8", "fp8", "mxfp4", "other"),
@@ -97,6 +120,7 @@ export const LocalModelRecommendation = Schema.Struct({
     acknowledgementRequired: Schema.Boolean,
   }),
   contextTokens: PositiveInteger,
+  servingProfile: LocalInferenceServingProfile,
   modelMaximumContextTokens: PositiveInteger,
   estimatedRuntimeBytes: NonNegativeNumber,
   stableCapacityBudgetBytes: NonNegativeNumber,
@@ -121,6 +145,8 @@ export const LocalModelChoice = Schema.Struct({
   activeParametersBillions: Schema.optional(NonNegativeNumber),
   effectiveParametersBillions: Schema.optional(NonNegativeNumber),
   contextTokens: PositiveInteger,
+  parallelSlots: Schema.optional(PositiveInteger),
+  servingProfile: Schema.optional(LocalInferenceServingProfile),
   modelMaximumContextTokens: Schema.optional(PositiveInteger),
   fitClass: LocalInferenceFitClass,
   managed: Schema.Boolean,
@@ -130,14 +156,15 @@ export const LocalModelChoice = Schema.Struct({
 export type LocalModelChoice = Schema.Schema.Type<typeof LocalModelChoice>
 
 export const LocalInferenceOnboardingSnapshot = Schema.Struct({
-  schemaVersion: PositiveInteger,
   onboarding: Schema.Struct({
     required: Schema.Boolean,
-    completedVersion: Schema.optional(PositiveInteger),
     completedAt: Schema.optional(Schema.String),
   }),
   configuration: Schema.Struct({
     usable: Schema.Boolean,
+  }),
+  usage: Schema.Struct({
+    selection: Schema.optional(LocalInferenceUsageSelection),
   }),
   runtime: Schema.Struct({
     status: Schema.Literal("ready", "integration_pending", "error"),

@@ -7,16 +7,22 @@ describe("MagnitudeConfig onboarding state", () => {
     expect(Schema.decodeUnknownSync(MagnitudeConfigSchema)({})).toEqual({})
   })
 
-  test("decodes the versioned CLI model-setup marker", () => {
+  test("decodes the CLI model-setup completion marker and local usage", () => {
     expect(Schema.decodeUnknownSync(MagnitudeConfigSchema)({
       onboarding: {
-        cliModelSetupVersion: 2,
         completedAt: "2026-07-14T22:00:00.000Z",
+      },
+      localInference: {
+        localModelRole: "main",
+        sessionConcurrency: "up_to_three",
       },
     })).toEqual({
       onboarding: {
-        cliModelSetupVersion: 2,
         completedAt: "2026-07-14T22:00:00.000Z",
+      },
+      localInference: {
+        localModelRole: "main",
+        sessionConcurrency: "up_to_three",
       },
     })
   })

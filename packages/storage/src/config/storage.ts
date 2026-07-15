@@ -113,7 +113,22 @@ export function makeConfigStorage(): Effect.Effect<
       getOnboardingConfig: () =>
         readConfig().pipe(Effect.map((config) => config.onboarding ?? null)),
 
-      completeCliModelSetupOnboarding: (version, completedAt) =>
+      getLocalInferenceConfig: () =>
+        readConfig().pipe(Effect.map((config) => config.localInference ?? null)),
+
+      setLocalInferenceConfig: (localInference) =>
+        io.withPathLock(
+          g.configFile,
+          Effect.gen(function* () {
+            const current = yield* readConfig();
+            yield* io.writeJsonFile(g.configFile, {
+              ...current,
+              localInference,
+            });
+          })
+        ),
+
+      completeCliModelSetupOnboarding: (completedAt) =>
         io.withPathLock(
           g.configFile,
           Effect.gen(function* () {
@@ -122,7 +137,6 @@ export function makeConfigStorage(): Effect.Effect<
               ...current,
               onboarding: {
                 ...current.onboarding,
-                cliModelSetupVersion: version,
                 completedAt,
               },
             });

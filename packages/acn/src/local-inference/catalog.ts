@@ -8,6 +8,7 @@ const APACHE_LICENSE = {
 
 const UNSLOTH_FIDELITY_SOURCE = "https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs"
 const QUANT_FIDELITY_STUDY = "https://arxiv.org/abs/2606.19558"
+const PRODUCT_CONTEXT_TARGETS = [64_000, 100_000, 200_000] as const
 
 /**
  * Cross-model guidance for an Unsloth Dynamic quant tier when no measurement of
@@ -81,7 +82,7 @@ const artifact = (input: ArtifactInput): LocalModelCatalogEntry => ({
     ? { effectiveParametersBillions: input.effectiveParametersBillions }
     : {}),
   modelMaximumContextTokens: input.modelMaximumContextTokens,
-  supportedContextTokens: [16_384, 32_768, 65_536, 131_072],
+  supportedContextTokens: PRODUCT_CONTEXT_TARGETS.filter((tokens) => tokens <= input.modelMaximumContextTokens),
   repo: input.repo,
   revision: input.revision,
   quantTag: input.format,
@@ -304,7 +305,7 @@ const NEMOTRON_SUPER: LocalModelCatalogEntry = {
   totalParametersBillions: 120,
   activeParametersBillions: 12,
   modelMaximumContextTokens: 131_072,
-  supportedContextTokens: [32_768],
+  supportedContextTokens: [64_000, 100_000],
   repo: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
   revision: "036038fb30334a2d56a146c6f0d4871ab5edccbb",
   quantTag: "MXFP4_MOE",
@@ -351,7 +352,7 @@ const QWEN_122B: LocalModelCatalogEntry = {
   totalParametersBillions: 122,
   activeParametersBillions: 10,
   modelMaximumContextTokens: 262_144,
-  supportedContextTokens: [16_384, 32_768, 65_536, 131_072],
+  supportedContextTokens: [64_000, 100_000, 200_000],
   repo: "unsloth/Qwen3.5-122B-A10B-GGUF",
   revision: "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
   quantTag: "UD-Q4_K_XL",
@@ -397,7 +398,7 @@ const DEEPSEEK_V4_FLASH: LocalModelCatalogEntry = {
   totalParametersBillions: 284,
   activeParametersBillions: 13,
   modelMaximumContextTokens: 1_048_576,
-  supportedContextTokens: [32_768, 65_536, 131_072],
+  supportedContextTokens: [64_000, 100_000, 200_000],
   repo: "unsloth/DeepSeek-V4-Flash-GGUF",
   revision: "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
   quantTag: "UD-Q8_K_XL",
@@ -454,7 +455,7 @@ const NEMOTRON_ULTRA: LocalModelCatalogEntry = {
   totalParametersBillions: 550,
   activeParametersBillions: 55,
   modelMaximumContextTokens: 1_048_576,
-  supportedContextTokens: [32_768],
+  supportedContextTokens: [64_000, 100_000, 200_000],
   repo: "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
   revision: "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6",
   quantTag: "MXFP4_MOE",
@@ -499,7 +500,7 @@ const GLM_52: LocalModelCatalogEntry = {
   totalParametersBillions: 753,
   activeParametersBillions: 40,
   modelMaximumContextTokens: 1_048_576,
-  supportedContextTokens: [32_768],
+  supportedContextTokens: [64_000, 100_000, 200_000],
   repo: "unsloth/GLM-5.2-GGUF",
   revision: "abc55e72527792c6e77069c99b4cb7de16fa9f23",
   quantTag: "UD-Q4_K_XL",

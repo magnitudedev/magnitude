@@ -3,6 +3,7 @@ import { Schema } from "effect"
 import { SessionError } from "../errors"
 import {
   LocalInferenceOnboardingSnapshot,
+  LocalInferenceUsageSelection,
   LocalModelDownloadWireEvent,
 } from "../schemas/local-inference"
 
@@ -10,6 +11,15 @@ export const GetLocalInferenceOnboardingSnapshot = Rpc.make(
   "GetLocalInferenceOnboardingSnapshot",
   {
     payload: Schema.Struct({}),
+    success: LocalInferenceOnboardingSnapshot,
+    error: SessionError,
+  },
+)
+
+export const ConfigureLocalInferenceUsage = Rpc.make(
+  "ConfigureLocalInferenceUsage",
+  {
+    payload: LocalInferenceUsageSelection,
     success: LocalInferenceOnboardingSnapshot,
     error: SessionError,
   },

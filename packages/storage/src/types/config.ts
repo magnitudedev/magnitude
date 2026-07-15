@@ -44,15 +44,21 @@ export const ModelConfigSchema = Schema.Struct({
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 
 export const OnboardingConfigSchema = Schema.Struct({
-  cliModelSetupVersion: Schema.optional(Schema.Number.pipe(Schema.int(), Schema.positive())),
   completedAt: Schema.optional(Schema.String),
 })
 export type OnboardingConfig = Schema.Schema.Type<typeof OnboardingConfigSchema>
+
+export const LocalInferenceConfigSchema = Schema.Struct({
+  localModelRole: Schema.Literal('main', 'subagent'),
+  sessionConcurrency: Schema.Literal('one', 'up_to_three'),
+})
+export type LocalInferenceConfig = Schema.Schema.Type<typeof LocalInferenceConfigSchema>
 
 export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   models: Schema.optional(ModelConfigSchema),
   onboarding: Schema.optional(OnboardingConfigSchema),
+  localInference: Schema.optional(LocalInferenceConfigSchema),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>
