@@ -36,6 +36,11 @@ export const formatBytes = (bytes: number): string => {
   return `${(bytes / 1024 ** 2).toFixed(0)} MiB`
 }
 
+export const formatModelSize = (bytes: number): string => {
+  const gb = bytes / 1_000_000_000
+  return `${gb.toFixed(gb >= 10 ? 1 : 2)} GB`
+}
+
 export const formatContext = (tokens: number): string =>
   tokens < 1_000
     ? `${tokens}`
@@ -48,30 +53,38 @@ export const selectionTitle = (selection: LocalInferenceSelection): string =>
     ? selection.recommendation.displayName
     : selection.choice.displayName
 
-export const selectionSubtitle = (selection: LocalInferenceSelection): string => {
-  if (selection.kind !== "recommendation") {
-    return [
-      selection.choice.quantization?.format ?? "Quant unavailable",
-      selection.choice.sizeBytes !== undefined ? formatBytes(selection.choice.sizeBytes) : "Size unavailable",
-      `${formatContext(selection.choice.contextTokens)} context`,
-    ].join(" · ")
-  }
-  const item = selection.recommendation
-  return `${item.quantization.format} · ${formatBytes(item.totalDownloadBytes)} · ${formatContext(item.contextTokens)} context`
-}
-
 const formatBillions = (value: number): string =>
   Number.isInteger(value) ? `${value}B` : `${value.toFixed(1)}B`
 
-export const selectionParameters = (selection: LocalInferenceSelection): string | null => {
+export const selectionMetadata = (selection: LocalInferenceSelection): string => {
   const total = selection.kind === "recommendation"
     ? selection.recommendation.totalParametersBillions
     : selection.choice.totalParametersBillions
   const active = selection.kind === "recommendation"
     ? selection.recommendation.activeParametersBillions
     : selection.choice.activeParametersBillions
-  if (total === undefined) return null
-  return active !== undefined
+  const parameters = total === undefined
+    ? null
+    : active !== undefined
     ? `${formatBillions(total)} total / ${formatBillions(active)} active`
     : `${formatBillions(total)} parameters`
+  const quant = selection.kind === "recommendation"
+    ? selection.recommendation.quantization.format
+    : selection.choice.quantization?.format ?? "Quant unavailable"
+  const size = selection.kind === "recommendation"
+    ? formatModelSize(selection.recommendation.totalDownloadBytes)
+    : selection.choice.sizeBytes !== undefined
+      ? formatModelSize(selection.choice.sizeBytes)
+      : "Size unavailable"
+  const contextTokens = selection.kind === "recommendation"
+    ? selection.recommendation.contextTokens
+    : selection.choice.contextTokens
+  return [quant, size, parameters, `${formatContext(contextTokens)} context`]
+    .filter((value): value is string => value !== null)
+    .join(" · ")
 }
+
+export const selectionFidelity = (selection: LocalInferenceSelection): string | null =>
+  selection.kind === "recommendation"
+    ? selection.recommendation.quantization.fidelityLabel
+    : null

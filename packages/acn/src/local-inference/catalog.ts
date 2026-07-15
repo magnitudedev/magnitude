@@ -7,6 +7,41 @@ const APACHE_LICENSE = {
 } as const
 
 const UNSLOTH_FIDELITY_SOURCE = "https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs"
+const QUANT_FIDELITY_STUDY = "https://arxiv.org/abs/2606.19558"
+
+/**
+ * Cross-model guidance for an Unsloth Dynamic quant tier when no measurement of
+ * the exact catalog artifact has been published. These labels intentionally say
+ * "fidelity", not "accuracy": the cited study found that KLD is useful for
+ * detecting badly degraded quants, but cannot rank downstream task quality once
+ * candidates are already close to the reference.
+ */
+const QUANT_TIER_FIDELITY = {
+  q4: {
+    rank: 40,
+    label: "Good fidelity with some possible quality loss",
+    evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q4_K_XL had KLD 0.0200 and composite score 0.695 and remained in the study's near-baseline group. Exact results can differ by model and calibration.",
+  },
+  q5: {
+    rank: 50,
+    label: "High fidelity with only minor quality loss",
+    evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q5_K_XL had KLD 0.0072 and composite score 0.692 and remained in the study's near-baseline group. Lower KLD means less distribution drift, not guaranteed higher task accuracy.",
+  },
+  q6: {
+    rank: 60,
+    label: "Very high fidelity with minimal quality loss",
+    evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q6_K_XL had KLD 0.0019 and composite score 0.694 and remained in the study's near-baseline group. Exact results can differ by model and calibration.",
+  },
+  q8: {
+    rank: 80,
+    label: "Near-original fidelity with the least quality loss",
+    evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q8_K_XL had KLD 0.0009 and composite score 0.700 and remained in the study's near-baseline group. This describes closeness to BF16 outputs, not coding accuracy.",
+  },
+} as const
+
+export const conventionalQuantFidelityLabel = (
+  bitsClass: "q4" | "q5" | "q6" | "q8",
+): string => QUANT_TIER_FIDELITY[bitsClass].label
 
 interface ArtifactInput {
   readonly modelId: string
@@ -65,13 +100,7 @@ const qwenConventional = (
   variants: readonly [format: "UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL", size: number, sha256: string][],
 ): LocalModelCatalogEntry[] => variants.map(([format, sizeBytes, sha256]) => {
   const bitsClass = format.slice(3, 5).toLowerCase() as "q4" | "q5" | "q6" | "q8"
-  const fidelityRank = { q4: 40, q5: 50, q6: 60, q8: 80 }[bitsClass]
-  const fidelityLabel = {
-    q4: "More quality loss from compression",
-    q5: "Low quality loss from compression",
-    q6: "Very low quality loss from compression",
-    q8: "Minimal quality loss from compression",
-  }[bitsClass]
+  const fidelity = QUANT_TIER_FIDELITY[bitsClass]
   return artifact({
     ...common,
     file: `${common.displayName.replaceAll(" ", "-")}-${format}.gguf`,
@@ -79,9 +108,10 @@ const qwenConventional = (
     sha256,
     format,
     bitsClass,
-    fidelityRank,
-    fidelityLabel,
-    fidelityEvidence: `${format} is an Unsloth Dynamic GGUF. Quant tier describes fidelity relative to the same checkpoint; it is not a coding-accuracy score.`,
+    fidelityRank: fidelity.rank,
+    fidelityLabel: fidelity.label,
+    fidelityEvidence: fidelity.evidence,
+    fidelitySourceUrl: QUANT_FIDELITY_STUDY,
   })
 })
 
@@ -134,14 +164,7 @@ const QWEN_27B = qwenConventional({
   ["UD-Q5_K_XL", 20_038_256_864, "ac310abf2895aa397121bad6c0be89466af41f0f1606a21c1131b110eeb19d0e"],
   ["UD-Q6_K_XL", 25_636_485_344, "8746881d40f280b1b6b858c656a347c754ed3d9cc8d2e1ad46b3635b87f611f8"],
   ["UD-Q8_K_XL", 35_325_163_744, "19a2f4733a863088bc06665bf307dca95f7d4370b4d8690340cdff9992fe48c6"],
-]).map((entry) => entry.quantization.bitsClass === "q5" ? {
-  ...entry,
-  quantization: {
-    ...entry.quantization,
-    fidelityEvidence: "Model-specific quantization analysis reports KLD 0.045526 and 96.187% same-top-token agreement versus the reference. These are fidelity metrics, not coding accuracy.",
-    fidelitySourceUrl: "https://arxiv.org/abs/2606.19558",
-  },
-} : entry)
+])
 
 const QWEN_35B = qwenConventional({
   modelId: "qwen3.6-35b-a3b",
@@ -159,18 +182,25 @@ const QWEN_35B = qwenConventional({
   ["UD-Q5_K_XL", 26_592_508_896, "25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506"],
   ["UD-Q6_K_XL", 31_843_777_504, "f6b6c6d5cfa6f00d964eeb7add28eb14ce7481734d506b90681007678cd2c484"],
   ["UD-Q8_K_XL", 38_451_182_560, "b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8"],
-]).map((entry) => ({
-  ...entry,
-  quantization: {
-    ...entry.quantization,
-    fidelityEvidence: entry.quantization.bitsClass === "q5"
-      ? "Model-specific quantization analysis reports KLD 0.0082 versus the reference. This is a fidelity metric, not coding accuracy."
-      : entry.quantization.bitsClass === "q4"
-        ? "Model-specific analysis places this Q4 artifact in a low-divergence region, making it a deliberate compact choice rather than a generic lowest-bit default."
-        : entry.quantization.fidelityEvidence,
-    fidelitySourceUrl: "https://arxiv.org/abs/2606.19558",
-  },
-}))
+]).map((entry) => {
+  if (entry.quantization.bitsClass !== "q4" && entry.quantization.bitsClass !== "q5") return entry
+
+  const isQ4 = entry.quantization.bitsClass === "q4"
+  return {
+    ...entry,
+    quantization: {
+      ...entry.quantization,
+      fidelityRank: isQ4 ? 40 : 50,
+      fidelityLabel: isQ4
+        ? "Good fidelity in model-specific testing"
+        : "High fidelity in model-specific testing",
+      fidelityEvidence: isQ4
+        ? "Exact-artifact measurement: UD-Q4_K_XL had KLD 0.0135 against BF16 and composite benchmark score 0.728, placing it in the study's near-baseline group. KLD measures output-distribution drift and does not rank task accuracy within that group."
+        : "Exact-artifact measurement: UD-Q5_K_XL had KLD 0.0082 against BF16 and composite benchmark score 0.724, placing it in the study's near-baseline group. Its lower KLD than Q4 did not produce a higher composite score, so KLD is not an accuracy ranking.",
+      fidelitySourceUrl: QUANT_FIDELITY_STUDY,
+    },
+  }
+})
 
 const GEMMA_QAT: LocalModelCatalogEntry[] = [
   artifact({
@@ -190,8 +220,9 @@ const GEMMA_QAT: LocalModelCatalogEntry[] = [
     bitsClass: "q4",
     quantAwareCheckpoint: true,
     fidelityRank: 58,
-    fidelityLabel: "Q4 trained to reduce quality loss",
-    fidelityEvidence: "This exact checkpoint was quantization-aware trained for Q4. That is stronger evidence than applying an ordinary post-training Q4 assumption, but it is not an end-task accuracy guarantee.",
+    fidelityLabel: "Near-original fidelity from quantization-aware training",
+    fidelityEvidence: "Checkpoint-level evidence: Google describes Gemma 4 QAT as preserving similar quality to BF16. This file is Unsloth's UD-Q4_K_XL conversion of those QAT weights; no KLD or downstream delta is published for this exact 26B artifact.",
+    fidelitySourceUrl: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF",
     modelQualityRank: 34,
   }),
   artifact({
@@ -210,8 +241,9 @@ const GEMMA_QAT: LocalModelCatalogEntry[] = [
     bitsClass: "q4",
     quantAwareCheckpoint: true,
     fidelityRank: 58,
-    fidelityLabel: "Q4 trained to reduce quality loss",
-    fidelityEvidence: "This exact checkpoint was quantization-aware trained for Q4. That is stronger evidence than applying an ordinary post-training Q4 assumption, but it is not an end-task accuracy guarantee.",
+    fidelityLabel: "Near-original fidelity from quantization-aware training",
+    fidelityEvidence: "Checkpoint-level evidence: Google describes Gemma 4 QAT as preserving similar quality to BF16. This file is Unsloth's UD-Q4_K_XL conversion of those QAT weights; no KLD or downstream delta is published for this exact 31B artifact.",
+    fidelitySourceUrl: "https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF",
     modelQualityRank: 36,
   }),
 ]
@@ -250,10 +282,10 @@ const NEMOTRON_SUPER: LocalModelCatalogEntry = {
     format: "MXFP4_MOE",
     bitsClass: "mxfp4",
     quantAwareCheckpoint: false,
-    fidelityRank: 45,
-    fidelityLabel: "High compression; quality varies by model",
-    fidelityEvidence: "MXFP4_MOE is a compact MoE artifact format. The quant format alone does not establish native fast execution or coding accuracy on pre-Blackwell NVIDIA, Apple, AMD, Intel, or CPU backends.",
-    fidelitySourceUrl: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+    fidelityRank: 70,
+    fidelityLabel: "Near-original fidelity in benchmark comparisons",
+    fidelityEvidence: "Checkpoint-level benchmark evidence: NVIDIA reports NVFP4 versus BF16 scores of 78.44 versus 78.69 on LiveCodeBench v6, 83.33 versus 83.73 on MMLU-Pro, and 79.42 versus 79.23 on GPQA. NVIDIA pre-trained most linear layers in NVFP4 while retaining selected layers in BF16 or MXFP8. This Unsloth MXFP4_MOE GGUF is a separate conversion, so the Details view must preserve that distinction rather than presenting these as exact-GGUF measurements.",
+    fidelitySourceUrl: "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
   },
   license: {
     id: "other",
@@ -269,6 +301,7 @@ const GLM_52: LocalModelCatalogEntry = {
   family: "glm-5.2",
   displayName: "GLM 5.2",
   architecture: "moe",
+  totalParametersBillions: 753,
   modelMaximumContextTokens: 1_048_576,
   supportedContextTokens: [32_768],
   repo: "unsloth/GLM-5.2-GGUF",
@@ -295,10 +328,12 @@ const GLM_52: LocalModelCatalogEntry = {
     format: "UD-Q4_K_XL",
     bitsClass: "q4",
     quantAwareCheckpoint: false,
+    // Ranking remains at the Q4 tier. The 97.5% measurement is not comparable
+    // to other models' BF16-referenced metrics and must not inflate ordering.
     fidelityRank: 40,
-    fidelityLabel: "Q4 tuned to preserve more quality",
-    fidelityEvidence: "This is the exact UD-Q4_K_XL artifact selected for the catalog. Quant tier is a fidelity description, not a coding-accuracy or consumer-backend performance claim.",
-    fidelitySourceUrl: "https://huggingface.co/unsloth/GLM-5.2-GGUF",
+    fidelityLabel: "Near-original fidelity in quantization tests",
+    fidelityEvidence: "Exact-artifact measurement: Unsloth plots UD-Q4_K_XL at about 97.5% top-1 token agreement with Q8_0 defined as 100%. This is next-token agreement against Q8_0, not BF16 fidelity or coding accuracy; no numeric KLD or downstream delta is tabulated.",
+    fidelitySourceUrl: "https://huggingface.co/unsloth/GLM-5.2-GGUF/discussions/3",
   },
   license: {
     id: "mit",
