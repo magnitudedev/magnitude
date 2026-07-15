@@ -344,19 +344,12 @@ export const LocalInferenceLive: Layer.Layer<
         fitPlan,
       }).pipe(Effect.mapError(fromRuntimeError))
       if (onStage) yield* onStage("verifying")
-      if (target.configuredContextTokens !== selected.contextTokens) {
-        return yield* localError(
-          "context_mismatch",
-          "activate local model",
-          `Runtime configured ${target.configuredContextTokens} tokens; expected ${selected.contextTokens}.`,
-        )
-      }
       const binding: DurableLocalModelBinding = {
         _tag: "Managed",
         selectionId: selected.selectionId,
         artifactId: selected.artifactId,
         providerModelId: selected.providerModelId,
-        contextTokens: selected.contextTokens,
+        contextTokens: target.configuredContextTokens,
         parallelSlots: selected.parallelSlots,
       }
       return { binding, target }

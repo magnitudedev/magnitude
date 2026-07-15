@@ -16,6 +16,7 @@ import {
   buildLocalInferenceSelections,
   formatBytes,
   formatContext,
+  selectedInferenceIndex,
   selectionMetadata,
   selectionTitle,
 } from "./view-model"
@@ -119,13 +120,14 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const role = roleOverride ?? state.usage?.localModelRole ?? "main"
   const concurrency = concurrencyOverride ?? state.usage?.sessionConcurrency ?? "one"
   const [usageRow, setUsageRow] = useState(role === "subagent" ? 1 : 0)
-  const [selectedIndex, setSelectedIndex] = useState(0)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
   const [details, setDetails] = useState(false)
   const [skipHovered, setSkipHovered] = useState(false)
   const [pendingActivationId, setPendingActivationId] = useState<string | null>(null)
   const scrollRef = useRef<ScrollBoxRenderable | null>(null)
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
-  const selected = selections[Math.min(selectedIndex, Math.max(0, selections.length - 1))]
+  const selectedIndex = selectedInferenceIndex(selections, selectedId)
+  const selected = selections[selectedIndex]
   const mutationBusy = local.mutationResults.some(AtomResult.isWaiting)
   const busy = mutationBusy
   const error = local.mutationResults.map(failureMessage).find((message) => message !== null) ?? null
@@ -203,12 +205,12 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
-      if (!busy) setSelectedIndex((index) => Math.max(0, index - 1))
+      if (!busy) setSelectedId(selections[Math.max(0, selectedIndex - 1)]?.id ?? null)
       return
     }
     if (key.name === "down" || key.name === "j" || key.name === "tab") {
       key.preventDefault()
-      if (!busy) setSelectedIndex((index) => Math.min(Math.max(0, selections.length - 1), index + 1))
+      if (!busy) setSelectedId(selections[Math.min(Math.max(0, selections.length - 1), selectedIndex + 1)]?.id ?? null)
       return
     }
     if (key.name === "d") { key.preventDefault(); setDetails((value) => !value); return }
@@ -225,7 +227,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     if (key.name === "return" || key.name === "enter") { key.preventDefault(); confirmModel(); return }
     if (key.name === "left" || key.name === "backspace") { key.preventDefault(); if (!busy) setRequestedStage("usage"); return }
     if (key.name === "escape") { key.preventDefault(); if (!busy) onSkip() }
-  }, [busy, concurrency, confirmModel, continueFromUsage, local, onConfigured, onSkip, role, selected, selections.length, stage, state.activeBinding, usageRow]))
+  }, [busy, concurrency, confirmModel, continueFromUsage, local, onConfigured, onSkip, role, selected, selectedIndex, selections, stage, state.activeBinding, usageRow]))
 
   if (stage === "usage") {
     const focusTarget = LOCAL_USAGE_FOCUS_ORDER[usageRow]!

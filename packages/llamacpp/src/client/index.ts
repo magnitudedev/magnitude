@@ -75,6 +75,11 @@ export type LlamaCppHealth =
 export interface LlamaCppEndpointClient {
   readonly health: Effect.Effect<LlamaCppHealth, never, HttpClient.HttpClient>
   readonly props: Effect.Effect<LlamaCppEndpointProps, LlamaCppEndpointClientError, HttpClient.HttpClient>
+  readonly propsForModel: (providerModelId: string) => Effect.Effect<
+    LlamaCppEndpointProps,
+    LlamaCppEndpointClientError,
+    HttpClient.HttpClient
+  >
   readonly models: Effect.Effect<readonly LlamaCppServedModel[], LlamaCppEndpointClientError, HttpClient.HttpClient>
 }
 
@@ -131,6 +136,14 @@ export const makeLlamaCppEndpointClient = (
         : error(operation, endpoint, "Response did not match the llama.cpp contract", cause)),
     )
 
+  const props = (query = ""): Effect.Effect<
+    LlamaCppEndpointProps,
+    LlamaCppEndpointClientError,
+    HttpClient.HttpClient
+  > => decodeJson("props", PropsResponse, HttpClientRequest.get(`${endpoint}/props${query}`)).pipe(
+    Effect.orElse(() => decodeJson("props", PropsResponse, HttpClientRequest.get(`${endpoint}/v1/props${query}`))),
+  )
+
   return {
     health: Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
@@ -154,9 +167,8 @@ export const makeLlamaCppEndpointClient = (
       if (response.status === 503) return { _tag: "Loading" }
       return { _tag: "Unavailable", message: `HTTP ${response.status}` }
     }),
-    props: decodeJson("props", PropsResponse, HttpClientRequest.get(`${endpoint}/props`)).pipe(
-      Effect.orElse(() => decodeJson("props", PropsResponse, HttpClientRequest.get(`${endpoint}/v1/props`))),
-    ),
+    props: props(),
+    propsForModel: (providerModelId) => props(`?model=${encodeURIComponent(providerModelId)}`),
     models: decodeJson("models", ModelsResponse, HttpClientRequest.get(`${endpoint}/v1/models`)).pipe(
       Effect.map((response) => response.data),
     ),

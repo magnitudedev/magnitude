@@ -31,6 +31,16 @@ export const buildLocalInferenceSelections = (
   ]
 }
 
+export const selectedInferenceIndex = (
+  selections: readonly LocalInferenceSelection[],
+  selectedId: string | null,
+): number => {
+  const index = selectedId === null
+    ? -1
+    : selections.findIndex((selection) => selection.id === selectedId)
+  return index >= 0 ? index : 0
+}
+
 export const formatBytes = (bytes: number): string => {
   const gib = bytes / 1024 ** 3
   return gib >= 1 ? `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`
