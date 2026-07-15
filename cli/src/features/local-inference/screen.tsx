@@ -234,7 +234,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       ? [running.displayName, running.quantization?.format, `${formatContext(running.contextTokens)} context`, running._tag === "RunningManaged" ? "Managed by Magnitude" : "Running outside Magnitude"].filter(Boolean).join(" · ")
       : null
     return (
-      <box style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
+      <box key="local-usage" style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
         <box style={{ flexDirection: "column", paddingTop: 1, flexShrink: 0, width: "100%", maxWidth: LOCAL_USAGE_SETUP_WIDTH }}>
           <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
           <text style={{ fg: theme.foreground }}>Magnitude uses llama.cpp to run local models in the background.</text>
@@ -275,7 +275,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
   const hasExistingModels = firstRunningIndex >= 0 || firstStoredIndex >= 0
   return (
-    <box style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
+    <box key="local-models" style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
       <box style={{ flexDirection: "column", paddingTop: 1, paddingBottom: 1 }}>
       <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
       <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
