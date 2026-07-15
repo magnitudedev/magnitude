@@ -32,6 +32,7 @@ interface EndpointModel {
   readonly sizeBytes?: number
   readonly totalParametersBillions?: number
   readonly quant?: string
+  readonly parallelSlots?: number
 }
 
 interface EndpointProbe {
@@ -118,6 +119,7 @@ const probeEndpoint = (
       : {}
     const propsContext = positiveNumber(settings.n_ctx)
     const propsQuant = typeof props.model_ftype === "string" ? props.model_ftype : undefined
+    const propsParallelSlots = positiveNumber(props.total_slots)
 
     const models: EndpointModel[] = []
     for (const raw of rawModels) {
@@ -144,6 +146,7 @@ const probeEndpoint = (
         ...(typeof meta.ftype === "string"
           ? { quant: meta.ftype }
           : propsQuant ? { quant: propsQuant } : {}),
+        ...(propsParallelSlots !== undefined ? { parallelSlots: propsParallelSlots } : {}),
       })
     }
     if (models.length === 0) {
@@ -181,6 +184,7 @@ const endpointChoice = (
     ? { totalParametersBillions: model.totalParametersBillions }
     : {}),
   contextTokens: model.contextTokens,
+  ...(model.parallelSlots !== undefined ? { parallelSlots: model.parallelSlots } : {}),
   ...(model.modelMaximumContextTokens !== undefined
     ? { modelMaximumContextTokens: model.modelMaximumContextTokens }
     : {}),
@@ -299,6 +303,7 @@ export const LlamaCppRuntimeBridgeEndpointTestLive: Layer.Layer<
           providerId: "llamacpp",
           providerModelId: model.id,
           contextTokens: model.contextTokens,
+          ...(model.parallelSlots !== undefined ? { parallelSlots: model.parallelSlots } : {}),
         }
       }),
     })
@@ -376,10 +381,15 @@ export const LlamaCppRuntimeBridgePendingLive = Layer.succeed(
     // the daemon's final llama.cpp lifecycle service; never spawn a second
     // server manager or restart an unrelated external server from onboarding.
     //
-    // TODO(llamacpp-fit-integration): Start the selected model with its exact
-    // catalog context through the final --fit lifecycle API; use
-    // llama-fit-params only if the runtime bundle exposes it, and never
-    // silently lower the selected context.
+    // TODO(llamacpp-serving-profile-integration, CTO-owned): Translate the
+    // typed uniform serving profile into exact llama.cpp parallel-slot,
+    // total-context, and cache arguments. The requested semantics are N
+    // distinct uniform windows, not one shared/unified KV pool: N is
+    // parallelSlots and the total token capacity is
+    // totalContextCapacityTokens. Run the authoritative fit, then return the
+    // verified actual per-slot allocation. Never silently lower the selected
+    // context or slot count, and do not reconstruct these arguments in
+    // onboarding.
     //
     // TODO(llamacpp-model-metadata): Return verified provider/model identity,
     // loaded quantization, byte size, and actual configured context from the

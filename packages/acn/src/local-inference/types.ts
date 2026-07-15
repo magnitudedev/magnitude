@@ -1,6 +1,7 @@
 import type {
   LocalInferenceCapabilities,
   LocalInferenceFitClass,
+  LocalInferenceServingProfile,
   LocalModelChoice,
   LocalModelDownloadProgress,
 } from "@magnitudedev/protocol"
@@ -67,6 +68,7 @@ export interface EvaluatedLocalConfiguration {
   readonly entry: LocalModelCatalogEntry
   readonly configurationId: string
   readonly contextTokens: number
+  readonly servingProfile: LocalInferenceServingProfile
   readonly estimatedRuntimeBytes: number
   readonly stableCapacityBudgetBytes: number
   readonly fitMarginBytes: number
@@ -90,6 +92,7 @@ export interface LlamaCppActivationResult {
   readonly providerId: string
   readonly providerModelId: string
   readonly contextTokens: number
+  readonly parallelSlots?: number
 }
 
 export interface LlamaCppHuggingFaceSource {
@@ -99,6 +102,7 @@ export interface LlamaCppHuggingFaceSource {
   readonly revision: string
   readonly quantTag: string
   readonly contextTokens: number
+  readonly servingProfile: LocalInferenceServingProfile
   readonly expectedFiles: readonly {
     readonly path: string
     readonly sizeBytes: number

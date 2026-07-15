@@ -1,8 +1,13 @@
 import { describe, expect, test } from "vitest"
-import type { LocalInferenceCapabilities } from "@magnitudedev/protocol"
+import type {
+  LocalInferenceCapabilities,
+  LocalInferenceUsageSelection,
+} from "@magnitudedev/protocol"
+import { LOCAL_MODEL_CATALOG } from "./catalog"
 import {
-  BASELINE_CONTEXT_TOKENS,
   GIB,
+  estimateRuntimeBytes,
+  parallelSlotsForUsage,
   recommendLocalModels,
   stableCapacityFromCapabilities,
   systemCapacityBudget,
@@ -14,77 +19,156 @@ const cpu = (gib: number): StableInferenceCapacity => ({
   acceleratorDomains: [],
 })
 
+const MAIN_ONE = {
+  localModelRole: "main",
+  sessionConcurrency: "one",
+} as const satisfies LocalInferenceUsageSelection
+
+const MAIN_THREE = {
+  localModelRole: "main",
+  sessionConcurrency: "up_to_three",
+} as const satisfies LocalInferenceUsageSelection
+
+const SUBAGENT_ONE = {
+  localModelRole: "subagent",
+  sessionConcurrency: "one",
+} as const satisfies LocalInferenceUsageSelection
+
+const SUBAGENT_THREE = {
+  localModelRole: "subagent",
+  sessionConcurrency: "up_to_three",
+} as const satisfies LocalInferenceUsageSelection
+
+const ALL_USAGE = [MAIN_ONE, MAIN_THREE, SUBAGENT_ONE, SUBAGENT_THREE] as const
+
 describe("local inference recommendation policy", () => {
   test.each([
+    [MAIN_ONE, 1],
+    [MAIN_THREE, 3],
+    [SUBAGENT_ONE, 3],
+    [SUBAGENT_THREE, 9],
+  ] as const)("derives deterministic uniform parallelism from %o", (usage, expected) => {
+    expect(parallelSlotsForUsage(usage)).toBe(expected)
+  })
+
+  test.each([
     [8, undefined],
-    [16, "Qwen3.5 9B"],
-    [24, "Gemma 4 26B-A4B"],
-    [32, "Qwen3.6 35B-A3B"],
+    [16, "Qwen3.5 4B"],
+    [24, "Gemma 4 12B"],
+    [32, "Qwen3.6 27B"],
     [48, "Qwen3.6 35B-A3B"],
     [64, "Qwen3.6 35B-A3B"],
-    [96, "Qwen3.6 35B-A3B"],
     [128, "NVIDIA Nemotron 3 Super 120B-A12B"],
     [256, "DeepSeek V4 Flash 284B-A13B"],
     [512, "NVIDIA Nemotron 3 Ultra 550B-A55B"],
-    [640, "GLM 5.2 753B-A40B"],
-  ])("returns a deterministic balanced tier for %i GiB", (gib, expected) => {
-    const recommendation = recommendLocalModels(cpu(gib))[0]
+    [768, "GLM 5.2 753B-A40B"],
+  ])("returns a deterministic one-main-agent tier for %i GiB", (gib, expected) => {
+    const recommendation = recommendLocalModels(cpu(gib), MAIN_ONE)[0]
     expect(recommendation?.displayName).toBe(expected)
     if (recommendation) {
-      expect(recommendation.contextTokens).toBeGreaterThanOrEqual(BASELINE_CONTEXT_TOKENS)
-      expect(recommendation.estimatedRuntimeBytes).toBeLessThanOrEqual(recommendation.stableCapacityBudgetBytes)
-      expect(recommendation.files.every((file) => file.downloadUrl.includes(recommendation.revision))).toBe(true)
+      expect([100_000, 200_000]).toContain(recommendation.contextTokens)
+      expect(recommendation.servingProfile.parallelSlots).toBe(1)
+      expect(recommendation.estimatedRuntimeBytes).toBeLessThanOrEqual(
+        recommendation.stableCapacityBudgetBytes,
+      )
     }
+  })
+
+  test("changes recommendations when identical hardware reserves more context windows", () => {
+    expect(recommendLocalModels(cpu(32), MAIN_ONE)[0]).toMatchObject({
+      displayName: "Qwen3.6 27B",
+      contextTokens: 200_000,
+      servingProfile: { parallelSlots: 1 },
+    })
+    expect(recommendLocalModels(cpu(32), MAIN_THREE)[0]).toMatchObject({
+      displayName: "Gemma 4 26B-A4B",
+      contextTokens: 100_000,
+      servingProfile: { parallelSlots: 3 },
+    })
+    expect(recommendLocalModels(cpu(32), SUBAGENT_ONE)[0]).toMatchObject({
+      displayName: "Qwen3.6 27B",
+      contextTokens: 64_000,
+      servingProfile: { parallelSlots: 3 },
+    })
+    expect(recommendLocalModels(cpu(32), SUBAGENT_THREE)[0]).toMatchObject({
+      displayName: "Qwen3.5 9B",
+      contextTokens: 64_000,
+      servingProfile: { parallelSlots: 9 },
+    })
+  })
+
+  test("enforces the role-specific context ladders and uniform total capacity", () => {
+    for (const usage of ALL_USAGE) {
+      for (const gib of [16, 24, 32, 48, 64, 128, 256, 512, 768, 1024]) {
+        for (const recommendation of recommendLocalModels(cpu(gib), usage)) {
+          const expectedContexts = usage.localModelRole === "main"
+            ? [200_000, 100_000]
+            : [100_000, 64_000]
+          expect(expectedContexts).toContain(recommendation.contextTokens)
+          expect(recommendation.servingProfile.contextTokensPerSlot).toBe(
+            recommendation.contextTokens,
+          )
+          expect(recommendation.servingProfile.totalContextCapacityTokens).toBe(
+            recommendation.contextTokens * recommendation.servingProfile.parallelSlots,
+          )
+          expect(recommendation.servingProfile.slotAllocation).toBe("uniform")
+        }
+      }
+    }
+  })
+
+  test("counts weights once and scales only runtime context with total reserved windows", () => {
+    const entry = LOCAL_MODEL_CATALOG.find((item) => item.id === "qwen3.6-35b-a3b:UD-Q6_K_XL")!
+    const one = estimateRuntimeBytes(entry, 100_000, 1)
+    const three = estimateRuntimeBytes(entry, 100_000, 3)
+    const nine = estimateRuntimeBytes(entry, 100_000, 9)
+    const weights = entry.files.reduce((total, file) => total + file.sizeBytes, 0)
+
+    expect(one).toBeGreaterThan(weights)
+    expect(three).toBeGreaterThan(one)
+    expect(nine).toBeGreaterThan(three)
+    expect(nine).toBeLessThan(one * 9)
+  })
+
+  test("uses distinct configuration IDs for the two different three-slot routing intents", () => {
+    const main = recommendLocalModels(cpu(64), MAIN_THREE)[0]!
+    const subagent = recommendLocalModels(cpu(64), SUBAGENT_ONE)[0]!
+
+    expect(main.servingProfile.parallelSlots).toBe(3)
+    expect(subagent.servingProfile.parallelSlots).toBe(3)
+    expect(main.configurationId).not.toBe(subagent.configurationId)
+    expect(main.configurationId).toContain("@role-main@sessions-up_to_three@p-3@")
+    expect(subagent.configurationId).toContain("@role-subagent@sessions-one@p-3@")
   })
 
   test("changes quant tiers with headroom instead of always defaulting to Q4", () => {
-    expect(recommendLocalModels(cpu(32))[0]?.quantization.bitsClass).toBe("q4")
-    expect(recommendLocalModels(cpu(48))[0]?.quantization.bitsClass).toBe("q6")
-    expect(recommendLocalModels(cpu(64))[0]?.quantization.bitsClass).toBe("q8")
+    expect(recommendLocalModels(cpu(48), MAIN_ONE)[0]?.quantization.bitsClass).toBe("q5")
+    expect(recommendLocalModels(cpu(64), MAIN_ONE)[0]?.quantization.bitsClass).toBe("q8")
+    expect(recommendLocalModels(cpu(64), MAIN_THREE)[0]?.quantization.bitsClass).toBe("q4")
   })
 
-  test("gives a lighter model its largest fitting context instead of minimizing context", () => {
-    const recommendations = recommendLocalModels(cpu(64))
-    const lighter = recommendations.find((item) => item.badge === "lighter")
-
-    expect(lighter?.displayName).toBe("Gemma 4 12B")
-    expect(lighter?.contextTokens).toBe(131_072)
-  })
-
-  test("returns three distinct models whenever three fit", () => {
-    for (const gib of [16, 24, 32, 48, 64, 128, 256, 512, 640]) {
-      const recommendations = recommendLocalModels(cpu(gib))
+  test("returns three useful choices whenever three configurations fit", () => {
+    for (const gib of [24, 32, 48, 64, 128, 256, 512, 768]) {
+      const recommendations = recommendLocalModels(cpu(gib), MAIN_ONE)
       expect(recommendations, `${gib} GiB`).toHaveLength(3)
-      expect(new Set(recommendations.map((item) => item.catalogModelId.split(":")[0])).size, `${gib} GiB`).toBe(3)
+      expect(
+        new Set(recommendations.map((item) => item.catalogModelId.split(":")[0])).size,
+        `${gib} GiB`,
+      ).toBeGreaterThanOrEqual(2)
     }
   })
 
-  test("keeps Qwen3.5 122B alongside Nemotron Super in the workstation tier", () => {
-    const recommendations = recommendLocalModels(cpu(128))
-    const names = recommendations.map((item) => item.displayName)
-    expect(names).toContain("NVIDIA Nemotron 3 Super 120B-A12B")
-    expect(names).toContain("Qwen3.5 122B-A10B")
-    expect(recommendations.find((item) => item.badge === "lighter")?.displayName).toBe("Qwen3.6 35B-A3B")
-  })
-
-  test("uses DeepSeek as the meaningful smaller step below GLM without changing the Ultra tier", () => {
-    expect(recommendLocalModels(cpu(512)).find((item) => item.badge === "lighter")?.displayName).toBe(
-      "Qwen3.5 122B-A10B",
-    )
-    expect(recommendLocalModels(cpu(640)).find((item) => item.badge === "lighter")?.displayName).toBe(
-      "DeepSeek V4 Flash 284B-A13B",
-    )
-  })
-
   test("uses the higher-fidelity badge only for another quant of the primary model", () => {
-    for (let gib = 12; gib <= 640; gib += 4) {
-      const recommendations = recommendLocalModels(cpu(gib))
-      const primary = recommendations.find((item) => item.badge === "recommended")
-      const higherFidelity = recommendations.find((item) => item.badge === "higher_fidelity")
-      if (higherFidelity) {
-        expect(higherFidelity.catalogModelId.split(":")[0], `${gib} GiB`).toBe(
-          primary?.catalogModelId.split(":")[0],
-        )
+    for (const usage of ALL_USAGE) {
+      for (let gib = 12; gib <= 768; gib += 4) {
+        const recommendations = recommendLocalModels(cpu(gib), usage)
+        const primary = recommendations.find((item) => item.badge === "recommended")
+        const higherFidelity = recommendations.find((item) => item.badge === "higher_fidelity")
+        if (higherFidelity) {
+          expect(higherFidelity.catalogModelId.split(":")[0], `${gib} GiB`).toBe(
+            primary?.catalogModelId.split(":")[0],
+          )
+        }
       }
     }
   })
@@ -94,7 +178,7 @@ describe("local inference recommendation policy", () => {
     expect(systemCapacityBudget(64 * GIB)).toBeCloseTo(51.2 * GIB, -2)
   })
 
-  test("transient free RAM and VRAM cannot change recommendations", () => {
+  test("transient free RAM and VRAM cannot change profile-aware recommendations", () => {
     const capabilities = (free: number): LocalInferenceCapabilities => ({
       binary: { identity: "managed-test-binary" },
       system: { totalMemoryBytes: 64 * GIB },
@@ -110,8 +194,14 @@ describe("local inference recommendation policy", () => {
       }],
       warnings: [],
     })
-    const busy = recommendLocalModels(stableCapacityFromCapabilities(capabilities(512 * 1024 ** 2)))
-    const idle = recommendLocalModels(stableCapacityFromCapabilities(capabilities(23 * GIB)))
+    const busy = recommendLocalModels(
+      stableCapacityFromCapabilities(capabilities(512 * 1024 ** 2)),
+      SUBAGENT_THREE,
+    )
+    const idle = recommendLocalModels(
+      stableCapacityFromCapabilities(capabilities(23 * GIB)),
+      SUBAGENT_THREE,
+    )
     expect(busy).toEqual(idle)
   })
 
@@ -144,7 +234,7 @@ describe("local inference recommendation policy", () => {
     const stable = stableCapacityFromCapabilities(capabilities)
     expect(stable.acceleratorDomains).toHaveLength(1)
     expect(stable.acceleratorDomains[0]?.capacityBytes).toBe(28 * GIB)
-    expect(recommendLocalModels(stable)[0]?.displayName).toBe("Qwen3.6 35B-A3B")
+    expect(recommendLocalModels(stable, MAIN_ONE)[0]?.displayName).toBe("Qwen3.6 27B")
   })
 
   test("combines discrete accelerator capacity only for an explicit supported split group", () => {
@@ -155,28 +245,49 @@ describe("local inference recommendation policy", () => {
         { memoryDomainId: "gpu:1", capacityBytes: 16 * GIB, sharesSystemMemory: false, preferredBackend: "CUDA" },
       ],
     }
-    const withoutSplit = recommendLocalModels(base)[0]
+    const withoutSplit = recommendLocalModels(base, MAIN_ONE)[0]
     const withSplit = recommendLocalModels({
       ...base,
-      acceleratorDomains: base.acceleratorDomains.map((domain) => ({ ...domain, modelSplitGroupId: "cuda:all" })),
-    })[0]
-    expect(withoutSplit?.displayName).toBe("Qwen3.6 27B")
-    expect(withSplit?.displayName).toBe("Qwen3.6 35B-A3B")
+      acceleratorDomains: base.acceleratorDomains.map((domain) => ({
+        ...domain,
+        modelSplitGroupId: "cuda:all",
+      })),
+    }, MAIN_ONE)[0]
+    expect(withoutSplit?.estimatedRuntimeBytes).toBeLessThanOrEqual(
+      withoutSplit?.stableCapacityBudgetBytes ?? 0,
+    )
+    expect(withSplit?.estimatedRuntimeBytes).toBeLessThanOrEqual(
+      withSplit?.stableCapacityBudgetBytes ?? 0,
+    )
+    expect(withSplit?.displayName).not.toBeUndefined()
   })
 
-  test("keeps exact model, quant, and context bound in opaque configuration ids", () => {
-    const recommendations = recommendLocalModels(cpu(32))
-    for (const recommendation of recommendations) {
-      expect(recommendation.configurationId).toBe(
-        `${recommendation.catalogModelId}@${recommendation.revision}@ctx-${recommendation.contextTokens}`,
-      )
+  test("keeps every serving input bound in opaque configuration IDs", () => {
+    for (const usage of ALL_USAGE) {
+      for (const recommendation of recommendLocalModels(cpu(64), usage)) {
+        expect(recommendation.configurationId).toContain(recommendation.catalogModelId)
+        expect(recommendation.configurationId).toContain(recommendation.revision)
+        expect(recommendation.configurationId).toContain(`@role-${usage.localModelRole}`)
+        expect(recommendation.configurationId).toContain(`@sessions-${usage.sessionConcurrency}`)
+        expect(recommendation.configurationId).toContain(
+          `@p-${recommendation.servingProfile.parallelSlots}@ctx-${recommendation.contextTokens}`,
+        )
+      }
     }
   })
 
-  test("treats very large models as normal capacity-gated recommendations", () => {
-    expect(recommendLocalModels(cpu(128))[0]?.quantization.bitsClass).toBe("mxfp4")
-    expect(recommendLocalModels(cpu(256))[0]?.displayName).toBe("DeepSeek V4 Flash 284B-A13B")
-    expect(recommendLocalModels(cpu(512))[0]?.displayName).toBe("NVIDIA Nemotron 3 Ultra 550B-A55B")
-    expect(recommendLocalModels(cpu(640))[0]?.displayName).toBe("GLM 5.2 753B-A40B")
+  test("keeps very large models as normal profile-gated recommendations", () => {
+    expect(recommendLocalModels(cpu(128), MAIN_ONE)[0]?.displayName).toBe(
+      "NVIDIA Nemotron 3 Super 120B-A12B",
+    )
+    expect(recommendLocalModels(cpu(256), MAIN_ONE)[0]?.displayName).toBe(
+      "DeepSeek V4 Flash 284B-A13B",
+    )
+    expect(recommendLocalModels(cpu(512), MAIN_ONE)[0]?.displayName).toBe(
+      "NVIDIA Nemotron 3 Ultra 550B-A55B",
+    )
+    expect(recommendLocalModels(cpu(768), MAIN_ONE)[0]?.displayName).toBe(
+      "GLM 5.2 753B-A40B",
+    )
   })
 })

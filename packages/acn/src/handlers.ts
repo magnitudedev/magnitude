@@ -333,6 +333,12 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localInference.getSnapshot,
         ),
 
+      ConfigureLocalInferenceUsage: (usage) =>
+        observeRpcDefects(
+          "ConfigureLocalInferenceUsage",
+          localInference.configureUsage(usage),
+        ),
+
       StartLocalModelDownload: ({ configurationId }) =>
         observeRpcDefects(
           "StartLocalModelDownload",

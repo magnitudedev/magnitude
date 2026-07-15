@@ -53,6 +53,7 @@ describe("attach-only llama.cpp endpoint bridge", () => {
         if (path === "/props") return Response.json({
           build_info: "test-build",
           model_ftype: "Q6_K",
+          total_slots: 4,
           default_generation_settings: { n_ctx: 65_536 },
         })
         return new Response("missing", { status: 404 })
@@ -74,6 +75,7 @@ describe("attach-only llama.cpp endpoint bridge", () => {
       displayName: "Qwen3.6 35B-A3B",
       providerModelId: "/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
       contextTokens: 65_536,
+      parallelSlots: 4,
       totalParametersBillions: 35.505251456,
       managed: false,
       compatible: true,
@@ -87,6 +89,7 @@ describe("attach-only llama.cpp endpoint bridge", () => {
       providerId: "llamacpp",
       providerModelId: "/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
       contextTokens: 65_536,
+      parallelSlots: 4,
     })
   })
 

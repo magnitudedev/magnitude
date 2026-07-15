@@ -11,16 +11,16 @@ import {
 } from "./view-model"
 
 const snapshot: LocalInferenceOnboardingSnapshot = {
-  schemaVersion: 2,
   onboarding: { required: true },
   configuration: { usable: false },
+  usage: { selection: { localModelRole: "main", sessionConcurrency: "one" } },
   runtime: { status: "ready", canDownload: true, canActivate: true },
   running: [{
     choiceId: "running-1",
     source: "running",
     displayName: "Running model",
     providerModelId: "running",
-    contextTokens: 32_768,
+    contextTokens: 100_000,
     fitClass: "unknown",
     managed: false,
     compatible: true,
@@ -72,7 +72,16 @@ const snapshot: LocalInferenceOnboardingSnapshot = {
     totalDownloadBytes: 10,
     sourcePageUrl: "https://example.com/model",
     license: { id: "apache-2.0", url: "https://example.com/license", acknowledgementRequired: false },
-    contextTokens: 32_768,
+    contextTokens: 100_000,
+    servingProfile: {
+      localModelRole: "main",
+      sessionConcurrency: "one",
+      parallelSlots: 1,
+      contextTokensPerSlot: 100_000,
+      totalContextCapacityTokens: 100_000,
+      slotAllocation: "uniform",
+      runtimeProfileId: "test-profile",
+    },
     modelMaximumContextTokens: 262_144,
     estimatedRuntimeBytes: 20,
     stableCapacityBudgetBytes: 30,
@@ -102,9 +111,9 @@ describe("local inference onboarding view model", () => {
 
   test("puts quant, size, parameters, and context on one metadata line", () => {
     const [running, , recommendation] = buildLocalInferenceSelections(snapshot)
-    expect(running && selectionMetadata(running)).toBe("Quant unavailable · Size unavailable · 32K context")
+    expect(running && selectionMetadata(running)).toBe("Quant unavailable · Size unavailable · 100K context")
     expect(running && selectionFidelity(running)).toBeNull()
-    expect(recommendation && selectionMetadata(recommendation)).toBe("UD-Q5_K_XL · 0.00 GB · 32K context")
+    expect(recommendation && selectionMetadata(recommendation)).toBe("UD-Q5_K_XL · 0.00 GB · 100K context")
     expect(recommendation && selectionFidelity(recommendation)).toBe("High fidelity with only minor quality loss")
   })
 
@@ -120,19 +129,19 @@ describe("local inference onboarding view model", () => {
     }).find((selection) => selection.kind === "recommendation")
 
     expect(recommendation && selectionMetadata(recommendation)).toBe(
-      "UD-Q5_K_XL · 0.00 GB · 5.1B total / 2.3B effective · 32K context",
+      "UD-Q5_K_XL · 0.00 GB · 5.1B total / 2.3B effective · 100K context",
     )
   })
 
-  test("gates only on versioned walkthrough completion or an explicit rerun", () => {
+  test("gates only on walkthrough completion or an explicit rerun", () => {
     expect(shouldShowLocalInferenceOnboarding(snapshot, false)).toBe(true)
     expect(shouldShowLocalInferenceOnboarding({
       ...snapshot,
-      onboarding: { required: false, completedVersion: 2 },
+      onboarding: { required: false, completedAt: "2026-07-14T22:00:00.000Z" },
     }, false)).toBe(false)
     expect(shouldShowLocalInferenceOnboarding({
       ...snapshot,
-      onboarding: { required: false, completedVersion: 2 },
+      onboarding: { required: false, completedAt: "2026-07-14T22:00:00.000Z" },
     }, true)).toBe(true)
   })
 })

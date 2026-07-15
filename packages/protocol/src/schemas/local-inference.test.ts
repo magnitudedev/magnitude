@@ -2,6 +2,8 @@ import { describe, expect, test } from "vitest"
 import { Schema } from "effect"
 import {
   LocalInferenceCapabilities,
+  LocalInferenceServingProfile,
+  LocalInferenceUsageSelection,
   LocalModelDownloadProgress,
 } from "./local-inference"
 
@@ -34,5 +36,35 @@ describe("local inference protocol schemas", () => {
       resumable: true,
     })).toThrow()
   })
-})
 
+  test("accepts only the two supported usage choices", () => {
+    expect(Schema.decodeUnknownSync(LocalInferenceUsageSelection)({
+      localModelRole: "subagent",
+      sessionConcurrency: "up_to_three",
+    })).toEqual({
+      localModelRole: "subagent",
+      sessionConcurrency: "up_to_three",
+    })
+    expect(() => Schema.decodeUnknownSync(LocalInferenceUsageSelection)({
+      localModelRole: "both",
+      sessionConcurrency: "unlimited",
+    })).toThrow()
+  })
+
+  test("requires positive uniform serving-profile dimensions", () => {
+    const profile = {
+      localModelRole: "main",
+      sessionConcurrency: "up_to_three",
+      parallelSlots: 3,
+      contextTokensPerSlot: 100_000,
+      totalContextCapacityTokens: 300_000,
+      slotAllocation: "uniform",
+      runtimeProfileId: "profile",
+    }
+    expect(Schema.decodeUnknownSync(LocalInferenceServingProfile)(profile)).toEqual(profile)
+    expect(() => Schema.decodeUnknownSync(LocalInferenceServingProfile)({
+      ...profile,
+      parallelSlots: 0,
+    })).toThrow()
+  })
+})

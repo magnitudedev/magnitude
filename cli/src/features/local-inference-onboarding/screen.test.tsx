@@ -26,14 +26,35 @@ vi.mock("../../components/button", () => ({
 }))
 const {
   LOCAL_MODEL_SECTION_WIDTH,
+  LocalUsageSetupView,
+  ModelSetupOnboardingView,
   LocalInferenceOnboardingView,
   localModelSectionRule,
+  moveLocalUsageFocus,
 } = await import("./screen")
 
+const controller = {
+  operationId: null,
+  downloadConfigurationId: null,
+  progress: null,
+  error: null,
+  busy: false,
+  usageSnapshot: null,
+  configureUsage: async () => snapshot,
+  startDownload: async () => {},
+  cancelDownload: async () => {},
+  activate: async () => true,
+  configureCloud: async () => {},
+  completeOnboarding: async () => true,
+  cloudKeyAlreadySet: false,
+} as const
+
 const snapshot: LocalInferenceOnboardingSnapshot = {
-  schemaVersion: 2,
   onboarding: { required: true },
   configuration: { usable: false },
+  usage: {
+    selection: { localModelRole: "main", sessionConcurrency: "one" },
+  },
   runtime: {
     status: "ready",
     canDownload: true,
@@ -84,7 +105,16 @@ const snapshot: LocalInferenceOnboardingSnapshot = {
     totalDownloadBytes: 22_360_456_160,
     sourcePageUrl: "https://huggingface.co/source",
     license: { id: "apache-2.0", url: "https://www.apache.org/licenses/LICENSE-2.0", acknowledgementRequired: false },
-    contextTokens: 32_768,
+    contextTokens: 200_000,
+    servingProfile: {
+      localModelRole: "main",
+      sessionConcurrency: "one",
+      parallelSlots: 1,
+      contextTokensPerSlot: 200_000,
+      totalContextCapacityTokens: 200_000,
+      slotAllocation: "uniform",
+      runtimeProfileId: "test-profile",
+    },
     modelMaximumContextTokens: 262_144,
     estimatedRuntimeBytes: 25_000_000_000,
     stableCapacityBudgetBytes: 25_769_803_776,
@@ -96,6 +126,77 @@ const snapshot: LocalInferenceOnboardingSnapshot = {
   warnings: [],
 }
 
+test("asks both usage questions before displaying dynamic recommendations", () => {
+  const html = renderToStaticMarkup(
+    <ModelSetupOnboardingView
+      snapshot={snapshot}
+      onExit={() => {}}
+      onComplete={() => {}}
+      controller={controller}
+    />,
+  )
+  expect(html).toContain("How do you plan to use local models?")
+  expect(html).toContain("Magnitude uses llama.cpp to run local models in the background.")
+  expect(html).toContain("Answer two questions and we&#x27;ll recommend Hugging Face models that fit your setup.")
+  expect(html).toContain("As my main agent")
+  expect(html).toContain("For local subagents")
+  expect(html).toContain("Uses a cloud main agent and reserves three context windows for local subagents.")
+  expect(html).toContain("How many Magnitude sessions will you run at once?")
+  expect(html).toContain("One session")
+  expect(html).toContain("Multiple sessions")
+  expect(html).toContain("smaller recommended local model")
+  expect(html).toContain("See recommendations")
+  expect(html).not.toContain("Qwen3.6 35B-A3B")
+})
+
+test("renders a detected external llama.cpp server without a separate attachment choice", () => {
+  const html = renderToStaticMarkup(
+    <LocalUsageSetupView
+      snapshot={{
+        ...snapshot,
+        running: [{
+          choiceId: "running-qwen",
+          source: "running",
+          displayName: "Qwen3.6 35B-A3B",
+          providerModelId: "qwen-running",
+          quantization: {
+            format: "Q6_K",
+            bitsClass: "q6",
+            quantAwareCheckpoint: false,
+            fidelityLabel: "Very high fidelity with minimal quality loss",
+            fidelityEvidence: "Reported by server",
+            fidelitySourceUrl: "https://github.com/ggml-org/llama.cpp",
+          },
+          contextTokens: 200_000,
+          fitClass: "unknown",
+          managed: false,
+          compatible: true,
+          explanation: "running",
+        }],
+      }}
+      localModelRole="main"
+      sessionConcurrency="one"
+      onSelectRole={() => {}}
+      onSelectConcurrency={() => {}}
+      onContinue={() => {}}
+      onSkip={() => {}}
+      onExit={() => {}}
+      busy={false}
+    />,
+  )
+  expect(html).toContain("llama.cpp server detected")
+  expect(html).toContain("Qwen3.6 35B-A3B · Q6_K · 200K context · Running outside Magnitude")
+  expect(html).not.toContain("Use Running Server")
+  expect(html).not.toContain("we’ll check")
+})
+
+test("moves one keyboard focus cursor across all choices and continue", () => {
+  expect(moveLocalUsageFocus(0, -1)).toBe(0)
+  expect(moveLocalUsageFocus(0, 1)).toBe(1)
+  expect(moveLocalUsageFocus(3, 1)).toBe(4)
+  expect(moveLocalUsageFocus(4, 1)).toBe(4)
+})
+
 test("renders stable capacity and exact recommendation metadata without an API-key gate", () => {
   const html = renderToStaticMarkup(
     <LocalInferenceOnboardingView
@@ -103,12 +204,15 @@ test("renders stable capacity and exact recommendation metadata without an API-k
       onExit={() => {}}
       onConfigured={() => {}}
       onSkip={() => {}}
+      onBack={() => {}}
       controller={{
         operationId: null,
         downloadConfigurationId: null,
         progress: null,
         error: null,
         busy: false,
+        usageSnapshot: null,
+        configureUsage: async () => snapshot,
         startDownload: async () => {},
         cancelDownload: async () => {},
         activate: async () => true,
@@ -123,8 +227,8 @@ test("renders stable capacity and exact recommendation metadata without an API-k
   expect(html).toContain("Metal: Apple GPU (28.0 GiB total)")
   expect(html).toContain("Qwen3.6 35B-A3B")
   expect(html).toContain("UD-Q4_K_XL")
-  expect(html).toContain("32K context")
-  expect(html).toContain("UD-Q4_K_XL · 22.4 GB · 35B total / 3B active · 32K context")
+  expect(html).toContain("200K context")
+  expect(html).toContain("UD-Q4_K_XL · 22.4 GB · 35B total / 3B active · 200K context")
   expect(html).toContain("Good fidelity with some possible quality loss")
   expect(html).toContain("Skip for now (Esc)")
   expect(html).not.toContain("Recommendations use total capacity")
@@ -156,12 +260,15 @@ test("shows recommendations while the CTO-owned llama.cpp bootstrap boundary is 
       onExit={() => {}}
       onConfigured={() => {}}
       onSkip={() => {}}
+      onBack={() => {}}
       controller={{
         operationId: null,
         downloadConfigurationId: null,
         progress: null,
         error: null,
         busy: false,
+        usageSnapshot: null,
+        configureUsage: async () => snapshot,
         startDownload: async () => {},
         cancelDownload: async () => {},
         activate: async () => true,
@@ -215,12 +322,15 @@ test("separates running inventory from possible downloads", () => {
       onExit={() => {}}
       onConfigured={() => {}}
       onSkip={() => {}}
+      onBack={() => {}}
       controller={{
         operationId: null,
         downloadConfigurationId: null,
         progress: null,
         error: null,
         busy: false,
+        usageSnapshot: null,
+        configureUsage: async () => snapshot,
         startDownload: async () => {},
         cancelDownload: async () => {},
         activate: async () => true,

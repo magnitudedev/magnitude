@@ -1,6 +1,8 @@
 import type {
   LocalInferenceCapabilities,
   LocalInferenceFitClass,
+  LocalInferenceServingProfile,
+  LocalInferenceUsageSelection,
   LocalModelRecommendation,
 } from "@magnitudedev/protocol"
 import { LOCAL_MODEL_CATALOG, catalogFileUrl, catalogSourcePageUrl } from "./catalog"
@@ -12,7 +14,36 @@ import type {
 
 export const GIB = 1024 ** 3
 export const BASELINE_CONTEXT_TOKENS = 32_768
-const CONTEXT_TARGETS = [131_072, 65_536, 32_768, 16_384] as const
+export const MAIN_AGENT_CONTEXT_TARGETS = [200_000, 100_000] as const
+export const SUBAGENT_CONTEXT_TARGETS = [100_000, 64_000] as const
+
+export const parallelSlotsForUsage = (usage: LocalInferenceUsageSelection): number => {
+  const requestsPerSession = usage.localModelRole === "main" ? 1 : 3
+  const sessionMultiplier = usage.sessionConcurrency === "one" ? 1 : 3
+  return requestsPerSession * sessionMultiplier
+}
+
+const contextTargetsForUsage = (usage: LocalInferenceUsageSelection): readonly number[] =>
+  usage.localModelRole === "main" ? MAIN_AGENT_CONTEXT_TARGETS : SUBAGENT_CONTEXT_TARGETS
+
+const minimumContextForUsage = (usage: LocalInferenceUsageSelection): number =>
+  contextTargetsForUsage(usage).at(-1)!
+
+const servingProfile = (
+  entry: LocalModelCatalogEntry,
+  usage: LocalInferenceUsageSelection,
+  contextTokensPerSlot: number,
+): LocalInferenceServingProfile => {
+  const parallelSlots = parallelSlotsForUsage(usage)
+  return {
+    ...usage,
+    parallelSlots,
+    contextTokensPerSlot,
+    totalContextCapacityTokens: parallelSlots * contextTokensPerSlot,
+    slotAllocation: "uniform",
+    runtimeProfileId: `conservative-v2:${entry.id}:p${parallelSlots}:ctx${contextTokensPerSlot}`,
+  }
+}
 
 export const stableCapacityFromCapabilities = (
   capabilities: LocalInferenceCapabilities,
@@ -49,20 +80,27 @@ export const acceleratorCapacityBudget = (totalBytes: number): number =>
  * overhead. The exact downloaded model is still authoritatively fitted by the
  * CTO-owned lifecycle integration before activation.
  */
-export const estimateRuntimeBytes = (entry: LocalModelCatalogEntry, contextTokens: number): number => {
+export const estimateRuntimeBytes = (
+  entry: LocalModelCatalogEntry,
+  contextTokensPerSlot: number,
+  parallelSlots: number,
+): number => {
   const weights = entry.files.reduce((total, file) => total + file.sizeBytes, 0)
   const computeAndGraph = Math.max(768 * 1024 ** 2, weights * 0.04)
   const contextAt32K = Math.max(GIB, weights * 0.06)
-  const contextAndKv = contextAt32K * (contextTokens / BASELINE_CONTEXT_TOKENS)
+  const totalContextTokens = contextTokensPerSlot * parallelSlots
+  const contextAndKv = contextAt32K * (totalContextTokens / BASELINE_CONTEXT_TOKENS)
   return Math.ceil(weights + computeAndGraph + contextAndKv)
 }
 
 const fitConfiguration = (
   capacity: StableInferenceCapacity,
   entry: LocalModelCatalogEntry,
-  contextTokens: number,
+  usage: LocalInferenceUsageSelection,
+  contextTokensPerSlot: number,
 ): EvaluatedLocalConfiguration | null => {
-  const estimatedRuntimeBytes = estimateRuntimeBytes(entry, contextTokens)
+  const profile = servingProfile(entry, usage, contextTokensPerSlot)
+  const estimatedRuntimeBytes = estimateRuntimeBytes(entry, contextTokensPerSlot, profile.parallelSlots)
   const systemBudget = systemCapacityBudget(capacity.systemMemoryBytes)
   const discreteDomains = capacity.acceleratorDomains
     .filter((domain) => domain.sharesSystemMemory === false)
@@ -101,26 +139,28 @@ const fitConfiguration = (
 
   return {
     entry,
-    configurationId: `${entry.id}@${entry.revision}@ctx-${contextTokens}`,
-    contextTokens,
+    configurationId: `${entry.id}@${entry.revision}@role-${usage.localModelRole}@sessions-${usage.sessionConcurrency}@p-${profile.parallelSlots}@ctx-${contextTokensPerSlot}@${profile.runtimeProfileId}`,
+    contextTokens: contextTokensPerSlot,
+    servingProfile: profile,
     estimatedRuntimeBytes,
     stableCapacityBudgetBytes,
     fitMarginBytes: Math.max(0, stableCapacityBudgetBytes - estimatedRuntimeBytes),
     fitClass,
-    constrainedContext: contextTokens < BASELINE_CONTEXT_TOKENS,
+    constrainedContext: contextTokensPerSlot < minimumContextForUsage(usage),
   }
 }
 
 export const evaluateCatalog = (
   capacity: StableInferenceCapacity,
+  usage: LocalInferenceUsageSelection,
   catalog: readonly LocalModelCatalogEntry[] = LOCAL_MODEL_CATALOG,
 ): EvaluatedLocalConfiguration[] => {
   const result: EvaluatedLocalConfiguration[] = []
   for (const entry of catalog) {
-    for (const contextTokens of CONTEXT_TARGETS) {
+    for (const contextTokens of contextTargetsForUsage(usage)) {
       if (!entry.supportedContextTokens.includes(contextTokens)) continue
       if (contextTokens > entry.modelMaximumContextTokens) continue
-      const evaluated = fitConfiguration(capacity, entry, contextTokens)
+      const evaluated = fitConfiguration(capacity, entry, usage, contextTokens)
       if (evaluated) result.push(evaluated)
     }
   }
@@ -212,21 +252,23 @@ const toRecommendation = (
     sourcePageUrl: catalogSourcePageUrl(entry),
     license: entry.license,
     contextTokens: item.contextTokens,
+    servingProfile: item.servingProfile,
     modelMaximumContextTokens: entry.modelMaximumContextTokens,
     estimatedRuntimeBytes: item.estimatedRuntimeBytes,
     stableCapacityBudgetBytes: item.stableCapacityBudgetBytes,
     fitMarginBytes: item.fitMarginBytes,
     fitClass: item.fitClass,
     constrainedContext: item.constrainedContext,
-    explanation: `${entry.quantization.fidelityLabel} ${entry.quantization.format} at ${Math.round(item.contextTokens / 1024)}K context; ${acceleration}.`,
+    explanation: `${entry.quantization.fidelityLabel} ${entry.quantization.format} at ${Math.round(item.contextTokens / 1_000)}K context across ${item.servingProfile.parallelSlots} uniform local slot${item.servingProfile.parallelSlots === 1 ? "" : "s"}; ${acceleration}.`,
   }
 }
 
 export const recommendLocalModels = (
   capacity: StableInferenceCapacity,
+  usage: LocalInferenceUsageSelection,
   catalog: readonly LocalModelCatalogEntry[] = LOCAL_MODEL_CATALOG,
 ): LocalModelRecommendation[] => {
-  const evaluated = evaluateCatalog(capacity, catalog).sort(recommendedOrder)
+  const evaluated = evaluateCatalog(capacity, usage, catalog).sort(recommendedOrder)
   const normal = evaluated.filter((item) => !item.constrainedContext)
   const pool = normal.length > 0 ? normal : evaluated
   const recommended = pool[0]
@@ -278,5 +320,6 @@ export const recommendLocalModels = (
 export const resolveConfiguration = (
   configurationId: string,
   capacity: StableInferenceCapacity,
+  usage: LocalInferenceUsageSelection,
 ): EvaluatedLocalConfiguration | undefined =>
-  evaluateCatalog(capacity).find((configuration) => configuration.configurationId === configurationId)
+  evaluateCatalog(capacity, usage).find((configuration) => configuration.configurationId === configurationId)

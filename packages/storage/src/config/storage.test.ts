@@ -33,15 +33,22 @@ describe("config storage onboarding state", () => {
         primary: { providerId: "llamacpp", providerModelId: "model" },
         secondary: { providerId: "llamacpp", providerModelId: "model" },
       })
-      yield* config.completeCliModelSetupOnboarding(2, "2026-07-14T22:00:00.000Z")
+      yield* config.setLocalInferenceConfig({
+        localModelRole: "subagent",
+        sessionConcurrency: "up_to_three",
+      })
+      yield* config.completeCliModelSetupOnboarding("2026-07-14T22:00:00.000Z")
       return yield* config.load()
     }).pipe(Effect.provide(base)))
 
     expect(result.models?.slots?.primary).toEqual({ providerId: "llamacpp", providerModelId: "model" })
     expect(result.models?.slots?.secondary).toEqual({ providerId: "llamacpp", providerModelId: "model" })
     expect(result.onboarding).toEqual({
-      cliModelSetupVersion: 2,
       completedAt: "2026-07-14T22:00:00.000Z",
+    })
+    expect(result.localInference).toEqual({
+      localModelRole: "subagent",
+      sessionConcurrency: "up_to_three",
     })
   })
 })
