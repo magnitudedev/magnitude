@@ -7,7 +7,7 @@ import {
 } from "@magnitudedev/protocol"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import { resolveLlamaCppAuth, type EndpointProviderAuthConfig } from "../shared-client"
-import { LOCAL_MODEL_CATALOG } from "./catalog"
+import { conventionalQuantFidelityLabel, LOCAL_MODEL_CATALOG } from "./catalog"
 import type { LlamaCppRuntimeBridgeShape, QuantBitsClass } from "./types"
 
 export class LlamaCppRuntimeBridge extends Context.Tag("LlamaCppRuntimeBridge")<
@@ -51,6 +51,15 @@ const quantBitsClass = (format: string): QuantBitsClass => {
   if (normalized.includes("q6")) return "q6"
   if (normalized.includes("q8")) return "q8"
   return "other"
+}
+
+const reportedQuantFidelityLabel = (format: string): string => {
+  const bitsClass = quantBitsClass(format)
+  if (bitsClass === "q4" || bitsClass === "q5" || bitsClass === "q6" || bitsClass === "q8") {
+    return conventionalQuantFidelityLabel(bitsClass)
+  }
+  if (bitsClass === "fp8") return conventionalQuantFidelityLabel("q8")
+  return "Quantization fidelity unavailable"
 }
 
 const displayName = (modelId: string): string => {
@@ -162,7 +171,7 @@ const endpointChoice = (
       format: model.quant,
       bitsClass: quantBitsClass(model.quant),
       quantAwareCheckpoint: false,
-      fidelityLabel: `Server-reported ${model.quant}`,
+      fidelityLabel: reportedQuantFidelityLabel(model.quant),
       fidelityEvidence: "The running llama.cpp server reported this loaded quant. Artifact revision and quantization-aware-training status are not inferred from a filename.",
       fidelitySourceUrl: "https://github.com/ggml-org/llama.cpp",
     },

@@ -77,7 +77,11 @@ describe("attach-only llama.cpp endpoint bridge", () => {
       totalParametersBillions: 35.505251456,
       managed: false,
       compatible: true,
-      quantization: expect.objectContaining({ format: "Q6_K", bitsClass: "q6" }),
+      quantization: expect.objectContaining({
+        format: "Q6_K",
+        bitsClass: "q6",
+        fidelityLabel: "Very high fidelity with minimal quality loss",
+      }),
     })])
     expect(result.activated).toEqual({
       providerId: "llamacpp",

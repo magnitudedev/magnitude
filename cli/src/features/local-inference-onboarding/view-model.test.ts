@@ -4,8 +4,9 @@ import {
   buildLocalInferenceSelections,
   formatBytes,
   formatContext,
-  selectionParameters,
-  selectionSubtitle,
+  formatModelSize,
+  selectionFidelity,
+  selectionMetadata,
   shouldShowLocalInferenceOnboarding,
 } from "./view-model"
 
@@ -60,7 +61,7 @@ const snapshot: LocalInferenceOnboardingSnapshot = {
       format: "UD-Q5_K_XL",
       bitsClass: "q5",
       quantAwareCheckpoint: false,
-      fidelityLabel: "Balanced",
+      fidelityLabel: "High fidelity with only minor quality loss",
       fidelityEvidence: "fidelity evidence",
       fidelitySourceUrl: "https://example.com/evidence",
     },
@@ -94,15 +95,17 @@ describe("local inference onboarding view model", () => {
 
   test("formats capacities and contexts for terminal cards", () => {
     expect(formatBytes(6_743_680_224)).toBe("6.28 GiB")
+    expect(formatModelSize(6_743_680_224)).toBe("6.74 GB")
     expect(formatContext(65_536)).toBe("64K")
     expect(formatContext(200_192)).toBe("200K")
   })
 
-  test("keeps internal fit classifications out of card subtitles", () => {
+  test("puts quant, size, parameters, and context on one metadata line", () => {
     const [running, , recommendation] = buildLocalInferenceSelections(snapshot)
-    expect(running && selectionSubtitle(running)).toBe("Quant unavailable · Size unavailable · 32K context")
-    expect(recommendation && selectionSubtitle(recommendation)).toBe("UD-Q5_K_XL · 0 MiB · 32K context")
-    expect(recommendation && selectionParameters(recommendation)).toBeNull()
+    expect(running && selectionMetadata(running)).toBe("Quant unavailable · Size unavailable · 32K context")
+    expect(running && selectionFidelity(running)).toBeNull()
+    expect(recommendation && selectionMetadata(recommendation)).toBe("UD-Q5_K_XL · 0.00 GB · 32K context")
+    expect(recommendation && selectionFidelity(recommendation)).toBe("High fidelity with only minor quality loss")
   })
 
   test("gates only on versioned walkthrough completion or an explicit rerun", () => {

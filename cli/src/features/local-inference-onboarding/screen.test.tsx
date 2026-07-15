@@ -64,7 +64,7 @@ const snapshot: LocalInferenceOnboardingSnapshot = {
       format: "UD-Q4_K_XL",
       bitsClass: "q4",
       quantAwareCheckpoint: false,
-      fidelityLabel: "Compact",
+      fidelityLabel: "Good fidelity with some possible quality loss",
       fidelityEvidence: "Model-specific low-divergence evidence; this is not coding accuracy.",
       fidelitySourceUrl: "https://arxiv.org/abs/2606.19558",
     },
@@ -120,6 +120,8 @@ test("renders stable capacity and exact recommendation metadata without an API-k
   expect(html).toContain("Qwen3.6 35B-A3B")
   expect(html).toContain("UD-Q4_K_XL")
   expect(html).toContain("32K context")
+  expect(html).toContain("UD-Q4_K_XL · 22.4 GB · 35B total / 3B active · 32K context")
+  expect(html).toContain("Good fidelity with some possible quality loss")
   expect(html).toContain("Skip for now (Esc)")
   expect(html).not.toContain("Recommendations use total capacity")
   expect(html).not.toContain("cloud fallback")
@@ -175,7 +177,7 @@ test("separates running inventory from possible downloads", () => {
             format: "Q6_K",
             bitsClass: "q6",
             quantAwareCheckpoint: false,
-            fidelityLabel: "Q6",
+            fidelityLabel: "Server-reported Q6 fidelity",
             fidelityEvidence: "Reported by server",
             fidelitySourceUrl: "https://github.com/ggml-org/llama.cpp",
           },
@@ -217,8 +219,8 @@ test("separates running inventory from possible downloads", () => {
   )
   expect(html).toContain("RUNNING NOW")
   expect(html).toContain("POSSIBLE DOWNLOADS")
-  expect(html).toContain("Q6_K · 30.4 GiB · 200K context")
-  expect(html).toContain("35.5B parameters")
+  expect(html).toContain("Q6_K · 32.6 GB · 35.5B parameters · 200K context")
+  expect(html).not.toContain("Server-reported Q6 fidelity")
   expect(html).toContain("Already Running")
   expect(html).toContain("Higher Fidelity Option")
   expect(html).not.toContain("cpu or unified")

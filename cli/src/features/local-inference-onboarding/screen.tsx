@@ -10,8 +10,8 @@ import {
   buildLocalInferenceSelections,
   formatBytes,
   formatContext,
-  selectionParameters,
-  selectionSubtitle,
+  selectionFidelity,
+  selectionMetadata,
   selectionTitle,
 } from "./view-model"
 import { useLocalInferenceOnboarding } from "./use-local-inference-onboarding"
@@ -335,12 +335,9 @@ export const LocalInferenceOnboardingView = memo(function LocalInferenceOnboardi
                     </text>
                   )}
                 </box>
-                <text style={{ fg: theme.muted }}>{selectionSubtitle(selection)}</text>
-                {selectionParameters(selection) && (
-                  <text style={{ fg: theme.muted }}>
-                    {selectionParameters(selection)}
-                    {recommendation ? ` · Quantization: ${recommendation.quantization.fidelityLabel}` : ""}
-                  </text>
+                <text style={{ fg: theme.muted }}>{selectionMetadata(selection)}</text>
+                {selectionFidelity(selection) && (
+                  <text style={{ fg: theme.muted }}>{selectionFidelity(selection)}</text>
                 )}
               </box>
             </Fragment>
