@@ -290,7 +290,14 @@ describe("LocalInference service", () => {
           serverId: "llamacpp",
           ownership: "external",
           health: "ready",
-          models: [{ providerModelId: "external-model", contextTokens: 32_768 }],
+          models: [{
+            providerModelId: "external-model",
+            modelPath: null,
+            displayName: null,
+            contextTokens: 32_768,
+            quantization: null,
+            sizeBytes: null,
+          }],
           build: "test",
         }],
       }),
@@ -356,6 +363,53 @@ describe("LocalInference service", () => {
       contextTokens: 32_768,
     }])
     expect(managedStops).toBe(1)
+  })
+
+  it("enriches a known running artifact with its curated name, quant, and live size", async () => {
+    const runtime: LlamaCppRuntimeApi = {
+      inspect: Effect.succeed({
+        managed: null,
+        external: [{
+          serverId: "llamacpp",
+          ownership: "external",
+          health: "ready",
+          models: [{
+            providerModelId: "/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+            modelPath: "/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+            displayName: null,
+            contextTokens: 200_192,
+            quantization: "Q6_K",
+            sizeBytes: 32_600_719_872,
+          }],
+          build: "test",
+        }],
+      }),
+      ensureServing: () => Effect.die("state inspection must not load a model"),
+      stopManaged: Effect.void,
+    }
+    const modelStore: LlamaCppModelStoreApi = {
+      inspect: Effect.succeed({ artifacts: [], warnings: [] }),
+      resolve: () => Effect.die("state inspection must not resolve an artifact"),
+      download: () => Stream.empty,
+      deleteOwned: () => Effect.void,
+    }
+    const layer = localInferenceLayer(
+      modelStore,
+      runtime,
+      makeConfiguration({ usage: { localModelRole: "main", sessionConcurrency: "one" } }),
+    )
+
+    const state = await Effect.runPromise(
+      Effect.flatMap(LocalInference, (service) => service.state).pipe(Effect.provide(layer)),
+    )
+
+    expect(state.choices).toContainEqual(expect.objectContaining({
+      _tag: "RunningExternal",
+      displayName: "Qwen3.6 35B-A3B",
+      contextTokens: 200_192,
+      sizeBytes: 32_600_719_872,
+      quantization: expect.objectContaining({ format: "UD-Q6_K_XL" }),
+    }))
   })
 
   it("deletes an arbitrary Magnitude-owned stored choice without requiring a catalog entry", async () => {

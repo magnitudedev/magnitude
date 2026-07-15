@@ -141,10 +141,10 @@ describe("local inference recommendation policy", () => {
     expect(subagent.configurationId).toContain("@role-subagent@sessions-one@p-3@")
   })
 
-  test("changes quant tiers with headroom instead of always defaulting to Q4", () => {
-    expect(recommendLocalModels(cpu(48), MAIN_ONE)[0]?.quantization.bitsClass).toBe("q5")
-    expect(recommendLocalModels(cpu(64), MAIN_ONE)[0]?.quantization.bitsClass).toBe("q8")
-    expect(recommendLocalModels(cpu(64), MAIN_THREE)[0]?.quantization.bitsClass).toBe("q4")
+  test("changes quant formats with headroom instead of always defaulting to Q4", () => {
+    expect(recommendLocalModels(cpu(48), MAIN_ONE)[0]?.quantization.format).toBe("UD-Q5_K_XL")
+    expect(recommendLocalModels(cpu(64), MAIN_ONE)[0]?.quantization.format).toBe("UD-Q8_K_XL")
+    expect(recommendLocalModels(cpu(64), MAIN_THREE)[0]?.quantization.format).toBe("UD-Q4_K_XL")
   })
 
   test("returns three useful choices whenever three configurations fit", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import type { LocalInferenceState, LocalModelRecommendation } from "@magnitudedev/sdk"
-import { buildLocalInferenceSelections } from "./view-model"
+import { buildLocalInferenceSelections, selectionMetadata } from "./view-model"
 
 const recommendation: LocalModelRecommendation = {
   configurationId: "configuration-1",
@@ -11,7 +11,6 @@ const recommendation: LocalModelRecommendation = {
   architecture: "dense",
   quantization: {
     format: "Q4_K_M",
-    bitsClass: "q4",
     quantAwareCheckpoint: false,
     fidelityLabel: "Test fidelity",
     fidelityEvidence: "Test evidence",
@@ -87,13 +86,23 @@ describe("local inference selection view model", () => {
         fitClass: "unknown",
         compatible: true,
         explanation: "Observed read-only endpoint.",
+        quantization: {
+          format: "UD-Q6_K_XL",
+          quantAwareCheckpoint: false,
+          fidelityLabel: "Very high fidelity with minimal quality loss",
+          fidelityEvidence: "Catalog evidence.",
+          fidelitySourceUrl: "https://example.invalid/model",
+        },
+        sizeBytes: 32_600_719_872,
       }],
       recommendations: [],
     }
 
-    expect(buildLocalInferenceSelections(state)).toEqual([expect.objectContaining({
+    const selections = buildLocalInferenceSelections(state)
+    expect(selections).toEqual([expect.objectContaining({
       kind: "running",
       id: "external-choice",
     })])
+    expect(selectionMetadata(selections[0]!)).toBe("UD-Q6_K_XL · 30.4 GiB · 48K context")
   })
 })

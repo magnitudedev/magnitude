@@ -198,7 +198,11 @@ export interface ServingTarget {
 
 export interface ServedModelObservation {
   readonly providerModelId: string
+  readonly modelPath: string | null
+  readonly displayName: string | null
   readonly contextTokens: number | null
+  readonly quantization: string | null
+  readonly sizeBytes: number | null
 }
 
 export interface LlamaCppServerObservation {

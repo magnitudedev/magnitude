@@ -9,12 +9,7 @@ const APACHE_LICENSE = {
 const UNSLOTH_FIDELITY_SOURCE = "https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs"
 const QUANT_FIDELITY_STUDY = "https://arxiv.org/abs/2606.19558"
 const PRODUCT_CONTEXT_TARGETS = [64_000, 100_000, 200_000] as const
-const QWEN_CONVENTIONAL_BITS = {
-  "UD-Q4_K_XL": "q4",
-  "UD-Q5_K_XL": "q5",
-  "UD-Q6_K_XL": "q6",
-  "UD-Q8_K_XL": "q8",
-} satisfies Record<"UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL", "q4" | "q5" | "q6" | "q8">
+type ConventionalQuantFormat = "UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL"
 
 const catalogFiles = (
   files: readonly (readonly [path: string, sizeBytes: number, sha256: string])[],
@@ -31,23 +26,23 @@ const catalogFiles = (
  * detecting badly degraded quants, but cannot rank downstream task quality once
  * candidates are already close to the reference.
  */
-const QUANT_TIER_FIDELITY = {
-  q4: {
+const CONVENTIONAL_QUANT_FIDELITY = {
+  "UD-Q4_K_XL": {
     rank: 40,
     label: "Good fidelity with some possible quality loss",
     evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q4_K_XL had KLD 0.0200 and composite score 0.695 and remained in the study's near-baseline group. Exact results can differ by model and calibration.",
   },
-  q5: {
+  "UD-Q5_K_XL": {
     rank: 50,
     label: "High fidelity with only minor quality loss",
     evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q5_K_XL had KLD 0.0072 and composite score 0.692 and remained in the study's near-baseline group. Lower KLD means less distribution drift, not guaranteed higher task accuracy.",
   },
-  q6: {
+  "UD-Q6_K_XL": {
     rank: 60,
     label: "Very high fidelity with minimal quality loss",
     evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q6_K_XL had KLD 0.0019 and composite score 0.694 and remained in the study's near-baseline group. Exact results can differ by model and calibration.",
   },
-  q8: {
+  "UD-Q8_K_XL": {
     rank: 80,
     label: "Near-original fidelity with the least quality loss",
     evidence: "Cross-model guidance, not a measurement of this exact artifact. In a published Devstral cohort, UD-Q8_K_XL had KLD 0.0009 and composite score 0.700 and remained in the study's near-baseline group. This describes closeness to BF16 outputs, not coding accuracy.",
@@ -55,8 +50,8 @@ const QUANT_TIER_FIDELITY = {
 } as const
 
 export const conventionalQuantFidelityLabel = (
-  bitsClass: "q4" | "q5" | "q6" | "q8",
-): string => QUANT_TIER_FIDELITY[bitsClass].label
+  format: ConventionalQuantFormat,
+): string => CONVENTIONAL_QUANT_FIDELITY[format].label
 
 interface ArtifactInput {
   readonly modelId: string
@@ -73,7 +68,6 @@ interface ArtifactInput {
   readonly sizeBytes: number
   readonly sha256: string
   readonly format: string
-  readonly bitsClass: "q4" | "q5" | "q6" | "q8"
   readonly quantAwareCheckpoint?: boolean
   readonly fidelityRank: number
   readonly fidelityLabel: string
@@ -103,7 +97,6 @@ const artifact = (input: ArtifactInput): LocalModelCatalogEntry => ({
   files: [{ path: input.file, sizeBytes: input.sizeBytes, sha256: input.sha256 }],
   quantization: {
     format: input.format,
-    bitsClass: input.bitsClass,
     quantAwareCheckpoint: input.quantAwareCheckpoint ?? false,
     fidelityRank: input.fidelityRank,
     fidelityLabel: input.fidelityLabel,
@@ -115,18 +108,16 @@ const artifact = (input: ArtifactInput): LocalModelCatalogEntry => ({
 })
 
 const qwenConventional = (
-  common: Omit<ArtifactInput, "file" | "sizeBytes" | "sha256" | "format" | "bitsClass" | "fidelityRank" | "fidelityLabel" | "fidelityEvidence">,
-  variants: readonly [format: "UD-Q4_K_XL" | "UD-Q5_K_XL" | "UD-Q6_K_XL" | "UD-Q8_K_XL", file: string, size: number, sha256: string][],
+  common: Omit<ArtifactInput, "file" | "sizeBytes" | "sha256" | "format" | "fidelityRank" | "fidelityLabel" | "fidelityEvidence">,
+  variants: readonly [format: ConventionalQuantFormat, file: string, size: number, sha256: string][],
 ): LocalModelCatalogEntry[] => variants.map(([format, file, sizeBytes, sha256]) => {
-  const bitsClass = QWEN_CONVENTIONAL_BITS[format]
-  const fidelity = QUANT_TIER_FIDELITY[bitsClass]
+  const fidelity = CONVENTIONAL_QUANT_FIDELITY[format]
   return artifact({
     ...common,
     file,
     sizeBytes,
     sha256,
     format,
-    bitsClass,
     fidelityRank: fidelity.rank,
     fidelityLabel: fidelity.label,
     fidelityEvidence: fidelity.evidence,
@@ -202,9 +193,9 @@ const QWEN_35B = qwenConventional({
   ["UD-Q6_K_XL", "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf", 31_843_777_504, "f6b6c6d5cfa6f00d964eeb7add28eb14ce7481734d506b90681007678cd2c484"],
   ["UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf", 38_451_182_560, "b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8"],
 ]).map((entry) => {
-  if (entry.quantization.bitsClass !== "q4" && entry.quantization.bitsClass !== "q5") return entry
+  if (entry.quantization.format !== "UD-Q4_K_XL" && entry.quantization.format !== "UD-Q5_K_XL") return entry
 
-  const isQ4 = entry.quantization.bitsClass === "q4"
+  const isQ4 = entry.quantization.format === "UD-Q4_K_XL"
   return {
     ...entry,
     quantization: {
@@ -236,7 +227,6 @@ const GEMMA_QAT: LocalModelCatalogEntry[] = [
     sizeBytes: 2_620_368_960,
     sha256: "cd4526493dccbfd6791bee8822e37e30340074d1d4d9aada52ce09afefd6a33a",
     format: "UD-Q4_K_XL",
-    bitsClass: "q4",
     quantAwareCheckpoint: true,
     fidelityRank: 58,
     fidelityLabel: "Near-original fidelity from quantization-aware training",
@@ -257,7 +247,6 @@ const GEMMA_QAT: LocalModelCatalogEntry[] = [
     sizeBytes: 6_716_355_328,
     sha256: "cc9ff072e0a8203429ed854e6662c17a6c2bc1e5dca5b475dd4736caaacbc165",
     format: "UD-Q4_K_XL",
-    bitsClass: "q4",
     quantAwareCheckpoint: true,
     fidelityRank: 58,
     fidelityLabel: "Near-original fidelity from quantization-aware training",
@@ -279,7 +268,6 @@ const GEMMA_QAT: LocalModelCatalogEntry[] = [
     sizeBytes: 14_249_045_120,
     sha256: "dcf179a91153e3a7ece792e48ef872180d9d6ef9b7677f0a0bd3e83cfe624d5e",
     format: "UD-Q4_K_XL",
-    bitsClass: "q4",
     quantAwareCheckpoint: true,
     fidelityRank: 58,
     fidelityLabel: "Near-original fidelity from quantization-aware training",
@@ -300,7 +288,6 @@ const GEMMA_QAT: LocalModelCatalogEntry[] = [
     sizeBytes: 17_287_668_064,
     sha256: "9188a71055550f1e60b875d02b7abb63625ac11b4a6f148d6b22b3b28ba3d335",
     format: "UD-Q4_K_XL",
-    bitsClass: "q4",
     quantAwareCheckpoint: true,
     fidelityRank: 58,
     fidelityLabel: "Near-original fidelity from quantization-aware training",
@@ -342,7 +329,6 @@ const NEMOTRON_SUPER: LocalModelCatalogEntry = {
   ],
   quantization: {
     format: "MXFP4_MOE",
-    bitsClass: "mxfp4",
     quantAwareCheckpoint: false,
     fidelityRank: 70,
     fidelityLabel: "Near-original fidelity in benchmark comparisons",
@@ -389,11 +375,10 @@ const QWEN_122B: LocalModelCatalogEntry = {
   ],
   quantization: {
     format: "UD-Q4_K_XL",
-    bitsClass: "q4",
     quantAwareCheckpoint: false,
-    fidelityRank: QUANT_TIER_FIDELITY.q4.rank,
-    fidelityLabel: QUANT_TIER_FIDELITY.q4.label,
-    fidelityEvidence: QUANT_TIER_FIDELITY.q4.evidence,
+    fidelityRank: CONVENTIONAL_QUANT_FIDELITY["UD-Q4_K_XL"].rank,
+    fidelityLabel: CONVENTIONAL_QUANT_FIDELITY["UD-Q4_K_XL"].label,
+    fidelityEvidence: CONVENTIONAL_QUANT_FIDELITY["UD-Q4_K_XL"].evidence,
     fidelitySourceUrl: QUANT_FIDELITY_STUDY,
   },
   license: APACHE_LICENSE,
@@ -445,10 +430,9 @@ const DEEPSEEK_V4_FLASH: LocalModelCatalogEntry = {
   ],
   quantization: {
     format: "UD-Q8_K_XL",
-    bitsClass: "q8",
     quantAwareCheckpoint: false,
-    fidelityRank: QUANT_TIER_FIDELITY.q8.rank,
-    fidelityLabel: QUANT_TIER_FIDELITY.q8.label,
+    fidelityRank: CONVENTIONAL_QUANT_FIDELITY["UD-Q8_K_XL"].rank,
+    fidelityLabel: CONVENTIONAL_QUANT_FIDELITY["UD-Q8_K_XL"].label,
     fidelityEvidence: "Q8 guidance, not a measurement of this exact artifact. Q8 GGUF conversion minimizes additional distribution drift, while the source DeepSeek V4 Flash checkpoint already uses mixed FP4 and FP8 weights. No exact-GGUF KLD or downstream coding delta is provided.",
     fidelitySourceUrl: "https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF",
   },
@@ -486,7 +470,6 @@ const NEMOTRON_ULTRA: LocalModelCatalogEntry = {
   ]),
   quantization: {
     format: "MXFP4_MOE",
-    bitsClass: "mxfp4",
     quantAwareCheckpoint: false,
     fidelityRank: 70,
     fidelityLabel: "Near-original fidelity in benchmark comparisons",
@@ -529,7 +512,6 @@ const GLM_52: LocalModelCatalogEntry = {
   ]),
   quantization: {
     format: "UD-Q4_K_XL",
-    bitsClass: "q4",
     quantAwareCheckpoint: false,
     // Ranking remains at the Q4 tier. The 97.5% measurement is not comparable
     // to other models' BF16-referenced metrics and must not inflate ordering.
@@ -560,6 +542,22 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
 ]
 
 export const LOCAL_MODEL_CATALOG_BY_ID = new Map(LOCAL_MODEL_CATALOG.map((entry) => [entry.id, entry]))
+
+const modelFileName = (value: string): string => value.replaceAll("\\", "/").split("/").at(-1) ?? value
+
+/** Match only an exact catalog filename; never infer model identity from a partial or normalized name. */
+export const catalogEntryForModelReferences = (
+  references: readonly (string | null | undefined)[],
+): LocalModelCatalogEntry | null => {
+  const fileNames = new Set(
+    references
+      .filter((value): value is string => value !== null && value !== undefined)
+      .map((value) => modelFileName(value).toLowerCase()),
+  )
+  return LOCAL_MODEL_CATALOG.find((entry) => entry.files.some(
+    (file) => fileNames.has(modelFileName(file.path).toLowerCase()),
+  )) ?? null
+}
 
 export const catalogFileUrl = (entry: LocalModelCatalogEntry, path: string): string =>
   `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${path.split("/").map(encodeURIComponent).join("/")}`

@@ -147,18 +147,28 @@ const observeConnection = (
       ? reportedModels
       : reportedModels.filter((model) => model.id === managedProviderModelId)
     const sharedContext = props.default_generation_settings?.n_ctx
+    const sharedMetadata = models.length === 1 ? props : {}
     return {
       serverId,
       ownership,
       health: "ready",
-      models: models.map((model) => ({
-        providerModelId: model.id,
-        contextTokens: model.meta?.n_ctx !== undefined && model.meta.n_ctx > 0
-          ? model.meta.n_ctx
-          : sharedContext !== undefined && sharedContext > 0
-            ? sharedContext
-            : null,
-      })),
+      models: models.map((model) => {
+        const metadata = verifiedMetadata(model, sharedMetadata)
+        return {
+          providerModelId: model.id,
+          modelPath: reportedModelPath(model, sharedMetadata),
+          displayName: metadataString(model, "general.name")
+            ?? metadataString(model, "general_name")
+            ?? null,
+          contextTokens: model.meta?.n_ctx !== undefined && model.meta.n_ctx > 0
+            ? model.meta.n_ctx
+            : sharedContext !== undefined && sharedContext > 0
+              ? sharedContext
+              : null,
+          quantization: metadata.quantization,
+          sizeBytes: metadata.sizeBytes,
+        }
+      }),
       build: props.build_info ?? null,
     }
   })
