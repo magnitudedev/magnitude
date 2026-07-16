@@ -2,7 +2,7 @@
  * SettingsPanel — unified settings + usage panel
  *
  * Replaces the entire chat-column when open. Has a tab bar to switch
- * between Settings (API key + roles) and Usage (balance + charts).
+ * between Settings (API key + roles) and Usage (subscription limits + charts).
  * No modal chrome — fills its parent container.
  */
 import { useState, useCallback, type ReactNode } from "react"
@@ -10,7 +10,7 @@ import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import { formatTokensCompact } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
-import type { BalanceResponse, UsagePeriod, SlotId, ReasoningEffort } from "@magnitudedev/sdk"
+import type { CloudUsageResponse, UsagePeriod, SlotId, ReasoningEffort } from "@magnitudedev/sdk"
 import { ModelCatalogLifecycle, ModelSlotsLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS, DEFAULT_REASONING_EFFORT } from "@magnitudedev/sdk"
 import type { UseModelConfigResult } from "@magnitudedev/client-common"
 
@@ -83,8 +83,8 @@ export interface SettingsPanelProps {
   usageLoading?: boolean
   /** Usage error message */
   usageError?: string | null
-  /** GetBalance response */
-  usageData?: BalanceResponse | null
+  /** GetCloudUsage response */
+  usageData?: CloudUsageResponse | null
   /** Current usage period */
   usagePeriod: UsagePeriod
   /** Called when usage period changes */
@@ -377,14 +377,12 @@ function UsageTab({
 }: {
   loading: boolean
   error: string | null
-  data: BalanceResponse | null
+  data: CloudUsageResponse | null
   period: UsagePeriod
   onPeriodChange: (period: UsagePeriod) => void
 }): ReactNode {
-  const balance = data?.data.balance.cents != null ? data.data.balance.cents / 100 : null
-  const autoReload = data?.data.autoReload ?? null
-  const autoReloadError = autoReload?.lastFailure ? autoReload.lastFailure.reason : null
-  const hasPaymentMethod = data?.data.hasPaymentMethod ?? false
+  const subscription = data?.data.subscription ?? null
+  const usageWindows = data?.data.usageWindows ?? {}
   const totals = data?.data.usage.totals ?? null
   const byModel = data?.data.usage.byModel ?? []
   const dailyTokens = data?.data.usage.dailyTokens ?? []
@@ -406,73 +404,30 @@ function UsageTab({
 
       {!loading && !error && data && (
         <>
-          {/* Balance strip */}
+          {/* Cloud subscription and current limit windows */}
           <div style={{ marginBottom: 16 }}>
-            {balance != null && (
-              <>
-                <span style={{ fontSize: 14, fontWeight: 600, color: "var(--fg-primary)" }}>
-                  Balance:{" "}
+            {subscription && (
+              <div style={{ fontSize: 14, fontWeight: 600, color: "var(--fg-primary)" }}>
+                Cloud subscription: <span style={{ color: "var(--accent-primary)" }}>
+                  {subscription.status === "active" ? subscription.plan.label : "Not subscribed"}
                 </span>
-                <span
-                  style={{
-                    fontSize: 14,
-                    fontWeight: 600,
-                    color:
-                      balance <= 1
-                        ? "var(--accent-error)"
-                        : "var(--accent-success)",
-                  }}
-                >
-                  ${balance.toFixed(2)}
-                </span>
-              </>
-            )}
-            <div style={{ marginTop: 4 }}>
-              <span style={{ fontSize: 12, color: "var(--fg-secondary)" }}>
-                Auto-reload:{" "}
-                {autoReload && autoReload.enabled
-                  ? `at $${(autoReload.thresholdCents / 100).toFixed(2)} \u2192 +$${(autoReload.amountCents / 100).toFixed(2)}`
-                  : "off"}
-              </span>
-            </div>
-            <div style={{ marginTop: 4, display: "flex", alignItems: "center", gap: 6 }}>
-              <span
-                style={{
-                  display: "inline-block",
-                  width: 8,
-                  height: 8,
-                  borderRadius: "50%",
-                  background: hasPaymentMethod
-                    ? "var(--accent-success)"
-                    : "var(--fg-tertiary)",
-                }}
-              />
-              <span style={{ fontSize: 12, color: "var(--fg-secondary)" }}>
-                {hasPaymentMethod
-                  ? "Payment method on file"
-                  : "No payment method"}
-              </span>
-            </div>
-
-            {autoReloadError && (
-              <div
-                style={{
-                  marginTop: 8,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  padding: "6px 10px",
-                  background: "var(--tint-warning)",
-                  borderRadius: 4,
-                  borderLeft: "3px solid var(--accent-warning)",
-                }}
-              >
-                <AlertTriangle size={14} style={{ color: "var(--accent-warning)" }} />
-                <span style={{ fontSize: 12, color: "var(--fg-secondary)" }}>
-                  {autoReloadError}
+                <span style={{ color: "var(--fg-secondary)", fontWeight: 400 }}>
+                  {subscription.status === "active"
+                    ? " · $20/month"
+                    : " · $10 first month, then $20/month"}
                 </span>
               </div>
             )}
+            {subscription?.status === "not_subscribed" && (
+              <div style={{ marginTop: 4, fontSize: 12, color: "var(--fg-secondary)" }}>
+                Magnitude Pro is required to use cloud models.
+              </div>
+            )}
+            {Object.entries(usageWindows).map(([window, budget]) => budget && (
+              <div key={window} style={{ marginTop: 4, fontSize: 12, color: "var(--fg-secondary)" }}>
+                {window === "five_hour" ? "5h" : window}: ${(budget.usedCents / 100).toFixed(2)} of ${(budget.limitCents / 100).toFixed(2)}
+              </div>
+            ))}
           </div>
 
           {/* Period tabs */}

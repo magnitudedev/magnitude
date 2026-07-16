@@ -5,7 +5,6 @@
  * (and what it looks like fed back to the model). All copy lives here.
  */
 
-import { Option } from 'effect'
 import type {
   TurnOutcome,
   ProviderNotReadyDetail,
@@ -38,7 +37,8 @@ export interface ErrorPresentation {
   readonly retryable: boolean
 }
 
-const TOP_UP_CTA: ErrorCta = { kind: 'url', label: 'Top up credits', url: 'https://app.magnitude.dev/billing' }
+const CLOUD_USAGE_CTA: ErrorCta = { kind: 'url', label: 'View cloud usage', url: 'https://app.magnitude.dev/billing' }
+const MAGNITUDE_PRO_CTA: ErrorCta = { kind: 'url', label: 'Start Magnitude Pro', url: 'https://app.magnitude.dev/billing' }
 const UPDATE_MAGNITUDE_CTA: ErrorCta = { kind: 'url', label: 'Update Magnitude', url: 'https://docs.magnitude.dev/get-started' }
 const OPEN_SETTINGS_CTA: ErrorCta = { kind: 'action', label: 'Open settings', actionId: 'open-settings', chord: 'ctrl+s' }
 
@@ -47,17 +47,6 @@ const SILENT: ErrorPresentation = {
   severity: 'info',
   message: '',
   retryable: false,
-}
-
-function formatDollars(cents: number): string {
-  return `$${(cents / 100).toFixed(2)}`
-}
-
-function insufficientCreditsMessage(balanceCents: Option.Option<number>): string {
-  if (Option.isSome(balanceCents)) {
-    return `Insufficient credits. Balance: ${formatDollars(balanceCents.value)}.`
-  }
-  return 'Insufficient credits.'
 }
 
 function presentProviderNotReady(detail: ProviderNotReadyDetail): ErrorPresentation {
@@ -80,14 +69,22 @@ function presentProviderNotReady(detail: ProviderNotReadyDetail): ErrorPresentat
         llmFeedback: 'Out-of-sync error from server. The CLI may need to be updated.',
         retryable: false,
       }
-    case 'InsufficientCredits': {
-      const message = insufficientCreditsMessage(detail.balanceCents)
+    case 'SubscriptionRequired':
       return {
         surface: 'inline',
         severity: 'error',
-        message,
-        cta: TOP_UP_CTA,
-        llmFeedback: message,
+        message: detail.message,
+        cta: MAGNITUDE_PRO_CTA,
+        llmFeedback: detail.message,
+        retryable: false,
+      }
+    case 'UsageLimitExceeded': {
+      return {
+        surface: 'inline',
+        severity: 'error',
+        message: detail.message,
+        cta: CLOUD_USAGE_CTA,
+        llmFeedback: detail.message,
         retryable: false,
       }
     }

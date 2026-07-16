@@ -1,12 +1,13 @@
 import { memo, useCallback, useMemo, useState, useSyncExternalStore } from 'react'
-import { subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import { subscribeAnimationTick, getAnimationTickSnapshot, useAgentClient, useSettingsState } from '@magnitudedev/client-common'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
-import type { BalanceResponse, UsagePeriod } from '@magnitudedev/sdk'
-import { useAgentClient } from '@magnitudedev/client-common'
+import type { CloudUsageResponse, UsagePeriod } from '@magnitudedev/sdk'
 import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
+import { authSourceAtom } from '../../state/cli-atoms'
+import { hasCloudUsageAuth } from './usage-auth'
 
 interface UsageOverlayProps {
   isVisible: boolean
@@ -26,7 +27,13 @@ const DAILY_DAYS = 30
 const TOP_MODELS_COUNT = 5
 
 function formatDollars(cents: number): string {
-  return `$${(cents / 100).toFixed(2)}`
+  const dollars = cents / 100
+  return dollars % 1 === 0 ? `$${dollars}` : `$${dollars.toFixed(2)}`
+}
+
+function formatReset(remainingMs: number): string {
+  const hours = Math.max(1, Math.ceil(remainingMs / (60 * 60 * 1000)))
+  return hours < 24 ? `${hours}h` : `${Math.ceil(hours / 24)}d`
 }
 
 function formatTokens(n: number): string {
@@ -123,19 +130,22 @@ function DailyBar({ date, inputTokens, outputTokens, topModel, total, max, width
 export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: UsageOverlayProps) {
   const theme = useTheme()
   const client = useAgentClient()
+  const settings = useSettingsState()
+  const authSource = useAtomValue(authSourceAtom)
   const runtimeResult = useAtomValue(client.runtime)
   const [period, setPeriod] = useState<UsagePeriod>('7d')
 
   const tz = useMemo(getLocalTimeZone, [])
   const runtimeReady = Result.isSuccess(runtimeResult)
+  const cloudConfigured = hasCloudUsageAuth(settings.keyAlreadySet, authSource)
 
-  const balanceAtom = useMemo(
-    () => isVisible && runtimeReady
-      ? client.query('GetBalance', { period, days: DAILY_DAYS, tz })
-      : Atom.make<Result.Result<BalanceResponse, never>>(() => Result.initial()),
-    [client, isVisible, period, runtimeReady, tz],
+  const usageAtom = useMemo(
+    () => isVisible && runtimeReady && cloudConfigured
+      ? client.query('GetCloudUsage', { period, days: DAILY_DAYS, tz })
+      : Atom.make<Result.Result<CloudUsageResponse, never>>(() => Result.initial()),
+    [client, cloudConfigured, isVisible, period, runtimeReady, tz],
   )
-  const result = useAtomValue(balanceAtom)
+  const result = useAtomValue(usageAtom)
 
   const loading = Result.isInitial(result)
   const error = Result.isFailure(result) ? 'Failed to load usage data' : null
@@ -143,7 +153,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
 
   // Loading dots animation via tick store (400ms ≈ 5 ticks per step)
   const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
-  const loadingTick = isVisible && data === null ? tick : 0
+  const loadingTick = isVisible && cloudConfigured && data === null ? tick : 0
 
   const periodIndex = PERIODS.findIndex(p => p.id === period)
 
@@ -184,16 +194,21 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
 
       {/* Body */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexGrow: 1 }}>
-        {error && (
+        {!cloudConfigured && (
+          <text style={{ fg: theme.muted }}>
+            Connect cloud models in /settings to view cloud usage.
+          </text>
+        )}
+        {cloudConfigured && error && (
           <text style={{ fg: theme.error }}>Failed to load usage: {error}</text>
         )}
-        {!error && !data && (
+        {cloudConfigured && !error && !data && (
           <text style={{ fg: theme.muted }}>
             <span attributes={TextAttributes.DIM}>Loading{'.'.repeat((loadingTick % 3) + 1)}</span>
           </text>
         )}
-        {!error && data && (
-          <BalanceBody
+        {cloudConfigured && !error && data && (
+          <UsageBody
             data={data}
             period={period}
             onPeriodChange={setPeriod}
@@ -205,16 +220,16 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
   )
 })
 
-interface BalanceBodyProps {
-  data: BalanceResponse['data']
+interface UsageBodyProps {
+  data: CloudUsageResponse['data']
   period: UsagePeriod
   onPeriodChange: (p: UsagePeriod) => void
   loading: boolean
 }
 
-function BalanceBody({ data, period, onPeriodChange, loading }: BalanceBodyProps) {
+function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
   const theme = useTheme()
-  const { balance, autoReload, hasPaymentMethod, recentTopups, usage } = data
+  const { subscription, usageWindows, usage } = data
 
   // Compute the chart max for proportional bar widths.
   const chartMax = useMemo(() => {
@@ -231,39 +246,28 @@ function BalanceBody({ data, period, onPeriodChange, loading }: BalanceBodyProps
 
   return (
     <box style={{ flexDirection: 'column' }}>
-      {/* Balance strip */}
-      <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
+      {/* Cloud subscription and current limit windows */}
+      <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
         <text style={{ fg: theme.foreground }}>
-          <span attributes={TextAttributes.BOLD}>Balance: </span>
-          <span fg={balance.cents <= 100 ? theme.error : theme.success}>{formatDollars(balance.cents)}</span>
+          <span attributes={TextAttributes.BOLD}>Cloud subscription: </span>
+          <span fg={subscription.status === 'active' ? theme.primary : theme.muted}>
+            {subscription.status === 'active' ? subscription.plan.label : 'Not subscribed'}
+          </span>
+          <span fg={theme.muted}>
+            {subscription.status === 'active' ? ' · $20/month' : ' · $10 first month, then $20/month'}
+          </span>
         </text>
-        <text style={{ fg: theme.muted }}>{'   '}</text>
-        <text style={{ fg: theme.muted }}>
-          {autoReload.enabled
-            ? `Auto-reload: at ${formatDollars(autoReload.thresholdCents)} → +${formatDollars(autoReload.amountCents)}`
-            : 'Auto-reload: off'}
-        </text>
-        <text style={{ fg: theme.muted }}>{'   '}</text>
-        <text style={{ fg: hasPaymentMethod ? theme.success : theme.warning }}>
-          {hasPaymentMethod ? '● Payment method on file' : '○ No payment method'}
-        </text>
+        {subscription.status !== 'active' && (
+          <text style={{ fg: theme.muted }}>
+            Magnitude Pro is required to use cloud models.
+          </text>
+        )}
+        {(Object.entries(usageWindows) as Array<[string, { limitCents: number; usedCents: number; remainingMs: number }]>).map(([window, budget]) => (
+          <text key={window} style={{ fg: budget.usedCents >= budget.limitCents ? theme.error : theme.muted }}>
+            {`${window === 'five_hour' ? '5h' : window}: ${formatDollars(budget.usedCents)} of ${formatDollars(budget.limitCents)} · resets in ${formatReset(budget.remainingMs)}`}
+          </text>
+        ))}
       </box>
-
-      {autoReload.lastFailure && (
-        <box style={{ paddingBottom: 1 }}>
-          <text style={{ fg: theme.error }}>
-            ⚠ Last auto-reload failed: {autoReload.lastFailure.reason}
-          </text>
-        </box>
-      )}
-
-      {recentTopups.length > 0 && (
-        <box style={{ paddingBottom: 1 }}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
-            {`Last top-up: ${formatDollars(recentTopups[0].chargedCents)}${recentTopups[0].at ? ` on ${recentTopups[0].at.slice(0, 10)}` : ''}`}
-          </text>
-        </box>
-      )}
 
       <box style={{ paddingBottom: 1 }}>
         <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>

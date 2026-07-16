@@ -7,7 +7,7 @@ Provider system spans three packages:
 
 ## Provider Contract
 
-`Provider<TModel>`: `id`, `displayName`, `catalog`, `bindModel(id, options?)`, `classifyModelFamily(model)`. Extensions are separate interfaces: `WebSearchExtension`, `BalanceExtension`.
+`Provider<TModel>`: `id`, `displayName`, `catalog`, `bindModel(id, options?)`, `classifyModelFamily(model)`. Extensions are separate interfaces: `WebSearchExtension`, `UsageExtension`.
 
 `BaseCallOptions`: `maxTokens`, `toolChoice`, `reasoningEffort`, `generateToolCallId`. Provider-specific options are baked at `bindModel` time via `wrapAsBaseModel` — consumers only see `BoundModel<BaseCallOptions>`.
 

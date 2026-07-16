@@ -3,7 +3,7 @@ import { Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai"
 import { SessionError } from "../errors"
 import {
-  BalanceResponse,
+  CloudUsageResponse,
   UsagePeriod,
   SlotId,
   SlotProfiles,
@@ -42,13 +42,13 @@ export const ListProviderAuth = Rpc.make("ListProviderAuth", {
   error: SessionError
 })
 
-export const GetBalance = Rpc.make("GetBalance", {
+export const GetCloudUsage = Rpc.make("GetCloudUsage", {
   payload: Schema.Struct({
     period: Schema.optional(UsagePeriod),
     days: Schema.optional(Schema.Number),
     tz: Schema.optional(Schema.String),
   }),
-  success: BalanceResponse,
+  success: CloudUsageResponse,
   error: SessionError
 })
 

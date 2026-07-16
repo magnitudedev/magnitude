@@ -23,9 +23,9 @@ export type {
   ProviderModelBindOptions,
   WebSearchExtension,
   WebSearchResult,
-  BalanceExtension,
-  BalanceQuery,
-  BalanceResponse,
+  UsageExtension,
+  UsageQuery,
+  UsageResponse,
 } from "./contract"
 export type { BaseCallOptions, ToolChoice } from "./call-options"
 

@@ -8,10 +8,12 @@ import {
   type RejectedHttpResponse,
 } from "@magnitudedev/ai"
 import type {
-  InsufficientCreditsDetails,
+  BillingWindowBudget,
   MagnitudeApiError,
   MagnitudeErrorCode,
   MagnitudeErrorType,
+  SubscriptionRequiredDetails,
+  UsageLimitDetails,
 } from "./contract"
 
 const ERROR_TYPES: readonly MagnitudeErrorType[] = [
@@ -33,7 +35,10 @@ const ERROR_CODES: readonly MagnitudeErrorCode[] = [
   "model_not_found",
   "model_not_multimodal",
   "model_not_grammar_compatible",
-  "insufficient_credits",
+  "subscription_required",
+  "usage_limit_exceeded_five_hour",
+  "usage_limit_exceeded_weekly",
+  "usage_limit_exceeded_monthly",
   "provider_rate_limited",
   "internal_server_error",
   "provider_error",
@@ -43,17 +48,35 @@ const ERROR_CODES: readonly MagnitudeErrorCode[] = [
 ]
 
 type MagnitudeErrorBase = Omit<MagnitudeApiError["error"], "code" | "details">
+type UsageLimitCode = Extract<MagnitudeErrorCode, `usage_limit_exceeded_${string}`>
+type SubscriptionRequiredCode = Extract<MagnitudeErrorCode, "subscription_required">
+
+const USAGE_LIMIT_CODES: readonly UsageLimitCode[] = [
+  "usage_limit_exceeded_five_hour",
+  "usage_limit_exceeded_weekly",
+  "usage_limit_exceeded_monthly",
+]
+
+function isUsageLimitCode(code: MagnitudeErrorCode): code is UsageLimitCode {
+  return USAGE_LIMIT_CODES.includes(code as UsageLimitCode)
+}
 
 export type ParsedMagnitudeApiError =
   | {
       readonly error: MagnitudeErrorBase & {
-        readonly code: "insufficient_credits"
-        readonly details: InsufficientCreditsDetails
+        readonly code: SubscriptionRequiredCode
+        readonly details: SubscriptionRequiredDetails
       }
     }
   | {
       readonly error: MagnitudeErrorBase & {
-        readonly code: Exclude<MagnitudeErrorCode, "insufficient_credits">
+        readonly code: UsageLimitCode
+        readonly details: UsageLimitDetails
+      }
+    }
+  | {
+      readonly error: MagnitudeErrorBase & {
+        readonly code: Exclude<MagnitudeErrorCode, UsageLimitCode | SubscriptionRequiredCode>
       }
     }
 
@@ -79,10 +102,34 @@ function isErrorCode(value: unknown): value is MagnitudeErrorCode {
   return typeof value === "string" && ERROR_CODES.includes(value as MagnitudeErrorCode)
 }
 
-function isInsufficientCreditsDetails(value: unknown): value is InsufficientCreditsDetails {
+function isBillingWindowBudget(value: unknown): value is BillingWindowBudget {
   return isRecord(value)
-    && value.category === "insufficient_credits"
-    && typeof value.balanceCents === "number"
+    && typeof value.limitCents === "number"
+    && typeof value.usedCents === "number"
+    && typeof value.remainingCents === "number"
+    && typeof value.windowStart === "string"
+    && typeof value.windowEnd === "string"
+    && typeof value.remainingMs === "number"
+}
+
+function isUsageLimitDetails(value: unknown): value is UsageLimitDetails {
+  const windows = isRecord(value) && isRecord(value.windows) ? value.windows : null
+  const violatedWindow = isRecord(value) ? value.violatedWindow : null
+  if (!isRecord(value)
+    || value.category !== "usage_limit_exceeded"
+    || typeof violatedWindow !== "string"
+    || !["five_hour", "weekly", "monthly"].includes(violatedWindow)
+    || windows === null
+    || !isBillingWindowBudget(windows[violatedWindow])
+    || !isBillingWindowBudget(value.violatedBudget)) return false
+
+  return Object.values(windows).every(isBillingWindowBudget)
+}
+
+function isSubscriptionRequiredDetails(value: unknown): value is SubscriptionRequiredDetails {
+  return isRecord(value)
+    && value.category === "subscription_required"
+    && value.requiredPlanId === "pro"
 }
 
 export function tryParseErrorBody(body: string): ParsedMagnitudeApiError | null {
@@ -107,8 +154,19 @@ export function tryParseErrorBody(body: string): ParsedMagnitudeApiError | null 
     param: error.param,
   }
 
-  if (error.code === "insufficient_credits") {
-    if (!isInsufficientCreditsDetails(error.details)) return null
+  if (isUsageLimitCode(error.code)) {
+    if (!isUsageLimitDetails(error.details)) return null
+    return {
+      error: {
+        ...base,
+        code: error.code,
+        details: error.details,
+      },
+    }
+  }
+
+  if (error.code === "subscription_required") {
+    if (!isSubscriptionRequiredDetails(error.details)) return null
     return {
       error: {
         ...base,
@@ -121,7 +179,7 @@ export function tryParseErrorBody(body: string): ParsedMagnitudeApiError | null 
   return {
     error: {
       ...base,
-      code: error.code,
+      code: error.code as Exclude<MagnitudeErrorCode, UsageLimitCode | SubscriptionRequiredCode>,
     },
   }
 }
@@ -146,15 +204,22 @@ function classifyMagnitudeError(
     message: error.message,
   }
 
-  if (error.code === "insufficient_credits") {
+  if (
+    isUsageLimitCode(error.code)
+    && "details" in error
+    && error.details.category === "usage_limit_exceeded"
+  ) {
     return {
-      _tag: "InsufficientCredits",
+      _tag: "UsageLimitExceeded",
       ...base,
-      balanceCents: Option.some(error.details.balanceCents),
+      window: error.details.violatedWindow,
+      resetAt: error.details.violatedBudget.windowEnd,
     }
   }
 
   switch (error.code) {
+    case "subscription_required":
+      return { _tag: "SubscriptionRequired", ...base }
     case "invalid_api_key":
       return { _tag: "AuthRejected", ...base }
     case "model_not_found":

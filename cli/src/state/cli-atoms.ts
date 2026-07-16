@@ -13,7 +13,6 @@ import { Atom } from "@effect-atom/atom-react"
 export type AuthSource =
   | { source: "config" }
   | { source: "env"; key: string; envVarName: string }
-  | { source: "env-local"; key: string; envVarName: string }
   | { source: "none" }
 
 export const authSourceAtom = Atom.make<AuthSource>({ source: "none" })
@@ -44,28 +43,6 @@ export const autopilotCountdownAtom = Atom.make<AutopilotCountdown>({
 })
 
 export const autopilotRetainedContentAtom = Atom.make<string | null>(null)
-
-/**
- * Resolve auth source from environment variables.
- * Called once in the entry point, result passed as prop to CliApp.
- */
-export function resolveEnvAuth(): AuthSource {
-  const useLocal = process.env.MAGNITUDE_USE_LOCAL === "1" || process.env.MAGNITUDE_USE_LOCAL === "true"
-
-  if (useLocal) {
-    const localKey = process.env.MAGNITUDE_LOCAL_API_KEY
-    if (localKey && localKey.trim()) {
-      return { source: "env-local", key: localKey, envVarName: "MAGNITUDE_LOCAL_API_KEY" }
-    }
-  }
-
-  const envKey = process.env.MAGNITUDE_API_KEY
-  if (envKey && envKey.trim()) {
-    return { source: "env", key: envKey, envVarName: "MAGNITUDE_API_KEY" }
-  }
-
-  return { source: "none" }
-}
 
 /**
  * Section anchor for the file viewer (markdown heading scroll target).

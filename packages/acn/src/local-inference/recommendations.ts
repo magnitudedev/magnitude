@@ -28,24 +28,19 @@ export interface LlamaCppHostProfile {
   readonly warnings?: readonly unknown[]
 }
 export const BASELINE_CONTEXT_TOKENS = 32_768
-export const MAIN_AGENT_CONTEXT_TARGETS = [200_000, 100_000] as const
-export const SUBAGENT_CONTEXT_TARGETS = [100_000, 64_000] as const
+export const LOCAL_CONTEXT_TARGETS = [200_000, 100_000] as const
 
 export const configuredParallelSlots = (): number => {
   const configured = Number(process.env.MAGNITUDE_LLAMA_PARALLEL ?? 2)
   return Number.isSafeInteger(configured) && configured >= 1 && configured <= 4 ? configured : 2
 }
 
-export const parallelSlotsForUsage = (usage: LocalInferenceUsageSelection): number => {
-  const requestsPerSession = usage.localModelRole === "main" ? 1 : 3
-  const sessionMultiplier = usage.sessionConcurrency === "one" ? 1 : 3
-  return requestsPerSession * sessionMultiplier
-}
+export const parallelSlotsForUsage = (usage: LocalInferenceUsageSelection): number =>
+  usage.sessionConcurrency === "one" ? 1 : 3
 
 export const contextTargetsForUsage = (
-  usage: LocalInferenceUsageSelection,
-): typeof MAIN_AGENT_CONTEXT_TARGETS | typeof SUBAGENT_CONTEXT_TARGETS =>
-  usage.localModelRole === "main" ? MAIN_AGENT_CONTEXT_TARGETS : SUBAGENT_CONTEXT_TARGETS
+  _usage: LocalInferenceUsageSelection,
+): typeof LOCAL_CONTEXT_TARGETS => LOCAL_CONTEXT_TARGETS
 
 const minimumContextForUsage = (usage: LocalInferenceUsageSelection): number =>
   contextTargetsForUsage(usage).at(-1) ?? BASELINE_CONTEXT_TOKENS
@@ -178,7 +173,7 @@ const fitConfiguration = (
 
   return {
     entry,
-    configurationId: `${entry.id}@${entry.revision}@role-${usage.localModelRole}@sessions-${usage.sessionConcurrency}@p-${profile.parallelSlots}@ctx-${contextTokensPerSlot}@${profile.runtimeProfileId}`,
+    configurationId: `${entry.id}@${entry.revision}@sessions-${usage.sessionConcurrency}@p-${profile.parallelSlots}@ctx-${contextTokensPerSlot}@${profile.runtimeProfileId}`,
     contextTokens: contextTokensPerSlot,
     servingProfile: profile,
     estimatedRuntimeBytes,

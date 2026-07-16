@@ -3,20 +3,15 @@ import { ProviderModelIdSchema } from "@magnitudedev/ai"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
-export const LocalModelRole = Schema.Literal("main", "subagent")
-export type LocalModelRole = Schema.Schema.Type<typeof LocalModelRole>
-
 export const LocalSessionConcurrency = Schema.Literal("one", "up_to_three")
 export type LocalSessionConcurrency = Schema.Schema.Type<typeof LocalSessionConcurrency>
 
 export const LocalInferenceUsageSelection = Schema.Struct({
-  localModelRole: LocalModelRole,
   sessionConcurrency: LocalSessionConcurrency,
 })
 export type LocalInferenceUsageSelection = Schema.Schema.Type<typeof LocalInferenceUsageSelection>
 
 export const LocalInferenceServingProfile = Schema.Struct({
-  localModelRole: LocalModelRole,
   sessionConcurrency: LocalSessionConcurrency,
   parallelSlots: PositiveInteger,
   contextTokensPerSlot: PositiveInteger,

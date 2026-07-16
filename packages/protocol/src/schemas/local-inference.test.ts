@@ -33,21 +33,17 @@ describe("local inference protocol schemas", () => {
 
   test("accepts only the supported usage choices", () => {
     expect(Schema.decodeUnknownSync(LocalInferenceUsageSelection)({
-      localModelRole: "subagent",
       sessionConcurrency: "up_to_three",
     })).toEqual({
-      localModelRole: "subagent",
       sessionConcurrency: "up_to_three",
     })
     expect(() => Schema.decodeUnknownSync(LocalInferenceUsageSelection)({
-      localModelRole: "both",
       sessionConcurrency: "unlimited",
     })).toThrow()
   })
 
   test("requires positive uniform serving-profile dimensions", () => {
     const profile = {
-      localModelRole: "main",
       sessionConcurrency: "up_to_three",
       parallelSlots: 3,
       contextTokensPerSlot: 100_000,

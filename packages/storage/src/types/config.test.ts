@@ -19,7 +19,6 @@ describe("MagnitudeConfig local inference and onboarding state", () => {
       },
       localInference: {
         usage: {
-          localModelRole: "main",
           sessionConcurrency: "up_to_three",
         },
         binding: {

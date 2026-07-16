@@ -19,34 +19,20 @@ const cpu = (gib: number): StableInferenceCapacity => ({
   acceleratorDomains: [],
 })
 
-const MAIN_ONE = {
-  localModelRole: "main",
+const ONE_SESSION = {
   sessionConcurrency: "one",
 } as const satisfies LocalInferenceUsageSelection
 
-const MAIN_THREE = {
-  localModelRole: "main",
+const THREE_SESSIONS = {
   sessionConcurrency: "up_to_three",
 } as const satisfies LocalInferenceUsageSelection
 
-const SUBAGENT_ONE = {
-  localModelRole: "subagent",
-  sessionConcurrency: "one",
-} as const satisfies LocalInferenceUsageSelection
-
-const SUBAGENT_THREE = {
-  localModelRole: "subagent",
-  sessionConcurrency: "up_to_three",
-} as const satisfies LocalInferenceUsageSelection
-
-const ALL_USAGE = [MAIN_ONE, MAIN_THREE, SUBAGENT_ONE, SUBAGENT_THREE] as const
+const ALL_USAGE = [ONE_SESSION, THREE_SESSIONS] as const
 
 describe("local inference recommendation policy", () => {
   test.each([
-    [MAIN_ONE, 1],
-    [MAIN_THREE, 3],
-    [SUBAGENT_ONE, 3],
-    [SUBAGENT_THREE, 9],
+    [ONE_SESSION, 1],
+    [THREE_SESSIONS, 3],
   ] as const)("derives deterministic uniform parallelism from %o", (usage, expected) => {
     expect(parallelSlotsForUsage(usage)).toBe(expected)
   })
@@ -63,7 +49,7 @@ describe("local inference recommendation policy", () => {
     [512, "NVIDIA Nemotron 3 Ultra 550B-A55B"],
     [768, "GLM 5.2 753B-A40B"],
   ])("returns a deterministic one-main-agent tier for %i GiB", (gib, expected) => {
-    const recommendation = recommendLocalModels(cpu(gib), MAIN_ONE)[0]
+    const recommendation = recommendLocalModels(cpu(gib), ONE_SESSION)[0]
     expect(recommendation?.displayName).toBe(expected)
     if (recommendation) {
       expect([100_000, 200_000]).toContain(recommendation.contextTokens)
@@ -75,36 +61,23 @@ describe("local inference recommendation policy", () => {
   })
 
   test("changes recommendations when identical hardware reserves more context windows", () => {
-    expect(recommendLocalModels(cpu(32), MAIN_ONE)[0]).toMatchObject({
+    expect(recommendLocalModels(cpu(32), ONE_SESSION)[0]).toMatchObject({
       displayName: "Qwen3.6 27B",
       contextTokens: 200_000,
       servingProfile: { parallelSlots: 1 },
     })
-    expect(recommendLocalModels(cpu(32), MAIN_THREE)[0]).toMatchObject({
+    expect(recommendLocalModels(cpu(32), THREE_SESSIONS)[0]).toMatchObject({
       displayName: "Gemma 4 26B-A4B",
       contextTokens: 100_000,
       servingProfile: { parallelSlots: 3 },
     })
-    expect(recommendLocalModels(cpu(32), SUBAGENT_ONE)[0]).toMatchObject({
-      displayName: "Qwen3.6 27B",
-      contextTokens: 64_000,
-      servingProfile: { parallelSlots: 3 },
-    })
-    expect(recommendLocalModels(cpu(32), SUBAGENT_THREE)[0]).toMatchObject({
-      displayName: "Qwen3.5 9B",
-      contextTokens: 64_000,
-      servingProfile: { parallelSlots: 9 },
-    })
   })
 
-  test("enforces the role-specific context ladders and uniform total capacity", () => {
+  test("enforces the local context ladder and uniform total capacity", () => {
     for (const usage of ALL_USAGE) {
       for (const gib of [16, 24, 32, 48, 64, 128, 256, 512, 768, 1024]) {
         for (const recommendation of recommendLocalModels(cpu(gib), usage)) {
-          const expectedContexts = usage.localModelRole === "main"
-            ? [200_000, 100_000]
-            : [100_000, 64_000]
-          expect(expectedContexts).toContain(recommendation.contextTokens)
+          expect([200_000, 100_000]).toContain(recommendation.contextTokens)
           expect(recommendation.servingProfile.contextTokensPerSlot).toBe(
             recommendation.contextTokens,
           )
@@ -130,26 +103,15 @@ describe("local inference recommendation policy", () => {
     expect(nine).toBeLessThan(one * 9)
   })
 
-  test("uses distinct configuration IDs for the two different three-slot routing intents", () => {
-    const main = recommendLocalModels(cpu(64), MAIN_THREE)[0]!
-    const subagent = recommendLocalModels(cpu(64), SUBAGENT_ONE)[0]!
-
-    expect(main.servingProfile.parallelSlots).toBe(3)
-    expect(subagent.servingProfile.parallelSlots).toBe(3)
-    expect(main.configurationId).not.toBe(subagent.configurationId)
-    expect(main.configurationId).toContain("@role-main@sessions-up_to_three@p-3@")
-    expect(subagent.configurationId).toContain("@role-subagent@sessions-one@p-3@")
-  })
-
   test("changes quant formats with headroom instead of always defaulting to Q4", () => {
-    expect(recommendLocalModels(cpu(48), MAIN_ONE)[0]?.quantization.format).toBe("UD-Q5_K_XL")
-    expect(recommendLocalModels(cpu(64), MAIN_ONE)[0]?.quantization.format).toBe("UD-Q8_K_XL")
-    expect(recommendLocalModels(cpu(64), MAIN_THREE)[0]?.quantization.format).toBe("UD-Q4_K_XL")
+    expect(recommendLocalModels(cpu(48), ONE_SESSION)[0]?.quantization.format).toBe("UD-Q5_K_XL")
+    expect(recommendLocalModels(cpu(64), ONE_SESSION)[0]?.quantization.format).toBe("UD-Q8_K_XL")
+    expect(recommendLocalModels(cpu(64), THREE_SESSIONS)[0]?.quantization.format).toBe("UD-Q4_K_XL")
   })
 
   test("returns three useful choices whenever three configurations fit", () => {
     for (const gib of [24, 32, 48, 64, 128, 256, 512, 768]) {
-      const recommendations = recommendLocalModels(cpu(gib), MAIN_ONE)
+      const recommendations = recommendLocalModels(cpu(gib), ONE_SESSION)
       expect(recommendations, `${gib} GiB`).toHaveLength(3)
       expect(
         new Set(recommendations.map((item) => item.catalogModelId.split(":")[0])).size,
@@ -195,11 +157,11 @@ describe("local inference recommendation policy", () => {
     })
     const busy = recommendLocalModels(
       stableCapacityFromHost(host(512 * 1024 ** 2)),
-      SUBAGENT_THREE,
+      THREE_SESSIONS,
     )
     const idle = recommendLocalModels(
       stableCapacityFromHost(host(23 * GIB)),
-      SUBAGENT_THREE,
+      THREE_SESSIONS,
     )
     expect(busy).toEqual(idle)
   })
@@ -227,7 +189,7 @@ describe("local inference recommendation policy", () => {
     const stable = stableCapacityFromHost(host)
     expect(stable.acceleratorDomains).toHaveLength(1)
     expect(stable.acceleratorDomains[0]?.capacityBytes).toBe(28 * GIB)
-    expect(recommendLocalModels(stable, MAIN_ONE)[0]?.displayName).toBe("Qwen3.6 27B")
+    expect(recommendLocalModels(stable, ONE_SESSION)[0]?.displayName).toBe("Qwen3.6 27B")
   })
 
   test("combines discrete accelerator capacity only for an explicit supported split group", () => {
@@ -238,14 +200,14 @@ describe("local inference recommendation policy", () => {
         { memoryDomainId: "gpu:1", capacityBytes: 16 * GIB, sharesSystemMemory: false, preferredBackend: "CUDA" },
       ],
     }
-    const withoutSplit = recommendLocalModels(base, MAIN_ONE)[0]
+    const withoutSplit = recommendLocalModels(base, ONE_SESSION)[0]
     const withSplit = recommendLocalModels({
       ...base,
       acceleratorDomains: base.acceleratorDomains.map((domain) => ({
         ...domain,
         modelSplitGroupId: "cuda:all",
       })),
-    }, MAIN_ONE)[0]
+    }, ONE_SESSION)[0]
     expect(withoutSplit?.estimatedRuntimeBytes).toBeLessThanOrEqual(
       withoutSplit?.stableCapacityBudgetBytes ?? 0,
     )
@@ -260,7 +222,6 @@ describe("local inference recommendation policy", () => {
       for (const recommendation of recommendLocalModels(cpu(64), usage)) {
         expect(recommendation.configurationId).toContain(recommendation.catalogModelId)
         expect(recommendation.configurationId).toMatch(/@[0-9a-f]{40}@/)
-        expect(recommendation.configurationId).toContain(`@role-${usage.localModelRole}`)
         expect(recommendation.configurationId).toContain(`@sessions-${usage.sessionConcurrency}`)
         expect(recommendation.configurationId).toContain(
           `@p-${recommendation.servingProfile.parallelSlots}@ctx-${recommendation.contextTokens}`,
@@ -270,16 +231,16 @@ describe("local inference recommendation policy", () => {
   })
 
   test("keeps very large models as normal profile-gated recommendations", () => {
-    expect(recommendLocalModels(cpu(128), MAIN_ONE)[0]?.displayName).toBe(
+    expect(recommendLocalModels(cpu(128), ONE_SESSION)[0]?.displayName).toBe(
       "NVIDIA Nemotron 3 Super 120B-A12B",
     )
-    expect(recommendLocalModels(cpu(256), MAIN_ONE)[0]?.displayName).toBe(
+    expect(recommendLocalModels(cpu(256), ONE_SESSION)[0]?.displayName).toBe(
       "DeepSeek V4 Flash 284B-A13B",
     )
-    expect(recommendLocalModels(cpu(512), MAIN_ONE)[0]?.displayName).toBe(
+    expect(recommendLocalModels(cpu(512), ONE_SESSION)[0]?.displayName).toBe(
       "NVIDIA Nemotron 3 Ultra 550B-A55B",
     )
-    expect(recommendLocalModels(cpu(768), MAIN_ONE)[0]?.displayName).toBe(
+    expect(recommendLocalModels(cpu(768), ONE_SESSION)[0]?.displayName).toBe(
       "GLM 5.2 753B-A40B",
     )
   })

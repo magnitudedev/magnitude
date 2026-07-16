@@ -298,7 +298,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
       {/* Status / inline controls */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexShrink: 0, flexDirection: 'column' }}>
-        {mode === 'view' && (auth.source === 'env' || auth.source === 'env-local') && (
+        {mode === 'view' && auth.source === 'env' && (
           <>
             <box style={{ flexDirection: 'row' }}>
               <text style={{ fg: theme.success }}>{'● Connected '}</text>

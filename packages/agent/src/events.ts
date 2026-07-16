@@ -216,10 +216,12 @@ export type TurnFeedback =
 export type ProviderNotReadyDetail =
   | { readonly _tag: 'AuthFailed' }
   | { readonly _tag: 'OutOfSync' }
+  | { readonly _tag: 'SubscriptionRequired'; readonly message: string }
   | {
-      readonly _tag: 'InsufficientCredits'
+      readonly _tag: 'UsageLimitExceeded'
       readonly message: string
-      readonly balanceCents: Option.Option<number>
+      readonly window: 'five_hour' | 'weekly' | 'monthly'
+      readonly resetAt: string
     }
 
 export type ConnectionFailureDetail = {

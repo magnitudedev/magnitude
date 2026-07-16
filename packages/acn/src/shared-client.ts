@@ -81,7 +81,7 @@ export const makeDelegatingProviderClient = (
   webSearch: (query, schema) => Ref.get(ref).pipe(
     Effect.flatMap((client) => client.webSearch(query, schema)),
   ),
-  balance: (query) => Ref.get(ref).pipe(Effect.flatMap((client) => client.balance(query))),
+  usage: (query) => Ref.get(ref).pipe(Effect.flatMap((client) => client.usage(query))),
   runtimeConfig,
 })
 

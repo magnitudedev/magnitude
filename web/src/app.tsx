@@ -70,7 +70,7 @@ import {
   SLOT_DESCRIPTIONS,
 } from "@magnitudedev/sdk"
 import type {
-  BalanceResponse,
+  CloudUsageResponse,
   DisplayActor,
   ListSessionsResult,
   ReadFileResult,
@@ -498,21 +498,21 @@ function SettingsPanelContainer({
     }))
   }, [slotProfiles])
 
-  // ── Usage / balance ──
+  // ── Cloud subscription and usage limits ──
   const tz = useMemo(() => {
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return "UTC" }
   }, [])
-  const balanceAtom = useMemo(
-    () => client.query("GetBalance", { period, days: 30, tz }),
+  const cloudUsageAtom = useMemo(
+    () => client.query("GetCloudUsage", { period, days: 30, tz }),
     [client, period, tz],
   )
-  const balanceResult = useAtomValue(balanceAtom)
-  const usageLoading = Result.isInitial(balanceResult)
-  const usageError = Result.isFailure(balanceResult)
-    ? (Cause.pretty(balanceResult.cause) || "Failed to load usage data.")
+  const cloudUsageResult = useAtomValue(cloudUsageAtom)
+  const usageLoading = Result.isInitial(cloudUsageResult)
+  const usageError = Result.isFailure(cloudUsageResult)
+    ? (Cause.pretty(cloudUsageResult.cause) || "Failed to load usage data.")
     : null
-  const usageData = Result.isSuccess(balanceResult)
-    ? (balanceResult.value as BalanceResponse)
+  const usageData = Result.isSuccess(cloudUsageResult)
+    ? (cloudUsageResult.value as CloudUsageResponse)
     : null
 
   return (

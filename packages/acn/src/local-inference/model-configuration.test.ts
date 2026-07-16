@@ -149,7 +149,7 @@ describe("LocalModelConfiguration", () => {
   it("drops every unresolved local model reference in the same reconciliation", () => {
     const result = reconcile({
       localInference: {
-        usage: { localModelRole: "main", sessionConcurrency: "one" },
+        usage: { sessionConcurrency: "one" },
         binding: {
           _tag: "Managed",
           selectionId: "missing",
@@ -171,7 +171,7 @@ describe("LocalModelConfiguration", () => {
 
     expect(result.changed).toBe(true)
     expect(result.config.localInference).toEqual({
-      usage: { localModelRole: "main", sessionConcurrency: "one" },
+      usage: { sessionConcurrency: "one" },
     })
     expect(result.config.models).toEqual({
       slots: { primary: { providerId: "llamacpp", providerModelId: "available" } },
@@ -184,7 +184,7 @@ describe("LocalModelConfiguration", () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const state = yield* Ref.make<MagnitudeConfig>({
         localInference: {
-          usage: { localModelRole: "main", sessionConcurrency: "one" },
+          usage: { sessionConcurrency: "one" },
         },
         models: {
           slots: {
@@ -240,7 +240,7 @@ describe("LocalModelConfiguration", () => {
 
     expect(result.totalUpdates).toBe(2)
     expect(result.disabled.localInference).toEqual({
-      usage: { localModelRole: "main", sessionConcurrency: "one" },
+      usage: { sessionConcurrency: "one" },
     })
     expect(result.disabled.models?.slots).toEqual({
       secondary: { providerId: "magnitude", providerModelId: "cloud-model" },

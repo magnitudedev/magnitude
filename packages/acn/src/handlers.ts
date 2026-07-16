@@ -328,10 +328,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           ),
         ),
 
-      GetBalance: (payload) =>
+      GetCloudUsage: (payload) =>
         observeRpcDefects(
-          "GetBalance",
-          account.getBalance({
+          "GetCloudUsage",
+          account.getCloudUsage({
             ...(payload.period !== undefined ? { period: payload.period } : {}),
             ...(payload.days !== undefined ? { days: payload.days } : {}),
             ...(payload.tz !== undefined ? { tz: payload.tz } : {}),

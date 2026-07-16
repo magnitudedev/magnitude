@@ -92,8 +92,8 @@ export {
 } from "@magnitudedev/roles/constants"
 export type { RoleId, SlotId } from "@magnitudedev/roles/constants"
 export type {
-  FetchBalanceOptions,
-  BalanceResponse,
+  FetchUsageOptions,
+  CloudUsageResponse,
 } from "@magnitudedev/providers"
-export type { BalanceQuery } from "@magnitudedev/ai"
+export type { UsageQuery } from "@magnitudedev/ai"
 export type { UsagePeriod } from "@magnitudedev/protocol"
