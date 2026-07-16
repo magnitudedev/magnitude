@@ -1,107 +1,132 @@
+import { randomUUID } from "node:crypto"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { Effect, Option, Schema, Stream } from "effect"
-import { ModelFileSourceId, ModelFileSourceKind, ModelOriginRepositoryId, ModelOriginRevisionId, makeSourceFileKey, makeSourceFileSetId } from "../model-files/identity"
+import {
+  ModelArtifactKey,
+  ModelFileDeleteError,
+  ModelFileSourceKind,
+  ModelOriginRepositoryId,
+  ModelOriginRevisionId,
+  SourceDiscoveryEvent,
+  SourceDiscoveryError,
+  SourceFileSetNotFound,
+  SourceUnavailable,
+  makeModelFileId,
+  makeSourceFileKey,
+  makeSourceFileSetId,
+  type DeletableModelFileSource,
+  type ModelFileId,
+  type SourceDiscoveryEvent as SourceDiscoveryEventType,
+  type SourceFileSet,
+} from "../model-files"
+import type { HuggingFaceManagedStoreOptions } from "./contracts"
 import { normalizeFileSystemFailure } from "../model-files/platform"
-import type { ModelFileSource, SourceDiscoveryEvent, SourceFileEntry } from "../model-files/types"
-import { SourceDiscoveryError, SourceDiscoveryEvent as SourceDiscoveryEventData, SourceFileSetNotFound, SourceUnavailable } from "../model-files/types"
-import { HuggingFaceCommitId, HuggingFaceRepositoryId } from "./identity"
+import { blobPath, isWithin, remoteContentKey } from "./cache-paths"
+import { makeHuggingFaceArtifactId } from "./artifact-identity"
+import { HuggingFaceInstallationManifestJson, type HuggingFaceInstallationManifest } from "./installation-schema"
 
-export interface HuggingFaceCacheSourceOptions { readonly root: string; readonly label: Option.Option<string> }
+export interface HuggingFaceCacheSourceOptions {
+  readonly store: HuggingFaceManagedStoreOptions
+  readonly label: Option.Option<string>
+}
 
-const repositoryFolder = Schema.String.pipe(
-  Schema.filter((folder) => folder.startsWith("models--") && folder.slice(8).split("--").length === 2, { message: () => "Not a model repository cache folder" }),
-  Schema.transform(HuggingFaceRepositoryId, { strict: true, decode: (folder) => folder.slice(8).replace("--", "/"), encode: (repository) => `models--${repository.replace("/", "--")}` }),
-)
+interface InstalledSet { readonly manifestPath: string; readonly manifest: HuggingFaceInstallationManifest; readonly set: SourceFileSet }
 
-export const makeHuggingFaceCacheSource = (options: HuggingFaceCacheSourceOptions): Effect.Effect<ModelFileSource, never, FileSystem.FileSystem | Path.Path> => Effect.gen(function* () {
+export const makeHuggingFaceCacheSource = (options: HuggingFaceCacheSourceOptions): Effect.Effect<DeletableModelFileSource, never, FileSystem.FileSystem | Path.Path> => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
-  const id = ModelFileSourceId.make("huggingface-cache")
-  const scan = Effect.gen(function* () {
-    const root = path.resolve(options.root)
-    const rootReal = yield* fs.realPath(root).pipe(Effect.mapError((error) => new SourceDiscoveryError({ sourceId: id, operation: "read-root", reason: normalizeFileSystemFailure(error), path: root })))
-    const repositoryFolders = yield* fs.readDirectory(root).pipe(Effect.mapError((error) => new SourceDiscoveryError({ sourceId: id, operation: "read-root", reason: normalizeFileSystemFailure(error), path: root })))
-    const events: SourceDiscoveryEvent[] = []
-    for (const folder of repositoryFolders.sort()) {
-      const repositoryOption = yield* Schema.decodeUnknown(repositoryFolder)(folder).pipe(Effect.option)
-      if (Option.isNone(repositoryOption)) {
-        if (folder.startsWith("models--")) events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "unsupported_layout", message: "Invalid Hugging Face repository cache folder", sourceKey: Option.some(makeSourceFileKey(folder)) } }))
-        continue
-      }
-      const repository = repositoryOption.value
-      const snapshots = path.join(root, folder, "snapshots")
-      const commitDirectory = yield* fs.readDirectory(snapshots).pipe(Effect.either)
-      if (commitDirectory._tag === "Left") {
-        events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "unreadable", message: `Cannot read Hugging Face snapshots (${normalizeFileSystemFailure(commitDirectory.left)})`, sourceKey: Option.some(makeSourceFileKey(repository)) } }))
-        continue
-      }
-      const commits = commitDirectory.right
-      for (const commitFolder of commits.sort()) {
-        const commitOption = yield* Schema.decodeUnknown(HuggingFaceCommitId)(commitFolder).pipe(Effect.option)
-        if (Option.isNone(commitOption)) {
-          events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "invalid_manifest", message: "Invalid Hugging Face snapshot commit", sourceKey: Option.some(makeSourceFileKey(`${repository}@${commitFolder}`)) } }))
-          continue
-        }
-        const commit = commitOption.value
-        const snapshot = path.join(snapshots, commit)
-        const entries: SourceFileEntry[] = []
-        const walk = (directory: string): Effect.Effect<void, never> => Effect.gen(function* () {
-          const directoryEntries = yield* fs.readDirectory(directory).pipe(Effect.either)
-          if (directoryEntries._tag === "Left") {
-            events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "unreadable", message: `Cannot read Hugging Face snapshot directory (${normalizeFileSystemFailure(directoryEntries.left)})`, sourceKey: Option.some(makeSourceFileKey(path.relative(root, directory))) } }))
-            return
-          }
-          const names = directoryEntries.right
-          for (const name of names.sort()) {
-            const candidate = path.join(directory, name)
-            const info = yield* fs.stat(candidate).pipe(Effect.either)
-            if (info._tag === "Left") {
-              events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "unreadable", message: `Cannot inspect Hugging Face cache entry (${normalizeFileSystemFailure(info.left)})`, sourceKey: Option.some(makeSourceFileKey(path.relative(root, candidate))) } }))
-              continue
-            }
-            if (info.right.type === "Directory") { yield* walk(candidate); continue }
-            if (info.right.type !== "File" && info.right.type !== "SymbolicLink") continue
-            const target = yield* fs.realPath(candidate).pipe(Effect.either)
-            if (target._tag === "Left") {
-              events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "unreadable", message: `Cannot resolve Hugging Face cache entry (${normalizeFileSystemFailure(target.left)})`, sourceKey: Option.some(makeSourceFileKey(path.relative(root, candidate))) } }))
-              continue
-            }
-            const relativeToRoot = path.relative(rootReal, target.right)
-            if (relativeToRoot === ".." || relativeToRoot.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToRoot)) {
-              events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "unsafe_path", message: "Hugging Face cache link escapes the cache root", sourceKey: Option.some(makeSourceFileKey(path.relative(root, candidate))) } }))
-              continue
-            }
-            const targetInfo = yield* fs.stat(target.right).pipe(Effect.either)
-            if (targetInfo._tag === "Left" || targetInfo.right.type !== "File") {
-              const message = targetInfo._tag === "Left" ? `Cannot inspect Hugging Face cache target (${normalizeFileSystemFailure(targetInfo.left)})` : "Hugging Face cache target is not a file"
-              events.push(SourceDiscoveryEventData.Issue({ issue: { sourceId: id, code: "unreadable", message, sourceKey: Option.some(makeSourceFileKey(path.relative(root, candidate))) } }))
-              continue
-            }
-            const relativePath = path.relative(snapshot, candidate)
-            entries.push({ key: makeSourceFileKey(`${repository}@${commit}:${relativePath}`), path: target.right, relativePath, sizeBytes: Number(targetInfo.right.size), modifiedAtMillis: Option.map(targetInfo.right.mtime, (mtime) => mtime.getTime()), sha256: Option.none(), declaredRole: Option.none(), shardIndex: Option.none() })
-          }
-        })
-        yield* walk(snapshot)
-        if (entries.length > 0) events.push(SourceDiscoveryEventData.FileSet({ set: { id: makeSourceFileSetId(`${repository}@${commit}`), artifactKey: Option.none(), sourceId: id, entries, relationships: [], origin: Option.some({ kind: "huggingface", repository: ModelOriginRepositoryId.make(repository), revision: Option.some(ModelOriginRevisionId.make(commit)) }) } }))
-      }
+  const id = options.store.sourceId
+  const cacheRoot = path.resolve(options.store.cacheRoot)
+  const installationRoot = path.resolve(options.store.installationRoot)
+  yield* fs.makeDirectory(cacheRoot, { recursive: true }).pipe(Effect.ignore)
+  const cacheRootReal = yield* fs.realPath(cacheRoot).pipe(Effect.orElseSucceed(() => cacheRoot))
+
+  const readInstalled = (manifestPath: string): Effect.Effect<InstalledSet, unknown> => Effect.gen(function* () {
+    const text = yield* fs.readFileString(manifestPath)
+    const manifest = yield* Schema.decode(HuggingFaceInstallationManifestJson)(text)
+    if (makeHuggingFaceArtifactId(manifest.artifact) !== manifest.artifact.id) return yield* Effect.fail("artifact-id-mismatch" as const)
+    if (manifest.files.length !== manifest.artifact.files.length) return yield* Effect.fail("manifest-file-count-mismatch" as const)
+    for (const artifactFile of manifest.artifact.files) {
+      const cachedFile = manifest.files.find(({ path }) => path === artifactFile.path)
+      if (!cachedFile || cachedFile.role !== artifactFile.role || cachedFile.sizeBytes !== artifactFile.sizeBytes || Option.getOrUndefined(cachedFile.shardIndex) !== Option.getOrUndefined(artifactFile.shardIndex) || remoteContentKey(cachedFile.content) !== remoteContentKey(artifactFile.content)) return yield* Effect.fail("manifest-file-mismatch" as const)
     }
-    return events
+    const entries = yield* Effect.forEach(manifest.files, (file) => Effect.gen(function* () {
+      const absolute = path.resolve(cacheRoot, file.snapshotRelativePath)
+      if (!isWithin(path, cacheRoot, absolute)) return yield* Effect.fail("manifest-path-escapes-cache-root" as const)
+      const resolved = yield* fs.realPath(absolute)
+      if (!isWithin(path, cacheRootReal, resolved)) return yield* Effect.fail("snapshot-target-escapes-cache-root" as const)
+      const info = yield* fs.stat(resolved)
+      if (info.type !== "File" || Number(info.size) !== file.sizeBytes) return yield* Effect.fail("cached-file-does-not-match-manifest" as const)
+      return {
+        key: makeSourceFileKey(`${manifest.artifact.id}:${file.path}`),
+        path: resolved,
+        relativePath: file.path,
+        sizeBytes: file.sizeBytes,
+        modifiedAtMillis: Option.map(info.mtime, (mtime) => mtime.getTime()),
+        sha256: file.content._tag === "LfsSha256" ? Option.some(file.content.sha256) : Option.none(),
+        declaredRole: Option.some(file.role),
+        shardIndex: file.shardIndex,
+      }
+    }))
+    const keys = new Map(manifest.files.map((file) => [file.path, makeSourceFileKey(`${manifest.artifact.id}:${file.path}`)]))
+    if (manifest.artifact.relationships.some(({ fromPath, toPath }) => !keys.has(fromPath) || !keys.has(toPath))) return yield* Effect.fail("invalid-manifest-relationship" as const)
+    return {
+      manifestPath,
+      manifest,
+      set: {
+        id: makeSourceFileSetId(manifest.artifact.id),
+        artifactKey: Option.some(ModelArtifactKey.make(manifest.artifact.id)),
+        sourceId: id,
+        entries,
+        relationships: manifest.artifact.relationships.map((relationship) => ({ kind: relationship.kind, from: keys.get(relationship.fromPath)!, to: keys.get(relationship.toPath)! })),
+        origin: Option.some({ kind: "huggingface", repository: ModelOriginRepositoryId.make(manifest.artifact.repository), revision: Option.some(ModelOriginRevisionId.make(manifest.artifact.commit)) }),
+      },
+    }
   })
+
+  const scan = Effect.gen(function* () {
+    yield* fs.makeDirectory(installationRoot, { recursive: true })
+    const names = yield* fs.readDirectory(installationRoot)
+    return yield* Effect.forEach(names.filter((name) => name.endsWith(".json") && !name.startsWith(".")).sort(), (name) => {
+      const manifestPath = path.join(installationRoot, name)
+      return readInstalled(manifestPath).pipe(Effect.match({
+        onFailure: (error) => ({ event: SourceDiscoveryEvent.Issue({ issue: { sourceId: id, code: "invalid_manifest", message: `Hugging Face installation manifest or cached files are invalid (${String(error).slice(0, 256)})`, sourceKey: Option.some(makeSourceFileKey(name)) } }), installed: Option.none<InstalledSet>() }),
+        onSuccess: (installed) => ({ event: SourceDiscoveryEvent.FileSet({ set: installed.set }), installed: Option.some(installed) }),
+      }))
+    })
+  })
+
+  const findBySet = (setId: SourceFileSet["id"]) => scan.pipe(Effect.map((items) => items.flatMap(({ installed }) => Option.toArray(installed)).find(({ set }) => set.id === setId)))
+  const findByModel = (modelId: ModelFileId) => scan.pipe(Effect.map((items) => items.flatMap(({ installed }) => Option.toArray(installed)).find(({ manifest }) => makeModelFileId(id, ModelArtifactKey.make(manifest.artifact.id)) === modelId)))
+
   return {
-    id, kind: ModelFileSourceKind.make("huggingface-cache"), label: Option.getOrElse(options.label, () => "Hugging Face cache"), ownership: "external",
-    discover: () => Stream.fromIterableEffect(scan),
-    resolve: (setId) => scan.pipe(
-      Effect.flatMap((events) => {
-        const event = Option.fromNullable(events.find((candidate) => candidate._tag === "FileSet" && candidate.set.id === setId))
-        return Option.match(event, {
-          onNone: () => Effect.fail(new SourceFileSetNotFound({ id: setId })),
-          onSome: (found) => found._tag === "FileSet"
-            ? Effect.succeed({ set: found.set })
-            : Effect.fail(new SourceFileSetNotFound({ id: setId })),
-        })
-      }),
+    id,
+    kind: ModelFileSourceKind.make("huggingface-cache"),
+    label: Option.getOrElse(options.label, () => "Hugging Face models"),
+    ownership: "magnitude",
+    discover: () => Stream.fromIterableEffect(scan.pipe(
+      Effect.map((items) => items.map(({ event }) => event satisfies SourceDiscoveryEventType)),
+      Effect.mapError(() => new SourceDiscoveryError({ sourceId: id, operation: "read-root", reason: "invalid-data", path: installationRoot })),
+    )),
+    resolve: (setId) => findBySet(setId).pipe(
+      Effect.flatMap((found) => found ? Effect.succeed({ set: found.set }) : Effect.fail(new SourceFileSetNotFound({ id: setId }))),
       Effect.mapError((error) => error._tag === "SourceFileSetNotFound" ? error : new SourceUnavailable({ sourceId: id, setId, reason: "unreadable" })),
     ),
+    remove: (modelId) => Effect.gen(function* () {
+      const installed = yield* findByModel(modelId).pipe(Effect.mapError(() => new ModelFileDeleteError({ id: modelId, reason: "source-unavailable" })))
+      if (!installed) return yield* new ModelFileDeleteError({ id: modelId, reason: "not-found" })
+      const tombstone = path.join(installationRoot, `.cleanup-${randomUUID()}.json`)
+      yield* fs.rename(installed.manifestPath, tombstone).pipe(Effect.mapError((error) => new ModelFileDeleteError({ id: modelId, reason: normalizeFileSystemFailure(error) })))
+      const remaining = yield* scan.pipe(Effect.orElseSucceed(() => []))
+      const referenced = new Set(remaining.flatMap(({ installed }) => Option.toArray(installed)).flatMap(({ manifest }) => manifest.files.map(({ content }) => `${content._tag}:${content._tag === "LfsSha256" ? content.sha256 : content._tag === "Xet" ? content.hash : content.oid}`)))
+      for (const file of installed.manifest.files) {
+        const pointer = path.resolve(cacheRoot, file.snapshotRelativePath)
+        if (isWithin(path, cacheRoot, pointer)) yield* fs.remove(pointer, { force: true }).pipe(Effect.ignore)
+        const reference = `${file.content._tag}:${file.content._tag === "LfsSha256" ? file.content.sha256 : file.content._tag === "Xet" ? file.content.hash : file.content.oid}`
+        if (!referenced.has(reference)) yield* fs.remove(blobPath(path, cacheRoot, installed.manifest.artifact.repository, file), { force: true }).pipe(Effect.ignore)
+      }
+      yield* fs.remove(tombstone, { force: true }).pipe(Effect.ignore)
+    }),
   }
 })
