@@ -1,14 +1,14 @@
 import { memo, useCallback, useState, useMemo } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
-import { Atom, useAtomMount } from '@effect-atom/atom-react'
-import { Effect } from 'effect'
+import { Atom, Result, useAtomMount } from '@effect-atom/atom-react'
+import { Effect, Option } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
 import type { UseModelConfigResult } from '@magnitudedev/client-common'
-import { SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, DEFAULT_REASONING_EFFORT, type SlotId } from '@magnitudedev/sdk'
+import { ModelCatalogLifecycle, ModelSlotsLifecycle, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, DEFAULT_REASONING_EFFORT, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 
 interface SettingsOverlayProps {
@@ -52,6 +52,10 @@ function formatPricing(pricing: { input: number; output: number; cachedInput?: n
   return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
 }
 
+const formatCatalogFailures = (failures: readonly ProviderCatalogFailure[]): string => failures.length === 1
+  ? `${failures[0]!.providerId}: ${failures[0]!.message}`
+  : `${failures.length} model providers failed.`
+
 const disabledReasonLabel = (reason: "insufficient_resources" | "provider_unavailable" | "model_unavailable" | "incompatible_runtime" | "invalid_configuration"): string => ({
   insufficient_resources: 'not enough free memory',
   provider_unavailable: 'server unavailable',
@@ -86,6 +90,46 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const [error, setError] = useState<string | null>(null)
   const [pendingAuthAction, setPendingAuthAction] = useState<PendingAuthAction>(null)
   const displayedAuthError = error ?? auth.error
+
+  const catalogSnapshot = modelConfig ? Result.value(modelConfig.catalog) : Option.none()
+  const catalogState = Option.map(catalogSnapshot, ({ state }) => state)
+  const models = Option.getOrNull(Option.flatMap(catalogState, (state) => ModelCatalogLifecycle.match(state, {
+    loading: () => Option.none(),
+    ready: ({ models }) => Option.some(models),
+    refreshing: ({ models }) => Option.some(models),
+    degraded: ({ models }) => Option.some(models),
+    unavailable: () => Option.none(),
+  })))
+  const providers = Option.getOrNull(Option.flatMap(catalogState, (state) => ModelCatalogLifecycle.match(state, {
+    loading: () => Option.none(),
+    ready: ({ providers }) => Option.some(providers),
+    refreshing: ({ providers }) => Option.some(providers),
+    degraded: ({ providers }) => Option.some(providers),
+    unavailable: ({ providers }) => Option.some(providers),
+  })))
+  const catalogFailures = Option.getOrElse(Option.map(catalogState, (state) => ModelCatalogLifecycle.match(state, {
+    loading: () => [] as readonly ProviderCatalogFailure[],
+    ready: () => [] as readonly ProviderCatalogFailure[],
+    refreshing: ({ failures }) => failures,
+    degraded: ({ failures }) => failures,
+    unavailable: ({ failures }) => failures,
+  })), () => [] as readonly ProviderCatalogFailure[])
+  const slotsSnapshot = modelConfig ? Result.value(modelConfig.slots) : Option.none()
+  const slotConfig = Option.getOrNull(Option.flatMap(slotsSnapshot, ({ state }) => ModelSlotsLifecycle.match(state, {
+    loading: () => Option.none(),
+    ready: ({ config }) => Option.some(config.slots),
+    refreshing: ({ config }) => Option.some(config.slots),
+    degraded: ({ config }) => Option.some(config.slots),
+    unavailable: ({ config }) => Option.some(config.slots),
+  })))
+  const catalogLoading = Option.match(catalogState, {
+    onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
+    onSome: (state) => ModelCatalogLifecycle.is(state, 'loading'),
+  })
+  const catalogRefreshing = modelConfig !== undefined && (
+    Result.isWaiting(modelConfig.catalogRefresh)
+    || Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'refreshing'))
+  )
 
   const [updateHovered, setUpdateHovered] = useState(false)
   const [disconnectHovered, setDisconnectHovered] = useState(false)
@@ -159,8 +203,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const dropdownItems = useMemo(() => {
     if (!dropdownTarget) return []
     if (dropdownTarget.field === 'model') {
-      const models = modelConfig?.models ?? []
-      return models.map(m => ({
+      return (models ?? []).map(m => ({
         id: m.providerModelId,
         providerId: m.providerId,
         label: `${m.displayName} · ${formatContextWindow(m.contextWindow)} ctx${m.pricing ? ` · ${formatPricing(m.pricing)}` : ''}${m.availability._tag === 'Disabled' ? ` · ${disabledReasonLabel(m.availability.reason)}` : ''}`,
@@ -168,7 +211,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       }))
     }
     return REASONING_OPTIONS.map(o => ({ id: o.value, label: o.label }))
-  }, [dropdownTarget, modelConfig])
+  }, [dropdownTarget, models])
 
   const openDropdown = useCallback((target: DropdownTarget) => {
     setDropdownTarget(target)
@@ -182,7 +225,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const selectDropdownItem = useCallback((index: number) => {
     if (!dropdownTarget || !modelConfig) return
     if (dropdownTarget.field === 'model') {
-      const model = modelConfig.models?.[index]
+      const model = models?.[index]
       if (!model || model.availability._tag === 'Disabled') return
       void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.providerModelId)
     } else {
@@ -191,9 +234,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       void modelConfig.updateSlotReasoning(dropdownTarget.slotId, option.value)
     }
     closeDropdown()
-  }, [dropdownTarget, modelConfig, closeDropdown])
+  }, [dropdownTarget, modelConfig, models, closeDropdown])
 
-  const unavailableProviders = modelConfig?.providers?.filter((provider) =>
+  const unavailableProviders = providers?.filter((provider) =>
     provider.status && provider.status !== 'ok'
   ) ?? []
 
@@ -384,7 +427,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         </text>
         {modelConfig && (
           <Button onClick={() => { void modelConfig.refreshModels() }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}>
-            <text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{modelConfig.refreshingModels ? '[Refreshing...]' : '[Refresh models]'}</text>
+            <text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{catalogRefreshing ? '[Refreshing...]' : '[Refresh models]'}</text>
           </Button>
         )}
       </box>
@@ -402,11 +445,38 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             </text>
           </box>
         ))}
+        {modelConfig && Result.isFailure(modelConfig.catalog) && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{ fg: theme.error }}>
+              {Option.isSome(catalogSnapshot)
+                ? '⚠ Lost contact with the model catalog; showing the last received state.'
+                : '✗ Unable to read the model catalog from the daemon.'}
+            </text>
+          </box>
+        )}
+        {catalogFailures.length > 0 && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{ fg: Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable')) ? theme.error : theme.warning }}>
+              {Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable'))
+                ? `✗ Model catalog unavailable. ${formatCatalogFailures(catalogFailures)}`
+                : `⚠ Showing available or last-known models. ${formatCatalogFailures(catalogFailures)}`}
+            </text>
+          </box>
+        )}
+        {modelConfig && Result.isFailure(modelConfig.catalogRefresh) && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{ fg: theme.error }}>✗ Failed to request a model catalog refresh.</text>
+          </box>
+        )}
+        {modelConfig && Result.isFailure(modelConfig.slotUpdate) && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{ fg: theme.error }}>✗ Failed to update model configuration.</text>
+          </box>
+        )}
         {SLOT_IDS.map((slotId) => {
           const label = SLOT_DISPLAY_NAMES[slotId]
           const description = SLOT_DESCRIPTIONS[slotId]
-          const models = modelConfig?.models ?? null
-          const currentOverride = modelConfig?.slotConfig?.[slotId] ?? null
+          const currentOverride = slotConfig?.[slotId] ?? null
           const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
           const currentEffort = currentOverride?.reasoningEffort ?? defaultEffort
           const availableModels = models?.filter(m => m.availability._tag === 'Available') ?? null
@@ -423,7 +493,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             ? effectiveModel.displayName
             : '—'
           const thinkingLabel = REASONING_OPTIONS.find(o => o.value === currentEffort)?.label ?? '—'
-          const loading = modelConfig?.modelsLoading ?? false
+          const loading = catalogLoading
           const isThisDropdownOpen = dropdownTarget?.slotId === slotId
 
           return (
@@ -469,7 +539,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                           backgroundColor: theme.terminalDetectedBg,
                         }}>
                           {dropdownItems.length === 0 ? (
-                            <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>No models</span></text>
+                            <text style={{ fg: Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable')) ? theme.error : theme.muted }}>
+                              <span attributes={TextAttributes.DIM}>{Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable')) ? 'Catalog unavailable' : 'No models'}</span>
+                            </text>
                           ) : dropdownItems.map((item, index) => {
                             const sel = index === dropdownIndex
                             const itemDisabled = 'disabled' in item && item.disabled

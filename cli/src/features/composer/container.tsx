@@ -5,7 +5,8 @@
  * the CLI's slash-command surface (overlays, system messages, bash mode).
  */
 import { useCallback, useMemo, useRef, type ReactNode } from 'react'
-import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
+import { Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
+import { Option } from 'effect'
 import type { KeyEvent } from '@opentui/core'
 import {
   useComposerState,
@@ -28,7 +29,7 @@ import {
   type CommandContext,
 } from '@magnitudedev/client-common'
 import type { RawMessageAttachment } from '@magnitudedev/sdk'
-import { ROLE_TO_SLOT } from '@magnitudedev/sdk'
+import { ModelSlotsLifecycle, ROLE_TO_SLOT } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
 import { showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
@@ -61,7 +62,15 @@ export function ComposerContainer({
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
   const { startNewSession } = useSessionActions()
-  const { slotConfig } = useModelConfig()
+  const modelConfig = useModelConfig()
+  const slotConfig = Option.getOrNull(Option.flatMap(Result.value(modelConfig.slots), ({ state }) =>
+    ModelSlotsLifecycle.match(state, {
+      loading: () => Option.none(),
+      ready: ({ config }) => Option.some(config.slots),
+      refreshing: ({ config }) => Option.some(config.slots),
+      degraded: ({ config }) => Option.some(config.slots),
+      unavailable: ({ config }) => Option.some(config.slots),
+    })))
 
   // The onboarding snapshot and model configuration are invalidated by the
   // same activation mutation, but they are separate RPC projections. During

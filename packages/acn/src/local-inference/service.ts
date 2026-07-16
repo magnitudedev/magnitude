@@ -2,6 +2,7 @@ import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import {
   LocalInferenceError,
+  type MirroredResourceInvalidation,
   type LocalInferenceHostProfile,
   type LocalInferenceState,
   type LocalInferenceUsageSelection,
@@ -19,6 +20,7 @@ import { recommendLocalModels } from "./recommendations"
 
 export interface LocalInferenceApi {
   readonly state: Effect.Effect<LocalInferenceState, LocalInferenceError>
+  readonly watchState: Stream.Stream<MirroredResourceInvalidation, LocalInferenceError>
   readonly configureUsage: (selection: LocalInferenceUsageSelection) => Effect.Effect<void, LocalInferenceError>
   readonly installDistribution: Effect.Effect<void, LocalInferenceError>
   readonly downloadModel: (configurationId: string) => Effect.Effect<void, LocalInferenceError>
@@ -261,5 +263,14 @@ export const LocalInferenceLive: Layer.Layer<
     } satisfies LocalInferenceState
   })
 
-  return LocalInference.of({ state, configureUsage, installDistribution, downloadModel, activateModel, deleteModel, restart, disable })
+  const watchState = Stream.concat(Stream.make(undefined), Stream.tick("500 millis")).pipe(
+    Stream.mapEffect(() => state),
+    Stream.changesWith((previous, current) => JSON.stringify(previous) === JSON.stringify(current)),
+    Stream.mapAccum(0, (revision): readonly [number, MirroredResourceInvalidation] => [
+      revision + 1,
+      { _tag: "changed", revision: revision + 1 },
+    ]),
+  )
+
+  return LocalInference.of({ state, watchState, configureUsage, installDistribution, downloadModel, activateModel, deleteModel, restart, disable })
 }))

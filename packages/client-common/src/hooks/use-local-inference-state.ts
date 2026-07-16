@@ -1,26 +1,11 @@
 import { useCallback, useMemo } from "react"
-import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { Cause, Effect, Stream } from "effect"
-import { RpcClient } from "@effect/rpc"
-import { MagnitudeRpcs, type LocalInferenceError, type LocalInferenceState, type LocalInferenceUsageSelection } from "@magnitudedev/sdk"
+import { useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import type { LocalInferenceUsageSelection } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { usePlatform } from "../platform/platform-context"
-
-const localInferenceStreamAtom = Atom.make<Result.Result<LocalInferenceState, LocalInferenceError>>(Result.initial())
+import { useLocalInferenceResource } from "./use-reactive-rpc"
 
 export function useLocalInferenceQuery() {
-  const platform = usePlatform()
-  const setState = useAtomSet(localInferenceStreamAtom)
-  const subscriptionAtom = useMemo(() => Atom.make(Effect.gen(function* () {
-    const client = yield* RpcClient.make(MagnitudeRpcs)
-    yield* client.StreamLocalInferenceState({}).pipe(
-      Stream.runForEach((state) => Effect.sync(() => setState(Result.success(state)))),
-      Effect.catchAllCause((cause) => Effect.logError(`StreamLocalInferenceState error: ${Cause.pretty(cause)}`)),
-      Effect.forkScoped,
-    )
-  }).pipe(Effect.provide(platform.protocolLayer))), [platform.protocolLayer, setState])
-  useAtomMount(subscriptionAtom)
-  return useAtomValue(localInferenceStreamAtom)
+  return useLocalInferenceResource()
 }
 
 export function useLocalInferenceState() {
@@ -54,22 +39,22 @@ export function useLocalInferenceState() {
   const disableMutation = useAtomSet(disableAtom)
 
   const configureUsage = useCallback((selection: LocalInferenceUsageSelection): void => {
-    configureMutation({ payload: selection, reactivityKeys: ["localInference"] })
+    configureMutation({ payload: selection, reactivityKeys: ["localInference", "modelSlots"] })
   }, [configureMutation])
   const installDistribution = useCallback((): void => {
-    installMutation({ payload: {}, reactivityKeys: ["localInference"] })
+    installMutation({ payload: {}, reactivityKeys: ["localInference", "modelCatalog"] })
   }, [installMutation])
   const downloadModel = useCallback((configurationId: string): void => {
-    downloadMutation({ payload: { configurationId }, reactivityKeys: ["localInference"] })
+    downloadMutation({ payload: { configurationId }, reactivityKeys: ["localInference", "modelCatalog"] })
   }, [downloadMutation])
   const activateModel = useCallback((selectionId: string): void => {
     activateMutation({ payload: { selectionId }, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })
   }, [activateMutation])
   const deleteModel = useCallback((selectionId: string): void => {
-    deleteMutation({ payload: { selectionId }, reactivityKeys: ["localInference"] })
+    deleteMutation({ payload: { selectionId }, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })
   }, [deleteMutation])
   const restart = useCallback((): void => {
-    restartMutation({ payload: {}, reactivityKeys: ["localInference"] })
+    restartMutation({ payload: {}, reactivityKeys: ["localInference", "modelCatalog"] })
   }, [restartMutation])
   const disable = useCallback((): void => {
     disableMutation({ payload: {}, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })

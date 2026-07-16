@@ -57,7 +57,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         Effect.tapErrorCause((cause) =>
           Chunk.isEmpty(Cause.defects(cause))
             ? Effect.void
-            : Effect.logError(`RPC defect in ${label}`).pipe(
+            : Effect.logFatal(`RPC defect in ${label}`).pipe(
                 Effect.annotateLogs({ defect: Cause.pretty(cause) })
               )
         )
@@ -71,7 +71,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         Stream.tapErrorCause((cause) =>
           Chunk.isEmpty(Cause.defects(cause))
             ? Effect.void
-            : Effect.logError(`RPC stream defect in ${label}`).pipe(
+            : Effect.logFatal(`RPC stream defect in ${label}`).pipe(
                 Effect.annotateLogs({ defect: Cause.pretty(cause) })
               )
         )
@@ -345,13 +345,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localInference.state,
         ),
 
-      StreamLocalInferenceState: () =>
+      WatchLocalInferenceState: () =>
         observeRpcStreamDefects(
-          "StreamLocalInferenceState",
-          Stream.concat(Stream.make(undefined), Stream.tick("500 millis")).pipe(
-            Stream.mapEffect(() => localInference.state),
-            Stream.changesWith((previous, current) => JSON.stringify(previous) === JSON.stringify(current)),
-          ),
+          "WatchLocalInferenceState",
+          withHeartbeat(localInference.watchState),
         ),
 
       ConfigureLocalInferenceUsage: (selection) =>

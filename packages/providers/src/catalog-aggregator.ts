@@ -15,14 +15,12 @@ import {
 export function makeAggregatedCatalog(
   providers: readonly { readonly id: ProviderId; readonly catalog: ModelCatalog<any> }[],
 ): ModelCatalog<ProviderModel> {
-  const list: ModelCatalog<ProviderModel>["list"] = Effect.gen(function* () {
-    const results = yield* Effect.all(
-      providers.map((p) =>
-        p.catalog.list.pipe(Effect.catchAll(() => Effect.succeed([] as readonly any[]))),
-      ),
+  const collect = (operation: "list" | "refresh"): ModelCatalog<ProviderModel>["list"] =>
+    inspectProviderCatalogs(providers, operation).pipe(
+      Effect.map((outcomes) => outcomes.flatMap((outcome) => outcome._tag === "Success" ? outcome.models : [])),
     )
-    return results.flat() as readonly ProviderModel[]
-  })
+
+  const list = collect("list")
 
   const get: ModelCatalog<ProviderModel>["get"] = (providerId, providerModelId) =>
     Effect.gen(function* () {
@@ -31,17 +29,41 @@ export function makeAggregatedCatalog(
       return yield* provider.catalog.get(providerId, providerModelId) as Effect.Effect<ProviderModel, ModelCatalogError, HttpClient.HttpClient>
     })
 
-  const refresh: ModelCatalog<ProviderModel>["refresh"] = Effect.gen(function* () {
-    const results = yield* Effect.all(
-      providers.map((p) =>
-        p.catalog.refresh.pipe(Effect.catchAll(() => Effect.succeed([] as readonly any[]))),
-      ),
-    )
-    return results.flat() as readonly ProviderModel[]
-  })
+  const refresh = collect("refresh")
 
   return { list, get, refresh }
 }
+
+export type ProviderCatalogOutcome =
+  | {
+      readonly _tag: "Success"
+      readonly providerId: ProviderId
+      readonly models: readonly ProviderModel[]
+    }
+  | {
+      readonly _tag: "Failure"
+      readonly providerId: ProviderId
+      readonly failure: ModelCatalogError
+    }
+
+export const inspectProviderCatalogs = (
+  providers: readonly { readonly id: ProviderId; readonly catalog: ModelCatalog<any> }[],
+  operation: "list" | "refresh",
+): Effect.Effect<readonly ProviderCatalogOutcome[], never, HttpClient.HttpClient> => Effect.gen(function* () {
+    const results = yield* Effect.all(
+      providers.map((p) =>
+        p.catalog[operation].pipe(
+          Effect.tapError((cause) => Effect.logWarning(`Provider catalog ${operation} failed`).pipe(
+            Effect.annotateLogs({ providerId: p.id, operation: `catalog-${operation}`, cause: String(cause).slice(0, 1_000) }),
+          )),
+          Effect.either,
+        ),
+      ),
+    )
+    return results.map((result, index): ProviderCatalogOutcome => result._tag === "Right"
+      ? { _tag: "Success", providerId: providers[index]!.id, models: result.right }
+      : { _tag: "Failure", providerId: providers[index]!.id, failure: result.left })
+  })
 
 export function buildFamilies(
   providerModels: readonly ProviderModel[],

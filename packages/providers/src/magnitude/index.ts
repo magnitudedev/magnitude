@@ -1,5 +1,5 @@
 export { createMagnitudeProvider, fetchBalance, PROVIDER_ID, type MagnitudeProviderInstance, type MagnitudeClientConfig, type FetchBalanceOptions, WebSearchError, MagnitudeClientError } from "./provider"
-export { createMagnitudeCatalog, toMagnitudeModelInfo } from "./catalog"
+export { createMagnitudeCatalog, toMagnitudeModelInfo, type MagnitudeAuthentication } from "./catalog"
 export { createMagnitudeCompatibleSpec, type MagnitudeCallOptions, type MagnitudeModelSpec, type MagnitudeCompatibleSpecConfig } from "./models"
 export { classifyMagnitudeRejectedResponse, tryParseErrorBody, type ParsedMagnitudeApiError } from "./errors"
 export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./contract"

@@ -67,7 +67,7 @@ export const MagnitudeRpcs = RpcGroup.make(
   Stream.CloseDisplayView.middleware(AcnRpcCommandActivity),
 
   // Long-running subscriptions
-  LocalInference.StreamLocalInferenceState,
+  LocalInference.WatchLocalInferenceState,
   Config.WatchModelCatalog,
   Config.WatchModelSlots,
   Session.StreamActiveSessionStatuses,

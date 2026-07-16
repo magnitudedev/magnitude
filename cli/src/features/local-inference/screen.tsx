@@ -1,7 +1,7 @@
 import { Fragment, memo, useCallback, useMemo, useState } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
-import { Cause, Effect } from "effect"
+import { Cause, Effect, Option } from "effect"
 import { Atom, Result as AtomResult, useAtomMount } from "@effect-atom/atom-react"
 import type {
   LocalInferenceState,
@@ -79,7 +79,8 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(
 ) {
   const theme = useTheme()
   const local = useLocalInferenceState()
-  const ready = AtomResult.isSuccess(local.state)
+  const snapshot = AtomResult.value(local.state)
+  const ready = Option.isSome(snapshot)
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c" && !key.meta && !key.option) {
       key.preventDefault()
@@ -91,22 +92,19 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(
       props.onSkip()
     }
   }, [props.onExit, props.onSkip, ready]))
-  if (AtomResult.isInitial(local.state)) {
-    return (
-      <box style={{ height: "100%", alignItems: "center", justifyContent: "center" }}>
-        <text style={{ fg: theme.muted }}>Inspecting local inference…</text>
-      </box>
-    )
-  }
-  if (AtomResult.isFailure(local.state)) {
-    return (
+  return Option.match(snapshot, {
+    onNone: () => AtomResult.isFailure(local.state) ? (
       <box style={{ height: "100%", alignItems: "center", justifyContent: "center", flexDirection: "column" }}>
         <text style={{ fg: theme.error }}>Failed to inspect local inference.</text>
         <text style={{ fg: theme.muted }}>{Cause.pretty(local.state.cause)}</text>
       </box>
-    )
-  }
-  return <ReadyLocalInferenceScreen {...props} state={local.state.value} local={local} />
+    ) : (
+      <box style={{ height: "100%", alignItems: "center", justifyContent: "center" }}>
+        <text style={{ fg: theme.muted }}>Inspecting local inference…</text>
+      </box>
+    ),
+    onSome: (state) => <ReadyLocalInferenceScreen {...props} state={state} local={local} />,
+  })
 })
 
 const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({

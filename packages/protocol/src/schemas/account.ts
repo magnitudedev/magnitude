@@ -1,5 +1,9 @@
 import { Schema } from "effect"
 import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema } from "@magnitudedev/ai"
+import { FSM } from "@magnitudedev/utils"
+import { MirroredSnapshotSchema } from "./mirrored-resource"
+
+const { defineFSM } = FSM
 
 export const RoleId = Schema.Literal(
   "leader",
@@ -111,27 +115,128 @@ export const ModelSummarySchema = Schema.Struct({
 })
 export type ModelSummary = Schema.Schema.Type<typeof ModelSummarySchema>
 
-/** Provider/model discovery state. Slot selection is intentionally separate. */
-export const ModelCatalogSchema = Schema.Struct({
-  revision: Schema.NonNegativeInt,
-  refreshing: Schema.Boolean,
+export class ProviderCatalogStale extends Schema.TaggedClass<ProviderCatalogStale>()("stale", {
+  providerId: ProviderIdSchema,
+  message: Schema.String,
+}) {}
+
+export class ProviderCatalogUnavailable extends Schema.TaggedClass<ProviderCatalogUnavailable>()("unavailable", {
+  providerId: ProviderIdSchema,
+  message: Schema.String,
+}) {}
+
+export const ProviderCatalogFailureSchema = Schema.Union(ProviderCatalogStale, ProviderCatalogUnavailable)
+export type ProviderCatalogFailure = typeof ProviderCatalogFailureSchema.Type
+
+export class ModelSlotConfigurationUnavailable extends Schema.TaggedClass<ModelSlotConfigurationUnavailable>()("configuration_unavailable", {
+  message: Schema.String,
+}) {}
+
+export const ModelSlotsFailureSchema = Schema.Union(
+  ProviderCatalogFailureSchema,
+  ModelSlotConfigurationUnavailable,
+)
+export type ModelSlotsFailure = typeof ModelSlotsFailureSchema.Type
+
+const CatalogSnapshotFields = {
   models: Schema.Array(ModelSummarySchema),
   providers: Schema.Array(ProviderInfoSchema),
-})
+} as const
+
+export class ModelCatalogLoading extends Schema.TaggedClass<ModelCatalogLoading>()("loading", {}) {}
+export class ModelCatalogReady extends Schema.TaggedClass<ModelCatalogReady>()("ready", CatalogSnapshotFields) {}
+export class ModelCatalogRefreshing extends Schema.TaggedClass<ModelCatalogRefreshing>()("refreshing", {
+  ...CatalogSnapshotFields,
+  failures: Schema.Array(ProviderCatalogFailureSchema),
+}) {}
+export class ModelCatalogDegraded extends Schema.TaggedClass<ModelCatalogDegraded>()("degraded", {
+  ...CatalogSnapshotFields,
+  failures: Schema.Array(ProviderCatalogFailureSchema),
+}) {}
+export class ModelCatalogUnavailable extends Schema.TaggedClass<ModelCatalogUnavailable>()("unavailable", {
+  providers: Schema.Array(ProviderInfoSchema),
+  failures: Schema.Array(ProviderCatalogUnavailable),
+}) {}
+
+export const ModelCatalogLifecycle = defineFSM(
+  {
+    loading: ModelCatalogLoading,
+    ready: ModelCatalogReady,
+    refreshing: ModelCatalogRefreshing,
+    degraded: ModelCatalogDegraded,
+    unavailable: ModelCatalogUnavailable,
+  },
+  {
+    loading: ["ready", "degraded", "unavailable"],
+    ready: ["refreshing"],
+    refreshing: ["ready", "degraded", "unavailable"],
+    degraded: ["refreshing"],
+    unavailable: ["refreshing"],
+  } as const,
+)
+
+export const ModelCatalogStateSchema = Schema.Union(
+  ModelCatalogLoading,
+  ModelCatalogReady,
+  ModelCatalogRefreshing,
+  ModelCatalogDegraded,
+  ModelCatalogUnavailable,
+)
+export type ModelCatalogState = typeof ModelCatalogStateSchema.Type
+
+/** Provider/model discovery state. Slot selection is intentionally separate. */
+export const ModelCatalogSchema = MirroredSnapshotSchema(ModelCatalogStateSchema)
 export type ModelCatalog = Schema.Schema.Type<typeof ModelCatalogSchema>
 
-/** Durable slot configuration plus its authoritative resolved projection. */
-export const ModelSlotsSchema = Schema.Struct({
-  revision: Schema.NonNegativeInt,
+const SlotSnapshotFields = {
   profiles: SlotProfiles,
   config: ModelConfigResponseSchema,
-})
-export type ModelSlots = Schema.Schema.Type<typeof ModelSlotsSchema>
+} as const
 
-export const ModelResourceInvalidationSchema = Schema.TaggedStruct("changed", {
-  revision: Schema.NonNegativeInt,
-})
-export type ModelResourceInvalidation = Schema.Schema.Type<typeof ModelResourceInvalidationSchema>
+export class ModelSlotsLoading extends Schema.TaggedClass<ModelSlotsLoading>()("loading", {}) {}
+export class ModelSlotsReady extends Schema.TaggedClass<ModelSlotsReady>()("ready", SlotSnapshotFields) {}
+export class ModelSlotsRefreshing extends Schema.TaggedClass<ModelSlotsRefreshing>()("refreshing", {
+  ...SlotSnapshotFields,
+  failures: Schema.Array(ModelSlotsFailureSchema),
+}) {}
+export class ModelSlotsDegraded extends Schema.TaggedClass<ModelSlotsDegraded>()("degraded", {
+  ...SlotSnapshotFields,
+  failures: Schema.Array(ModelSlotsFailureSchema),
+}) {}
+export class ModelSlotsUnavailable extends Schema.TaggedClass<ModelSlotsUnavailable>()("unavailable", {
+  config: ModelConfigResponseSchema,
+  failures: Schema.Array(ModelSlotsFailureSchema),
+}) {}
+
+export const ModelSlotsLifecycle = defineFSM(
+  {
+    loading: ModelSlotsLoading,
+    ready: ModelSlotsReady,
+    refreshing: ModelSlotsRefreshing,
+    degraded: ModelSlotsDegraded,
+    unavailable: ModelSlotsUnavailable,
+  },
+  {
+    loading: ["ready", "degraded", "unavailable"],
+    ready: ["refreshing"],
+    refreshing: ["ready", "degraded", "unavailable"],
+    degraded: ["refreshing"],
+    unavailable: ["refreshing"],
+  } as const,
+)
+
+export const ModelSlotsStateSchema = Schema.Union(
+  ModelSlotsLoading,
+  ModelSlotsReady,
+  ModelSlotsRefreshing,
+  ModelSlotsDegraded,
+  ModelSlotsUnavailable,
+)
+export type ModelSlotsState = typeof ModelSlotsStateSchema.Type
+
+/** Durable slot configuration plus its authoritative resolved projection. */
+export const ModelSlotsSchema = MirroredSnapshotSchema(ModelSlotsStateSchema)
+export type ModelSlots = Schema.Schema.Type<typeof ModelSlotsSchema>
 
 // ---------------------------------------------------------------------------
 // Auth

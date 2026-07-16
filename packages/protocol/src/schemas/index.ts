@@ -1,6 +1,7 @@
 export * from "./json"
 export * from "./attachments"
 export * from "./account"
+export * from "./mirrored-resource"
 export * from "./display"
 export * from "./events"
 export * from "./session"

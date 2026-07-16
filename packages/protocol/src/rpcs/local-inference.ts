@@ -5,6 +5,8 @@ import {
   LocalInferenceState,
   LocalInferenceUsageSelection,
 } from "../schemas/local-inference"
+import { MirroredResourceInvalidationSchema } from "../schemas/mirrored-resource"
+import { StreamHeartbeat } from "../schemas/events"
 
 export const GetLocalInferenceState = Rpc.make("GetLocalInferenceState", {
   payload: Schema.Struct({}),
@@ -12,9 +14,9 @@ export const GetLocalInferenceState = Rpc.make("GetLocalInferenceState", {
   error: LocalInferenceError,
 })
 
-export const StreamLocalInferenceState = Rpc.make("StreamLocalInferenceState", {
+export const WatchLocalInferenceState = Rpc.make("WatchLocalInferenceState", {
   payload: Schema.Struct({}),
-  success: LocalInferenceState,
+  success: Schema.Union(MirroredResourceInvalidationSchema, StreamHeartbeat),
   error: LocalInferenceError,
   stream: true,
 })

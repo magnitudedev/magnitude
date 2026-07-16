@@ -11,7 +11,7 @@ import type {
   ProviderModelId,
 } from "@magnitudedev/ai"
 import type { MagnitudeProviderInstance } from "./magnitude/provider"
-import { makeAggregatedCatalog } from "./catalog-aggregator"
+import { inspectProviderCatalogs, makeAggregatedCatalog, type ProviderCatalogOutcome } from "./catalog-aggregator"
 
 export type AuthStatus =
   | { readonly _tag: "authenticated" }
@@ -41,6 +41,10 @@ export interface ProviderRegistryService {
   readonly listProviderIds: Effect.Effect<readonly ProviderId[]>
   readonly listProviders: Effect.Effect<readonly ProviderInfo[], never, HttpClient.HttpClient>
   readonly aggregatedCatalog: ModelCatalog<ProviderModel>
+  readonly catalogs: {
+    readonly list: Effect.Effect<readonly ProviderCatalogOutcome[], never, HttpClient.HttpClient>
+    readonly refresh: (providerId?: ProviderId) => Effect.Effect<readonly ProviderCatalogOutcome[], never, HttpClient.HttpClient>
+  }
   /**
    * Resolve a model from any registered provider.
    * Dispatches to the correct provider's `model()` method.
@@ -70,7 +74,13 @@ export function makeProviderRegistry(config: {
 
   if (config.magnitude) {
     providers.set(config.magnitude.provider.id, config.magnitude.provider)
-    providerInfos.push({ id: config.magnitude.provider.id, displayName: "Magnitude", authStatus: { _tag: "authenticated" } })
+    providerInfos.push({
+      id: config.magnitude.provider.id,
+      displayName: "Magnitude",
+      authStatus: config.magnitude.authentication._tag === "Configured"
+        ? { _tag: "authenticated" }
+        : { _tag: "not_configured", reason: "Magnitude authentication is not configured" },
+    })
   }
 
   for (const instance of config.discoverableProviders ?? []) {
@@ -98,6 +108,13 @@ export function makeProviderRegistry(config: {
       return infos
     }),
     aggregatedCatalog,
+    catalogs: {
+      list: inspectProviderCatalogs(activeProviders, "list"),
+      refresh: (providerId) => inspectProviderCatalogs(
+        providerId === undefined ? activeProviders : activeProviders.filter((provider) => provider.id === providerId),
+        "refresh",
+      ),
+    },
     resolveModel: (providerId, providerModelId, options) =>
       Effect.gen(function* () {
         const provider = providers.get(providerId)

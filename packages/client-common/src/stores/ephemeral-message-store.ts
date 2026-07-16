@@ -6,7 +6,8 @@
 
 export interface EphemeralMessage {
   readonly text: string
-  readonly color: string
+  readonly color?: string
+  readonly tone?: "error" | "warning"
 }
 
 const DEFAULT_DISMISS_MS = 5000
@@ -22,6 +23,21 @@ function notify(): void {
 export function addEphemeralMessage(text: string, color: string, dismissMs: number = DEFAULT_DISMISS_MS): void {
   if (timer) clearTimeout(timer)
   current = { text, color }
+  notify()
+  timer = setTimeout(() => {
+    current = null
+    timer = null
+    notify()
+  }, dismissMs)
+}
+
+export function addEphemeralLogMessage(
+  text: string,
+  tone: "error" | "warning",
+  dismissMs: number = DEFAULT_DISMISS_MS,
+): void {
+  if (timer) clearTimeout(timer)
+  current = { text, tone }
   notify()
   timer = setTimeout(() => {
     current = null
