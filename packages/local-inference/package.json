@@ -16,13 +16,15 @@
     "typecheck": "tsc --noEmit",
     "test": "bunx --bun vitest run",
     "verify:package": "bun run typecheck && bun run test",
+    "verify:huggingface": "bun scripts/verify-huggingface.ts",
     "verify:llama-cli": "bun scripts/verify-llama-cli.ts",
     "verify:external-readonly": "bun scripts/verify-external-readonly.ts"
   },
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@huggingface/gguf": "0.4.2",
-    "@huggingface/tasks": "0.20.25",
+    "@huggingface/hub": "2.13.3",
+    "@huggingface/tasks": "0.21.24",
     "effect": "3.21.2"
   },
   "devDependencies": {
