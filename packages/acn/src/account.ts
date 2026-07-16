@@ -4,8 +4,8 @@ import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import { Cause, Chunk, Context, Effect, Layer, Option, Ref, Schema, Scope, Stream } from "effect"
 import {
   ProviderClient,
-  type BalanceQuery,
-  type BalanceResponse,
+  type UsageQuery,
+  type CloudUsageResponse,
   type ProviderModel,
   type ProviderClientShape,
   type ProviderRegistryInfo,
@@ -68,7 +68,7 @@ export interface AccountApi {
   readonly modelSlots: Effect.Effect<ModelSlots>
   readonly watchModelSlots: Stream.Stream<MirroredResourceInvalidation>
   readonly updateModelSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, SessionError>
-  readonly getBalance: (query?: BalanceQuery) => Effect.Effect<BalanceResponse, SessionError>
+  readonly getCloudUsage: (query?: UsageQuery) => Effect.Effect<CloudUsageResponse, SessionError>
 }
 
 export class Account extends Context.Tag("Account")<
@@ -356,19 +356,13 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       )
 
       const resolveApiKey = Effect.gen(function* () {
-        const useLocal = isEnvFlagOn(process.env.MAGNITUDE_USE_LOCAL)
-        if (useLocal) {
-          const localKey = process.env.MAGNITUDE_LOCAL_API_KEY
-          if (localKey?.trim()) return localKey
-        }
+        const envKey = process.env.MAGNITUDE_API_KEY
+        if (envKey?.trim()) return envKey
 
         const stored = yield* storage.auth.get("magnitude").pipe(
           Effect.catchAll(() => Effect.void),
         )
         if (stored?.type === "api" && stored.key.trim()) return stored.key
-
-        const envKey = process.env.MAGNITUDE_API_KEY
-        if (envKey?.trim()) return envKey
 
         return null
       })
@@ -509,12 +503,12 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           Effect.andThen(rebuildSlotSnapshot),
         ),
 
-        getBalance: (query) =>
+        getCloudUsage: (query) =>
           Effect.gen(function* () {
-            const client: ProviderClientShape = yield* magnitudeAuthenticatedClient("get balance")
-            return yield* client.balance(query).pipe(
+            const client: ProviderClientShape = yield* magnitudeAuthenticatedClient("get cloud usage")
+            return yield* client.usage(query).pipe(
               Effect.provide(FetchHttpClient.layer),
-              Effect.mapError(toAccountError("get balance")),
+              Effect.mapError(toAccountError("get cloud usage")),
             )
           }),
       }

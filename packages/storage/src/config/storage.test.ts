@@ -38,7 +38,7 @@ describe("config storage onboarding state", () => {
           },
         },
         localInference: {
-          usage: { localModelRole: "subagent", sessionConcurrency: "up_to_three" },
+          usage: { sessionConcurrency: "up_to_three" },
         },
       }))
       yield* config.completeOnboardingFlow("model_setup", 2, "2026-07-14T22:00:00.000Z")
@@ -47,7 +47,6 @@ describe("config storage onboarding state", () => {
 
     expect(result.models?.slots?.primary).toEqual({ providerId: "llamacpp", providerModelId: "model" })
     expect(result.localInference?.usage).toEqual({
-      localModelRole: "subagent",
       sessionConcurrency: "up_to_three",
     })
     expect(result.onboarding?.completions?.model_setup).toEqual({
@@ -70,7 +69,7 @@ describe("config storage onboarding state", () => {
         },
       },
       localInference: {
-        usage: { localModelRole: "main", sessionConcurrency: "one" },
+        usage: { sessionConcurrency: "one" },
       },
       futureDomain: { enabled: true },
     }))
@@ -88,7 +87,6 @@ describe("config storage onboarding state", () => {
       providerModelId: "model",
     })
     expect(result.loaded.localInference?.usage).toEqual({
-      localModelRole: "main",
       sessionConcurrency: "one",
     })
 
@@ -101,7 +99,7 @@ describe("config storage onboarding state", () => {
     const paths = makeGlobalStoragePaths(root)
     await Bun.write(paths.configFile, JSON.stringify({
       localInference: {
-        usage: { localModelRole: "subagent", sessionConcurrency: "up_to_three" },
+        usage: { sessionConcurrency: "up_to_three" },
         binding: {
           _tag: "Managed",
           selectionId: "selection",
@@ -119,7 +117,6 @@ describe("config storage onboarding state", () => {
     }).pipe(Effect.provide(makeBase())))
 
     expect(localInference?.usage).toEqual({
-      localModelRole: "subagent",
       sessionConcurrency: "up_to_three",
     })
     expect(localInference?.binding).toBeUndefined()

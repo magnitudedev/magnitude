@@ -1,6 +1,6 @@
 ---
 title: Pricing
-description: "Enterprise hosting and cloud pass-through pricing"
+description: "Enterprise hosting and optional Magnitude Pro cloud models"
 icon: badge-dollar-sign
 ---
 
@@ -16,24 +16,22 @@ We host Magnitude in your VPC or data center, optionally air-gapped. Your code n
 
 ## Cloud
 
-Runs on our infrastructure, nothing to host. Zero data retention on your prompts and code. Sign up at [app.magnitude.dev](https://app.magnitude.dev) and get **\$5 of free credits** to start, no card required.
+Cloud models run on our infrastructure when you choose to use them. Zero data retention applies to your prompts and code. Magnitude's open-source agent remains available with local models without a cloud subscription.
 
-### How it works
+### Magnitude Pro
 
-- **Pass-through pricing.** Each request is charged at the model's actual per-token cost with no markup.
-- **Top-ups.** Add credits in multiples of \$5 (presets at \$10, \$20, \$50, custom up to \$500). Stripe processing fees are passed through as a separate line item.
-- **Auto-reload (optional).** Off by default. Turn it on and set a threshold, top-up amount, and monthly cap. When your balance drops below the threshold, we charge your card for the configured amount.
+Pro is \$10 for the first month, then \$20/month. It includes \$10 every 5 hours, \$20 each week, and \$40 each month.
 
-Manage all of this on the [billing page](https://app.magnitude.dev/billing) in the console. Run `/usage` in the CLI to check your balance, recent spend, top-up history, and auto-reload status.
+Usage is measured from each completed request at the underlying model's per-token cost. It is included in the plan rather than billed as an overage. There are no credit top-ups or automatic reloads.
 
-### Per-token pricing
+Manage your plan on the [billing page](https://app.magnitude.dev/billing). Run `/usage` or `/limits` in the CLI to see current limits, reset times, and recent usage.
 
-Pricing per 1M tokens, identical to what the underlying provider charges us.
+### Usage accounting rates
+
+The limits above use these underlying rates per 1M tokens.
 
 | Model | Input/1M | Cached input/1M | Output/1M |
 |---|---|---|---|
 | GLM 5.2 | $1.40 | $0.14 | $4.40 |
 | Kimi K2.7 Code | $0.95 | $0.16 | $4.00 |
 | DeepSeek V4 Flash | $0.14 | $0.04 | $0.28 |
-
-

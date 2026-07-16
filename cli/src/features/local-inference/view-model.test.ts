@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import type { LocalInferenceState, LocalModelRecommendation } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema, type LocalInferenceState, type LocalModelRecommendation } from "@magnitudedev/sdk"
 import { buildLocalInferenceSelections, selectionMetadata } from "./view-model"
 
 const recommendation: LocalModelRecommendation = {
@@ -25,7 +25,6 @@ const recommendation: LocalModelRecommendation = {
   license: { id: "test", url: "https://example.invalid/license", acknowledgementRequired: false },
   contextTokens: 32_768,
   servingProfile: {
-    localModelRole: "main",
     sessionConcurrency: "one",
     parallelSlots: 1,
     contextTokensPerSlot: 32_768,
@@ -43,7 +42,7 @@ const recommendation: LocalModelRecommendation = {
 }
 
 const baseState = {
-  usage: { localModelRole: "main", sessionConcurrency: "one" },
+  usage: { sessionConcurrency: "one" },
   activeBinding: null,
   distribution: { _tag: "Ready", build: 10011, source: "managed" },
   host: { _tag: "Unavailable", message: "not needed" },
@@ -59,7 +58,7 @@ describe("local inference selection view model", () => {
         _tag: "StoredOwned",
         choiceId: recommendation.configurationId,
         displayName: recommendation.displayName,
-        providerModelId: "local-model",
+        providerModelId: ProviderModelIdSchema.make("local-model"),
         contextTokens: recommendation.contextTokens,
         fitClass: recommendation.fitClass,
         compatible: true,
@@ -82,7 +81,7 @@ describe("local inference selection view model", () => {
         _tag: "RunningExternal",
         choiceId: "external-choice",
         displayName: "External model",
-        providerModelId: "external-model",
+        providerModelId: ProviderModelIdSchema.make("external-model"),
         contextTokens: 48_000,
         fitClass: "unknown",
         compatible: true,

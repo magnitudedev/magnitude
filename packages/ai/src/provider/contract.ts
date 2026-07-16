@@ -78,19 +78,18 @@ export interface WebSearchExtension<TResult = WebSearchResult, TError = unknown,
   ) => Effect.Effect<TResult, TError, R>
 }
 
-export interface BalanceQuery {
+export interface UsageQuery {
   readonly period?: string
   readonly days?: number
   readonly tz?: string
 }
 
-export interface BalanceResponse {
-  readonly balance: number
-  readonly usage?: unknown
+export interface UsageResponse {
+  readonly usage: unknown
 }
 
-export interface BalanceExtension<TResponse = BalanceResponse, TError = unknown, R = unknown> {
-  readonly balance: (
-    query?: BalanceQuery,
+export interface UsageExtension<TResponse = UsageResponse, TError = unknown, R = unknown> {
+  readonly usage: (
+    query?: UsageQuery,
   ) => Effect.Effect<TResponse, TError, R>
 }

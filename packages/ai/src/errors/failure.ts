@@ -72,7 +72,13 @@ export type RetryPolicy = {
 
 export type ProviderRejection =
   | { readonly _tag: "AuthRejected"; readonly message: string }
-  | { readonly _tag: "InsufficientCredits"; readonly message: string; readonly balanceCents: Option.Option<number> }
+  | { readonly _tag: "SubscriptionRequired"; readonly message: string }
+  | {
+      readonly _tag: "UsageLimitExceeded"
+      readonly message: string
+      readonly window: "five_hour" | "weekly" | "monthly"
+      readonly resetAt: string
+    }
   | { readonly _tag: "ModelUnavailable"; readonly message: string }
   | { readonly _tag: "ModelCapabilityMissing"; readonly message: string }
   | { readonly _tag: "ProviderCapabilityMissing"; readonly message: string }

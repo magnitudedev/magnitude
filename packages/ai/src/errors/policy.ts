@@ -287,7 +287,8 @@ function nonRetryableReasonForTag(tag: ProviderRejection["_tag"]): NonRetryableR
   switch (tag) {
     case "AuthRejected":
       return "auth"
-    case "InsufficientCredits":
+    case "SubscriptionRequired":
+    case "UsageLimitExceeded":
       return "billing"
     case "ModelUnavailable":
     case "ModelCapabilityMissing":

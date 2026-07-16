@@ -130,13 +130,23 @@ function providerSpecificOutcome(failure: AgentModelAttemptFailure, requestId: s
       return { _tag: 'ContextWindowExceeded', requestId }
     case 'AuthRejected':
       return { _tag: 'ProviderNotReady', detail: { _tag: 'AuthFailed' }, requestId }
-    case 'InsufficientCredits':
+    case 'SubscriptionRequired':
       return {
         _tag: 'ProviderNotReady',
         detail: {
-          _tag: 'InsufficientCredits',
+          _tag: 'SubscriptionRequired',
           message: failure.rejection.message,
-          balanceCents: failure.rejection.balanceCents,
+        },
+        requestId,
+      }
+    case 'UsageLimitExceeded':
+      return {
+        _tag: 'ProviderNotReady',
+        detail: {
+          _tag: 'UsageLimitExceeded',
+          message: failure.rejection.message,
+          window: failure.rejection.window,
+          resetAt: failure.rejection.resetAt,
         },
         requestId,
       }

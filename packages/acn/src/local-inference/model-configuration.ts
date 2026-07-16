@@ -242,8 +242,7 @@ export const makeLocalModelConfiguration = (
 
     updateUsage: (usage) => storage.update((current) => {
       const previous = current.localInference?.usage
-      const changed = previous?.localModelRole !== usage.localModelRole
-        || previous.sessionConcurrency !== usage.sessionConcurrency
+      const changed = previous?.sessionConcurrency !== usage.sessionConcurrency
       if (!changed) return current
       const existing = current.models?.slots ?? {}
       const primary = existing.primary?.providerId === "llamacpp" ? undefined : existing.primary
@@ -272,9 +271,7 @@ export const makeLocalModelConfiguration = (
       const usage = current.localInference?.usage
       if (!usage) return current
       const existingSlots = current.models?.slots ?? {}
-      const slots = usage.localModelRole === "main"
-        ? { ...existingSlots, primary: localSlot(binding) }
-        : { ...existingSlots, secondary: localSlot(binding) }
+      const slots = { ...existingSlots, primary: localSlot(binding) }
       return {
         ...current,
         localInference: { ...current.localInference, binding },
@@ -283,12 +280,12 @@ export const makeLocalModelConfiguration = (
           slots,
           localSlotIntent: {
             ...(current.models?.localSlotIntent ?? {}),
-            [usage.localModelRole === "main" ? "primary" : "secondary"]: "local",
+            primary: "local",
           },
           localModelRecency: {
             ...(current.models?.localModelRecency ?? {}),
-            [usage.localModelRole === "main" ? "primary" : "secondary"]: moveToFront(
-              current.models?.localModelRecency?.[usage.localModelRole === "main" ? "primary" : "secondary"] ?? [],
+            primary: moveToFront(
+              current.models?.localModelRecency?.primary ?? [],
               binding.providerModelId,
             ),
           },

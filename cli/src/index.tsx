@@ -20,11 +20,6 @@ import { makeCliEffectLoggingLayer } from './platform/effect-logger'
 
 /** One-time env-var auth resolution (spec §2.9) — not reactive. */
 function resolveEnvAuth(): AuthSource {
-  const useLocal = process.env.MAGNITUDE_USE_LOCAL === 'true' || process.env.MAGNITUDE_USE_LOCAL === '1'
-  const localKey = process.env.MAGNITUDE_LOCAL_API_KEY
-  if (useLocal && localKey && localKey.trim()) {
-    return { source: 'env-local', key: localKey, envVarName: 'MAGNITUDE_LOCAL_API_KEY' }
-  }
   const envKey = process.env.MAGNITUDE_API_KEY
   if (envKey && envKey.trim()) {
     return { source: 'env', key: envKey, envVarName: 'MAGNITUDE_API_KEY' }

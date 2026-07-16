@@ -2,7 +2,7 @@ import { Context } from "effect"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import { Effect } from "effect"
 import { ModelCatalogError } from "@magnitudedev/ai"
-import type { BoundModel, ProviderRejection, WebSearchResult, BalanceQuery, BaseCallOptions, ProviderModelBindOptions, ProviderModel, ProviderId, ProviderModelId } from "@magnitudedev/ai"
+import type { BoundModel, ProviderRejection, WebSearchResult, UsageQuery, BaseCallOptions, ProviderModelBindOptions, ProviderModel, ProviderId, ProviderModelId } from "@magnitudedev/ai"
 import type { ModelCatalog } from "@magnitudedev/ai"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
@@ -17,8 +17,8 @@ import {
   type MagnitudeClientError,
   type MagnitudeModelInfo,
   type WebSearchError,
-  type FetchBalanceOptions,
-  type BalanceResponse,
+  type FetchUsageOptions,
+  type CloudUsageResponse,
   type ProviderCatalogOutcome,
 } from "@magnitudedev/providers"
 import type { ProviderInfo as RegistryProviderInfo } from "@magnitudedev/providers"
@@ -58,14 +58,14 @@ export interface ProviderClientConfig extends MagnitudeClientConfig {
 
 export type {
   MagnitudeModelInfo,
-  FetchBalanceOptions,
-  BalanceResponse,
+  FetchUsageOptions,
+  CloudUsageResponse,
   MagnitudeCallOptions,
   MagnitudeAdditionalOptions,
 } from "@magnitudedev/providers"
 export type { LlamaCppProviderSource, LlamaCppInferenceLease, LlamaCppModelInfo, LlamaServedModelId, LlamaServingRouteId } from "@magnitudedev/providers"
 export { LlamaCppAcquisitionError, LlamaCppModelInfoSchema, LlamaServedModelIdSchema, LlamaServingRouteIdSchema } from "@magnitudedev/providers"
-export type { WebSearchResult, BalanceQuery } from "@magnitudedev/ai"
+export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/protocol"
 
@@ -120,9 +120,9 @@ export interface ProviderClientShape {
     query: string,
     schema?: Record<string, unknown>,
   ) => Effect.Effect<WebSearchResult, WebSearchError, HttpClient.HttpClient>
-  readonly balance: (
-    query?: BalanceQuery,
-  ) => Effect.Effect<BalanceResponse, ProviderClientError, HttpClient.HttpClient>
+  readonly usage: (
+    query?: UsageQuery,
+  ) => Effect.Effect<CloudUsageResponse, ProviderClientError, HttpClient.HttpClient>
   readonly runtimeConfig: ProviderRuntimeConfig
 }
 
@@ -159,7 +159,7 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
     resolveModel: (providerId, providerModelId, options) =>
       registry.resolveModel(providerId, providerModelId, options),
     webSearch: magnitudeInstance.provider.webSearch,
-    balance: magnitudeInstance.provider.balance,
+    usage: magnitudeInstance.provider.usage,
     runtimeConfig: {
       preferProvider: process.env.MAGNITUDE_PREFER_PROVIDER || undefined,
       disableTraits: !!process.env.MAGNITUDE_DISABLE_TRAITS,

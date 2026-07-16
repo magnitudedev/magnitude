@@ -55,7 +55,6 @@ function CloudSetup({ onFinish, onBack, onExit, completing, completionError }: {
   const [submitted, setSubmitted] = useState(false)
   const cloudConfigured = settings.keyAlreadySet
     || authSource.source === "env"
-    || authSource.source === "env-local"
 
   const completionAtom = useMemo(
     () => Atom.make(Effect.sync(() => {
@@ -101,7 +100,7 @@ function CloudConfigured({ onFinish, onBack, onExit }: {
   return (
     <box style={{ height: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
       <text style={{ fg: theme.success }} attributes={TextAttributes.BOLD}>Magnitude Cloud is configured.</text>
-      <text style={{ fg: theme.muted }}>Cloud fallback is ready.</text>
+      <text style={{ fg: theme.muted }}>Cloud models are ready.</text>
       <box style={{ flexDirection: "row", paddingTop: 1 }}>
         <Button
           onClick={onBack}
@@ -140,7 +139,6 @@ export const ModelSetupScreen = memo(function ModelSetupScreen({
   const authSource = useAtomValue(authSourceAtom)
   const cloudConfigured = settings.keyAlreadySet
     || authSource.source === "env"
-    || authSource.source === "env-local"
 
   const finish = useCallback(() => {
     (onComplete ?? onExit)()

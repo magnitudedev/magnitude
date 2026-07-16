@@ -24,6 +24,13 @@ describe('routeSlashCommand', () => {
     expect(ctx.resetConversation).toHaveBeenCalledTimes(1)
   })
 
+  test('opens cloud usage from /usage and /limits', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/usage', ctx)).toBe(true)
+    expect(routeSlashCommand('/limits', ctx)).toBe(true)
+    expect(ctx.openUsage).toHaveBeenCalledTimes(2)
+  })
+
   test('unknown command is not handled', () => {
     const ctx = createContext()
     expect(routeSlashCommand('/definitely-not-a-command', ctx)).toBe(false)

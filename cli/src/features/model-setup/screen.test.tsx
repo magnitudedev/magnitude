@@ -87,7 +87,7 @@ test("management preserves an explicitly selected cloud surface", () => {
 test("saved usage answers remain preselected without skipping the questions", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { localModelRole: "main", sessionConcurrency: "one" },
+    usage: { sessionConcurrency: "one" },
   }
   const view = await testRender(
     <ModelSetupScreen initialStep="local" mode="management" onExit={() => {}} />,
@@ -97,8 +97,8 @@ test("saved usage answers remain preselected without skipping the questions", as
   try {
     await act(view.renderOnce)
     const frame = view.captureCharFrame()
-    expect(frame).toContain("How do you plan to use local models?")
-    expect(frame).toContain("● As my main agent")
+    expect(frame).toContain("How many local coding sessions will you run at once?")
+    expect(frame).toContain("● One session")
     expect(frame).not.toContain("┌")
     expect(frame.indexOf("How many Magnitude sessions")).toBeLessThan(frame.indexOf("↑/↓ move"))
     expect(frame.indexOf("↑/↓ move")).toBeLessThan(frame.indexOf("Skip for now"))
@@ -112,7 +112,7 @@ test("saved usage answers remain preselected without skipping the questions", as
 test("recommendation controls follow the model list instead of filling the terminal footer", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { localModelRole: "main", sessionConcurrency: "one" },
+    usage: { sessionConcurrency: "one" },
   }
   const view = await testRender(
     <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
@@ -139,7 +139,7 @@ test("recommendation controls follow the model list instead of filling the termi
 test("Right Arrow opens recommendations from the usage questions", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { localModelRole: "main", sessionConcurrency: "one" },
+    usage: { sessionConcurrency: "one" },
   }
   const view = await testRender(
     <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
@@ -171,14 +171,22 @@ test("local and cloud onboarding actions can be clicked with the mouse", async (
     await act(view.renderOnce)
     await act(async () => view.mockMouse.click(localSkip.x, localSkip.y))
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("MAGNITUDE CLOUD FALLBACK")
+    expect(view.captureCharFrame()).toContain("CLOUD MODELS (OPTIONAL)")
+    expect(view.captureCharFrame()).toContain("Connect cloud models too large to run on this machine")
+    const cloudFrame = view.captureCharFrame()
+    expect(cloudFrame).toContain("Use Exa web search for external research")
+    expect(cloudFrame).not.toContain("Primary")
+    expect(cloudFrame).not.toContain("Secondary")
+    expect(cloudFrame).not.toContain("Ctrl+C close")
+    expect(cloudFrame.indexOf("Press ← to return")).toBeLessThan(cloudFrame.indexOf("Back to local models (←)"))
+    expect(cloudFrame.indexOf("Back to local models (←)")).toBeLessThan(cloudFrame.indexOf("Skip for now (Esc)"))
 
     const cloudBack = textPosition(view.captureCharFrame(), "Back to local models (←)")
     await act(async () => view.mockMouse.moveTo(cloudBack.x, cloudBack.y))
     await act(view.renderOnce)
     await act(async () => view.mockMouse.click(cloudBack.x, cloudBack.y))
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("How do you plan to use local models?")
+    expect(view.captureCharFrame()).toContain("How many local coding sessions will you run at once?")
 
     const localSkipAgain = textPosition(view.captureCharFrame(), "Skip for now (Esc)")
     await act(async () => view.mockMouse.click(localSkipAgain.x, localSkipAgain.y))

@@ -90,7 +90,7 @@ const providerClient = (label: string): ProviderClientShape => ({
   sessionId: "session",
   resolveModel: () => Effect.die("not used"),
   webSearch: () => Effect.die("not used"),
-  balance: () => Effect.die("not used"),
+  usage: () => Effect.die("not used"),
   runtimeConfig: { disableTraits: false },
 })
 

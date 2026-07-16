@@ -248,6 +248,20 @@ describe("defaultRetryabilityForFailure", () => {
     expect(result.reason).toBe("invalid_request")
   })
 
+  it("a required cloud subscription is a non-retryable billing rejection", () => {
+    const result = defaultRetryabilityForFailure(new StreamStartProviderRejection({
+      call,
+      response: rejectedHttpResponse(402, new Headers(), "{}"),
+      rejection: {
+        _tag: "SubscriptionRequired",
+        message: "Magnitude Pro is required to use cloud models.",
+      },
+    }))
+
+    assertNotRetryable(result)
+    expect(result.reason).toBe("billing")
+  })
+
   it("stream-start transport failures are retryable", () => {
     const result = defaultRetryabilityForFailure(makeStartOperationalFailure())
     assertRetryable(result)

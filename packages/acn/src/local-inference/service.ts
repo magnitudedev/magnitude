@@ -274,3 +274,4 @@ export const LocalInferenceLive: Layer.Layer<
 
   return LocalInference.of({ state, watchState, configureUsage, installDistribution, downloadModel, activateModel, deleteModel, restart, disable })
 }))
+

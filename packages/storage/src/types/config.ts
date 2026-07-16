@@ -66,7 +66,6 @@ export const OnboardingConfigSchema = Schema.Struct({
 export type OnboardingConfig = Schema.Schema.Type<typeof OnboardingConfigSchema>
 
 export const LocalInferenceUsageSelectionSchema = Schema.Struct({
-  localModelRole: Schema.Literal('main', 'subagent'),
   sessionConcurrency: Schema.Literal('one', 'up_to_three'),
 })
 export type LocalInferenceUsageSelection = Schema.Schema.Type<typeof LocalInferenceUsageSelectionSchema>

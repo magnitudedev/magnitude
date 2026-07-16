@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useMemo, useRef } from 'react'
+import { memo, useState, useCallback, useRef } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../../hooks/use-theme'
@@ -6,34 +6,8 @@ import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import { BOX_CHARS } from '../../utils/ui-constants'
 import { writeTextToClipboard } from '../../utils/clipboard'
-import { green, orange, rose, useAgentClient } from '@magnitudedev/client-common'
-import type { SlotProfile } from '@magnitudedev/sdk'
-import { SLOT_IDS, SLOT_DISPLAY_NAMES } from '@magnitudedev/sdk'
-import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
-
-import type { BorderCharacters } from '@opentui/core'
-import type { SlotId } from '@magnitudedev/sdk'
 
 const MAGNITUDE_URL = 'https://app.magnitude.dev'
-
-const SLOT_ICONS: Record<SlotId, string> = {
-  primary: '★',
-  secondary: '⚒',
-}
-
-const DOUBLE_BOX: BorderCharacters = {
-  topLeft: '╔',
-  topRight: '╗',
-  bottomLeft: '╚',
-  bottomRight: '╝',
-  horizontal: '═',
-  vertical: '║',
-  leftT: '╠',
-  rightT: '╣',
-  topT: '╦',
-  bottomT: '╩',
-  cross: '╬',
-}
 
 function useCopyFeedback() {
   const [copied, setCopied] = useState(false)
@@ -46,20 +20,6 @@ function useCopyFeedback() {
   }, [])
 
   return { copied, showCopied }
-}
-
-function getModelColor(modelDisplayName: string, theme: ReturnType<typeof useTheme>): string {
-  const name = modelDisplayName.toLowerCase()
-  if (name.includes('glm')) return theme.primary
-  if (name.includes('minimax')) return orange[400]
-  if (name.includes('kimi')) return theme.warning
-  if (name.includes('deepseek')) return rose[400]
-  if (name.includes('gpt')) return green[400]
-  return theme.foreground
-}
-
-function padEnd(s: string, length: number): string {
-  return s + ' '.repeat(Math.max(0, length - s.length))
 }
 
 interface MagnitudeLoginScreenProps {
@@ -80,7 +40,6 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   error: serverError = null,
 }: MagnitudeLoginScreenProps) {
   const theme = useTheme()
-  const client = useAgentClient()
   const [apiKey, setApiKey] = useState('')
   const [validationError, setValidationError] = useState<string | null>(null)
   const [continueHovered, setContinueHovered] = useState(false)
@@ -88,13 +47,6 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   const [backHovered, setBackHovered] = useState(false)
   const [skipHovered, setSkipHovered] = useState(false)
   const urlCopy = useCopyFeedback()
-
-  const slotProfilesAtom = useMemo(
-    () => client.query('ListPublicSlotProfiles', {}, { reactivityKeys: ['config'] }),
-    [client],
-  )
-  const profilesResult = useAtomValue(slotProfilesAtom)
-  const slotProfiles = Result.isSuccess(profilesResult) ? profilesResult.value : null
 
   const error = validationError ?? serverError
 
@@ -155,53 +107,23 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
       }}>
         <box style={{ flexDirection: 'column' }}>
           <text style={{ fg: theme.primary }}>
-            <span attributes={TextAttributes.BOLD}>MAGNITUDE CLOUD FALLBACK</span>
+            <span attributes={TextAttributes.BOLD}>CLOUD MODELS (OPTIONAL)</span>
           </text>
           <text style={{ fg: theme.foreground }}>
-            <span attributes={TextAttributes.BOLD}>Use models that are too large for this machine</span>
+            <span attributes={TextAttributes.BOLD}>Connect hosted models with Magnitude Pro</span>
           </text>
           <text style={{ fg: theme.muted }}>
-            Optional cloud inference alongside, or instead of, local models
+            Magnitude Pro lets you:
           </text>
-
-          {/* Slot profiles list (conditional) — inside right column with gap */}
-          {slotProfiles && (
-            <box style={{
-              borderStyle: 'single',
-              customBorderChars: BOX_CHARS,
-              borderColor: theme.border,
-              marginTop: 1,
-              paddingLeft: 1,
-              paddingRight: 1,
-              paddingTop: 1,
-              paddingBottom: 1,
-              flexShrink: 0,
-              alignSelf: 'flex-start',
-            }}>
-              <box style={{ flexDirection: 'column' }}>
-                {SLOT_IDS.map((slotId) => {
-                  const profile = slotProfiles[slotId]
-                  const label = SLOT_DISPLAY_NAMES[slotId]
-                  const modelName = profile?.modelDisplayName ?? '?'
-                  const modelColor = profile ? getModelColor(modelName, theme) : theme.muted
-                  return (
-                    <box key={slotId} style={{ flexDirection: 'row' }}>
-                      <text style={{ fg: theme.foreground }}>
-                        <span attributes={TextAttributes.BOLD}>
-                          {SLOT_ICONS[slotId]}
-                        </span>
-                        {' '}
-                        {padEnd(label, 12)}{' '}
-                      </text>
-                      <text style={{ fg: modelColor }}>
-                        {padEnd(modelName, 18)}
-                      </text>
-                    </box>
-                  )
-                })}
-              </box>
-            </box>
-          )}
+          <box style={{ flexDirection: 'column', paddingTop: 1, paddingLeft: 2 }}>
+            <text style={{ fg: theme.foreground }}>• Connect cloud models too large to run on this machine</text>
+            <text style={{ fg: theme.foreground }}>• Use Exa web search for external research</text>
+          </box>
+          <box style={{ paddingTop: 1 }}>
+            <text style={{ fg: theme.muted }}>
+              Magnitude Pro is $10 for the first month, then $20/month.
+            </text>
+          </box>
         </box>
       </box>
 
@@ -209,12 +131,12 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
       <box style={{
         paddingLeft: 2,
         paddingRight: 2,
-        paddingTop: slotProfiles ? 1 : 2,
+        paddingTop: 1,
         flexGrow: 1,
         flexDirection: 'column',
       }}>
         <box style={{ paddingBottom: 1, flexDirection: 'row' }}>
-          <text style={{ fg: theme.muted }}>Sign up for a free API key → </text>
+          <text style={{ fg: theme.muted }}>Subscribe to Pro and copy your API key → </text>
           <text style={{ fg: theme.primary }}>{MAGNITUDE_URL}</text>
           <text> </text>
           <Button
@@ -278,7 +200,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
               paddingRight: 1,
             }}>
               <text style={{ fg: continueHovered ? theme.primary : theme.foreground }}>
-                {busy ? 'Saving...' : 'Connect Cloud (Enter)'}
+                {busy ? 'Saving...' : 'Connect cloud models (Enter)'}
               </text>
             </box>
           </Button>
@@ -294,17 +216,8 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
             </span>
           </text>
         </box>
-      </box>
 
-      <box style={{
-        flexDirection: 'row',
-        justifyContent: 'space-between',
-        paddingLeft: 2,
-        paddingRight: 2,
-        paddingBottom: 1,
-        flexShrink: 0,
-      }}>
-        <box style={{ flexDirection: 'row' }}>
+        <box style={{ flexDirection: 'row', paddingTop: 1, flexShrink: 0 }}>
           {onBack && (
             <Button
               onClick={onBack}
@@ -324,27 +237,27 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
               </box>
             </Button>
           )}
-          <text style={{ fg: theme.muted }}>{onBack ? '  ' : ''}Ctrl+C close</text>
+          {onBack && onSkip && <text>  </text>}
+          {onSkip && (
+            <Button
+              onClick={handleSkip}
+              onMouseOver={() => setSkipHovered(true)}
+              onMouseOut={() => setSkipHovered(false)}
+            >
+              <box style={{
+                borderStyle: 'single',
+                borderColor: skipHovered ? theme.primary : theme.border,
+                customBorderChars: BOX_CHARS,
+                paddingLeft: 1,
+                paddingRight: 1,
+              }}>
+                <text style={{ fg: skipHovered ? theme.primary : theme.foreground }}>
+                  Skip for now (Esc)
+                </text>
+              </box>
+            </Button>
+          )}
         </box>
-        {onSkip && (
-          <Button
-            onClick={handleSkip}
-            onMouseOver={() => setSkipHovered(true)}
-            onMouseOut={() => setSkipHovered(false)}
-          >
-            <box style={{
-              borderStyle: 'single',
-              borderColor: skipHovered ? theme.primary : theme.border,
-              customBorderChars: BOX_CHARS,
-              paddingLeft: 1,
-              paddingRight: 1,
-            }}>
-              <text style={{ fg: skipHovered ? theme.primary : theme.foreground }}>
-                Skip for now (Esc)
-              </text>
-            </box>
-          </Button>
-        )}
       </box>
     </box>
   )

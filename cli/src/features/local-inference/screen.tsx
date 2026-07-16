@@ -5,7 +5,6 @@ import { Cause, Effect, Option } from "effect"
 import { Atom, Result as AtomResult, useAtomMount } from "@effect-atom/atom-react"
 import type {
   LocalInferenceState,
-  LocalModelRole,
   LocalSessionConcurrency,
 } from "@magnitudedev/sdk"
 import { useLocalInferenceState } from "@magnitudedev/client-common"
@@ -33,10 +32,10 @@ export const LOCAL_MODEL_SECTION_WIDTH = 72
 export const LOCAL_USAGE_SETUP_WIDTH = 88
 const SECTION_LABEL_GAP = 2
 
-export type LocalUsageFocusTarget = "main" | "subagent" | "one" | "up_to_three" | "continue"
+export type LocalUsageFocusTarget = "one" | "up_to_three" | "continue"
 type LocalSetupHoveredAction = "usage-skip" | "usage-recommendations" | "models-back" | "models-skip"
 export const LOCAL_USAGE_FOCUS_ORDER: readonly LocalUsageFocusTarget[] = [
-  "main", "subagent", "one", "up_to_three", "continue",
+  "one", "up_to_three", "continue",
 ]
 export const moveLocalUsageFocus = (currentIndex: number, direction: -1 | 1): number =>
   Math.max(0, Math.min(LOCAL_USAGE_FOCUS_ORDER.length - 1, currentIndex + direction))
@@ -120,11 +119,9 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 }) {
   const theme = useTheme()
   const [requestedStage, setRequestedStage] = useState<"usage" | "models">("usage")
-  const [roleOverride, setRoleOverride] = useState<LocalModelRole | null>(null)
   const [concurrencyOverride, setConcurrencyOverride] = useState<LocalSessionConcurrency | null>(null)
-  const role = roleOverride ?? state.usage?.localModelRole ?? "main"
   const concurrency = concurrencyOverride ?? state.usage?.sessionConcurrency ?? "one"
-  const [usageRow, setUsageRow] = useState(role === "subagent" ? 1 : 0)
+  const [usageRow, setUsageRow] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [details, setDetails] = useState(false)
   const [hoveredAction, setHoveredAction] = useState<LocalSetupHoveredAction | null>(null)
@@ -135,8 +132,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const mutationBusy = local.mutationResults.some(AtomResult.isWaiting)
   const busy = mutationBusy
   const error = local.mutationResults.map(failureMessage).find((message) => message !== null) ?? null
-  const usageReady = state.usage?.localModelRole === role
-    && state.usage.sessionConcurrency === concurrency
+  const usageReady = state.usage?.sessionConcurrency === concurrency
   const stage = requestedStage === "models" && usageReady ? "models" : "usage"
 
   const activationCompletionAtom = useMemo(
@@ -156,9 +152,9 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 
   const continueFromUsage = useCallback(() => {
     if (busy) return
-    local.configureUsage({ localModelRole: role, sessionConcurrency: concurrency })
+    local.configureUsage({ sessionConcurrency: concurrency })
     setRequestedStage("models")
-  }, [busy, concurrency, local, role])
+  }, [busy, concurrency, local])
 
   const confirmModel = useCallback(() => {
     if (busy) return
@@ -199,8 +195,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       if (key.name === "space" || key.name === "return" || key.name === "enter") {
         key.preventDefault()
         const target = LOCAL_USAGE_FOCUS_ORDER[usageRow]
-        if (target === "main" || target === "subagent") setRoleOverride(target)
-        else if (target === "one" || target === "up_to_three") setConcurrencyOverride(target)
+        if (target === "one" || target === "up_to_three") setConcurrencyOverride(target)
         else continueFromUsage()
         return
       }
@@ -232,7 +227,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     if (key.name === "return" || key.name === "enter") { key.preventDefault(); confirmModel(); return }
     if (key.name === "left" || key.name === "backspace") { key.preventDefault(); if (!busy) setRequestedStage("usage"); return }
     if (key.name === "escape") { key.preventDefault(); if (!busy) onSkip() }
-  }, [busy, concurrency, confirmModel, continueFromUsage, local, onConfigured, onSkip, role, selected, selectedIndex, selections, stage, state.activeBinding, usageRow]))
+  }, [busy, confirmModel, continueFromUsage, local, onConfigured, onSkip, selected, selectedIndex, selections, stage, state.activeBinding, usageRow]))
 
   if (stage === "usage") {
     const focusTarget = LOCAL_USAGE_FOCUS_ORDER[usageRow]!
@@ -245,20 +240,15 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         <box style={{ flexDirection: "column", paddingTop: 1, flexShrink: 0, width: "100%", maxWidth: LOCAL_USAGE_SETUP_WIDTH }}>
           <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
           <text style={{ fg: theme.foreground }}>Magnitude uses llama.cpp to run local models in the background.</text>
-          <text style={{ fg: theme.muted }}>Answer two questions and we'll recommend Hugging Face models that fit your setup.</text>
+          <text style={{ fg: theme.muted }}>Tell us how many local sessions to reserve, and we'll recommend Hugging Face models that fit.</text>
           {running && <box style={{ flexDirection: "column", paddingTop: 1 }}>
             <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>● llama.cpp server detected</text>
             <text style={{ fg: theme.muted }}>  {runningMetadata}</text>
           </box>}
-          <box style={{ flexDirection: "column", paddingTop: running ? 1 : 0 }}>
-            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>How do you plan to use local models?</text>
-            <LocalUsageOption focused={focusTarget === "main"} selected={role === "main"} title="As my main agent" description="One larger context window per active session." />
-            <LocalUsageOption focused={focusTarget === "subagent"} selected={role === "subagent"} title="For local subagents" description="Uses a cloud main agent and reserves three context windows for local subagents." />
-          </box>
           <box style={{ flexDirection: "column", paddingTop: 1 }}>
-            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>How many Magnitude sessions will you run at once?</text>
-            <LocalUsageOption focused={focusTarget === "one"} selected={concurrency === "one"} title="One session" description="Reserve one set of context windows." />
-            <LocalUsageOption focused={focusTarget === "up_to_three"} selected={concurrency === "up_to_three"} title="Multiple sessions" description="Reserve up to three sets of context windows. This may result in a smaller recommended local model." />
+            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>How many local coding sessions will you run at once?</text>
+            <LocalUsageOption focused={focusTarget === "one"} selected={concurrency === "one"} title="One session" description="Reserve one local context window." />
+            <LocalUsageOption focused={focusTarget === "up_to_three"} selected={concurrency === "up_to_three"} title="Multiple sessions" description="Reserve up to three local context windows. This may result in a smaller recommended local model." />
           </box>
           {busy && <text style={{ fg: theme.primary }}>Finding models for this setup…</text>}
           {error && <text style={{ fg: theme.error }}>{error}</text>}

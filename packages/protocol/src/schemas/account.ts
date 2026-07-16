@@ -257,7 +257,7 @@ export const ProviderAuthSchema = Schema.Union(ApiKeyAuthSchema, EndpointAuthSch
 export type ProviderAuth = Schema.Schema.Type<typeof ProviderAuthSchema>
 
 // ---------------------------------------------------------------------------
-// Balance
+// Cloud subscription and usage limits
 // ---------------------------------------------------------------------------
 
 const UsageTotals = Schema.Struct({
@@ -267,30 +267,30 @@ const UsageTotals = Schema.Struct({
   outputTokens: Schema.Number
 })
 
-export const BalanceResponse = Schema.Struct({
+export const CloudUsageResponse = Schema.Struct({
   data: Schema.Struct({
     meta: Schema.Struct({
       generatedAt: Schema.String,
       autumnConfigured: Schema.Boolean
     }),
-    balance: Schema.Struct({
-      cents: Schema.Number
+    subscription: Schema.Struct({
+      status: Schema.Literal("active", "not_subscribed"),
+      plan: Schema.Struct({
+        id: Schema.Literal("pro"),
+        label: Schema.Literal("Pro"),
+        priceCents: Schema.Number,
+      }),
     }),
-    autoReload: Schema.Struct({
-      enabled: Schema.Boolean,
-      thresholdCents: Schema.Number,
-      amountCents: Schema.Number,
-      lastFailure: Schema.NullOr(Schema.Struct({
-        reason: Schema.String,
-        at: Schema.NullOr(Schema.String)
-      }))
-    }),
-    hasPaymentMethod: Schema.Boolean,
-    recentTopups: Schema.Array(Schema.Struct({
-      at: Schema.NullOr(Schema.String),
-      chargedCents: Schema.Number,
-      invoiceUrl: Schema.NullOr(Schema.String),
-      status: Schema.NullOr(Schema.String)
+    usageWindows: Schema.partial(Schema.Record({
+      key: Schema.Literal("five_hour", "weekly", "monthly"),
+      value: Schema.Struct({
+        limitCents: Schema.Number,
+        usedCents: Schema.Number,
+        remainingCents: Schema.Number,
+        windowStart: Schema.String,
+        windowEnd: Schema.String,
+        remainingMs: Schema.Number,
+      }),
     })),
     usage: Schema.Struct({
       period: UsagePeriod,
@@ -313,4 +313,4 @@ export const BalanceResponse = Schema.Struct({
     })
   })
 })
-export type BalanceResponse = Schema.Schema.Type<typeof BalanceResponse>
+export type CloudUsageResponse = Schema.Schema.Type<typeof CloudUsageResponse>

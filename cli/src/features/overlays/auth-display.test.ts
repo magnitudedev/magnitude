@@ -11,31 +11,17 @@ function derive(apiKey: ApiKeyState, authSource: AuthSource) {
 }
 
 describe('deriveSettingsAuthInfo', () => {
-  test('keeps local env auth ahead of configured storage', () => {
-    const auth = derive(
-      { status: 'config', maskedKey: 'mg_sk_conf………1111' },
-      { source: 'env-local', key: 'local-key', envVarName: 'MAGNITUDE_LOCAL_API_KEY' },
-    )
-
-    expect(auth).toMatchObject({
-      source: 'env-local',
-      key: 'local-key',
-      maskedKey: null,
-      envVarName: 'MAGNITUDE_LOCAL_API_KEY',
-    })
-  })
-
-  test('uses configured storage ahead of normal env auth', () => {
+  test('uses environment auth ahead of configured storage', () => {
     const auth = derive(
       { status: 'config', maskedKey: 'mg_sk_conf………2222' },
       { source: 'env', key: 'env-key', envVarName: 'MAGNITUDE_API_KEY' },
     )
 
     expect(auth).toMatchObject({
-      source: 'config',
-      key: null,
-      maskedKey: 'mg_sk_conf………2222',
-      envVarName: null,
+      source: 'env',
+      key: 'env-key',
+      maskedKey: null,
+      envVarName: 'MAGNITUDE_API_KEY',
     })
   })
 

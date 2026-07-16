@@ -40,7 +40,7 @@ export const MagnitudeRpcs = RpcGroup.make(
   Config.RefreshModelCatalog.middleware(AcnRpcCommandActivity),
   Config.GetModelSlots.middleware(AcnRpcCommandActivity),
   Config.UpdateModelSlots.middleware(AcnRpcCommandActivity),
-  Config.GetBalance.middleware(AcnRpcCommandActivity),
+  Config.GetCloudUsage.middleware(AcnRpcCommandActivity),
   LocalInference.GetLocalInferenceState.middleware(AcnRpcCommandActivity),
   LocalInference.ConfigureLocalInferenceUsage.middleware(AcnRpcCommandActivity),
   LocalInference.InstallLocalInferenceDistribution.middleware(AcnRpcCommandActivity),

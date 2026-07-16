@@ -10,8 +10,8 @@ import {
   type ModelCatalog,
   type WebSearchExtension,
   type WebSearchResult,
-  type BalanceExtension,
-  type BalanceQuery,
+  type UsageExtension,
+  type UsageQuery,
   type ProviderModelCapabilities,
   type ImagePlaceholderConfig,
   type BaseCallOptions,
@@ -24,7 +24,7 @@ import { isEnvFlagOn } from "@magnitudedev/utils"
 import type { MagnitudeModelInfo, MagnitudeAdditionalOptions } from "./contract"
 import { classifyModelFamily as classifyModelFamilyRaw } from "../family-registry"
 import { createMagnitudeCatalog, type MagnitudeAuthentication } from "./catalog"
-import type { BalanceResponse as MagnitudeBalanceResponse } from "./usage"
+import type { CloudUsageResponse } from "./usage"
 import type { UsagePeriod } from "./usage"
 import { createMagnitudeCompatibleSpec, wrapAsBaseModel, type MagnitudeCallOptions } from "./models"
 import { CLIENT_PLATFORM, CLIENT_SHELL, HEADER_PLATFORM, HEADER_SHELL, HEADER_SESSION_ID, HEADER_USE_DEDICATED } from "./client-headers"
@@ -61,7 +61,7 @@ export interface MagnitudeClientConfig {
 const DEFAULT_ENDPOINT = "https://app.magnitude.dev/api/v1"
 const LOCAL_ENDPOINT = "http://localhost:3000/api/v1"
 
-export interface FetchBalanceOptions {
+export interface FetchUsageOptions {
   readonly period?: UsagePeriod
   readonly days?: number
   readonly tz?: string
@@ -69,11 +69,11 @@ export interface FetchBalanceOptions {
 
 /**
  * The Magnitude provider — implements Provider<MagnitudeModelInfo, MagnitudeCallOptions>
- * & WebSearchExtension & BalanceExtension.
+ * & WebSearchExtension & UsageExtension.
  */
 export interface MagnitudeProvider extends Provider<MagnitudeModelInfo> {
   readonly webSearch: WebSearchExtension<WebSearchResult, WebSearchError, HttpClient.HttpClient>["webSearch"]
-  readonly balance: BalanceExtension<MagnitudeBalanceResponse, MagnitudeClientError, HttpClient.HttpClient>["balance"]
+  readonly usage: UsageExtension<CloudUsageResponse, MagnitudeClientError, HttpClient.HttpClient>["usage"]
 }
 
 export interface MagnitudeProviderInstance {
@@ -88,7 +88,7 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
   const sessionId = config?.sessionId ?? null
   const dedicatedProvider = config?.dedicatedProvider || process.env.MAGNITUDE_USE_DEDICATED || undefined
 
-  const apiKey = config?.apiKey ?? (useLocal ? process.env.MAGNITUDE_LOCAL_API_KEY : undefined) ?? process.env.MAGNITUDE_API_KEY
+  const apiKey = config?.apiKey ?? process.env.MAGNITUDE_API_KEY
   const authentication: MagnitudeAuthentication = config?.auth !== undefined
     ? { _tag: "Configured", apply: config.auth }
     : apiKey?.trim()
@@ -195,7 +195,7 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
       } satisfies WebSearchResult
     })
 
-  const balance: BalanceExtension<MagnitudeBalanceResponse, MagnitudeClientError, HttpClient.HttpClient>["balance"] = (query?) =>
+  const usage: UsageExtension<CloudUsageResponse, MagnitudeClientError, HttpClient.HttpClient>["usage"] = (query?) =>
     Effect.gen(function* () {
       if (requestAuthentication._tag === "NotConfigured") {
         return yield* new MagnitudeClientError({ message: "Magnitude authentication is not configured" })
@@ -212,22 +212,22 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
       if (query?.days != null) params.set("days", String(query.days))
       if (query?.tz) params.set("tz", query.tz)
       const qs = params.toString()
-      const url = `${endpoint}/balance${qs ? `?${qs}` : ""}`
+      const url = `${endpoint}/usage${qs ? `?${qs}` : ""}`
 
       const request = HttpClientRequest.get(url).pipe(
         HttpClientRequest.setHeaders(headerRecord),
       )
       const response = yield* http.execute(request).pipe(
-        Effect.mapError((cause) => new MagnitudeClientError({ message: "Failed to fetch balance", cause })),
+        Effect.mapError((cause) => new MagnitudeClientError({ message: "Failed to fetch cloud usage", cause })),
       )
       if (response.status < 200 || response.status >= 300) {
         const body = yield* response.text.pipe(Effect.orElseSucceed(() => ""))
-        return yield* new MagnitudeClientError({ message: `Failed to fetch balance: HTTP ${response.status} - ${body}` })
+        return yield* new MagnitudeClientError({ message: `Failed to fetch cloud usage: HTTP ${response.status} - ${body}` })
       }
       const body = yield* response.json.pipe(
-        Effect.mapError((cause) => new MagnitudeClientError({ message: "Failed to read balance response", cause })),
+        Effect.mapError((cause) => new MagnitudeClientError({ message: "Failed to read cloud usage response", cause })),
       )
-      return body as MagnitudeBalanceResponse
+      return body as CloudUsageResponse
     })
 
   const provider: MagnitudeProvider = {
@@ -237,25 +237,25 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
     bindModel,
     classifyModelFamily,
     webSearch,
-    balance,
+    usage,
   }
 
   return { provider, catalog, authentication }
 }
 
-export async function fetchBalance(
+export async function fetchUsage(
   apiKey?: string,
   endpoint?: string,
-  options?: FetchBalanceOptions,
-): Promise<MagnitudeBalanceResponse> {
+  options?: FetchUsageOptions,
+): Promise<CloudUsageResponse> {
   const { FetchHttpClient } = await import("@effect/platform")
   const instance = createMagnitudeProvider({ apiKey, endpoint })
-  const query: BalanceQuery = {
+  const query: UsageQuery = {
     period: options?.period,
     days: options?.days,
     tz: options?.tz,
   }
   return Effect.runPromise(
-    instance.provider.balance(query).pipe(Effect.provide(FetchHttpClient.layer)),
+    instance.provider.usage(query).pipe(Effect.provide(FetchHttpClient.layer)),
   )
 }

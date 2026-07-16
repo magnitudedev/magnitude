@@ -66,15 +66,15 @@ export {
 // Magnitude provider
 export {
   createMagnitudeProvider,
-  fetchBalance,
+  fetchUsage,
   PROVIDER_ID as MAGNITUDE_PROVIDER_ID,
   type MagnitudeProviderInstance,
   type MagnitudeClientConfig,
-  type FetchBalanceOptions,
+  type FetchUsageOptions,
   WebSearchError,
   MagnitudeClientError,
 } from "./magnitude/provider"
-export type { WebSearchResult, BalanceQuery } from "@magnitudedev/ai"
+export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export { createMagnitudeCatalog, toMagnitudeModelInfo, type MagnitudeAuthentication } from "./magnitude/catalog"
 export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./magnitude/contract"
 export {
@@ -97,9 +97,13 @@ export type {
   MagnitudeErrorType,
   MagnitudeErrorCode,
   MagnitudeErrorDetails,
-  InsufficientCreditsDetails,
+  UsageLimitDetails,
+  SubscriptionRequiredDetails,
+  BillingWindowBudget,
+  BillingWindowName,
+  ProSubscriptionStatus,
   ReasoningEffort,
   ModelPricingInfo,
 } from "./magnitude/contract"
 export type { ToolChoice } from "@magnitudedev/ai"
-export type { BalanceResponse, UsagePeriod } from "./magnitude/usage"
+export type { CloudUsageResponse, UsagePeriod } from "./magnitude/usage"

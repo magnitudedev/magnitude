@@ -20,7 +20,7 @@ export type AuthInfo = AuthActions & (
     envVarName: null
   }
   | {
-    source: 'env' | 'env-local'
+    source: 'env'
     key: string
     maskedKey: null
     envVarName: string
@@ -48,9 +48,9 @@ export function deriveSettingsAuthInfo({
   error?: string | null
 }): AuthInfo {
   const actions = { save, clear, saving, error }
-  if (authSource.source === 'env-local') {
+  if (authSource.source === 'env') {
     return {
-      source: 'env-local',
+      source: 'env',
       key: authSource.key,
       maskedKey: null,
       envVarName: authSource.envVarName,
@@ -64,16 +64,6 @@ export function deriveSettingsAuthInfo({
       key: null,
       maskedKey: apiKey.maskedKey ?? null,
       envVarName: null,
-      ...actions,
-    }
-  }
-
-  if (authSource.source === 'env') {
-    return {
-      source: 'env',
-      key: authSource.key,
-      maskedKey: null,
-      envVarName: authSource.envVarName,
       ...actions,
     }
   }
