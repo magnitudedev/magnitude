@@ -1,5 +1,5 @@
 import { Context, Effect, Layer } from 'effect'
-import { ProviderClient } from '@magnitudedev/sdk'
+import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema } from '@magnitudedev/sdk'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import type { RoleId } from '../agents/role-validation'
 import { ConfigAmbient, getSlotConfig, getSlotConfigForRole, type SlotConfig } from '../ambient/config-ambient'
@@ -54,7 +54,7 @@ export const AgentModelResolverLive = (debug?: boolean) =>
           }
           const capabilities = { vision: slotConfig.profile.capabilities.vision }
 
-          const rawModel = yield* client.resolveModel(slotConfig.providerId, slotConfig.providerModelId, {
+          const rawModel = yield* client.resolveModel(ProviderIdSchema.make(slotConfig.providerId), ProviderModelIdSchema.make(slotConfig.providerModelId), {
             defaults,
             capabilities,
             agentId,

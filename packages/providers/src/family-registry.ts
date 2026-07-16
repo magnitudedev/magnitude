@@ -1,16 +1,16 @@
 import { Option } from "effect"
-import type { ModelFamily } from "@magnitudedev/ai"
+import { ModelFamilyIdSchema, type ModelFamily, type ModelFamilyId } from "@magnitudedev/ai"
 import { dot, lit, num, opt, sep, ver } from "./classifier/symbols"
 import type { Family } from "./classifier/classify"
 import { classify } from "./classifier/classify"
 
 const withVision = (id: string): ModelFamily => ({
-  id,
+  id: ModelFamilyIdSchema.make(id),
   capabilities: { vision: true },
 })
 
 const withoutVision = (id: string): ModelFamily => ({
-  id,
+  id: ModelFamilyIdSchema.make(id),
   capabilities: { vision: false },
 })
 
@@ -279,13 +279,13 @@ export const MODEL_FAMILIES: readonly ModelFamily[] = FAMILY_DEFINITIONS.map(
 
 const FAMILY_BY_ID = new Map<string, ModelFamily>(MODEL_FAMILIES.map((f) => [f.id, f]))
 
-export function getModelFamily(id: string): ModelFamily | null {
+export function getModelFamily(id: ModelFamilyId): ModelFamily | null {
   return FAMILY_BY_ID.get(id) ?? null
 }
 
-export function classifyModelFamily(id: string): Option.Option<string> {
+export function classifyModelFamily(id: string): Option.Option<ModelFamilyId> {
   const result = classify(id, FAMILY_DEFINITIONS)
-  return result.matched ? Option.some(result.familyId) : Option.none()
+  return result.matched ? Option.some(ModelFamilyIdSchema.make(result.familyId)) : Option.none()
 }
 
 export interface ModelFamilyMetadata {
@@ -317,10 +317,10 @@ function metadataPatternMatches(
 /** Classify only when all required structured metadata for a family agrees. */
 export function classifyModelFamilyFromMetadata(
   metadata: ModelFamilyMetadata,
-): Option.Option<string> {
+): Option.Option<ModelFamilyId> {
   for (const family of FAMILY_DEFINITIONS) {
     if (family.metadataPatterns?.some((pattern) => metadataPatternMatches(metadata, pattern))) {
-      return Option.some(family.familyId)
+      return Option.some(ModelFamilyIdSchema.make(family.familyId))
     }
   }
   return Option.none()
@@ -349,7 +349,7 @@ export function modelFamilyMetadataConflicts(
 export function classifyModelFamilyFromEvidence(
   metadata: ModelFamilyMetadata,
   candidates: readonly (string | undefined)[],
-): Option.Option<string> {
+): Option.Option<ModelFamilyId> {
   const structuredFamily = classifyModelFamilyFromMetadata(metadata)
   if (Option.isSome(structuredFamily)) return structuredFamily
 

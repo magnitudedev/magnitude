@@ -2,7 +2,7 @@ import { Effect, Option, Schema } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import { MagnitudeModelListResponseSchema, type MagnitudeModelInfo, type MagnitudeRawModel } from "./contract"
-import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, type ModelCatalog, type ModelCatalogConfig } from "@magnitudedev/ai"
+import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, type ModelCatalog, type ModelCatalogConfig, type ModelFamilyId } from "@magnitudedev/ai"
 
 type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
 
@@ -12,8 +12,8 @@ type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
  */
 export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWithoutFamily {
   return {
-    providerModelId: raw.id,
-    providerId: "magnitude",
+    providerModelId: ProviderModelIdSchema.make(raw.id),
+    providerId: ProviderIdSchema.make("magnitude"),
     displayName: raw.displayName,
     contextWindow: raw.contextWindow,
     maxOutputTokens: raw.maxOutputTokens,
@@ -30,7 +30,7 @@ export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWith
 }
 
 export interface MagnitudeCatalogConfig extends ModelCatalogConfig {
-  readonly classify: (model: MagnitudeModelWithoutFamily) => Option.Option<string>
+  readonly classify: (model: MagnitudeModelWithoutFamily) => Option.Option<ModelFamilyId>
 }
 
 /**
@@ -87,7 +87,7 @@ export function createMagnitudeCatalog(config: MagnitudeCatalogConfig): ModelCat
         const model = toMagnitudeModelInfo(raw)
         const familyOption = classify(model)
         if (Option.isNone(familyOption)) continue
-        classified.push({ ...model, modelFamilyId: familyOption.value })
+        classified.push({ ...model, modelFamilyId: ModelFamilyIdSchema.make(familyOption.value) })
       }
 
       return classified

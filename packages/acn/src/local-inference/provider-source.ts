@@ -8,6 +8,10 @@ import {
   type LlamaCppModelInfo,
   type LlamaCppProviderSource,
   type ProviderModelAvailability,
+  ProviderModelIdSchema,
+  LlamaServedModelIdSchema,
+  LlamaServingRouteIdSchema,
+  type ProviderModelId,
   classifyModelFamilyFromEvidence,
 } from "@magnitudedev/sdk"
 import { LlamaCpp, ModelFiles } from "@magnitudedev/local-inference"
@@ -46,6 +50,10 @@ type ExternalRoute = {
 
 export type LlamaLogicalRoute = ManagedRoute | ExternalRoute
 
+const ManagedRouteIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.brand("ManagedRouteId"))
+const ExternalRouteIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.brand("ExternalRouteId"))
+const InternalLlamaServingRouteIdSchema = Schema.Union(ManagedRouteIdSchema, ExternalRouteIdSchema)
+
 export const LlamaRouteRuntimeStateSchema = Schema.Union(
   Schema.TaggedStruct("Unloaded", {}),
   Schema.TaggedStruct("Loading", {}),
@@ -56,20 +64,20 @@ export const LlamaRouteRuntimeStateSchema = Schema.Union(
 )
 export const LlamaServingRouteSnapshotSchema = Schema.Union(
   Schema.TaggedStruct("Managed", {
-    routeId: Schema.String,
-    providerModelId: Schema.String,
-    modelPath: Schema.String,
-    modelFileId: Schema.String,
+    routeId: ManagedRouteIdSchema,
+    providerModelId: ProviderModelIdSchema,
+    modelPath: LlamaCpp.NormalizedLlamaModelPath,
+    modelFileId: ModelFiles.ModelFileId,
     state: LlamaRouteRuntimeStateSchema,
     availability: Schema.Literal("available", "disabled"),
     productRank: Schema.NonNegativeInt,
   }),
   Schema.TaggedStruct("External", {
-    routeId: Schema.String,
-    providerModelId: Schema.String,
-    modelPath: Schema.String,
-    serverId: Schema.String,
-    servedModelId: Schema.String,
+    routeId: ExternalRouteIdSchema,
+    providerModelId: ProviderModelIdSchema,
+    modelPath: LlamaCpp.NormalizedLlamaModelPath,
+    serverId: LlamaCpp.LlamaInstanceId,
+    servedModelId: LlamaCpp.LlamaServedModelId,
     state: LlamaRouteRuntimeStateSchema,
     healthy: Schema.Boolean,
     priority: Schema.NonNegativeInt,
@@ -87,16 +95,16 @@ const OpportunisticModelMetadataSchema = Schema.Struct({
 })
 export const LlamaModelMetadataEvidenceSchema = Schema.Union(
   Schema.TaggedStruct("IndexedArtifact", {
-    modelFileId: Schema.String,
+    modelFileId: ModelFiles.ModelFileId,
     artifactDisplayName: Schema.String,
     metadata: OpportunisticModelMetadataSchema,
   }),
   Schema.TaggedStruct("SourceManifest", {
-    sourceId: Schema.String,
+    sourceId: ModelFiles.ModelFileSourceId,
     metadata: OpportunisticModelMetadataSchema,
   }),
   Schema.TaggedStruct("ServerReported", {
-    routeId: Schema.String,
+    routeId: InternalLlamaServingRouteIdSchema,
     alias: Schema.String,
     metadata: OpportunisticModelMetadataSchema,
   }),
@@ -105,7 +113,7 @@ export type LlamaModelMetadataEvidence = Schema.Schema.Type<typeof LlamaModelMet
 const ModelMetadataSourceSchema = Schema.Literal("indexed_artifact", "source_manifest", "server_reported")
 const ResolvedStringSchema = Schema.Struct({ value: Schema.String, source: ModelMetadataSourceSchema })
 export const ResolvedLlamaModelInformationSchema = Schema.Struct({
-  providerModelId: Schema.String,
+  providerModelId: ProviderModelIdSchema,
   displayName: Schema.String,
   displayNameSource: Schema.Literal("gguf_metadata", "source_manifest", "server_metadata", "server_alias", "path_basename"),
   metadata: Schema.Struct({
@@ -119,14 +127,14 @@ export const ResolvedLlamaModelInformationSchema = Schema.Struct({
 })
 export type ResolvedLlamaModelInformation = Schema.Schema.Type<typeof ResolvedLlamaModelInformationSchema>
 const LogicalProjectionSignatureSchema = Schema.Array(Schema.Struct({
-  id: Schema.String,
+  id: ProviderModelIdSchema,
   information: ResolvedLlamaModelInformationSchema,
   model: Schema.optional(LlamaCppModelInfoSchema),
   routes: Schema.Array(LlamaServingRouteSnapshotSchema),
 }))
 
 export interface LogicalLlamaModelRecord {
-  readonly providerModelId: string
+  readonly providerModelId: ProviderModelId
   readonly modelPath: LlamaCpp.NormalizedLlamaModelPath
   readonly routes: readonly LlamaLogicalRoute[]
   readonly routeSnapshots: readonly LlamaServingRouteSnapshot[]
@@ -136,11 +144,11 @@ export interface LogicalLlamaModelRecord {
 }
 
 export interface LocalModelProviderSourceApi extends LlamaCppProviderSource {
-  readonly warm: (providerModelId: string) => Effect.Effect<void, LlamaCppAcquisitionError>
+  readonly warm: (providerModelId: ProviderModelId) => Effect.Effect<void, LlamaCppAcquisitionError>
   readonly operations: Effect.Effect<readonly LocalInferenceOperationSnapshot[]>
   readonly stopManaged: Effect.Effect<void, LlamaCpp.LlamaControlError | LlamaCpp.ModelInUse | LlamaCpp.LlamaDistributionError>
-  readonly logicalModels: Effect.Effect<ReadonlyMap<string, LogicalLlamaModelRecord>>
-  readonly getModelInformation: (providerModelId: string) => Effect.Effect<ResolvedLlamaModelInformation, ModelCatalogError>
+  readonly logicalModels: Effect.Effect<ReadonlyMap<ProviderModelId, LogicalLlamaModelRecord>>
+  readonly getModelInformation: (providerModelId: ProviderModelId) => Effect.Effect<ResolvedLlamaModelInformation, ModelCatalogError>
   readonly selectionInput: Effect.Effect<LocalModelReconciliationInput>
   readonly selectionReady: Effect.Effect<boolean>
   readonly selectionChanges: Stream.Stream<void>
@@ -167,7 +175,7 @@ const profileFor = (contextTokens: number) => LlamaCpp.makeLlamaExecutionProfile
   mlock: false,
 })
 
-const acquisitionError = (modelId: string, cause: unknown) => new LlamaCppAcquisitionError({
+const acquisitionError = (modelId: ProviderModelId, cause: unknown) => new LlamaCppAcquisitionError({
   modelId,
   reason: cause instanceof Error ? cause.message : String(cause),
   cause,
@@ -202,24 +210,24 @@ const routeState = (status: LlamaCpp.LlamaServedModelStatus) => {
   }
 }
 
-const routeSnapshot = (providerModelId: string, route: LlamaLogicalRoute): LlamaServingRouteSnapshot => route._tag === "Managed"
+const routeSnapshot = (providerModelId: ProviderModelId, route: LlamaLogicalRoute): LlamaServingRouteSnapshot => route._tag === "Managed"
   ? {
       _tag: "Managed",
-      routeId: `managed:${route.record.id}`,
+      routeId: ManagedRouteIdSchema.make(`managed:${route.record.id}`),
       providerModelId,
-      modelPath: String(route.modelPath),
-      modelFileId: String(route.record.id),
+      modelPath: route.modelPath,
+      modelFileId: route.record.id,
       state: route.loaded ? { _tag: "Loaded" } : { _tag: "Unloaded" },
       availability: route.availability._tag === "Available" ? "available" : "disabled",
       productRank: route.productRank,
     }
   : {
       _tag: "External",
-      routeId: `external:${route.request.instanceId}:${route.request.servedModelId}`,
+      routeId: ExternalRouteIdSchema.make(`external:${route.request.instanceId}:${route.request.servedModelId}`),
       providerModelId,
-      modelPath: String(route.modelPath),
-      serverId: String(route.request.instanceId),
-      servedModelId: String(route.request.servedModelId),
+      modelPath: route.modelPath,
+      serverId: route.request.instanceId,
+      servedModelId: route.request.servedModelId,
       state: routeState(route.observation.status),
       healthy: route.healthy,
       priority: route.priority,
@@ -243,7 +251,7 @@ const productRankFor = (record: ModelFiles.ModelFileRecord): number => {
 }
 
 export const resolveLlamaModelInformation = (
-  providerModelId: string,
+  providerModelId: ProviderModelId,
   path: LlamaCpp.NormalizedLlamaModelPath,
   routes: readonly LlamaLogicalRoute[],
 ): { readonly information: ResolvedLlamaModelInformation; readonly evidence: readonly LlamaModelMetadataEvidence[] } => {
@@ -252,7 +260,7 @@ export const resolveLlamaModelInformation = (
   const evidence: readonly LlamaModelMetadataEvidence[] = [
     ...managed.map((route) => ({
       _tag: "IndexedArtifact" as const,
-      modelFileId: String(route.record.id),
+      modelFileId: route.record.id,
       artifactDisplayName: route.record.displayName,
       metadata: {
         ...(Option.isSome(route.record.metadata.name) ? { name: route.record.metadata.name.value } : {}),
@@ -265,7 +273,7 @@ export const resolveLlamaModelInformation = (
     })),
     ...external.map((route) => ({
       _tag: "ServerReported" as const,
-      routeId: `${route.request.instanceId}\0${route.request.servedModelId}`,
+      routeId: ExternalRouteIdSchema.make(`external:${route.request.instanceId}:${route.request.servedModelId}`),
       alias: String(route.observation.id),
       metadata: {
         ...(Option.isSome(route.observation.serverDisplayName) ? { name: route.observation.serverDisplayName.value } : {}),
@@ -317,16 +325,16 @@ export const LocalModelProviderSourceLive: Layer.Layer<
 > = Layer.scoped(LocalModelProviderSource, Effect.gen(function* () {
   const platform = yield* LocalInferencePlatform
   const configuration = yield* LocalModelConfiguration
-  const logicalModels = yield* Ref.make<ReadonlyMap<string, LogicalLlamaModelRecord>>(new Map())
+  const logicalModels = yield* Ref.make<ReadonlyMap<ProviderModelId, LogicalLlamaModelRecord>>(new Map())
   const logicalSignature = yield* Ref.make("")
   const catalogSignature = yield* Ref.make("")
-  const demandLoads = yield* Ref.make<ReadonlySet<string>>(new Set())
+  const demandLoads = yield* Ref.make<ReadonlySet<ProviderModelId>>(new Set())
   const selectionReady = yield* Ref.make(false)
   const operations = yield* Ref.make<ReadonlyMap<string, LocalInferenceOperationSnapshot>>(new Map())
   const catalogChanges = yield* PubSub.unbounded<void>()
   const selectionChanges = yield* PubSub.unbounded<void>()
   const serviceScope = yield* Scope.Scope
-  const setManagedSnapshotState = (providerModelId: string, state: LlamaServingRouteSnapshot["state"]) => Ref.update(logicalModels, (models) => {
+  const setManagedSnapshotState = (providerModelId: ProviderModelId, state: LlamaServingRouteSnapshot["state"]) => Ref.update(logicalModels, (models) => {
     const current = models.get(providerModelId)
     if (!current) return models
     const next = new Map(models)
@@ -350,7 +358,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     }
   }
 
-  const observeOperation = (providerModelId: string, operation: LlamaCpp.LlamaLoadOperation) => Effect.gen(function* () {
+  const observeOperation = (providerModelId: ProviderModelId, operation: LlamaCpp.LlamaLoadOperation) => Effect.gen(function* () {
     const id = String(operation.id)
     if ((yield* Ref.get(operations)).has(id)) return
     yield* Ref.update(operations, (current) => new Map(current).set(id, {
@@ -379,8 +387,8 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       ? Option.some(yield* registry.value.inspect)
       : Option.none<LlamaCpp.LlamaInstanceSnapshot>()
     const cli = assessAvailability ? yield* platform.cli.pipe(Effect.option) : Option.none<LlamaCpp.LlamaCli>()
-    const groups = new Map<string, { path: LlamaCpp.NormalizedLlamaModelPath; routes: LlamaLogicalRoute[] }>()
-    const addRoute = (providerModelId: string, path: LlamaCpp.NormalizedLlamaModelPath, route: LlamaLogicalRoute) => {
+    const groups = new Map<ProviderModelId, { path: LlamaCpp.NormalizedLlamaModelPath; routes: LlamaLogicalRoute[] }>()
+    const addRoute = (providerModelId: ProviderModelId, path: LlamaCpp.NormalizedLlamaModelPath, route: LlamaLogicalRoute) => {
       const group = groups.get(providerModelId) ?? { path, routes: [] }
       group.routes.push(route)
       groups.set(providerModelId, group)
@@ -460,14 +468,17 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     }
 
     const previous = yield* Ref.get(logicalModels)
-    const selectedIds = new Set(Object.values((yield* configuration.getModels)?.slots ?? {}).flatMap((slot) => slot?.providerId === "llamacpp" && slot.providerModelId ? [slot.providerModelId] : []))
+    const selectedIds = new Set(Object.values((yield* configuration.getModels)?.slots ?? {}).flatMap((slot) =>
+      slot?.providerId === "llamacpp" && slot.providerModelId && Schema.is(ProviderModelIdSchema)(slot.providerModelId)
+        ? [slot.providerModelId]
+        : []))
     for (const id of selectedIds) {
       if (groups.has(id)) continue
       const old = previous.get(id)
       if (old) groups.set(id, { path: old.modelPath, routes: [] })
     }
 
-    const next = new Map<string, LogicalLlamaModelRecord>()
+    const next = new Map<ProviderModelId, LogicalLlamaModelRecord>()
     for (const [providerModelId, group] of groups) {
       const retained = group.routes.length === 0 ? previous.get(providerModelId) : undefined
       const resolvedInformation = retained
@@ -487,7 +498,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       const providerModel: LlamaCppModelInfo | undefined = retained?.providerModel
         ? { ...retained.providerModel, availability: disabled("model_unavailable") }
         : Option.isSome(context) ? {
-        providerId: "llamacpp",
+        providerId: LlamaCppModelInfoSchema.fields.providerId.make("llamacpp"),
         providerModelId,
         displayName: information.displayName,
         ...Option.match(classifyModelFamilyFromEvidence({
@@ -536,7 +547,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
   const refresh = yield* Effect.cachedWithTTL(rebuild("changed", true), "250 millis")
   const list = Ref.get(logicalModels).pipe(Effect.map((models) => [...models.values()].flatMap((record) => record.providerModel ? [record.providerModel] : [])))
 
-  const acquire = (providerModelId: string): Effect.Effect<LlamaCppInferenceLease, LlamaCppAcquisitionError, Scope.Scope> => Effect.gen(function* () {
+  const acquire = (providerModelId: ProviderModelId): Effect.Effect<LlamaCppInferenceLease, LlamaCppAcquisitionError, Scope.Scope> => Effect.gen(function* () {
     const logical = (yield* Ref.get(logicalModels)).get(providerModelId)
     if (!logical) return yield* acquisitionError(providerModelId, "This local model is no longer available.")
     const loadedManagedRoute = logical.routes.find((candidate): candidate is ManagedRoute => candidate._tag === "Managed" && candidate.loaded && candidate.availability._tag === "Available")
@@ -582,9 +593,13 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       yield* PubSub.publish(selectionChanges, undefined)
     }
     return {
+      providerModelId,
+      routeId: LlamaServingRouteIdSchema.make(externalRoute
+        ? `external:${externalRoute.request.instanceId}:${externalRoute.request.servedModelId}`
+        : `managed:${managedRoute!.record.id}`),
       origin: lease.target.origin,
       authorization: lease.target.authorization,
-      servedModelId: String(lease.target.model),
+      servedModelId: LlamaServedModelIdSchema.make(lease.target.model),
       requestStarted: configuration.recordUse("selected", providerModelId).pipe(Effect.ignore),
     }
   })
@@ -610,7 +625,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     }),
   })))
 
-  const warm = (providerModelId: string) => Effect.scoped(acquire(providerModelId)).pipe(Effect.asVoid)
+  const warm = (providerModelId: ProviderModelId) => Effect.scoped(acquire(providerModelId)).pipe(Effect.asVoid)
   const status = platform.instances.pipe(
     Effect.flatMap((registry) => registry.inspect),
     Effect.map((snapshot) => snapshot.instances.some((instance) => instance.health === "ready")

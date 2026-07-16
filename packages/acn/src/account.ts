@@ -12,6 +12,8 @@ import {
   type ProviderRegistryInfo,
   MagnitudeModelListResponseSchema,
   toMagnitudeModelInfo,
+  ProviderIdSchema,
+  ProviderModelIdSchema,
 } from "@magnitudedev/sdk"
 import { isEnvFlagOn } from "@magnitudedev/utils"
 import { ProviderClientRegistry } from "./shared-client"
@@ -81,6 +83,12 @@ const noApiKey = (operation: string): SessionError =>
 const isSlotId = (value: unknown): value is SlotId =>
   value === "primary" || value === "secondary"
 
+const storedProviderId = (value: string | undefined) =>
+  value !== undefined && Schema.is(ProviderIdSchema)(value) ? value : undefined
+
+const storedProviderModelId = (value: string | undefined) =>
+  value !== undefined && Schema.is(ProviderModelIdSchema)(value) ? value : undefined
+
 const slotsForModel = (model: ProviderModel): readonly SlotId[] => {
   if (!("slots" in model) || !Array.isArray(model.slots)) return []
   return model.slots.filter(isSlotId)
@@ -143,7 +151,11 @@ function buildModelList(
       providers,
       slotProfiles: slotProfilesFromModels(models, modelConfig),
       modelConfig: {
-        slots: modelConfig?.slots ?? {},
+        slots: Object.fromEntries(Object.entries(modelConfig?.slots ?? {}).map(([slotId, slot]) => [slotId, {
+          ...(storedProviderId(slot?.providerId) ? { providerId: storedProviderId(slot?.providerId)! } : {}),
+          ...(storedProviderModelId(slot?.providerModelId) ? { providerModelId: storedProviderModelId(slot?.providerModelId)! } : {}),
+          ...(slot?.reasoningEffort ? { reasoningEffort: slot.reasoningEffort } : {}),
+        }])),
         localSlotIntent: modelConfig?.localSlotIntent ?? {},
       },
     }
@@ -190,8 +202,8 @@ function slotProfilesFromModels(
       ...profiles,
       [slotId]: {
         slotId,
-        providerId: resolved.providerId,
-        providerModelId: resolved.providerModelId,
+        providerId: ProviderIdSchema.make(resolved.providerId),
+        providerModelId: ProviderModelIdSchema.make(resolved.providerModelId),
         modelDisplayName: model.displayName,
         contextWindow: model.contextWindow,
         maxOutputTokens: model.maxOutputTokens,

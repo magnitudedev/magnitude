@@ -1,7 +1,7 @@
 import { Data, Effect } from "effect"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import type { AuthApplicator } from "../auth/auth"
-import type { ProviderModel } from "./model"
+import type { ProviderId, ProviderModel, ProviderModelId } from "./model"
 
 export class ModelCatalogError extends Data.TaggedError("ModelCatalogError")<{
   readonly message: string
@@ -21,7 +21,7 @@ export interface ModelCatalog<T extends ProviderModel = ProviderModel> {
   /** Returns cached models if fresh, otherwise fetches. */
   readonly list: Effect.Effect<readonly T[], ModelCatalogError, HttpClient.HttpClient>
   /** Finds a model by provider ID + provider model ID. Fails if not found. */
-  readonly get: (providerId: string, providerModelId: string) => Effect.Effect<T, ModelCatalogError, HttpClient.HttpClient>
+  readonly get: (providerId: ProviderId, providerModelId: ProviderModelId) => Effect.Effect<T, ModelCatalogError, HttpClient.HttpClient>
   /** Forces a fresh fetch, replacing the cache. */
   readonly refresh: Effect.Effect<readonly T[], ModelCatalogError, HttpClient.HttpClient>
 }

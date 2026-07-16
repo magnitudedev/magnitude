@@ -6,7 +6,7 @@ export {
   type LlamaCppProviderInstance,
   type LlamaCppProviderSource,
 } from "./provider"
-export { LlamaCppModelInfoSchema } from "./contract"
+export { LlamaCppModelInfoSchema, LlamaServedModelIdSchema, LlamaServingRouteIdSchema } from "./contract"
 export {
   createLlamaCppCompatibleSpec,
   type LlamaCppCallOptions,
@@ -19,4 +19,6 @@ export {
 export type {
   LlamaCppModelInfo,
   LlamaCppToolChoice,
+  LlamaServedModelId,
+  LlamaServingRouteId,
 } from "./contract"

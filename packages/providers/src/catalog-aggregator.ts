@@ -4,6 +4,8 @@ import {
   ModelCatalogError,
   type ModelCatalog,
   type ProviderModel,
+  type ProviderId,
+  type ModelFamilyId,
 } from "@magnitudedev/ai"
 
 /**
@@ -11,7 +13,7 @@ import {
  * The aggregated catalog type-erases to ProviderModel (base type).
  */
 export function makeAggregatedCatalog(
-  providers: readonly { readonly id: string; readonly catalog: ModelCatalog<any> }[],
+  providers: readonly { readonly id: ProviderId; readonly catalog: ModelCatalog<any> }[],
 ): ModelCatalog<ProviderModel> {
   const list: ModelCatalog<ProviderModel>["list"] = Effect.gen(function* () {
     const results = yield* Effect.all(
@@ -43,10 +45,10 @@ export function makeAggregatedCatalog(
 
 export function buildFamilies(
   providerModels: readonly ProviderModel[],
-  getModelFamily: (id: string) => { readonly id: string; readonly capabilities: { readonly vision: boolean } } | null,
-): readonly { readonly id: string; readonly capabilities: { readonly vision: boolean } }[] {
-  const seen = new Set<string>()
-  const families: { readonly id: string; readonly capabilities: { readonly vision: boolean } }[] = []
+  getModelFamily: (id: ModelFamilyId) => { readonly id: ModelFamilyId; readonly capabilities: { readonly vision: boolean } } | null,
+): readonly { readonly id: ModelFamilyId; readonly capabilities: { readonly vision: boolean } }[] {
+  const seen = new Set<ModelFamilyId>()
+  const families: { readonly id: ModelFamilyId; readonly capabilities: { readonly vision: boolean } }[] = []
   for (const pm of providerModels) {
     if (!pm.modelFamilyId) continue
     if (!seen.has(pm.modelFamilyId)) {

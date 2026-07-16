@@ -9,7 +9,11 @@ import { ProviderModelSchema } from "@magnitudedev/ai"
  * A model served by a local Llama.cpp server.
  * Extends ProviderModel with Llama.cpp-specific metadata.
  */
-export const LlamaCppProviderId = Schema.Literal("llamacpp")
+export const LlamaCppProviderId = Schema.Literal("llamacpp").pipe(Schema.brand("ProviderId"))
+export const LlamaServedModelIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(4096), Schema.brand("LlamaServedModelId"))
+export type LlamaServedModelId = Schema.Schema.Type<typeof LlamaServedModelIdSchema>
+export const LlamaServingRouteIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(8192), Schema.brand("LlamaServingRouteId"))
+export type LlamaServingRouteId = Schema.Schema.Type<typeof LlamaServingRouteIdSchema>
 export const LlamaCppModelInfoSchema = Schema.Struct({
   ...ProviderModelSchema.fields,
   providerId: LlamaCppProviderId,

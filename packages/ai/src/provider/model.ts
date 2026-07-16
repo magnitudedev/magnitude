@@ -55,7 +55,7 @@ export interface ModelFamilyCapabilities {
  */
 export interface ModelFamily {
   /** Family ID, e.g. "glm-5", "kimi-k2", "deepseek-v3" */
-  readonly id: string
+  readonly id: ModelFamilyId
   /** Intrinsic capabilities — same for every model in this family */
   readonly capabilities: ModelFamilyCapabilities
 }
@@ -81,9 +81,9 @@ export const isProviderModelAvailable = (
  * Properties here MAY differ across providers serving the same family.
  */
 export const ProviderModelSchema = Schema.Struct({
-  providerModelId: Schema.String,
-  providerId: Schema.String,
-  modelFamilyId: Schema.optional(Schema.String),
+  providerModelId: ProviderModelIdSchema,
+  providerId: ProviderIdSchema,
+  modelFamilyId: Schema.optional(ModelFamilyIdSchema),
   displayName: Schema.String.pipe(Schema.minLength(1)),
   contextWindow: PositiveSafeInteger,
   maxOutputTokens: PositiveSafeInteger,
