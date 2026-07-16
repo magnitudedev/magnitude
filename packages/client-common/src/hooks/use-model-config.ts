@@ -14,12 +14,12 @@ import { useModelCatalog, useModelSlots } from "./use-reactive-rpc"
 export interface ModelOption {
   providerId: string
   providerModelId: string
-  modelFamilyId: string
+  modelFamilyId?: string
   displayName: string
   slots?: readonly string[]
   contextWindow: number
   maxOutputTokens: number
-  capabilities: { vision: boolean }
+  capabilities: { vision?: boolean }
   availability: ProviderModelAvailability
   reasoningEfforts: readonly string[]
   pricing: { input: number; output: number; cachedInput?: number } | null

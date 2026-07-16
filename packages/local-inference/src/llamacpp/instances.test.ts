@@ -70,7 +70,6 @@ describe("llama instance registry", () => {
       const record: ModelFileRecord = {
         id: modelFileId,
         sourceId,
-        contentId: Option.none(),
         displayName: "Managed model",
         format: ModelFileFormatId.make("gguf"),
         sizeBytes: 4,
@@ -92,7 +91,7 @@ describe("llama instance registry", () => {
           version: [{ key: SourceFileKey.make("model"), sizeBytes: 4, modifiedAtMillis: Option.none() }],
         }),
         remove: () => Effect.void,
-        index: Effect.succeed({ schemaVersion: 1, capturedAt: new Date(), sets: [], issues: [] }),
+        index: Effect.succeed({ capturedAt: new Date(), sets: [], issues: [] }),
       }
       const cli: LlamaCli = {
         binary: {

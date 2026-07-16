@@ -5,7 +5,6 @@ import type { LocalInferenceState } from "@magnitudedev/sdk"
 import { act } from "react"
 
 const emptyLocalInferenceState = {
-  schemaVersion: 3,
   usage: null,
   activeBinding: null,
   distribution: { _tag: "Missing" },

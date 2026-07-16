@@ -57,5 +57,6 @@ describe("llama.cpp server protocol", () => {
     expect(Option.getOrNull(model?.activeContextTokens ?? Option.none())).toBe(65_536)
     expect(Option.getOrNull(model?.architecture ?? Option.none())).toBe("qwen2")
     expect(Option.getOrNull(model?.inputModalities ?? Option.none())).toEqual(["text"])
+    expect(Option.getOrNull(model?.reportedModelPath ?? Option.none())).toBe("/models/qwen.gguf")
   })
 })

@@ -41,6 +41,7 @@ export {
 export {
   type LlamaCppProviderInstance,
   type LlamaCppModelInfo,
+  LlamaCppModelInfoSchema,
   type LlamaCppCallOptions,
   type LlamaCppToolChoice,
   type LlamaCppProviderSource,

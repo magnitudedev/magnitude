@@ -12,7 +12,7 @@ import type { DurableLocalModelBinding } from "@magnitudedev/storage"
 import { LOCAL_MODEL_CATALOG } from "./catalog"
 import { LocalModelConfiguration, type ModelConfigurationError } from "./model-configuration"
 import { LocalInferencePlatform } from "./platform"
-import { LocalModelProviderSource } from "./provider-source"
+import { LocalModelProviderSource, type LlamaLogicalRoute } from "./provider-source"
 import { configuredParallelSlots } from "./recommendations"
 import { recommendLocalModels } from "./recommendations"
 
@@ -137,29 +137,34 @@ export const LocalInferenceLive: Layer.Layer<
     : undefined
 
   const resolveSelectedModel = (selectionId: string) => Effect.gen(function* () {
-    const [models, files] = yield* Effect.all([catalogModels, platform.files.inspect("cached")], { concurrency: 2 })
-    const records = new Map(files.records.map((record) => [String(record.id), record]))
-    return models.find((model) => model.providerModelId === selectionId
-      || matchCatalogEntry(model.managedArtifactId ? records.get(model.managedArtifactId) : undefined)?.id === selectionId)
+    const logical = yield* source.logicalModels
+    for (const record of logical.values()) {
+      const managed = record.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
+      if (record.providerModelId === selectionId || matchCatalogEntry(managed?.record)?.id === selectionId) return record
+    }
+    return undefined
   })
 
   const activateModel = (selectionId: string) => lock.withPermits(1)(Effect.gen(function* () {
-    const model = yield* resolveSelectedModel(selectionId)
-    if (!model || model.availability._tag === "Disabled") return yield* localError("invalid_selection", "activate local model", "The requested local model is unavailable.")
-    yield* source.warm(model.providerModelId).pipe(Effect.mapError((cause) => mapFailure("activate local model", cause)))
-    const binding: DurableLocalModelBinding = model.ownership === "external"
+    const logical = yield* resolveSelectedModel(selectionId)
+    const model = logical?.providerModel
+    if (!logical || !model || model.availability._tag === "Disabled") return yield* localError("invalid_selection", "activate local model", "The requested local model is unavailable.")
+    yield* source.warm(logical.providerModelId).pipe(Effect.mapError((cause) => mapFailure("activate local model", cause)))
+    const managed = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
+    const external = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "External" }> => route._tag === "External")
+    const binding: DurableLocalModelBinding = !managed && external
       ? {
           _tag: "External",
           selectionId,
-          endpointConfigId: model.externalServerId ?? "external",
-          providerModelId: model.providerModelId,
+          endpointConfigId: String(external.request.instanceId),
+          providerModelId: logical.providerModelId,
           contextTokens: model.contextWindow,
         }
       : {
           _tag: "Managed",
           selectionId,
-          artifactId: model.managedArtifactId ?? "",
-          providerModelId: model.providerModelId,
+          artifactId: managed ? String(managed.record.id) : "",
+          providerModelId: logical.providerModelId,
           contextTokens: model.contextWindow,
           parallelSlots: configuredParallelSlots(),
         }
@@ -170,8 +175,9 @@ export const LocalInferenceLive: Layer.Layer<
     const config = yield* configured
     if (config.binding?.providerModelId === selectionId) return yield* localError("artifact_active", "delete local model", "Disable the active local model before deleting it.")
     const model = yield* resolveSelectedModel(selectionId)
-    if (!model?.managedArtifactId) return yield* localError("invalid_selection", "delete local model", "The requested stored model is unknown.")
-    const id = ModelFiles.ModelFileId.make(model.managedArtifactId)
+    const managed = model?.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
+    if (!managed) return yield* localError("invalid_selection", "delete local model", "The requested stored model is unknown.")
+    const id = managed.record.id
     const record = yield* platform.files.get(id).pipe(Effect.mapError((cause) => mapFailure("inspect local model", cause)))
     if (!record.operations.delete) return yield* localError("artifact_not_owned", "delete local model", "Only Magnitude-owned model artifacts can be deleted.")
     yield* platform.files.remove(id).pipe(Effect.mapError((cause) => mapFailure("delete local model", cause)))
@@ -190,38 +196,43 @@ export const LocalInferenceLive: Layer.Layer<
   }))
 
   const state = Effect.gen(function* () {
-    const [config, distribution, hostResult, models, files, operations] = yield* Effect.all([
+    const [config, distribution, hostResult, models, logicalModels, files, operations] = yield* Effect.all([
       configured,
       distributionStatus,
       platform.hardware.inspect.pipe(Effect.either),
       catalogModels,
+      source.logicalModels,
       platform.files.inspect("cached"),
       source.operations,
     ], { concurrency: 4 })
-    const records = new Map(files.records.map((record) => [String(record.id), record]))
-    const choices: LocalModelChoice[] = models.map((model) => {
-      const record = model.managedArtifactId ? records.get(model.managedArtifactId) : undefined
+    const choices: LocalModelChoice[] = [...logicalModels.values()].map((logical) => {
+      const model = logical.providerModel
+      const managed = logical?.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
+      const external = logical?.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "External" }> => route._tag === "External")
+      const record = managed?.record
       const curated = matchCatalogEntry(record)
+      const runningExternal = logical?.routes.some((route) => route._tag === "External" && route.healthy && (route.observation.status === "loaded" || route.observation.status === "sleeping")) ?? false
+      const runningManaged = logical?.routes.some((route) => route._tag === "Managed" && route.loaded) ?? false
+      const residency = runningExternal || runningManaged ? "loaded" as const : "unloaded" as const
       const common = {
-        choiceId: curated?.id ?? model.providerModelId,
-        displayName: model.displayName,
-        providerModelId: model.providerModelId,
-        contextTokens: model.contextWindow,
+        choiceId: curated?.id ?? logical.providerModelId,
+        displayName: logical.information.displayName,
+        providerModelId: logical.providerModelId,
+        ...(model ? { contextTokens: model.contextWindow } : {}),
         fitClass: "unknown" as const,
-        compatible: model.availability._tag === "Available",
-        explanation: model.availability._tag === "Available" ? "Runnable with the active llama.cpp distribution." : `Unavailable: ${model.availability.reason}`,
-        residency: model.residency ?? "unknown" as const,
+        compatible: model?.availability._tag === "Available",
+        explanation: !model ? "Metadata required for safe inference is unavailable." : model.availability._tag === "Available" ? "Runnable with the active llama.cpp distribution." : `Unavailable: ${model.availability.reason}`,
+        residency,
         ...(record ? { sizeBytes: record.sizeBytes } : {}),
       }
-      if (model.ownership === "external") return { _tag: "RunningExternal" as const, ...common }
-      if (model.residency === "loaded" || model.residency === "sleeping" || model.residency === "loading") return { _tag: "RunningManaged" as const, ...common }
+      if (runningExternal && !runningManaged) return { _tag: "RunningExternal" as const, ...common }
+      if (runningManaged) return { _tag: "RunningManaged" as const, ...common }
       return record?.ownership === "magnitude"
         ? { _tag: "StoredOwned" as const, ...common }
         : { _tag: "StoredExternal" as const, ...common }
     })
     const binary = Option.orElse(distribution.configured, () => Option.orElse(distribution.managed, () => distribution.path))
     return {
-      schemaVersion: 3,
       usage: config.usage ?? null,
       activeBinding: config.binding
         ? config.binding._tag === "Managed"

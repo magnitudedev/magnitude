@@ -4,16 +4,16 @@ import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import { Effect, Layer, Schema } from "effect"
 
 import { ModelCatalogError, type ModelCatalog } from "./catalog"
-import type { ProviderModel } from "./model"
+import { ProviderModelSchema, type ProviderModel } from "./model"
 
 // =============================================================================
 // File cache format
 // =============================================================================
 
-const ModelCacheFileSchema = Schema.Struct({
+const modelCacheFileSchema = <A extends ProviderModel, I, R>(model: Schema.Schema<A, I, R>) => Schema.Struct({
   fetchedAt: Schema.Number,
   ttlMs: Schema.Number,
-  models: Schema.Array(Schema.Any),
+  models: Schema.Array(model),
 })
 
 interface ModelCacheFile {
@@ -57,7 +57,9 @@ export function makeFileBackedModelCatalog<T extends ProviderModel>(
   cachePath: string,
   fileTtlMs: number = 10 * 60 * 1000,
   inMemoryTtlMs: number = 5 * 60 * 1000,
+  modelSchema: Schema.Schema<T, unknown> = ProviderModelSchema as Schema.Schema<T, unknown>,
 ): ModelCatalog<T> {
+  const ModelCacheFileSchema = modelCacheFileSchema(modelSchema)
   let inMemory: readonly T[] | null = null
   let inMemoryFetchedAt = 0
 
@@ -75,7 +77,7 @@ export function makeFileBackedModelCatalog<T extends ProviderModel>(
       return {
         fetchedAt: parsed.fetchedAt,
         ttlMs: parsed.ttlMs,
-        models: parsed.models as readonly T[],
+        models: parsed.models,
       }
     }).pipe(Effect.provide(PlatformFileLayer))
 
@@ -95,7 +97,7 @@ export function makeFileBackedModelCatalog<T extends ProviderModel>(
         ttlMs: fileTtlMs,
         models,
       }
-      const content = yield* Schema.encodeUnknown(Schema.parseJson({ space: 2 }))(payload).pipe(
+      const content = yield* Schema.encodeUnknown(Schema.parseJson(ModelCacheFileSchema, { space: 2 }))(payload).pipe(
         Effect.catchAll(() => Effect.succeed("{}")),
       )
       yield* fs.writeFileString(tmpPath, content).pipe(

@@ -6,20 +6,29 @@ import { makeLocalModelConfiguration, reconcileLocalModelSlots, type LocalSlotCa
 const candidate = (
   providerModelId: string,
   ownership: "managed" | "external",
-  residency: LocalSlotCandidate["residency"],
+  residency: "loaded" | "sleeping" | "unloaded" | "loading" | "failed" | "unknown",
   availability: LocalSlotCandidate["availability"] = "available",
 ): LocalSlotCandidate => ({
   providerModelId,
-  ownership,
-  residency,
   availability,
+  externalLoaded: ownership === "external" && residency === "loaded",
+  managedLoaded: ownership === "managed" && residency === "loaded",
+  sleeping: residency === "sleeping",
+  managedRestorable: ownership === "managed" && residency !== "failed",
+  demandLoading: ownership === "managed" && residency === "loading",
   productRank: 0,
   externalPriority: 0,
 })
 
+const reconcile = (
+  current: MagnitudeConfig,
+  candidates: readonly LocalSlotCandidate[],
+  authoritativeModelIds: ReadonlySet<string> = new Set(candidates.map((item) => item.providerModelId)),
+) => reconcileLocalModelSlots(current, { authoritativeModelIds, candidates })
+
 describe("LocalModelConfiguration", () => {
-  it("keeps cloud slots fixed while an external loaded model takes over local slots", () => {
-    const result = reconcileLocalModelSlots({
+  it("keeps cloud slots fixed and does not replace a running local selection", () => {
+    const result = reconcile({
       models: {
         slots: {
           primary: { providerId: "magnitude", providerModelId: "cloud" },
@@ -30,7 +39,7 @@ describe("LocalModelConfiguration", () => {
 
     expect(result.config.models?.slots).toEqual({
       primary: { providerId: "magnitude", providerModelId: "cloud" },
-      secondary: { providerId: "llamacpp", providerModelId: "external-a" },
+      secondary: { providerId: "llamacpp", providerModelId: "managed-a" },
     })
     expect(result.config.models?.localSlotIntent).toEqual({ primary: "cloud", secondary: "local" })
   })
@@ -42,11 +51,52 @@ describe("LocalModelConfiguration", () => {
         localSlotIntent: { primary: "local" },
       },
     }
-    expect(reconcileLocalModelSlots(current, [candidate("managed-a", "managed", "unloaded")]).changed).toBe(false)
+    expect(reconcile(current, [candidate("managed-a", "managed", "unloaded")]).changed).toBe(false)
+  })
+
+  it("replaces an unloaded undemanded managed selection when an external model starts", () => {
+    const current: MagnitudeConfig = {
+      models: {
+        slots: { primary: { providerId: "llamacpp", providerModelId: "managed-a" } },
+        localSlotIntent: { primary: "local" },
+      },
+    }
+    const result = reconcile(current, [
+      candidate("managed-a", "managed", "unloaded"),
+      candidate("external-b", "external", "loaded"),
+    ])
+    expect(result.config.models?.slots?.primary?.providerModelId).toBe("external-b")
+  })
+
+  it("protects a selected model while its demand load is active", () => {
+    const current: MagnitudeConfig = {
+      models: {
+        slots: { primary: { providerId: "llamacpp", providerModelId: "managed-a" } },
+        localSlotIntent: { primary: "local" },
+      },
+    }
+    const loading = { ...candidate("managed-a", "managed", "loading"), managedLoaded: false, demandLoading: true }
+    const result = reconcile(current, [loading, candidate("external-b", "external", "loaded")])
+    expect(result.changed).toBe(false)
+    expect(result.config.models?.slots?.primary?.providerModelId).toBe("managed-a")
+  })
+
+  it("selects the next candidate after an external-only selection stops", () => {
+    const current: MagnitudeConfig = {
+      models: {
+        slots: { primary: { providerId: "llamacpp", providerModelId: "external-a" } },
+        localSlotIntent: { primary: "local" },
+      },
+    }
+    const result = reconcile(current, [
+      candidate("external-a", "external", "failed", "disabled"),
+      candidate("managed-b", "managed", "unloaded"),
+    ])
+    expect(result.config.models?.slots?.primary?.providerModelId).toBe("managed-b")
   })
 
   it("falls through disabled selection to per-slot recency without crossing to cloud", () => {
-    const result = reconcileLocalModelSlots({
+    const result = reconcile({
       models: {
         slots: {
           primary: { providerId: "llamacpp", providerModelId: "disabled" },
@@ -66,7 +116,7 @@ describe("LocalModelConfiguration", () => {
   })
 
   it("clears an unavailable local slot but preserves local intent", () => {
-    const result = reconcileLocalModelSlots({
+    const result = reconcile({
       models: {
         slots: { primary: { providerId: "llamacpp", providerModelId: "gone" } },
         localSlotIntent: { primary: "local" },
@@ -74,6 +124,59 @@ describe("LocalModelConfiguration", () => {
     }, [])
     expect(result.config.models?.slots?.primary).toBeUndefined()
     expect(result.config.models?.localSlotIntent?.primary).toBe("local")
+  })
+
+  it("uses authoritative existence rather than provider-model ID syntax", () => {
+    const existing = reconcile({
+      models: {
+        slots: { primary: { providerId: "llamacpp", providerModelId: "arbitrary-id" } },
+        localSlotIntent: { primary: "local" },
+      },
+    }, [candidate("arbitrary-id", "managed", "unloaded")], new Set(["arbitrary-id"]))
+    expect(existing.changed).toBe(false)
+
+    const nonexistentHash = `lmp_${"a".repeat(64)}`
+    const missing = reconcile({
+      models: {
+        slots: { primary: { providerId: "llamacpp", providerModelId: nonexistentHash } },
+        localSlotIntent: { primary: "local" },
+      },
+    }, [], new Set())
+    expect(missing.config.models?.slots?.primary).toBeUndefined()
+  })
+
+  it("drops every unresolved local model reference in the same reconciliation", () => {
+    const result = reconcile({
+      localInference: {
+        usage: { localModelRole: "main", sessionConcurrency: "one" },
+        binding: {
+          _tag: "Managed",
+          selectionId: "missing",
+          artifactId: "missing",
+          providerModelId: "missing",
+          contextTokens: 100_000,
+          parallelSlots: 1,
+        },
+      },
+      models: {
+        slots: { primary: { providerId: "llamacpp", providerModelId: "missing" } },
+        localSlotIntent: { primary: "local" },
+        localModelRecency: { primary: ["missing", "available"], secondary: ["missing"] },
+      },
+    }, [
+      candidate("missing", "external", "failed", "disabled"),
+      candidate("available", "managed", "unloaded"),
+    ], new Set(["available"]))
+
+    expect(result.changed).toBe(true)
+    expect(result.config.localInference).toEqual({
+      usage: { localModelRole: "main", sessionConcurrency: "one" },
+    })
+    expect(result.config.models).toEqual({
+      slots: { primary: { providerId: "llamacpp", providerModelId: "available" } },
+      localSlotIntent: { primary: "local" },
+      localModelRecency: { primary: ["available"] },
+    })
   })
 
   it("atomically commits and clears the binding with only the local slot", async () => {
@@ -93,6 +196,7 @@ describe("LocalModelConfiguration", () => {
         getLocalInferenceConfig: () => Ref.get(state).pipe(
           Effect.map((config) => config.localInference ?? null),
         ),
+        getModelConfig: () => Ref.get(state).pipe(Effect.map((config) => config.models ?? null)),
         updateModelConfig: () => Effect.void,
         update: (f: (config: MagnitudeConfig) => MagnitudeConfig) => Ref.modify(
           state,

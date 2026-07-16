@@ -1,7 +1,6 @@
 import { Context, Data, Option, Schema, type Effect, type Stream } from "effect"
 import {
   ModelArtifactKey,
-  ModelContentId,
   ModelFileFormatId,
   ModelFileId,
   ModelFilePartId,
@@ -223,7 +222,6 @@ export const InspectedModelArtifactSchema = Schema.Struct({
 })
 
 export const LocalModelFileIndexSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
   capturedAt: Schema.DateFromString,
   sets: Schema.Array(Schema.Struct({
     sourceId: ModelFileSourceId,
@@ -273,7 +271,6 @@ export const ModelFileWarning = Data.taggedEnum<ModelFileWarning>()
 export interface ModelFileRecord {
   readonly id: ModelFileId
   readonly sourceId: ModelFileSourceId
-  readonly contentId: Option.Option<ModelContentId>
   readonly displayName: string
   readonly format: ModelFileFormatId
   readonly sizeBytes: number

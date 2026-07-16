@@ -6,6 +6,7 @@ export {
   type LlamaCppProviderInstance,
   type LlamaCppProviderSource,
 } from "./provider"
+export { LlamaCppModelInfoSchema } from "./contract"
 export {
   createLlamaCppCompatibleSpec,
   type LlamaCppCallOptions,

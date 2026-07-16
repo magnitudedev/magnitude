@@ -94,12 +94,12 @@ function toModelSummary(model: ProviderModel): ModelSummary {
   return {
     providerId: model.providerId,
     providerModelId: model.providerModelId,
-    modelFamilyId: model.modelFamilyId,
+    ...(model.modelFamilyId ? { modelFamilyId: model.modelFamilyId } : {}),
     displayName: model.displayName,
     ...(slots.length > 0 ? { slots: [...slots] } : {}),
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
-    capabilities: { vision: model.capabilities.vision ?? false },
+    capabilities: { ...(model.capabilities.vision === undefined ? {} : { vision: model.capabilities.vision }) },
     availability: model.availability,
     reasoningEfforts: [...model.reasoningEfforts],
     pricing: model.pricing ? {
@@ -181,7 +181,10 @@ function slotProfilesFromModels(
       && candidate.providerModelId === resolved.providerModelId)
     if (!model) continue
 
-    const reasoningEffort = userSlotConfig?.reasoningEffort ?? DEFAULT_REASONING_EFFORT[slotId]
+    const requestedEffort = userSlotConfig?.reasoningEffort ?? DEFAULT_REASONING_EFFORT[slotId]
+    const reasoningEffort = model.reasoningEfforts.includes(requestedEffort)
+      ? requestedEffort
+      : model.reasoningEfforts[0] ?? "none"
 
     profiles = {
       ...profiles,
@@ -357,10 +360,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
             const body = yield* response.json.pipe(
               Effect.flatMap(Schema.decodeUnknown(MagnitudeModelListResponseSchema)),
             )
-            const models = body.data.map((raw) => ({
-              ...toMagnitudeModelInfo(raw),
-              modelFamilyId: "unknown",
-            }))
+            const models = body.data.map(toMagnitudeModelInfo)
             return slotProfilesFromModels(models, null)
           }).pipe(
             Effect.provide(FetchHttpClient.layer),
@@ -374,7 +374,26 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         ),
         modelSlots: Ref.get(slotState),
         watchModelSlots: Stream.fromPubSub(slotChanges),
-        updateModelSlots: (slots) => modelConfiguration.updateSlots(slots).pipe(
+        updateModelSlots: (slots) => Effect.gen(function* () {
+          const models = yield* Ref.get(catalogModels)
+          for (const [slotId, slot] of Object.entries(slots)) {
+            if (!slot?.providerId || !slot.providerModelId) continue
+            const model = models.find((candidate) => candidate.providerId === slot.providerId && candidate.providerModelId === slot.providerModelId)
+            if (!model || model.availability._tag !== "Available") {
+              return yield* new SessionOperationFailed({
+                operation: "update model slots",
+                reason: `Model is not available for ${slotId}: ${slot.providerId}/${slot.providerModelId}`,
+              })
+            }
+          }
+          const normalized = Object.fromEntries(Object.entries(slots).map(([slotId, slot]) => {
+            if (!slot?.providerId || !slot.providerModelId) return [slotId, slot]
+            const model = models.find((candidate) => candidate.providerId === slot.providerId && candidate.providerModelId === slot.providerModelId)
+            if (!model || !slot.reasoningEffort || model.reasoningEfforts.includes(slot.reasoningEffort)) return [slotId, slot]
+            return [slotId, { ...slot, reasoningEffort: model.reasoningEfforts[0] ?? "none" }]
+          })) as typeof slots
+          yield* modelConfiguration.updateSlots(normalized)
+        }).pipe(
           Effect.mapError(toAccountError("update model slots")),
           Effect.andThen(Effect.gen(function* () {
             const catalog = yield* Ref.get(catalogState)

@@ -206,7 +206,7 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const loadedLocalModels = Result.isSuccess(localInference)
     ? localInference.value.choices.filter((choice) =>
         (choice._tag === 'RunningExternal' || choice._tag === 'RunningManaged')
-        && ((choice.residency ?? 'loaded') === 'loaded' || choice.residency === 'sleeping'))
+        && (choice.residency === 'loaded' || choice.residency === 'sleeping'))
     : []
   const loadingLocalModels = Result.isSuccess(localInference)
     ? localInference.value.operations.filter((operation) => operation.status === 'running')

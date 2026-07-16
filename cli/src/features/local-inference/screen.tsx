@@ -240,7 +240,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     const focusTarget = LOCAL_USAGE_FOCUS_ORDER[usageRow]!
     const running = state.choices.find((choice) => choice._tag === "RunningExternal" || choice._tag === "RunningManaged")
     const runningMetadata = running
-      ? [running.displayName, running.quantization?.format, `${formatContext(running.contextTokens)} context`, running._tag === "RunningManaged" ? "Managed by Magnitude" : "Running outside Magnitude"].filter(Boolean).join(" · ")
+      ? [running.displayName, running.quantization?.format, running.contextTokens === undefined ? "Context unavailable" : `${formatContext(running.contextTokens)} context`, running._tag === "RunningManaged" ? "Managed by Magnitude" : "Running outside Magnitude"].filter(Boolean).join(" · ")
       : null
     return (
       <box key="local-usage" style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
