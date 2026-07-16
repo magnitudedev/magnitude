@@ -23,6 +23,7 @@ import type {
   Dialogs,
   TerminalCapabilities,
 } from "@magnitudedev/client-common"
+import { makeCliEffectLoggingLayer } from "./effect-logger"
 
 const bunSpawn: SpawnProcess = (command) => {
   const proc = Bun.spawn({
@@ -82,9 +83,12 @@ const terminalCapabilities: TerminalCapabilities = {
 export interface TerminalPlatformOptions {
   readonly spawnCommand?: string[]
   readonly debug?: boolean
+  readonly effectLoggingLayer?: Layer.Layer<never, never, never>
 }
 
 export function createTerminalPlatform(options: TerminalPlatformOptions = {}): Platform {
+  const effectLoggingLayer = options.effectLoggingLayer
+    ?? makeCliEffectLoggingLayer({ debug: options.debug === true })
   const withSpawnCommand = (spawner: DaemonSpawner): DaemonSpawner =>
     options.spawnCommand
       ? {
@@ -104,7 +108,7 @@ export function createTerminalPlatform(options: TerminalPlatformOptions = {}): P
   )
 
   const protocolLayer = recoveringProtocolLayer().pipe(
-    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, spawnerLayer)),
+    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, spawnerLayer, effectLoggingLayer)),
   )
 
   return {

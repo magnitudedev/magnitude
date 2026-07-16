@@ -6,15 +6,42 @@
  * No modal chrome — fills its parent container.
  */
 import { useState, useCallback, type ReactNode } from "react"
+import { Option } from "effect"
+import { Result } from "@effect-atom/atom-react"
 import { formatTokensCompact } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
 import type { BalanceResponse, UsagePeriod, SlotId, ReasoningEffort } from "@magnitudedev/sdk"
-import { SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS, DEFAULT_REASONING_EFFORT } from "@magnitudedev/sdk"
-import type { UseModelConfigResult, ModelOption } from "@magnitudedev/client-common"
+import { ModelCatalogLifecycle, ModelSlotsLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS, DEFAULT_REASONING_EFFORT } from "@magnitudedev/sdk"
+import type { UseModelConfigResult } from "@magnitudedev/client-common"
 
 export type { UsagePeriod } from "@magnitudedev/sdk"
 
 type Tab = "settings" | "usage"
+
+const catalogStateOf = (modelConfig: UseModelConfigResult) =>
+  Option.map(Result.value(modelConfig.catalog), ({ state }) => state)
+
+const catalogModelsOf = (modelConfig: UseModelConfigResult) => Option.flatMap(
+  catalogStateOf(modelConfig),
+  (state) => ModelCatalogLifecycle.match(state, {
+    loading: () => Option.none(),
+    ready: ({ models }) => Option.some(models),
+    refreshing: ({ models }) => Option.some(models),
+    degraded: ({ models }) => Option.some(models),
+    unavailable: () => Option.none(),
+  }),
+)
+
+const slotConfigurationOf = (modelConfig: UseModelConfigResult) => Option.flatMap(
+  Result.value(modelConfig.slots),
+  ({ state }) => ModelSlotsLifecycle.match(state, {
+    loading: () => Option.none(),
+    ready: ({ config }) => Option.some(config),
+    refreshing: ({ config }) => Option.some(config),
+    degraded: ({ config }) => Option.some(config),
+    unavailable: ({ config }) => Option.some(config),
+  }),
+)
 
 // ── Settings types ──
 
@@ -158,6 +185,15 @@ function SettingsTab({
   const [inputKey, setInputKey] = useState("")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
+  const catalogLoading = Option.match(catalogState, {
+    onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
+    onSome: (state) => ModelCatalogLifecycle.is(state, "loading"),
+  })
+  const catalogRefreshing = modelConfig !== undefined && (
+    Result.isWaiting(modelConfig.catalogRefresh)
+    || Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, "refreshing"))
+  )
 
   const handleSave = useCallback(async () => {
     if (!onSaveApiKey) return
@@ -290,6 +326,16 @@ function SettingsTab({
           >
             Model Selection
           </h3>
+          {modelConfig && Result.isFailure(modelConfig.catalogRefresh) && (
+            <div style={{ marginBottom: 8, fontSize: 12, color: "var(--accent-error)" }}>
+              Failed to request a model catalog refresh.
+            </div>
+          )}
+          {modelConfig && Result.isFailure(modelConfig.slotUpdate) && (
+            <div style={{ marginBottom: 8, fontSize: 12, color: "var(--accent-error)" }}>
+              Failed to update model configuration.
+            </div>
+          )}
           {slots.map((entry, i) => (
             <SlotCard
               key={entry.slotId}
@@ -302,13 +348,13 @@ function SettingsTab({
             <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
               <SettingsButton
                 onClick={() => { void modelConfig.refreshModels() }}
-                disabled={modelConfig.modelsLoading || modelConfig.refreshingModels}
+                disabled={catalogLoading || catalogRefreshing}
               >
-                {modelConfig.refreshingModels ? "Refreshing..." : "Refresh models"}
+                {catalogRefreshing ? "Refreshing..." : "Refresh models"}
               </SettingsButton>
               <SettingsButton
                 onClick={() => { void modelConfig.resetToDefaults() }}
-                disabled={modelConfig.modelsLoading || modelConfig.refreshingModels}
+                disabled={catalogLoading || catalogRefreshing}
               >
                 Reset to defaults
               </SettingsButton>
@@ -656,12 +702,18 @@ function SlotCard({
   isLast: boolean
 }): ReactNode {
   const slotId = entry.slotId
-  const models = modelConfig?.models ?? null
-  const currentOverride = modelConfig?.slotConfig?.[slotId] ?? null
+  const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
+  const models = modelConfig ? Option.getOrNull(catalogModelsOf(modelConfig)) : null
+  const slotConfiguration = modelConfig ? Option.getOrNull(slotConfigurationOf(modelConfig)) : null
+  const currentOverride = slotConfiguration?.slots[slotId] ?? null
   const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
   const currentEffort = currentOverride?.reasoningEffort ?? defaultEffort
-  const loading = modelConfig?.modelsLoading ?? false
-  const error = modelConfig?.modelsError ?? null
+  const transportFailed = modelConfig !== undefined && Result.isFailure(modelConfig.catalog)
+  const transportHasSnapshot = modelConfig !== undefined && Option.isSome(Result.value(modelConfig.catalog))
+  const loading = Option.match(catalogState, {
+    onNone: () => modelConfig !== undefined && !transportFailed,
+    onSome: (state) => ModelCatalogLifecycle.is(state, "loading"),
+  })
 
   // Find the currently effective model: user override, then first model for this slot, then first overall
   const effectiveModelId = currentOverride?.providerModelId
@@ -711,13 +763,14 @@ function SlotCard({
         </span>
       </div>
 
-      {error ? (
+      {(transportFailed && !transportHasSnapshot)
+        || Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, "unavailable")) ? (
         <div style={{ marginBottom: 4 }}>
           <span style={{ fontSize: 13, color: "var(--accent-error)" }}>
             Unable to load available models
           </span>
         </div>
-      ) : loading ? (
+      ) : loading && models === null ? (
         <div style={{ marginBottom: 4 }}>
           <div style={{
             height: 32,
@@ -728,7 +781,20 @@ function SlotCard({
           }} />
         </div>
       ) : (
-        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
+        <div>
+          {transportFailed && transportHasSnapshot && (
+            <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-error)" }}>
+              Lost contact with the model catalog; showing the last received state.
+            </div>
+          )}
+          {Option.exists(catalogState, (state) =>
+            ModelCatalogLifecycle.is(state, "degraded")
+            || (ModelCatalogLifecycle.is(state, "refreshing") && state.failures.length > 0)) && (
+            <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-error)" }}>
+              Some model providers are unavailable; showing available or last known models.
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
           {/* Model dropdown */}
           <select
             value={effectiveModelId ?? ""}
@@ -783,6 +849,7 @@ function SlotCard({
               </option>
             ))}
           </select>
+          </div>
         </div>
       )}
 

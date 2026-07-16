@@ -2,7 +2,7 @@ import { Effect, Option, Schema } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import { MagnitudeModelListResponseSchema, type MagnitudeModelInfo, type MagnitudeRawModel } from "./contract"
-import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, type ModelCatalog, type ModelCatalogConfig, type ModelFamilyId } from "@magnitudedev/ai"
+import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, type AuthApplicator, type ModelCatalog, type ModelFamilyId } from "@magnitudedev/ai"
 
 type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
 
@@ -29,7 +29,19 @@ export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWith
   }
 }
 
-export interface MagnitudeCatalogConfig extends ModelCatalogConfig {
+export type MagnitudeAuthentication =
+  | {
+      readonly _tag: "Configured"
+      readonly apply: AuthApplicator
+    }
+  | {
+      readonly _tag: "NotConfigured"
+    }
+
+export interface MagnitudeCatalogConfig {
+  readonly endpoint: string
+  readonly authentication: MagnitudeAuthentication
+  readonly ttlMs?: number
   readonly classify: (model: MagnitudeModelWithoutFamily) => Option.Option<ModelFamilyId>
 }
 
@@ -41,20 +53,20 @@ export interface MagnitudeCatalogConfig extends ModelCatalogConfig {
  * cannot be classified (per §4.3 — unidentified models are excluded).
  */
 export function createMagnitudeCatalog(config: MagnitudeCatalogConfig): ModelCatalog<MagnitudeModelInfo> {
-  const { endpoint, auth, ttlMs = 5 * 60 * 1000, classify } = config
+  const { endpoint, authentication, ttlMs = 5 * 60 * 1000, classify } = config
 
   let cache: readonly MagnitudeModelInfo[] | null = null
   let fetchedAt = 0
 
   const fetchModels: Effect.Effect<readonly MagnitudeModelInfo[], ModelCatalogError, HttpClient.HttpClient> =
     Effect.gen(function* () {
-      const client = yield* HttpClient.HttpClient
+      if (authentication._tag === "NotConfigured") {
+        return yield* new ModelCatalogError({ message: "Magnitude authentication is not configured" })
+      }
 
+      const client = yield* HttpClient.HttpClient
       const headers = new Headers()
-      yield* Effect.try({
-        try: () => auth(headers),
-        catch: (cause) => new ModelCatalogError({ message: "Magnitude authentication is not configured", cause }),
-      })
+      yield* Effect.sync(() => authentication.apply(headers))
 
       const headerRecord: Record<string, string> = {}
       headers.forEach((value, key) => {

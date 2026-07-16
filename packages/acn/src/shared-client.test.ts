@@ -82,6 +82,10 @@ const providerClient = (label: string): ProviderClientShape => ({
     get: () => Effect.die("not used"),
     refresh: Effect.die("not used"),
   },
+  catalogs: {
+    list: Effect.succeed([]),
+    refresh: () => Effect.succeed([]),
+  },
   listProviders: Effect.succeed([]),
   sessionId: "session",
   resolveModel: () => Effect.die("not used"),

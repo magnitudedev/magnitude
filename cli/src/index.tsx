@@ -2,7 +2,7 @@ import { resolve } from 'path'
 import { createCliRenderer } from '@opentui/core'
 import { createRoot } from '@opentui/react'
 import { Command } from '@commander-js/extra-typings'
-import { RegistryProvider } from '@effect-atom/atom-react'
+import { Atom, RegistryProvider } from '@effect-atom/atom-react'
 import {
   createAgentClient,
   AgentClientProvider,
@@ -16,6 +16,7 @@ import { getLastSessionId } from './state/last-session'
 import { CLI_VERSION } from './version'
 import { installGracefulShutdownHandlers } from './utils/graceful-shutdown'
 import { createTerminalPlatform } from './platform/terminal'
+import { makeCliEffectLoggingLayer } from './platform/effect-logger'
 
 /** One-time env-var auth resolution (spec §2.9) — not reactive. */
 function resolveEnvAuth(): AuthSource {
@@ -70,7 +71,9 @@ async function main() {
         ? ['bun', acnSourcePath, 'serve', '--register', ...(opts.debug ? ['--debug'] : [])]
         : undefined
 
-      const platform = createTerminalPlatform({ spawnCommand, debug: opts.debug })
+      const effectLoggingLayer = makeCliEffectLoggingLayer({ debug: opts.debug === true })
+      Atom.runtime.addGlobalLayer(effectLoggingLayer)
+      const platform = createTerminalPlatform({ spawnCommand, debug: opts.debug, effectLoggingLayer })
       const agentClientTag = createAgentClient(platform.protocolLayer)
       const renderer = await createCliRenderer({
         exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit

@@ -333,6 +333,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
   const operations = yield* Ref.make<ReadonlyMap<string, LocalInferenceOperationSnapshot>>(new Map())
   const catalogChanges = yield* PubSub.unbounded<void>()
   const selectionChanges = yield* PubSub.unbounded<void>()
+  const rebuildLock = yield* Effect.makeSemaphore(1)
   const serviceScope = yield* Scope.Scope
   const setManagedSnapshotState = (providerModelId: ProviderModelId, state: LlamaServingRouteSnapshot["state"]) => Ref.update(logicalModels, (models) => {
     const current = models.get(providerModelId)
@@ -378,7 +379,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     ), serviceScope)
   })
 
-  const rebuild = (fileRefresh: ModelFiles.ModelFileRefresh, assessAvailability: boolean) => Effect.gen(function* () {
+  const rebuild = (fileRefresh: ModelFiles.ModelFileRefresh, assessAvailability: boolean) => rebuildLock.withPermits(1)(Effect.gen(function* () {
     const records = (yield* platform.files.inspect(fileRefresh)).records
     const registry = assessAvailability
       ? Option.some(yield* platform.instances)
@@ -542,7 +543,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     return yield* Schema.decodeUnknown(Schema.Array(LlamaCppModelInfoSchema))(
       [...next.values()].flatMap((record) => record.providerModel ? [record.providerModel] : []),
     )
-  }).pipe(Effect.mapError((cause) => new ModelCatalogError({ message: cause instanceof Error ? cause.message : String(cause), cause })))
+  }).pipe(Effect.mapError((cause) => new ModelCatalogError({ message: cause instanceof Error ? cause.message : String(cause), cause }))))
 
   const refresh = yield* Effect.cachedWithTTL(rebuild("changed", true), "250 millis")
   const list = Ref.get(logicalModels).pipe(Effect.map((models) => [...models.values()].flatMap((record) => record.providerModel ? [record.providerModel] : [])))
@@ -634,7 +635,9 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     Effect.catchAll((cause) => Effect.succeed({ status: "error" as const, message: cause instanceof Error ? cause.message : String(cause) })),
   )
 
-  yield* rebuild("cached", false).pipe(Effect.catchAll(() => Effect.void))
+  yield* rebuild("cached", false).pipe(Effect.catchAll((cause) => Effect.logWarning("Cached local model projection failed").pipe(
+    Effect.annotateLogs({ operation: "hydrate-local-model-catalog", cause: String(cause) }),
+  )))
   yield* Effect.forkIn(refresh.pipe(Effect.catchAll((cause) => Effect.logWarning("Initial local model discovery failed").pipe(Effect.annotateLogs({ cause: String(cause) })))), serviceScope)
   yield* Effect.forkIn(Stream.tick("3 seconds").pipe(
     Stream.runForEach(() => rebuild("cached", true).pipe(

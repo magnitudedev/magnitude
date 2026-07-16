@@ -19,6 +19,7 @@ import {
   type WebSearchError,
   type FetchBalanceOptions,
   type BalanceResponse,
+  type ProviderCatalogOutcome,
 } from "@magnitudedev/providers"
 import type { ProviderInfo as RegistryProviderInfo } from "@magnitudedev/providers"
 
@@ -49,6 +50,7 @@ export {
 } from "@magnitudedev/ai"
 export type ProviderClientError = MagnitudeClientError
 export type ProviderRegistryInfo = RegistryProviderInfo
+export type { ProviderCatalogOutcome } from "@magnitudedev/providers"
 
 export interface ProviderClientConfig extends MagnitudeClientConfig {
   readonly llamacpp?: LlamaCppProviderSource
@@ -103,6 +105,10 @@ export interface ProviderRuntimeConfig {
  */
 export interface ProviderClientShape {
   readonly catalog: ModelCatalog<ProviderModel>
+  readonly catalogs: {
+    readonly list: Effect.Effect<readonly ProviderCatalogOutcome[], never, HttpClient.HttpClient>
+    readonly refresh: (providerId?: ProviderId) => Effect.Effect<readonly ProviderCatalogOutcome[], never, HttpClient.HttpClient>
+  }
   readonly listProviders: Effect.Effect<readonly ProviderRegistryInfo[], never, HttpClient.HttpClient>
   readonly sessionId: string | null
   readonly resolveModel: (
@@ -147,6 +153,7 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
 
   return {
     catalog: registry.aggregatedCatalog,
+    catalogs: registry.catalogs,
     listProviders: registry.listProviders,
     sessionId,
     resolveModel: (providerId, providerModelId, options) =>

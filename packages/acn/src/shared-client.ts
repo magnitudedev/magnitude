@@ -69,6 +69,10 @@ export const makeDelegatingProviderClient = (
     ),
     refresh: Ref.get(ref).pipe(Effect.flatMap((client) => client.catalog.refresh)),
   },
+  catalogs: {
+    list: Ref.get(ref).pipe(Effect.flatMap((client) => client.catalogs.list)),
+    refresh: (providerId) => Ref.get(ref).pipe(Effect.flatMap((client) => client.catalogs.refresh(providerId))),
+  },
   listProviders: Ref.get(ref).pipe(Effect.flatMap((client) => client.listProviders)),
   sessionId,
   resolveModel: (providerId, providerModelId, options) => Ref.get(ref).pipe(

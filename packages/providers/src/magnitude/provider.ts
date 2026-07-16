@@ -23,7 +23,7 @@ import {
 import { isEnvFlagOn } from "@magnitudedev/utils"
 import type { MagnitudeModelInfo, MagnitudeAdditionalOptions } from "./contract"
 import { classifyModelFamily as classifyModelFamilyRaw } from "../family-registry"
-import { createMagnitudeCatalog } from "./catalog"
+import { createMagnitudeCatalog, type MagnitudeAuthentication } from "./catalog"
 import type { BalanceResponse as MagnitudeBalanceResponse } from "./usage"
 import type { UsagePeriod } from "./usage"
 import { createMagnitudeCompatibleSpec, wrapAsBaseModel, type MagnitudeCallOptions } from "./models"
@@ -79,6 +79,7 @@ export interface MagnitudeProvider extends Provider<MagnitudeModelInfo> {
 export interface MagnitudeProviderInstance {
   readonly provider: MagnitudeProvider
   readonly catalog: ModelCatalog<MagnitudeModelInfo>
+  readonly authentication: MagnitudeAuthentication
 }
 
 export function createMagnitudeProvider(config?: MagnitudeClientConfig): MagnitudeProviderInstance {
@@ -87,28 +88,36 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
   const sessionId = config?.sessionId ?? null
   const dedicatedProvider = config?.dedicatedProvider || process.env.MAGNITUDE_USE_DEDICATED || undefined
 
-  const auth: AuthApplicator = config?.auth ?? (() => {
-    const apiKey = config?.apiKey ?? (useLocal ? process.env.MAGNITUDE_LOCAL_API_KEY : undefined) ?? process.env.MAGNITUDE_API_KEY
-    if (!apiKey) throw new Error(
-      useLocal
-        ? "No API key provided. Set MAGNITUDE_LOCAL_API_KEY (or MAGNITUDE_API_KEY) environment variable, or pass apiKey in config."
-        : "No API key provided. Pass apiKey in config or set MAGNITUDE_API_KEY environment variable."
-    )
-    return Auth.bearer(apiKey)
-  })()
+  const apiKey = config?.apiKey ?? (useLocal ? process.env.MAGNITUDE_LOCAL_API_KEY : undefined) ?? process.env.MAGNITUDE_API_KEY
+  const authentication: MagnitudeAuthentication = config?.auth !== undefined
+    ? { _tag: "Configured", apply: config.auth }
+    : apiKey?.trim()
+      ? { _tag: "Configured", apply: Auth.bearer(apiKey) }
+      : { _tag: "NotConfigured" }
 
-  const authWithHeaders: AuthApplicator = (headers) => {
-    auth(headers)
+  const applyClientHeaders = (headers: Headers) => {
     headers.set(HEADER_PLATFORM, CLIENT_PLATFORM)
     headers.set(HEADER_SHELL, CLIENT_SHELL)
     if (sessionId) headers.set(HEADER_SESSION_ID, sessionId)
     if (dedicatedProvider) headers.set(HEADER_USE_DEDICATED, dedicatedProvider)
   }
+  const requestAuthentication: MagnitudeAuthentication = authentication._tag === "Configured"
+    ? {
+        _tag: "Configured",
+        apply: (headers) => {
+          authentication.apply(headers)
+          applyClientHeaders(headers)
+        },
+      }
+    : authentication
+  const modelAuth: AuthApplicator = requestAuthentication._tag === "Configured"
+    ? requestAuthentication.apply
+    : applyClientHeaders
 
   const classifyModelFamily = (model: Omit<MagnitudeModelInfo, "modelFamilyId">): Option.Option<ModelFamilyId> =>
     classifyModelFamilyRaw(model.providerModelId)
 
-  const catalog = createMagnitudeCatalog({ endpoint, auth: authWithHeaders, classify: classifyModelFamily })
+  const catalog = createMagnitudeCatalog({ endpoint, authentication: requestAuthentication, classify: classifyModelFamily })
 
   const bindModel = (
     id: ProviderModelId,
@@ -124,7 +133,7 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
       }
 
       const internal = createMagnitudeCompatibleSpec({ modelId: id, endpoint }).bind({
-        auth: authWithHeaders,
+        auth: modelAuth,
         defaults: options?.defaults as Partial<MagnitudeCallOptions> | undefined,
         ...(options?.imagePlaceholders ? { imagePlaceholders: options.imagePlaceholders } : {}),
       })
@@ -134,10 +143,13 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
 
   const webSearch: WebSearchExtension<WebSearchResult, WebSearchError, HttpClient.HttpClient>["webSearch"] = (query, schema?) =>
     Effect.gen(function* () {
-      const http = yield* HttpClient.HttpClient
+      if (requestAuthentication._tag === "NotConfigured") {
+        return yield* new WebSearchError({ message: "Magnitude authentication is not configured" })
+      }
 
+      const http = yield* HttpClient.HttpClient
       const headers = new Headers()
-      authWithHeaders(headers)
+      requestAuthentication.apply(headers)
 
       const headerRecord: Record<string, string> = {}
       headers.forEach((value, key) => {
@@ -185,9 +197,13 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
 
   const balance: BalanceExtension<MagnitudeBalanceResponse, MagnitudeClientError, HttpClient.HttpClient>["balance"] = (query?) =>
     Effect.gen(function* () {
+      if (requestAuthentication._tag === "NotConfigured") {
+        return yield* new MagnitudeClientError({ message: "Magnitude authentication is not configured" })
+      }
+
       const http = yield* HttpClient.HttpClient
       const headers = new Headers()
-      authWithHeaders(headers)
+      requestAuthentication.apply(headers)
       const headerRecord: Record<string, string> = {}
       headers.forEach((value, key) => { headerRecord[key] = value })
 
@@ -224,7 +240,7 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
     balance,
   }
 
-  return { provider, catalog }
+  return { provider, catalog, authentication }
 }
 
 export async function fetchBalance(

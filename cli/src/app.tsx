@@ -28,7 +28,7 @@ import {
   useFileWatchBridge,
   useLocalInferenceQuery,
 } from '@magnitudedev/client-common'
-import type { SessionOptions } from '@magnitudedev/sdk'
+import { ModelSlotsLifecycle, type SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
 import { useSessionStartup, type SessionStart } from './hooks/use-session-startup'
 import { useTerminalBgDetection } from './hooks/use-terminal-bg-detection'
@@ -129,7 +129,7 @@ function OnboardingGate(
   },
 ): ReactNode {
   const onboarding = useOnboardingState()
-  const { profiles, loading: profilesLoading } = useSlotProfiles()
+  const { profiles, slots, retry: retryProfiles } = useSlotProfiles()
   const controller = useDisplayViewController()
 
   if (Result.isInitial(onboarding.state)) {
@@ -163,8 +163,33 @@ function OnboardingGate(
     )
   }
 
-  if (profilesLoading) {
+  const slotsSnapshot = Result.value(slots)
+  if (Option.isNone(slotsSnapshot)) {
+    if (Result.isFailure(slots)) {
+      return (
+        <FatalErrorScreen
+          error="Failed to load model configuration from the daemon."
+          onRetry={retryProfiles}
+          onQuit={props.onExitApp}
+        />
+      )
+    }
     return <PreparingModelSetupScreen />
+  }
+
+  const slotsState = slotsSnapshot.value.state
+  if (ModelSlotsLifecycle.is(slotsState, 'loading')) {
+    return <PreparingModelSetupScreen />
+  }
+
+  if (ModelSlotsLifecycle.is(slotsState, 'unavailable')) {
+    return (
+      <FatalErrorScreen
+        error={`Failed to load model configuration: ${slotsState.failures.map((failure) => failure.message).join('; ')}`}
+        onRetry={retryProfiles}
+        onQuit={props.onExitApp}
+      />
+    )
   }
 
   const modelsConfigured = Boolean(profiles?.primary && profiles.secondary)
@@ -203,14 +228,13 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy()
   const ephemeralMessage = useSyncExternalStore(subscribeEphemeralMessage, getEphemeralMessageSnapshot)
   const localInference = useLocalInferenceQuery()
-  const loadedLocalModels = Result.isSuccess(localInference)
-    ? localInference.value.choices.filter((choice) =>
+  const localInferenceSnapshot = Result.value(localInference)
+  const loadedLocalModels = Option.getOrElse(Option.map(localInferenceSnapshot, (snapshot) =>
+    snapshot.choices.filter((choice) =>
         (choice._tag === 'RunningExternal' || choice._tag === 'RunningManaged')
-        && (choice.residency === 'loaded' || choice.residency === 'sleeping'))
-    : []
-  const loadingLocalModels = Result.isSuccess(localInference)
-    ? localInference.value.operations.filter((operation) => operation.status === 'running')
-    : []
+        && (choice.residency === 'loaded' || choice.residency === 'sleeping'))), () => [])
+  const loadingLocalModels = Option.getOrElse(Option.map(localInferenceSnapshot, (snapshot) =>
+    snapshot.operations.filter((operation) => operation.status === 'running')), () => [])
 
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
@@ -296,7 +320,11 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
             <Toast color={theme.success} background={theme.surface} text="Copied to clipboard" />
           )}
           {ephemeralMessage && (
-            <Toast color={ephemeralMessage.color} background={theme.surface} text={ephemeralMessage.text} />
+            <Toast
+              color={ephemeralMessage.color ?? (ephemeralMessage.tone === 'warning' ? theme.warning : theme.error)}
+              background={theme.surface}
+              text={ephemeralMessage.text}
+            />
           )}
         </box>
 

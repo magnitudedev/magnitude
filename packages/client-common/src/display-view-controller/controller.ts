@@ -164,7 +164,7 @@ export class DisplayViewControllerCore {
           ),
         )
       }),
-    )
+    ).pipe(Effect.provide(this.protocolLayer))
 
   private executeCommand = (
     client: DisplayRpcClient,
@@ -522,6 +522,7 @@ export class DisplayViewControllerCore {
             }),
       ),
       Effect.scoped,
+      Effect.provide(this.protocolLayer),
     )
 
     this.streamFiber = Effect.runFork(streamEffect)
@@ -549,7 +550,7 @@ export class DisplayViewControllerCore {
             Effect.catchAll(() => Effect.void),
           )
         }),
-      ),
+      ).pipe(Effect.provide(this.protocolLayer)),
     )
   }
 

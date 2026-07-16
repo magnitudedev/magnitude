@@ -6,6 +6,7 @@
  */
 import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+import { Option } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 
@@ -65,35 +66,27 @@ export function useSettingsState(): UseSettingsStateResult {
     ? "Failed to update the Magnitude API key"
     : null
 
-  const loading = Result.isInitial(result)
+  const snapshot = Result.value(result)
+  const loading = Result.isWaiting(result) && Option.isNone(snapshot)
   const loadError = Result.isFailure(result)
     ? "Failed to read the Magnitude API key configuration"
     : null
-  const keyAlreadySet = Result.match(result, {
-    onInitial: () => false,
-    onFailure: () => false,
-    onSuccess: (s) => {
-      const value = s.value
-      return value.auth._tag === "Some" && value.auth.value.type === "api" && value.auth.value.key.trim().length > 0
-    },
-  })
+  const configuredKey = Option.flatMap(snapshot, ({ auth }) => Option.flatMap(auth, (value) =>
+    value.type === "api" && value.key.trim().length > 0 ? Option.some(value) : Option.none()))
+  const keyAlreadySet = Option.isSome(configuredKey)
 
-  const apiKey: ApiKeyState = Result.match(result, {
-    onInitial: (): ApiKeyState => ({ status: "loading" }),
-    onFailure: (): ApiKeyState => ({ status: "none" }),
-    onSuccess: (s) => {
-      const value = s.value
-      if (value.auth._tag === "Some" && value.auth.value.type === "api" && value.auth.value.key.trim().length > 0) {
-        return { status: "config", maskedKey: maskApiKey(value.auth.value.key) }
-      }
-      return { status: "none" }
-    },
+  const apiKey: ApiKeyState = Option.match(snapshot, {
+    onNone: () => Result.isFailure(result) ? { status: "none" } : { status: "loading" },
+    onSome: () => Option.match(configuredKey, {
+      onNone: () => ({ status: "none" }),
+      onSome: (auth) => ({ status: "config", maskedKey: maskApiKey(auth.key) }),
+    }),
   })
 
   function saveApiKey(key: string): void {
     updateProviderAuth({
       payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key } },
-      reactivityKeys: ["apiKey"],
+      reactivityKeys: ["apiKey", "modelCatalog", "modelSlots"],
     })
   }
 
@@ -101,7 +94,7 @@ export function useSettingsState(): UseSettingsStateResult {
     // Clear by setting an empty key — the server can handle this
     updateProviderAuth({
       payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: "" } },
-      reactivityKeys: ["apiKey"],
+      reactivityKeys: ["apiKey", "modelCatalog", "modelSlots"],
     })
   }
 

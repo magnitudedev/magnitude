@@ -58,6 +58,8 @@ export {
 } from "./llamacpp"
 export {
   makeAggregatedCatalog,
+  inspectProviderCatalogs,
+  type ProviderCatalogOutcome,
   buildFamilies,
 } from "./catalog-aggregator"
 
@@ -73,7 +75,7 @@ export {
   MagnitudeClientError,
 } from "./magnitude/provider"
 export type { WebSearchResult, BalanceQuery } from "@magnitudedev/ai"
-export { createMagnitudeCatalog, toMagnitudeModelInfo } from "./magnitude/catalog"
+export { createMagnitudeCatalog, toMagnitudeModelInfo, type MagnitudeAuthentication } from "./magnitude/catalog"
 export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./magnitude/contract"
 export {
   createMagnitudeCompatibleSpec,

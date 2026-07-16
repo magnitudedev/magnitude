@@ -10,9 +10,9 @@ import {
   SlotModelConfigSchema,
   ModelCatalogSchema,
   ModelSlotsSchema,
-  ModelResourceInvalidationSchema,
   ProviderAuthSchema,
 } from "../schemas/account"
+import { MirroredResourceInvalidationSchema } from "../schemas/mirrored-resource"
 import { StreamHeartbeat } from "../schemas/events"
 
 export const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
@@ -68,7 +68,7 @@ export const GetModelCatalog = Rpc.make("GetModelCatalog", {
 
 export const WatchModelCatalog = Rpc.make("WatchModelCatalog", {
   payload: Schema.Struct({}),
-  success: Schema.Union(ModelResourceInvalidationSchema, StreamHeartbeat),
+  success: Schema.Union(MirroredResourceInvalidationSchema, StreamHeartbeat),
   error: SessionError,
   stream: true,
 })
@@ -89,7 +89,7 @@ export const GetModelSlots = Rpc.make("GetModelSlots", {
 
 export const WatchModelSlots = Rpc.make("WatchModelSlots", {
   payload: Schema.Struct({}),
-  success: Schema.Union(ModelResourceInvalidationSchema, StreamHeartbeat),
+  success: Schema.Union(MirroredResourceInvalidationSchema, StreamHeartbeat),
   error: SessionError,
   stream: true,
 })
