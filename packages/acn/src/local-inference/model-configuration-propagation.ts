@@ -1,9 +1,8 @@
 import { Effect, Layer, Stream } from "effect"
-import { FetchHttpClient } from "@effect/platform"
 import { AgentRuntime } from "../agent-runtime"
 import { ProviderClientRegistry } from "../shared-client"
 import { LocalModelProviderSource } from "./provider-source"
-import { LocalModelConfiguration, type LocalSlotCandidate } from "./model-configuration"
+import { LocalModelConfiguration } from "./model-configuration"
 
 export interface ModelConfigurationRefreshEntry {
   readonly session: {
@@ -51,25 +50,15 @@ export const ModelConfigurationPropagationLive: Layer.Layer<
     Effect.forkScoped,
   )
 
-  const reconcile = localSource.catalog.list.pipe(
-    Effect.provide(FetchHttpClient.layer),
-    Effect.map((models) => models.map((model): LocalSlotCandidate => ({
-      providerModelId: model.providerModelId,
-      availability: model.availability._tag === "Available" ? "available" : "disabled",
-      ownership: model.ownership,
-      residency: model.residency ?? "unknown",
-      productRank: model.productRank ?? Number.MAX_SAFE_INTEGER,
-      externalPriority: model.externalPriority ?? Number.MAX_SAFE_INTEGER,
-    }))),
-    Effect.flatMap(configuration.reconcileSlots),
+  const reconcile = localSource.selectionReady.pipe(
+    Effect.flatMap((ready) => ready
+      ? localSource.selectionInput.pipe(Effect.flatMap(configuration.reconcileSlots))
+      : Effect.succeed(false)),
     Effect.catchAll((cause) => Effect.logWarning("Local model slot reconciliation failed").pipe(
       Effect.annotateLogs({ cause: String(cause) }),
     )),
   )
-  yield* Stream.concat(
-    Stream.make(undefined),
-    Stream.tick("3 seconds"),
-  ).pipe(
+  yield* Stream.concat(Stream.make(undefined), localSource.selectionChanges).pipe(
     Stream.runForEach(() => reconcile),
     Effect.forkScoped,
   )

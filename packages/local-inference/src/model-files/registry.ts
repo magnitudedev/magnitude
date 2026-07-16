@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Chunk, Effect, Option, Stream, SynchronizedRef } from "effect"
-import { makeContentId, makeModelFileId, makeModelFilePartId, type ModelFileId } from "./identity"
+import { makeModelFileId, makeModelFilePartId, type ModelFileId } from "./identity"
 import type { InspectedModelArtifact, LocalModelFileIndex, ModelFileDiscoveryRefresh, ModelFileFormat, ModelFileRecord, ModelFileRegistryApi, ModelFileSnapshot, ModelFileSourceRegistration, ResolvedModelFiles, SourceDiscoveryIssue, SourceFileSet } from "./types"
 import { ModelFileDeleteError, ModelFileNotFound, ModelFileResolveError } from "./types"
 
@@ -34,10 +34,8 @@ const setVersion = (set: SourceFileSet): string => {
 
 const buildRecord = (registration: ModelFileSourceRegistration, format: ModelFileFormat, artifact: InspectedModelArtifact): ModelFileRecord => {
   const source = registration.source
-  const digests = artifact.parts.flatMap(({ entry }) => Option.toArray(entry.sha256))
   return {
     id: makeModelFileId(source.id, artifact.key), sourceId: source.id,
-    contentId: digests.length === artifact.parts.length ? makeContentId(digests) : Option.none(),
     displayName: artifact.displayName, format: format.id,
     sizeBytes: artifact.parts.reduce((sum, { entry }) => sum + entry.sizeBytes, 0),
     files: artifact.parts.map(({ entry, role }) => ({ id: makeModelFilePartId(source.id, entry.key), role, sizeBytes: entry.sizeBytes, sha256: entry.sha256 })),
@@ -217,7 +215,6 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
       }] as const
     })).pipe(Effect.asVoid),
     index: SynchronizedRef.get(state).pipe(Effect.map((current) => ({
-      schemaVersion: 1 as const,
       capturedAt: Option.match(current.snapshot, { onNone: () => new Date(), onSome: (snapshot) => snapshot.capturedAt }),
       sets: current.sets,
       issues: Option.match(current.snapshot, { onNone: () => [], onSome: (snapshot) => snapshot.issues }),

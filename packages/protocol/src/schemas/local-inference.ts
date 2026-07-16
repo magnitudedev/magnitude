@@ -119,11 +119,11 @@ const ChoiceFields = {
   choiceId: Schema.String,
   displayName: Schema.String,
   providerModelId: Schema.String,
-  contextTokens: PositiveInteger,
+  contextTokens: Schema.optional(PositiveInteger),
   fitClass: LocalInferenceFitClass,
   compatible: Schema.Boolean,
   explanation: Schema.String,
-  residency: Schema.optional(Schema.Literal("loaded", "sleeping", "unloaded", "loading", "failed", "unknown")),
+  residency: Schema.Literal("loaded", "sleeping", "unloaded", "loading", "failed"),
   quantization: Schema.optional(LocalInferenceQuantization),
   sizeBytes: Schema.optional(NonNegativeNumber),
   servingProfile: Schema.optional(LocalInferenceServingProfile),
@@ -187,7 +187,6 @@ export const LocalInferenceErrorCode = Schema.Literal(
 export type LocalInferenceErrorCode = Schema.Schema.Type<typeof LocalInferenceErrorCode>
 
 export const LocalInferenceState = Schema.Struct({
-  schemaVersion: Schema.Literal(3),
   usage: Schema.NullOr(LocalInferenceUsageSelection),
   activeBinding: Schema.NullOr(ActiveLocalBindingSummary),
   distribution: LocalInferenceDistributionState,

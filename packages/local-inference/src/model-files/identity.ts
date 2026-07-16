@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { Option, Schema } from "effect"
+import { Schema } from "effect"
 
 const bounded = <const Brand extends string>(brand: Brand) => Schema.String.pipe(
   Schema.minLength(1),
@@ -23,8 +23,6 @@ export const ModelFileId = bounded("ModelFileId")
 export type ModelFileId = Schema.Schema.Type<typeof ModelFileId>
 export const ModelFilePartId = bounded("ModelFilePartId")
 export type ModelFilePartId = Schema.Schema.Type<typeof ModelFilePartId>
-export const ModelContentId = bounded("ModelContentId")
-export type ModelContentId = Schema.Schema.Type<typeof ModelContentId>
 export const ModelFileVersionId = bounded("ModelFileVersionId")
 export type ModelFileVersionId = Schema.Schema.Type<typeof ModelFileVersionId>
 export const ModelOriginRepositoryId = bounded("ModelOriginRepositoryId")
@@ -46,7 +44,3 @@ export const makeModelFileId = (sourceId: ModelFileSourceId, key: ModelArtifactK
   ModelFileId.make(digest("mf", `${sourceId}\0${key}`))
 export const makeModelFilePartId = (sourceId: ModelFileSourceId, key: SourceFileKey): ModelFilePartId =>
   ModelFilePartId.make(digest("part", `${sourceId}\0${key}`))
-export const makeContentId = (digests: readonly Sha256Digest[]): Option.Option<ModelContentId> =>
-  digests.length === 0
-    ? Option.none()
-    : Option.some(ModelContentId.make(digest("content", [...digests].sort().join("\0"))))

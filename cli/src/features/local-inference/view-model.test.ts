@@ -43,7 +43,6 @@ const recommendation: LocalModelRecommendation = {
 }
 
 const baseState = {
-  schemaVersion: 3,
   usage: { localModelRole: "main", sessionConcurrency: "one" },
   activeBinding: null,
   distribution: { _tag: "Ready", build: 10011, source: "managed" },
@@ -65,6 +64,7 @@ describe("local inference selection view model", () => {
         fitClass: recommendation.fitClass,
         compatible: true,
         explanation: "Stored and ready.",
+        residency: "unloaded",
       }],
       recommendations: [recommendation],
     }
@@ -87,6 +87,7 @@ describe("local inference selection view model", () => {
         fitClass: "unknown",
         compatible: true,
         explanation: "Observed read-only endpoint.",
+        residency: "loaded",
         quantization: {
           format: "UD-Q6_K_XL",
           quantAwareCheckpoint: false,

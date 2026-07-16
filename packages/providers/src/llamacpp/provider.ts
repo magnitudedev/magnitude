@@ -10,7 +10,6 @@ import type {
 import { StreamStartOperationalFailure } from "@magnitudedev/ai"
 import { createLlamaCppCompatibleSpec, wrapAsBaseModel } from "./models"
 import type { LlamaCppCallOptions, LlamaCppModelInfo } from "./contract"
-import { classifyModelFamilyFromEvidence } from "../family-registry"
 
 export const PROVIDER_ID = "llamacpp" as const
 
@@ -24,6 +23,7 @@ export interface LlamaCppInferenceLease {
   readonly origin: URL
   readonly authorization: Option.Option<Redacted.Redacted<string>>
   readonly servedModelId: string
+  readonly requestStarted: Effect.Effect<void>
 }
 
 /**
@@ -47,19 +47,6 @@ export interface LlamaCppProviderInstance {
   readonly provider: Provider<LlamaCppModelInfo>
   readonly checkStatus: LlamaCppProviderSource["status"]
 }
-
-type ModelWithoutFamily = Omit<LlamaCppModelInfo, "modelFamilyId">
-
-const classify = (model: ModelWithoutFamily): Option.Option<string> =>
-  classifyModelFamilyFromEvidence({
-    architecture: model.modelArchitecture,
-    tokenizerModel: model.tokenizerModel,
-    tokenizerPre: model.tokenizerPre,
-  }, [
-    model.metadataName,
-    ...(model.baseModelNames ?? []),
-    ...(model.baseModelRepositories ?? []),
-  ])
 
 const callOptions = (defaults: Partial<BaseCallOptions> | undefined): Partial<LlamaCppCallOptions> | undefined =>
   defaults
@@ -112,6 +99,7 @@ const dynamicBoundModel = (
           ...(options?.imagePlaceholders ? { imagePlaceholders: options.imagePlaceholders } : {}),
         }),
       ).stream(prompt, tools, requestOptions)
+      yield* lease.requestStarted
       return {
         ...result,
         events: result.events.pipe(Stream.ensuring(Scope.close(scope, Exit.void))),
@@ -126,7 +114,7 @@ export function createLlamaCppProvider(source: LlamaCppProviderSource): LlamaCpp
     displayName: "Llama.cpp",
     catalog: source.catalog,
     bindModel: (providerModelId, options) => Effect.succeed(dynamicBoundModel(source, providerModelId, options)),
-    classifyModelFamily: classify,
+    classifyModelFamily: () => Option.none(),
   }
   return { provider, checkStatus: source.status }
 }

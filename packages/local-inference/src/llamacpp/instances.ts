@@ -86,6 +86,7 @@ export interface LlamaManagedInstance {
   readonly id: LlamaInstanceId
   readonly observe: Effect.Effect<LlamaInstanceObservation, LlamaObservationError>
   readonly ensureLoaded: (request: ManagedModelRequest) => Effect.Effect<LlamaLoadOperation>
+  readonly acquireLoaded: (request: ManagedModelRequest) => Effect.Effect<LlamaModelLease, LlamaAcquireError, Scope.Scope>
   readonly acquire: (request: ManagedModelRequest) => Effect.Effect<LlamaModelLease, LlamaAcquireError, Scope.Scope>
   readonly unload: (model: LlamaServedModelId) => Effect.Effect<void, LlamaControlError | ModelInUse>
   readonly restart: Effect.Effect<void, LlamaControlError | ModelInUse>
@@ -111,6 +112,7 @@ export interface LlamaInstanceRegistryApi {
   readonly refreshExternal: Effect.Effect<LlamaInstanceSnapshot>
   readonly get: (id: LlamaInstanceId) => Effect.Effect<LlamaInstance, LlamaInstanceNotFound>
   readonly ensureManagedLoaded: (request: ManagedModelRequest) => Effect.Effect<LlamaLoadOperation>
+  readonly acquireLoadedManaged: (request: ManagedModelRequest) => Effect.Effect<LlamaModelLease, LlamaAcquireError, Scope.Scope>
   readonly acquire: (request: LlamaModelRequest) => Effect.Effect<LlamaModelLease, LlamaAcquireError, Scope.Scope>
   readonly stopManaged: Effect.Effect<void, LlamaControlError | ModelInUse>
 }
@@ -302,6 +304,15 @@ export const makeLlamaInstanceRegistry = (options: LlamaInstanceRegistryOptions)
     },
   ))
   const isLoaded = (model: LlamaServedModelObservation): boolean => model.status === "loaded" || model.status === "sleeping"
+  const acquireLoadedLease = (request: ManagedModelRequest): Effect.Effect<LlamaModelLease, LlamaAcquireError> => lock.withPermits(1)(Effect.gen(function* () {
+    const running = runningRuntime(yield* Ref.get(runtime))
+    if (Option.isNone(running)) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "not-already-served" })
+    const models = yield* running.value.observer.models.pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "model-unavailable" })))
+    const model = models.find((candidate) => candidate.id === request.servedModelId && isLoaded(candidate))
+    if (!model) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "not-already-served" })
+    yield* acquireLease(request.servedModelId)
+    return { instanceId: managedId, model, target: { origin: running.value.process.origin, authorization: Option.some(options.apiKey), model: request.servedModelId } }
+  }))
   const loadManaged = (
     request: ManagedModelRequest,
     publish: (event: LlamaLoadEvent) => Effect.Effect<void>,
@@ -444,15 +455,15 @@ export const makeLlamaInstanceRegistry = (options: LlamaInstanceRegistryOptions)
     _tag: "Managed", id: managedId, observe: observeManaged,
     events: Stream.repeatEffectWithSchedule(observeManaged, Schedule.spaced("1 second")).pipe(Stream.map((observation) => ({ capturedAt: new Date(), observation }))),
     ensureLoaded,
-    acquire: (request) => Effect.acquireRelease(
-      Effect.gen(function* () {
-        const operation = yield* ensureLoaded(request)
-        const loaded = yield* operation.result.pipe(Effect.ensuring(operation.cancel))
-        yield* lock.withPermits(1)(acquireLease(request.servedModelId))
-        return loaded
-      }),
+    acquireLoaded: (request) => Effect.acquireRelease(
+      acquireLoadedLease(request),
       () => lock.withPermits(1)(releaseLease(request.servedModelId)),
     ),
+    acquire: (request) => Effect.gen(function* () {
+      const operation = yield* ensureLoaded(request)
+      yield* operation.result.pipe(Effect.ensuring(operation.cancel))
+      return yield* managed.acquireLoaded(request)
+    }),
     unload: (model) => lock.withPermits(1)(Effect.gen(function* () {
       const entries = yield* Ref.get(registrations)
       const registration = Option.fromNullable(entries.get(model))
@@ -500,6 +511,7 @@ export const makeLlamaInstanceRegistry = (options: LlamaInstanceRegistryOptions)
       onSome: Effect.succeed,
     }),
     ensureManagedLoaded: ensureLoaded,
+    acquireLoadedManaged: managed.acquireLoaded,
     acquire: LlamaModelRequest.$match({
       Managed: ({ request }) => managed.acquire(request),
       External: ({ request }) => Effect.gen(function* () {

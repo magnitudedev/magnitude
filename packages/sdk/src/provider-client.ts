@@ -33,8 +33,20 @@ export type {
   ProviderModel,
   ProviderModelAvailability,
   ProviderModelDisabledReason,
+  ProviderId,
+  ProviderModelId,
+  ModelFamilyId,
 } from "@magnitudedev/ai"
-export { AVAILABLE_PROVIDER_MODEL, isProviderModelAvailable, ModelCatalogError } from "@magnitudedev/ai"
+export {
+  AVAILABLE_PROVIDER_MODEL,
+  isProviderModelAvailable,
+  ModelCatalogError,
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ModelFamilyIdSchema,
+  ProviderModelAvailabilitySchema,
+  ProviderModelSchema,
+} from "@magnitudedev/ai"
 export type ProviderClientError = MagnitudeClientError
 export type ProviderRegistryInfo = RegistryProviderInfo
 
@@ -50,7 +62,7 @@ export type {
   MagnitudeAdditionalOptions,
 } from "@magnitudedev/providers"
 export type { LlamaCppProviderSource, LlamaCppInferenceLease, LlamaCppModelInfo } from "@magnitudedev/providers"
-export { LlamaCppAcquisitionError } from "@magnitudedev/providers"
+export { LlamaCppAcquisitionError, LlamaCppModelInfoSchema } from "@magnitudedev/providers"
 export type { WebSearchResult, BalanceQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/protocol"
@@ -60,6 +72,7 @@ export type { UsagePeriod } from "@magnitudedev/protocol"
 // =============================================================================
 
 export {
+  classifyModelFamilyFromEvidence,
   classifyMagnitudeRejectedResponse,
   tryParseErrorBody,
   type ParsedMagnitudeApiError,

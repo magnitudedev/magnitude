@@ -11,7 +11,6 @@ import type { ProviderModel } from "../model"
 const model = (providerId: string, displayName: string): ProviderModel => ({
   providerId,
   providerModelId: "shared-model-id",
-  modelFamilyId: "unknown",
   displayName,
   contextWindow: 8_192,
   maxOutputTokens: 1_024,

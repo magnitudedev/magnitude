@@ -66,6 +66,8 @@ export const selectionMetadata = (selection: LocalInferenceSelection): string =>
       : formatBytes(selection.choice.sizeBytes)
   const context = selection.kind === "recommendation"
     ? `${formatContext(selection.recommendation.contextTokens)} × ${selection.recommendation.servingProfile.parallelSlots} slot${selection.recommendation.servingProfile.parallelSlots === 1 ? "" : "s"}`
-    : `${formatContext(selection.choice.contextTokens)} context`
+    : selection.choice.contextTokens === undefined
+      ? "Context unavailable"
+      : `${formatContext(selection.choice.contextTokens)} context`
   return `${quantization} · ${size} · ${context}`
 }

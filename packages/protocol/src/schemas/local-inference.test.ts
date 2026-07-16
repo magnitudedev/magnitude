@@ -64,7 +64,6 @@ describe("local inference protocol schemas", () => {
 
   test("local inference state cannot contain onboarding state", () => {
     const state = {
-      schemaVersion: 3,
       usage: null,
       activeBinding: null,
       distribution: { _tag: "Missing" },
@@ -86,6 +85,7 @@ describe("local inference protocol schemas", () => {
       fitClass: "unknown",
       compatible: true,
       explanation: "test",
+      residency: "loaded",
     }
     for (const _tag of ["RunningExternal", "RunningManaged", "StoredOwned", "StoredExternal"] as const) {
       const choice = { _tag, ...choiceFields }

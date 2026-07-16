@@ -94,12 +94,12 @@ export type ProviderModelAvailability = Schema.Schema.Type<typeof ProviderModelA
 export const ModelSummarySchema = Schema.Struct({
   providerId: Schema.String,
   providerModelId: Schema.String,
-  modelFamilyId: Schema.String,
+  modelFamilyId: Schema.optional(Schema.String),
   displayName: Schema.String,
   slots: Schema.optional(Schema.Array(SlotId)),
   contextWindow: Schema.Number,
   maxOutputTokens: Schema.Number,
-  capabilities: Schema.Struct({ vision: Schema.Boolean }),
+  capabilities: Schema.Struct({ vision: Schema.optional(Schema.Boolean) }),
   availability: ProviderModelAvailability,
   reasoningEfforts: Schema.Array(Schema.String),
   pricing: Schema.optional(Schema.Struct({

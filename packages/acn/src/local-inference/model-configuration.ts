@@ -18,12 +18,13 @@ export class ModelConfigurationError extends Data.TaggedError("ModelConfiguratio
 
 export interface LocalModelConfigurationApi {
   readonly get: Effect.Effect<LocalInferenceConfig, ModelConfigurationError>
+  readonly getModels: Effect.Effect<MagnitudeConfig["models"], ModelConfigurationError>
   readonly updateUsage: (usage: LocalInferenceUsageSelection) => Effect.Effect<void, ModelConfigurationError>
   readonly updateSlots: (
     slots: Partial<Record<SlotId, SlotModelConfig>>,
   ) => Effect.Effect<void, ModelConfigurationError>
   readonly reconcileSlots: (
-    candidates: readonly LocalSlotCandidate[],
+    input: LocalModelReconciliationInput,
   ) => Effect.Effect<boolean, ModelConfigurationError>
   readonly recordUse: (slotId: SlotId | "selected", providerModelId: string) => Effect.Effect<void, ModelConfigurationError>
   readonly activateLocal: (binding: DurableLocalModelBinding) => Effect.Effect<void, ModelConfigurationError>
@@ -34,10 +35,18 @@ export interface LocalModelConfigurationApi {
 export interface LocalSlotCandidate {
   readonly providerModelId: string
   readonly availability: "available" | "disabled"
-  readonly ownership: "managed" | "external"
-  readonly residency: "loaded" | "sleeping" | "unloaded" | "loading" | "failed" | "unknown"
+  readonly externalLoaded: boolean
+  readonly managedLoaded: boolean
+  readonly sleeping: boolean
+  readonly managedRestorable: boolean
+  readonly demandLoading: boolean
   readonly productRank: number
   readonly externalPriority: number
+}
+
+export interface LocalModelReconciliationInput {
+  readonly authoritativeModelIds: ReadonlySet<string>
+  readonly candidates: readonly LocalSlotCandidate[]
 }
 
 export class LocalModelConfiguration extends Context.Tag("LocalModelConfiguration")<
@@ -68,13 +77,32 @@ const sameSlot = (left: SlotModelConfig | undefined, right: SlotModelConfig | un
 
 export const reconcileLocalModelSlots = (
   current: MagnitudeConfig,
-  candidates: readonly LocalSlotCandidate[],
+  input: LocalModelReconciliationInput,
 ): { readonly config: MagnitudeConfig; readonly changed: boolean } => {
+  const { authoritativeModelIds, candidates } = input
   const models = current.models ?? {}
   const slots = { ...(models.slots ?? {}) }
   const intent = { ...(models.localSlotIntent ?? {}) }
+  const recency = { ...(models.localModelRecency ?? {}) }
   const available = candidates.filter((candidate) => candidate.availability === "available")
   let changed = false
+
+  for (const slotId of ["primary", "secondary"] as const) {
+    const existing = recency[slotId]
+    if (!existing) continue
+    const resolved = existing.filter((providerModelId) => authoritativeModelIds.has(providerModelId))
+    if (resolved.length === existing.length) continue
+    if (resolved.length > 0) recency[slotId] = resolved
+    else delete recency[slotId]
+    changed = true
+  }
+
+  let localInference = current.localInference
+  if (localInference?.binding && !authoritativeModelIds.has(localInference.binding.providerModelId)) {
+    const { binding: _, ...remaining } = localInference
+    localInference = Object.keys(remaining).length > 0 ? remaining : undefined
+    changed = true
+  }
 
   for (const slotId of ["primary", "secondary"] as const) {
     const existing = slots[slotId]
@@ -84,9 +112,9 @@ export const reconcileLocalModelSlots = (
     }
     if (intent[slotId] !== "local" && existing?.providerId !== "llamacpp") continue
     if (intent[slotId] !== "local") { intent[slotId] = "local"; changed = true }
-    const recency = models.localModelRecency?.[slotId] ?? []
+    const slotRecency = recency[slotId] ?? []
     const recencyIndex = (id: string): number => {
-      const index = recency.indexOf(id)
+      const index = slotRecency.indexOf(id)
       return index < 0 ? Number.MAX_SAFE_INTEGER : index
     }
     const rank = (left: LocalSlotCandidate, right: LocalSlotCandidate): number =>
@@ -95,12 +123,13 @@ export const reconcileLocalModelSlots = (
       || left.externalPriority - right.externalPriority
       || left.productRank - right.productRank
       || left.providerModelId.localeCompare(right.providerModelId)
-    const resident = (candidate: LocalSlotCandidate): boolean => candidate.residency === "loaded" || candidate.residency === "sleeping"
-    const externalLoaded = available.filter((candidate) => candidate.ownership === "external" && resident(candidate)).sort(rank)
-    const managedLoaded = available.filter((candidate) => candidate.ownership === "managed" && resident(candidate)).sort(rank)
+    const currentAny = candidates.find((candidate) => candidate.providerModelId === existing?.providerModelId)
+    if (currentAny && (currentAny.externalLoaded || currentAny.managedLoaded || currentAny.sleeping || currentAny.demandLoading)) continue
+    const externalLoaded = available.filter((candidate) => candidate.externalLoaded).sort(rank)
+    const managedLoaded = available.filter((candidate) => candidate.managedLoaded).sort(rank)
     const currentCandidate = available.find((candidate) => candidate.providerModelId === existing?.providerModelId)
-    const recentCandidate = recency.map((id) => available.find((candidate) => candidate.providerModelId === id)).find((candidate): candidate is LocalSlotCandidate => candidate !== undefined)
-    const bestManaged = available.filter((candidate) => candidate.ownership === "managed").sort(rank)[0]
+    const recentCandidate = slotRecency.map((id) => available.find((candidate) => candidate.providerModelId === id)).find((candidate): candidate is LocalSlotCandidate => candidate !== undefined)
+    const bestManaged = available.filter((candidate) => candidate.managedRestorable).sort(rank)[0]
     const selected = externalLoaded[0] ?? managedLoaded[0] ?? currentCandidate ?? recentCandidate ?? bestManaged
     const next = selected
       ? { ...existing, providerId: "llamacpp", providerModelId: selected.providerModelId }
@@ -112,12 +141,22 @@ export const reconcileLocalModelSlots = (
     }
   }
   if (!changed) return { config: current, changed: false }
-  return { config: { ...current, models: { ...models, slots, localSlotIntent: intent } }, changed: true }
+  const { localModelRecency: _, ...modelsWithoutRecency } = models
+  const nextModels = {
+    ...modelsWithoutRecency,
+    slots,
+    localSlotIntent: intent,
+    ...(Object.keys(recency).length > 0 ? { localModelRecency: recency } : {}),
+  }
+  const next = { ...current, models: nextModels }
+  if (localInference) return { config: { ...next, localInference }, changed: true }
+  const { localInference: __, ...withoutLocalInference } = next
+  return { config: withoutLocalInference, changed: true }
 }
 
 type LocalModelConfigurationStorage = Pick<
   ConfigStorageShape,
-  "getLocalInferenceConfig" | "updateModelConfig" | "update"
+  "getLocalInferenceConfig" | "getModelConfig" | "updateModelConfig" | "update"
 >
 
 export const makeLocalModelConfiguration = (
@@ -133,6 +172,10 @@ export const makeLocalModelConfiguration = (
 
   return LocalModelConfiguration.of({
     get,
+    getModels: storage.getModelConfig().pipe(
+      Effect.map((models) => models ?? {}),
+      Effect.mapError((cause) => configurationError("read model configuration", cause)),
+    ),
 
     updateSlots: (updates) => storage.update((current) => {
       const models = current.models ?? {}
@@ -161,10 +204,10 @@ export const makeLocalModelConfiguration = (
       Effect.zipRight(publish),
     ),
 
-    reconcileSlots: (candidates) => Effect.gen(function* () {
+    reconcileSlots: (input) => Effect.gen(function* () {
       let changed = false
       yield* storage.update((current) => {
-        const result = reconcileLocalModelSlots(current, candidates)
+        const result = reconcileLocalModelSlots(current, input)
         changed = result.changed
         return result.config
       }).pipe(Effect.mapError((cause) => configurationError("reconcile local model slots", cause)))

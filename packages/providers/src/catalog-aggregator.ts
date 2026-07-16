@@ -48,6 +48,7 @@ export function buildFamilies(
   const seen = new Set<string>()
   const families: { readonly id: string; readonly capabilities: { readonly vision: boolean } }[] = []
   for (const pm of providerModels) {
+    if (!pm.modelFamilyId) continue
     if (!seen.has(pm.modelFamilyId)) {
       seen.add(pm.modelFamilyId)
       const family = getModelFamily(pm.modelFamilyId)

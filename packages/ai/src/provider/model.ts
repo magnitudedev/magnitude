@@ -1,4 +1,5 @@
-import type { ProviderModelCapabilities } from "../model/capabilities"
+import { Schema } from "effect"
+import { ProviderModelCapabilitiesSchema, type ProviderModelCapabilities } from "../model/capabilities"
 
 /**
  * Reasoning effort levels — provider-agnostic.
@@ -11,11 +12,20 @@ export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max"
 /**
  * Pricing info for a provider model (per 1M tokens, in USD).
  */
-export interface ModelPricingInfo {
-  readonly input: number
-  readonly output: number
-  readonly cached_input: number | null
-}
+const FiniteNonNegative = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
+const PositiveSafeInteger = Schema.Number.pipe(Schema.int(), Schema.positive(), Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER))
+export const ProviderIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(256), Schema.brand("ProviderId"))
+export type ProviderId = Schema.Schema.Type<typeof ProviderIdSchema>
+export const ProviderModelIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(4096), Schema.brand("ProviderModelId"))
+export type ProviderModelId = Schema.Schema.Type<typeof ProviderModelIdSchema>
+export const ModelFamilyIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(512), Schema.brand("ModelFamilyId"))
+export type ModelFamilyId = Schema.Schema.Type<typeof ModelFamilyIdSchema>
+export const ModelPricingInfoSchema = Schema.Struct({
+  input: FiniteNonNegative,
+  output: FiniteNonNegative,
+  cached_input: Schema.NullOr(FiniteNonNegative),
+})
+export type ModelPricingInfo = Schema.Schema.Type<typeof ModelPricingInfoSchema>
 
 /**
  * Intrinsic model family capabilities — determined by the model architecture,
@@ -50,19 +60,15 @@ export interface ModelFamily {
   readonly capabilities: ModelFamilyCapabilities
 }
 
-export type ProviderModelDisabledReason =
-  | "insufficient_resources"
-  | "provider_unavailable"
-  | "model_unavailable"
-  | "incompatible_runtime"
-  | "invalid_configuration"
-
-export type ProviderModelAvailability =
-  | { readonly _tag: "Available" }
-  | {
-      readonly _tag: "Disabled"
-      readonly reason: ProviderModelDisabledReason
-    }
+export const ProviderModelDisabledReasonSchema = Schema.Literal(
+  "insufficient_resources", "provider_unavailable", "model_unavailable", "incompatible_runtime", "invalid_configuration",
+)
+export type ProviderModelDisabledReason = Schema.Schema.Type<typeof ProviderModelDisabledReasonSchema>
+export const ProviderModelAvailabilitySchema = Schema.Union(
+  Schema.TaggedStruct("Available", {}),
+  Schema.TaggedStruct("Disabled", { reason: ProviderModelDisabledReasonSchema }),
+)
+export type ProviderModelAvailability = Schema.Schema.Type<typeof ProviderModelAvailabilitySchema>
 
 export const AVAILABLE_PROVIDER_MODEL: ProviderModelAvailability = { _tag: "Available" }
 
@@ -74,33 +80,19 @@ export const isProviderModelAvailable = (
  * A model as offered by a specific provider.
  * Properties here MAY differ across providers serving the same family.
  */
-export interface ProviderModel {
-  /** Provider-specific model ID, e.g. "glm-5.2", "kimi-k2.7" */
-  readonly providerModelId: string
-  /** ID of the provider serving this model, e.g. "magnitude", "llamacpp" */
-  readonly providerId: string
-  /** Model family ID this provider model maps to; may be "unknown" when discovery is authoritative. */
-  readonly modelFamilyId: string
-  /** Display name (may differ from family name) */
-  readonly displayName: string
-  /** Context window — provider-specific (can differ by provider) */
-  readonly contextWindow: number
-  /** Max output tokens — provider-specific */
-  readonly maxOutputTokens: number
-  /** Capabilities as served by this provider (may be a subset of family capabilities) */
-  readonly capabilities: ProviderModelCapabilities
-  /** Whether this catalog entry can currently occupy a model slot. */
-  readonly availability: ProviderModelAvailability
-  /** Pricing — provider-specific (per 1M tokens, USD) */
-  readonly pricing: ModelPricingInfo
-  /**
-   * Reasoning effort options available on this provider for this model.
-   * Always has at least one entry (e.g. ["none"] for non-reasoning models).
-   * Read from the provider at catalog time. Plain strings — the UI
-   * capitalizes them for display.
-   */
-  readonly reasoningEfforts: readonly string[]
-}
+export const ProviderModelSchema = Schema.Struct({
+  providerModelId: Schema.String,
+  providerId: Schema.String,
+  modelFamilyId: Schema.optional(Schema.String),
+  displayName: Schema.String.pipe(Schema.minLength(1)),
+  contextWindow: PositiveSafeInteger,
+  maxOutputTokens: PositiveSafeInteger,
+  capabilities: ProviderModelCapabilitiesSchema,
+  availability: ProviderModelAvailabilitySchema,
+  pricing: ModelPricingInfoSchema,
+  reasoningEfforts: Schema.Array(Schema.String.pipe(Schema.minLength(1))).pipe(Schema.minItems(1)),
+})
+export type ProviderModel = Schema.Schema.Type<typeof ProviderModelSchema>
 
 /** Re-exported for convenience. */
 export type { ProviderModelCapabilities } from "../model/capabilities"

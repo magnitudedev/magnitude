@@ -4,6 +4,9 @@ import { Data, Duration, Effect, Option, Redacted, Schema, Stream, pipe } from "
 import { formatSchemaIssues, type SchemaIssue } from "../schema-issues"
 import {
   LlamaServedModelId as LlamaServedModelIdSchema,
+  LlamaInstanceId as LlamaInstanceIdSchema,
+  NormalizedLlamaModelPath,
+  normalizeLlamaModelPath,
   type LlamaInstanceId,
   type LlamaServedModelId,
 } from "./identity"
@@ -29,49 +32,57 @@ export type LlamaServerMethod = Schema.Schema.Type<typeof LlamaServerMethod>
 export const LlamaRouterControlOperation = Schema.Literal("load", "unload")
 export type LlamaRouterControlOperation = Schema.Schema.Type<typeof LlamaRouterControlOperation>
 
-export interface LlamaDiagnostic {
-  readonly code: string
-  readonly message: string
-  readonly modelId: Option.Option<LlamaServedModelId>
-}
-export interface LlamaModelLoadProgress {
-  readonly completed: Option.Option<number>
-  readonly total: Option.Option<number>
-  readonly fraction: Option.Option<number>
-}
-export interface LlamaModelFailure {
-  readonly exitCode: Option.Option<number>
-  readonly message: Option.Option<string>
-}
-export interface LlamaServedModelObservation {
-  readonly id: LlamaServedModelId
-  readonly status: LlamaServedModelStatus
-  readonly serverDisplayName: Option.Option<string>
-  readonly activeContextTokens: Option.Option<number>
-  readonly architecture: Option.Option<string>
-  readonly serverFileType: Option.Option<string>
-  readonly serverReportedSizeBytes: Option.Option<number>
-  readonly inputModalities: Option.Option<readonly string[]>
-  readonly outputModalities: Option.Option<readonly string[]>
-  readonly loadProgress: Option.Option<LlamaModelLoadProgress>
-  readonly failure: Option.Option<LlamaModelFailure>
-}
-export interface LlamaInstanceObservation {
-  readonly id: LlamaInstanceId
-  readonly ownership: LlamaInstanceOwnership
-  readonly health: LlamaServerHealth
-  readonly mode: LlamaServerMode
-  readonly build: Option.Option<string>
-  readonly capabilities: {
-    readonly models: Availability
-    readonly modelEvents: Availability
-    readonly load: Availability
-    readonly unload: Availability
-    readonly sleep: Availability
-  }
-  readonly models: readonly LlamaServedModelObservation[]
-  readonly diagnostics: readonly LlamaDiagnostic[]
-}
+const NonNegative = Schema.Number.pipe(Schema.filter((value) => Number.isFinite(value) && value >= 0))
+const Optional = Schema.OptionFromSelf
+export const LlamaDiagnosticSchema = Schema.Struct({
+  code: Schema.String,
+  message: Schema.String,
+  modelId: Optional(LlamaServedModelIdSchema),
+})
+export type LlamaDiagnostic = Schema.Schema.Type<typeof LlamaDiagnosticSchema>
+export const LlamaModelLoadProgressSchema = Schema.Struct({
+  completed: Optional(Schema.Number),
+  total: Optional(Schema.Number),
+  fraction: Optional(Schema.Number),
+})
+export type LlamaModelLoadProgress = Schema.Schema.Type<typeof LlamaModelLoadProgressSchema>
+export const LlamaModelFailureSchema = Schema.Struct({
+  exitCode: Optional(Schema.Int),
+  message: Optional(Schema.String),
+})
+export type LlamaModelFailure = Schema.Schema.Type<typeof LlamaModelFailureSchema>
+export const LlamaServedModelObservationSchema = Schema.Struct({
+  id: LlamaServedModelIdSchema,
+  status: LlamaServedModelStatus,
+  serverDisplayName: Optional(Schema.String),
+  reportedModelPath: Optional(NormalizedLlamaModelPath),
+  activeContextTokens: Optional(NonNegative),
+  architecture: Optional(Schema.String),
+  serverFileType: Optional(Schema.String),
+  serverReportedSizeBytes: Optional(NonNegative),
+  inputModalities: Optional(Schema.Array(Schema.String)),
+  outputModalities: Optional(Schema.Array(Schema.String)),
+  loadProgress: Optional(LlamaModelLoadProgressSchema),
+  failure: Optional(LlamaModelFailureSchema),
+})
+export type LlamaServedModelObservation = Schema.Schema.Type<typeof LlamaServedModelObservationSchema>
+export const LlamaInstanceObservationSchema = Schema.Struct({
+  id: LlamaInstanceIdSchema,
+  ownership: LlamaInstanceOwnership,
+  health: LlamaServerHealth,
+  mode: LlamaServerMode,
+  build: Optional(Schema.String),
+  capabilities: Schema.Struct({
+    models: Availability,
+    modelEvents: Availability,
+    load: Availability,
+    unload: Availability,
+    sleep: Availability,
+  }),
+  models: Schema.Array(LlamaServedModelObservationSchema),
+  diagnostics: Schema.Array(LlamaDiagnosticSchema),
+})
+export type LlamaInstanceObservation = Schema.Schema.Type<typeof LlamaInstanceObservationSchema>
 export type LlamaServerModelEventTarget = Data.TaggedEnum<{
   AllModels: Record<never, never>
   Model: { readonly id: LlamaServedModelId }
@@ -110,7 +121,6 @@ export interface LlamaServerClientOptions {
   readonly timeout: Option.Option<Duration.DurationInput>
 }
 
-const NonNegative = Schema.Number.pipe(Schema.filter((value) => Number.isFinite(value) && value >= 0))
 const StatusValue = LlamaServedModelStatus
 const StatusObject = Schema.Struct({
   value: Schema.optional(StatusValue),
@@ -147,6 +157,7 @@ const RawModel = Schema.Struct({
   model: Schema.optional(LlamaServedModelIdSchema),
   status: Schema.optional(Status),
   path: Schema.optional(Schema.String),
+  model_path: Schema.optional(Schema.String),
   n_ctx: Schema.optional(NonNegative),
   size: Schema.optional(NonNegative),
   ftype: Schema.optional(Schema.String),
@@ -372,10 +383,14 @@ export const makeLlamaServerClient = (
     )
     const failure = Option.orElse(serverFailure, () => failureFromStatus(Option.fromNullable(raw.status)))
     const propsFileType = pipe(modelProps, Option.flatMap((value) => optionalText(value.model_ftype)))
+    const reportedModelPath = firstSome([
+      pipe(modelProps, Option.flatMap((value) => optionalText(value.model_path))),
+    ]).pipe(Option.flatMap((value) => Option.fromNullable(normalizeLlamaModelPath(value))))
     return {
       id: identifier.value,
       status: Option.isSome(failure) ? "failed" : status,
       serverDisplayName: firstSome([optionalText(raw["general.name"]), optionalText(raw.general_name), metadataName(meta)]),
+      reportedModelPath,
       activeContextTokens: firstSome([
         Option.fromNullable(raw.n_ctx),
         pipe(meta, Option.flatMap((value) => Option.fromNullable(value.n_ctx))),
@@ -467,6 +482,15 @@ export const makeLlamaServerClient = (
             message: `${modelResult.left.reason}${statusSuffix}`,
             modelId: Option.none(),
           })
+        }
+        for (const model of listed) {
+          if ((model.status === "loaded" || model.status === "sleeping") && Option.isNone(model.reportedModelPath)) {
+            diagnostics.push({
+              code: "model_path_unavailable",
+              message: "Loaded model did not provide a valid model-scoped model_path.",
+              modelId: Option.some(model.id),
+            })
+          }
         }
 
         let mode: LlamaInstanceObservation["mode"] = "unknown"
