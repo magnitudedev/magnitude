@@ -21,6 +21,8 @@ import { connectionRetrySchedule } from '../util/retry-backoff'
 import { modelAttemptRetryability } from '../errors'
 import { CHAT_TITLE_PROMPT } from '../util/title-prompts'
 
+export const CHAT_TITLE_MAX_TOKENS = 100
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -76,8 +78,8 @@ export const ChatTitleServiceLive = Layer.scoped(
       Effect.gen(function* () {
         logger.info('[chat-title-service] generate() called')
 
-        logger.info('[chat-title-service] Resolving title model...')
-        const titleModel = yield* modelResolver.resolveSecondary()
+        logger.info('[chat-title-service] Resolving title model from the primary slot...')
+        const titleModel = yield* modelResolver.resolvePrimary('leader')
         logger.info({ modelId: titleModel.modelId, modelSource: titleModel.modelSource }, '[chat-title-service] Title model resolved')
 
         const prompt = Prompt.from({
@@ -96,7 +98,7 @@ export const ChatTitleServiceLive = Layer.scoped(
 
         logger.info('[chat-title-service] Starting model stream call...')
         const streamResult = yield* Effect.gen(function* () {
-          const result = yield* titleModel.model.stream(prompt, [], { maxTokens: 100 }).pipe(
+          const result = yield* titleModel.model.stream(prompt, [], { maxTokens: CHAT_TITLE_MAX_TOKENS }).pipe(
             Effect.tap(() => Effect.sync(() => logger.info('[chat-title-service] Stream started'))),
             Effect.tapError((e) => Effect.sync(() => logger.error({ error: String(e) }, '[chat-title-service] Stream error before timeout'))),
           )
@@ -123,7 +125,7 @@ export const ChatTitleServiceLive = Layer.scoped(
         )
 
         if (!streamResult) {
-          logger.info('[chat-title-service] Title generation timed out or failed, keeping default')
+          logger.info('[chat-title-service] Title generation timed out or failed, keeping fallback title')
           return null
         }
 
@@ -139,19 +141,25 @@ export const ChatTitleServiceLive = Layer.scoped(
           },
         )
 
-        if (collected.streamError) {
-          logger.info({ streamError: collected.streamError }, '[chat-title-service] Title generation stream failed, keeping default')
-          return null
-        }
-
         const title = collected.text.trim().slice(0, 50)
-        if (!title) {
-          logger.info('[chat-title-service] Title generation returned empty, keeping default')
-          return null
+        if (title) {
+          if (collected.streamError) {
+            logger.info(
+              { title, streamError: collected.streamError },
+              '[chat-title-service] Using partial title from failed generation stream',
+            )
+          } else {
+            logger.info({ title }, '[chat-title-service] Generated chat title')
+          }
+          return title
         }
 
-        logger.info({ title }, '[chat-title-service] Generated chat title')
-        return title
+        if (collected.streamError) {
+          logger.info({ streamError: collected.streamError }, '[chat-title-service] Title generation stream failed without usable text, keeping fallback title')
+        } else {
+          logger.info('[chat-title-service] Title generation returned empty, keeping fallback title')
+        }
+        return null
       }).pipe(
         Effect.catchAllCause((cause) => {
           if (Cause.isInterruptedOnly(cause)) return Effect.succeed(null)

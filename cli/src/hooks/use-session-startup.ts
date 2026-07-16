@@ -31,6 +31,7 @@ import {
   getDraftSessionOwnerId,
 } from '@magnitudedev/client-common'
 import { setLastSessionId } from '../state/last-session'
+import { useTerminalTitle } from './use-terminal-title'
 
 export type SessionStart =
   | { _tag: 'new' }
@@ -57,6 +58,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
   const runtimeResult = useAtomValue(client.runtime)
   const sessionTitle = useDisplayState((state) => state.session.title)
+  useTerminalTitle(renderer, sessionId, sessionTitle)
 
   // ── 1. Latest session query — declarative, only for --latest ──────────
   const latestSessionAtom = useMemo(
@@ -140,24 +142,6 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
     [skillsResult],
   )
   useAtomMount(skillRegistrationAtom)
-
-  // ── Terminal title tracks the display projection's session title ───────
-  const titleAtom = useMemo(
-    () =>
-      Atom.make(
-        Effect.gen(function* () {
-          const title = sessionId ? (sessionTitle ?? 'Magnitude') : 'Magnitude'
-          renderer.setTerminalTitle(title)
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() => {
-              renderer.setTerminalTitle('Magnitude')
-            }),
-          )
-        }),
-      ),
-    [renderer, sessionId, sessionTitle],
-  )
-  useAtomMount(titleAtom)
 
   // ── 3. One-shot --prompt / --goal — true mutations needing return value
   const startGoalAtom = useMemo(() => client.mutation('StartGoal'), [client])

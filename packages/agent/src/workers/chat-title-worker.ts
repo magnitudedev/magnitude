@@ -9,6 +9,7 @@ import { updateTraceMeta } from '@magnitudedev/tracing'
 import { ChatPersistence } from '../persistence/chat-persistence-service'
 import { DEFAULT_CHAT_NAME } from '../constants'
 import { AgentModelOperationContextTag } from '../model/agent-model'
+import { fallbackChatTitle } from '../util/title-prompts'
 
 export const ChatTitleWorker = Worker.define<AppEvent>()({
   name: 'ChatTitleWorker',
@@ -58,6 +59,29 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
             return
           }
 
+          // Establish a useful title before starting the model call. Besides
+          // making title generation resilient to local/offline model failures,
+          // this persisted event is the one-attempt guard: later user messages
+          // see a non-default title and never start another title request.
+          const fallbackTitle = fallbackChatTitle(text)
+          if (fallbackTitle === null) return
+
+          yield* persistence.saveSessionMetadata({ chatName: fallbackTitle }).pipe(
+            Effect.catchAll((error) =>
+              Effect.sync(() => logger.error(
+                { error, fallbackTitle },
+                '[chat-title-worker] Failed to persist fallback title metadata',
+              )),
+            ),
+          )
+          updateTraceMeta({ chatName: fallbackTitle })
+          yield* publish({
+            type: 'chat_title_generated',
+            forkId: null,
+            title: fallbackTitle,
+            timestamp: Date.now(),
+          })
+
           logger.info({ textPreview: text.slice(0, 100) }, '[chat-title-worker] Delegating to ChatTitleService')
 
           // Fire-and-forget: run AI generation in background fiber so signal handler returns immediately
@@ -73,7 +97,14 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
             )
 
             if (title === null) {
-              logger.info('[chat-title-worker] Title generation returned null, keeping default')
+              logger.info({ fallbackTitle }, '[chat-title-worker] Title generation returned null, keeping fallback title')
+              return
+            }
+
+            // Never replace the fallback with the sentinel default, which
+            // would re-enable title generation on the next user message.
+            if (title === DEFAULT_CHAT_NAME) {
+              logger.info('[chat-title-worker] Title generation returned the default title, keeping fallback title')
               return
             }
 
