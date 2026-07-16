@@ -1,5 +1,6 @@
-import { Context, Data, Effect, Layer, PubSub, Stream } from "effect"
+import { Context, Data, Effect, Layer, PubSub, Schema, Stream } from "effect"
 import type { LocalInferenceUsageSelection } from "@magnitudedev/protocol"
+import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
   type ConfigStorageShape,
@@ -26,14 +27,14 @@ export interface LocalModelConfigurationApi {
   readonly reconcileSlots: (
     input: LocalModelReconciliationInput,
   ) => Effect.Effect<boolean, ModelConfigurationError>
-  readonly recordUse: (slotId: SlotId | "selected", providerModelId: string) => Effect.Effect<void, ModelConfigurationError>
+  readonly recordUse: (slotId: SlotId | "selected", providerModelId: ProviderModelId) => Effect.Effect<void, ModelConfigurationError>
   readonly activateLocal: (binding: DurableLocalModelBinding) => Effect.Effect<void, ModelConfigurationError>
   readonly disableLocal: Effect.Effect<void, ModelConfigurationError>
   readonly changes: Stream.Stream<void>
 }
 
 export interface LocalSlotCandidate {
-  readonly providerModelId: string
+  readonly providerModelId: ProviderModelId
   readonly availability: "available" | "disabled"
   readonly externalLoaded: boolean
   readonly managedLoaded: boolean
@@ -45,7 +46,7 @@ export interface LocalSlotCandidate {
 }
 
 export interface LocalModelReconciliationInput {
-  readonly authoritativeModelIds: ReadonlySet<string>
+  readonly authoritativeModelIds: ReadonlySet<ProviderModelId>
   readonly candidates: readonly LocalSlotCandidate[]
 }
 
@@ -67,6 +68,8 @@ const localSlot = (binding: DurableLocalModelBinding): SlotModelConfig => ({
 })
 
 const RECENCY_LIMIT = 32
+const storedProviderModelId = (value: string): ProviderModelId | undefined =>
+  Schema.is(ProviderModelIdSchema)(value) ? value : undefined
 const moveToFront = (items: readonly string[], providerModelId: string): readonly string[] =>
   [providerModelId, ...items.filter((item) => item !== providerModelId)].slice(0, RECENCY_LIMIT)
 
@@ -90,7 +93,10 @@ export const reconcileLocalModelSlots = (
   for (const slotId of ["primary", "secondary"] as const) {
     const existing = recency[slotId]
     if (!existing) continue
-    const resolved = existing.filter((providerModelId) => authoritativeModelIds.has(providerModelId))
+    const resolved = existing.filter((providerModelId) => {
+      const id = storedProviderModelId(providerModelId)
+      return id !== undefined && authoritativeModelIds.has(id)
+    })
     if (resolved.length === existing.length) continue
     if (resolved.length > 0) recency[slotId] = resolved
     else delete recency[slotId]
@@ -98,7 +104,10 @@ export const reconcileLocalModelSlots = (
   }
 
   let localInference = current.localInference
-  if (localInference?.binding && !authoritativeModelIds.has(localInference.binding.providerModelId)) {
+  if (localInference?.binding && (() => {
+    const id = storedProviderModelId(localInference.binding.providerModelId)
+    return id === undefined || !authoritativeModelIds.has(id)
+  })()) {
     const { binding: _, ...remaining } = localInference
     localInference = Object.keys(remaining).length > 0 ? remaining : undefined
     changed = true

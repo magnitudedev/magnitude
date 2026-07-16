@@ -7,22 +7,24 @@ import type {
   Provider,
   ProviderModelBindOptions,
 } from "@magnitudedev/ai"
-import { StreamStartOperationalFailure } from "@magnitudedev/ai"
+import { ProviderIdSchema, StreamStartOperationalFailure, type ProviderModelId } from "@magnitudedev/ai"
 import { createLlamaCppCompatibleSpec, wrapAsBaseModel } from "./models"
-import type { LlamaCppCallOptions, LlamaCppModelInfo } from "./contract"
+import type { LlamaCppCallOptions, LlamaCppModelInfo, LlamaServedModelId, LlamaServingRouteId } from "./contract"
 
-export const PROVIDER_ID = "llamacpp" as const
+export const PROVIDER_ID = ProviderIdSchema.make("llamacpp")
 
 export class LlamaCppAcquisitionError extends Data.TaggedError("LlamaCppAcquisitionError")<{
-  readonly modelId: string
+  readonly modelId: ProviderModelId
   readonly reason: string
   readonly cause?: unknown
 }> {}
 
 export interface LlamaCppInferenceLease {
+  readonly providerModelId: ProviderModelId
+  readonly routeId: LlamaServingRouteId
   readonly origin: URL
   readonly authorization: Option.Option<Redacted.Redacted<string>>
-  readonly servedModelId: string
+  readonly servedModelId: LlamaServedModelId
   readonly requestStarted: Effect.Effect<void>
 }
 
@@ -34,7 +36,7 @@ export interface LlamaCppInferenceLease {
 export interface LlamaCppProviderSource {
   readonly catalog: ModelCatalog<LlamaCppModelInfo>
   readonly acquire: (
-    providerModelId: string,
+    providerModelId: ProviderModelId,
   ) => Effect.Effect<LlamaCppInferenceLease, LlamaCppAcquisitionError, Scope.Scope>
   readonly status: Effect.Effect<{
     readonly status: "ok" | "loading" | "not_found" | "error"
@@ -68,7 +70,7 @@ const inferenceEndpoint = (lease: LlamaCppInferenceLease): string =>
 
 const dynamicBoundModel = (
   source: LlamaCppProviderSource,
-  providerModelId: string,
+  providerModelId: ProviderModelId,
   options: ProviderModelBindOptions | undefined,
 ): BoundModel<BaseCallOptions> => ({
   stream: (prompt, tools, requestOptions) => Effect.gen(function* () {

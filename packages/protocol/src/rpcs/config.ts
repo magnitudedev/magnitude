@@ -1,5 +1,6 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
+import { ProviderIdSchema } from "@magnitudedev/ai"
 import { SessionError } from "../errors"
 import {
   BalanceResponse,
@@ -16,7 +17,7 @@ import { StreamHeartbeat } from "../schemas/events"
 
 export const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
   payload: Schema.Struct({
-    providerId: Schema.String,
+    providerId: ProviderIdSchema,
     auth: ProviderAuthSchema,
   }),
   success: Schema.Struct({}),
@@ -25,7 +26,7 @@ export const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
 
 export const GetProviderAuth = Rpc.make("GetProviderAuth", {
   payload: Schema.Struct({
-    providerId: Schema.String,
+    providerId: ProviderIdSchema,
   }),
   success: Schema.Struct({
     auth: Schema.optionalWith(ProviderAuthSchema, { as: "Option", exact: true }),
@@ -74,7 +75,7 @@ export const WatchModelCatalog = Rpc.make("WatchModelCatalog", {
 
 export const RefreshModelCatalog = Rpc.make("RefreshModelCatalog", {
   payload: Schema.Struct({
-    providerId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+    providerId: Schema.optionalWith(ProviderIdSchema, { as: "Option", exact: true }),
   }),
   success: Schema.Struct({}),
   error: SessionError,

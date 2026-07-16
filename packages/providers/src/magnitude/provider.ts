@@ -16,6 +16,9 @@ import {
   type ImagePlaceholderConfig,
   type BaseCallOptions,
   type ProviderModelBindOptions,
+  ProviderIdSchema,
+  type ModelFamilyId,
+  type ProviderModelId,
 } from "@magnitudedev/ai"
 import { isEnvFlagOn } from "@magnitudedev/utils"
 import type { MagnitudeModelInfo, MagnitudeAdditionalOptions } from "./contract"
@@ -45,7 +48,7 @@ const WebSearchResultSchema = Schema.Struct({
   data: Schema.optional(JsonValueSchema),
 })
 
-export const PROVIDER_ID = "magnitude" as const
+export const PROVIDER_ID = ProviderIdSchema.make("magnitude")
 
 export interface MagnitudeClientConfig {
   readonly apiKey?: string
@@ -102,13 +105,13 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
     if (dedicatedProvider) headers.set(HEADER_USE_DEDICATED, dedicatedProvider)
   }
 
-  const classifyModelFamily = (model: Omit<MagnitudeModelInfo, "modelFamilyId">): Option.Option<string> =>
+  const classifyModelFamily = (model: Omit<MagnitudeModelInfo, "modelFamilyId">): Option.Option<ModelFamilyId> =>
     classifyModelFamilyRaw(model.providerModelId)
 
   const catalog = createMagnitudeCatalog({ endpoint, auth: authWithHeaders, classify: classifyModelFamily })
 
   const bindModel = (
-    id: string,
+    id: ProviderModelId,
     options?: ProviderModelBindOptions,
   ): Effect.Effect<BoundModel<BaseCallOptions>, never, never> =>
     Effect.gen(function* () {

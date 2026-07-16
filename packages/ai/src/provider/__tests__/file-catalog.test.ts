@@ -6,11 +6,11 @@ import { describe, expect, it } from "vitest"
 import { Effect } from "effect"
 import type { ModelCatalog } from "../catalog"
 import { makeFileBackedModelCatalog } from "../file-catalog"
-import type { ProviderModel } from "../model"
+import { ProviderIdSchema, ProviderModelIdSchema, type ProviderId, type ProviderModel } from "../model"
 
-const model = (providerId: string, displayName: string): ProviderModel => ({
+const model = (providerId: ProviderId, displayName: string): ProviderModel => ({
   providerId,
-  providerModelId: "shared-model-id",
+  providerModelId: ProviderModelIdSchema.make("shared-model-id"),
   displayName,
   contextWindow: 8_192,
   maxOutputTokens: 1_024,
@@ -24,8 +24,8 @@ describe("file-backed model catalog", () => {
   it("uses provider ID and provider model ID as the cache key", async () => {
     const directory = await mkdtemp(join(tmpdir(), "magnitude-model-cache-"))
     const models = [
-      model("magnitude", "Hosted model"),
-      model("llamacpp", "Local model"),
+      model(ProviderIdSchema.make("magnitude"), "Hosted model"),
+      model(ProviderIdSchema.make("llamacpp"), "Local model"),
     ]
     const inner: ModelCatalog<ProviderModel> = {
       list: Effect.succeed(models),
@@ -43,7 +43,7 @@ describe("file-backed model catalog", () => {
     try {
       const catalog = makeFileBackedModelCatalog(inner, join(directory, "models.json"))
       const local = await Effect.runPromise(
-        catalog.get("llamacpp", "shared-model-id").pipe(
+        catalog.get(ProviderIdSchema.make("llamacpp"), ProviderModelIdSchema.make("shared-model-id")).pipe(
           Effect.provide(FetchHttpClient.layer),
         ),
       )

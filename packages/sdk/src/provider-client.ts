@@ -2,7 +2,7 @@ import { Context } from "effect"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import { Effect } from "effect"
 import { ModelCatalogError } from "@magnitudedev/ai"
-import type { BoundModel, ProviderRejection, WebSearchResult, BalanceQuery, BaseCallOptions, ProviderModelBindOptions, ProviderModel } from "@magnitudedev/ai"
+import type { BoundModel, ProviderRejection, WebSearchResult, BalanceQuery, BaseCallOptions, ProviderModelBindOptions, ProviderModel, ProviderId, ProviderModelId } from "@magnitudedev/ai"
 import type { ModelCatalog } from "@magnitudedev/ai"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
@@ -61,8 +61,8 @@ export type {
   MagnitudeCallOptions,
   MagnitudeAdditionalOptions,
 } from "@magnitudedev/providers"
-export type { LlamaCppProviderSource, LlamaCppInferenceLease, LlamaCppModelInfo } from "@magnitudedev/providers"
-export { LlamaCppAcquisitionError, LlamaCppModelInfoSchema } from "@magnitudedev/providers"
+export type { LlamaCppProviderSource, LlamaCppInferenceLease, LlamaCppModelInfo, LlamaServedModelId, LlamaServingRouteId } from "@magnitudedev/providers"
+export { LlamaCppAcquisitionError, LlamaCppModelInfoSchema, LlamaServedModelIdSchema, LlamaServingRouteIdSchema } from "@magnitudedev/providers"
 export type { WebSearchResult, BalanceQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/protocol"
@@ -106,8 +106,8 @@ export interface ProviderClientShape {
   readonly listProviders: Effect.Effect<readonly ProviderRegistryInfo[], never, HttpClient.HttpClient>
   readonly sessionId: string | null
   readonly resolveModel: (
-    providerId: string,
-    providerModelId: string,
+    providerId: ProviderId,
+    providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
   ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
   readonly webSearch: (

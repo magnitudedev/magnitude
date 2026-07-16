@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { ProviderModelIdSchema } from "@magnitudedev/ai"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
@@ -118,7 +119,7 @@ export type LocalModelRecommendation = Schema.Schema.Type<typeof LocalModelRecom
 const ChoiceFields = {
   choiceId: Schema.String,
   displayName: Schema.String,
-  providerModelId: Schema.String,
+  providerModelId: ProviderModelIdSchema,
   contextTokens: Schema.optional(PositiveInteger),
   fitClass: LocalInferenceFitClass,
   compatible: Schema.Boolean,
@@ -140,12 +141,12 @@ export type LocalModelChoice = Schema.Schema.Type<typeof LocalModelChoice>
 export const ActiveLocalBindingSummary = Schema.Union(
   Schema.TaggedStruct("Managed", {
     selectionId: Schema.String,
-    providerModelId: Schema.String,
+    providerModelId: ProviderModelIdSchema,
     contextTokens: PositiveInteger,
   }),
   Schema.TaggedStruct("External", {
     selectionId: Schema.String,
-    providerModelId: Schema.String,
+    providerModelId: ProviderModelIdSchema,
     contextTokens: PositiveInteger,
   }),
 )
@@ -159,7 +160,7 @@ export type LocalInferenceOperationStage = Schema.Schema.Type<typeof LocalInfere
 
 export const LocalInferenceOperationSnapshot = Schema.Struct({
   operationId: Schema.String,
-  providerModelId: Schema.String,
+  providerModelId: ProviderModelIdSchema,
   status: Schema.Literal("running", "completed", "failed"),
   stage: LocalInferenceOperationStage,
   progress: Schema.optional(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1))),

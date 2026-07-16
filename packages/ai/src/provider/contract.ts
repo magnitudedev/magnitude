@@ -1,6 +1,6 @@
 import type { Effect, Option } from "effect"
 import type { BoundModel } from "../model/bound-model"
-import type { ProviderModel } from "./model"
+import type { ModelFamilyId, ProviderId, ProviderModel, ProviderModelId } from "./model"
 import type { ModelCatalog } from "./catalog"
 import type { ProviderModelCapabilities, ImagePlaceholderConfig } from "../model/capabilities"
 import type { BaseCallOptions, ToolChoice } from "./call-options"
@@ -16,7 +16,7 @@ import type { BaseCallOptions, ToolChoice } from "./call-options"
 export interface Provider<
   TModel extends ProviderModel = ProviderModel,
 > {
-  readonly id: string
+  readonly id: ProviderId
   readonly displayName: string
   readonly catalog: ModelCatalog<TModel>
 
@@ -27,7 +27,7 @@ export interface Provider<
    * baked in at bind time and invisible to the caller.
    */
   readonly bindModel: (
-    providerModelId: string,
+    providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
   ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
 
@@ -38,7 +38,7 @@ export interface Provider<
    * cannot be classified. Each provider's catalog decides whether an
    * unclassified model is excluded or surfaced with an unknown family.
    */
-  readonly classifyModelFamily: (model: Omit<TModel, "modelFamilyId">) => Option.Option<string>
+  readonly classifyModelFamily: (model: Omit<TModel, "modelFamilyId">) => Option.Option<ModelFamilyId>
 }
 
 /**

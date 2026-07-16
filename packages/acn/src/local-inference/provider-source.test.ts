@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { FetchHttpClient } from "@effect/platform"
 import { Effect, Layer, Option, Stream } from "effect"
 import { LlamaCpp } from "@magnitudedev/local-inference"
+import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { LocalInferencePlatform, type LocalInferencePlatformApi } from "./platform"
 import { LocalModelConfiguration, type LocalModelConfigurationApi } from "./model-configuration"
 import { LocalModelProviderSource, LocalModelProviderSourceLive, resolveLlamaModelInformation, type LlamaLogicalRoute } from "./provider-source"
@@ -29,7 +30,7 @@ describe("LocalModelProviderSource", () => {
         serverReportedSizeBytes: Option.none(), inputModalities: Option.none(), outputModalities: Option.none(), loadProgress: Option.none(), failure: Option.none(),
       },
     }] as const satisfies readonly LlamaLogicalRoute[]
-    const resolved = resolveLlamaModelInformation("lmp_test", path, routes)
+    const resolved = resolveLlamaModelInformation(ProviderModelIdSchema.make("lmp_test"), path, routes)
     expect(resolved.information.displayName).toBe("Gemma-4-E4B-It")
     expect(resolved.information.displayNameSource).toBe("gguf_metadata")
     expect(resolved.evidence.map((item) => item._tag)).toEqual(["IndexedArtifact", "ServerReported"])

@@ -7,6 +7,8 @@ import type {
   BoundModel,
   BaseCallOptions,
   ProviderModelBindOptions,
+  ProviderId,
+  ProviderModelId,
 } from "@magnitudedev/ai"
 import type { MagnitudeProviderInstance } from "./magnitude/provider"
 import { makeAggregatedCatalog } from "./catalog-aggregator"
@@ -17,7 +19,7 @@ export type AuthStatus =
   | { readonly _tag: "not_configured"; readonly reason: string }
 
 export interface ProviderInfo {
-  readonly id: string
+  readonly id: ProviderId
   readonly displayName: string
   readonly authStatus: AuthStatus
   readonly status?: "ok" | "loading" | "not_found" | "error"
@@ -36,7 +38,7 @@ export interface DiscoverableProviderInstance {
 }
 
 export interface ProviderRegistryService {
-  readonly listProviderIds: Effect.Effect<readonly string[]>
+  readonly listProviderIds: Effect.Effect<readonly ProviderId[]>
   readonly listProviders: Effect.Effect<readonly ProviderInfo[], never, HttpClient.HttpClient>
   readonly aggregatedCatalog: ModelCatalog<ProviderModel>
   /**
@@ -44,8 +46,8 @@ export interface ProviderRegistryService {
    * Dispatches to the correct provider's `model()` method.
    */
   readonly resolveModel: (
-    providerId: string,
-    providerModelId: string,
+    providerId: ProviderId,
+    providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
   ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
 }
@@ -63,12 +65,12 @@ export function makeProviderRegistry(config: {
   readonly magnitude: MagnitudeProviderInstance | null
   readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
 }): ProviderRegistryService {
-  const providers = new Map<string, Pick<Provider, "id" | "bindModel" | "catalog">>()
+  const providers = new Map<ProviderId, Pick<Provider, "id" | "bindModel" | "catalog">>()
   const providerInfos: ProviderInfo[] = []
 
   if (config.magnitude) {
-    providers.set("magnitude", config.magnitude.provider)
-    providerInfos.push({ id: "magnitude", displayName: "Magnitude", authStatus: { _tag: "authenticated" } })
+    providers.set(config.magnitude.provider.id, config.magnitude.provider)
+    providerInfos.push({ id: config.magnitude.provider.id, displayName: "Magnitude", authStatus: { _tag: "authenticated" } })
   }
 
   for (const instance of config.discoverableProviders ?? []) {

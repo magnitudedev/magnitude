@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Effect, Ref } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import type { ProviderAuth } from "@magnitudedev/protocol"
-import type { ProviderClientShape } from "@magnitudedev/sdk"
+import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, type ProviderClientShape } from "@magnitudedev/sdk"
 import {
   makeDelegatingProviderClient,
   resolveEndpointProviderAuthFromStorage,
@@ -68,9 +68,9 @@ describe("endpoint provider auth resolution", () => {
 const providerClient = (label: string): ProviderClientShape => ({
   catalog: {
     list: Effect.succeed([{
-      providerId: label,
-      providerModelId: "model",
-      modelFamilyId: "family",
+      providerId: ProviderIdSchema.make(label),
+      providerModelId: ProviderModelIdSchema.make("model"),
+      modelFamilyId: ModelFamilyIdSchema.make("family"),
       displayName: label,
       contextWindow: 1,
       maxOutputTokens: 1,

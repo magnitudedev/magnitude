@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from 'vitest'
 import { Effect, Layer, Option } from 'effect'
+import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema } from '@magnitudedev/ai'
 import {
   ProjectionBusTag,
   makeProjectionBusLayer,
@@ -25,8 +26,8 @@ import { serializeAtif } from '../src/projections/atif/serialize'
 import { toToolKeyErased } from '../src/tools/toolkits'
 
 const mockModels = [
-  { providerModelId: 'primary-model', providerId: 'magnitude', modelFamilyId: 'unknown', availability: { _tag: 'Available' as const }, reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
-  { providerModelId: 'secondary-model', providerId: 'magnitude', modelFamilyId: 'unknown', availability: { _tag: 'Available' as const }, reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+  { providerModelId: ProviderModelIdSchema.make('primary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' as const }, reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+  { providerModelId: ProviderModelIdSchema.make('secondary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' as const }, reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
 ] as const
 
 const mockConfigState = buildConfigState(mockModels, null, {

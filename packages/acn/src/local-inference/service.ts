@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Ref, Stream } from "effect"
+import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import {
   LocalInferenceError,
@@ -9,6 +9,7 @@ import {
 } from "@magnitudedev/protocol"
 import { HuggingFace, LlamaCpp, ModelFiles } from "@magnitudedev/local-inference"
 import type { DurableLocalModelBinding } from "@magnitudedev/storage"
+import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { LOCAL_MODEL_CATALOG } from "./catalog"
 import { LocalModelConfiguration, type ModelConfigurationError } from "./model-configuration"
 import { LocalInferencePlatform } from "./platform"
@@ -33,6 +34,8 @@ const localError = (code: LocalInferenceError["code"], operation: string, messag
   new LocalInferenceError({ code, operation, message, retryable })
 const fromConfiguration = (error: ModelConfigurationError) =>
   localError("configuration_failed", error.operation, error.reason, true)
+const storedProviderModelId = (value: string) =>
+  Schema.is(ProviderModelIdSchema)(value) ? value : undefined
 const mapFailure = (operation: string, cause: unknown) => localError(
   "configuration_failed",
   operation,
@@ -186,8 +189,10 @@ export const LocalInferenceLive: Layer.Layer<
   const restart = lock.withPermits(1)(Effect.gen(function* () {
     const config = yield* configured
     if (!config.binding || config.binding._tag !== "Managed") return yield* localError("invalid_selection", "restart local model", "There is no managed local model to restart.")
+    const providerModelId = storedProviderModelId(config.binding.providerModelId)
+    if (!providerModelId) return yield* localError("invalid_selection", "restart local model", "The configured local model ID is invalid.")
     yield* source.stopManaged.pipe(Effect.mapError((cause) => mapFailure("restart local model", cause)))
-    yield* source.warm(config.binding.providerModelId).pipe(Effect.mapError((cause) => mapFailure("restart local model", cause)))
+    yield* source.warm(providerModelId).pipe(Effect.mapError((cause) => mapFailure("restart local model", cause)))
   }))
 
   const disable = lock.withPermits(1)(Effect.gen(function* () {
@@ -232,12 +237,13 @@ export const LocalInferenceLive: Layer.Layer<
         : { _tag: "StoredExternal" as const, ...common }
     })
     const binary = Option.orElse(distribution.configured, () => Option.orElse(distribution.managed, () => distribution.path))
+    const activeProviderModelId = config.binding ? storedProviderModelId(config.binding.providerModelId) : undefined
     return {
       usage: config.usage ?? null,
-      activeBinding: config.binding
+      activeBinding: config.binding && activeProviderModelId
         ? config.binding._tag === "Managed"
-          ? { _tag: "Managed" as const, selectionId: config.binding.selectionId, providerModelId: config.binding.providerModelId, contextTokens: config.binding.contextTokens }
-          : { _tag: "External" as const, selectionId: config.binding.selectionId, providerModelId: config.binding.providerModelId, contextTokens: config.binding.contextTokens }
+          ? { _tag: "Managed" as const, selectionId: config.binding.selectionId, providerModelId: activeProviderModelId, contextTokens: config.binding.contextTokens }
+          : { _tag: "External" as const, selectionId: config.binding.selectionId, providerModelId: activeProviderModelId, contextTokens: config.binding.contextTokens }
         : null,
       distribution: Option.match(binary, {
         onNone: () => ({ _tag: "Missing" as const }),

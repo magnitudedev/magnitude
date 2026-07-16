@@ -6,6 +6,7 @@
  */
 import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+import { ProviderIdSchema } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 
 export interface ApiKeyState {
@@ -44,7 +45,7 @@ function maskApiKey(key: string): string {
   return `${head}………${tail}`
 }
 
-const MAGNITUDE_PROVIDER_ID = "magnitude"
+const MAGNITUDE_PROVIDER_ID = ProviderIdSchema.make("magnitude")
 
 export function useSettingsState(): UseSettingsStateResult {
   const client = useAgentClient()

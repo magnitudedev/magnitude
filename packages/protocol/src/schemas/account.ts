@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema } from "@magnitudedev/ai"
 
 export const RoleId = Schema.Literal(
   "leader",
@@ -25,8 +26,8 @@ export type SlotId = Schema.Schema.Type<typeof SlotId>
 /** Effective slot config (read-only, sent to client for display). */
 export const SlotProfile = Schema.Struct({
   slotId: SlotId,
-  providerId: Schema.String,
-  providerModelId: Schema.String,
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
   modelDisplayName: Schema.String,
   contextWindow: Schema.Number,
   maxOutputTokens: Schema.Number,
@@ -43,8 +44,8 @@ export type SlotProfiles = Schema.Schema.Type<typeof SlotProfiles>
 
 /** Persisted per-slot user config (providerId/providerModelId/reasoningEffort overrides). */
 export const SlotModelConfigSchema = Schema.Struct({
-  providerId: Schema.optional(Schema.String),
-  providerModelId: Schema.optional(Schema.String),
+  providerId: Schema.optional(ProviderIdSchema),
+  providerModelId: Schema.optional(ProviderModelIdSchema),
   reasoningEffort: Schema.optional(Schema.String),
 })
 export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
@@ -63,7 +64,7 @@ export const AuthStatusSchema = Schema.Literal("authenticated", "no_auth_require
 export type AuthStatus = Schema.Schema.Type<typeof AuthStatusSchema>
 
 export const ProviderInfoSchema = Schema.Struct({
-  id: Schema.String,
+  id: ProviderIdSchema,
   displayName: Schema.String,
   authStatus: AuthStatusSchema,
   status: Schema.optional(Schema.Literal("ok", "loading", "not_found", "error")),
@@ -92,9 +93,9 @@ export type ProviderModelAvailability = Schema.Schema.Type<typeof ProviderModelA
 // ---------------------------------------------------------------------------
 
 export const ModelSummarySchema = Schema.Struct({
-  providerId: Schema.String,
-  providerModelId: Schema.String,
-  modelFamilyId: Schema.optional(Schema.String),
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
+  modelFamilyId: Schema.optional(ModelFamilyIdSchema),
   displayName: Schema.String,
   slots: Schema.optional(Schema.Array(SlotId)),
   contextWindow: Schema.Number,

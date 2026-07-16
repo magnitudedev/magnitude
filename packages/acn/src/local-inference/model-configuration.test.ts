@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Ref } from "effect"
 import type { MagnitudeConfig } from "@magnitudedev/storage"
+import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/sdk"
 import { makeLocalModelConfiguration, reconcileLocalModelSlots, type LocalSlotCandidate } from "./model-configuration"
 
 const candidate = (
@@ -9,7 +10,7 @@ const candidate = (
   residency: "loaded" | "sleeping" | "unloaded" | "loading" | "failed" | "unknown",
   availability: LocalSlotCandidate["availability"] = "available",
 ): LocalSlotCandidate => ({
-  providerModelId,
+  providerModelId: ProviderModelIdSchema.make(providerModelId),
   availability,
   externalLoaded: ownership === "external" && residency === "loaded",
   managedLoaded: ownership === "managed" && residency === "loaded",
@@ -23,7 +24,7 @@ const candidate = (
 const reconcile = (
   current: MagnitudeConfig,
   candidates: readonly LocalSlotCandidate[],
-  authoritativeModelIds: ReadonlySet<string> = new Set(candidates.map((item) => item.providerModelId)),
+  authoritativeModelIds: ReadonlySet<ProviderModelId> = new Set(candidates.map((item) => item.providerModelId)),
 ) => reconcileLocalModelSlots(current, { authoritativeModelIds, candidates })
 
 describe("LocalModelConfiguration", () => {
@@ -132,7 +133,7 @@ describe("LocalModelConfiguration", () => {
         slots: { primary: { providerId: "llamacpp", providerModelId: "arbitrary-id" } },
         localSlotIntent: { primary: "local" },
       },
-    }, [candidate("arbitrary-id", "managed", "unloaded")], new Set(["arbitrary-id"]))
+    }, [candidate("arbitrary-id", "managed", "unloaded")], new Set([ProviderModelIdSchema.make("arbitrary-id")]))
     expect(existing.changed).toBe(false)
 
     const nonexistentHash = `lmp_${"a".repeat(64)}`
@@ -166,7 +167,7 @@ describe("LocalModelConfiguration", () => {
     }, [
       candidate("missing", "external", "failed", "disabled"),
       candidate("available", "managed", "unloaded"),
-    ], new Set(["available"]))
+    ], new Set([ProviderModelIdSchema.make("available")]))
 
     expect(result.changed).toBe(true)
     expect(result.config.localInference).toEqual({
