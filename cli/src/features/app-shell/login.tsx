@@ -85,6 +85,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
   const [validationError, setValidationError] = useState<string | null>(null)
   const [continueHovered, setContinueHovered] = useState(false)
   const [copyHovered, setCopyHovered] = useState(false)
+  const [backHovered, setBackHovered] = useState(false)
   const [skipHovered, setSkipHovered] = useState(false)
   const urlCopy = useCopyFeedback()
 
@@ -303,7 +304,28 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
         paddingBottom: 1,
         flexShrink: 0,
       }}>
-        <text style={{ fg: theme.muted }}>← back to local models · Ctrl+C close</text>
+        <box style={{ flexDirection: 'row' }}>
+          {onBack && (
+            <Button
+              onClick={onBack}
+              onMouseOver={() => setBackHovered(true)}
+              onMouseOut={() => setBackHovered(false)}
+            >
+              <box style={{
+                borderStyle: 'single',
+                borderColor: backHovered ? theme.primary : theme.border,
+                customBorderChars: BOX_CHARS,
+                paddingLeft: 1,
+                paddingRight: 1,
+              }}>
+                <text style={{ fg: backHovered ? theme.primary : theme.foreground }}>
+                  Back to local models (←)
+                </text>
+              </box>
+            </Button>
+          )}
+          <text style={{ fg: theme.muted }}>{onBack ? '  ' : ''}Ctrl+C close</text>
+        </box>
         {onSkip && (
           <Button
             onClick={handleSkip}

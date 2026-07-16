@@ -5,7 +5,9 @@ import { useSettingsState } from "@magnitudedev/client-common"
 import { Atom, useAtomMount, useAtomValue } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import { authSourceAtom } from "../../state/cli-atoms"
+import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
+import { BOX_CHARS } from "../../utils/ui-constants"
 import { MagnitudeLoginScreen } from "../app-shell/login"
 import { LocalInferenceScreen } from "../local-inference"
 
@@ -90,6 +92,7 @@ function CloudConfigured({ onFinish, onBack, onExit }: {
   readonly onExit: () => void
 }) {
   const theme = useTheme()
+  const [hoveredAction, setHoveredAction] = useState<"back" | "finish" | null>(null)
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.name === "return" || key.name === "enter") { key.preventDefault(); onFinish(); return }
     if (key.name === "left" || key.name === "backspace") { key.preventDefault(); onBack(); return }
@@ -98,7 +101,28 @@ function CloudConfigured({ onFinish, onBack, onExit }: {
   return (
     <box style={{ height: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
       <text style={{ fg: theme.success }} attributes={TextAttributes.BOLD}>Magnitude Cloud is configured.</text>
-      <text style={{ fg: theme.muted }}>Press Enter to finish model setup or ← to configure local inference.</text>
+      <text style={{ fg: theme.muted }}>Cloud fallback is ready.</text>
+      <box style={{ flexDirection: "row", paddingTop: 1 }}>
+        <Button
+          onClick={onBack}
+          onMouseOver={() => setHoveredAction("back")}
+          onMouseOut={() => setHoveredAction((current) => current === "back" ? null : current)}
+        >
+          <box style={{ borderStyle: "single", borderColor: hoveredAction === "back" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+            <text style={{ fg: hoveredAction === "back" ? theme.primary : theme.foreground }}>Back to local models (←)</text>
+          </box>
+        </Button>
+        <text>  </text>
+        <Button
+          onClick={onFinish}
+          onMouseOver={() => setHoveredAction("finish")}
+          onMouseOut={() => setHoveredAction((current) => current === "finish" ? null : current)}
+        >
+          <box style={{ borderStyle: "single", borderColor: hoveredAction === "finish" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+            <text style={{ fg: hoveredAction === "finish" ? theme.primary : theme.foreground }}>Finish setup (Enter)</text>
+          </box>
+        </Button>
+      </box>
     </box>
   )
 }
@@ -143,6 +167,7 @@ export const ModelSetupScreen = memo(function ModelSetupScreen({
   return (
     <LocalInferenceScreen
       management={mode === "management"}
+      onExit={onExit}
       onBack={() => mode === "management" ? onExit() : setStep("cloud")}
       onSkip={finishLocal}
       onConfigured={finishLocal}
