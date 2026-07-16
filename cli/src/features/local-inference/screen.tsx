@@ -1,5 +1,5 @@
-import { Fragment, memo, useCallback, useMemo, useRef, useState } from "react"
-import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from "@opentui/core"
+import { Fragment, memo, useCallback, useMemo, useState } from "react"
+import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Cause, Effect } from "effect"
 import { Atom, Result as AtomResult, useAtomMount } from "@effect-atom/atom-react"
@@ -23,6 +23,7 @@ import {
 
 interface LocalInferenceScreenProps {
   readonly management: boolean
+  readonly onExit: () => void
   readonly onBack: () => void
   readonly onSkip: () => void
   readonly onConfigured: () => void
@@ -33,6 +34,7 @@ export const LOCAL_USAGE_SETUP_WIDTH = 88
 const SECTION_LABEL_GAP = 2
 
 export type LocalUsageFocusTarget = "main" | "subagent" | "one" | "up_to_three" | "continue"
+type LocalSetupHoveredAction = "usage-skip" | "usage-recommendations" | "models-back" | "models-skip"
 export const LOCAL_USAGE_FOCUS_ORDER: readonly LocalUsageFocusTarget[] = [
   "main", "subagent", "one", "up_to_three", "continue",
 ]
@@ -79,11 +81,16 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(
   const local = useLocalInferenceState()
   const ready = AtomResult.isSuccess(local.state)
   useKeyboard(useCallback((key: KeyEvent) => {
+    if (key.ctrl && key.name === "c" && !key.meta && !key.option) {
+      key.preventDefault()
+      props.onExit()
+      return
+    }
     if (!ready && key.name === "escape") {
       key.preventDefault()
       props.onSkip()
     }
-  }, [props.onSkip, ready]))
+  }, [props.onExit, props.onSkip, ready]))
   if (AtomResult.isInitial(local.state)) {
     return (
       <box style={{ height: "100%", alignItems: "center", justifyContent: "center" }}>
@@ -114,7 +121,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   readonly local: LocalInferenceController
 }) {
   const theme = useTheme()
-  const [requestedStage, setRequestedStage] = useState<"usage" | "models">(state.usage ? "models" : "usage")
+  const [requestedStage, setRequestedStage] = useState<"usage" | "models">("usage")
   const [roleOverride, setRoleOverride] = useState<LocalModelRole | null>(null)
   const [concurrencyOverride, setConcurrencyOverride] = useState<LocalSessionConcurrency | null>(null)
   const role = roleOverride ?? state.usage?.localModelRole ?? "main"
@@ -122,9 +129,8 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const [usageRow, setUsageRow] = useState(role === "subagent" ? 1 : 0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [details, setDetails] = useState(false)
-  const [skipHovered, setSkipHovered] = useState(false)
+  const [hoveredAction, setHoveredAction] = useState<LocalSetupHoveredAction | null>(null)
   const [pendingActivationId, setPendingActivationId] = useState<string | null>(null)
-  const scrollRef = useRef<ScrollBoxRenderable | null>(null)
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
   const selectedIndex = selectedInferenceIndex(selections, selectedId)
   const selected = selections[selectedIndex]
@@ -189,6 +195,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c") return
     if (stage === "usage") {
+      if (key.name === "right") { key.preventDefault(); continueFromUsage(); return }
       if (key.name === "up" || key.name === "k") { key.preventDefault(); setUsageRow((row) => moveLocalUsageFocus(row, -1)); return }
       if (key.name === "down" || key.name === "j" || key.name === "tab") { key.preventDefault(); setUsageRow((row) => moveLocalUsageFocus(row, 1)); return }
       if (key.name === "space" || key.name === "return" || key.name === "enter") {
@@ -257,14 +264,27 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           </box>
           {busy && <text style={{ fg: theme.primary }}>Finding models for this setup…</text>}
           {error && <text style={{ fg: theme.error }}>{error}</text>}
-        </box>
-        <box style={{ flexGrow: 1 }} />
-        <box style={{ paddingTop: 1, paddingBottom: 1, flexDirection: "row", justifyContent: "space-between", width: "100%", maxWidth: LOCAL_USAGE_SETUP_WIDTH }}>
-          <text style={{ fg: theme.muted }}>↑/↓ move · Enter select</text>
-          <box style={{ flexDirection: "row" }}>
-            <Button onClick={() => { if (!busy) onSkip() }}><box style={{ borderStyle: "single", borderColor: theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}><text style={{ fg: theme.foreground }}>Skip for now (Esc)</text></box></Button>
+          <text style={{ fg: theme.muted, marginTop: 1 }}>↑/↓ move · Enter select</text>
+          <box style={{ flexDirection: "row", paddingTop: 1 }}>
+            <Button
+              onClick={() => { if (!busy) onSkip() }}
+              onMouseOver={() => setHoveredAction("usage-skip")}
+              onMouseOut={() => setHoveredAction((current) => current === "usage-skip" ? null : current)}
+            >
+              <box style={{ borderStyle: "single", borderColor: hoveredAction === "usage-skip" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+                <text style={{ fg: hoveredAction === "usage-skip" ? theme.primary : theme.foreground }}>Skip for now (Esc)</text>
+              </box>
+            </Button>
             <text>  </text>
-            <Button onClick={continueFromUsage}><box style={{ borderStyle: "single", borderColor: focusTarget === "continue" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}><text style={{ fg: focusTarget === "continue" ? theme.primary : theme.foreground }}>See recommendations</text></box></Button>
+            <Button
+              onClick={continueFromUsage}
+              onMouseOver={() => setHoveredAction("usage-recommendations")}
+              onMouseOut={() => setHoveredAction((current) => current === "usage-recommendations" ? null : current)}
+            >
+              <box style={{ borderStyle: "single", borderColor: focusTarget === "continue" || hoveredAction === "usage-recommendations" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+                <text style={{ fg: focusTarget === "continue" || hoveredAction === "usage-recommendations" ? theme.primary : theme.foreground }}>See recommendations (→)</text>
+              </box>
+            </Button>
           </box>
         </box>
       </box>
@@ -277,7 +297,14 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
   const hasExistingModels = firstRunningIndex >= 0 || firstStoredIndex >= 0
   return (
-    <box key="local-models" style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
+    <scrollbox
+      key="local-models"
+      scrollX={false}
+      scrollbarOptions={{ visible: false }}
+      verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }}
+      style={{ height: "100%", rootOptions: { backgroundColor: "transparent" }, wrapperOptions: { border: false, backgroundColor: "transparent" }, contentOptions: { flexDirection: "column" } }}
+    >
+    <box style={{ flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
       <box style={{ flexDirection: "column", paddingTop: 1, paddingBottom: 1 }}>
       <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
       <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
@@ -290,13 +317,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           <text style={{ fg: theme.warning }}>Install llama.cpp to download or run a recommended model.</text>
         </box>
       )}
-      <scrollbox
-        ref={scrollRef}
-        scrollX={false}
-        scrollbarOptions={{ visible: false }}
-        verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }}
-        style={{ flexGrow: 1, rootOptions: { flexGrow: 1, backgroundColor: "transparent" }, wrapperOptions: { border: false, backgroundColor: "transparent" }, contentOptions: { flexDirection: "column" } }}
-      >
+      <box style={{ flexDirection: "column" }}>
         {selections.length === 0
           ? <text style={{ fg: theme.warning }}>No curated model currently fits this configuration.</text>
           : selections.map((selection, index) => {
@@ -339,36 +360,40 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
             </text>
           </box>
         )}
-      </scrollbox>
+      </box>
       {busy && <text style={{ fg: theme.primary }}>Applying local model changes…</text>}
       {error && <text style={{ fg: theme.error }}>{error}</text>}
       {state.warnings.map((warning) => <text key={warning.code} style={{ fg: theme.warning }}>{warning.message}</text>)}
-      <box style={{ paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: "row", justifyContent: "space-between" }}>
-        <box style={{ flexDirection: "row" }}>
-          <Button onClick={() => { if (!busy) setRequestedStage("usage") }}>
-            <box style={{ borderStyle: "single", borderColor: theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
-              <text style={{ fg: theme.foreground }}>Back (←)</text>
-            </box>
-          </Button>
-          <text style={{ fg: theme.muted }}>
-            {"  "}↑/↓ choose · D details
-            {selected?.kind === "recommendation"
-              ? state.distribution._tag === "Ready" ? " · Enter download" : " · Enter install"
-              : " · Enter use"}
-          </text>
-        </box>
+      <text style={{ fg: theme.muted, marginTop: 1 }}>
+        ↑/↓ choose · D details
+        {selected?.kind === "recommendation"
+          ? state.distribution._tag === "Ready" ? " · Enter download" : " · Enter install"
+          : " · Enter use"}
+      </text>
+      <box style={{ paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: "row" }}>
+        <Button
+          onClick={() => { if (!busy) setRequestedStage("usage") }}
+          onMouseOver={() => setHoveredAction("models-back")}
+          onMouseOut={() => setHoveredAction((current) => current === "models-back" ? null : current)}
+        >
+          <box style={{ borderStyle: "single", borderColor: hoveredAction === "models-back" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+            <text style={{ fg: hoveredAction === "models-back" ? theme.primary : theme.foreground }}>Back (←)</text>
+          </box>
+        </Button>
+        <text>  </text>
         <Button
           onClick={() => { if (!busy) onSkip() }}
-          onMouseOver={() => setSkipHovered(true)}
-          onMouseOut={() => setSkipHovered(false)}
+          onMouseOver={() => setHoveredAction("models-skip")}
+          onMouseOut={() => setHoveredAction((current) => current === "models-skip" ? null : current)}
         >
-          <box style={{ borderStyle: "single", borderColor: skipHovered ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
-            <text style={{ fg: skipHovered ? theme.primary : theme.foreground }}>
+          <box style={{ borderStyle: "single", borderColor: hoveredAction === "models-skip" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+            <text style={{ fg: hoveredAction === "models-skip" ? theme.primary : theme.foreground }}>
               Skip for now (Esc)
             </text>
           </box>
         </Button>
       </box>
     </box>
+    </scrollbox>
   )
 })
