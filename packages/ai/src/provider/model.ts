@@ -50,6 +50,26 @@ export interface ModelFamily {
   readonly capabilities: ModelFamilyCapabilities
 }
 
+export type ProviderModelDisabledReason =
+  | "insufficient_resources"
+  | "provider_unavailable"
+  | "model_unavailable"
+  | "incompatible_runtime"
+  | "invalid_configuration"
+
+export type ProviderModelAvailability =
+  | { readonly _tag: "Available" }
+  | {
+      readonly _tag: "Disabled"
+      readonly reason: ProviderModelDisabledReason
+    }
+
+export const AVAILABLE_PROVIDER_MODEL: ProviderModelAvailability = { _tag: "Available" }
+
+export const isProviderModelAvailable = (
+  model: Pick<ProviderModel, "availability">,
+): boolean => model.availability._tag === "Available"
+
 /**
  * A model as offered by a specific provider.
  * Properties here MAY differ across providers serving the same family.
@@ -69,6 +89,8 @@ export interface ProviderModel {
   readonly maxOutputTokens: number
   /** Capabilities as served by this provider (may be a subset of family capabilities) */
   readonly capabilities: ProviderModelCapabilities
+  /** Whether this catalog entry can currently occupy a model slot. */
+  readonly availability: ProviderModelAvailability
   /** Pricing — provider-specific (per 1M tokens, USD) */
   readonly pricing: ModelPricingInfo
   /**

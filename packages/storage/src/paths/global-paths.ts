@@ -8,7 +8,7 @@ export interface GlobalStoragePaths {
 
   readonly configFile: string
   readonly authFile: string
-  readonly modelCacheFile: string
+  readonly localModelIndexFile: string
 
   readonly sessionsRoot: string
   readonly indexRoot: string
@@ -75,7 +75,7 @@ export function makeGlobalStoragePaths(root: string): GlobalStoragePaths {
 
     configFile: join(root, 'config.json'),
     authFile: join(root, 'auth.json'),
-    modelCacheFile: join(root, 'model-cache.json'),
+    localModelIndexFile: join(root, 'local-model-index.json'),
 
     sessionsRoot,
     indexRoot,

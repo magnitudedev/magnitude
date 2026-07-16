@@ -7,9 +7,12 @@ import {
   SlotId,
   SlotProfiles,
   SlotModelConfigSchema,
-  ModelListSchema,
+  ModelCatalogSchema,
+  ModelSlotsSchema,
+  ModelResourceInvalidationSchema,
   ProviderAuthSchema,
 } from "../schemas/account"
+import { StreamHeartbeat } from "../schemas/events"
 
 export const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
   payload: Schema.Struct({
@@ -56,26 +59,44 @@ export const ListPublicSlotProfiles = Rpc.make("ListPublicSlotProfiles", {
   error: SessionError
 })
 
-export const UpdateModelConfig = Rpc.make("UpdateModelConfig", {
+export const GetModelCatalog = Rpc.make("GetModelCatalog", {
+  payload: Schema.Struct({}),
+  success: ModelCatalogSchema,
+  error: SessionError,
+})
+
+export const WatchModelCatalog = Rpc.make("WatchModelCatalog", {
+  payload: Schema.Struct({}),
+  success: Schema.Union(ModelResourceInvalidationSchema, StreamHeartbeat),
+  error: SessionError,
+  stream: true,
+})
+
+export const RefreshModelCatalog = Rpc.make("RefreshModelCatalog", {
+  payload: Schema.Struct({
+    providerId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  }),
+  success: Schema.Struct({}),
+  error: SessionError,
+})
+
+export const GetModelSlots = Rpc.make("GetModelSlots", {
+  payload: Schema.Struct({}),
+  success: ModelSlotsSchema,
+  error: SessionError,
+})
+
+export const WatchModelSlots = Rpc.make("WatchModelSlots", {
+  payload: Schema.Struct({}),
+  success: Schema.Union(ModelResourceInvalidationSchema, StreamHeartbeat),
+  error: SessionError,
+  stream: true,
+})
+
+export const UpdateModelSlots = Rpc.make("UpdateModelSlots", {
   payload: Schema.Struct({
     slots: Schema.partial(Schema.Record({ key: SlotId, value: SlotModelConfigSchema })),
   }),
   success: Schema.Struct({}),
-  error: SessionError
-})
-
-export const GetCachedModelList = Rpc.make("GetCachedModelList", {
-  payload: Schema.Struct({
-    providerId: Schema.optional(Schema.String),
-  }),
-  success: ModelListSchema,
-  error: SessionError
-})
-
-export const RefreshCachedModelList = Rpc.make("RefreshCachedModelList", {
-  payload: Schema.Struct({
-    providerId: Schema.optional(Schema.String),
-  }),
-  success: ModelListSchema,
-  error: SessionError
+  error: SessionError,
 })

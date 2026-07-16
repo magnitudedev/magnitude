@@ -3,7 +3,7 @@ import { FetchHttpClient, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
-import { Effect, Layer, Option, Runtime, Secret } from "effect"
+import { Effect, Layer, Option, Redacted, Runtime } from "effect"
 import {
   StorageLive,
   MagnitudeStorage,
@@ -11,8 +11,8 @@ import {
   ProjectStorageLiveFromCwd,
   VersionLive,
   defaultGlobalStorageRoot,
+  makeGlobalStoragePaths,
 } from "@magnitudedev/storage"
-import { LlamaCppLive } from "@magnitudedev/llamacpp"
 import { MagnitudeRpcs } from "@magnitudedev/protocol"
 import { HandlersLive } from "./handlers"
 import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
@@ -31,7 +31,8 @@ import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import {
   LocalInferenceLive,
-  LocalModelProviderBackendLive,
+  LocalInferencePlatformLive,
+  LocalModelProviderSourceLive,
   LocalModelConfigurationLive,
   ModelConfigurationPropagationLive,
 } from "./local-inference"
@@ -184,45 +185,37 @@ const makeAcnServicesBase = (debug: boolean) => {
   return Layer.provideMerge(AcnActivityTrackerLive, withDestroyer)
 }
 
-const llamaCppPackageLayer = () => {
+const localInferencePlatformLayer = () => {
   const root = defaultGlobalStorageRoot()
+  const paths = makeGlobalStoragePaths(root)
   return Layer.unwrapEffect(Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
-    return LlamaCppLive({
-      distribution: {
-        managedRoot: `${root}/llamacpp/distribution`,
-        ...(process.env.LLAMA_CPP_SERVER_PATH?.trim()
-          ? { configuredExecutable: process.env.LLAMA_CPP_SERVER_PATH.trim() }
-          : {}),
-      },
-      modelStore: {
-        ownedRoot: `${root}/llamacpp/models`,
-      },
-      runtime: {
-        runtimeRoot: `${root}/llamacpp/runtime`,
-        externalConnections: () => resolveLlamaCppAuth(storage).pipe(
-          Effect.map((auth) => auth
-            ? [{
-                connectionId: "llamacpp",
-                connection: {
-                  baseUrl: auth.endpoint,
-                  apiKey: auth.apiKey
-                    ? Option.some(Secret.fromString(auth.apiKey))
-                    : Option.none(),
-                },
-              }]
-            : []),
-        ),
-      },
+    return LocalInferencePlatformLive({
+      root: `${root}/local-inference`,
+      indexPath: paths.localModelIndexFile,
+      configuredExecutable: Option.fromNullable(process.env.LLAMA_CPP_SERVER_PATH?.trim() || undefined),
+      external: resolveLlamaCppAuth(storage).pipe(
+        Effect.flatMap((auth) => auth
+          ? Effect.try({
+              try: () => [{
+                id: "llamacpp",
+                origin: new URL(auth.endpoint),
+                apiKey: auth.apiKey ? Option.some(Redacted.make(auth.apiKey)) : Option.none(),
+              }],
+              catch: () => [] as const,
+            })
+          : Effect.succeed([])),
+        Effect.catchAll(() => Effect.succeed([])),
+      ),
     })
   }))
 }
 
 const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {
-  const withPackage = Layer.provideMerge(llamaCppPackageLayer(), base)
+  const withPackage = Layer.provideMerge(localInferencePlatformLayer(), base)
   const withConfiguration = Layer.provideMerge(LocalModelConfigurationLive, withPackage)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withConfiguration)
-  const withBackend = Layer.provideMerge(LocalModelProviderBackendLive, withOnboarding)
+  const withBackend = Layer.provideMerge(LocalModelProviderSourceLive, withOnboarding)
   const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withBackend)
   return Layer.provideMerge(LocalInferenceLive, withProviderClients)
 }

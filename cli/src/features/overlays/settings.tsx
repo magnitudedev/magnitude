@@ -52,6 +52,14 @@ function formatPricing(pricing: { input: number; output: number; cachedInput?: n
   return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
 }
 
+const disabledReasonLabel = (reason: "insufficient_resources" | "provider_unavailable" | "model_unavailable" | "incompatible_runtime" | "invalid_configuration"): string => ({
+  insufficient_resources: 'not enough free memory',
+  provider_unavailable: 'server unavailable',
+  model_unavailable: 'model unavailable',
+  incompatible_runtime: 'incompatible runtime',
+  invalid_configuration: 'invalid configuration',
+})[reason]
+
 function maskApiKey(key: string): string {
   const trimmed = key.trim()
   if (trimmed.length <= 12) return '•'.repeat(Math.max(trimmed.length, 4))
@@ -155,7 +163,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       return models.map(m => ({
         id: m.providerModelId,
         providerId: m.providerId,
-        label: `${m.displayName} · ${formatContextWindow(m.contextWindow)} ctx${m.pricing ? ` · ${formatPricing(m.pricing)}` : ''}`,
+        label: `${m.displayName} · ${formatContextWindow(m.contextWindow)} ctx${m.pricing ? ` · ${formatPricing(m.pricing)}` : ''}${m.availability._tag === 'Disabled' ? ` · ${disabledReasonLabel(m.availability.reason)}` : ''}`,
+        disabled: m.availability._tag === 'Disabled',
       }))
     }
     return REASONING_OPTIONS.map(o => ({ id: o.value, label: o.label }))
@@ -174,7 +183,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     if (!dropdownTarget || !modelConfig) return
     if (dropdownTarget.field === 'model') {
       const model = modelConfig.models?.[index]
-      if (!model) return
+      if (!model || model.availability._tag === 'Disabled') return
       void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.providerModelId)
     } else {
       const option = REASONING_OPTIONS[index]
@@ -400,7 +409,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           const currentOverride = modelConfig?.slotConfig?.[slotId] ?? null
           const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
           const currentEffort = currentOverride?.reasoningEffort ?? defaultEffort
-          const defaultModel = models?.find(m => m.slots?.includes(slotId)) ?? models?.[0] ?? null
+          const availableModels = models?.filter(m => m.availability._tag === 'Available') ?? null
+          const defaultModel = availableModels?.find(m => m.slots?.includes(slotId)) ?? availableModels?.[0] ?? null
           const effectiveModel = currentOverride?.providerId && currentOverride.providerModelId
             ? models?.find(m =>
                 m.providerId === currentOverride.providerId
@@ -462,10 +472,11 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                             <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>No models</span></text>
                           ) : dropdownItems.map((item, index) => {
                             const sel = index === dropdownIndex
+                            const itemDisabled = 'disabled' in item && item.disabled
                             return (
-                              <Button key={`${'providerId' in item ? item.providerId : 'model'}:${item.id}`} onClick={() => selectDropdownItem(index)} onMouseOver={() => setDropdownIndex(index)}
+                              <Button key={`${'providerId' in item ? item.providerId : 'model'}:${item.id}`} onClick={() => { if (!itemDisabled) selectDropdownItem(index) }} onMouseOver={() => setDropdownIndex(index)}
                                 style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.terminalDetectedBg }}>
-                                <text style={{ fg: sel ? theme.primary : theme.foreground, overflow: 'hidden' }}>
+                                <text style={{ fg: itemDisabled ? theme.muted : sel ? theme.primary : theme.foreground, overflow: 'hidden' }}>
                                   {sel ? '▸ ' : '  '}{item.label.length > maxLen - 2 ? item.label.slice(0, maxLen - 3) + '…' : item.label}
                                 </text>
                               </Button>

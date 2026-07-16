@@ -7,7 +7,7 @@
   "types": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bunx --bun vitest run src/types/session.test.ts src/io/structured-file.test.ts src/io/boundary-architecture.test.ts src/sessions/storage.test.ts"
+    "test": "bunx --bun vitest run src/types/session.test.ts src/types/config.test.ts src/io/structured-file.test.ts src/io/boundary-architecture.test.ts src/config/storage.test.ts src/sessions/storage.test.ts"
   },
   "dependencies": {
     "@effect/platform": "^0.96.0",

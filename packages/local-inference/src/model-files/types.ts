@@ -1,5 +1,5 @@
 import { Context, Data, Option, Schema, type Effect, type Stream } from "effect"
-import type {
+import {
   ModelArtifactKey,
   ModelContentId,
   ModelFileFormatId,
@@ -157,6 +157,90 @@ export interface InspectedModelArtifact {
   readonly warnings: readonly ModelFileWarning[]
 }
 
+export const SourceFileEntrySchema = Schema.Struct({
+  key: SourceFileKey,
+  path: Schema.String,
+  relativePath: Schema.String,
+  sizeBytes: Schema.NonNegativeInt,
+  modifiedAtMillis: Schema.optionalWith(Schema.NonNegativeInt, { as: "Option", exact: true }),
+  sha256: Schema.optionalWith(Sha256Digest, { as: "Option", exact: true }),
+  declaredRole: Schema.optionalWith(ModelFileRole, { as: "Option", exact: true }),
+  shardIndex: Schema.optionalWith(Schema.NonNegativeInt, { as: "Option", exact: true }),
+})
+
+export const SourceFileSetSchema = Schema.Struct({
+  id: SourceFileSetId,
+  artifactKey: Schema.optionalWith(ModelArtifactKey, { as: "Option", exact: true }),
+  sourceId: ModelFileSourceId,
+  entries: Schema.Array(SourceFileEntrySchema),
+  relationships: Schema.Array(Schema.Struct({
+    kind: SourceFileRelationshipKind,
+    from: SourceFileKey,
+    to: SourceFileKey,
+  })),
+  origin: Schema.optionalWith(Schema.Struct({
+    kind: ModelOriginKind,
+    repository: ModelOriginRepositoryId,
+    revision: Schema.optionalWith(ModelOriginRevisionId, { as: "Option", exact: true }),
+  }), { as: "Option", exact: true }),
+})
+
+export const ModelFileMetadataSchema = Schema.Struct({
+  name: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  architecture: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  ggufFileType: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  quantization: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  trainedContextTokens: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  parameterCount: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  embeddingLength: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  blockCount: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  attentionHeadCount: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  vocabularySize: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  feedForwardLength: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  expertCount: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  expertUsedCount: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
+  tokenizerModel: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  tokenizerPre: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  chatTemplate: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  baseModelNames: Schema.Array(Schema.String),
+  baseModelRepositories: Schema.Array(Schema.String),
+  inputModalities: Schema.optionalWith(Schema.Array(Schema.String), { as: "Option", exact: true }),
+  outputModalities: Schema.optionalWith(Schema.Array(Schema.String), { as: "Option", exact: true }),
+})
+
+export const ModelFileWarningSchema = Schema.Union(
+  Schema.TaggedStruct("DuplicatePart", { key: SourceFileKey }),
+  Schema.TaggedStruct("RelationshipConflict", { key: SourceFileKey, declaredRole: ModelFileRole }),
+  Schema.TaggedStruct("IncompleteSplit", { expectedParts: Schema.NonNegativeInt, observedParts: Schema.NonNegativeInt }),
+)
+
+export const InspectedModelArtifactSchema = Schema.Struct({
+  key: ModelArtifactKey,
+  displayName: Schema.String,
+  parts: Schema.Array(Schema.Struct({ entry: SourceFileEntrySchema, role: ModelFileRole })),
+  metadata: ModelFileMetadataSchema,
+  warnings: Schema.Array(ModelFileWarningSchema),
+})
+
+export const LocalModelFileIndexSchema = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  capturedAt: Schema.DateFromString,
+  sets: Schema.Array(Schema.Struct({
+    sourceId: ModelFileSourceId,
+    set: SourceFileSetSchema,
+    formatId: ModelFileFormatId,
+    version: Schema.String,
+    artifacts: Schema.Array(InspectedModelArtifactSchema),
+  })),
+  issues: Schema.Array(Schema.Struct({
+    sourceId: ModelFileSourceId,
+    code: SourceDiscoveryIssueCode,
+    message: Schema.String,
+    sourceKey: Schema.optionalWith(SourceFileKey, { as: "Option", exact: true }),
+  })),
+})
+export type LocalModelFileIndex = Schema.Schema.Type<typeof LocalModelFileIndexSchema>
+
 export interface ModelFileFormat {
   readonly id: ModelFileFormatId
   readonly recognize: (file: SourceFileEntry) => Effect.Effect<boolean, ModelFormatError>
@@ -236,6 +320,7 @@ export interface ModelFileRegistryApi {
   readonly get: (id: ModelFileId) => Effect.Effect<ModelFileRecord, ModelFileNotFound>
   readonly resolve: (id: ModelFileId) => Effect.Effect<ResolvedModelFiles, ModelFileResolveError>
   readonly remove: (id: ModelFileId) => Effect.Effect<void, ModelFileDeleteError>
+  readonly index: Effect.Effect<LocalModelFileIndex>
 }
 export class ModelFileRegistry extends Context.Tag("@magnitudedev/local-inference/ModelFileRegistry")<ModelFileRegistry, ModelFileRegistryApi>() {}
 

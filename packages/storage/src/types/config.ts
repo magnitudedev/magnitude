@@ -40,6 +40,12 @@ export const ModelConfigSchema = Schema.Struct({
   slots: Schema.optional(
     Schema.partial(Schema.Record({ key: SlotIdSchema, value: SlotModelConfigSchema }))
   ),
+  localSlotIntent: Schema.optional(
+    Schema.partial(Schema.Record({ key: SlotIdSchema, value: Schema.Literal('local', 'cloud') }))
+  ),
+  localModelRecency: Schema.optional(
+    Schema.partial(Schema.Record({ key: SlotIdSchema, value: Schema.Array(Schema.String) }))
+  ),
 })
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 

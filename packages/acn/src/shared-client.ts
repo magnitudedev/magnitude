@@ -1,18 +1,15 @@
 import { Context, Effect, Layer, Ref } from "effect"
-import { FetchHttpClient } from "@effect/platform"
 import {
   ProviderClient,
   createProviderClient,
   type ProviderClientShape,
 } from "@magnitudedev/sdk"
-import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
-  GlobalStorage,
   MagnitudeStorage,
   type AuthStorageShape,
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
-import { LocalModelProviderBackend } from "./local-inference/provider-backend"
+import { LocalModelProviderSource } from "./local-inference/provider-source"
 
 const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,
@@ -99,13 +96,12 @@ export class ProviderClientRegistry extends Context.Tag("ProviderClientRegistry"
 export const ProviderClientRegistryLive: Layer.Layer<
   ProviderClientRegistry,
   never,
-  MagnitudeStorage | GlobalStorage | LocalModelProviderBackend
+  MagnitudeStorage | LocalModelProviderSource
 > = Layer.effect(
   ProviderClientRegistry,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
-    const globalStorage = yield* GlobalStorage
-    const llamacppBackend = yield* LocalModelProviderBackend
+    const llamacpp = yield* LocalModelProviderSource
     const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
     const lock = yield* Effect.makeSemaphore(1)
 
@@ -114,16 +110,20 @@ export const ProviderClientRegistryLive: Layer.Layer<
       const client = createProviderClient({
         ...(apiKey ? { apiKey } : {}),
         ...(sessionId ? { sessionId } : {}),
-        llamacppBackend,
+        llamacpp,
       })
-      const catalog = makeFileBackedModelCatalog(client.catalog, globalStorage.paths.modelCacheFile)
+      const withLiveLocalModels = (models: readonly import("@magnitudedev/ai").ProviderModel[]) =>
+        llamacpp.catalog.list.pipe(
+          Effect.map((local) => [...models.filter((model) => model.providerId !== "llamacpp"), ...local]),
+        )
+      const catalog: ProviderClientShape["catalog"] = {
+        list: client.catalog.list.pipe(Effect.flatMap(withLiveLocalModels)),
+        refresh: client.catalog.refresh.pipe(Effect.flatMap(withLiveLocalModels)),
+        get: (providerId, providerModelId) => providerId === "llamacpp"
+          ? llamacpp.catalog.get(providerId, providerModelId)
+          : client.catalog.get(providerId, providerModelId),
+      }
       const fileBacked: ProviderClientShape = { ...client, catalog }
-      yield* catalog.refresh.pipe(
-        Effect.provide(FetchHttpClient.layer),
-        Effect.catchAll((cause) => Effect.logWarning("Provider catalog refresh failed").pipe(
-          Effect.annotateLogs({ sessionId: sessionId ?? "shared", cause: String(cause) }),
-        )),
-      )
       return fileBacked
     })
 

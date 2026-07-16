@@ -1,6 +1,7 @@
 export * from "./identity"
 export * from "./binary"
 export * from "./distribution"
+export * from "./release"
 export * from "./cli-errors"
 export * from "./execution-profile"
 export * from "./fit"

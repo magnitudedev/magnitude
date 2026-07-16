@@ -12,7 +12,6 @@
     "@effect/platform": "^0.96.0",
     "@effect/platform-bun": "^0.90.0",
     "@magnitudedev/ai": "workspace:*",
-    "@magnitudedev/llamacpp": "workspace:*",
     "@magnitudedev/roles": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
     "effect": "3.21.2"

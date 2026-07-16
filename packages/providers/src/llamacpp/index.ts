@@ -1,14 +1,11 @@
 export {
   createLlamaCppProvider,
-  makeFixedEndpointBackend,
   PROVIDER_ID,
-  DEFAULT_LLAMACPP_ENDPOINT,
-  LlamaCppProviderBackendError,
-  type LlamaCppProviderComponents,
-  type LlamaCppProviderBackend,
-  type FixedLlamaCppEndpointConfig,
+  LlamaCppAcquisitionError,
+  type LlamaCppInferenceLease,
+  type LlamaCppProviderInstance,
+  type LlamaCppProviderSource,
 } from "./provider"
-export { createLlamaCppCatalog } from "./catalog"
 export {
   createLlamaCppCompatibleSpec,
   type LlamaCppCallOptions,
@@ -20,19 +17,5 @@ export {
 } from "./errors"
 export type {
   LlamaCppModelInfo,
-  LlamaCppDiscoveryResult,
-  LlamaCppRawModel,
-  LlamaCppModelMeta,
   LlamaCppToolChoice,
-  ServerProps,
-  ServerStatus,
 } from "./contract"
-export {
-  checkServerHealth,
-  fetchModelList,
-  fetchServerProps,
-  deriveDisplayName,
-  deriveContextWindow,
-  detectVision,
-} from "./discovery"
-export type { CheckServerHealthOptions } from "./discovery"

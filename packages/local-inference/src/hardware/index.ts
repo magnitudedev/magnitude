@@ -52,14 +52,20 @@ const parseNativeArchitecture = (
   processArchitecture: string,
   value: string,
 ): Effect.Effect<string, NativeArchitectureOutputError> => {
+  const normalize = (architecture: string): string => {
+    const value = architecture.trim().toLowerCase()
+    if (value === "x86_64" || value === "amd64" || value === "x64") return "x64"
+    if (value === "aarch64" || value === "arm64") return "arm64"
+    return architecture.trim()
+  }
   if (hostPlatform !== "darwin") {
     return value.length > 0
-      ? Effect.succeed(value)
+      ? Effect.succeed(normalize(value))
       : Effect.fail(new NativeArchitectureOutputError({ platform: hostPlatform, output: value }))
   }
 
   if (value === "1") return Effect.succeed("arm64")
-  if (value === "0") return Effect.succeed(processArchitecture)
+  if (value === "0") return Effect.succeed(normalize(processArchitecture))
 
   return Effect.fail(new NativeArchitectureOutputError({
     platform: hostPlatform,
@@ -73,7 +79,9 @@ const inspectNativeArchitecture = (hostPlatform: NodeJS.Platform, processArchite
       Option.fromNullable(process.env.PROCESSOR_ARCHITEW6432),
       () => Option.fromNullable(process.env.PROCESSOR_ARCHITECTURE),
     )
-    return Effect.succeed(Option.getOrElse(native, () => processArchitecture))
+    return Effect.succeed(Option.getOrElse(native, () => processArchitecture)).pipe(
+      Effect.flatMap((value) => parseNativeArchitecture("win32", processArchitecture, value)),
+    )
   }
   const command = commandForNativeArchitecture(hostPlatform)
   const parser: CommandOutputParser<string, HostHardwareError> = {

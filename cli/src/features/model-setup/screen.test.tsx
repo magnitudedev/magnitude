@@ -11,6 +11,7 @@ const emptyLocalInferenceState = {
   distribution: { _tag: "Missing" },
   host: { _tag: "Unavailable", message: "not needed" },
   choices: [],
+  operations: [],
   recommendations: [],
   warnings: [],
 } as const satisfies LocalInferenceState

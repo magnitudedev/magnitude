@@ -26,6 +26,7 @@ import {
   subscribeEphemeralMessage,
   getEphemeralMessageSnapshot,
   useFileWatchBridge,
+  useLocalInferenceQuery,
 } from '@magnitudedev/client-common'
 import type { SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
@@ -201,6 +202,15 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const widget = useRecentChatsWidgetState()
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy()
   const ephemeralMessage = useSyncExternalStore(subscribeEphemeralMessage, getEphemeralMessageSnapshot)
+  const localInference = useLocalInferenceQuery()
+  const loadedLocalModels = Result.isSuccess(localInference)
+    ? localInference.value.choices.filter((choice) =>
+        (choice._tag === 'RunningExternal' || choice._tag === 'RunningManaged')
+        && ((choice.residency ?? 'loaded') === 'loaded' || choice.residency === 'sleeping'))
+    : []
+  const loadingLocalModels = Result.isSuccess(localInference)
+    ? localInference.value.operations.filter((operation) => operation.status === 'running')
+    : []
 
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
@@ -270,6 +280,16 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
               handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
               modelsConfigured={props.modelsConfigured}
             />
+            {(loadedLocalModels.length > 0 || loadingLocalModels.length > 0) && (
+              <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0 }}>
+                <text style={{ fg: theme.muted }}>
+                  {[
+                    loadedLocalModels.length > 0 ? `Local loaded: ${loadedLocalModels.map((model) => model.displayName).join(' · ')}` : null,
+                    ...loadingLocalModels.map((operation) => `Loading ${operation.providerModelId}: ${operation.stage}${operation.progress === undefined ? '' : ` ${Math.round(operation.progress * 100)}%`}`),
+                  ].filter(Boolean).join('  ·  ')}
+                </text>
+              </box>
+            )}
           </box>
 
           {clipboardToast && (

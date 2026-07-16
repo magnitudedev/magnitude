@@ -1,14 +1,15 @@
 /**
  * Model config hook — shared between web, desktop, and CLI.
  *
- * Derives everything from the `GetCachedModelList` RPC (models, slot profiles,
- * and user config all in one response).
+ * Composes the independent reactive model-catalog and model-slot resources.
  */
 import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+import { Option } from "effect"
 import { useAgentClient } from "../state/agent-client-context"
 import { SLOT_IDS, type SlotId } from "@magnitudedev/sdk"
-import type { ModelSummary, ProviderInfo } from "@magnitudedev/sdk"
+import type { ModelSummary, ProviderInfo, ProviderModelAvailability } from "@magnitudedev/sdk"
+import { useModelCatalog, useModelSlots } from "./use-reactive-rpc"
 
 export interface ModelOption {
   providerId: string
@@ -19,6 +20,7 @@ export interface ModelOption {
   contextWindow: number
   maxOutputTokens: number
   capabilities: { vision: boolean }
+  availability: ProviderModelAvailability
   reasoningEfforts: readonly string[]
   pricing: { input: number; output: number; cachedInput?: number } | null
 }
@@ -62,6 +64,7 @@ function toModelOption(model: ModelSummary): ModelOption {
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
     capabilities: { vision: model.capabilities.vision },
+    availability: model.availability,
     reasoningEfforts: model.reasoningEfforts,
     pricing: model.pricing ?? null,
   }
@@ -69,28 +72,31 @@ function toModelOption(model: ModelSummary): ModelOption {
 
 export function useModelConfig(): UseModelConfigResult {
   const client = useAgentClient()
-  const queryAtom = useMemo(
-    () => client.query("GetCachedModelList", {}, { reactivityKeys: ["modelConfig"] }),
-    [client],
-  )
-  const result = useAtomValue(queryAtom)
+  const catalogResult = useModelCatalog()
+  const slotsResult = useModelSlots()
 
-  const modelsLoading = Result.isInitial(result)
-  const modelsError = Result.isFailure(result) ? "Failed to load available models" : null
+  const modelsLoading = Result.isInitial(catalogResult)
+  const modelsError = Result.isFailure(catalogResult) ? "Failed to load available models" : null
 
-  const data = Result.match(result, {
+  const catalog = Result.match(catalogResult, {
     onInitial: () => null,
     onFailure: () => null,
     onSuccess: (success) => success.value,
   })
+  const slots = Result.match(slotsResult, {
+    onInitial: () => null,
+    onFailure: () => null,
+    onSuccess: (success) => success.value,
+  })
+  const catalogLoading = modelsLoading || (catalog?.refreshing === true && catalog.models.length === 0)
 
   const models = useMemo(() => {
-    if (!data) return null
-    return data.models.map(toModelOption)
-  }, [data])
+    if (!catalog) return null
+    return catalog.models.map(toModelOption)
+  }, [catalog])
 
-  const configResponse = data?.modelConfig ?? null
-  const providers = data?.providers ?? null
+  const configResponse = slots?.config ?? null
+  const providers = catalog?.providers ?? null
 
   const slotConfig = useMemo(() => {
     if (!configResponse) return null
@@ -113,8 +119,8 @@ export function useModelConfig(): UseModelConfigResult {
 
   // ── Mutations ──
 
-  const updateConfigAtom = useMemo(() => client.mutation("UpdateModelConfig"), [client])
-  const refreshMutationAtom = useMemo(() => client.mutation("RefreshCachedModelList"), [client])
+  const updateConfigAtom = useMemo(() => client.mutation("UpdateModelSlots"), [client])
+  const refreshMutationAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
   const updateConfigResult = useAtomValue(updateConfigAtom)
   const refreshMutationResult = useAtomValue(refreshMutationAtom)
   const updateConfig = useAtomSet(updateConfigAtom)
@@ -133,7 +139,7 @@ export function useModelConfig(): UseModelConfigResult {
             },
           },
         },
-        reactivityKeys: ["modelConfig"],
+        reactivityKeys: ["modelSlots"],
       })
     },
     [updateConfig, configResponse],
@@ -152,7 +158,7 @@ export function useModelConfig(): UseModelConfigResult {
             },
           },
         },
-        reactivityKeys: ["modelConfig"],
+        reactivityKeys: ["modelSlots"],
       })
     },
     [updateConfig, configResponse],
@@ -164,7 +170,7 @@ export function useModelConfig(): UseModelConfigResult {
         payload: {
           slots: {},
         },
-        reactivityKeys: ["modelConfig"],
+        reactivityKeys: ["modelSlots"],
       })
     },
     [updateConfig],
@@ -173,8 +179,8 @@ export function useModelConfig(): UseModelConfigResult {
   const refreshModels = useMemo(
     () => (): void => {
       refreshMutation({
-        payload: {},
-        reactivityKeys: ["modelConfig"],
+        payload: { providerId: Option.none() },
+        reactivityKeys: ["modelCatalog"],
       })
     },
     [refreshMutation],
@@ -183,7 +189,7 @@ export function useModelConfig(): UseModelConfigResult {
   return {
     models,
     providers,
-    modelsLoading,
+    modelsLoading: catalogLoading,
     modelsError,
     slotConfig,
     updateSlotModel,
@@ -192,7 +198,7 @@ export function useModelConfig(): UseModelConfigResult {
     refreshModels,
     updating: Result.isWaiting(updateConfigResult),
     updateError: Result.isFailure(updateConfigResult) ? "Failed to update model configuration" : null,
-    refreshingModels: Result.isWaiting(refreshMutationResult),
+    refreshingModels: Result.isWaiting(refreshMutationResult) || catalog?.refreshing === true,
     refreshModelsError: Result.isFailure(refreshMutationResult) ? "Failed to refresh models" : null,
   }
 }

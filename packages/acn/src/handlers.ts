@@ -31,7 +31,7 @@ import {
 } from "./ops";
 import type { AppEvent } from "@magnitudedev/agent";
 import { LocalInference } from "./local-inference";
-import { LocalModelConfiguration } from "./local-inference/model-configuration";
+import { LocalModelProviderSource } from "./local-inference/provider-source";
 import { Onboarding } from "./onboarding";
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
@@ -42,7 +42,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
     const localInference = yield* LocalInference;
-    const modelConfiguration = yield* LocalModelConfiguration;
+    const localModelSource = yield* LocalModelProviderSource;
     const onboarding = yield* Onboarding;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
@@ -289,28 +289,43 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           account.listPublicSlotProfiles
         ),
 
-      UpdateModelConfig: ({ slots }) =>
+      GetModelCatalog: () =>
+        observeRpcDefects("GetModelCatalog", account.modelCatalog),
+
+      WatchModelCatalog: () =>
+        observeRpcStreamDefects("WatchModelCatalog", withHeartbeat(account.watchModelCatalog)),
+
+      RefreshModelCatalog: ({ providerId }) =>
         observeRpcDefects(
-          "UpdateModelConfig",
-          modelConfiguration.updateSlots(slots ?? {}).pipe(
+          "RefreshModelCatalog",
+          account.refreshModelCatalog(providerId).pipe(Effect.as({})),
+        ),
+
+      GetModelSlots: () =>
+        observeRpcDefects("GetModelSlots", account.modelSlots),
+
+      WatchModelSlots: () =>
+        observeRpcStreamDefects("WatchModelSlots", withHeartbeat(account.watchModelSlots)),
+
+      UpdateModelSlots: ({ slots }) =>
+        observeRpcDefects(
+          "UpdateModelSlots",
+          Effect.gen(function* () {
+            const updates = slots ?? {}
+            yield* Effect.forEach(Object.values(updates), (slot) =>
+              slot?.providerId === "llamacpp" && slot.providerModelId
+                ? localModelSource.warm(slot.providerModelId)
+                : Effect.void,
+              { concurrency: 2, discard: true },
+            )
+            yield* account.updateModelSlots(updates)
+          }).pipe(
             Effect.mapError((error) => new SessionOperationFailed({
-              operation: error.operation,
-              reason: error.reason,
+              operation: "operation" in error ? String(error.operation) : "select local model",
+              reason: "reason" in error ? String(error.reason) : String(error),
             })),
             Effect.as({}),
-          )
-        ),
-
-      GetCachedModelList: (payload) =>
-        observeRpcDefects(
-          "GetCachedModelList",
-          account.getCachedModelList(payload.providerId)
-        ),
-
-      RefreshCachedModelList: (payload) =>
-        observeRpcDefects(
-          "RefreshCachedModelList",
-          account.refreshCachedModelList(payload.providerId)
+          ),
         ),
 
       GetBalance: (payload) =>
@@ -328,6 +343,15 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         observeRpcDefects(
           "GetLocalInferenceState",
           localInference.state,
+        ),
+
+      StreamLocalInferenceState: () =>
+        observeRpcStreamDefects(
+          "StreamLocalInferenceState",
+          Stream.concat(Stream.make(undefined), Stream.tick("500 millis")).pipe(
+            Stream.mapEffect(() => localInference.state),
+            Stream.changesWith((previous, current) => JSON.stringify(previous) === JSON.stringify(current)),
+          ),
         ),
 
       ConfigureLocalInferenceUsage: (selection) =>

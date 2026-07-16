@@ -92,12 +92,12 @@ import { collectSessionContext } from './util/collect-session-context'
 import { AgentModelResolverLive } from './model/model-resolver'
 
 // Config & Auth
-import { ProviderClient, type ProviderClientShape, makeFileBackedModelCatalog } from '@magnitudedev/sdk'
+import { ProviderClient, type ProviderClientShape } from '@magnitudedev/sdk'
 import type { DisplayViewShape, DisplayViewSnapshot } from '@magnitudedev/protocol'
 import type { ForkTurnState } from './projections/turn'
 import type { AgentLifecycleState } from './projections/agent-lifecycle'
 
-import { MagnitudeStorage, type MagnitudeStorageShape, defaultGlobalStorageRoot, makeGlobalStoragePaths } from '@magnitudedev/storage'
+import { MagnitudeStorage, type MagnitudeStorageShape } from '@magnitudedev/storage'
 import { initLogger, logger } from '@magnitudedev/logger'
 import { BunFileSystem, BunPath } from '@effect/platform-bun'
 import { initTraceSession } from '@magnitudedev/tracing'
@@ -592,6 +592,9 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           const configState = ambientService.getValue(ConfigAmbient)
           const slotConfig = getSlotConfig(configState, slotId)
           if (!slotConfig || !slotConfig.isUserOverride) return
+          // Local selection is reconciled against runtime/catalog state by ACN.
+          // Never erase local intent and silently cross the cloud boundary.
+          if (slotConfig.providerId === 'llamacpp') return
 
           // Clear the stale override and refresh config
           yield* options.storage.config.updateModelConfig({ [slotId]: {} }).pipe(
@@ -677,17 +680,9 @@ export type CodingAgentClient = CodingAgentSession
 
 export function createCodingAgentSession(options: CreateClientOptions) {
   return Effect.gen(function* () {
-  // Receive the pre-built provider client from the caller (ACN).
-  // Wrap its catalog with a file-backed cache that shares the model list
-  // across sessions via ~/.magnitude/model-cache.json (per spec §8.8).
-  const fileBackedClient: ProviderClientShape = {
-    ...options.providerClient,
-    catalog: makeFileBackedModelCatalog(
-      options.providerClient.catalog,
-      makeGlobalStoragePaths(defaultGlobalStorageRoot()).modelCacheFile,
-    ),
-  }
-  const providerClientLayer = Layer.succeed(ProviderClient, fileBackedClient)
+  // ACN owns the authoritative catalog; sessions consume it without adding a
+  // second cache or refresh policy.
+  const providerClientLayer = Layer.succeed(ProviderClient, options.providerClient)
   const agentModelResolverLayer = Layer.provide(AgentModelResolverLive(options.debug), providerClientLayer)
   const chatTitleServiceLayer = Layer.provide(
     ChatTitleServiceLive,

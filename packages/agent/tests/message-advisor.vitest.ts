@@ -337,8 +337,8 @@ describe('message_advisor execution', () => {
 describe('messageAdvisor toolkit registration', () => {
   it('keeps static advisor registration but removes it from effective toolkits while disabled', () => {
     const catalogModels: readonly MagnitudeModelInfo[] = [
-      { providerModelId: 'primary-model', providerId: 'magnitude', modelFamilyId: 'unknown', reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
-      { providerModelId: 'secondary-model', providerId: 'magnitude', modelFamilyId: 'unknown', reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+      { providerModelId: 'primary-model', providerId: 'magnitude', modelFamilyId: 'unknown', availability: { _tag: 'Available' }, reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+      { providerModelId: 'secondary-model', providerId: 'magnitude', modelFamilyId: 'unknown', availability: { _tag: 'Available' }, reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
     ]
     const config = buildConfigState(catalogModels, null, {
       softCapRatio: 0.9,

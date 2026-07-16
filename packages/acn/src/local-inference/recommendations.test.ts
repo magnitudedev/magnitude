@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest"
 import type {
   LocalInferenceUsageSelection,
 } from "@magnitudedev/protocol"
-import type { LlamaCppHostProfile } from "@magnitudedev/llamacpp"
+import type { LlamaCppHostProfile } from "./recommendations"
 import { LOCAL_MODEL_CATALOG } from "./catalog"
 import {
   GIB,

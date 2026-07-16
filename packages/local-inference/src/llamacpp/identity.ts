@@ -19,5 +19,7 @@ export const LlamaExecutionProfileId = id("LlamaExecutionProfileId")
 export type LlamaExecutionProfileId = Schema.Schema.Type<typeof LlamaExecutionProfileId>
 export const LlamaFitPlanId = id("LlamaFitPlanId")
 export type LlamaFitPlanId = Schema.Schema.Type<typeof LlamaFitPlanId>
+export const LlamaOperationId = id("LlamaOperationId")
+export type LlamaOperationId = Schema.Schema.Type<typeof LlamaOperationId>
 export const ExternalServerConfigId = id("ExternalServerConfigId")
 export type ExternalServerConfigId = Schema.Schema.Type<typeof ExternalServerConfigId>

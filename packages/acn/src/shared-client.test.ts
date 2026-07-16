@@ -75,6 +75,7 @@ const providerClient = (label: string): ProviderClientShape => ({
       contextWindow: 1,
       maxOutputTokens: 1,
       capabilities: { vision: false },
+      availability: { _tag: "Available" },
       reasoningEfforts: [],
       pricing: { input: 0, output: 0, cached_input: null },
     }]),

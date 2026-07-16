@@ -114,6 +114,14 @@ describe("ModelFileRegistry", () => {
         formats: [format],
       })
       const initial = yield* registry.inspect("changed")
+      const persistedIndex = yield* registry.index!
+      const hydratedRegistry = yield* makeModelFileRegistry({
+        sources: [ModelFileSourceRegistration.ReadOnly({ source })],
+        formats: [format],
+        initialIndex: persistedIndex,
+      })
+      const hydrated = yield* hydratedRegistry.inspect("cached")
+      const afterHydration = { discoveryCount, inspectionCount }
       yield* registry.inspect("cached")
       const afterCached = { discoveryCount, inspectionCount }
       yield* registry.inspect("changed")
@@ -128,6 +136,8 @@ describe("ModelFileRegistry", () => {
 
       return {
         afterCached,
+        afterHydration,
+        hydratedRecords: hydrated.records.length,
         afterChanged,
         afterFull,
         primaryPath: beforeChange.primaryPath,
@@ -136,6 +146,8 @@ describe("ModelFileRegistry", () => {
     }).pipe(Effect.provide(BunContext.layer))))
 
     expect(result.afterCached).toEqual({ discoveryCount: 1, inspectionCount: 1 })
+    expect(result.afterHydration).toEqual({ discoveryCount: 1, inspectionCount: 1 })
+    expect(result.hydratedRecords).toBe(1)
     expect(result.afterChanged).toEqual({ discoveryCount: 2, inspectionCount: 1 })
     expect(result.afterFull).toEqual({ discoveryCount: 3, inspectionCount: 2 })
     expect(result.primaryPath.endsWith("model.gguf")).toBe(true)

@@ -44,6 +44,7 @@ export function createLlamaCppCompatibleSpec(config: LlamaCppCompatibleSpecConfi
   return NativeChatCompletions.model({
     modelId: config.modelId,
     endpoint: config.endpoint,
+    path: "/chat/completions?autoload=false",
     options: llamacppOptions,
     classifyRejectedResponse: classifyLlamaCppRejectedResponse,
   })

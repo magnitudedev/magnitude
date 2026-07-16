@@ -1,7 +1,8 @@
+import { isDeepStrictEqual } from "node:util"
 import { FetchHttpClient } from "@effect/platform"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
-import { Cause, Context, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Effect, Layer, Option, PubSub, Ref, Schema, Scope, Stream } from "effect"
 import {
   ProviderClient,
   type BalanceQuery,
@@ -23,12 +24,18 @@ import {
   type SessionError,
   type SlotProfiles,
   type ModelSummary,
-  type ModelList,
+  type ModelCatalog,
+  type ModelSlots,
+  type ModelResourceInvalidation,
+  type ModelConfigResponse,
+  type SlotModelConfig,
   type ProviderInfo,
   type ProviderAuth,
   type SlotId,
 } from "@magnitudedev/protocol"
 import { SessionStore } from "./session-store"
+import { LocalModelProviderSource } from "./local-inference/provider-source"
+import { LocalModelConfiguration } from "./local-inference/model-configuration"
 
 import {
   SLOT_IDS,
@@ -41,8 +48,12 @@ export interface AccountApi {
   readonly getProviderAuth: (providerId: string) => Effect.Effect<ProviderAuth | null, SessionError>
   readonly listProviderAuth: Effect.Effect<Readonly<Record<string, ProviderAuth>>, SessionError>
   readonly listPublicSlotProfiles: Effect.Effect<SlotProfiles | null, SessionError>
-  readonly getCachedModelList: (providerId?: string) => Effect.Effect<ModelList, SessionError>
-  readonly refreshCachedModelList: (providerId?: string) => Effect.Effect<ModelList, SessionError>
+  readonly modelCatalog: Effect.Effect<ModelCatalog>
+  readonly watchModelCatalog: Stream.Stream<ModelResourceInvalidation>
+  readonly refreshModelCatalog: (providerId: Option.Option<string>) => Effect.Effect<void>
+  readonly modelSlots: Effect.Effect<ModelSlots>
+  readonly watchModelSlots: Stream.Stream<ModelResourceInvalidation>
+  readonly updateModelSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, SessionError>
   readonly getBalance: (query?: BalanceQuery) => Effect.Effect<BalanceResponse, SessionError>
 }
 
@@ -89,6 +100,7 @@ function toModelSummary(model: ProviderModel): ModelSummary {
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
     capabilities: { vision: model.capabilities.vision ?? false },
+    availability: model.availability,
     reasoningEfforts: [...model.reasoningEfforts],
     pricing: model.pricing ? {
       input: model.pricing.input,
@@ -99,14 +111,21 @@ function toModelSummary(model: ProviderModel): ModelSummary {
 }
 
 /**
- * Build a unified `ModelList` response from catalog models + user config.
+ * Build both independent projections from one consistent provider observation.
  */
+interface BuiltModelState {
+  readonly models: readonly ModelSummary[]
+  readonly providers: readonly ProviderInfo[]
+  readonly slotProfiles: SlotProfiles
+  readonly modelConfig: ModelConfigResponse
+}
+
 function buildModelList(
   models: readonly ProviderModel[],
   providerInfos: readonly ProviderRegistryInfo[],
   storage: MagnitudeStorageShape,
   operation: string,
-): Effect.Effect<ModelList, SessionError> {
+): Effect.Effect<BuiltModelState, SessionError> {
   return Effect.gen(function* () {
     const modelConfig = yield* storage.config.getModelConfig().pipe(
       Effect.mapError(toAccountError(operation)),
@@ -123,7 +142,10 @@ function buildModelList(
       models: models.map(toModelSummary),
       providers,
       slotProfiles: slotProfilesFromModels(models, modelConfig),
-      modelConfig: { slots: modelConfig?.slots ?? {} },
+      modelConfig: {
+        slots: modelConfig?.slots ?? {},
+        localSlotIntent: modelConfig?.localSlotIntent ?? {},
+      },
     }
   })
 }
@@ -136,6 +158,7 @@ function slotProfilesFromModels(
   models: readonly ProviderModel[],
   userConfig: {
     readonly slots?: Partial<Record<SlotId, { readonly providerId?: string; readonly providerModelId?: string; readonly reasoningEffort?: string }>>
+    readonly localSlotIntent?: Partial<Record<SlotId, "local" | "cloud">>
   } | null,
 ): SlotProfiles {
   const routableModels = models.map((model) => ({
@@ -145,8 +168,13 @@ function slotProfilesFromModels(
   let profiles: SlotProfiles = {}
   for (const slotId of SLOT_IDS) {
     const userSlotConfig = userConfig?.slots?.[slotId]
-
-    const resolved = resolveSlotModel(routableModels, userSlotConfig, slotId)
+    const intent = userConfig?.localSlotIntent?.[slotId]
+    const eligibleModels = intent === "local"
+      ? routableModels.filter((model) => model.providerId === "llamacpp")
+      : intent === "cloud"
+        ? routableModels.filter((model) => model.providerId !== "llamacpp")
+        : routableModels
+    const resolved = resolveSlotModel(eligibleModels, userSlotConfig, slotId)
     if (!resolved) continue
     const model = routableModels.find((candidate) =>
       candidate.providerId === resolved.providerId
@@ -177,14 +205,70 @@ function slotProfilesFromModels(
 // Layer
 // =============================================================================
 
-export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | ProviderClientRegistry> =
-  Layer.effect(
+export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | ProviderClientRegistry | LocalModelProviderSource | LocalModelConfiguration> =
+  Layer.scoped(
     Account,
     Effect.gen(function* () {
       const store = yield* SessionStore
       const sharedClient = yield* ProviderClient
       const storage = yield* MagnitudeStorage
       const providerClients = yield* ProviderClientRegistry
+      const localModels = yield* LocalModelProviderSource
+      const modelConfiguration = yield* LocalModelConfiguration
+      const scope = yield* Scope.Scope
+      const catalogChanges = yield* PubSub.unbounded<ModelResourceInvalidation>()
+      const slotChanges = yield* PubSub.unbounded<ModelResourceInvalidation>()
+      const catalogState = yield* Ref.make<ModelCatalog>({ revision: 0, refreshing: true, models: [], providers: [] })
+      const catalogModels = yield* Ref.make<readonly ProviderModel[]>([])
+      const slotState = yield* Ref.make<ModelSlots>({ revision: 0, profiles: {}, config: { slots: {}, localSlotIntent: {} } })
+
+      const publishSnapshots = (list: BuiltModelState, refreshing: boolean) => Effect.gen(function* () {
+        const previousCatalog = yield* Ref.get(catalogState)
+        const catalogChanged = previousCatalog.refreshing !== refreshing
+          || !isDeepStrictEqual(previousCatalog.models, list.models)
+          || !isDeepStrictEqual(previousCatalog.providers, list.providers)
+        if (catalogChanged) {
+          const catalog: ModelCatalog = {
+            revision: previousCatalog.revision + 1,
+            refreshing,
+            models: list.models,
+            providers: list.providers,
+          }
+          yield* Ref.set(catalogState, catalog)
+          const catalogInvalidation: ModelResourceInvalidation = { _tag: "changed", revision: catalog.revision }
+          yield* PubSub.publish(catalogChanges, catalogInvalidation)
+        }
+        const previousSlots = yield* Ref.get(slotState)
+        const slotsChanged = !isDeepStrictEqual(previousSlots.profiles, list.slotProfiles)
+          || !isDeepStrictEqual(previousSlots.config, list.modelConfig)
+        if (slotsChanged) {
+          const slots: ModelSlots = {
+            revision: previousSlots.revision + 1,
+            profiles: list.slotProfiles,
+            config: list.modelConfig,
+          }
+          yield* Ref.set(slotState, slots)
+          const slotInvalidation: ModelResourceInvalidation = { _tag: "changed", revision: slots.revision }
+          yield* PubSub.publish(slotChanges, slotInvalidation)
+        }
+      })
+
+      const markCatalogRefreshing = Effect.gen(function* () {
+        const previous = yield* Ref.get(catalogState)
+        if (previous.refreshing) return
+        const next = { ...previous, revision: previous.revision + 1, refreshing: true }
+        yield* Ref.set(catalogState, next)
+        yield* PubSub.publish(catalogChanges, { _tag: "changed", revision: next.revision } satisfies ModelResourceInvalidation)
+      })
+      const markCatalogRefreshFailed = (cause: unknown) => Effect.gen(function* () {
+        const previous = yield* Ref.get(catalogState)
+        if (previous.refreshing) {
+          const next = { ...previous, revision: previous.revision + 1, refreshing: false }
+          yield* Ref.set(catalogState, next)
+          yield* PubSub.publish(catalogChanges, { _tag: "changed", revision: next.revision } satisfies ModelResourceInvalidation)
+        }
+        yield* Effect.logWarning("Model catalog refresh failed").pipe(Effect.annotateLogs({ cause: String(cause) }))
+      })
 
       const resolveApiKey = Effect.gen(function* () {
         const useLocal = isEnvFlagOn(process.env.MAGNITUDE_USE_LOCAL)
@@ -211,26 +295,38 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           return sharedClient
         })
 
-      const refreshModels = (operation: string) =>
-        sharedClient.catalog.refresh.pipe(
+      const rebuildSnapshots = (force: boolean, providerId: Option.Option<string> = Option.none()) => Effect.gen(function* () {
+        if (force && Option.contains(providerId, "llamacpp")) {
+          yield* localModels.catalog.refresh.pipe(
+            Effect.provide(FetchHttpClient.layer),
+            Effect.mapError(toAccountError("refresh local model catalog")),
+          )
+        }
+        const refreshAllProviders = force && !Option.contains(providerId, "llamacpp")
+        const models = yield* (refreshAllProviders ? sharedClient.catalog.refresh : sharedClient.catalog.list).pipe(
           Effect.provide(FetchHttpClient.layer),
-          Effect.mapError(toAccountError(operation)),
+          Effect.mapError(toAccountError(force ? "refresh model catalog" : "load model catalog")),
         )
+        const providers = yield* sharedClient.listProviders.pipe(
+          Effect.provide(FetchHttpClient.layer),
+          Effect.mapError(toAccountError("inspect model providers")),
+        )
+        const list = yield* buildModelList(models, providers, storage, "build model state")
+        yield* Ref.set(catalogModels, models)
+        yield* publishSnapshots(list, false)
+      })
 
-      const reconcileDiscoverableProviderModels = (
-        models: readonly ProviderModel[],
-        providers: readonly ProviderRegistryInfo[],
-        operation: string,
-      ) => {
-        const modelProviderIds = new Set(models.map((model) => model.providerId))
-        const hasMismatch = providers.some((provider) =>
-          provider.status !== undefined
-          && modelProviderIds.has(provider.id) !== (provider.status === "ok")
-        )
-        return !hasMismatch
-          ? Effect.succeed(models)
-          : refreshModels(operation)
-      }
+      const refreshInBackground = (force: boolean, providerId: Option.Option<string> = Option.none()) => Effect.forkIn(
+        rebuildSnapshots(force, providerId).pipe(
+          Effect.catchAll(markCatalogRefreshFailed),
+        ),
+        scope,
+      ).pipe(Effect.asVoid)
+
+      yield* refreshInBackground(false)
+      yield* Effect.forkIn(localModels.changes.pipe(
+        Stream.runForEach(() => rebuildSnapshots(false).pipe(Effect.catchAll(() => Effect.void))),
+      ), scope)
 
       return {
         updateProviderAuth: (providerId, auth) =>
@@ -271,31 +367,23 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
             Effect.mapError(toAccountError("list public slot profiles")),
           ),
 
-        getCachedModelList: (providerId?: string) =>
-          Effect.gen(function* () {
-            const cachedModels = yield* sharedClient.catalog.list.pipe(
-              Effect.provide(FetchHttpClient.layer),
-              Effect.mapError(toAccountError("get cached model list")),
-            )
-            const providers = yield* sharedClient.listProviders.pipe(
-              Effect.provide(FetchHttpClient.layer),
-            )
-            const models = yield* reconcileDiscoverableProviderModels(
-              cachedModels,
-              providers,
-              "reconcile discoverable provider model cache",
-            )
-            return yield* buildModelList(models, providers, storage, "get cached model list")
-          }),
-
-        refreshCachedModelList: (providerId?: string) =>
-          Effect.gen(function* () {
-            const models = yield* refreshModels("refresh cached model list")
-            const providers = yield* sharedClient.listProviders.pipe(
-              Effect.provide(FetchHttpClient.layer),
-            )
-            return yield* buildModelList(models, providers, storage, "refresh cached model list")
-          }),
+        modelCatalog: Ref.get(catalogState),
+        watchModelCatalog: Stream.fromPubSub(catalogChanges),
+        refreshModelCatalog: (providerId) => markCatalogRefreshing.pipe(
+          Effect.andThen(refreshInBackground(true, providerId)),
+        ),
+        modelSlots: Ref.get(slotState),
+        watchModelSlots: Stream.fromPubSub(slotChanges),
+        updateModelSlots: (slots) => modelConfiguration.updateSlots(slots).pipe(
+          Effect.mapError(toAccountError("update model slots")),
+          Effect.andThen(Effect.gen(function* () {
+            const catalog = yield* Ref.get(catalogState)
+            const models = yield* Ref.get(catalogModels)
+            const providers = yield* sharedClient.listProviders.pipe(Effect.provide(FetchHttpClient.layer))
+            const list = yield* buildModelList(models, providers, storage, "update model slots")
+            yield* publishSnapshots(list, catalog.refreshing)
+          }).pipe(Effect.mapError(toAccountError("update model slots")))),
+        ),
 
         getBalance: (query) =>
           Effect.gen(function* () {

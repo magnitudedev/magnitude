@@ -92,6 +92,7 @@ describe("llama instance registry", () => {
           version: [{ key: SourceFileKey.make("model"), sizeBytes: 4, modifiedAtMillis: Option.none() }],
         }),
         remove: () => Effect.void,
+        index: Effect.succeed({ schemaVersion: 1, capturedAt: new Date(), sets: [], issues: [] }),
       }
       const cli: LlamaCli = {
         binary: {
@@ -124,7 +125,7 @@ describe("llama instance registry", () => {
         onSome: Effect.succeed,
       })
       const registry = yield* makeLlamaInstanceRegistry({
-        cli, modelFiles, presetPath: path.join(temporary, "presets.ini"), host: "127.0.0.1", port,
+        cli: Option.some(cli), modelFiles, presetPath: path.join(temporary, "presets.ini"), host: "127.0.0.1", port,
         apiKey: Redacted.make("managed-secret"), modelsMax: 1,
         external: [],
       })

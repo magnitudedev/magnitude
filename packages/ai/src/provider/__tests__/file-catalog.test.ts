@@ -16,6 +16,7 @@ const model = (providerId: string, displayName: string): ProviderModel => ({
   contextWindow: 8_192,
   maxOutputTokens: 1_024,
   capabilities: { vision: false },
+  availability: { _tag: "Available" },
   pricing: { input: 0, output: 0, cached_input: null },
   reasoningEfforts: ["none"],
 })
