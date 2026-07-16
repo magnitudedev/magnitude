@@ -259,6 +259,20 @@
         "@types/bun": "latest",
       },
     },
+    "packages/local-inference": {
+      "name": "@magnitudedev/local-inference",
+      "version": "0.0.0",
+      "dependencies": {
+        "@effect/platform": "^0.96.0",
+        "@huggingface/gguf": "0.4.2",
+        "@huggingface/tasks": "0.20.25",
+        "effect": "3.21.2",
+      },
+      "devDependencies": {
+        "@effect/platform-bun": "^0.90.0",
+        "@types/bun": "latest",
+      },
+    },
     "packages/logger": {
       "name": "@magnitudedev/logger",
       "version": "0.0.1",
@@ -780,6 +794,8 @@
     "@magnitudedev/harness": ["@magnitudedev/harness@workspace:packages/harness"],
 
     "@magnitudedev/llamacpp": ["@magnitudedev/llamacpp@workspace:packages/llamacpp"],
+
+    "@magnitudedev/local-inference": ["@magnitudedev/local-inference@workspace:packages/local-inference"],
 
     "@magnitudedev/logger": ["@magnitudedev/logger@workspace:packages/logger"],
 
