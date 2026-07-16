@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Chunk, Effect, Option, Stream, SynchronizedRef } from "effect"
 import { makeContentId, makeModelFileId, makeModelFilePartId, type ModelFileId } from "./identity"
-import type { InspectedModelArtifact, ModelFileDiscoveryRefresh, ModelFileFormat, ModelFileRecord, ModelFileRegistryApi, ModelFileSnapshot, ModelFileSourceRegistration, ResolvedModelFiles, SourceDiscoveryIssue, SourceFileSet } from "./types"
+import type { InspectedModelArtifact, LocalModelFileIndex, ModelFileDiscoveryRefresh, ModelFileFormat, ModelFileRecord, ModelFileRegistryApi, ModelFileSnapshot, ModelFileSourceRegistration, ResolvedModelFiles, SourceDiscoveryIssue, SourceFileSet } from "./types"
 import { ModelFileDeleteError, ModelFileNotFound, ModelFileResolveError } from "./types"
 
 const resolveError = (id: ModelFileId, reason: ModelFileResolveError["reason"], part: Option.Option<SourceFileSet["entries"][number]["key"]> = Option.none()) => new ModelFileResolveError({ id, reason, part })
@@ -18,8 +18,13 @@ interface RegistryState {
   readonly snapshot: Option.Option<ModelFileSnapshot>
   readonly entries: ReadonlyMap<ModelFileId, RegistryEntry>
   readonly formatCache: ReadonlyMap<string, CachedInspection>
+  readonly sets: LocalModelFileIndex["sets"]
 }
-export interface ModelFileRegistryOptions { readonly sources: readonly ModelFileSourceRegistration[]; readonly formats: readonly ModelFileFormat[] }
+export interface ModelFileRegistryOptions {
+  readonly sources: readonly ModelFileSourceRegistration[]
+  readonly formats: readonly ModelFileFormat[]
+  readonly initialIndex?: LocalModelFileIndex
+}
 
 const setVersion = (set: SourceFileSet): string => {
   const hash = createHash("sha256")
@@ -42,29 +47,74 @@ const buildRecord = (registration: ModelFileSourceRegistration, format: ModelFil
 
 export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect.Effect<ModelFileRegistryApi, never, FileSystem.FileSystem> => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
+  const registrations = new Map(options.sources.map((registration) => [String(registration.source.id), registration]))
+  const formats = new Map(options.formats.map((format) => [String(format.id), format]))
+  const hydrate = (index: LocalModelFileIndex | undefined): RegistryState => {
+    if (!index) return { snapshot: Option.none(), entries: new Map(), formatCache: new Map(), sets: [] }
+    const entries = new Map<ModelFileId, RegistryEntry>()
+    const formatCache = new Map<string, CachedInspection>()
+    const validSets: LocalModelFileIndex["sets"][number][] = []
+    for (const cached of index.sets) {
+      const registration = registrations.get(String(cached.sourceId))
+      const format = formats.get(String(cached.formatId))
+      if (!registration || !format) continue
+      validSets.push(cached)
+      formatCache.set(`${cached.sourceId}\0${cached.set.id}\0${cached.formatId}`, {
+        version: cached.version,
+        artifacts: cached.artifacts,
+      })
+      for (const artifact of cached.artifacts) {
+        const record = buildRecord(registration, format, artifact)
+        entries.set(record.id, { record, registration, setId: cached.set.id, artifact })
+      }
+    }
+    return {
+      snapshot: Option.some({
+        records: [...entries.values()].map(({ record }) => record).sort((a, b) => a.displayName.localeCompare(b.displayName) || String(a.id).localeCompare(String(b.id))),
+        issues: index.issues,
+        capturedAt: index.capturedAt,
+      }),
+      entries,
+      formatCache,
+      sets: validSets,
+    }
+  }
   const state = yield* SynchronizedRef.make<RegistryState>({
-    snapshot: Option.none(),
-    entries: new Map(),
-    formatCache: new Map(),
+    ...hydrate(options.initialIndex),
   })
 
   const inspectFresh = (
     refresh: ModelFileDiscoveryRefresh,
   ): Effect.Effect<ModelFileSnapshot> => SynchronizedRef.modifyEffect(state, (previous) => Effect.gen(function* () {
     const previousCache = refresh === "full" ? new Map<string, CachedInspection>() : previous.formatCache
-    const cache = new Map<string, CachedInspection>()
-    const entries = new Map<ModelFileId, RegistryEntry>()
-    const issues: SourceDiscoveryIssue[] = []
-    for (const registration of options.sources) {
+    const sourceResults = yield* Effect.forEach(options.sources, (registration) => Effect.gen(function* () {
       const source = registration.source
+      const localCache = new Map<string, CachedInspection>()
+      const localEntries = new Map<ModelFileId, RegistryEntry>()
+      const localIssues: SourceDiscoveryIssue[] = []
+      const localSets: LocalModelFileIndex["sets"][number][] = []
+      const preserveCachedSet = (cachedSet: LocalModelFileIndex["sets"][number]) => {
+        const format = formats.get(String(cachedSet.formatId))
+        if (!format) return
+        const cacheKey = `${source.id}\0${cachedSet.set.id}\0${cachedSet.formatId}`
+        localCache.set(cacheKey, { version: cachedSet.version, artifacts: cachedSet.artifacts })
+        localSets.push(cachedSet)
+        for (const artifact of cachedSet.artifacts) {
+          const record = buildRecord(registration, format, artifact)
+          localEntries.set(record.id, { record, registration, setId: cachedSet.set.id, artifact })
+        }
+      }
       const discovered = yield* Stream.runCollect(source.discover({ refresh })).pipe(Effect.either)
       if (discovered._tag === "Left") {
-        issues.push({ sourceId: source.id, code: "unreadable", message: `${discovered.left.operation}: ${discovered.left.reason}`, sourceKey: Option.none() })
-        continue
+        localIssues.push({ sourceId: source.id, code: "unreadable", message: `${discovered.left.operation}: ${discovered.left.reason}`, sourceKey: Option.none() })
+        for (const cachedSet of previous.sets) {
+          if (cachedSet.sourceId === source.id) preserveCachedSet(cachedSet)
+        }
+        return { cache: localCache, entries: localEntries, issues: localIssues, sets: localSets }
       }
-      for (const event of Chunk.toReadonlyArray(discovered.right)) {
-        if (event._tag === "Issue") { issues.push(event.issue); continue }
-        for (const format of options.formats) {
+      yield* Effect.forEach(Chunk.toReadonlyArray(discovered.right), (event) => event._tag === "Issue"
+        ? Effect.sync(() => { localIssues.push(event.issue) })
+        : Effect.forEach(options.formats, (format) => Effect.gen(function* () {
           const cacheKey = `${source.id}\0${event.set.id}\0${format.id}`
           const version = setVersion(event.set)
           const cached = Option.fromNullable(previousCache.get(cacheKey))
@@ -74,17 +124,25 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
           })
           const result = yield* inspected.pipe(Effect.either)
           if (result._tag === "Left") {
-            issues.push({ sourceId: source.id, code: "unreadable", message: `${result.left.operation}: ${result.left.reason}`, sourceKey: Option.some(result.left.file) })
-            continue
+            localIssues.push({ sourceId: source.id, code: "unreadable", message: `${result.left.operation}: ${result.left.reason}`, sourceKey: Option.some(result.left.file) })
+            const cachedSet = previous.sets.find((item) =>
+              item.sourceId === source.id && item.set.id === event.set.id && item.formatId === format.id)
+            if (cachedSet) preserveCachedSet(cachedSet)
+            return
           }
-          cache.set(cacheKey, { version, artifacts: result.right })
+          localCache.set(cacheKey, { version, artifacts: result.right })
+          localSets.push({ sourceId: source.id, set: event.set, formatId: format.id, version, artifacts: result.right })
           for (const artifact of result.right) {
             const record = buildRecord(registration, format, artifact)
-            entries.set(record.id, { record, registration, setId: event.set.id, artifact })
+            localEntries.set(record.id, { record, registration, setId: event.set.id, artifact })
           }
-        }
-      }
-    }
+        }), { concurrency: 4, discard: true }), { concurrency: 16, discard: true })
+      return { cache: localCache, entries: localEntries, issues: localIssues, sets: localSets }
+    }), { concurrency: options.sources.length })
+    const cache = new Map(sourceResults.flatMap((result) => [...result.cache]))
+    const entries = new Map(sourceResults.flatMap((result) => [...result.entries]))
+    const issues = sourceResults.flatMap((result) => result.issues)
+    const sets = sourceResults.flatMap((result) => result.sets)
     const snapshot: ModelFileSnapshot = {
       records: [...entries.values()].map(({ record }) => record).sort((left, right) => left.displayName.localeCompare(right.displayName) || String(left.id).localeCompare(String(right.id))),
       issues, capturedAt: new Date(),
@@ -93,6 +151,7 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
       snapshot: Option.some(snapshot),
       entries,
       formatCache: cache,
+      sets,
     }
     return [snapshot, next] as const
   }))
@@ -154,7 +213,14 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
         snapshot: Option.none(),
         entries,
         formatCache: current.formatCache,
+        sets: current.sets,
       }] as const
     })).pipe(Effect.asVoid),
+    index: SynchronizedRef.get(state).pipe(Effect.map((current) => ({
+      schemaVersion: 1 as const,
+      capturedAt: Option.match(current.snapshot, { onNone: () => new Date(), onSome: (snapshot) => snapshot.capturedAt }),
+      sets: current.sets,
+      issues: Option.match(current.snapshot, { onNone: () => [], onSome: (snapshot) => snapshot.issues }),
+    }))),
   }
 })

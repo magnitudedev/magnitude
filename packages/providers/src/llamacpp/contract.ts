@@ -3,7 +3,6 @@
  */
 
 import type { ProviderModel } from "@magnitudedev/ai"
-import type { LlamaCppServedModel } from "@magnitudedev/llamacpp/client"
 
 /**
  * A model served by a local Llama.cpp server.
@@ -11,6 +10,14 @@ import type { LlamaCppServedModel } from "@magnitudedev/llamacpp/client"
  */
 export interface LlamaCppModelInfo extends ProviderModel {
   readonly providerId: "llamacpp"
+  /** Whether Magnitude manages the model runtime or connects to an external server. */
+  readonly ownership: "managed" | "external"
+  readonly residency?: "loaded" | "sleeping" | "unloaded" | "loading" | "failed" | "unknown"
+  readonly productRank?: number
+  readonly externalPriority?: number
+  readonly servedModelId?: string
+  readonly externalServerId?: string
+  readonly managedArtifactId?: string
   /** Server-configured context window (from /slots or /props), if available */
   readonly serverContextSize?: number
   /** Underlying model path, when llama-server exposes one separately from its API ID. */
@@ -28,38 +35,6 @@ export interface LlamaCppModelInfo extends ProviderModel {
   /** Base-model repositories embedded in GGUF metadata. */
   readonly baseModelRepositories?: readonly string[]
 }
-
-export type ServerStatus =
-  | { readonly status: "ready"; readonly endpoint: string }
-  | { readonly status: "loading"; readonly endpoint: string }
-  | { readonly status: "error"; readonly endpoint: string; readonly message: string }
-  | { readonly status: "not_found"; readonly endpoint: string }
-
-export interface ServerProps {
-  readonly nCtx?: number
-  readonly modelAlias?: string
-  readonly modelFtype?: string
-  readonly modelPath?: string
-  readonly chatTemplate?: string
-  readonly modalities?: {
-    readonly vision?: boolean
-    readonly audio?: boolean
-  }
-}
-
-export interface LlamaCppDiscoveryResult {
-  readonly models: readonly LlamaCppModelInfo[]
-  readonly status: "ok" | "loading" | "not_found" | "error"
-  readonly endpoint: string
-  readonly message?: string
-  readonly hint?: string
-}
-
-/** Raw model observation decoded by the shared llama.cpp endpoint client. */
-export type LlamaCppRawModel = LlamaCppServedModel
-
-/** Metadata decoded by the shared llama.cpp endpoint client. */
-export type LlamaCppModelMeta = NonNullable<LlamaCppServedModel["meta"]>
 
 /**
  * Call options for Llama.cpp inference.

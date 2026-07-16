@@ -70,6 +70,7 @@ describe("local inference protocol schemas", () => {
       distribution: { _tag: "Missing" },
       host: { _tag: "Unavailable", message: "distribution missing" },
       choices: [],
+      operations: [],
       recommendations: [],
       warnings: [],
     }

@@ -8,12 +8,9 @@ import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
   createMagnitudeProvider,
   createLlamaCppProvider,
-  makeFixedEndpointBackend,
   makeProviderRegistry,
   type MagnitudeProviderInstance,
-  type LlamaCppProviderComponents,
-  type LlamaCppProviderBackend,
-  LlamaCppProviderBackendError,
+  type LlamaCppProviderSource,
   type MagnitudeClientConfig,
   type MagnitudeCallOptions,
   type MagnitudeAdditionalOptions,
@@ -29,15 +26,20 @@ import type { ProviderInfo as RegistryProviderInfo } from "@magnitudedev/provide
 // Re-exported types with provider-agnostic names
 // =============================================================================
 
-export type { ProviderRejection, BaseCallOptions, ProviderModelBindOptions, ProviderModel } from "@magnitudedev/ai"
-export { ModelCatalogError } from "@magnitudedev/ai"
+export type {
+  ProviderRejection,
+  BaseCallOptions,
+  ProviderModelBindOptions,
+  ProviderModel,
+  ProviderModelAvailability,
+  ProviderModelDisabledReason,
+} from "@magnitudedev/ai"
+export { AVAILABLE_PROVIDER_MODEL, isProviderModelAvailable, ModelCatalogError } from "@magnitudedev/ai"
 export type ProviderClientError = MagnitudeClientError
 export type ProviderRegistryInfo = RegistryProviderInfo
 
 export interface ProviderClientConfig extends MagnitudeClientConfig {
-  readonly llamacppEndpoint?: string
-  readonly llamacppApiKey?: string
-  readonly llamacppBackend?: LlamaCppProviderBackend
+  readonly llamacpp?: LlamaCppProviderSource
 }
 
 export type {
@@ -47,8 +49,8 @@ export type {
   MagnitudeCallOptions,
   MagnitudeAdditionalOptions,
 } from "@magnitudedev/providers"
-export type { LlamaCppProviderBackend } from "@magnitudedev/providers"
-export { LlamaCppProviderBackendError } from "@magnitudedev/providers"
+export type { LlamaCppProviderSource, LlamaCppInferenceLease, LlamaCppModelInfo } from "@magnitudedev/providers"
+export { LlamaCppAcquisitionError } from "@magnitudedev/providers"
 export type { WebSearchResult, BalanceQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/protocol"
@@ -65,7 +67,6 @@ export {
 export { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 export {
   createMagnitudeCompatibleSpec,
-  DEFAULT_LLAMACPP_ENDPOINT,
   MagnitudeModelListResponseSchema,
   toMagnitudeModelInfo,
 } from "@magnitudedev/providers"
@@ -124,16 +125,11 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
   const magnitudeInstance: MagnitudeProviderInstance = createMagnitudeProvider(config)
   const sessionId = config?.sessionId ?? null
 
-  const llamacpp: LlamaCppProviderComponents = createLlamaCppProvider(
-    config?.llamacppBackend ?? makeFixedEndpointBackend({
-      endpoint: config?.llamacppEndpoint,
-      apiKey: config?.llamacppApiKey,
-    }),
-  )
+  const llamacpp = config?.llamacpp ? createLlamaCppProvider(config.llamacpp) : null
 
   const registry = makeProviderRegistry({
     magnitude: magnitudeInstance,
-    discoverableProviders: [llamacpp],
+    discoverableProviders: llamacpp ? [llamacpp] : [],
   })
 
   return {

@@ -66,7 +66,7 @@ export function ComposerContainer({
   // The onboarding snapshot and model configuration are invalidated by the
   // same activation mutation, but they are separate RPC projections. During
   // the transition out of onboarding, the snapshot can briefly retain its
-  // pre-activation value while GetCachedModelList already contains the slots
+  // pre-activation value while the model-slot snapshot already contains the slots
   // that were just persisted. Explicit slots are sufficient proof that a
   // provider is configured; provider availability failures belong to the send
   // path and must be surfaced as their real error, not as "not configured".

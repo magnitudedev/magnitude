@@ -1,5 +1,5 @@
 import type { ProviderModel, ModelProfile } from '@magnitudedev/ai'
-import { toModelProfile } from '@magnitudedev/ai'
+import { isProviderModelAvailable, toModelProfile } from '@magnitudedev/ai'
 import type { SlotId } from './types'
 
 /**
@@ -45,10 +45,11 @@ export function resolveSlotModel<T extends ProviderModel & { readonly slots?: re
   const overrideProviderId = userSlotConfig?.providerId
   const overrideProviderModelId = userSlotConfig?.providerModelId
   const hasOverride = overrideProviderId !== undefined && overrideProviderModelId !== undefined
-  const defaultEntry = catalogModels?.find(m => m.slots?.includes(slotId)) ?? catalogModels?.[0] ?? null
+  const availableModels = catalogModels?.filter(isProviderModelAvailable) ?? null
+  const defaultEntry = availableModels?.find(m => m.slots?.includes(slotId)) ?? availableModels?.[0] ?? null
 
   if (hasOverride) {
-    const overrideEntry = catalogModels?.find(
+    const overrideEntry = availableModels?.find(
       m => m.providerId === overrideProviderId && m.providerModelId === overrideProviderModelId,
     ) ?? null
     if (overrideEntry) {

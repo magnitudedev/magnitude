@@ -39,24 +39,16 @@ export {
   ProviderRegistryLive,
 } from "./registry"
 export {
-  type LlamaCppProviderComponents,
-  type LlamaCppDiscoveryResult,
+  type LlamaCppProviderInstance,
   type LlamaCppModelInfo,
   type LlamaCppCallOptions,
   type LlamaCppToolChoice,
-  type LlamaCppRawModel,
-  type LlamaCppModelMeta,
-  type LlamaCppProviderBackend,
-  type FixedLlamaCppEndpointConfig,
-  type ServerProps as LlamaCppServerProps,
-  type ServerStatus as LlamaCppServerStatus,
+  type LlamaCppProviderSource,
+  type LlamaCppInferenceLease,
   createLlamaCppProvider,
-  makeFixedEndpointBackend,
-  createLlamaCppCatalog,
   createLlamaCppCompatibleSpec,
   classifyLlamaCppRejectedResponse,
-  DEFAULT_LLAMACPP_ENDPOINT,
-  LlamaCppProviderBackendError,
+  LlamaCppAcquisitionError,
   PROVIDER_ID as LLAMACPP_PROVIDER_ID,
 } from "./llamacpp"
 export {

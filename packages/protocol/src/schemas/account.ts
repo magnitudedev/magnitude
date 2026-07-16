@@ -51,6 +51,7 @@ export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
 
 export const ModelConfigResponseSchema = Schema.Struct({
   slots: Schema.partial(Schema.Record({ key: SlotId, value: SlotModelConfigSchema })),
+  localSlotIntent: Schema.partial(Schema.Record({ key: SlotId, value: Schema.Literal("local", "cloud") })),
 })
 export type ModelConfigResponse = Schema.Schema.Type<typeof ModelConfigResponseSchema>
 
@@ -71,6 +72,21 @@ export const ProviderInfoSchema = Schema.Struct({
 })
 export type ProviderInfo = Schema.Schema.Type<typeof ProviderInfoSchema>
 
+export const ProviderModelDisabledReason = Schema.Literal(
+  "insufficient_resources",
+  "provider_unavailable",
+  "model_unavailable",
+  "incompatible_runtime",
+  "invalid_configuration",
+)
+export type ProviderModelDisabledReason = Schema.Schema.Type<typeof ProviderModelDisabledReason>
+
+export const ProviderModelAvailability = Schema.Union(
+  Schema.TaggedStruct("Available", {}),
+  Schema.TaggedStruct("Disabled", { reason: ProviderModelDisabledReason }),
+)
+export type ProviderModelAvailability = Schema.Schema.Type<typeof ProviderModelAvailability>
+
 // ---------------------------------------------------------------------------
 // Model summary (provider catalog entry)
 // ---------------------------------------------------------------------------
@@ -84,6 +100,7 @@ export const ModelSummarySchema = Schema.Struct({
   contextWindow: Schema.Number,
   maxOutputTokens: Schema.Number,
   capabilities: Schema.Struct({ vision: Schema.Boolean }),
+  availability: ProviderModelAvailability,
   reasoningEfforts: Schema.Array(Schema.String),
   pricing: Schema.optional(Schema.Struct({
     input: Schema.Number,
@@ -93,13 +110,27 @@ export const ModelSummarySchema = Schema.Struct({
 })
 export type ModelSummary = Schema.Schema.Type<typeof ModelSummarySchema>
 
-export const ModelListSchema = Schema.Struct({
+/** Provider/model discovery state. Slot selection is intentionally separate. */
+export const ModelCatalogSchema = Schema.Struct({
+  revision: Schema.NonNegativeInt,
+  refreshing: Schema.Boolean,
   models: Schema.Array(ModelSummarySchema),
   providers: Schema.Array(ProviderInfoSchema),
-  slotProfiles: SlotProfiles,
-  modelConfig: ModelConfigResponseSchema,
 })
-export type ModelList = Schema.Schema.Type<typeof ModelListSchema>
+export type ModelCatalog = Schema.Schema.Type<typeof ModelCatalogSchema>
+
+/** Durable slot configuration plus its authoritative resolved projection. */
+export const ModelSlotsSchema = Schema.Struct({
+  revision: Schema.NonNegativeInt,
+  profiles: SlotProfiles,
+  config: ModelConfigResponseSchema,
+})
+export type ModelSlots = Schema.Schema.Type<typeof ModelSlotsSchema>
+
+export const ModelResourceInvalidationSchema = Schema.TaggedStruct("changed", {
+  revision: Schema.NonNegativeInt,
+})
+export type ModelResourceInvalidation = Schema.Schema.Type<typeof ModelResourceInvalidationSchema>
 
 // ---------------------------------------------------------------------------
 // Auth

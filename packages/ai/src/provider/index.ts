@@ -9,6 +9,8 @@ export type {
   ModelFamilyCapabilities,
   ModelPricingInfo,
   ReasoningEffort,
+  ProviderModelAvailability,
+  ProviderModelDisabledReason,
 } from "./model"
 export type { ProviderModelCapabilities } from "../model/capabilities"
 export type { ModelProfile } from "./profile"
@@ -29,4 +31,5 @@ export { ModelCatalogError } from "./catalog"
 
 // Functions
 export { toModelProfile } from "./profile"
+export { AVAILABLE_PROVIDER_MODEL, isProviderModelAvailable } from "./model"
 export { makeFileBackedModelCatalog } from "./file-catalog"

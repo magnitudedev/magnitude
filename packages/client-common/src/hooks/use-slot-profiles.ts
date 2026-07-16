@@ -1,14 +1,13 @@
 /**
  * Slot profiles hook — shared between web, desktop, and CLI.
  *
- * Derives slot profiles from the `GetCachedModelList` RPC response.
+ * Reads the authoritative reactive model-slot resource.
  */
-import { useMemo } from "react"
-import { useAtomValue, Result } from "@effect-atom/atom-react"
-import { useAgentClient } from "../state/agent-client-context"
+import { Result } from "@effect-atom/atom-react"
 import { useDisplayState } from "../state/display-state-store"
 import { isRoleId, ROLE_TO_SLOT, type SlotId } from "@magnitudedev/sdk"
 import type { SlotProfile, SlotProfiles } from "@magnitudedev/sdk"
+import { useModelSlots } from "./use-reactive-rpc"
 
 /**
  * Find the slot profile for a given slot ID.
@@ -42,18 +41,12 @@ export interface UseSlotProfilesResult {
 }
 
 export function useSlotProfiles(): UseSlotProfilesResult {
-  const client = useAgentClient()
-
-  const queryAtom = useMemo(
-    () => client.query("GetCachedModelList", {}, { reactivityKeys: ["modelConfig"] }),
-    [client],
-  )
-  const result = useAtomValue(queryAtom)
+  const result = useModelSlots()
 
   const profiles = Result.match(result, {
     onInitial: () => null,
     onFailure: () => null,
-    onSuccess: (success) => success.value.slotProfiles,
+    onSuccess: (success) => success.value.profiles,
   })
 
   const rootRole = useDisplayState((state) => state.actors["root"]?.role ?? null)

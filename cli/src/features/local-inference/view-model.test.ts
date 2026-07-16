@@ -48,6 +48,7 @@ const baseState = {
   activeBinding: null,
   distribution: { _tag: "Ready", build: 10011, source: "managed" },
   host: { _tag: "Unavailable", message: "not needed" },
+  operations: [],
   warnings: [],
 } satisfies Omit<LocalInferenceState, "choices" | "recommendations">
 

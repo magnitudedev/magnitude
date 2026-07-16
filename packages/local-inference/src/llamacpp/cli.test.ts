@@ -52,7 +52,7 @@ describe("llama.cpp CLI contracts", () => {
   it("renders one validated profile consistently for commands and presets", async () => {
     const profile = await Effect.runPromise(makeLlamaExecutionProfile(profileInput))
     expect(renderExecutionProfileArguments(profile)).toEqual([
-      "--parallel", "2", "--split-mode", "layer", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+      "--parallel", "2", "--kv-unified", "--cont-batching", "--split-mode", "layer", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
       "--ctx-size", "8192", "--n-gpu-layers", "42", "--fit", "off", "--tensor-split", "3,2",
       "--flash-attn", "on", "--batch-size", "512", "--ubatch-size", "128", "--mmap",
     ])

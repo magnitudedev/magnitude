@@ -2,7 +2,7 @@ import { Effect, Option, Schema } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import { MagnitudeModelListResponseSchema, type MagnitudeModelInfo, type MagnitudeRawModel } from "./contract"
-import { ModelCatalogError, type ModelCatalog, type ModelCatalogConfig } from "@magnitudedev/ai"
+import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, type ModelCatalog, type ModelCatalogConfig } from "@magnitudedev/ai"
 
 type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
 
@@ -18,6 +18,7 @@ export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWith
     contextWindow: raw.contextWindow,
     maxOutputTokens: raw.maxOutputTokens,
     capabilities: { vision: raw.capabilities?.vision ?? false },
+    availability: AVAILABLE_PROVIDER_MODEL,
     pricing: raw.pricing ?? { input: 0, output: 0, cached_input: null },
     reasoningEfforts: raw.reasoningEfforts ?? ["none"],
     object: raw.object,

@@ -94,7 +94,7 @@
         "@effect/rpc": "0.75.1",
         "@magnitudedev/agent": "workspace:*",
         "@magnitudedev/generate-id": "workspace:*",
-        "@magnitudedev/llamacpp": "workspace:*",
+        "@magnitudedev/local-inference": "workspace:*",
         "@magnitudedev/protocol": "workspace:*",
         "@magnitudedev/ripgrep": "workspace:*",
         "@magnitudedev/roles": "workspace:*",
@@ -246,19 +246,6 @@
         "@types/bun": "latest",
       },
     },
-    "packages/llamacpp": {
-      "name": "@magnitudedev/llamacpp",
-      "version": "0.0.0",
-      "dependencies": {
-        "@effect/platform": "^0.96.0",
-        "@huggingface/gguf": "0.4.2",
-        "effect": "3.21.2",
-      },
-      "devDependencies": {
-        "@effect/platform-bun": "^0.90.0",
-        "@types/bun": "latest",
-      },
-    },
     "packages/local-inference": {
       "name": "@magnitudedev/local-inference",
       "version": "0.0.0",
@@ -310,7 +297,6 @@
         "@effect/platform": "^0.96.0",
         "@effect/platform-bun": "^0.90.0",
         "@magnitudedev/ai": "workspace:*",
-        "@magnitudedev/llamacpp": "workspace:*",
         "@magnitudedev/roles": "workspace:*",
         "@magnitudedev/utils": "workspace:*",
         "effect": "3.21.2",
@@ -800,8 +786,6 @@
     "@magnitudedev/generate-id": ["@magnitudedev/generate-id@workspace:packages/generate-id"],
 
     "@magnitudedev/harness": ["@magnitudedev/harness@workspace:packages/harness"],
-
-    "@magnitudedev/llamacpp": ["@magnitudedev/llamacpp@workspace:packages/llamacpp"],
 
     "@magnitudedev/local-inference": ["@magnitudedev/local-inference@workspace:packages/local-inference"],
 

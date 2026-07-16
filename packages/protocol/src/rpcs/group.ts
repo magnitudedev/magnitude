@@ -36,9 +36,10 @@ export const MagnitudeRpcs = RpcGroup.make(
   Config.GetProviderAuth.middleware(AcnRpcCommandActivity),
   Config.ListProviderAuth.middleware(AcnRpcCommandActivity),
   Config.ListPublicSlotProfiles.middleware(AcnRpcCommandActivity),
-  Config.UpdateModelConfig.middleware(AcnRpcCommandActivity),
-  Config.GetCachedModelList.middleware(AcnRpcCommandActivity),
-  Config.RefreshCachedModelList.middleware(AcnRpcCommandActivity),
+  Config.GetModelCatalog.middleware(AcnRpcCommandActivity),
+  Config.RefreshModelCatalog.middleware(AcnRpcCommandActivity),
+  Config.GetModelSlots.middleware(AcnRpcCommandActivity),
+  Config.UpdateModelSlots.middleware(AcnRpcCommandActivity),
   Config.GetBalance.middleware(AcnRpcCommandActivity),
   LocalInference.GetLocalInferenceState.middleware(AcnRpcCommandActivity),
   LocalInference.ConfigureLocalInferenceUsage.middleware(AcnRpcCommandActivity),
@@ -66,6 +67,9 @@ export const MagnitudeRpcs = RpcGroup.make(
   Stream.CloseDisplayView.middleware(AcnRpcCommandActivity),
 
   // Long-running subscriptions
+  LocalInference.StreamLocalInferenceState,
+  Config.WatchModelCatalog,
+  Config.WatchModelSlots,
   Session.StreamActiveSessionStatuses,
   Events.StreamEvents,
 )

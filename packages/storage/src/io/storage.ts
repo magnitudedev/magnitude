@@ -18,12 +18,17 @@ export class SchemaDecodeError extends Schema.TaggedError<SchemaDecodeError>()(
   { path: Schema.String, message: Schema.String }
 ) {}
 
+export class SchemaEncodeError extends Schema.TaggedError<SchemaEncodeError>()(
+  "SchemaEncodeError",
+  { path: Schema.String, message: Schema.String }
+) {}
+
 export class JsonLinesParseError extends Schema.TaggedError<JsonLinesParseError>()(
   "JsonLinesParseError",
   { path: Schema.String, line: Schema.Number, message: Schema.String }
 ) {}
 
-export type JsonError = JsonParseError | SchemaDecodeError;
+export type JsonError = JsonParseError | SchemaDecodeError | SchemaEncodeError;
 export type JsonLinesError = JsonLinesParseError | PlatformError;
 
 // =============================================================================

@@ -123,6 +123,7 @@ const ChoiceFields = {
   fitClass: LocalInferenceFitClass,
   compatible: Schema.Boolean,
   explanation: Schema.String,
+  residency: Schema.optional(Schema.Literal("loaded", "sleeping", "unloaded", "loading", "failed", "unknown")),
   quantization: Schema.optional(LocalInferenceQuantization),
   sizeBytes: Schema.optional(NonNegativeNumber),
   servingProfile: Schema.optional(LocalInferenceServingProfile),
@@ -150,6 +151,22 @@ export const ActiveLocalBindingSummary = Schema.Union(
 )
 export type ActiveLocalBindingSummary = Schema.Schema.Type<typeof ActiveLocalBindingSummary>
 
+export const LocalInferenceOperationStage = Schema.Literal(
+  "queued", "resolving_files", "writing_preset", "starting_router",
+  "unloading_previous", "loading", "verifying", "loaded",
+)
+export type LocalInferenceOperationStage = Schema.Schema.Type<typeof LocalInferenceOperationStage>
+
+export const LocalInferenceOperationSnapshot = Schema.Struct({
+  operationId: Schema.String,
+  providerModelId: Schema.String,
+  status: Schema.Literal("running", "completed", "failed"),
+  stage: LocalInferenceOperationStage,
+  progress: Schema.optional(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1))),
+  message: Schema.optional(Schema.String),
+})
+export type LocalInferenceOperationSnapshot = Schema.Schema.Type<typeof LocalInferenceOperationSnapshot>
+
 export const LocalInferenceErrorCode = Schema.Literal(
   "distribution_missing",
   "unsupported_platform",
@@ -176,6 +193,7 @@ export const LocalInferenceState = Schema.Struct({
   distribution: LocalInferenceDistributionState,
   host: LocalInferenceHostState,
   choices: Schema.Array(LocalModelChoice),
+  operations: Schema.Array(LocalInferenceOperationSnapshot),
   recommendations: Schema.Array(LocalModelRecommendation),
   warnings: Schema.Array(LocalInferenceWarning),
 })

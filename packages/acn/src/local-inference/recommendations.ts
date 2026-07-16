@@ -4,7 +4,6 @@ import type {
   LocalInferenceUsageSelection,
   LocalModelRecommendation,
 } from "@magnitudedev/protocol"
-import type { LlamaCppHostProfile } from "@magnitudedev/llamacpp"
 import { LOCAL_MODEL_CATALOG, catalogFileUrl, catalogSourcePageUrl } from "./catalog"
 import type {
   EvaluatedLocalConfiguration,
@@ -13,9 +12,29 @@ import type {
 } from "./types"
 
 export const GIB = 1024 ** 3
+
+export interface LlamaCppHostProfile {
+  readonly system: { readonly totalMemoryBytes: number; readonly cpuModel?: string | null; readonly logicalCores?: number }
+  readonly memoryDomains: readonly {
+    readonly id: string
+    readonly kind: "system" | "physical_device" | "unified_working_set"
+    readonly stableCapacityBytes: number
+    readonly sharesSystemMemory: boolean
+    readonly splitGroupId?: string | null
+    readonly currentFreeBytes?: number | null
+    readonly devices: readonly { readonly backend: string; readonly name?: string }[]
+  }[]
+  readonly runtimeProbe?: unknown
+  readonly warnings?: readonly unknown[]
+}
 export const BASELINE_CONTEXT_TOKENS = 32_768
 export const MAIN_AGENT_CONTEXT_TARGETS = [200_000, 100_000] as const
 export const SUBAGENT_CONTEXT_TARGETS = [100_000, 64_000] as const
+
+export const configuredParallelSlots = (): number => {
+  const configured = Number(process.env.MAGNITUDE_LLAMA_PARALLEL ?? 2)
+  return Number.isSafeInteger(configured) && configured >= 1 && configured <= 4 ? configured : 2
+}
 
 export const parallelSlotsForUsage = (usage: LocalInferenceUsageSelection): number => {
   const requestsPerSession = usage.localModelRole === "main" ? 1 : 3

@@ -45,6 +45,7 @@ interface NativeChatCompletionsModelConfig<
 > {
   readonly modelId: string
   readonly endpoint: string
+  readonly path?: string
   readonly options: TOptions
 
   readonly compose?: (
@@ -116,7 +117,7 @@ function model<
   >({
     modelId: config.modelId,
     endpoint: config.endpoint,
-    path: "/chat/completions",
+    path: config.path ?? "/chat/completions",
     codec: nativeChatCompletionsCodec,
     doneSignal: "[DONE]",
     decodePayload: decodeChatCompletionsPayload,

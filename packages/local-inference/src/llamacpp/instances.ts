@@ -2,9 +2,9 @@ import { createHash, randomUUID } from "node:crypto"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
-import { Context, Data, Effect, Either, Exit, Fiber, Option, Redacted, Ref, Schedule, Schema, Scope, Stream } from "effect"
+import { Context, Data, Deferred, Effect, Either, Exit, Fiber, Option, Redacted, Ref, Schedule, Schema, Scope, Stream, SubscriptionRef } from "effect"
 import type { ModelFileId, ModelFileRegistryApi, ResolvedModelFiles } from "../model-files"
-import { LlamaInstanceId, LlamaModelRegistrationId, type ExternalServerConfigId, type LlamaServedModelId } from "./identity"
+import { LlamaInstanceId, LlamaModelRegistrationId, LlamaOperationId, type ExternalServerConfigId, type LlamaServedModelId } from "./identity"
 import type { LlamaCli, LlamaRouterHost, RunningLlamaProcess } from "./cli"
 import { renderExecutionProfilePreset, type LlamaExecutionProfile } from "./execution-profile"
 import { LlamaServerFailureReason, makeLlamaServerClient, type LlamaInstanceObservation, type LlamaRouterController, type LlamaServerError, type LlamaServerObserver, type LlamaServedModelObservation } from "./server"
@@ -19,6 +19,32 @@ export interface LlamaModelLease {
   readonly instanceId: LlamaInstanceId
   readonly model: LlamaServedModelObservation
   readonly target: LlamaInferenceTarget
+}
+
+export interface LlamaLoadedModel {
+  readonly instanceId: LlamaInstanceId
+  readonly model: LlamaServedModelObservation
+  readonly target: LlamaInferenceTarget
+}
+
+export type LlamaLoadEvent = Data.TaggedEnum<{
+  Queued: Record<never, never>
+  ResolvingFiles: Record<never, never>
+  WritingPreset: Record<never, never>
+  StartingRouter: Record<never, never>
+  UnloadingPrevious: { readonly modelId: LlamaServedModelId }
+  Loading: { readonly progress: Option.Option<number> }
+  Verifying: Record<never, never>
+  Loaded: { readonly model: LlamaServedModelObservation }
+}>
+export const LlamaLoadEvent = Data.taggedEnum<LlamaLoadEvent>()
+
+export interface LlamaLoadOperation {
+  readonly id: LlamaOperationId
+  readonly modelId: LlamaServedModelId
+  readonly events: Stream.Stream<LlamaLoadEvent>
+  readonly result: Effect.Effect<LlamaLoadedModel, LlamaAcquireError>
+  readonly cancel: Effect.Effect<void>
 }
 
 export interface ManagedModelRequest {
@@ -36,7 +62,7 @@ export type LlamaModelRequest = Data.TaggedEnum<{
   External: { readonly request: ExternalModelRequest }
 }>
 export const LlamaModelRequest = Data.taggedEnum<LlamaModelRequest>()
-export const LlamaAcquireFailureReason = Schema.Literal("instance-not-found", "not-already-served", "registration-conflict", "all-slots-leased", "catalog-change-in-use", "model-unavailable", "server-start-failed", "server-start-timeout", "process-exited", "load-rejected", "load-failed", "load-timeout")
+export const LlamaAcquireFailureReason = Schema.Literal("instance-not-found", "not-already-served", "registration-conflict", "all-slots-leased", "catalog-change-in-use", "model-unavailable", "server-start-failed", "server-start-timeout", "process-exited", "load-rejected", "load-failed", "load-timeout", "context-mismatch")
 export type LlamaAcquireFailureReason = Schema.Schema.Type<typeof LlamaAcquireFailureReason>
 export const LlamaControlOperation = Schema.Literal("unload", "restart", "stop")
 export type LlamaControlOperation = Schema.Schema.Type<typeof LlamaControlOperation>
@@ -59,6 +85,7 @@ export interface LlamaManagedInstance {
   readonly _tag: "Managed"
   readonly id: LlamaInstanceId
   readonly observe: Effect.Effect<LlamaInstanceObservation, LlamaObservationError>
+  readonly ensureLoaded: (request: ManagedModelRequest) => Effect.Effect<LlamaLoadOperation>
   readonly acquire: (request: ManagedModelRequest) => Effect.Effect<LlamaModelLease, LlamaAcquireError, Scope.Scope>
   readonly unload: (model: LlamaServedModelId) => Effect.Effect<void, LlamaControlError | ModelInUse>
   readonly restart: Effect.Effect<void, LlamaControlError | ModelInUse>
@@ -83,14 +110,23 @@ export interface LlamaInstanceRegistryApi {
   readonly inspect: Effect.Effect<LlamaInstanceSnapshot>
   readonly refreshExternal: Effect.Effect<LlamaInstanceSnapshot>
   readonly get: (id: LlamaInstanceId) => Effect.Effect<LlamaInstance, LlamaInstanceNotFound>
+  readonly ensureManagedLoaded: (request: ManagedModelRequest) => Effect.Effect<LlamaLoadOperation>
   readonly acquire: (request: LlamaModelRequest) => Effect.Effect<LlamaModelLease, LlamaAcquireError, Scope.Scope>
   readonly stopManaged: Effect.Effect<void, LlamaControlError | ModelInUse>
 }
 export class LlamaInstanceRegistry extends Context.Tag("@magnitudedev/local-inference/LlamaInstanceRegistry")<LlamaInstanceRegistry, LlamaInstanceRegistryApi>() {}
 export interface ExternalLlamaServerConfig { readonly id: ExternalServerConfigId; readonly origin: URL; readonly authorization: Option.Option<Redacted.Redacted<string>>; readonly label: Option.Option<string> }
-export interface LlamaInstanceRegistryOptions { readonly cli: LlamaCli; readonly modelFiles: ModelFileRegistryApi; readonly presetPath: string; readonly host: LlamaRouterHost; readonly port: number; readonly apiKey: Redacted.Redacted<string>; readonly modelsMax: number; readonly external: readonly ExternalLlamaServerConfig[] }
+export interface LlamaInstanceRegistryOptions { readonly cli: Option.Option<LlamaCli>; readonly modelFiles: ModelFileRegistryApi; readonly presetPath: string; readonly host: LlamaRouterHost; readonly port: number; readonly apiKey: Redacted.Redacted<string>; readonly modelsMax: number; readonly external: readonly ExternalLlamaServerConfig[] }
 
 interface Registration { readonly id: LlamaModelRegistrationId; readonly request: ManagedModelRequest; readonly files: ResolvedModelFiles; readonly leases: number; readonly lastReleasedAt: number }
+interface SharedLoadOperation {
+  readonly id: LlamaOperationId
+  readonly modelId: LlamaServedModelId
+  readonly events: SubscriptionRef.SubscriptionRef<LlamaLoadEvent>
+  readonly result: Deferred.Deferred<LlamaLoadedModel, LlamaAcquireError>
+  readonly waiters: Ref.Ref<number>
+  readonly fiber: Ref.Ref<Option.Option<Fiber.RuntimeFiber<void>>>
+}
 interface ManagedRuntime { readonly scope: Scope.CloseableScope; readonly process: RunningLlamaProcess; readonly observer: LlamaServerObserver; readonly controller: LlamaRouterController }
 type ManagedRuntimeState = Data.TaggedEnum<{
   Stopped: Record<never, never>
@@ -137,9 +173,11 @@ export const makeLlamaInstanceRegistry = (options: LlamaInstanceRegistryOptions)
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
   const http = yield* HttpClient.HttpClient
+  const registryScope = yield* Scope.Scope
   const managedId = LlamaInstanceId.make("managed")
   const lock = yield* Effect.makeSemaphore(1)
   const registrations = yield* Ref.make<ReadonlyMap<LlamaServedModelId, Registration>>(new Map())
+  const loadOperations = yield* Ref.make<ReadonlyMap<LlamaModelRegistrationId, SharedLoadOperation>>(new Map())
   const runtime = yield* Ref.make<ManagedRuntimeState>(ManagedRuntimeState.Stopped())
   const closeRuntimeState = ManagedRuntimeState.$match({
     Stopped: () => Effect.void,
@@ -203,7 +241,11 @@ export const makeLlamaInstanceRegistry = (options: LlamaInstanceRegistryOptions)
     const processScope = yield* Scope.make()
     yield* Ref.set(runtime, ManagedRuntimeState.Starting({ scope: processScope }))
     const boot = Effect.gen(function* () {
-      const process = yield* options.cli.startRouter({ presetPath: options.presetPath, host: options.host, port: options.port, apiKey: options.apiKey, modelsMax: Option.some(options.modelsMax), modelSleepIdleSeconds: Option.none() }).pipe(Effect.provideService(Scope.Scope, processScope), Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId, reason: "server-start-failed" })))
+      const cli = yield* Option.match(options.cli, {
+        onNone: () => Effect.fail(new LlamaAcquireError({ instanceId: managedId, modelId, reason: "model-unavailable" })),
+        onSome: Effect.succeed,
+      })
+      const process = yield* cli.startRouter({ presetPath: options.presetPath, host: options.host, port: options.port, apiKey: options.apiKey, modelsMax: Option.some(options.modelsMax), modelSleepIdleSeconds: Option.some(300) }).pipe(Effect.provideService(Scope.Scope, processScope), Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId, reason: "server-start-failed" })))
       const client = yield* makeClient(process.origin, Option.some(options.apiKey))
       const created = { scope: processScope, process, observer: client.observer, controller: client.controller }
       yield* Ref.set(runtime, ManagedRuntimeState.Running({ runtime: created }))
@@ -260,52 +302,155 @@ export const makeLlamaInstanceRegistry = (options: LlamaInstanceRegistryOptions)
     },
   ))
   const isLoaded = (model: LlamaServedModelObservation): boolean => model.status === "loaded" || model.status === "sleeping"
+  const loadManaged = (
+    request: ManagedModelRequest,
+    publish: (event: LlamaLoadEvent) => Effect.Effect<void>,
+  ): Effect.Effect<LlamaLoadedModel, LlamaAcquireError> => lock.withPermits(1)(Effect.gen(function* () {
+    let entries = yield* Ref.get(registrations)
+    const existingRegistration = Option.fromNullable(entries.get(request.servedModelId))
+    if (Option.exists(existingRegistration, (registration) => registration.request.modelFileId !== request.modelFileId || registration.request.profile.id !== request.profile.id)) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "registration-conflict" })
+    yield* publish(LlamaLoadEvent.ResolvingFiles())
+    if (Option.isNone(existingRegistration)) {
+      if (entries.size >= options.modelsMax) {
+        const evictable = Option.fromNullable([...entries.values()].filter(({ leases }) => leases === 0).sort((left, right) => left.lastReleasedAt - right.lastReleasedAt || String(left.request.servedModelId).localeCompare(String(right.request.servedModelId)))[0])
+        if (Option.isNone(evictable)) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "all-slots-leased" })
+        const current = yield* Ref.get(runtime)
+        const running = runningRuntime(current)
+        if (Option.isSome(running)) {
+          yield* publish(LlamaLoadEvent.UnloadingPrevious({ modelId: evictable.value.request.servedModelId }))
+          yield* running.value.controller.unload(evictable.value.request.servedModelId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
+        }
+        const withoutEvicted = new Map(entries)
+        withoutEvicted.delete(evictable.value.request.servedModelId)
+        entries = withoutEvicted
+      }
+      if (hasLiveRuntime(yield* Ref.get(runtime)) && [...entries.values()].some(({ leases }) => leases > 0)) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "catalog-change-in-use" })
+      const files = yield* options.modelFiles.resolve(request.modelFileId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "model-unavailable" })))
+      const registration = { id: registrationId(request), request, files, leases: 0, lastReleasedAt: 0 }
+      entries = new Map(entries).set(request.servedModelId, registration)
+      yield* Ref.set(registrations, entries)
+      yield* publish(LlamaLoadEvent.WritingPreset())
+      yield* stopRuntime
+    } else {
+      yield* options.modelFiles.resolve(request.modelFileId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "model-unavailable" })))
+    }
+    yield* publish(LlamaLoadEvent.StartingRouter())
+    const current = yield* startRuntime(request.servedModelId)
+    const before = yield* current.observer.models.pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
+    const loaded = Option.fromNullable(before.find(({ id }) => id === request.servedModelId))
+    if (!Option.exists(loaded, isLoaded)) {
+      yield* publish(LlamaLoadEvent.Loading({ progress: Option.none() }))
+      yield* current.controller.load(request.servedModelId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
+    }
+    let observed = loaded
+    for (let attempt = 0; attempt < 300 && !Option.exists(observed, isLoaded); attempt++) {
+      yield* Effect.sleep("100 millis")
+      const models = yield* current.observer.models.pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
+      observed = Option.fromNullable(models.find(({ id }) => id === request.servedModelId))
+      yield* Option.match(observed, {
+        onNone: () => Effect.void,
+        onSome: (model) => publish(LlamaLoadEvent.Loading({ progress: Option.flatMap(model.loadProgress, (progress) => progress.fraction) })),
+      })
+      if (Option.exists(observed, ({ status }) => status === "failed")) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-failed" })
+    }
+    yield* publish(LlamaLoadEvent.Verifying())
+    const readyModel = yield* Option.match(observed, {
+      onNone: () => Effect.fail(new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-timeout" })),
+      onSome: (model) => isLoaded(model)
+        ? Effect.succeed(model)
+        : Effect.fail(new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-timeout" })),
+    })
+    if (request.profile.contextSize._tag === "Tokens" && !Option.contains(readyModel.activeContextTokens, request.profile.contextSize.value)) {
+      return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "context-mismatch" })
+    }
+    yield* publish(LlamaLoadEvent.Loaded({ model: readyModel }))
+    yield* Ref.update(registrations, (entries) => Option.match(
+      Option.fromNullable(entries.get(request.servedModelId)),
+      {
+        onNone: () => entries,
+        onSome: (registration) => new Map(entries).set(
+          request.servedModelId,
+          replaceLeaseCount(registration, registration.leases, Date.now()),
+        ),
+      },
+    ))
+    return { instanceId: managedId, model: readyModel, target: { origin: current.process.origin, authorization: Option.some(options.apiKey), model: request.servedModelId } }
+  }))
+
+  const operationHandle = (shared: SharedLoadOperation): Effect.Effect<LlamaLoadOperation> => Effect.gen(function* () {
+    yield* Ref.update(shared.waiters, (count) => count + 1)
+    const cancelled = yield* Ref.make(false)
+    const cancel = Ref.getAndSet(cancelled, true).pipe(
+      Effect.flatMap((alreadyCancelled) => alreadyCancelled
+        ? Effect.void
+        : Ref.updateAndGet(shared.waiters, (count) => Math.max(0, count - 1)).pipe(
+          Effect.flatMap((remaining) => remaining === 0
+            ? Ref.get(shared.fiber).pipe(Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: Fiber.interruptFork })))
+            : Effect.void),
+        )),
+    )
+    return {
+      id: shared.id,
+      modelId: shared.modelId,
+      events: shared.events.changes,
+      result: Deferred.await(shared.result),
+      cancel,
+    }
+  })
+
+  const ensureLoaded = (request: ManagedModelRequest): Effect.Effect<LlamaLoadOperation> => Effect.gen(function* () {
+    const key = registrationId(request)
+    const existing = yield* Ref.get(loadOperations).pipe(Effect.map((operations) => Option.fromNullable(operations.get(key))))
+    if (Option.isSome(existing)) return yield* operationHandle(existing.value)
+    const events = yield* SubscriptionRef.make<LlamaLoadEvent>(LlamaLoadEvent.Queued())
+    const result = yield* Deferred.make<LlamaLoadedModel, LlamaAcquireError>()
+    const waiters = yield* Ref.make(0)
+    const fiberRef = yield* Ref.make<Option.Option<Fiber.RuntimeFiber<void>>>(Option.none())
+    const shared: SharedLoadOperation = { id: LlamaOperationId.make(randomUUID()), modelId: request.servedModelId, events, result, waiters, fiber: fiberRef }
+    const installed = yield* Ref.modify(loadOperations, (operations) => {
+      const raced = operations.get(key)
+      return raced
+        ? [raced, operations] as const
+        : [shared, new Map(operations).set(key, shared)] as const
+    })
+    if (installed !== shared) return yield* operationHandle(installed)
+    const run = loadManaged(request, (event) => SubscriptionRef.set(events, event)).pipe(
+      Effect.exit,
+      Effect.flatMap((exit) => Deferred.done(result, exit)),
+      Effect.ensuring(Ref.update(loadOperations, (operations) => {
+        if (operations.get(key) !== shared) return operations
+        const next = new Map(operations)
+        next.delete(key)
+        return next
+      })),
+      Effect.asVoid,
+    )
+    const fiber = yield* Effect.forkIn(run, registryScope)
+    yield* Ref.set(fiberRef, Option.some(fiber))
+    return yield* operationHandle(shared)
+  })
+  yield* Stream.repeatEffectWithSchedule(Effect.void, Schedule.spaced("1 minute")).pipe(
+    Stream.runForEach(() => lock.withPermits(1)(Effect.gen(function* () {
+      const state = yield* Ref.get(runtime)
+      if (state._tag !== "Running") return
+      const entries = [...(yield* Ref.get(registrations)).values()]
+      if (entries.some((entry) => entry.leases > 0)) return
+      const mostRecentUse = Math.max(0, ...entries.map((entry) => entry.lastReleasedAt))
+      if (mostRecentUse > 0 && Date.now() - mostRecentUse >= 30 * 60 * 1000) yield* stopRuntime
+    }))),
+    Effect.forkScoped,
+  )
   const managed: LlamaManagedInstance = {
     _tag: "Managed", id: managedId, observe: observeManaged,
     events: Stream.repeatEffectWithSchedule(observeManaged, Schedule.spaced("1 second")).pipe(Stream.map((observation) => ({ capturedAt: new Date(), observation }))),
+    ensureLoaded,
     acquire: (request) => Effect.acquireRelease(
-      lock.withPermits(1)(Effect.gen(function* () {
-        let entries = yield* Ref.get(registrations)
-        const existingRegistration = Option.fromNullable(entries.get(request.servedModelId))
-        if (Option.exists(existingRegistration, (registration) => registration.request.modelFileId !== request.modelFileId || registration.request.profile.id !== request.profile.id)) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "registration-conflict" })
-        if (Option.isNone(existingRegistration)) {
-          if (entries.size >= options.modelsMax) {
-            const evictable = Option.fromNullable([...entries.values()].filter(({ leases }) => leases === 0).sort((left, right) => left.lastReleasedAt - right.lastReleasedAt || String(left.request.servedModelId).localeCompare(String(right.request.servedModelId)))[0])
-            if (Option.isNone(evictable)) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "all-slots-leased" })
-            const current = yield* Ref.get(runtime)
-            const running = runningRuntime(current)
-            if (Option.isSome(running)) yield* running.value.controller.unload(evictable.value.request.servedModelId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
-            const withoutEvicted = new Map(entries)
-            withoutEvicted.delete(evictable.value.request.servedModelId)
-            entries = withoutEvicted
-          }
-          if (hasLiveRuntime(yield* Ref.get(runtime)) && [...entries.values()].some(({ leases }) => leases > 0)) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "catalog-change-in-use" })
-          const files = yield* options.modelFiles.resolve(request.modelFileId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "model-unavailable" })))
-          const registration = { id: registrationId(request), request, files, leases: 0, lastReleasedAt: 0 }
-          entries = new Map(entries).set(request.servedModelId, registration)
-          yield* Ref.set(registrations, entries)
-          yield* stopRuntime
-        } else yield* options.modelFiles.resolve(request.modelFileId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "model-unavailable" })))
-        const current = yield* startRuntime(request.servedModelId)
-        const before = yield* current.observer.models.pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
-        const loaded = Option.fromNullable(before.find(({ id }) => id === request.servedModelId))
-        if (!Option.exists(loaded, isLoaded)) yield* current.controller.load(request.servedModelId).pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
-        let observed = loaded
-        for (let attempt = 0; attempt < 300 && !Option.exists(observed, isLoaded); attempt++) {
-          yield* Effect.sleep("100 millis")
-          const models = yield* current.observer.models.pipe(Effect.mapError(() => new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-rejected" })))
-          observed = Option.fromNullable(models.find(({ id }) => id === request.servedModelId))
-          if (Option.exists(observed, ({ status }) => status === "failed")) return yield* new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-failed" })
-        }
-        const readyModel = yield* Option.match(observed, {
-          onNone: () => Effect.fail(new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-timeout" })),
-          onSome: (model) => isLoaded(model)
-            ? Effect.succeed(model)
-            : Effect.fail(new LlamaAcquireError({ instanceId: managedId, modelId: request.servedModelId, reason: "load-timeout" })),
-        })
-        yield* acquireLease(request.servedModelId)
-        return { instanceId: managedId, model: readyModel, target: { origin: current.process.origin, authorization: Option.some(options.apiKey), model: request.servedModelId } }
-      })),
+      Effect.gen(function* () {
+        const operation = yield* ensureLoaded(request)
+        const loaded = yield* operation.result.pipe(Effect.ensuring(operation.cancel))
+        yield* lock.withPermits(1)(acquireLease(request.servedModelId))
+        return loaded
+      }),
       () => lock.withPermits(1)(releaseLease(request.servedModelId)),
     ),
     unload: (model) => lock.withPermits(1)(Effect.gen(function* () {
@@ -354,6 +499,7 @@ export const makeLlamaInstanceRegistry = (options: LlamaInstanceRegistryOptions)
       onNone: () => Effect.fail(new LlamaInstanceNotFound({ id })),
       onSome: Effect.succeed,
     }),
+    ensureManagedLoaded: ensureLoaded,
     acquire: LlamaModelRequest.$match({
       Managed: ({ request }) => managed.acquire(request),
       External: ({ request }) => Effect.gen(function* () {

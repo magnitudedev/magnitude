@@ -12,6 +12,13 @@ export const GetLocalInferenceState = Rpc.make("GetLocalInferenceState", {
   error: LocalInferenceError,
 })
 
+export const StreamLocalInferenceState = Rpc.make("StreamLocalInferenceState", {
+  payload: Schema.Struct({}),
+  success: LocalInferenceState,
+  error: LocalInferenceError,
+  stream: true,
+})
+
 export const ConfigureLocalInferenceUsage = Rpc.make("ConfigureLocalInferenceUsage", {
   payload: LocalInferenceUsageSelection,
   success: Schema.Struct({}),

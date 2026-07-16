@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import * as BunContext from "@effect/platform-bun/BunContext"
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient"
@@ -20,4 +21,3 @@ const program = Effect.gen(function* () {
 })
 
 BunRuntime.runMain(program.pipe(Effect.provide(Layer.merge(BunContext.layer, FetchHttpClient.layer))))
-import { createHash } from "node:crypto"

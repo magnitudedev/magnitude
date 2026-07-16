@@ -65,7 +65,13 @@ export function buildConfigState<T extends ProviderModel & { readonly slots?: re
   const bySlot = {} as Record<SlotId, SlotConfig>
   for (const slotId of SLOT_IDS) {
     const userSlotConfig = userConfig?.slots?.[slotId]
-    const resolved = resolveSlotModel(catalogModels, userSlotConfig, slotId)
+    const intent = userConfig?.localSlotIntent?.[slotId]
+    const eligibleModels = intent === 'local'
+      ? catalogModels?.filter((model) => model.providerId === 'llamacpp') ?? null
+      : intent === 'cloud'
+        ? catalogModels?.filter((model) => model.providerId !== 'llamacpp') ?? null
+        : catalogModels
+    const resolved = resolveSlotModel(eligibleModels, userSlotConfig, slotId)
     if (resolved === null) {
       throw new NoModelForSlotError(slotId)
     }

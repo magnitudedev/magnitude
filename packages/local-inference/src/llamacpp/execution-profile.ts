@@ -151,6 +151,8 @@ const appendMicroBatchSize = MicroBatchSize.$match({
 export const renderExecutionProfileArguments = (profile: LlamaExecutionProfile): readonly string[] => {
   const arguments_ = [
     "--parallel", String(profile.parallelSlots),
+    "--kv-unified",
+    "--cont-batching",
     "--split-mode", profile.splitMode,
     "--cache-type-k", profile.kvCache.key,
     "--cache-type-v", profile.kvCache.value,
@@ -176,6 +178,9 @@ const presetOutputLimit = OutputLimit.$match({ RuntimeDefault: () => [] as strin
 export const renderExecutionProfilePreset = (profile: LlamaExecutionProfile): readonly string[] => {
   const lines = [
     `parallel = ${profile.parallelSlots}`,
+    "kv-unified = true",
+    "cont-batching = true",
+    "kv-offload = true",
     `split-mode = ${profile.splitMode}`,
     `cache-type-k = ${profile.kvCache.key}`,
     `cache-type-v = ${profile.kvCache.value}`,

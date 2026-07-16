@@ -21,7 +21,7 @@
     "@effect/rpc": "0.75.1",
     "@magnitudedev/agent": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
-    "@magnitudedev/llamacpp": "workspace:*",
+    "@magnitudedev/local-inference": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
 
     "@magnitudedev/protocol": "workspace:*",
