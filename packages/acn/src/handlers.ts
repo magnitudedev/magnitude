@@ -310,16 +310,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       UpdateModelSlots: ({ slots }) =>
         observeRpcDefects(
           "UpdateModelSlots",
-          Effect.gen(function* () {
-            const updates = slots ?? {}
-            yield* Effect.forEach(Object.values(updates), (slot) =>
-              slot?.providerId === "llamacpp" && slot.providerModelId
-                ? localModelSource.warm(slot.providerModelId)
-                : Effect.void,
-              { concurrency: 2, discard: true },
-            )
-            yield* account.updateModelSlots(updates)
-          }).pipe(
+          account.updateModelSlots(slots ?? {}).pipe(
             Effect.mapError((error) => new SessionOperationFailed({
               operation: "operation" in error ? String(error.operation) : "select local model",
               reason: "reason" in error ? String(error.reason) : String(error),
@@ -357,10 +348,16 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localInference.configureUsage(selection).pipe(Effect.as({})),
         ),
 
-      InstallLocalInferenceDistribution: () =>
+      InstallManagedLlamaCpp: () =>
         observeRpcDefects(
-          "InstallLocalInferenceDistribution",
-          localInference.installDistribution.pipe(Effect.as({})),
+          "InstallManagedLlamaCpp",
+          localInference.installLlamaCpp.pipe(Effect.map((operationId) => ({ operationId }))),
+        ),
+
+      RefreshLocalInferenceInstallations: () =>
+        observeRpcDefects(
+          "RefreshLocalInferenceInstallations",
+          localInference.refreshInstallations.pipe(Effect.as({})),
         ),
 
       DownloadLocalModel: ({ configurationId }) =>

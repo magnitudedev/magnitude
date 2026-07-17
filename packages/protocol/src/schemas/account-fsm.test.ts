@@ -5,6 +5,7 @@ import {
   ModelCatalogUnavailable,
   ModelSlotsLifecycle,
   ModelSlotsLoading,
+  SlotUnassigned,
   ProviderCatalogUnavailable,
 } from "./account"
 import { ProviderIdSchema } from "@magnitudedev/ai"
@@ -51,7 +52,10 @@ describe("model catalog lifecycle", () => {
 describe("model slots lifecycle", () => {
   it("requires the same explicit refresh boundary", () => {
     const ready = ModelSlotsLifecycle.transition(new ModelSlotsLoading({}), "ready", {
-      profiles: {},
+      slots: {
+        primary: new SlotUnassigned({ slotId: "primary", reason: "no_candidate" }),
+        secondary: new SlotUnassigned({ slotId: "secondary", reason: "no_candidate" }),
+      },
       config: { slots: {}, localSlotIntent: {} },
     })
     const refreshing = ModelSlotsLifecycle.transition(ready, "refreshing", { failures: [] })

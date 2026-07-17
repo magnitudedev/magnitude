@@ -16,13 +16,6 @@ export {
 export { definePrompt } from './prompt'
 export type { PromptTemplate } from './prompt'
 
-// Re-export model types for convenience
-export type { ModelProfile } from '@magnitudedev/ai'
-
-// Slot resolution
-export { resolveSlotModel } from './slot-resolution'
-export type { UserSlotConfig, ResolvedSlotModel } from './slot-resolution'
-
 // Roles
 export {
   createRoles,

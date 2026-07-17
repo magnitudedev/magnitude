@@ -2,7 +2,7 @@ import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
 import {
-  LocalInferenceState,
+  LocalInferenceSnapshotSchema,
   LocalInferenceUsageSelection,
 } from "../schemas/local-inference"
 import { MirroredResourceInvalidationSchema } from "../schemas/mirrored-resource"
@@ -10,7 +10,7 @@ import { StreamHeartbeat } from "../schemas/events"
 
 export const GetLocalInferenceState = Rpc.make("GetLocalInferenceState", {
   payload: Schema.Struct({}),
-  success: LocalInferenceState,
+  success: LocalInferenceSnapshotSchema,
   error: LocalInferenceError,
 })
 
@@ -27,7 +27,13 @@ export const ConfigureLocalInferenceUsage = Rpc.make("ConfigureLocalInferenceUsa
   error: LocalInferenceError,
 })
 
-export const InstallLocalInferenceDistribution = Rpc.make("InstallLocalInferenceDistribution", {
+export const InstallManagedLlamaCpp = Rpc.make("InstallManagedLlamaCpp", {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({ operationId: Schema.String }),
+  error: LocalInferenceError,
+})
+
+export const RefreshLocalInferenceInstallations = Rpc.make("RefreshLocalInferenceInstallations", {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: LocalInferenceError,

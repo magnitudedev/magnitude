@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
+import { Option } from "effect"
 import { ProviderModelIdSchema, type LocalInferenceState, type LocalModelRecommendation } from "@magnitudedev/sdk"
-import { buildLocalInferenceSelections, selectionMetadata } from "./view-model"
+import { buildLocalInferenceSelections, selectionCapacityWarning, selectionMetadata } from "./view-model"
 
 const recommendation: LocalModelRecommendation = {
   configurationId: "configuration-1",
@@ -44,7 +45,21 @@ const recommendation: LocalModelRecommendation = {
 const baseState = {
   usage: { sessionConcurrency: "one" },
   activeBinding: null,
-  distribution: { _tag: "Ready", build: 10011, source: "managed" },
+  llamaCpp: {
+    minimumBuild: 8868,
+    recommendedBuild: 10011,
+    installations: [{
+      id: "managed",
+      executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" },
+      build: 10011,
+      ownership: "magnitude",
+      discoveries: [{ _tag: "Managed", markerPath: "/managed/current.json", release: "test" }],
+    }],
+    selectedInstallationId: Option.some("managed"),
+    activeManagedInstallationId: Option.none(),
+    managedInstall: { availability: { _tag: "Available", build: 10011 }, operation: { _tag: "Idle" } },
+    diagnostics: [],
+  },
   host: { _tag: "Unavailable", message: "not needed" },
   operations: [],
   warnings: [],
@@ -61,7 +76,8 @@ describe("local inference selection view model", () => {
         providerModelId: ProviderModelIdSchema.make("local-model"),
         contextTokens: recommendation.contextTokens,
         fitClass: recommendation.fitClass,
-        compatible: true,
+        availability: { _tag: "Available" },
+        fitAssessment: { _tag: "NotAssessed" },
         explanation: "Stored and ready.",
         residency: "unloaded",
       }],
@@ -74,7 +90,7 @@ describe("local inference selection view model", () => {
     })])
   })
 
-  it("keeps a compatible external server as an actionable running selection", () => {
+  it("keeps an available external server as an actionable running selection", () => {
     const state: LocalInferenceState = {
       ...baseState,
       choices: [{
@@ -84,7 +100,8 @@ describe("local inference selection view model", () => {
         providerModelId: ProviderModelIdSchema.make("external-model"),
         contextTokens: 48_000,
         fitClass: "unknown",
-        compatible: true,
+        availability: { _tag: "Available" },
+        fitAssessment: { _tag: "NotAssessed" },
         explanation: "Observed read-only endpoint.",
         residency: "loaded",
         quantization: {
@@ -105,5 +122,53 @@ describe("local inference selection view model", () => {
       id: "external-choice",
     })])
     expect(selectionMetadata(selections[0]!)).toBe("UD-Q6_K_XL · 30.4 GiB · 48K context")
+  })
+
+  it("keeps a capacity-risk model actionable and exposes its warning", () => {
+    const state: LocalInferenceState = {
+      ...baseState,
+      choices: [{
+        _tag: "StoredOwned",
+        choiceId: "large-model",
+        displayName: "Large model",
+        providerModelId: ProviderModelIdSchema.make("large-model"),
+        contextTokens: 32_768,
+        fitClass: "cpu_or_unified",
+        availability: { _tag: "Available" },
+        fitAssessment: {
+          _tag: "Estimated",
+          estimatedTotalBytes: 24 * 1024 ** 3,
+          domains: [{ memoryDomainId: "system", estimatedBytes: 24 * 1024 ** 3, stableCapacityBytes: 20 * 1024 ** 3, marginBytes: -4 * 1024 ** 3 }],
+          result: "capacity_risk",
+        },
+        explanation: "Loading may fail.",
+        residency: "unloaded",
+      }],
+      recommendations: [],
+    }
+
+    const selections = buildLocalInferenceSelections(state)
+    expect(selections).toHaveLength(1)
+    expect(selectionCapacityWarning(selections[0]!)).toContain("estimated 24.0 GiB")
+  })
+
+  it("excludes a hard-disabled model independently of fit state", () => {
+    const state: LocalInferenceState = {
+      ...baseState,
+      choices: [{
+        _tag: "StoredOwned",
+        choiceId: "unavailable",
+        displayName: "Unavailable model",
+        providerModelId: ProviderModelIdSchema.make("unavailable"),
+        fitClass: "unknown",
+        availability: { _tag: "Disabled", reason: "installation_unavailable" },
+        fitAssessment: { _tag: "NotAssessed" },
+        explanation: "No installation.",
+        residency: "unloaded",
+      }],
+      recommendations: [],
+    }
+
+    expect(buildLocalInferenceSelections(state)).toEqual([])
   })
 })

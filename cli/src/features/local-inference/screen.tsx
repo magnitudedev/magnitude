@@ -16,6 +16,7 @@ import {
   formatBytes,
   formatContext,
   selectedInferenceIndex,
+  selectionCapacityWarning,
   selectionMetadata,
   selectionTitle,
   type LocalInferenceSelection,
@@ -68,9 +69,6 @@ const LocalUsageOption = memo(function LocalUsageOption({ focused, selected, tit
     </box>
   )
 })
-
-const failureMessage = <A, E>(result: AtomResult.Result<A, E>): string | null =>
-  AtomResult.isFailure(result) ? Cause.pretty(result.cause) : null
 
 type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
 
@@ -130,9 +128,9 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
   const selectedIndex = selectedInferenceIndex(selections, selectedId)
   const selected = selections[selectedIndex]
-  const mutationBusy = local.mutationResults.some(AtomResult.isWaiting)
-  const busy = mutationBusy
-  const error = local.mutationResults.map(failureMessage).find((message) => message !== null) ?? null
+  const busy = local.mutationBusy
+  const installationReady = Option.isSome(state.llamaCpp.selectedInstallationId)
+  const error = local.mutationFailure
   const usageReady = state.usage?.sessionConcurrency === concurrency
   const stage = requestedStage === "models" && usageReady ? "models" : "usage"
 
@@ -159,8 +157,8 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 
   const confirmSelection = useCallback((selection: LocalInferenceSelection | undefined) => {
     if (busy) return
-    if (state.distribution._tag !== "Ready") {
-      local.installDistribution()
+    if (!installationReady) {
+      local.installLlamaCpp()
       return
     }
     if (!selection) return
@@ -185,7 +183,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     } else {
       local.downloadModel(selection.id)
     }
-  }, [busy, local, onConfigured, state.activeBinding, state.choices, state.distribution._tag])
+  }, [installationReady, busy, local, onConfigured, state.activeBinding, state.choices])
 
   const confirmModel = useCallback(() => {
     confirmSelection(selected)
@@ -256,7 +254,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
             <LocalUsageOption focused={focusTarget === "up_to_three"} selected={concurrency === "up_to_three"} title="Multiple sessions" description="Reserve up to three local context windows. This may result in a smaller recommended local model." />
           </box>
           {busy && <text style={{ fg: theme.primary }}>Finding models for this setup…</text>}
-          {error && <text style={{ fg: theme.error }}>{error}</text>}
+          {Option.isSome(error) && <text style={{ fg: theme.error }}>{error.value}</text>}
           <text style={{ fg: theme.muted, marginTop: 1 }}>↑/↓ move · Enter select</text>
           <box style={{ flexDirection: "row", paddingTop: 1 }}>
             <Button
@@ -305,7 +303,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         {host ? `${formatBytes(host.systemMemoryBytes)} total system memory` : "System memory unavailable"}
       </text>
       </box>
-      {state.distribution._tag !== "Ready" && (
+      {!installationReady && (
         <box style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: theme.warning, paddingLeft: 1, paddingRight: 1 }}>
           <text style={{ fg: theme.warning }}>Install llama.cpp to download or run a recommended model.</text>
         </box>
@@ -314,6 +312,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         {selections.length === 0
           ? <text style={{ fg: theme.warning }}>No curated model currently fits this configuration.</text>
           : selections.map((selection, index) => {
+            const capacityWarning = selectionCapacityWarning(selection)
             const sectionLabel = index === firstRunningIndex ? "RUNNING NOW"
               : index === firstStoredIndex ? "DOWNLOADED"
               : index === firstRecommendationIndex ? (hasExistingModels ? "POSSIBLE DOWNLOADS" : "RECOMMENDED DOWNLOADS")
@@ -336,6 +335,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               </text>
               <text style={{ fg: theme.muted }}>{selectionMetadata(selection)}</text>
               {selection.kind === "recommendation" && <text style={{ fg: theme.muted }}>{selection.recommendation.quantization.fidelityLabel}</text>}
+              {capacityWarning && <text style={{ fg: theme.warning }}>{capacityWarning}</text>}
             </Button>
             </Fragment>
           })}
@@ -358,12 +358,12 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         )}
       </box>
       {busy && <text style={{ fg: theme.primary }}>Applying local model changes…</text>}
-      {error && <text style={{ fg: theme.error }}>{error}</text>}
+      {Option.isSome(error) && <text style={{ fg: theme.error }}>{error.value}</text>}
       {state.warnings.map((warning) => <text key={warning.code} style={{ fg: theme.warning }}>{warning.message}</text>)}
       <text style={{ fg: theme.muted, marginTop: 1 }}>
         ↑/↓ choose · D details
         {selected?.kind === "recommendation"
-          ? state.distribution._tag === "Ready" ? " · Enter download" : " · Enter install"
+          ? installationReady ? " · Enter download" : " · Enter install"
           : " · Enter use"}
       </text>
       <box style={{ paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: "row" }}>

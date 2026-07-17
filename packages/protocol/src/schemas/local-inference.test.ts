@@ -1,17 +1,30 @@
 import { describe, expect, test } from "vitest"
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 import {
   ActiveLocalBindingSummary,
-  LocalInferenceDistributionState,
   LocalInferenceErrorCode,
   LocalInferenceHostProfile,
+  LocalInferenceLlamaCppState,
   LocalModelChoice,
   LocalInferenceServingProfile,
   LocalInferenceState,
+  LocalInferenceSnapshotSchema,
   LocalInferenceUsageSelection,
 } from "./local-inference"
 
 describe("local inference protocol schemas", () => {
+  const llamaCpp = {
+    minimumBuild: 8868,
+    recommendedBuild: 10011,
+    installations: [],
+    selectedInstallationId: Option.none<string>(),
+    activeManagedInstallationId: Option.none<string>(),
+    managedInstall: {
+      availability: { _tag: "Available" as const, build: 10011 },
+      operation: { _tag: "Idle" as const },
+    },
+    diagnostics: [],
+  }
   test("keeps stable capacity distinct from point-in-time free memory", () => {
     const decoded = Schema.decodeUnknownSync(LocalInferenceHostProfile)({
       systemMemoryBytes: 64 * 1024 ** 3,
@@ -62,24 +75,30 @@ describe("local inference protocol schemas", () => {
     const state = {
       usage: null,
       activeBinding: null,
-      distribution: { _tag: "Missing" },
-      host: { _tag: "Unavailable", message: "distribution missing" },
+      llamaCpp,
+      host: { _tag: "Unavailable" as const, message: "llama.cpp missing" },
       choices: [],
       operations: [],
       recommendations: [],
       warnings: [],
     }
-    expect(Schema.decodeUnknownSync(LocalInferenceState)(state)).toEqual(state)
+    const encodedState = Schema.encodeSync(LocalInferenceState)(state)
+    expect(Schema.decodeUnknownSync(LocalInferenceState)(encodedState)).toEqual(state)
+
+    const snapshot = { revision: 3, state }
+    const encodedSnapshot = Schema.encodeSync(LocalInferenceSnapshotSchema)(snapshot)
+    expect(Schema.decodeUnknownSync(LocalInferenceSnapshotSchema)(encodedSnapshot)).toEqual(snapshot)
   })
 
-  test("round-trips every tagged choice, binding, and distribution variant", () => {
+  test("round-trips every tagged choice, binding, and llama.cpp state", () => {
     const choiceFields = {
       choiceId: "opaque-choice",
       displayName: "Model",
       providerModelId: "model",
       contextTokens: 8192,
       fitClass: "unknown",
-      compatible: true,
+      availability: { _tag: "Available" },
+      fitAssessment: { _tag: "NotAssessed" },
       explanation: "test",
       residency: "loaded",
     }
@@ -95,19 +114,16 @@ describe("local inference protocol schemas", () => {
       expect(Schema.decodeUnknownSync(ActiveLocalBindingSummary)(binding)).toEqual(binding)
     }
 
-    for (const distribution of [
-      { _tag: "Missing" },
-      { _tag: "Unsupported", message: "unsupported" },
-      { _tag: "Invalid", message: "invalid" },
-      { _tag: "Ready", build: 10011, source: "managed" },
-    ] as const) {
-      expect(Schema.decodeUnknownSync(LocalInferenceDistributionState)(distribution)).toEqual(distribution)
-    }
+    const encoded = Schema.encodeSync(LocalInferenceLlamaCppState)(llamaCpp)
+    const transported = JSON.parse(JSON.stringify(encoded))
+    expect(transported).not.toHaveProperty("selectedInstallationId")
+    expect(transported).not.toHaveProperty("activeManagedInstallationId")
+    expect(Schema.decodeUnknownSync(LocalInferenceLlamaCppState)(transported)).toEqual(llamaCpp)
   })
 
   test("accepts every error code in the closed wire vocabulary", () => {
     const codes = [
-      "distribution_missing",
+      "llama_cpp_missing",
       "unsupported_platform",
       "invalid_selection",
       "artifact_unavailable",

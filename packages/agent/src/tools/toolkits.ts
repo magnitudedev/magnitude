@@ -215,7 +215,7 @@ export function getEffectiveToolkit(
 
   // Vision-based image tool selection
   if ('fileView' in toolkit.entries) {
-    const hasVision = getSlotConfigForRole(configState, roleId)?.profile?.capabilities?.vision ?? true
+    const hasVision = getSlotConfigForRole(configState, roleId)?.vision === true
     toolkit = hasVision
       ? toolkit.omit('queryImage')
       : toolkit.omit('fileView')

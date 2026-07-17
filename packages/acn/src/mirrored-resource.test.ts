@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Effect, Option, Stream } from "effect"
+import { Effect, Fiber, Option, Stream } from "effect"
 import { makeMirroredResource } from "./mirrored-resource"
 
 describe("mirrored resource", () => {
@@ -29,5 +29,20 @@ describe("mirrored resource", () => {
 
     expect(result.exit._tag).toBe("Failure")
     expect(result.snapshot).toEqual({ revision: 0, state: { count: 0 } })
+  })
+
+  it("suppresses an equivalent set", async () => {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const resource = yield* makeMirroredResource({ count: 0 })
+      const event = yield* Effect.fork(Stream.runHead(resource.changes))
+      yield* Effect.yieldNow()
+      const snapshot = yield* resource.setIfChanged({ count: 0 }, (left, right) => left.count === right.count)
+      const published = yield* Fiber.poll(event)
+      yield* Fiber.interrupt(event)
+      return { snapshot, published }
+    })))
+
+    expect(result.snapshot).toEqual({ revision: 0, state: { count: 0 } })
+    expect(Option.isNone(result.published)).toBe(true)
   })
 })

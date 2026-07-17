@@ -104,7 +104,7 @@ import { initTraceSession } from '@magnitudedev/tracing'
 import { MAGNITUDE_VERSION } from '@magnitudedev/version'
 
 import { publishSessionOptions, SessionOptionsAmbient } from './ambient/session-ambient'
-import { ConfigAmbient, publishConfigFromCatalog, getSlotConfig } from './ambient/config-ambient'
+import { ConfigAmbient, publishConfigFromModelResources, getSlotConfig } from './ambient/config-ambient'
 import { loadSkills, skillLoadDiagnosticLogFields, type Skill, type SkillLoadDiagnostic } from '@magnitudedev/skills'
 import { publishSkills } from './ambient/skills-ambient'
 import { publishToolkit } from './ambient/toolkit-ambient'
@@ -226,6 +226,14 @@ export interface CreateClientOptions {
    */
   providerClient: ProviderClientShape
 
+  /** Authoritative ACN model resources. Reads are observational. */
+  modelCatalog: Effect.Effect<import('@magnitudedev/sdk').ModelCatalog>
+  modelSlots: Effect.Effect<import('@magnitudedev/sdk').ModelSlots>
+  /** ACN-owned authoritative persistence/publication for a runtime-invalidated bound effort. */
+  applyReasoningEffortFallback?: (
+    input: import('./model/model-resolver').ReasoningEffortFallbackInput,
+  ) => Effect.Effect<void, unknown>
+
   /**
    * Disable shell command classification safeguards for this runtime only.
    */
@@ -338,9 +346,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
       }
 
       const refreshConfig: Effect.Effect<void> = provideAmbient(
-        publishConfigFromCatalog(options.storage).pipe(
-          Effect.provideService(ProviderClient, magnitudeClient)
-        )
+        publishConfigFromModelResources(options.storage, options.modelCatalog, options.modelSlots)
       ).pipe(
         Effect.catchAll((err) =>
           Effect.logWarning(`Failed to refresh config: ${err}`).pipe(Effect.asVoid)
@@ -603,9 +609,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
             ),
           )
           yield* provideAmbient(
-            publishConfigFromCatalog(options.storage).pipe(
-              Effect.provideService(ProviderClient, magnitudeClient),
-            ),
+            publishConfigFromModelResources(options.storage, options.modelCatalog, options.modelSlots),
           ).pipe(
             Effect.catchAll(() =>
               Effect.logWarning('Self-heal: failed to refresh config')
@@ -683,7 +687,10 @@ export function createCodingAgentSession(options: CreateClientOptions) {
   // ACN owns the authoritative catalog; sessions consume it without adding a
   // second cache or refresh policy.
   const providerClientLayer = Layer.succeed(ProviderClient, options.providerClient)
-  const agentModelResolverLayer = Layer.provide(AgentModelResolverLive(options.debug), providerClientLayer)
+  const agentModelResolverLayer = Layer.provide(
+    AgentModelResolverLive(options.debug, options.applyReasoningEffortFallback),
+    providerClientLayer,
+  )
   const chatTitleServiceLayer = Layer.provide(
     ChatTitleServiceLive,
     Layer.mergeAll(agentModelResolverLayer, FetchHttpClient.layer, options.persistence),
@@ -719,7 +726,13 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     BunFileSystem.layer,
     BunPath.layer,
   )
-  const engineLayer = Layer.provideMerge(CodingAgent.EngineLayer, baseLayer)
+  // All worker requirements are supplied by baseLayer. The EventEngine worker
+  // tuple currently widens that requirement parameter to `any`, so constrain
+  // it at this composition boundary instead of leaking `any` into Surface.host.
+  const engineLayer = Layer.provideMerge(
+    CodingAgent.EngineLayer as Layer.Layer<any, any, never>,
+    baseLayer,
+  )
   const withDisplayRuntime = Layer.provideMerge(DisplayViewRuntimeLive, engineLayer)
   const appLayer = Layer.provideMerge(
     makeCodingAgentLive(options),

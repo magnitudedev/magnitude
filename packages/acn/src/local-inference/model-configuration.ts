@@ -27,7 +27,7 @@ export interface LocalModelConfigurationApi {
   readonly reconcileSlots: (
     input: LocalModelReconciliationInput,
   ) => Effect.Effect<boolean, ModelConfigurationError>
-  readonly recordUse: (slotId: SlotId | "selected", providerModelId: ProviderModelId) => Effect.Effect<void, ModelConfigurationError>
+  readonly recordUse: (slotId: SlotId, providerModelId: ProviderModelId) => Effect.Effect<void, ModelConfigurationError>
   readonly activateLocal: (binding: DurableLocalModelBinding) => Effect.Effect<void, ModelConfigurationError>
   readonly disableLocal: Effect.Effect<void, ModelConfigurationError>
   readonly changes: Stream.Stream<void>
@@ -197,11 +197,14 @@ export const makeLocalModelConfiguration = (
       for (const slotId of ["primary", "secondary"] as const) {
         const slot = updates[slotId]
         if (!slot) continue
+        const previous = slots[slotId]
         if (slot.providerId || slot.providerModelId || slot.reasoningEffort) slots[slotId] = slot
         else delete slots[slotId]
         if (slot.providerId === "llamacpp") {
           intent[slotId] = "local"
-          if (slot.providerModelId) recency[slotId] = moveToFront(recency[slotId] ?? [], slot.providerModelId)
+          if (slot.providerModelId && previous?.providerModelId !== slot.providerModelId) {
+            recency[slotId] = moveToFront(recency[slotId] ?? [], slot.providerModelId)
+          }
         } else if (slot.providerId) {
           intent[slotId] = "cloud"
         }
@@ -227,13 +230,7 @@ export const makeLocalModelConfiguration = (
     recordUse: (slotId, providerModelId) => storage.update((current) => {
       const models = current.models ?? {}
       const recency = { ...(models.localModelRecency ?? {}) }
-      const targets = slotId === "selected"
-        ? (["primary", "secondary"] as const).filter((candidate) => {
-            const slot = models.slots?.[candidate]
-            return slot?.providerId === "llamacpp" && slot.providerModelId === providerModelId
-          })
-        : [slotId]
-      for (const target of targets) recency[target] = moveToFront(recency[target] ?? [], providerModelId)
+      recency[slotId] = moveToFront(recency[slotId] ?? [], providerModelId)
       return { ...current, models: { ...models, localModelRecency: recency } }
     }).pipe(
       Effect.mapError((cause) => configurationError("record local model use", cause)),

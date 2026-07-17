@@ -27,6 +27,7 @@ import {
   getEphemeralMessageSnapshot,
   useFileWatchBridge,
   useLocalInferenceQuery,
+  deriveLlamaCppInstallationChatNotice,
 } from '@magnitudedev/client-common'
 import { ModelSlotsLifecycle, type SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
@@ -43,6 +44,7 @@ import type { ActionId } from './types/ui-actions'
 import { FatalErrorScreen } from './features/app-shell/connection-error'
 import { WindowsWarningScreen } from './features/app-shell/windows-warning'
 import { AnimatedLogo } from './components/animated-logo'
+import { Button } from './components/button'
 import { ChatTimelineContainer } from './features/chat-timeline/container'
 import { ComposerContainer } from './features/composer/container'
 import { WorkingTimerContainer, TaskListContainer } from './features/agent-status/container'
@@ -239,6 +241,8 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
         && (choice.residency === 'loaded' || choice.residency === 'sleeping'))), () => [])
   const loadingLocalModels = Option.getOrElse(Option.map(localInferenceSnapshot, (snapshot) =>
     snapshot.operations.filter((operation) => operation.status === 'running')), () => [])
+  const llamaNotice = Option.flatMap(localInferenceSnapshot, (snapshot) =>
+    deriveLlamaCppInstallationChatNotice(snapshot, snapshot.activeBinding?._tag === 'Managed'))
 
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
@@ -302,6 +306,15 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
             <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
               <TaskListContainer />
             </box>
+            {Option.isSome(llamaNotice) && (
+              <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, flexDirection: 'row' }}>
+                <text style={{ fg: theme.warning }}>{llamaNotice.value.prefix}</text>
+                <Button onClick={() => setSettingsOpen(true)}>
+                  <text style={{ fg: theme.primary }}>{llamaNotice.value.actionLabel}</text>
+                </Button>
+                <text style={{ fg: theme.warning }}>{llamaNotice.value.suffix}</text>
+              </box>
+            )}
             <ComposerContainer
               chatColumnWidth={chatColumnWidth}
               widgetNavActive={widget.widgetNavActive}

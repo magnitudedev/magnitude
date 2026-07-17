@@ -25,6 +25,8 @@ import {
   useSessionActions,
   useActiveSessionStatusesSubscription,
   activeSessionStatusesAtom,
+  useLocalInferenceQuery,
+  deriveLlamaCppInstallationChatNotice,
 } from "@magnitudedev/client-common"
 import { SessionsSidebar } from "./components/sessions-sidebar"
 import { ChatTimeline } from "./components/chat-timeline"
@@ -673,6 +675,10 @@ function FooterBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nul
 }
 
 function BottomDockContainer({ slotProfiles }: { slotProfiles: SlotProfiles | null }): ReactNode {
+  const setSettingsOpen = useAtomSet(settingsOpenAtom)
+  const localInference = useLocalInferenceQuery()
+  const snapshot = Result.value(localInference)
+  const notice = Option.flatMap(snapshot, (state) => deriveLlamaCppInstallationChatNotice(state, state.activeBinding?._tag === "Managed"))
   return (
     <div
       style={{
@@ -684,6 +690,16 @@ function BottomDockContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nu
       }}
     >
       <WorkStatusBarContainer slotProfiles={slotProfiles} />
+      {Option.isSome(notice) && (
+        <div style={{ color: "var(--accent-warning)", fontSize: 12, padding: "0 6px" }}>
+          {notice.value.prefix}
+          <button
+            onClick={() => setSettingsOpen(true)}
+            style={{ border: 0, padding: 0, background: "transparent", color: "var(--accent-primary)", cursor: "pointer", font: "inherit" }}
+          >{notice.value.actionLabel}</button>
+          {notice.value.suffix}
+        </div>
+      )}
       <ComposerContainer docked />
       <FooterBarContainer slotProfiles={slotProfiles} />
     </div>

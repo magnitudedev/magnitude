@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Chunk, Effect, Option, Stream, SynchronizedRef } from "effect"
+import { Chunk, Effect, Option, PubSub, Stream, SynchronizedRef } from "effect"
 import { makeModelFileId, makeModelFilePartId, type ModelFileId } from "./identity"
-import type { InspectedModelArtifact, LocalModelFileIndex, ModelFileDiscoveryRefresh, ModelFileFormat, ModelFileRecord, ModelFileRegistryApi, ModelFileSnapshot, ModelFileSourceRegistration, ResolvedModelFiles, SourceDiscoveryIssue, SourceFileSet } from "./types"
+import type { InspectedModelArtifact, ModelArtifactIndex, ModelFileDiscoveryRefresh, ModelFileFormat, ModelFileRecord, ModelFileRegistryApi, ModelFileSnapshot, ModelFileSourceRegistration, ResolvedModelFiles, SourceDiscoveryIssue, SourceFileSet } from "./types"
 import { ModelFileDeleteError, ModelFileNotFound, ModelFileResolveError } from "./types"
 
 const resolveError = (id: ModelFileId, reason: ModelFileResolveError["reason"], part: Option.Option<SourceFileSet["entries"][number]["key"]> = Option.none()) => new ModelFileResolveError({ id, reason, part })
@@ -18,12 +18,12 @@ interface RegistryState {
   readonly snapshot: Option.Option<ModelFileSnapshot>
   readonly entries: ReadonlyMap<ModelFileId, RegistryEntry>
   readonly formatCache: ReadonlyMap<string, CachedInspection>
-  readonly sets: LocalModelFileIndex["sets"]
+  readonly sets: ModelArtifactIndex["sets"]
 }
 export interface ModelFileRegistryOptions {
   readonly sources: readonly ModelFileSourceRegistration[]
   readonly formats: readonly ModelFileFormat[]
-  readonly initialIndex?: LocalModelFileIndex
+  readonly initialIndex: Option.Option<ModelArtifactIndex>
 }
 
 const setVersion = (set: SourceFileSet): string => {
@@ -31,6 +31,19 @@ const setVersion = (set: SourceFileSet): string => {
   for (const entry of set.entries) hash.update(`${entry.key.length}:${entry.key}${entry.sizeBytes}:${Option.getOrElse(entry.modifiedAtMillis, () => -1)}:${Option.getOrElse(entry.sha256, () => "")}`)
   return hash.digest("hex")
 }
+
+const artifactStateKey = (
+  sets: ModelArtifactIndex["sets"],
+  issues: readonly SourceDiscoveryIssue[],
+): string => [
+  ...[...sets]
+    .map((entry) => `${entry.sourceId}\0${entry.set.id}\0${entry.formatId}\0${entry.version}`)
+    .sort(),
+  "\0issues\0",
+  ...[...issues]
+    .map((issue) => `${issue.sourceId}\0${issue.code}\0${issue.message}\0${Option.getOrElse(issue.sourceKey, () => "")}`)
+    .sort(),
+].join("\0")
 
 const buildRecord = (registration: ModelFileSourceRegistration, format: ModelFileFormat, artifact: InspectedModelArtifact): ModelFileRecord => {
   const source = registration.source
@@ -47,12 +60,13 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
   const fs = yield* FileSystem.FileSystem
   const registrations = new Map(options.sources.map((registration) => [String(registration.source.id), registration]))
   const formats = new Map(options.formats.map((format) => [String(format.id), format]))
-  const hydrate = (index: LocalModelFileIndex | undefined): RegistryState => {
-    if (!index) return { snapshot: Option.none(), entries: new Map(), formatCache: new Map(), sets: [] }
+  const hydrate = (index: Option.Option<ModelArtifactIndex>): RegistryState => {
+    if (Option.isNone(index)) return { snapshot: Option.none(), entries: new Map(), formatCache: new Map(), sets: [] }
+    const artifactIndex = index.value
     const entries = new Map<ModelFileId, RegistryEntry>()
     const formatCache = new Map<string, CachedInspection>()
-    const validSets: LocalModelFileIndex["sets"][number][] = []
-    for (const cached of index.sets) {
+    const validSets: ModelArtifactIndex["sets"][number][] = []
+    for (const cached of artifactIndex.sets) {
       const registration = registrations.get(String(cached.sourceId))
       const format = formats.get(String(cached.formatId))
       if (!registration || !format) continue
@@ -69,8 +83,8 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
     return {
       snapshot: Option.some({
         records: [...entries.values()].map(({ record }) => record).sort((a, b) => a.displayName.localeCompare(b.displayName) || String(a.id).localeCompare(String(b.id))),
-        issues: index.issues,
-        capturedAt: index.capturedAt,
+        issues: artifactIndex.issues,
+        capturedAt: artifactIndex.capturedAt,
       }),
       entries,
       formatCache,
@@ -80,6 +94,7 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
   const state = yield* SynchronizedRef.make<RegistryState>({
     ...hydrate(options.initialIndex),
   })
+  const changes = yield* PubSub.unbounded<void>()
 
   const inspectFresh = (
     refresh: ModelFileDiscoveryRefresh,
@@ -90,8 +105,8 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
       const localCache = new Map<string, CachedInspection>()
       const localEntries = new Map<ModelFileId, RegistryEntry>()
       const localIssues: SourceDiscoveryIssue[] = []
-      const localSets: LocalModelFileIndex["sets"][number][] = []
-      const preserveCachedSet = (cachedSet: LocalModelFileIndex["sets"][number]) => {
+      const localSets: ModelArtifactIndex["sets"][number][] = []
+      const preserveCachedSet = (cachedSet: ModelArtifactIndex["sets"][number]) => {
         const format = formats.get(String(cachedSet.formatId))
         if (!format) return
         const cacheKey = `${source.id}\0${cachedSet.set.id}\0${cachedSet.formatId}`
@@ -151,8 +166,18 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
       formatCache: cache,
       sets,
     }
-    return [snapshot, next] as const
-  }))
+    const previousIssues = Option.match(previous.snapshot, {
+      onNone: () => [] as readonly SourceDiscoveryIssue[],
+      onSome: (value) => value.issues,
+    })
+    const changed = artifactStateKey(previous.sets, previousIssues) !== artifactStateKey(sets, issues)
+    return [{ snapshot, changed }, next] as const
+  })).pipe(
+    Effect.tap(({ changed }) => changed
+      ? PubSub.publish(changes, undefined)
+      : Effect.void),
+    Effect.map(({ snapshot }) => snapshot),
+  )
 
   return {
     inspect: (refresh) => refresh === "cached"
@@ -198,26 +223,21 @@ export const makeModelFileRegistry = (options: ModelFileRegistryOptions): Effect
         version: resolvedParts.map(({ file }) => ({ key: file.key, sizeBytes: file.sizeBytes, modifiedAtMillis: file.modifiedAtMillis })),
       } satisfies ResolvedModelFiles
     }),
-    remove: (id) => SynchronizedRef.modifyEffect(state, (current) => Effect.gen(function* () {
+    remove: (id) => Effect.gen(function* () {
+      const current = yield* SynchronizedRef.get(state)
       const entry = yield* Option.match(Option.fromNullable(current.entries.get(id)), {
         onNone: () => Effect.fail(new ModelFileDeleteError({ id, reason: "not-found" })),
         onSome: Effect.succeed,
       })
       if (entry.registration._tag !== "Deletable") return yield* new ModelFileDeleteError({ id, reason: "read-only" })
       yield* entry.registration.source.remove(id)
-      const entries = new Map(current.entries)
-      entries.delete(id)
-      return [current.snapshot, {
-        snapshot: Option.none(),
-        entries,
-        formatCache: current.formatCache,
-        sets: current.sets,
-      }] as const
-    })).pipe(Effect.asVoid),
-    index: SynchronizedRef.get(state).pipe(Effect.map((current) => ({
+      yield* inspectFresh("changed")
+    }),
+    artifactIndex: SynchronizedRef.get(state).pipe(Effect.map((current) => ({
       capturedAt: Option.match(current.snapshot, { onNone: () => new Date(), onSome: (snapshot) => snapshot.capturedAt }),
       sets: current.sets,
       issues: Option.match(current.snapshot, { onNone: () => [], onSome: (snapshot) => snapshot.issues }),
     }))),
+    changes: Stream.fromPubSub(changes),
   }
 })

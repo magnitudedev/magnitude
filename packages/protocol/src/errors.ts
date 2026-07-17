@@ -44,7 +44,7 @@ export class LocalInferenceError extends Schema.TaggedError<LocalInferenceError>
   "LocalInferenceError",
   {
     code: Schema.Literal(
-      "distribution_missing",
+      "llama_cpp_missing",
       "unsupported_platform",
       "invalid_selection",
       "artifact_unavailable",

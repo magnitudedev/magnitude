@@ -6,7 +6,15 @@ import { describe, expect, it } from "vitest"
 import { Effect } from "effect"
 import type { ModelCatalog } from "../catalog"
 import { makeFileBackedModelCatalog } from "../file-catalog"
-import { ProviderIdSchema, ProviderModelIdSchema, type ProviderId, type ProviderModel } from "../model"
+import {
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  ReasoningProperty,
+  VisionProperty,
+  type ProviderId,
+  type ProviderModel,
+} from "../model"
 
 const model = (providerId: ProviderId, displayName: string): ProviderModel => ({
   providerId,
@@ -14,10 +22,13 @@ const model = (providerId: ProviderId, displayName: string): ProviderModel => ({
   displayName,
   contextWindow: 8_192,
   maxOutputTokens: 1_024,
-  capabilities: { vision: false },
+  defaultReasoningEffort: ReasoningEffortSchema.make("none"),
+  properties: {
+    vision: new VisionProperty.states.Resolved({ value: false }),
+    reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make("none")] }),
+  },
   availability: { _tag: "Available" },
-  pricing: { input: 0, output: 0, cached_input: null },
-  reasoningEfforts: ["none"],
+    pricing: { input: 0, output: 0, cached_input: null },
 })
 
 describe("file-backed model catalog", () => {

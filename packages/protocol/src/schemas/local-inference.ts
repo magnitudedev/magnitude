@@ -1,5 +1,6 @@
 import { Schema } from "effect"
-import { ProviderModelIdSchema } from "@magnitudedev/ai"
+import { ProviderModelAvailabilitySchema, ProviderModelIdSchema } from "@magnitudedev/ai"
+import { MirroredSnapshotSchema } from "./mirrored-resource"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
@@ -24,6 +25,21 @@ export type LocalInferenceServingProfile = Schema.Schema.Type<typeof LocalInfere
 export const LocalInferenceFitClass = Schema.Literal("full_accelerator", "hybrid", "cpu_or_unified", "unknown")
 export type LocalInferenceFitClass = Schema.Schema.Type<typeof LocalInferenceFitClass>
 
+export const LocalModelFitAssessmentSchema = Schema.Union(
+  Schema.TaggedStruct("NotAssessed", {}),
+  Schema.TaggedStruct("Estimated", {
+    estimatedTotalBytes: NonNegativeNumber,
+    domains: Schema.Array(Schema.Struct({
+      memoryDomainId: Schema.String.pipe(Schema.minLength(1)),
+      estimatedBytes: NonNegativeNumber,
+      stableCapacityBytes: NonNegativeNumber,
+      marginBytes: Schema.Number.pipe(Schema.finite()),
+    })).pipe(Schema.minItems(1)),
+    result: Schema.Literal("likely_fits", "capacity_risk"),
+  }),
+)
+export type LocalModelFitAssessment = Schema.Schema.Type<typeof LocalModelFitAssessmentSchema>
+
 export const LocalInferenceQuantization = Schema.Struct({
   format: Schema.String,
   quantAwareCheckpoint: Schema.Boolean,
@@ -39,16 +55,56 @@ export const LocalInferenceWarning = Schema.Struct({
 })
 export type LocalInferenceWarning = Schema.Schema.Type<typeof LocalInferenceWarning>
 
-export const LocalInferenceDistributionState = Schema.Union(
-  Schema.TaggedStruct("Missing", {}),
-  Schema.TaggedStruct("Unsupported", { message: Schema.String }),
-  Schema.TaggedStruct("Invalid", { message: Schema.String }),
-  Schema.TaggedStruct("Ready", {
-    build: PositiveInteger,
-    source: Schema.Literal("managed", "configured"),
-  }),
+export const LocalInferenceLlamaInstallationDiscovery = Schema.Union(
+  Schema.TaggedStruct("Configured", { requestedPath: Schema.String }),
+  Schema.TaggedStruct("Managed", { markerPath: Schema.String, release: Schema.String }),
+  Schema.TaggedStruct("Path", { requestedPath: Schema.String, priority: Schema.NonNegativeInt }),
 )
-export type LocalInferenceDistributionState = Schema.Schema.Type<typeof LocalInferenceDistributionState>
+export type LocalInferenceLlamaInstallationDiscovery = Schema.Schema.Type<typeof LocalInferenceLlamaInstallationDiscovery>
+
+export const LocalInferenceLlamaCppInstallation = Schema.Struct({
+  id: Schema.String,
+  build: PositiveInteger,
+  ownership: Schema.Literal("user", "magnitude"),
+  executables: Schema.Struct({
+    serverPath: Schema.String,
+    fitParamsPath: Schema.String,
+  }),
+  discoveries: Schema.Array(LocalInferenceLlamaInstallationDiscovery),
+})
+export type LocalInferenceLlamaCppInstallation = Schema.Schema.Type<typeof LocalInferenceLlamaCppInstallation>
+
+export const LocalInferenceLlamaManagedInstallAvailability = Schema.Union(
+  Schema.TaggedStruct("Available", { build: PositiveInteger }),
+  Schema.TaggedStruct("UnsupportedPlatform", { reason: Schema.String }),
+)
+export type LocalInferenceLlamaManagedInstallAvailability = Schema.Schema.Type<typeof LocalInferenceLlamaManagedInstallAvailability>
+
+export const LocalInferenceLlamaManagedInstallOperation = Schema.Union(
+  Schema.TaggedStruct("Idle", {}),
+  Schema.TaggedStruct("Running", {
+    operationId: Schema.String,
+    stage: Schema.Literal("preparing", "downloading", "installing"),
+    bytesDownloaded: Schema.optionalWith(Schema.NonNegativeInt, { as: "Option", exact: true }),
+    bytesTotal: Schema.optionalWith(Schema.NonNegativeInt, { as: "Option", exact: true }),
+  }),
+  Schema.TaggedStruct("Failed", { operationId: Schema.String, message: Schema.String }),
+)
+export type LocalInferenceLlamaManagedInstallOperation = Schema.Schema.Type<typeof LocalInferenceLlamaManagedInstallOperation>
+
+export const LocalInferenceLlamaCppState = Schema.Struct({
+  minimumBuild: PositiveInteger,
+  recommendedBuild: PositiveInteger,
+  installations: Schema.Array(LocalInferenceLlamaCppInstallation),
+  selectedInstallationId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  activeManagedInstallationId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  managedInstall: Schema.Struct({
+    availability: LocalInferenceLlamaManagedInstallAvailability,
+    operation: LocalInferenceLlamaManagedInstallOperation,
+  }),
+  diagnostics: Schema.Array(LocalInferenceWarning),
+})
+export type LocalInferenceLlamaCppState = Schema.Schema.Type<typeof LocalInferenceLlamaCppState>
 
 export const LocalInferenceHostProfile = Schema.Struct({
   systemMemoryBytes: NonNegativeNumber,
@@ -117,7 +173,8 @@ const ChoiceFields = {
   providerModelId: ProviderModelIdSchema,
   contextTokens: Schema.optional(PositiveInteger),
   fitClass: LocalInferenceFitClass,
-  compatible: Schema.Boolean,
+  availability: ProviderModelAvailabilitySchema,
+  fitAssessment: LocalModelFitAssessmentSchema,
   explanation: Schema.String,
   residency: Schema.Literal("loaded", "sleeping", "unloaded", "loading", "failed"),
   quantization: Schema.optional(LocalInferenceQuantization),
@@ -164,7 +221,7 @@ export const LocalInferenceOperationSnapshot = Schema.Struct({
 export type LocalInferenceOperationSnapshot = Schema.Schema.Type<typeof LocalInferenceOperationSnapshot>
 
 export const LocalInferenceErrorCode = Schema.Literal(
-  "distribution_missing",
+  "llama_cpp_missing",
   "unsupported_platform",
   "invalid_selection",
   "artifact_unavailable",
@@ -185,7 +242,7 @@ export type LocalInferenceErrorCode = Schema.Schema.Type<typeof LocalInferenceEr
 export const LocalInferenceState = Schema.Struct({
   usage: Schema.NullOr(LocalInferenceUsageSelection),
   activeBinding: Schema.NullOr(ActiveLocalBindingSummary),
-  distribution: LocalInferenceDistributionState,
+  llamaCpp: LocalInferenceLlamaCppState,
   host: LocalInferenceHostState,
   choices: Schema.Array(LocalModelChoice),
   operations: Schema.Array(LocalInferenceOperationSnapshot),
@@ -193,3 +250,6 @@ export const LocalInferenceState = Schema.Struct({
   warnings: Schema.Array(LocalInferenceWarning),
 })
 export type LocalInferenceState = Schema.Schema.Type<typeof LocalInferenceState>
+
+export const LocalInferenceSnapshotSchema = MirroredSnapshotSchema(LocalInferenceState)
+export type LocalInferenceSnapshot = Schema.Schema.Type<typeof LocalInferenceSnapshotSchema>

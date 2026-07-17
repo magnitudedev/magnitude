@@ -150,7 +150,6 @@ function makeTitleModel(title: string | null, options?: { failAfterOutput?: bool
     profile: {
       contextWindow: 128_000,
       maxOutputTokens: 4096,
-      capabilities: { vision: false },
     },
   }
 

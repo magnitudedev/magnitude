@@ -2,7 +2,21 @@ import { Context } from "effect"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import { Effect } from "effect"
 import { ModelCatalogError } from "@magnitudedev/ai"
-import type { BoundModel, ProviderRejection, WebSearchResult, UsageQuery, BaseCallOptions, ProviderModelBindOptions, ProviderModel, ProviderId, ProviderModelId } from "@magnitudedev/ai"
+import type {
+  BaseCallOptions,
+  BoundModel,
+  ModelDiscoveryOperationId,
+  ModelPropertyDiscoveryError,
+  ModelPropertyDiscoveryRequest,
+  ProviderId,
+  ProviderModel,
+  ProviderModelBindOptions,
+  ProviderModelId,
+  ProviderRejection,
+  RequestAttribution,
+  UsageQuery,
+  WebSearchResult,
+} from "@magnitudedev/ai"
 import type { ModelCatalog } from "@magnitudedev/ai"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
@@ -47,6 +61,20 @@ export {
   ModelFamilyIdSchema,
   ProviderModelAvailabilitySchema,
   ProviderModelSchema,
+  ModelDiscoveryOperationIdSchema,
+  ModelPropertyDiscoveryErrorSchema,
+  ModelPropertyDiscoveryRequestSchema,
+  ModelPropertyNameSchema,
+  ReasoningEffortSchema,
+  ReasoningProperty,
+  VisionProperty,
+} from "@magnitudedev/ai"
+export type {
+  ModelDiscoveryOperationId,
+  ModelPropertyDiscoveryError,
+  ModelPropertyDiscoveryRequest,
+  ModelPropertyName,
+  ReasoningEffort,
 } from "@magnitudedev/ai"
 export type ProviderClientError = MagnitudeClientError
 export type ProviderRegistryInfo = RegistryProviderInfo
@@ -64,7 +92,7 @@ export type {
   MagnitudeAdditionalOptions,
 } from "@magnitudedev/providers"
 export type { LlamaCppProviderSource, LlamaCppInferenceLease, LlamaCppModelInfo, LlamaServedModelId, LlamaServingRouteId } from "@magnitudedev/providers"
-export { LlamaCppAcquisitionError, LlamaCppModelInfoSchema, LlamaServedModelIdSchema, LlamaServingRouteIdSchema } from "@magnitudedev/providers"
+export { LlamaCppAcquisitionError, LlamaCppModelInfoSchema, LlamaCppProviderId, LlamaServedModelIdSchema, LlamaServingRouteIdSchema } from "@magnitudedev/providers"
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/protocol"
@@ -116,6 +144,15 @@ export interface ProviderClientShape {
     providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
   ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
+  readonly discoverModelProperties: (
+    providerId: ProviderId,
+    request: ModelPropertyDiscoveryRequest,
+  ) => Effect.Effect<ModelDiscoveryOperationId, ModelPropertyDiscoveryError>
+  readonly requestAttribution: (
+    providerId: ProviderId,
+    providerModelId: ProviderModelId,
+    key: string,
+  ) => RequestAttribution
   readonly webSearch: (
     query: string,
     schema?: Record<string, unknown>,
@@ -158,6 +195,8 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
     sessionId,
     resolveModel: (providerId, providerModelId, options) =>
       registry.resolveModel(providerId, providerModelId, options),
+    discoverModelProperties: registry.discoverModelProperties,
+    requestAttribution: () => ({ requestStarted: Effect.void }),
     webSearch: magnitudeInstance.provider.webSearch,
     usage: magnitudeInstance.provider.usage,
     runtimeConfig: {

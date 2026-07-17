@@ -2,13 +2,13 @@ import { memo, useCallback, useState, useMemo } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { Atom, Result, useAtomMount } from '@effect-atom/atom-react'
-import { Effect, Option } from 'effect'
+import { Cause, Effect, Option } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
-import type { UseModelConfigResult } from '@magnitudedev/client-common'
-import { ModelCatalogLifecycle, ModelSlotsLifecycle, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, DEFAULT_REASONING_EFFORT, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
+import { deriveLlamaCppInstallationManagementView, reasoningEffortOptions, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
+import { ModelCatalogLifecycle, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
 
@@ -35,14 +35,6 @@ type DropdownTarget =
   | { slotId: SlotId; field: 'thinking' }
   | null
 
-const REASONING_OPTIONS: { value: string; label: string }[] = [
-  { value: 'none', label: 'None' },
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'max', label: 'Max' },
-]
-
 function formatContextWindow(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
   if (tokens >= 1_000) return `${Math.round(tokens / 1000)}K`
@@ -53,10 +45,11 @@ function formatPricing(pricing: { input: number; output: number; cachedInput?: n
   return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
 }
 
-const disabledReasonLabel = (reason: "insufficient_resources" | "provider_unavailable" | "model_unavailable" | "incompatible_runtime" | "invalid_configuration"): string => ({
+const disabledReasonLabel = (reason: "insufficient_resources" | "provider_unavailable" | "model_unavailable" | "installation_unavailable" | "incompatible_runtime" | "invalid_configuration"): string => ({
   insufficient_resources: 'not enough free memory',
   provider_unavailable: 'server unavailable',
   model_unavailable: 'model unavailable',
+  installation_unavailable: 'llama.cpp unavailable',
   incompatible_runtime: 'incompatible runtime',
   invalid_configuration: 'invalid configuration',
 })[reason]
@@ -82,6 +75,11 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onConfigureCloud,
 }: SettingsOverlayProps) {
   const theme = useTheme()
+  const localInference = useLocalInferenceState()
+  const llamaView = Option.map(Result.value(localInference.state), deriveLlamaCppInstallationManagementView)
+  const localFailure = Result.isFailure(localInference.state)
+    ? Option.some(Cause.pretty(localInference.state.cause))
+    : localInference.mutationFailure
   const [mode, setMode] = useState<Mode>('view')
   const [inputValue, setInputValue] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -112,13 +110,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     unavailable: ({ failures }) => failures,
   })), () => [] as readonly ProviderCatalogFailure[])
   const slotsSnapshot = modelConfig ? Result.value(modelConfig.slots) : Option.none()
-  const slotConfig = Option.getOrNull(Option.flatMap(slotsSnapshot, ({ state }) => ModelSlotsLifecycle.match(state, {
-    loading: () => Option.none(),
-    ready: ({ config }) => Option.some(config.slots),
-    refreshing: ({ config }) => Option.some(config.slots),
-    degraded: ({ config }) => Option.some(config.slots),
-    unavailable: ({ config }) => Option.some(config.slots),
-  })))
+  const slotsState = Option.map(slotsSnapshot, ({ state }) => state)
   const catalogLoading = Option.match(catalogState, {
     onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
     onSome: (state) => ModelCatalogLifecycle.is(state, 'loading'),
@@ -203,6 +195,11 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   )
   useAtomMount(authCompletionAtom)
 
+  const selectedForSlot = useCallback((slotId: SlotId) => Option.flatMap(
+    Option.all({ catalog: catalogState, slots: slotsState }),
+    ({ catalog, slots }) => selectedSlotModel(catalog, slots, slotId),
+  ), [catalogState, slotsState])
+
   const dropdownItems = useMemo(() => {
     if (!dropdownTarget) return []
     if (dropdownTarget.field === 'model') {
@@ -213,8 +210,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         disabled: m.availability._tag === 'Disabled',
       }))
     }
-    return REASONING_OPTIONS.map(o => ({ id: o.value, label: o.label }))
-  }, [dropdownTarget, models])
+    return Option.match(selectedForSlot(dropdownTarget.slotId), {
+      onNone: () => [],
+      onSome: ({ model }) => reasoningEffortOptions(model).map((option) => ({
+          id: option.value,
+          label: `${option.label}${option.isDefault ? ' (default)' : ''}`,
+        })),
+    })
+  }, [dropdownTarget, models, selectedForSlot])
 
   const openDropdown = useCallback((target: DropdownTarget) => {
     setDropdownTarget(target)
@@ -232,12 +235,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       if (!model || model.availability._tag === 'Disabled') return
       void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.providerModelId)
     } else {
-      const option = REASONING_OPTIONS[index]
+      const option = dropdownItems[index]
       if (!option) return
-      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, option.value)
+      void modelConfig.updateSlotReasoning(dropdownTarget.slotId, option.id)
     }
     closeDropdown()
-  }, [dropdownTarget, modelConfig, models, closeDropdown])
+  }, [dropdownItems, dropdownTarget, modelConfig, models, closeDropdown])
 
   const unavailableProviders = providers?.filter((provider) =>
     provider.status && provider.status !== 'ok'
@@ -394,6 +397,53 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       </box>
 
       {/* Inference source setup */}
+      {Option.isNone(llamaView) && (
+        <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
+          <text style={{ fg: Option.isSome(localFailure) ? theme.error : theme.muted }}>
+            {Option.getOrElse(localFailure, () => 'Inspecting llama.cpp installations…')}
+          </text>
+        </box>
+      )}
+      {Option.isSome(llamaView) && (
+        <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
+          <text style={{ fg: theme.foreground }}><span attributes={TextAttributes.BOLD}>llama.cpp</span></text>
+          <text style={{ fg: llamaView.value.status === 'ready' ? theme.success : theme.warning }}>
+            {llamaView.value.status === 'ready'
+              ? Option.match(llamaView.value.selected, {
+                  onNone: () => 'Ready',
+                  onSome: (installation) => `${installation.ownership === 'magnitude' ? 'Managed by Magnitude' : 'User installation'} · b${installation.build} · ${installation.executables.serverPath}`,
+                })
+              : llamaView.value.status === 'outdated'
+                ? Option.match(llamaView.value.representativeOutdated, { onNone: () => 'Outdated', onSome: (installation) => `Outdated b${installation.build} · requires b${llamaView.value.minimumBuild}` })
+                : 'Not installed for managed local inference'}
+          </text>
+          <text style={{ fg: theme.muted }}>Minimum b{llamaView.value.minimumBuild} · recommended b{llamaView.value.recommendedBuild}</text>
+          {llamaView.value.managedInstall.operation._tag === 'Running' && (
+            <text style={{ fg: theme.primary }}>{llamaView.value.managedInstall.operation.stage[0]?.toUpperCase()}{llamaView.value.managedInstall.operation.stage.slice(1)}…</text>
+          )}
+          {llamaView.value.managedInstall.operation._tag === 'Failed' && (
+            <text style={{ fg: theme.error }}>{llamaView.value.managedInstall.operation.message}</text>
+          )}
+          {llamaView.value.managedInstall.availability._tag === 'UnsupportedPlatform' && (
+            <text style={{ fg: theme.warning }}>{llamaView.value.managedInstall.availability.reason}</text>
+          )}
+          {Option.isSome(localFailure) && <text style={{ fg: theme.error }}>{localFailure.value}</text>}
+          <box style={{ flexDirection: 'row', paddingTop: 1 }}>
+            {llamaView.value.managedInstallRecommended && llamaView.value.managedInstall.availability._tag === 'Available' && llamaView.value.managedInstall.operation._tag !== 'Running' && (
+              <Button onClick={localInference.mutationBusy ? undefined : localInference.installLlamaCpp}><text style={{ fg: localInference.mutationBusy ? theme.muted : theme.primary }}>[Install b{llamaView.value.recommendedBuild}]</text></Button>
+            )}
+            <text> </text>
+            <Button onClick={localInference.mutationBusy ? undefined : localInference.refreshInstallations}><text style={{ fg: theme.muted }}>[Refresh detection]</text></Button>
+          </box>
+          {llamaView.value.installations.map((installation) => (
+            <text key={installation.id} style={{ fg: theme.muted }}>
+              {`${Option.exists(llamaView.value.selected, (selected) => selected.id === installation.id) ? '● ' : '  '}b${installation.build} · ${installation.ownership === 'magnitude' ? 'Magnitude' : 'User'}${Option.exists(llamaView.value.active, (active) => active.id === installation.id) ? ' · active' : ''} · ${installation.executables.serverPath} · ${installation.executables.fitParamsPath}`}
+            </text>
+          ))}
+        </box>
+      )}
+
+      {/* Inference source setup */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
         <text style={{ fg: theme.foreground }}>
           <span attributes={TextAttributes.BOLD}>Inference sources</span>
@@ -484,23 +534,13 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         {SLOT_IDS.map((slotId) => {
           const label = SLOT_DISPLAY_NAMES[slotId]
           const description = SLOT_DESCRIPTIONS[slotId]
-          const currentOverride = slotConfig?.[slotId] ?? null
-          const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
-          const currentEffort = currentOverride?.reasoningEffort ?? defaultEffort
-          const availableModels = models?.filter(m => m.availability._tag === 'Available') ?? null
-          const defaultModel = availableModels?.find(m => m.slots?.includes(slotId)) ?? availableModels?.[0] ?? null
-          const effectiveModel = currentOverride?.providerId && currentOverride.providerModelId
-            ? models?.find(m =>
-                m.providerId === currentOverride.providerId
-                && m.providerModelId === currentOverride.providerModelId
-              ) ?? null
-            : currentOverride?.providerModelId
-              ? models?.find(m => m.providerModelId === currentOverride.providerModelId) ?? null
-              : defaultModel
-          const modelLabel = effectiveModel
-            ? effectiveModel.displayName
-            : '—'
-          const thinkingLabel = REASONING_OPTIONS.find(o => o.value === currentEffort)?.label ?? '—'
+          const selected = selectedForSlot(slotId)
+          const modelLabel = Option.match(selected, { onNone: () => '—', onSome: ({ model }) => model.displayName })
+          const thinkingLabel = Option.match(selected, {
+            onNone: () => '—',
+            onSome: ({ model, slot }) => reasoningEffortOptions(model)
+              .find((option) => option.value === slot.selection.reasoningEffort)?.label ?? '—',
+          })
           const loading = catalogLoading
           const isThisDropdownOpen = dropdownTarget?.slotId === slotId
 
@@ -573,7 +613,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                 {/* Thinking dropdown — relative wrapper, dropdown floats below with absolute */}
                 {(() => {
                   const w = 18; const pad = 2; const border = 2; const arrow = '▾'
-                  const fullLabel = thinkingLabel + (currentOverride?.reasoningEffort === undefined ? ' (def)' : '')
+                  const fullLabel = thinkingLabel + (Option.exists(selected, ({ model, slot }) =>
+                    slot.selection.reasoningEffort === model.defaultReasoningEffort) ? ' (def)' : '')
                   const maxLen = w - pad - border - arrow.length - 1
                   const trunc = fullLabel.length > maxLen ? fullLabel.slice(0, maxLen - 1) + '…' : fullLabel
                   const padded = trunc + ' '.repeat(Math.max(0, maxLen - trunc.length))
@@ -622,6 +663,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                   )
                 })()}
               </box>
+
+              {Option.isSome(selected) && (
+                <text style={{ fg: theme.muted }}>
+                  <span attributes={TextAttributes.DIM}>{visionPropertyLabel(selected.value.model)} · {reasoningPropertyLabel(selected.value.model)}</span>
+                </text>
+              )}
 
               <text style={{ fg: theme.muted }}>
                 <span attributes={TextAttributes.DIM}>{description}</span>

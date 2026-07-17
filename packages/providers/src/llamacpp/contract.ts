@@ -3,7 +3,7 @@
  */
 
 import { Schema } from "effect"
-import { ProviderModelSchema } from "@magnitudedev/ai"
+import { ProviderModelFields } from "@magnitudedev/ai"
 
 /**
  * A model served by a local Llama.cpp server.
@@ -15,9 +15,15 @@ export type LlamaServedModelId = Schema.Schema.Type<typeof LlamaServedModelIdSch
 export const LlamaServingRouteIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(8192), Schema.brand("LlamaServingRouteId"))
 export type LlamaServingRouteId = Schema.Schema.Type<typeof LlamaServingRouteIdSchema>
 export const LlamaCppModelInfoSchema = Schema.Struct({
-  ...ProviderModelSchema.fields,
+  ...ProviderModelFields,
   providerId: LlamaCppProviderId,
-})
+}).pipe(Schema.filter((model) => {
+  const reasoning = model.properties.reasoning
+  return reasoning._tag !== "Cached"
+    && reasoning._tag !== "Resolved"
+    && reasoning._tag !== "Refreshing"
+    || reasoning.value.includes(model.defaultReasoningEffort)
+}, { message: () => "Discovered reasoning efforts must contain defaultReasoningEffort" }))
 export type LlamaCppModelInfo = Schema.Schema.Type<typeof LlamaCppModelInfoSchema>
 
 /**
@@ -28,7 +34,7 @@ export type LlamaCppModelInfo = Schema.Schema.Type<typeof LlamaCppModelInfoSchem
 export interface LlamaCppCallOptions {
   readonly maxTokens?: number
   readonly toolChoice?: LlamaCppToolChoice
-  readonly reasoningEffort?: string
+  readonly chatTemplateKwargs?: Readonly<Record<string, unknown>>
   readonly temperature?: number
   readonly topP?: number
   readonly stop?: readonly string[]

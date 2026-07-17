@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Effect, Layer, Stream, Option } from 'effect'
 import { FetchHttpClient } from '@effect/platform'
-import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema } from '@magnitudedev/ai'
+import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty } from '@magnitudedev/ai'
 import { AmbientServiceTag, Fork, type AmbientService } from '@magnitudedev/event-core'
 import {
   ModelStreamTerminal,
@@ -20,7 +20,7 @@ import type {
   ProviderRejection,
   MagnitudeModelInfo,
 } from '@magnitudedev/sdk'
-import type { ModelProfile } from '@magnitudedev/ai'
+import { SlotReady, type SlotStates } from '@magnitudedev/sdk'
 import type { JsonValue } from '@magnitudedev/ai'
 import { advisorWindowToPrompt } from '../src/window/render'
 import type { ForkWindowState, WindowEntry } from '../src/window'
@@ -30,14 +30,13 @@ import { AgentStateReaderTag } from '../src/tools/fork'
 import { AgentModelResolver } from '../src/model/model-resolver'
 import { makeAgentBoundModel } from '../src/model/agent-model'
 import { leaderToolkit, getEffectiveToolkit, isToolKey } from '../src/tools/toolkits'
-import { buildConfigState } from '../src/ambient/config-ambient'
+import { buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 
 const { ForkContext } = Fork
 
-const profile: ModelProfile = {
+const profile = {
   contextWindow: 100_000,
   maxOutputTokens: 4096,
-  capabilities: { vision: true },
 }
 
 const testModelSpec: ModelSpec<BaseCallOptions> = {
@@ -338,10 +337,14 @@ describe('message_advisor execution', () => {
 describe('messageAdvisor toolkit registration', () => {
   it('keeps static advisor registration but removes it from effective toolkits while disabled', () => {
     const catalogModels: readonly MagnitudeModelInfo[] = [
-      { providerModelId: ProviderModelIdSchema.make('primary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' }, reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
-      { providerModelId: ProviderModelIdSchema.make('secondary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' }, reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+      { providerModelId: ProviderModelIdSchema.make('primary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' }, defaultReasoningEffort: ReasoningEffortSchema.make('none'), properties: { vision: new VisionProperty.states.Resolved({ value: true }), reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make('none')] }) }, slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+      { providerModelId: ProviderModelIdSchema.make('secondary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' }, defaultReasoningEffort: ReasoningEffortSchema.make('none'), properties: { vision: new VisionProperty.states.Resolved({ value: true }), reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make('none')] }) }, slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
     ]
-    const config = buildConfigState(catalogModels, null, {
+    const slots: SlotStates = {
+      primary: new SlotReady({ slotId: 'primary', selection: { providerId: catalogModels[0]!.providerId, providerModelId: catalogModels[0]!.providerModelId, reasoningEffort: catalogModels[0]!.defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
+      secondary: new SlotReady({ slotId: 'secondary', selection: { providerId: catalogModels[1]!.providerId, providerModelId: catalogModels[1]!.providerModelId, reasoningEffort: catalogModels[1]!.defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
+    }
+    const config = buildConfigStateFromSlots(catalogModels as never, slots, {
       softCapRatio: 0.9,
       softCapMaxTokens: 200_000,
     })

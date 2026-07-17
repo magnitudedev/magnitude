@@ -9,8 +9,6 @@ import {
 import { classifyMagnitudeRejectedResponse } from "./errors"
 import type { MagnitudeAdditionalOptions } from "./contract"
 
-export type { ModelProfile } from "@magnitudedev/ai"
-export { toModelProfile } from "@magnitudedev/ai"
 
 export type MagnitudeModelSpec = ModelSpec<MagnitudeCallOptions>
 

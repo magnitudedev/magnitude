@@ -7,7 +7,7 @@ Provider system spans three packages:
 
 ## Provider Contract
 
-`Provider<TModel>`: `id`, `displayName`, `catalog`, `bindModel(id, options?)`, `classifyModelFamily(model)`. Extensions are separate interfaces: `WebSearchExtension`, `UsageExtension`.
+`Provider<TModel>`: `id`, `displayName`, `catalog`, `discoverModelProperties(request)`, `bindModel(id, options?)`, `classifyModelFamily(model)`. Hosted providers return their authoritative resolved properties immediately; runtime providers may perform demand-driven discovery. Extensions are separate interfaces: `WebSearchExtension`, `UsageExtension`.
 
 `BaseCallOptions`: `maxTokens`, `toolChoice`, `reasoningEffort`, `generateToolCallId`. Provider-specific options are baked at `bindModel` time via `wrapAsBaseModel` — consumers only see `BoundModel<BaseCallOptions>`.
 

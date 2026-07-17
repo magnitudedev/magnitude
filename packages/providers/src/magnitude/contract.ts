@@ -56,7 +56,6 @@ export const MagnitudeRawModelSchema = Schema.Struct({
     output: Schema.Number,
     cached_input: Schema.NullOr(Schema.Number),
   })),
-  reasoningEfforts: Schema.optional(Schema.Array(Schema.String)),
 })
 export type MagnitudeRawModel = Schema.Schema.Type<typeof MagnitudeRawModelSchema>
 

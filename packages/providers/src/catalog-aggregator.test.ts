@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Cause, Chunk, Effect } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { ModelCatalogError, ProviderIdSchema, ProviderModelIdSchema, type ModelCatalog, type ProviderModel } from "@magnitudedev/ai"
+import { ModelCatalogError, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty, type ModelCatalog, type ProviderModel } from "@magnitudedev/ai"
 import { inspectProviderCatalogs, makeAggregatedCatalog } from "./catalog-aggregator"
 
 const catalog = (list: ModelCatalog<ProviderModel>["list"]): ModelCatalog<ProviderModel> => ({
@@ -43,10 +43,13 @@ describe("aggregated model catalog", () => {
       displayName: "Healthy model",
       contextWindow: 8_192,
       maxOutputTokens: 1_024,
-      capabilities: { vision: false },
+      defaultReasoningEffort: ReasoningEffortSchema.make("none"),
+      properties: {
+        vision: new VisionProperty.states.Resolved({ value: false }),
+        reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make("none")] }),
+      },
       availability: { _tag: "Available" },
       pricing: { input: 0, output: 0, cached_input: null },
-      reasoningEfforts: ["none"],
     }
     const providers = [
       { id: ProviderIdSchema.make("failed"), catalog: catalog(Effect.fail(new ModelCatalogError({ message: "offline" }))) },

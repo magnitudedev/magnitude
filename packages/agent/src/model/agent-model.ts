@@ -6,7 +6,6 @@ import {
   type ToolCallId,
   type ToolDefinition,
 } from '@magnitudedev/ai'
-import type { ModelProfile } from '@magnitudedev/ai'
 import type { SlotId } from '@magnitudedev/roles'
 import { buildMaxToolCallsGrammar } from './tool-call-grammar'
 import { Fork } from '@magnitudedev/event-core'
@@ -67,7 +66,7 @@ export interface AgentBoundModel {
    * check this field.
    */
   readonly providerId: string
-  readonly profile: ModelProfile
+  readonly profile: { readonly contextWindow: number; readonly maxOutputTokens: number }
   readonly maxToolCalls?: number
 }
 
@@ -76,7 +75,7 @@ export interface AgentBoundModelConfig {
   readonly modelId: string
   readonly modelSource: ModelSource
   readonly providerId: string
-  readonly profile: ModelProfile
+  readonly profile: { readonly contextWindow: number; readonly maxOutputTokens: number }
   readonly debug: boolean
   readonly agentId: string
   readonly maxToolCalls?: number

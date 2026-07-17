@@ -168,6 +168,25 @@ export const renderExecutionProfileArguments = (profile: LlamaExecutionProfile):
   return arguments_
 }
 
+/** Arguments shared by the dedicated llama-fit-params executable. */
+export const renderFitProfileArguments = (profile: LlamaExecutionProfile): readonly string[] => {
+  const arguments_ = [
+    "--parallel", String(profile.parallelSlots),
+    "--split-mode", profile.splitMode,
+    "--cache-type-k", profile.kvCache.key,
+    "--cache-type-v", profile.kvCache.value,
+  ]
+  arguments_.push(...appendContextSize(profile.contextSize))
+  arguments_.push(...appendGpuLayers(profile.gpuLayers))
+  Option.map(profile.tensorSplit, (values) => arguments_.push("--tensor-split", values.join(",")))
+  arguments_.push(...appendFlashAttention(profile.flashAttention))
+  arguments_.push(...appendBatchSize(profile.batchSize))
+  arguments_.push(...appendMicroBatchSize(profile.microBatchSize))
+  arguments_.push(profile.mmap ? "--mmap" : "--no-mmap")
+  if (profile.mlock) arguments_.push("--mlock")
+  return arguments_
+}
+
 const presetContextSize = ContextSize.$match({ ModelDefault: () => [] as string[], Tokens: ({ value }) => [`ctx-size = ${value}`] })
 const presetGpuLayers = GpuLayerSelection.$match({ Fit: () => ["fit = on"], Exact: ({ layers }) => [`n-gpu-layers = ${layers}`, "fit = off"] })
 const presetFlashAttention = FlashAttentionSelection.$match({ RuntimeDefault: () => [] as string[], Enabled: () => ["flash-attn = on"], Disabled: () => ["flash-attn = off"] })

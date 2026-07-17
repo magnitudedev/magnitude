@@ -4,7 +4,8 @@
 
 import { describe, it, expect } from 'vitest'
 import { Effect, Layer, Option } from 'effect'
-import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema } from '@magnitudedev/ai'
+import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty } from '@magnitudedev/ai'
+import { SlotReady, type SlotStates } from '@magnitudedev/sdk'
 import {
   ProjectionBusTag,
   makeProjectionBusLayer,
@@ -19,18 +20,22 @@ import { AgentRoutingProjection } from '../src/projections/agent-routing'
 import { AgentLifecycleProjection } from '../src/projections/agent-lifecycle'
 import { GoalProjection } from '../src/projections/goal'
 import { TurnProjection } from '../src/projections/turn'
-import { ConfigAmbient, buildConfigState } from '../src/ambient/config-ambient'
+import { ConfigAmbient, buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 import { AtifAmbient, type AtifConfig } from '../src/ambient/atif-ambient'
 import type { AtifForkState, AtifTrajectory } from '../src/projections/atif'
 import { serializeAtif } from '../src/projections/atif/serialize'
 import { toToolKeyErased } from '../src/tools/toolkits'
 
 const mockModels = [
-  { providerModelId: ProviderModelIdSchema.make('primary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' as const }, reasoningEfforts: ['none'], slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
-  { providerModelId: ProviderModelIdSchema.make('secondary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' as const }, reasoningEfforts: ['none'], slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, capabilities: { vision: true }, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+  { providerModelId: ProviderModelIdSchema.make('primary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' as const }, defaultReasoningEffort: ReasoningEffortSchema.make('none'), properties: { vision: new VisionProperty.states.Resolved({ value: true }), reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make('none')] }) }, slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
+  { providerModelId: ProviderModelIdSchema.make('secondary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' as const }, defaultReasoningEffort: ReasoningEffortSchema.make('none'), properties: { vision: new VisionProperty.states.Resolved({ value: true }), reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make('none')] }) }, slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
 ] as const
 
-const mockConfigState = buildConfigState(mockModels, null, {
+const mockSlots: SlotStates = {
+  primary: new SlotReady({ slotId: 'primary', selection: { providerId: mockModels[0].providerId, providerModelId: mockModels[0].providerModelId, reasoningEffort: mockModels[0].defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
+  secondary: new SlotReady({ slotId: 'secondary', selection: { providerId: mockModels[1].providerId, providerModelId: mockModels[1].providerModelId, reasoningEffort: mockModels[1].defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
+}
+const mockConfigState = buildConfigStateFromSlots(mockModels as never, mockSlots, {
   softCapRatio: 0.9,
   softCapMaxTokens: 200_000,
 })

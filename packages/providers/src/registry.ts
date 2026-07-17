@@ -9,6 +9,9 @@ import type {
   ProviderModelBindOptions,
   ProviderId,
   ProviderModelId,
+  ModelPropertyDiscoveryRequest,
+  ModelDiscoveryOperationId,
+  ModelPropertyDiscoveryError,
 } from "@magnitudedev/ai"
 import type { MagnitudeProviderInstance } from "./magnitude/provider"
 import { inspectProviderCatalogs, makeAggregatedCatalog, type ProviderCatalogOutcome } from "./catalog-aggregator"
@@ -28,7 +31,7 @@ export interface ProviderInfo {
 }
 
 export interface DiscoverableProviderInstance {
-  readonly provider: Pick<Provider, "id" | "displayName" | "bindModel" | "catalog">
+  readonly provider: Pick<Provider, "id" | "displayName" | "bindModel" | "catalog" | "discoverModelProperties">
   readonly authStatus?: AuthStatus
   readonly checkStatus: Effect.Effect<{
     readonly status: "ok" | "loading" | "not_found" | "error"
@@ -54,6 +57,10 @@ export interface ProviderRegistryService {
     providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
   ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
+  readonly discoverModelProperties: (
+    providerId: ProviderId,
+    request: ModelPropertyDiscoveryRequest,
+  ) => Effect.Effect<ModelDiscoveryOperationId, ModelPropertyDiscoveryError>
 }
 
 export class ProviderRegistry extends Context.Tag("ProviderRegistry")<
@@ -69,7 +76,7 @@ export function makeProviderRegistry(config: {
   readonly magnitude: MagnitudeProviderInstance | null
   readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
 }): ProviderRegistryService {
-  const providers = new Map<ProviderId, Pick<Provider, "id" | "bindModel" | "catalog">>()
+  const providers = new Map<ProviderId, Pick<Provider, "id" | "bindModel" | "catalog" | "discoverModelProperties">>()
   const providerInfos: ProviderInfo[] = []
 
   if (config.magnitude) {
@@ -121,6 +128,11 @@ export function makeProviderRegistry(config: {
         if (!provider) return yield* Effect.die(`Unknown provider: ${providerId}`)
         return yield* provider.bindModel(providerModelId, options)
       }),
+    discoverModelProperties: (providerId, request) => Effect.gen(function* () {
+      const provider = providers.get(providerId)
+      if (!provider) return yield* Effect.die(`Unknown provider: ${providerId}`)
+      return yield* provider.discoverModelProperties(request)
+    }),
   }
 }
 

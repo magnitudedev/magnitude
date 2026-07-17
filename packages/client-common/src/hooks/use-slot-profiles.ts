@@ -8,7 +8,7 @@ import { Result, useAtomSet } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { useDisplayState } from "../state/display-state-store"
 import { isRoleId, ModelSlotsLifecycle, ROLE_TO_SLOT, type SlotId } from "@magnitudedev/sdk"
-import type { SlotProfile, SlotProfiles } from "@magnitudedev/sdk"
+import type { SlotProfile, SlotProfiles, SlotStates } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { useModelSlots } from "./use-reactive-rpc"
 
@@ -26,6 +26,25 @@ export function findSlotProfile(
 function formatRoleLabel(role: string | null | undefined): string {
   if (!role) return "Leader"
   return role.charAt(0).toUpperCase() + role.slice(1)
+}
+
+/** Compatibility view for call sites that only need ready, callable slots. */
+function readyProfiles(slots: SlotStates): Partial<Record<SlotId, SlotProfile>> {
+  return Object.fromEntries(
+    Object.entries(slots).flatMap(([slotId, slot]) => slot._tag === "Ready"
+      ? [[slotId, {
+          slotId: slot.slotId,
+          providerId: slot.selection.providerId,
+          providerModelId: slot.selection.providerModelId,
+          modelDisplayName: slot.modelDisplayName,
+          contextWindow: slot.contextWindow,
+          maxOutputTokens: slot.maxOutputTokens,
+          reasoningEffort: slot.selection.reasoningEffort,
+          isUserOverride: slot.source === "user",
+        } satisfies SlotProfile]]
+      : [],
+    ),
+  )
 }
 
 export interface UseSlotProfilesResult {
@@ -56,10 +75,10 @@ export function useSlotProfiles(): UseSlotProfilesResult {
 
   const profiles = Option.flatMap(Result.value(result), ({ state }) => ModelSlotsLifecycle.match(state, {
     loading: () => Option.none(),
-    ready: ({ profiles }) => Option.some(profiles),
-    refreshing: ({ profiles }) => Option.some(profiles),
-    degraded: ({ profiles }) => Option.some(profiles),
-    unavailable: () => Option.none(),
+    ready: ({ slots }) => Option.some(readyProfiles(slots)),
+    refreshing: ({ slots }) => Option.some(readyProfiles(slots)),
+    degraded: ({ slots }) => Option.some(readyProfiles(slots)),
+    unavailable: ({ slots }) => Option.some(readyProfiles(slots)),
   }))
 
   const rootRole = useDisplayState((state) => state.actors["root"]?.role ?? null)
