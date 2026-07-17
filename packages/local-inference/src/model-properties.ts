@@ -1,36 +1,20 @@
 import { Schema } from "effect"
+import { LlamaCppReasoningProfileSchema } from "./llamacpp/reasoning-profile"
+export * from "./llamacpp/reasoning-profile"
 
-export const LlamaCppTemplateReasoningControlSchema = Schema.Union(
-  Schema.TaggedStruct("Omitted", {}),
-  Schema.TaggedStruct("EnableThinkingKwarg", { enabled: Schema.Boolean }),
-  Schema.TaggedStruct("ReasoningEffortKwarg", { value: Schema.String }),
-  Schema.TaggedStruct("EnableThinkingAndReasoningEffortKwarg", {
-    enabled: Schema.Boolean,
-    value: Schema.String,
-  }),
-)
-export type LlamaCppTemplateReasoningControl = typeof LlamaCppTemplateReasoningControlSchema.Type
-
-export const LlamaCppReasoningOptionSchema = Schema.Struct({
-  reasoningEffort: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(256)),
-  control: LlamaCppTemplateReasoningControlSchema,
-})
-export type LlamaCppReasoningOption = typeof LlamaCppReasoningOptionSchema.Type
-
-const ReasoningInspectionFields = {
-  probeProtocolVersion: Schema.String.pipe(Schema.minLength(1)),
-  options: Schema.Array(LlamaCppReasoningOptionSchema).pipe(Schema.minItems(1)),
+const ReasoningTemplateInspectionFields = {
+  profile: LlamaCppReasoningProfileSchema,
 } as const
 
-/** Final semantic output of the differential template probe. */
-export const LlamaCppReasoningTemplateInspectionSchema = Schema.Struct(ReasoningInspectionFields)
+/** Final resolved reasoning profile produced by inspecting one loaded template. */
+export const LlamaCppReasoningTemplateInspectionSchema = Schema.Struct(ReasoningTemplateInspectionFields)
 export type LlamaCppReasoningTemplateInspection = typeof LlamaCppReasoningTemplateInspectionSchema.Type
 
-/** Cached result for one exact serving route configuration. */
+/** Cached reasoning profile for one exact serving route configuration. */
 export const LlamaCppReasoningInspectionSchema = Schema.Struct({
   routeId: Schema.String.pipe(Schema.minLength(1)),
   fingerprint: Schema.String.pipe(Schema.minLength(1)),
-  ...ReasoningInspectionFields,
+  ...ReasoningTemplateInspectionFields,
 })
 export type LlamaCppReasoningInspection = typeof LlamaCppReasoningInspectionSchema.Type
 

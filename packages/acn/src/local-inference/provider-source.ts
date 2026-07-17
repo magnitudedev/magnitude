@@ -60,7 +60,7 @@ type ExternalRoute = {
 
 export type LlamaLogicalRoute = ManagedRoute | ExternalRoute
 
-const LLAMA_DEFAULT_REASONING_EFFORT = ReasoningEffortSchema.make("Default")
+const LLAMA_DEFAULT_REASONING_EFFORT = LlamaCpp.llamaCppDisabledReasoningDefinition().reasoningEffort
 
 const ManagedRouteIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.brand("ManagedRouteId"))
 const ExternalRouteIdSchema = Schema.String.pipe(Schema.minLength(1), Schema.brand("ExternalRouteId"))
@@ -319,17 +319,61 @@ const loadedRouteProps = (
     : Effect.fail(error)),
 )
 
-const kwargsForReasoningControl = (
-  control: LlamaCpp.LlamaCppTemplateReasoningControl,
-): Option.Option<Readonly<Record<string, unknown>>> => {
-  switch (control._tag) {
-    case "Omitted": return Option.none()
-    case "EnableThinkingKwarg": return Option.some({ enable_thinking: control.enabled })
-    case "ReasoningEffortKwarg": return Option.some({ reasoning_effort: control.value })
-    case "EnableThinkingAndReasoningEffortKwarg": return Option.some({
-      enable_thinking: control.enabled,
-      reasoning_effort: control.value,
-    })
+const reasoningEffortsForInspections = (
+  inspections: readonly LlamaCpp.LlamaCppReasoningInspection[],
+) => [...new Set(inspections.flatMap((inspection) =>
+  inspection.profile.effortMappings.map((mapping) => mapping.reasoningEffort)))]
+
+const profileSupportsReasoningEffort = (
+  profile: LlamaCpp.LlamaCppReasoningProfile,
+  reasoningEffort: typeof ReasoningEffortSchema.Type,
+): boolean => Option.isSome(LlamaCpp.resolveLlamaCppReasoningEffort(profile, reasoningEffort))
+
+const resolveReasoningMapping = (
+  profile: LlamaCpp.LlamaCppReasoningProfile,
+  requestedEffort: typeof ReasoningEffortSchema.Type,
+) => Option.map(
+  Option.orElse(
+    LlamaCpp.resolveLlamaCppReasoningEffort(profile, requestedEffort),
+    () => LlamaCpp.resolveLlamaCppReasoningEffort(profile, profile.defaultReasoningEffort),
+  ),
+  (mapping) => ({ reasoningEffort: mapping.reasoningEffort, mapping }),
+)
+
+const resolveReasoningProperty = (
+  property: LlamaCppModelInfo["properties"]["reasoning"],
+  value: readonly (typeof ReasoningEffortSchema.Type)[],
+  undiscovered: "preserve" | "resolve",
+): LlamaCppModelInfo["properties"]["reasoning"] => ReasoningProperty.Lifecycle.match(property, {
+  Deferred: (state) => undiscovered === "resolve" ? new ReasoningProperty.states.Resolved({ value: [...value] }) : state,
+  Discovering: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value: [...value] }),
+  Cached: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value: [...value] }),
+  Resolved: (state) => ReasoningProperty.Lifecycle.hold(state, { value: [...value] }),
+  Refreshing: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value: [...value] }),
+  Failed: (state) => undiscovered === "resolve" ? new ReasoningProperty.states.Resolved({ value: [...value] }) : state,
+})
+
+export const llamaCppRequestOptionsForReasoningMapping = (
+  mapping: LlamaCpp.LlamaCppReasoningEffortMapping,
+): {
+  readonly chatTemplateKwargs: Option.Option<Readonly<Record<string, unknown>>>
+  readonly thinkingBudgetTokens: Option.Option<number>
+} => {
+  const kwargs = {
+    ...Option.match(mapping.templateOptions.enableThinking, {
+      onNone: () => ({}),
+      onSome: (enableThinking) => ({ enable_thinking: enableThinking }),
+    }),
+    ...Option.match(mapping.templateOptions.reasoningEffort, {
+      onNone: () => ({}),
+      onSome: (reasoningEffort) => ({ reasoning_effort: reasoningEffort }),
+    }),
+  }
+  return {
+    chatTemplateKwargs: Object.keys(kwargs).length === 0 ? Option.none() : Option.some(kwargs),
+    thinkingBudgetTokens: mapping.thinkingBudget._tag === "Enabled"
+      ? Option.some(mapping.thinkingBudget.tokens)
+      : Option.none(),
   }
 }
 
@@ -457,8 +501,6 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       ? yield* platform.files.resolve(route.record.id).pipe(Effect.option)
       : Option.none<ModelFiles.ResolvedModelFiles>()
     const hash = createHash("sha256")
-    addFingerprintField(hash, "implementation", "magnitude-llama-properties-v1")
-    addFingerprintField(hash, "probe", LlamaCpp.LLAMA_REASONING_PROBE_PROTOCOL_VERSION)
     addFingerprintField(hash, "model-path", logical.modelPath)
     addFingerprintField(hash, "projector", Option.flatMap(resolved, (files) => files.projectorPath).pipe(Option.getOrElse(() => "<absent>")))
     addFingerprintField(hash, "route-config", route._tag === "Managed" ? route.request?.profile.id ?? "<invalid>" : routeKey(logical.providerModelId, route))
@@ -636,6 +678,12 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       ])
       const previousModel = previous.get(providerModelId)?.providerModel
       const cachedProperties = yield* platform.modelIndex.discoveredProperties(group.path)
+      const cachedReasoningProfiles = Option.match(cachedProperties, {
+        onNone: () => [] as readonly LlamaCpp.LlamaCppReasoningProfile[],
+        onSome: (cached) => cached.reasoningInspections.map((inspection) => inspection.profile),
+      })
+      const cachedDefaultReasoningEffort = cachedReasoningProfiles[0]?.defaultReasoningEffort
+        ?? LLAMA_DEFAULT_REASONING_EFFORT
       const indexedProperties = Option.match(cachedProperties, {
         onNone: () => ({
           vision: new VisionProperty.states.Deferred({}),
@@ -646,10 +694,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
             ? new VisionProperty.states.Cached({ value: cached.visionInspections.some((inspection) => inspection.value) })
             : new VisionProperty.states.Deferred({}),
           reasoning: cached.reasoningInspections.length > 0
-            ? new ReasoningProperty.states.Cached({
-                value: [...new Set(cached.reasoningInspections.flatMap((inspection) =>
-                  inspection.options.map((option) => ReasoningEffortSchema.make(option.reasoningEffort))))],
-              })
+            ? new ReasoningProperty.states.Cached({ value: reasoningEffortsForInspections(cached.reasoningInspections) })
             : new ReasoningProperty.states.Deferred({}),
         }),
       })
@@ -673,7 +718,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
         }),
         contextWindow: context.value,
         maxOutputTokens: Math.min(context.value, 8192),
-        defaultReasoningEffort: LLAMA_DEFAULT_REASONING_EFFORT,
+        defaultReasoningEffort: previousModel?.defaultReasoningEffort ?? cachedDefaultReasoningEffort,
         properties: previousModel?.properties ?? indexedProperties,
         availability: bestDisabledReason(group.routes),
         pricing: ZERO_PRICING,
@@ -852,6 +897,15 @@ export const LocalModelProviderSourceLive: Layer.Layer<
           render: (templateRequest) => client.applyTemplate(target.servedModelId, templateRequest),
         })
         reasoningInspection = { routeId, fingerprint: fingerprint.value, ...templateInspection }
+        yield* Effect.logInfo("Resolved llama.cpp reasoning profile").pipe(Effect.annotateLogs({
+          providerModelId: logical.providerModelId,
+          routeId,
+          fingerprint: fingerprint.value,
+          defaultReasoningEffort: templateInspection.profile.defaultReasoningEffort,
+          reasoningEfforts: templateInspection.profile.effortMappings
+            .map((mapping) => mapping.reasoningEffort)
+            .join(","),
+        }))
       }
     }
 
@@ -882,16 +936,17 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     const currentVision = [...(yield* Ref.get(visionByRoute)).entries()]
       .filter(([id]) => currentRouteIds.has(id))
       .map(([, evidence]) => evidence.value)
-    const currentReasoning = [...(yield* Ref.get(reasoningByRoute)).entries()]
+    const currentReasoningInspections = [...(yield* Ref.get(reasoningByRoute)).entries()]
       .filter(([id]) => currentRouteIds.has(id))
-      .flatMap(([, inspection]) => inspection.options.map((option) => ReasoningEffortSchema.make(option.reasoningEffort)))
+      .map(([, inspection]) => inspection)
 
     return {
       fingerprint,
       ...(visionInspection ? { vision: currentVision.some(Boolean) } : {}),
       ...(reasoningInspection ? {
         reasoningInspection,
-        reasoning: [...new Set([logical.providerModel?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT, ...currentReasoning])],
+        reasoningDefaultReasoningEffort: reasoningInspection.profile.defaultReasoningEffort,
+        reasoning: reasoningEffortsForInspections(currentReasoningInspections),
       } : {}),
     }
   }))
@@ -977,31 +1032,40 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       || model?.properties.reasoning._tag === "Refreshing"
       ? model.properties.reasoning.value
       : [model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT]
+    let effectiveDefault = model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT
     let effectiveEffort = requestedEffort && knownEfforts.includes(requestedEffort)
       ? requestedEffort
       : model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT
-    let cachedReasoning = model?.properties.reasoning._tag === "Cached" || model?.properties.reasoning._tag === "Refreshing"
-    if (cachedReasoning && effectiveEffort !== (model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT)) {
+    const cachedReasoning = model?.properties.reasoning._tag === "Cached" || model?.properties.reasoning._tag === "Refreshing"
+    if (cachedReasoning) {
       const inspection = yield* inspectEligibleRoutes(logical, new Set(["reasoning"] as const))
       const value = inspection.reasoning!
+      effectiveDefault = inspection.reasoningDefaultReasoningEffort!
       yield* updateProviderModel(providerModelId, (current) => ({
         ...current,
-        properties: { ...current.properties, reasoning: ReasoningProperty.Lifecycle.match(current.properties.reasoning, {
-          Deferred: (state) => state,
-          Discovering: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value }),
-          Cached: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value }),
-          Resolved: (state) => ReasoningProperty.Lifecycle.hold(state, { value }),
-          Refreshing: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value }),
-          Failed: (state) => state,
-        }) },
+        defaultReasoningEffort: effectiveDefault,
+        properties: { ...current.properties, reasoning: resolveReasoningProperty(current.properties.reasoning, value, "preserve") },
       }))
-      cachedReasoning = false
-      if (!value.includes(effectiveEffort)) effectiveEffort = model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT
+      if (!value.includes(effectiveEffort)) effectiveEffort = effectiveDefault
     }
-    const routeInspections = yield* Ref.get(reasoningByRoute)
-    const supportsEffort = (route: LlamaLogicalRoute) => effectiveEffort === (model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT)
-      || routeInspections.get(routeKey(providerModelId, route))?.options.some((entry) => entry.reasoningEffort === effectiveEffort) === true
-      || cachedReasoning
+    let routeInspections = yield* Ref.get(reasoningByRoute)
+    if (![...routeInspections.values()].some((routeInspection) =>
+      profileSupportsReasoningEffort(routeInspection.profile, effectiveEffort))) {
+      const inspection = yield* inspectEligibleRoutes(logical, new Set(["reasoning"] as const))
+      const value = inspection.reasoning!
+      effectiveDefault = inspection.reasoningDefaultReasoningEffort!
+      if (!value.includes(effectiveEffort)) effectiveEffort = effectiveDefault
+      routeInspections = yield* Ref.get(reasoningByRoute)
+      yield* updateProviderModel(providerModelId, (current) => ({
+        ...current,
+        defaultReasoningEffort: effectiveDefault,
+        properties: { ...current.properties, reasoning: resolveReasoningProperty(current.properties.reasoning, value, "resolve") },
+      }))
+    }
+    const supportsEffort = (route: LlamaLogicalRoute) => {
+      const profile = routeInspections.get(routeKey(providerModelId, route))?.profile
+      return profile !== undefined && profileSupportsReasoningEffort(profile, effectiveEffort)
+    }
     const eligibleRoutes = logical.routes.filter(supportsEffort)
     const activeRouteId = (yield* Ref.get(activeRouteByModel)).get(providerModelId)
     const lastUsed = yield* Ref.get(routeLastUsed)
@@ -1024,35 +1088,25 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     const selectedRouteId = routeKey(providerModelId, selectedRoute)
     yield* Ref.update(activeRouteByModel, (current) => new Map(current).set(providerModelId, selectedRouteId))
     yield* Ref.update(routeLastUsed, (current) => new Map(current).set(selectedRouteId, Date.now()))
-    let selectedInspection = routeInspections.get(routeKey(providerModelId, selectedRoute))
-    if (effectiveEffort !== (model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT)) {
-      const inspection = yield* inspectLoadedRoute(logical, selectedRoute, {
-        origin: lease.target.origin,
-        authorization: lease.target.authorization,
-        servedModelId: LlamaServedModelIdSchema.make(lease.target.model),
-      }, new Set(["reasoning"])).pipe(
-        Effect.mapError((cause) => acquisitionError(providerModelId, cause)),
-      )
-      selectedInspection = inspection.reasoningInspection
-      const value = inspection.reasoning!
-      yield* updateProviderModel(providerModelId, (current) => ({
-        ...current,
-        properties: { ...current.properties, reasoning: ReasoningProperty.Lifecycle.match(current.properties.reasoning, {
-          Deferred: (state) => state,
-          Discovering: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value }),
-          Cached: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value }),
-          Resolved: (state) => ReasoningProperty.Lifecycle.hold(state, { value }),
-          Refreshing: (state) => ReasoningProperty.Lifecycle.transition(state, "Resolved", { value }),
-          Failed: (state) => state,
-        }) },
-      }))
-      if (!selectedInspection?.options.some((entry) => entry.reasoningEffort === effectiveEffort)) {
-        effectiveEffort = model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT
-      }
-    }
-    const selectedControl = effectiveEffort === (model?.defaultReasoningEffort ?? LLAMA_DEFAULT_REASONING_EFFORT)
-      ? Option.none<LlamaCpp.LlamaCppTemplateReasoningControl>()
-      : Option.fromNullable(selectedInspection?.options.find((entry) => entry.reasoningEffort === effectiveEffort)?.control)
+    const inspection = yield* inspectLoadedRoute(logical, selectedRoute, {
+      origin: lease.target.origin,
+      authorization: lease.target.authorization,
+      servedModelId: LlamaServedModelIdSchema.make(lease.target.model),
+    }, new Set(["reasoning"])).pipe(
+      Effect.mapError((cause) => acquisitionError(providerModelId, cause)),
+    )
+    const selectedInspection = inspection.reasoningInspection!
+    const value = inspection.reasoning!
+    effectiveDefault = selectedInspection.profile.defaultReasoningEffort
+    const selection = Option.getOrUndefined(resolveReasoningMapping(selectedInspection.profile, effectiveEffort))
+    if (!selection) return yield* acquisitionError(providerModelId, "The selected route has no reasoning mapping for its default effort.")
+    effectiveEffort = selection.reasoningEffort
+    const reasoningRequestOptions = llamaCppRequestOptionsForReasoningMapping(selection.mapping)
+    yield* updateProviderModel(providerModelId, (current) => ({
+      ...current,
+      defaultReasoningEffort: effectiveDefault,
+      properties: { ...current.properties, reasoning: resolveReasoningProperty(current.properties.reasoning, value, "preserve") },
+    }))
     return {
       providerModelId,
       routeId: LlamaServingRouteIdSchema.make(externalRoute
@@ -1062,7 +1116,8 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       authorization: lease.target.authorization,
       servedModelId: LlamaServedModelIdSchema.make(lease.target.model),
       reasoningEffort: effectiveEffort,
-      chatTemplateKwargs: Option.flatMap(selectedControl, kwargsForReasoningControl),
+      chatTemplateKwargs: reasoningRequestOptions.chatTemplateKwargs,
+      thinkingBudgetTokens: reasoningRequestOptions.thinkingBudgetTokens,
     }
   })
 
@@ -1109,10 +1164,13 @@ export const LocalModelProviderSourceLive: Layer.Layer<
         },
       }))
       const logical = (yield* Ref.get(logicalModels)).get(request.providerModelId)
-      if (!logical) return yield* new LlamaCpp.LlamaCppReasoningDiscoveryError({ message: "The llama.cpp model is no longer registered" })
+      if (!logical) return yield* new LlamaCpp.LlamaCppReasoningInspectionError({ message: "The llama.cpp model is no longer registered" })
       const inspection = yield* inspectEligibleRoutes(logical, requested)
       yield* updateProviderModel(request.providerModelId, (model) => ({
         ...model,
+        ...(requested.has("reasoning") && inspection.reasoningDefaultReasoningEffort !== undefined
+          ? { defaultReasoningEffort: inspection.reasoningDefaultReasoningEffort }
+          : {}),
         properties: {
           vision: requested.has("vision") && inspection.vision !== undefined
             && (model.properties.vision._tag === "Discovering" || model.properties.vision._tag === "Refreshing")
@@ -1125,28 +1183,31 @@ export const LocalModelProviderSourceLive: Layer.Layer<
         },
       }))
     }).pipe(
-      Effect.catchAll((cause) => updateProviderModel(request.providerModelId, (model) => {
-        const error = { code: "discovery_failed", message: cause instanceof Error ? cause.message : String(cause), retryable: true }
-        return {
-          ...model,
-          properties: {
-            vision: requested.has("vision")
-              ? model.properties.vision._tag === "Refreshing"
-                ? VisionProperty.Lifecycle.transition(model.properties.vision, "Cached", {})
-                : model.properties.vision._tag === "Discovering"
-                  ? VisionProperty.Lifecycle.transition(model.properties.vision, "Failed", { error })
-                  : model.properties.vision
-              : model.properties.vision,
-            reasoning: requested.has("reasoning")
-              ? model.properties.reasoning._tag === "Refreshing"
-                ? ReasoningProperty.Lifecycle.transition(model.properties.reasoning, "Cached", {})
-                : model.properties.reasoning._tag === "Discovering"
-                  ? ReasoningProperty.Lifecycle.transition(model.properties.reasoning, "Failed", { error })
-                  : model.properties.reasoning
-              : model.properties.reasoning,
-          },
-        }
-      })),
+      Effect.catchAll((cause) => Effect.logWarning("Local model property discovery failed").pipe(
+        Effect.annotateLogs({ providerModelId: request.providerModelId, cause: String(cause) }),
+        Effect.zipRight(updateProviderModel(request.providerModelId, (model) => {
+          const error = { code: "discovery_failed", message: cause instanceof Error ? cause.message : String(cause), retryable: true }
+          return {
+            ...model,
+            properties: {
+              vision: requested.has("vision")
+                ? model.properties.vision._tag === "Refreshing"
+                  ? VisionProperty.Lifecycle.transition(model.properties.vision, "Cached", {})
+                  : model.properties.vision._tag === "Discovering"
+                    ? VisionProperty.Lifecycle.transition(model.properties.vision, "Failed", { error })
+                    : model.properties.vision
+                : model.properties.vision,
+              reasoning: requested.has("reasoning")
+                ? model.properties.reasoning._tag === "Refreshing"
+                  ? ReasoningProperty.Lifecycle.transition(model.properties.reasoning, "Cached", {})
+                  : model.properties.reasoning._tag === "Discovering"
+                    ? ReasoningProperty.Lifecycle.transition(model.properties.reasoning, "Failed", { error })
+                    : model.properties.reasoning
+                : model.properties.reasoning,
+            },
+          }
+        })),
+      )),
     )
     yield* Ref.update(discoveryOperations, (current) => new Map(current).set(discoveryKey, operationId))
     yield* Effect.forkIn(work.pipe(Effect.ensuring(Ref.update(discoveryOperations, (current) => {

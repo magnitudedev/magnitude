@@ -2,14 +2,44 @@ import { describe, expect, it } from "vitest"
 import { FetchHttpClient } from "@effect/platform"
 import { Effect, Layer, Option, Stream } from "effect"
 import { LlamaCpp } from "@magnitudedev/local-inference"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { LocalInferencePlatform, type LocalInferencePlatformApi } from "./platform"
 import { LocalModelConfiguration, type LocalModelConfigurationApi } from "./model-configuration"
-import { LocalModelProviderSource, LocalModelProviderSourceLive, assessLlamaFitStableCapacity, llamaFitEstimateFitsStableCapacity, resolveLlamaModelInformation, type LlamaLogicalRoute } from "./provider-source"
+import { LocalModelProviderSource, LocalModelProviderSourceLive, assessLlamaFitStableCapacity, llamaCppRequestOptionsForReasoningMapping, llamaFitEstimateFitsStableCapacity, resolveLlamaModelInformation, type LlamaLogicalRoute } from "./provider-source"
 
 const GIBIBYTE = 1024 ** 3
 
 describe("LocalModelProviderSource", () => {
+  it("serializes a reasoning mapping into separate template and budget options", () => {
+    const requestOptions = llamaCppRequestOptionsForReasoningMapping({
+      reasoningEffort: ReasoningEffortSchema.make("high"),
+      templateOptions: {
+        enableThinking: Option.some(true),
+        reasoningEffort: Option.some("high"),
+      },
+      thinkingBudget: { _tag: "Enabled", tokens: 4_096 },
+    })
+
+    expect(requestOptions).toEqual({
+      chatTemplateKwargs: Option.some({ enable_thinking: true, reasoning_effort: "high" }),
+      thinkingBudgetTokens: Option.some(4_096),
+    })
+  })
+
+  it("omits empty template options and a disabled thinking budget", () => {
+    expect(llamaCppRequestOptionsForReasoningMapping({
+      reasoningEffort: ReasoningEffortSchema.make("none"),
+      templateOptions: {
+        enableThinking: Option.none(),
+        reasoningEffort: Option.none(),
+      },
+      thinkingBudget: { _tag: "Disabled" },
+    })).toEqual({
+      chatTemplateKwargs: Option.none(),
+      thinkingBudgetTokens: Option.none(),
+    })
+  })
+
   it("compares Apple Silicon placements as one stable unified-memory domain", () => {
     const plan = LlamaCpp.makeLlamaFitPlan({
       fitExecutableFingerprint: LlamaCpp.LlamaCppExecutableFingerprint.make("fit"),

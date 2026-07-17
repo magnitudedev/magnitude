@@ -12,8 +12,8 @@ import { slotStatesFromModels } from "./account"
 
 const providerId = ProviderIdSchema.make("llamacpp")
 const providerModelId = ProviderModelIdSchema.make("/models/test.gguf")
-const defaultEffort = ReasoningEffortSchema.make("Default")
-const highEffort = ReasoningEffortSchema.make("High")
+const defaultEffort = ReasoningEffortSchema.make("high")
+const highEffort = ReasoningEffortSchema.make("max")
 
 const modelWithReasoning = (reasoning: ProviderModel["properties"]["reasoning"]): ProviderModel => ({
   providerId,

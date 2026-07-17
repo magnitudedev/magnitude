@@ -7,5 +7,15 @@ export * from "./execution-profile"
 export * from "./fit"
 export * from "./cli"
 export * from "./server"
-export * from "./reasoning-discovery"
+export * from "./reasoning-profile"
+export * from "./reasoning-policy"
+export * from "./reasoning-inspection"
+export {
+  LlamaCppReasoningInspectionSchema,
+  LlamaCppReasoningTemplateInspectionSchema,
+  LlamaCppVisionInspectionSchema,
+  type LlamaCppReasoningInspection,
+  type LlamaCppReasoningTemplateInspection,
+  type LlamaCppVisionInspection,
+} from "../model-properties"
 export * from "./instances"

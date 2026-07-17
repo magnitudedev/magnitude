@@ -9,8 +9,8 @@ import {
 } from "@magnitudedev/sdk"
 import { reasoningEffortOptions, reasoningPropertyLabel, visionPropertyLabel } from "./model-properties"
 
-const defaultEffort = ReasoningEffortSchema.make("Default")
-const lowEffort = ReasoningEffortSchema.make("Low")
+const defaultEffort = ReasoningEffortSchema.make("high")
+const lowEffort = ReasoningEffortSchema.make("low")
 
 const model = (
   reasoning: ModelSummary["properties"]["reasoning"],
@@ -31,7 +31,7 @@ describe("model property presentation", () => {
     const value = model(new ReasoningProperty.states.Deferred({}))
 
     expect(reasoningEffortOptions(value)).toEqual([
-      { value: defaultEffort, label: "Default" },
+      { value: defaultEffort, label: "High" },
     ])
     expect(reasoningPropertyLabel(value)).toContain("after loading")
   })
