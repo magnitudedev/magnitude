@@ -20,8 +20,8 @@ import type { AppEvent } from '../events'
 import { AtifProjection } from '../projections/atif/projection'
 import { serializeAtif } from '../projections/atif/serialize'
 import { AtifAmbient } from '../ambient/atif-ambient'
-import { ConfigAmbient } from '../ambient/config-ambient'
-import { SessionOptionsAmbient } from '../ambient/session-ambient'
+import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
+import { AgentToolkitProjection } from '../projections/agent-toolkit'
 
 export const AtifWriter = Worker.define<AppEvent>()({
   name: 'AtifWriter',
@@ -35,9 +35,13 @@ export const AtifWriter = Worker.define<AppEvent>()({
 
         const atifInstance = yield* AtifProjection.Tag
         const atifState = yield* SubscriptionRef.get(atifInstance.state)
-        const configState = ambientService.getValue(ConfigAmbient)
-        const sessionOptions = ambientService.getValue(SessionOptionsAmbient)
-        const trajectory = serializeAtif(atifState.forks, { configState, solo: sessionOptions.solo })
+        const toolkitProjection = yield* AgentToolkitProjection.Tag
+        const toolkitState = yield* SubscriptionRef.get(toolkitProjection.state)
+        const toolKeysByFork = new Map([...toolkitState.forks].map(([forkId, state]) => [forkId, state.toolKeys] as const))
+        const trajectory = serializeAtif(atifState.forks, {
+          universe: ambientService.getValue(ToolUniverseAmbient),
+          toolKeysByFork,
+        })
 
         // Atomic write: tmp file + rename
         const filePath = config.filePath

@@ -88,7 +88,6 @@ const makeCodingAgentSession = (displayView: CodingAgentSession["displayView"]):
   displayView,
   send: () => Effect.void,
   interrupt: () => Effect.void,
-  refreshConfig: () => Effect.void,
   publishInitialTask: () => Effect.void,
   onEvent: Stream.never,
   onError: Stream.never,

@@ -26,8 +26,6 @@ export { messageAdvisorModel, type MessageAdvisorState } from './message-advisor
 export { finishGoalModel, type FinishGoalState } from './finish-goal'
 export { fileViewModel, type FileViewState } from './file-view'
 export { queryImageModel, type QueryImageState } from './query-image'
-export { isToolKey, type ToolKey } from '../tools/toolkits'
-
 // Aliases for display compatibility
 export { fileWriteModel as contentModel, type FileWriteState as ContentState } from './file-write'
 export { fileEditModel as diffModel, type FileEditState as DiffState } from './file-edit'

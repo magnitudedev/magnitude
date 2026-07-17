@@ -6,7 +6,7 @@
  */
 
 import { Projection, Signal } from '@magnitudedev/event-core'
-import { outcomeWillChainContinue, type AppEvent, type StrategyId, type ImageAttachment, type ObservationPart } from '../events'
+import { outcomeWillChainContinue, type AppEvent, type StrategyId } from '../events'
 import { present } from '../errors'
 import { getAgentByForkId, AgentLifecycleProjection, hasActiveWorkers } from '../projections/agent-lifecycle'
 import { WorkerActivityProjection } from '../projections/worker-activity'
@@ -25,14 +25,12 @@ import { UserMessageResolutionProjection } from '../projections/user-message-res
 import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from '../projections/task-graph'
 import { TaskAssignmentProjection, type TaskAssignmentRow } from '../projections/task-assignment'
 
-import type { UserPart, ImageMediaType } from '@magnitudedev/ai'
 import { Option } from 'effect'
 import { textParts } from '../content'
 
 import { EMPTY_RESPONSE_ERROR } from '../prompts/error-states'
 import type {
   TimelineEntry,
-  TimelineAttachment,
   AgentAtom,
 } from './inbox/types'
 import type { CompletedTurn, TurnFeedback } from './types'
@@ -54,6 +52,7 @@ import {
   toTimelineDetachedProcessExited,
   toTimelineTurnStart,
   toTimelineTurnEnd,
+  composeTimelineUserMessageItems,
   toTimelineEscalation,
   toTimelineBackgroundProcesses,
 } from './inbox/compose'
@@ -78,13 +77,6 @@ const compactionInjectedSignal = Signal.fromDef<
   CompactionInjectedSignal,
   unknown
 >(compactionSignals.compactionInjected, 'Compaction')
-
-function extractText(parts: readonly UserPart[]): string {
-  return parts
-    .filter((p): p is Extract<UserPart, { _tag: 'TextPart' }> => p._tag === 'TextPart')
-    .map(p => p.text)
-    .join('')
-}
 
 function makeGoalInjectionEntry(text: string): Extract<WindowEntry, { type: 'goal_injection' }> {
   const content = textParts(text)
@@ -224,19 +216,6 @@ function enqueueAgentAtomBlock(
     }),
     args.timestamp,
   )
-}
-
-function toUserPartFromObservation(part: ObservationPart): UserPart {
-  if (part.type === 'text') {
-    return { _tag: 'TextPart', text: part.text }
-  }
-
-  return {
-    _tag: 'ImagePart',
-    data: part.base64,
-    mediaType: part.mediaType as ImageMediaType,
-    ...(part.dimensions ? { dimensions: part.dimensions } : {}),
-  }
 }
 
 function findRootTaskId(state: TaskGraphState, taskId: string): string {
@@ -381,7 +360,7 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
       const skills = ambient.get(SkillsAmbient)
       const configState = ambient.get(ConfigAmbient)
       const sessionOptions = ambient.get(SessionOptionsAmbient)
-      const sysPromptTokens = estimateSystemPromptTokens('leader', skills, configState, { solo: sessionOptions.solo, systemPromptOverride: sessionOptions.systemPromptOverride })
+      const sysPromptTokens = estimateSystemPromptTokens('leader', skills, { solo: sessionOptions.solo, systemPromptOverride: sessionOptions.systemPromptOverride })
       const messageTokens = fork.messageTokens + entryTokens
       const tokenEstimate = sysPromptTokens + messageTokens
 
@@ -423,7 +402,11 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
     skill_activated: ({ event, fork }) => {
       if (event.source !== 'user') return fork
       const text = event.message ? `/${event.skillName} ${event.message}` : `/${event.skillName}`
-      const entry = toTimelineUserMessage({ timestamp: event.timestamp, text, attachments: [], synthetic: Option.none() })
+      const entry = toTimelineUserMessage({
+        timestamp: event.timestamp,
+        items: [{ kind: 'body', parts: textParts(text) }],
+        synthetic: Option.none(),
+      })
       return enqueueTimeline(fork, entry, event.timestamp)
     },
 
@@ -467,7 +450,7 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
       if (fork.currentTurnId !== event.turnId) return fork
       const nextFork = enqueueTimeline(
         fork,
-        toTimelineObservation({ timestamp: event.timestamp, parts: event.parts.map(toUserPartFromObservation) }),
+        toTimelineObservation({ timestamp: event.timestamp, parts: event.parts }),
         event.timestamp,
       )
       const result = flushQueue(nextFork, read(TaskGraphProjection), read(TaskAssignmentProjection))
@@ -843,7 +826,7 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
       const configState = ambient.get(ConfigAmbient)
       const sessionOptions = ambient.get(SessionOptionsAmbient)
       const sysPromptTokens = isRoleId(event.role)
-        ? estimateSystemPromptTokens(event.role, skills, configState, { solo: sessionOptions.solo, systemPromptOverride: sessionOptions.systemPromptOverride })
+        ? estimateSystemPromptTokens(event.role, skills, { solo: sessionOptions.solo, systemPromptOverride: sessionOptions.systemPromptOverride })
         : 0
 
       const coordinatorMessageEntry = toTimelineCoordinatorMessage({ timestamp: event.timestamp, text: event.message })
@@ -1061,34 +1044,14 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
       const targetFork = state.forks.get(value.forkId)
       if (!targetFork) return state
 
-      const text = extractText(value.content)
-      const imageAttachments: TimelineAttachment[] = (value.attachments ?? [])
-        .filter((a): a is ImageAttachment => a.type === 'image')
-        .map(a => ({
-          kind: 'image' as const,
-          path: a.path,
-          filename: a.filename,
-          mediaType: a.mediaType,
-          width: a.width,
-          height: a.height,
-        }))
-      const mentionTimelineAttachments: TimelineAttachment[] = value.mentionResolutions.map((mention) => ({
-        kind: 'mention' as const,
-        attachment: mention.attachment,
-        resolution: mention.status === 'resolved'
-          ? {
-              status: 'resolved' as const,
-              content: mention.content,
-              truncated: mention.truncated,
-              originalBytes: mention.originalBytes,
-            }
-          : {
-              status: 'failed' as const,
-              reason: mention.reason,
-            },
-      }))
-      const attachments = [...imageAttachments, ...mentionTimelineAttachments]
-      const userEntry = toTimelineUserMessage({ timestamp: value.timestamp, text, attachments, synthetic: value.synthetic ? Option.some(true) : Option.none() })
+      const text = value.text
+      const items = composeTimelineUserMessageItems({
+        text: value.text,
+        mentions: value.mentions,
+        resolutions: value.mentionResolutions,
+        attachments: value.attachments,
+      })
+      const userEntry = toTimelineUserMessage({ timestamp: value.timestamp, items, synthetic: value.synthetic ? Option.some(true) : Option.none() })
 
       let nextFork = enqueueTimeline(targetFork, userEntry, value.timestamp)
 

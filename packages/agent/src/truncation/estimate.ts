@@ -1,5 +1,6 @@
 import { CHARS_PER_TOKEN_LOWER } from '../constants'
 import type { UserPart } from '@magnitudedev/ai'
+import { renderContextImageAnchor, type ContextPart } from '../content'
 
 /**
  * Kimi K2.6 image token estimation.
@@ -20,8 +21,8 @@ export function estimateText(s: string | undefined): number {
 }
 
 export function estimateContentTokens(content: string): number
-export function estimateContentTokens(content: UserPart[]): number
-export function estimateContentTokens(content: string | UserPart[]): number {
+export function estimateContentTokens(content: readonly (UserPart | ContextPart)[]): number
+export function estimateContentTokens(content: string | readonly (UserPart | ContextPart)[]): number {
   if (typeof content === 'string') {
     return Math.ceil(content.length / CHARS_PER_TOKEN_LOWER)
   }
@@ -29,12 +30,17 @@ export function estimateContentTokens(content: string | UserPart[]): number {
   for (const part of content) {
     switch (part._tag) {
       case 'TextPart':
+      case 'ContextText':
         tokens += Math.ceil(part.text.length / CHARS_PER_TOKEN_LOWER)
         break
       case 'ImagePart':
         tokens += part.dimensions
           ? estimateImageTokens(part.dimensions.width, part.dimensions.height)
           : DEFAULT_IMAGE_TOKENS
+        break
+      case 'ContextImage':
+        tokens += estimateText(renderContextImageAnchor(part))
+        tokens += estimateImageTokens(part.dimensions.width, part.dimensions.height)
         break
     }
   }

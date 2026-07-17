@@ -16,7 +16,7 @@ import { SessionContextProjection } from '../projections/session-context'
 import { AgentModelResolver } from '../model/model-resolver'
 import { getAgentByForkId } from '../projections/agent-lifecycle'
 import { getAgentDefinition } from '../agents/registry'
-import { getEffectiveToolkit } from '../tools/toolkits'
+import { materializeAgentToolkit } from '../tools/toolkits'
 import { buildSystemPrompt } from '../prompts/system-prompt-builder'
 import { buildCompactionPrompt } from './prompt'
 import { createToolResultFormatter } from '@magnitudedev/harness'
@@ -32,7 +32,10 @@ import type { RoleId } from '../agents/role-validation'
 import { COMPACTION_MAX_RETRIES } from '../constants'
 import type { AgentLifecycleState } from '../projections/agent-lifecycle'
 import { ConfigAmbient } from '../ambient/config-ambient'
+import { getSlotConfigForRole } from '../ambient/config-ambient'
 import { SessionOptionsAmbient } from '../ambient/session-ambient'
+import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
+import { readCoherentAgentToolkit } from '../projections/agent-toolkit'
 
 class CompactionTurnError extends Data.TaggedError('CompactionTurnError')<{
   readonly reason: 'ForkLayerMissing' | 'EmptyResponse'
@@ -66,13 +69,14 @@ export function runCompactionTurn(
     const agentId = forkId
       ? getAgentByForkId(agentStatus, forkId)?.agentId ?? '000000000000'
       : '000000000000'
-    const agentModel = yield* modelResolver.resolvePrimary(roleId, agentId)
-
-    // Get toolkit and fork layer (same as Cortex)
+    // Resolve the same projected tool/config state used by ordinary turns.
     const ambientService = yield* AmbientServiceTag
-    const configState = ambientService.getValue(ConfigAmbient)
+    const { config: configState, toolkit: toolkitState } = yield* readCoherentAgentToolkit(read, forkId)
+    const activeSlot = getSlotConfigForRole(configState, roleId)
+    const agentModel = yield* modelResolver.resolveSlotConfig(activeSlot, agentId, roleId)
+
     const sessionOptions = ambientService.getValue(SessionOptionsAmbient)
-    const toolkit = getEffectiveToolkit(roleId, configState, undefined, { solo: sessionOptions.solo })
+    const toolkit = materializeAgentToolkit(ambientService.getValue(ToolUniverseAmbient), toolkitState.toolKeys)
     const execManager = yield* ExecutionManager
     const forkLayer = execManager.getForkLayer(forkId)
     if (!forkLayer) {
@@ -154,6 +158,7 @@ export function runCompactionTurn(
         formatter,
         autopilotEnabled: windowState.autopilotEnabled,
         leaderLastAutopilotKnowledge: windowState.consumerAutopilotKnowledge.leader,
+        includeImageData: activeSlot.vision === true,
       })
       const compactionPrompt = buildCompactionPrompt(basePrompt)
 

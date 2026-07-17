@@ -1,7 +1,8 @@
 import { FetchHttpClient } from "@effect/platform"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
-import { Cause, Chunk, Context, Effect, Layer, Option, Ref, Schema, Scope, Stream } from "effect"
+import { Cause, Chunk, Context, Effect, Layer, Option, Ref, Schema, Scope, Stream, SubscriptionRef } from "effect"
+import { buildConfigStateFromSlots, type ConfigState } from "@magnitudedev/agent"
 import {
   ProviderClient,
   type UsageQuery,
@@ -74,6 +75,8 @@ export interface AccountApi {
   readonly refreshModelCatalog: (providerId: Option.Option<ProviderId>) => Effect.Effect<void>
   readonly modelSlots: Effect.Effect<ModelSlots>
   readonly watchModelSlots: Stream.Stream<MirroredResourceInvalidation>
+  /** Replaying, coherent model configuration consumed by agent ambients. */
+  readonly agentModelConfigurations: Stream.Stream<ConfigState>
   readonly updateModelSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, SessionError>
   readonly applyReasoningEffortFallback: (input: {
     readonly slotId: SlotId
@@ -313,6 +316,14 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       const slotMutationLock = yield* Effect.makeSemaphore(1)
       const catalogResource = yield* makeMirroredResource<ModelCatalogState>(new ModelCatalogLoading({}))
       const slotResource = yield* makeMirroredResource<ModelSlotsState>(new ModelSlotsLoading({}))
+      const agentConfiguration = yield* SubscriptionRef.make<ConfigState>({
+        revision: 0,
+        bySlot: {
+          primary: { _tag: "Unavailable", slotId: "primary", reason: "not_loaded" },
+          secondary: { _tag: "Unavailable", slotId: "secondary", reason: "not_loaded" },
+        },
+        catalogLoaded: false,
+      })
       const providerCatalogs = yield* Ref.make<Pick<FoldedProviderCatalogs, "byProvider" | "failuresByProvider">>({
         byProvider: new Map(),
         failuresByProvider: new Map(),
@@ -386,6 +397,23 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           }
           return invalidSlotTransition(state, "publish unavailable")
         })
+
+      const publishAgentConfiguration = (
+        models: readonly ModelSummary[],
+        slots: SlotStates,
+      ) => Effect.gen(function* () {
+        const policy = yield* storage.config.getContextLimitPolicy()
+        const current = yield* SubscriptionRef.get(agentConfiguration)
+        const candidate = buildConfigStateFromSlots(models, slots, policy, current.revision)
+        const unchanged = current.catalogLoaded === candidate.catalogLoaded
+          && SLOT_IDS.every((slotId) => JSON.stringify(current.bySlot[slotId]) === JSON.stringify(candidate.bySlot[slotId]))
+        if (!unchanged) {
+          yield* SubscriptionRef.set(agentConfiguration, {
+            ...candidate,
+            revision: current.revision + 1,
+          })
+        }
+      })
 
       const markSlotConfigurationFailed = (cause: unknown) => {
         const failure = new ModelSlotConfigurationUnavailable({
@@ -491,6 +519,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           Effect.tapError(markSlotConfigurationFailed),
         )
         yield* publishSlots(slots, folded.failures)
+        yield* publishAgentConfiguration(folded.models, slots.slots)
         yield* discoverSelectedProperties(folded.models, slots.slots, false)
       }).pipe(Effect.provide(FetchHttpClient.layer))
 
@@ -560,6 +589,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           unavailable: (state) => state.failures,
         })
         yield* publishSlots(list, failures)
+        yield* publishAgentConfiguration(models, list.slots)
       }))
 
       const refreshInBackground = (force: boolean, providerId: Option.Option<ProviderId> = Option.none()) => Effect.forkIn(
@@ -621,6 +651,9 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         refreshModelCatalog: (providerId) => refreshInBackground(true, providerId),
         modelSlots: slotResource.get,
         watchModelSlots: slotResource.changes,
+        agentModelConfigurations: agentConfiguration.changes.pipe(
+          Stream.filter((state) => state.catalogLoaded),
+        ),
         updateModelSlots: (slots) => slotMutationLock.withPermits(1)(Effect.gen(function* () {
           const models = yield* catalogModels
           for (const [slotId, slot] of Object.entries(slots)) {

@@ -27,13 +27,14 @@ const makeEvent = (id: string, timestamp: number): Timestamped<AppEvent> => ({
   type: 'user_message',
   forkId: null,
   messageId: id,
-  content: [{ _tag: 'TextPart', text: id }],
+  text: id,
+  mentions: [],
   attachments: [],
   mode: 'text',
   synthetic: false,
   taskMode: false,
   timestamp,
-} as Timestamped<AppEvent>)
+})
 
 const metadata: SessionMetadata = {
   sessionId: 'session-1',

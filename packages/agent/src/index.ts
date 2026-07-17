@@ -59,8 +59,8 @@ export type {
   SkillActivated,
   ChatTitleGenerated,
 
-  Attachment,
   ImageAttachment,
+  MentionOccurrence,
 } from './events'
 
 // Agents
@@ -227,7 +227,7 @@ export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export type { AutopilotState } from './projections/autopilot-state'
 
-export { ChatTitleServiceTag, ChatTitleServiceLive, extractTextFromParts } from './workers/chat-title-service'
+export { ChatTitleServiceTag, ChatTitleServiceLive } from './workers/chat-title-service'
 export type { ChatTitleService } from './workers/chat-title-service'
 export { ChatTitleWorker } from './workers/chat-title-worker'
 
@@ -289,5 +289,28 @@ export { type AgentCallUsage, fromResponseUsage } from './execution/types'
 // Tracing
 export { initTraceSession, getTraceSessionId } from '@magnitudedev/tracing'
 export type { TraceSessionMeta, AgentCallTrace } from '@magnitudedev/tracing'
-export type { UserPart, TextPart, ImagePart, ImageMediaType } from '@magnitudedev/ai'
-export { textParts, textOf, hasImages, wrapTextParts } from './content'
+export {
+  ContextTextPartSchema,
+  ContextImagePartSchema,
+  ContextPartSchema,
+  ContextImageResultSchema,
+  textParts,
+  textOf,
+  hasImages,
+  wrapTextParts,
+  renderContextImageAnchor,
+  renderContextParts,
+  isContextImagePart,
+} from './content'
+export type {
+  ContextTextPart,
+  ContextImagePart,
+  ContextPart,
+  ContextImageResult,
+  ContextRenderPolicy,
+  ImageMediaType,
+} from './content'
+export {
+  captureContextImageFromFile,
+  captureContextImageInline,
+} from './util/capture-context-image'

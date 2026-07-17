@@ -26,6 +26,7 @@ import { HarnessStateProjection } from '../src/projections/harness-state'
 import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
 import { toToolKeyErased } from '../src/tools/toolkits'
 import type { DisplayTimeline } from '../src/display'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 // Materialize timeline messages for assertions — accepts the normalized
 // byId/order display form or a plain array (addressed readAll results).
@@ -57,7 +58,7 @@ const makeDisplay = async (events: AppEvent[]): Promise<DisplayTimeline> => {
       UserMessageResolutionProjection.Layer,
       Layer.provide(DisplayTimelineProjection.Layer, InMemoryAddressedEntryStoreLive),
     ),
-    baseLayer,
+    Layer.merge(baseLayer, ToolUniverseSourceLive),
   )
 
   const program = Effect.gen(function* () {
@@ -101,7 +102,7 @@ const makeDisplayAndRootWork = async (events: AppEvent[]): Promise<{
       UserMessageResolutionProjection.Layer,
       Layer.provide(DisplayTimelineProjection.Layer, InMemoryAddressedEntryStoreLive),
     ),
-    baseLayer,
+    Layer.merge(baseLayer, ToolUniverseSourceLive),
   )
 
   const program = Effect.gen(function* () {

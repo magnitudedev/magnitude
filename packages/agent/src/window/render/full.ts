@@ -88,6 +88,7 @@ export interface LeaderWindowPromptInput {
   readonly formatter: ToolResultFormatter
   readonly autopilotEnabled: boolean
   readonly leaderLastAutopilotKnowledge: boolean | null
+  readonly includeImageData: boolean
 }
 
 export function windowToPrompt(input: LeaderWindowPromptInput): Prompt {
@@ -98,6 +99,7 @@ export function windowToPrompt(input: LeaderWindowPromptInput): Prompt {
     formatter,
     autopilotEnabled,
     leaderLastAutopilotKnowledge,
+    includeImageData,
   } = input
   const messages: AiMessage[] = []
 
@@ -111,7 +113,7 @@ export function windowToPrompt(input: LeaderWindowPromptInput): Prompt {
       case 'fork_context':
       case 'goal_injection':
       case 'compacted': {
-        messages.push(...systemEntryToMessages(msg))
+        messages.push(...systemEntryToMessages(msg, includeImageData))
         break
       }
 
@@ -138,7 +140,7 @@ export function windowToPrompt(input: LeaderWindowPromptInput): Prompt {
       }
 
       case 'context': {
-        messages.push(...contextEntryToMessages(msg, timezone))
+        messages.push(...contextEntryToMessages(msg, timezone, includeImageData))
         break
       }
     }

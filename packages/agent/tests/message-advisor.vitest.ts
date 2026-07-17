@@ -29,7 +29,7 @@ import { WindowStateReaderTag } from '../src/tools/window-reader'
 import { AgentStateReaderTag } from '../src/tools/fork'
 import { AgentModelResolver } from '../src/model/model-resolver'
 import { makeAgentBoundModel } from '../src/model/agent-model'
-import { leaderToolkit, getEffectiveToolkit, isToolKey } from '../src/tools/toolkits'
+import { leaderToolkit, isToolKey, selectAgentToolKeys } from '../src/tools/toolkits'
 import { buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 
 const { ForkContext } = Fork
@@ -108,27 +108,27 @@ function makeWindowFixture(): ForkWindowState {
     {
       type: 'session_context',
       source: 'system',
-      content: [{ _tag: 'TextPart', text: 'SESSION SHOULD NOT APPEAR' }],
+      content: [{ _tag: 'ContextText', text: 'SESSION SHOULD NOT APPEAR' }],
       estimatedTokens: 1,
     },
     {
       type: 'compacted',
       source: 'system',
-      content: [{ _tag: 'TextPart', text: 'COMPACT SUMMARY' }],
+      content: [{ _tag: 'ContextText', text: 'COMPACT SUMMARY' }],
       estimatedTokens: 1,
     },
     {
       type: 'fork_context',
       source: 'system',
-      content: [{ _tag: 'TextPart', text: 'FORK SHOULD NOT APPEAR' }],
+      content: [{ _tag: 'ContextText', text: 'FORK SHOULD NOT APPEAR' }],
       estimatedTokens: 1,
     },
     {
       type: 'context',
       source: 'system',
       timeline: [
-        { kind: 'user_message', timestamp: 1, text: 'Please implement advisor.', attachments: [], synthetic: Option.none() },
-        { kind: 'observation', timestamp: 2, parts: [{ _tag: 'TextPart', text: 'RAW OBSERVATION OUTPUT' }] },
+        { kind: 'user_message', timestamp: 1, items: [{ kind: 'body', parts: [{ _tag: 'ContextText', text: 'Please implement advisor.' }] }], synthetic: Option.none() },
+        { kind: 'observation', timestamp: 2, parts: [{ _tag: 'ContextText', text: 'RAW OBSERVATION OUTPUT' }] },
       ],
       estimatedTokens: 1,
     },
@@ -246,6 +246,7 @@ function makeResolver(model: BoundModel<BaseCallOptions>) {
   })
 
   return Layer.succeed(AgentModelResolver, {
+    resolveSlotConfig: () => Effect.succeed(resolved),
     resolvePrimary: () => Effect.succeed(resolved),
     resolveSecondary: () => Effect.die('not used'),
   })
@@ -293,7 +294,7 @@ describe('advisorWindowToPrompt', () => {
 
     expect(text).toContain('ADVISOR SYSTEM')
     expect(text).toContain('COMPACT SUMMARY')
-    expect(text).toContain('<user>Please implement advisor.</user>')
+    expect(text).toContain('<message from="user">Please implement advisor.</message>')
     expect(text).toContain('<message>I am wiring the tool.</message>')
     expect(text).toContain('<tools shell=1 apply_patch=1 />')
     expect(text).toContain('<message_advisor>')
@@ -344,14 +345,14 @@ describe('messageAdvisor toolkit registration', () => {
       primary: new SlotReady({ slotId: 'primary', selection: { providerId: catalogModels[0]!.providerId, providerModelId: catalogModels[0]!.providerModelId, reasoningEffort: catalogModels[0]!.defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
       secondary: new SlotReady({ slotId: 'secondary', selection: { providerId: catalogModels[1]!.providerId, providerModelId: catalogModels[1]!.providerModelId, reasoningEffort: catalogModels[1]!.defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
     }
-    const config = buildConfigStateFromSlots(catalogModels as never, slots, {
+    const config = buildConfigStateFromSlots(catalogModels, slots, {
       softCapRatio: 0.9,
       softCapMaxTokens: 200_000,
     })
 
     expect(leaderToolkit.entries.messageAdvisor).toBeDefined()
     expect(isToolKey('messageAdvisor')).toBe(true)
-    expect((getEffectiveToolkit('leader', config).entries as Record<string, unknown>).messageAdvisor).toBeUndefined()
-    expect((getEffectiveToolkit('engineer', config).entries as Record<string, unknown>).messageAdvisor).toBeUndefined()
+    expect(selectAgentToolKeys({ roleId: 'leader', configState: config, solo: false, vcsAvailable: false })).not.toContain('messageAdvisor')
+    expect(selectAgentToolKeys({ roleId: 'engineer', configState: config, solo: false, vcsAvailable: false })).not.toContain('messageAdvisor')
   })
 })

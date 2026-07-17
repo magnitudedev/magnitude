@@ -171,7 +171,8 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
                 content: messagePrompt,
                 visibleMessage: Option.some(messagePrompt),
                 taskMode: false,
-                attachments: [],
+                imageAttachments: [],
+                mentions: [],
               }
 
           const work = sessionId
@@ -187,7 +188,8 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
                     content: messagePrompt,
                     visibleMessage: Option.some(messagePrompt),
                     taskMode: false,
-                    attachments: [],
+                    imageAttachments: [],
+                    mentions: [],
                   },
                   reactivityKeys: ['sessions'],
                 })

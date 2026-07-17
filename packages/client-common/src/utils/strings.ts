@@ -1,9 +1,6 @@
 import stringWidth from 'string-width'
 import type { InputMentionSegment, InputPasteSegment, InputValue } from '../types/store'
 
-// Re-export InputValue type for backwards compatibility
-export type { InputValue } from '../types/store'
-
 export const LIST_BULLET_GLYPH = '• '
 
 /** Max number of lines to show in collapsed previews */
@@ -382,29 +379,13 @@ export function reconstituteInputTextWithMentions(
   input: InputValue,
 ): {
   text: string
-  mentions: Array<{ path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }>
+  mentions: InputMentionSegment[]
 } {
   const text = reconstituteInputText(input)
-  const seen = new Set<string>()
-  const mentions: Array<{
-    path: string
-    contentType: 'text' | 'directory'
-    lineRange?: { start: number; end: number }
-  }> = []
-
-  for (const segment of input.mentionSegments) {
-    const path = segment.path.trim()
-    const key = `${path}|${segment.contentType}`
-    if (!path || seen.has(key)) continue
-    seen.add(key)
-    mentions.push({
-      path: segment.path,
-      contentType: segment.contentType,
-      lineRange: segment.lineRange,
-    })
+  return {
+    text,
+    mentions: sortMentionSegments(input.mentionSegments).filter(segment => segment.path.trim().length > 0),
   }
-
-  return { text, mentions }
 }
 
 /**

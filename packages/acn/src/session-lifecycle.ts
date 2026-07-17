@@ -161,7 +161,8 @@ export const SessionLifecycleLive: Layer.Layer<
                 messageId: Option.getOrUndefined(initial.messageId),
                 content: initial.content,
                 taskMode: initial.taskMode,
-                attachments: initial.attachments,
+                imageAttachments: initial.imageAttachments,
+                mentions: initial.mentions,
               })
             } else if (initial?._tag === "goal") {
               yield* commands.startGoal({ sessionId: claim.sessionId, objective: initial.objective })

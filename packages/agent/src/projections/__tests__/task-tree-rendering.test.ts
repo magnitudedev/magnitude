@@ -71,7 +71,7 @@ const contextText = (ctx: Extract<ForkWindowState['messages'][number], { type: '
     timeline: ctx.timeline,
     timezone: null,
   })
-    .filter((p): p is { _tag: 'TextPart', text: string } => p._tag === 'TextPart')
+    .filter((p): p is { _tag: 'ContextText', text: string } => p._tag === 'ContextText')
     .map(p => p.text)
     .join('')
 

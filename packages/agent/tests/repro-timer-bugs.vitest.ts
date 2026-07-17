@@ -30,6 +30,7 @@ import { SessionContextProjection } from '../src/projections/session-context'
 import { ChatTitleProjection } from '../src/projections/chat-title'
 import { WindowProjection } from '../src/window'
 import { CompactionProjection } from '../src/projections/compaction'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 import {
   materializeDisplayActors,
   materializeDisplayTasks,
@@ -54,12 +55,15 @@ const runtimeLayer = Layer.provideMerge(
     CompactionProjection.Layer,
     Layer.provide(DisplayTimelineProjection.Layer, InMemoryAddressedEntryStoreLive),
   ),
-  Layer.provideMerge(
-    makeAmbientServiceLayer<AppEvent>(),
+  Layer.merge(
     Layer.provideMerge(
-      makeProjectionBusLayer<AppEvent>(),
-      Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
+      makeAmbientServiceLayer<AppEvent>(),
+      Layer.provideMerge(
+        makeProjectionBusLayer<AppEvent>(),
+        Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
+      ),
     ),
+    ToolUniverseSourceLive,
   ),
 )
 

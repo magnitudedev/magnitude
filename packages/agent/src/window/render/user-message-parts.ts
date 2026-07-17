@@ -1,56 +1,59 @@
-import { ContentBuilder } from '../../content'
-import type { UserPart } from '@magnitudedev/ai'
+import { ContextBuilder, type ContextImagePart, type ContextPart } from '../../content'
 import type { TimelineEntry } from '../inbox/types'
 
 export interface RenderTimelineUserMessagePartsOptions {
   readonly open: string
   readonly close: string
-  readonly attachmentsInsideWrapper?: boolean
 }
 
 const defaultUserMessageOptions: RenderTimelineUserMessagePartsOptions = {
   open: '<message from="user">',
   close: '</message>',
-  attachmentsInsideWrapper: false,
+}
+
+function imageFrom(parts: readonly ContextPart[]): ContextImagePart | undefined {
+  return parts.find((part): part is ContextImagePart => part._tag === 'ContextImage')
 }
 
 export function renderTimelineUserMessageParts(
   entry: Extract<TimelineEntry, { kind: 'user_message' }>,
   options: RenderTimelineUserMessagePartsOptions = defaultUserMessageOptions,
-): UserPart[] {
-  const builder = new ContentBuilder()
-  const attachmentsInsideWrapper = options.attachmentsInsideWrapper === true
-  builder.pushText(
-    attachmentsInsideWrapper
-      ? `${options.open}${entry.text}`
-      : `${options.open}${entry.text}${options.close}`,
-  )
+): ContextPart[] {
+  const builder = new ContextBuilder()
+  builder.pushText(options.open)
 
-  for (const attachment of entry.attachments) {
-    switch (attachment.kind) {
-      case 'image':
-        builder.pushText(`\n<attachment path="${attachment.path}" filename="${attachment.filename}" media_type="${attachment.mediaType}" width="${attachment.width}" height="${attachment.height}" />`)
-        break
-      case 'mention': {
-        const mention = attachment.attachment
-        const mentionType = mention.type === 'mention_directory' ? 'directory' : 'file'
-        const lineRange = mention.type === 'mention_file_range'
-          ? ` lines="${mention.startLine}-${mention.endLine}"`
-          : ''
-        if (attachment.resolution.status === 'failed') {
-          builder.pushText(`\n<mention path="${mention.path}" type="${mentionType}"${lineRange} status="failed" reason="${attachment.resolution.reason}" />`)
-          break
-        }
-        const truncated = attachment.resolution.truncated ? ' truncated="true"' : ''
-        builder.pushText(`\n<mention path="${mention.path}" type="${mentionType}"${lineRange}${truncated} original_bytes="${attachment.resolution.originalBytes}">${attachment.resolution.content}</mention>`)
-        break
-      }
+  for (const item of entry.items) {
+    if (item.kind === 'body') {
+      for (const part of item.parts) builder.pushPart(part)
+      continue
     }
+
+    if (item.kind === 'attachment') {
+      const image = imageFrom(item.parts)
+      const path = image?.path ?? 'unknown'
+      builder.pushText(`\n<attachment type="image" path="${path}">`)
+      for (const part of item.parts) builder.pushPart(part)
+      builder.pushText('</attachment>')
+      continue
+    }
+
+    const occurrence = item.mention.occurrence
+    const mention = occurrence.attachment
+    const mentionType = mention.type === 'mention_directory' ? 'directory' : 'file'
+    const lineRange = mention.type === 'mention_file_range'
+      ? ` lines="${mention.startLine}-${mention.endLine}"`
+      : ''
+    const resolution = item.mention.resolution
+    if (resolution.status === 'failed') {
+      builder.pushText(`<mention path="${mention.path}" type="${mentionType}"${lineRange} status="failed" reason="${resolution.reason}" />`)
+      continue
+    }
+    const truncated = resolution.truncated ? ' truncated="true"' : ''
+    builder.pushText(`<mention path="${mention.path}" type="${mentionType}"${lineRange}${truncated}>`)
+    for (const part of resolution.parts) builder.pushPart(part)
+    builder.pushText('</mention>')
   }
 
-  if (attachmentsInsideWrapper) {
-    builder.pushText(options.close)
-  }
-
+  builder.pushText(options.close)
   return builder.build()
 }

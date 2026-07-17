@@ -31,6 +31,7 @@ import { TurnProjection } from '../src/projections/turn'
 import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
 import { WorkerActivityProjection } from '../src/projections/worker-activity'
 import { WindowProjection } from '../src/window'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 const profile = {
   contextWindow: 100_000,
@@ -124,12 +125,13 @@ function userMessage(messageId: string): AppEvent {
     forkId: null,
     messageId,
     timestamp: Date.now(),
-    content: [{ _tag: 'TextPart', text: 'continue' }],
+    text: 'continue',
+    mentions: [],
     attachments: [],
     mode: 'text',
     synthetic: false,
     taskMode: false,
-  } as any
+  }
 }
 
 function userMessageReady(messageId: string): AppEvent {
@@ -138,7 +140,7 @@ function userMessageReady(messageId: string): AppEvent {
     forkId: null,
     messageId,
     mentionResolutions: [],
-  } as any
+  }
 }
 
 function observerReportEvents(args: {
@@ -229,18 +231,20 @@ function makeModelResolver(escalateOnCalls: Set<number>) {
   })
 
   return Layer.succeed(AgentModelResolver, {
+    resolveSlotConfig: () => Effect.succeed(observerResolved),
     resolvePrimary: () => Effect.die('not used'),
     resolveSecondary: () => Effect.succeed(observerResolved),
   })
 }
 
 describe('Observer scheduler', () => {
-  it('blocks until the next leader turn claims an advisor-required escalation', async () => {
+  it('continues scheduling while advisor-required escalation is disabled', async () => {
     // First call escalates, subsequent calls do not
     const requirements = Layer.mergeAll(
       makeModelResolver(new Set([1])),
       ObserverStateLive,
       FetchHttpClient.layer,
+      ToolUniverseSourceLive,
     ) as Parameters<typeof TestAgent.createClient>[0]
 
     const client = await TestAgent.createClient(requirements)
@@ -250,8 +254,8 @@ describe('Observer scheduler', () => {
     })
 
     try {
-      // t1: observer runs and escalates. TurnProjection then owns an
-      // advisor-required communication, so observer scheduling is blocked.
+      // t1 escalates, but disabled advisor-required routing does not create a
+      // pending communication or block later observer work.
       await client.send(turnOutcome('t1'))
       await waitFor(() => {
         const count = events.filter(isRootObserverOutcome).length
@@ -263,18 +267,16 @@ describe('Observer scheduler', () => {
       expect(firstOutcome.justification).toBe('churn')
 
       await client.send(turnOutcome('blocked-before-claim'))
-      await sleep(50)
-      expect(events.filter(isRootObserverOutcome)).toHaveLength(1)
+      await waitFor(() => events.filter(isRootObserverOutcome).length >= 2, 1000)
+      expect(events.filter(isRootObserverOutcome)[1]!.observedTurnId).toBe('blocked-before-claim')
 
-      // A real user message is what wakes root. That turn claims the
-      // advisor-required communication; only then can observer evaluate again.
       await client.send(userMessage('message-1'))
       await client.send(userMessageReady('message-1'))
       await client.send(turnStarted('t2'))
       await client.send(turnOutcome('t2'))
-      await waitFor(() => events.filter(isRootObserverOutcome).length >= 2, 1000)
-      const secondOutcome = events.filter(isRootObserverOutcome)[1]!
-      expect(secondOutcome.observedTurnId).toBe('t2')
+      await waitFor(() => events.filter(isRootObserverOutcome).length >= 3, 1000)
+      const thirdOutcome = events.filter(isRootObserverOutcome)[2]!
+      expect(thirdOutcome.observedTurnId).toBe('t2')
     } finally {
       unsub()
       await client.dispose()

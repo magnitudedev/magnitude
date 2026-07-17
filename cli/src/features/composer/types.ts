@@ -1,4 +1,4 @@
-import type { DisplayMessage, DisplayTimeline, RawMessageAttachment } from '@magnitudedev/sdk'
+import type { DisplayMessage, DisplayTimeline, RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import type { BashResult } from '@magnitudedev/client-common'
 import type { KeyEvent } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
@@ -40,7 +40,8 @@ export type ComposerProps = {
   submitUserMessage: (payload: {
     message: string
     visibleMessage?: string
-    attachments: RawMessageAttachment[]
+    imageAttachments: RawImageAttachment[]
+    mentions: RawMentionOccurrence[]
   }) => void
   runSlashCommand: (commandText: string) => boolean | void
   executeBash: (command: string) => BashResult | Promise<BashResult | null> | null

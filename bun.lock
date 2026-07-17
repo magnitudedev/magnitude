@@ -282,6 +282,20 @@
         "micromark-extension-gfm-task-list-item": "*",
       },
     },
+    "packages/openapi-effect": {
+      "name": "@magnitudedev/openapi-effect",
+      "version": "0.0.1",
+      "dependencies": {
+        "@effect/platform": "^0.96.0",
+        "effect": "^3.21.2",
+        "prettier": "^2.8.8",
+      },
+      "devDependencies": {
+        "@types/bun": "latest",
+        "@types/prettier": "^2.7.3",
+        "vitest": "^3.2.4",
+      },
+    },
     "packages/protocol": {
       "name": "@magnitudedev/protocol",
       "version": "0.0.1",
@@ -794,6 +808,8 @@
 
     "@magnitudedev/logger": ["@magnitudedev/logger@workspace:packages/logger"],
 
+    "@magnitudedev/openapi-effect": ["@magnitudedev/openapi-effect@workspace:packages/openapi-effect"],
+
     "@magnitudedev/protocol": ["@magnitudedev/protocol@workspace:packages/protocol"],
 
     "@magnitudedev/providers": ["@magnitudedev/providers@workspace:packages/providers"],
@@ -1083,6 +1099,8 @@
     "@types/ms": ["@types/ms@2.1.0", "", {}, "sha512-GsCCIZDE/p3i96vtEqx+7dBUGXrc7zeSK3wwPHIaRThS+9OhWIXRqzs4d6k1SVU8g91DrNRWxWUGhp5KXQb2VA=="],
 
     "@types/node": ["@types/node@25.9.1", "", { "dependencies": { "undici-types": ">=7.24.0 <7.24.7" } }, "sha512-xfrlY7UD5rMJk3ZVJP8BNzS28J36YJg+xp+LPXV1TdWxr8uMH5A860QNxYDGQe/ylDSgjxE52Q9VnO7p75tJxg=="],
+
+    "@types/prettier": ["@types/prettier@2.7.3", "", {}, "sha512-+68kP9yzs4LMp7VNh8gdzMSPZFL44MLGqiHWvttYJe+6qnuVr4Ek9wSBQoveqY/r+LwjCcU29kNVkidwim+kYA=="],
 
     "@types/react": ["@types/react@19.2.15", "", { "dependencies": { "csstype": "^3.2.2" } }, "sha512-eRwcGNHve+E8qtEQSSRl6urh+rFop4v8gm6O8rGv25CodbvFdLjA1vVQ1KkiFE0w0UPOnb8tDiFKL5lp0rtY5Q=="],
 

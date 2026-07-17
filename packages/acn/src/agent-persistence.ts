@@ -2,7 +2,6 @@ import { Effect, Schema } from "effect"
 import {
   DEFAULT_CHAT_NAME,
   PersistenceError,
-  textOf,
   type AppEvent,
   type ChatPersistenceService,
   type SessionMetadata as AgentSessionMetadata,
@@ -40,7 +39,7 @@ export class AcnChatPersistence implements ChatPersistenceService {
     let next = metadata
     for (const event of events) {
       if (event.type !== "user_message") continue
-      const text = textOf(event.content).trim()
+      const text = event.text.trim()
       if (!text) continue
       next = {
         ...next,

@@ -15,7 +15,7 @@ import {
   TaskStatusSchema,
 } from './task-graph'
 import { HarnessStateProjection, getToolHandlesRecord, type HarnessTurnState } from './harness-state'
-import type { ToolState } from '../models'
+import type { ToolState } from '../models/tool-state'
 import type { ToolHandleFromSchema } from '../models/tool-handle-schema'
 
 export const WorkerStateSchema = Schema.Union(

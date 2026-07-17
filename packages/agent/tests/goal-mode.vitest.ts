@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Effect, Layer } from 'effect'
+import { Effect, Layer, Option } from 'effect'
 import {
   Addressed,
   FrameworkErrorPubSubLive,
@@ -17,6 +17,7 @@ import { GoalProjection } from '../src/projections/goal'
 import { HarnessStateProjection } from '../src/projections/harness-state'
 import { TurnProjection, type ForkTurnState } from '../src/projections/turn'
 import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 // Materialize timeline messages for assertions — accepts the normalized
 // byId/order display form or a plain array (addressed readAll results).
@@ -48,7 +49,7 @@ function makeRuntimeLayer() {
       TurnProjection.Layer,
       Layer.provide(DisplayTimelineProjection.Layer, InMemoryAddressedEntryStoreLive),
     ),
-    baseLayer,
+    Layer.merge(baseLayer, ToolUniverseSourceLive),
   )
 }
 
@@ -203,7 +204,7 @@ describe('goal mode turn guard', () => {
 
     const goalMessages = listMessages(display.messages).filter((message) => message.type === 'goal_status')
     expect(goalMessages).toHaveLength(2)
-    expect(goalMessages[0]).toMatchObject({ status: 'started', objective: 'ship the fix' })
-    expect(goalMessages[1]).toMatchObject({ status: 'finished', evidence: 'done' })
+    expect(goalMessages[0]).toMatchObject({ status: 'started', objective: Option.some('ship the fix') })
+    expect(goalMessages[1]).toMatchObject({ status: 'finished', evidence: Option.some('done') })
   })
 })

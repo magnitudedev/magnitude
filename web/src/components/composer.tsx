@@ -14,7 +14,19 @@ import {
   Terminal,
   Sparkles,
 } from "lucide-react"
-import { useSlashCommands, useFileMentions, type MentionFileItem, type SlashCommandDefinition, type MentionSearchClient, mentionAttachmentFromSegment } from "@magnitudedev/client-common"
+import {
+  applyTextEditWithPastesAndMentions,
+  insertMentionSegment,
+  mentionAttachmentFromSegment,
+  mentionOccurrenceFromInputSegment,
+  useSlashCommands,
+  useFileMentions,
+  type InputMentionSegment,
+  type InputValue,
+  type MentionFileItem,
+  type SlashCommandDefinition,
+  type MentionSearchClient,
+} from "@magnitudedev/client-common"
 import { useAtomValue, useAtomSet, useAtomMount, Atom } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import { toGenericKeyEvent, isSendKey, isEscapeKey } from "../utils/keyboard"
@@ -24,7 +36,7 @@ import {
   composerAttachmentsAtom,
   composerHistoryIndexAtom,
 } from "@magnitudedev/client-common"
-import type { MentionAttachment } from "@magnitudedev/sdk"
+import type { MentionAttachment, RawMentionOccurrence } from "@magnitudedev/sdk"
 
 export interface ComposerProps {
   /** Current role label (e.g. "Leader") */
@@ -34,7 +46,7 @@ export interface ComposerProps {
   /** Bash mode active */
   bashMode?: boolean
   /** Send a message */
-  onSend: (text: string, attachments?: MentionAttachment[]) => void
+  onSend: (text: string, mentions?: RawMentionOccurrence[]) => void
   /** Interrupt the current turn */
   onInterrupt?: () => void
   /** Run a bash command (bash mode) */
@@ -73,7 +85,10 @@ export function Composer({
   const setAttachments = useAtomSet(composerAttachmentsAtom)
   const historyIndex = useAtomValue(composerHistoryIndexAtom)
   const setHistoryIndex = useAtomSet(composerHistoryIndexAtom)
-  const [savedDraft, setSavedDraft] = useState("")
+  const [savedDraft, setSavedDraft] = useState<{
+    text: string
+    mentions: InputMentionSegment[]
+  }>({ text: "", mentions: [] })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   // Track what the user last typed so we can distinguish external restore
   // (queued input / rollback) from normal user input.
@@ -131,26 +146,31 @@ export function Composer({
   const insertMention = useCallback(
     (item: MentionFileItem) => {
       const before = text.slice(0, cursorPosition)
-      const after = text.slice(cursorPosition)
       // Replace the @query with @path
       const atIdx = before.lastIndexOf("@")
       if (atIdx === -1) return
-      const replacement = `@${item.path}`
-      const newText = text.slice(0, atIdx) + replacement + after
-      setText(newText)
-      lastUserTextRef.current = newText
-      // Add as attachment mention
-      const attachment = mentionAttachmentFromSegment(item)
-      setAttachments((prev) => [...prev, attachment])
+      const input: InputValue = {
+        text,
+        cursorPosition,
+        lastEditDueToNav: false,
+        pasteSegments: [],
+        mentionSegments: attachments,
+        selectedPasteSegmentId: null,
+        selectedMentionSegmentId: null,
+      }
+      const next = insertMentionSegment(input, item, crypto.randomUUID(), atIdx, cursorPosition)
+      setText(next.text)
+      setAttachments(next.mentionSegments)
+      lastUserTextRef.current = next.text
       // Move cursor after the inserted text
-      const newCursorPos = atIdx + replacement.length
+      const newCursorPos = next.cursorPosition
       setCursorPosition(newCursorPos)
       requestAnimationFrame(() => {
         textareaRef.current?.focus()
         textareaRef.current?.setSelectionRange(newCursorPos, newCursorPos)
       })
     },
-    [text, cursorPosition, setText, setAttachments],
+    [text, cursorPosition, attachments, setText, setAttachments],
   )
 
   const handleSubmit = useCallback(() => {
@@ -165,14 +185,14 @@ export function Composer({
       return
     }
 
-    onSend(trimmed, attachments.length > 0 ? attachments : undefined)
+    onSend(text, attachments.length > 0 ? attachments.map(mentionOccurrenceFromInputSegment) : undefined)
     // Push to message history (most recent first, dedup consecutive)
     setMessageHistory((prev: string[]) =>
       prev[0] === trimmed ? prev : [trimmed, ...prev].slice(0, 100),
     )
     // Reset history navigation
     setHistoryIndex(-1)
-    setSavedDraft("")
+    setSavedDraft({ text: "", mentions: [] })
     setText("")
     setAttachments([])
     // Keep lastUserTextRef in sync so the restore-focus Effect doesn't
@@ -215,7 +235,8 @@ export function Composer({
           e.preventDefault()
           if (historyIndex === -1) {
             // Entering history mode — save current draft
-            setSavedDraft(text)
+            setSavedDraft({ text, mentions: attachments })
+            setAttachments([])
             setHistoryIndex(0)
             const entry = messageHistory[0]
             if (entry !== undefined) {
@@ -275,13 +296,14 @@ export function Composer({
             } else {
               // Exit history mode — restore saved draft
               setHistoryIndex(-1)
-              setSavedDraft("")
-              setText(savedDraft)
-              lastUserTextRef.current = savedDraft
+              setSavedDraft({ text: "", mentions: [] })
+              setText(savedDraft.text)
+              setAttachments(savedDraft.mentions)
+              lastUserTextRef.current = savedDraft.text
               requestAnimationFrame(() => {
                 const ta = textareaRef.current
                 if (ta) {
-                  ta.setSelectionRange(savedDraft.length, savedDraft.length)
+                  ta.setSelectionRange(savedDraft.text.length, savedDraft.text.length)
                 }
               })
             }
@@ -308,17 +330,37 @@ export function Composer({
         return
       }
     },
-    [slashState, mentionState, canSend, isStreaming, bashMode, onInterrupt, onToggleBashMode, handleSubmit, messageHistory, historyIndex, text, savedDraft, setText, setHistoryIndex, setSavedDraft],
+    [slashState, mentionState, canSend, isStreaming, bashMode, onInterrupt, onToggleBashMode, handleSubmit, messageHistory, historyIndex, text, attachments, savedDraft, setText, setAttachments, setHistoryIndex, setSavedDraft],
   )
 
   const handleTextareaChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      lastUserTextRef.current = e.target.value
-      setText(e.target.value)
-      setCursorPosition(e.target.selectionStart)
+      const nextText = e.target.value
+      let start = 0
+      while (start < text.length && start < nextText.length && text[start] === nextText[start]) start++
+      let oldEnd = text.length
+      let newEnd = nextText.length
+      while (oldEnd > start && newEnd > start && text[oldEnd - 1] === nextText[newEnd - 1]) {
+        oldEnd--
+        newEnd--
+      }
+      const input: InputValue = {
+        text,
+        cursorPosition,
+        lastEditDueToNav: false,
+        pasteSegments: [],
+        mentionSegments: attachments,
+        selectedPasteSegmentId: null,
+        selectedMentionSegmentId: null,
+      }
+      const next = applyTextEditWithPastesAndMentions(input, start, oldEnd, nextText.slice(start, newEnd))
+      lastUserTextRef.current = next.text
+      setText(next.text)
+      setAttachments(next.mentionSegments)
+      setCursorPosition(next.cursorPosition)
       resizeTextarea(e.target)
     },
-    [setText],
+    [text, cursorPosition, attachments, setText, setAttachments],
   )
 
   const handleTextareaSelect = useCallback(
@@ -329,8 +371,21 @@ export function Composer({
   )
 
   const removeAttachment = useCallback((index: number) => {
-    setAttachments((prev) => prev.filter((_, i) => i !== index))
-  }, [setAttachments])
+    const segment = attachments[index]
+    if (!segment) return
+    const input: InputValue = {
+      text,
+      cursorPosition,
+      lastEditDueToNav: false,
+      pasteSegments: [],
+      mentionSegments: attachments,
+      selectedPasteSegmentId: null,
+      selectedMentionSegmentId: null,
+    }
+    const next = applyTextEditWithPastesAndMentions(input, segment.start, segment.end, '')
+    setText(next.text)
+    setAttachments(next.mentionSegments)
+  }, [attachments, text, cursorPosition, setText, setAttachments])
 
   // Placeholder text
   const placeholder = bashMode
@@ -381,7 +436,7 @@ export function Composer({
         {attachments.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
             {attachments.map((att, i) => (
-              <AttachmentPill key={i} attachment={att} onRemove={() => removeAttachment(i)} />
+              <AttachmentPill key={att.id} attachment={mentionAttachmentFromSegment(att)} onRemove={() => removeAttachment(i)} />
             ))}
           </div>
         )}

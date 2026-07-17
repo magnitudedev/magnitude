@@ -42,6 +42,7 @@ export {
   CheckpointChangesStateSchema,
   CheckpointRollbackStateSchema,
   getVcsToolEntries,
+  vcsToolkit,
   type CheckpointChangesState,
   type CheckpointRollbackState,
 } from "./tools"

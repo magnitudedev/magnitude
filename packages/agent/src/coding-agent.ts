@@ -19,6 +19,7 @@ import type { AgentIntrospection, AgentIntrospectionError } from './introspectio
 import { SessionContextProjection } from './projections/session-context'
 import { TurnProjection } from './projections/turn'
 import { HarnessStateProjection } from './projections/harness-state'
+import { AgentToolkitProjection } from './projections/agent-toolkit'
 import { DetachedProcessProjection } from './projections/detached-process'
 import { WindowProjection } from './window'
 import { WorkerActivityProjection } from './projections/worker-activity'
@@ -104,13 +105,12 @@ import { initTraceSession } from '@magnitudedev/tracing'
 import { MAGNITUDE_VERSION } from '@magnitudedev/version'
 
 import { publishSessionOptions, SessionOptionsAmbient } from './ambient/session-ambient'
-import { ConfigAmbient, publishConfigFromModelResources, getSlotConfig } from './ambient/config-ambient'
+import { ConfigAmbient, getSlotConfig, type ConfigState } from './ambient/config-ambient'
 import { loadSkills, skillLoadDiagnosticLogFields, type Skill, type SkillLoadDiagnostic } from '@magnitudedev/skills'
 import { publishSkills } from './ambient/skills-ambient'
-import { publishToolkit } from './ambient/toolkit-ambient'
-import { getEffectiveToolkit } from './tools/toolkits'
 import { publishAtifConfig, DEFAULT_ATIF_CONFIG } from './ambient/atif-ambient'
 import { publishInitialTask as publishInitialTaskAmbient } from './ambient/initial-task-ambient'
+import { ToolUniverseSourceLive } from './tools/tool-universe-live'
 
 // =============================================================================
 // Coding Agent
@@ -131,6 +131,7 @@ export const CodingAgent = EventEngine.make<AppEvent>()({
     SessionContextProjection,
     AgentRoutingProjection,
     AgentLifecycleProjection,
+    AgentToolkitProjection,
     GoalProjection,
     TaskGraphProjection,
     CompactionProjection,
@@ -187,7 +188,6 @@ export interface CodingAgentService {
   readonly initialize: () => Effect.Effect<void>
   readonly send: (event: AppEvent) => Effect.Effect<void>
   readonly interrupt: () => Effect.Effect<void>
-  readonly refreshConfig: Effect.Effect<void>
   readonly publishInitialTask: (task: string | null) => Effect.Effect<void>
   readonly introspectionChanges: (forkId: string | null) => Stream.Stream<AgentIntrospection, AgentIntrospectionError>
 }
@@ -226,9 +226,8 @@ export interface CreateClientOptions {
    */
   providerClient: ProviderClientShape
 
-  /** Authoritative ACN model resources. Reads are observational. */
-  modelCatalog: Effect.Effect<import('@magnitudedev/sdk').ModelCatalog>
-  modelSlots: Effect.Effect<import('@magnitudedev/sdk').ModelSlots>
+  /** Replaying coherent snapshots from ACN's authoritative model state. */
+  modelConfigurations: Stream.Stream<ConfigState>
   /** ACN-owned authoritative persistence/publication for a runtime-invalidated bound effort. */
   applyReasoningEffortFallback?: (
     input: import('./model/model-resolver').ReasoningEffortFallbackInput,
@@ -345,21 +344,17 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         )
       }
 
-      const refreshConfig: Effect.Effect<void> = provideAmbient(
-        publishConfigFromModelResources(options.storage, options.modelCatalog, options.modelSlots)
-      ).pipe(
-        Effect.catchAll((err) =>
-          Effect.logWarning(`Failed to refresh config: ${err}`).pipe(Effect.asVoid)
-        )
+      const applyConfig = (state: ConfigState): Effect.Effect<void> =>
+        ambientService.update(ConfigAmbient, state)
+      const loadInitialConfig: Effect.Effect<void> = options.modelConfigurations.pipe(
+        Stream.runHead,
+        Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: applyConfig })),
       )
 
-      const publishEffectiveLeaderToolkit: Effect.Effect<void> = Effect.gen(function* () {
-        const configState = ambientService.getValue(ConfigAmbient)
-        const sessionOptions = ambientService.getValue(SessionOptionsAmbient)
-        yield* provideAmbient(publishToolkit(
-          getEffectiveToolkit('leader', configState, undefined, { solo: sessionOptions.solo }),
-        ))
-      })
+      yield* Effect.acquireRelease(
+        Effect.forkScoped(Stream.runForEach(options.modelConfigurations, applyConfig)),
+        Fiber.interrupt,
+      )
 
       // Root resources are app-owned, not event-core-owned. LifecycleCoordinator
       // persists anything emitted by this cleanup when the engine scope closes.
@@ -453,7 +448,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
             yield* provideAmbient(publishAtifConfig(DEFAULT_ATIF_CONFIG))
           }
 
-          yield* refreshConfig
+          yield* loadInitialConfig
 
           const skills = yield* Effect.tryPromise(() => loadRuntimeSkills(process.cwd())).pipe(
             Effect.catchTag('UnknownException', (error) =>
@@ -466,7 +461,6 @@ function makeCodingAgentLive(options: CreateClientOptions) {
             ),
           )
           yield* provideAmbient(publishSkills(skills))
-          yield* publishEffectiveLeaderToolkit
 
           return
         }
@@ -488,7 +482,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           yield* provideAmbient(publishAtifConfig(DEFAULT_ATIF_CONFIG))
         }
 
-        yield* refreshConfig
+        yield* loadInitialConfig
         const skills = yield* Effect.tryPromise(() => loadRuntimeSkills(process.cwd())).pipe(
           Effect.catchTag('UnknownException', (error) =>
             Effect.sync(() => logger.error({
@@ -500,7 +494,6 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           ),
         )
         yield* provideAmbient(publishSkills(skills))
-        yield* publishEffectiveLeaderToolkit
 
         for (const event of events) {
           yield* engine.send(event)
@@ -608,13 +601,6 @@ function makeCodingAgentLive(options: CreateClientOptions) {
               Effect.logWarning(`Self-heal: failed to clear override for slot ${slotId}`)
             ),
           )
-          yield* provideAmbient(
-            publishConfigFromModelResources(options.storage, options.modelCatalog, options.modelSlots),
-          ).pipe(
-            Effect.catchAll(() =>
-              Effect.logWarning('Self-heal: failed to refresh config')
-            ),
-          )
         })
       ).pipe(Effect.ignoreLogged)
 
@@ -629,7 +615,6 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         initialize,
         send: (event) => engine.send(event),
         interrupt: () => engine.interrupt(),
-        refreshConfig,
         publishInitialTask: (task) => provideAmbient(publishInitialTaskAmbient(task)),
         introspectionChanges,
       } satisfies CodingAgentService
@@ -673,7 +658,6 @@ export interface CodingAgentSession {
   }
   readonly send: (event: AppEvent) => Effect.Effect<void>
   readonly interrupt: () => Effect.Effect<void>
-  readonly refreshConfig: () => Effect.Effect<void>
   readonly publishInitialTask: (task: string | null) => Effect.Effect<void>
   readonly onEvent: Stream.Stream<AppEvent>
   readonly onError: Stream.Stream<FrameworkError>
@@ -725,6 +709,7 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     Layer.succeed(MagnitudeStorage, options.storage),
     BunFileSystem.layer,
     BunPath.layer,
+    ToolUniverseSourceLive,
   )
   // All worker requirements are supplied by baseLayer. The EventEngine worker
   // tuple currently widens that requirement parameter to `any`, so constrain
@@ -783,9 +768,6 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     ),
     interrupt: Surface.command(() =>
       Effect.flatMap(CodingAgentTag, (agent) => agent.interrupt())
-    ),
-    refreshConfig: Surface.command(() =>
-      Effect.flatMap(CodingAgentTag, (agent) => agent.refreshConfig)
     ),
     publishInitialTask: Surface.command((task: string | null) =>
       Effect.flatMap(CodingAgentTag, (agent) => agent.publishInitialTask(task))

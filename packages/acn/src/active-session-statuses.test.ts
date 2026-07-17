@@ -88,7 +88,6 @@ const makeSession = (input: {
   },
   send: () => Effect.die("unused test session send"),
   interrupt: () => Effect.die("unused test session interrupt"),
-  refreshConfig: () => Effect.void,
   publishInitialTask: () => Effect.void,
   onEvent: Stream.never,
   onError: Stream.never,

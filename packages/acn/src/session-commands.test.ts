@@ -52,7 +52,6 @@ const makeSession = (send: CodingAgentSession["send"]): CodingAgentSession => ({
   },
   send,
   interrupt: () => Effect.die("unused test session interrupt"),
-  refreshConfig: () => Effect.void,
   publishInitialTask: () => Effect.void,
   onEvent: Stream.never,
   onError: Stream.never,
@@ -120,7 +119,8 @@ describe("SessionCommands", () => {
           sessionId: "session-a",
           content: "hello after eviction",
           taskMode: false,
-          attachments: [],
+          imageAttachments: [],
+          mentions: [],
         })
       }).pipe(Effect.provide(makeLayer(runtime)))
 

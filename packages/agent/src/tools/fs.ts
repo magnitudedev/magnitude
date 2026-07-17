@@ -7,16 +7,11 @@ import { defineHarnessTool, StreamValidationError } from '@magnitudedev/harness'
 import { resolve } from 'path'
 import { validateAndApply } from '../util/edit'
 import { WorkingDirectoryTag } from '../execution/working-directory'
-import { readImageFileForModel } from '../util/read-image-file'
+import { captureContextImageFromFile } from '../util/capture-context-image'
+import { ContextImageResultSchema } from '../content'
 import { expandScratchpadPath } from '@magnitudedev/scratchpad'
 import { Fs, resolveFsPath } from '../services/fs'
 import { ToolErrorSchema } from './errors'
-const ToolImageSchema = Schema.Struct({
-  base64: Schema.String,
-  mediaType: Schema.Literal('image/png', 'image/jpeg', 'image/webp', 'image/gif'),
-  width: Schema.Number,
-  height: Schema.Number,
-}).annotations({ identifier: 'ToolImage' })
 
 // =============================================================================
 // Errors
@@ -400,7 +395,7 @@ export const viewTool = defineHarnessTool({
         description: 'Relative path to an image file from cwd. Use $M/ prefix for scratchpad path.'
       }),
     }),
-    outputSchema: ToolImageSchema,
+    outputSchema: ContextImageResultSchema,
   },
   errorSchema: FsErrorSchema,
   stream: {
@@ -427,10 +422,13 @@ export const viewTool = defineHarnessTool({
       Effect.mapError(() => fsError(`Failed to read image: ${filePath}`))
     )
 
-    return yield* Effect.tryPromise({
-      try: () => readImageFileForModel(fullPath),
-      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to read image: ${filePath}`),
-    })
+    return yield* captureContextImageFromFile({
+        absolutePath: fullPath,
+        logicalPath: filePath,
+      }).pipe(
+        Effect.map((image) => ({ _tag: 'ContextImageResult' as const, image })),
+        Effect.mapError((error) => fsError(error.message)),
+      )
   }),
 })
 

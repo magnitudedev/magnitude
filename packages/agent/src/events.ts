@@ -8,7 +8,7 @@
 
 
 import { Option } from 'effect'
-import type { UserPart } from './content'
+import type { ContextPart } from './content'
 import type { ModelAttemptFailureSnapshot, ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
 import type { ToolLifecycleEvent } from '@magnitudedev/harness'
 import type { ValidationIssue } from '@magnitudedev/ai'
@@ -18,22 +18,19 @@ import type { ValidationIssue } from '@magnitudedev/ai'
 // See tools/types.ts for details.
 import type { ToolKeyErased } from './tools/types'
 
-export type ObservationPart =
-  | { readonly type: 'text'; readonly text: string }
-  | { readonly type: 'image'; readonly base64: string; readonly mediaType: string; readonly dimensions?: { readonly width: number; readonly height: number } }
 import type { Skill } from '@magnitudedev/skills'
 import type { RoleId } from '@magnitudedev/roles'
 import type { TaskAssignee } from './tasks/types'
 import type { ErrorPresentation } from './errors/present'
 import type { CompletedTurn } from './window/types'
 import type { CompactResult } from './compaction/context'
-import type { AgentMessageAttachment, MentionResolution } from './attachments'
+import type { AgentImageAttachment, MentionOccurrence, MentionResolution } from './attachments'
 
 
 export type {
   AgentImageAttachment as ImageAttachment,
   AgentMentionAttachment as MentionAttachment,
-  AgentMessageAttachment as Attachment,
+  MentionOccurrence,
   MentionResolution,
 } from './attachments'
 // =============================================================================
@@ -88,8 +85,9 @@ export interface UserMessage {
   readonly messageId: string
   readonly forkId: string | null
   readonly timestamp: number
-  readonly content: UserPart[]
-  readonly attachments: AgentMessageAttachment[]
+  readonly text: string
+  readonly mentions: readonly MentionOccurrence[]
+  readonly attachments: readonly AgentImageAttachment[]
   readonly mode: 'text' | 'audio'
   readonly synthetic: boolean  // true when sent by autopilot
   readonly taskMode: boolean
@@ -99,7 +97,7 @@ export interface ObservationsCaptured {
   readonly type: 'observations_captured'
   readonly forkId: string | null
   readonly turnId: string
-  readonly parts: readonly ObservationPart[]
+  readonly parts: readonly ContextPart[]
 }
 
 export interface UserBashCommand {
@@ -147,7 +145,7 @@ export interface ObservedResult {
   readonly toolCallId: string
   readonly toolName: string
   readonly query: string
-  readonly content: UserPart[]
+  readonly content: ContextPart[]
 }
 
 export type AttemptCommitPolicy =

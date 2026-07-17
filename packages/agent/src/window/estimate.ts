@@ -1,16 +1,14 @@
-import type { UserPart } from '@magnitudedev/ai'
+import type { ContextPart } from '../content'
 import type { CompletedTurn } from '../window/types'
 import type { TimelineEntry } from './inbox/types'
 
 import type { Skill } from '@magnitudedev/skills'
-import type { ConfigState } from '../ambient/config-ambient'
 import type { RoleId } from '../agents/role-validation'
 
 import { estimateContentTokens, estimateText } from '../truncation/estimate'
 import { estimateCompletedTurn } from '../util/turn-estimation'
 import { renderTimeline } from './inbox/render'
 import { getAgentDefinition } from '../agents/registry'
-import { getEffectiveToolkit } from '../tools/toolkits'
 import { buildSystemPrompt } from '../prompts/system-prompt-builder'
 
 // =============================================================================
@@ -18,7 +16,7 @@ import { buildSystemPrompt } from '../prompts/system-prompt-builder'
 // =============================================================================
 
 /** Estimate tokens for content-based entries (session_context, fork_context, compacted). */
-export function estimateContentEntry(content: UserPart[]): number {
+export function estimateContentEntry(content: ContextPart[]): number {
   return estimateContentTokens(content)
 }
 
@@ -58,11 +56,9 @@ const systemPromptTokenCache = new Map<string, number>()
 export function estimateSystemPromptTokens(
   roleId: RoleId,
   skills: Map<string, Skill>,
-  configState: ConfigState,
   options?: { solo?: boolean; systemPromptOverride?: string },
 ): number {
-  const toolkit = getEffectiveToolkit(roleId, configState, undefined, options)
-  const cacheKey = `${roleId}:[${[...toolkit.keys].sort().join(',')}]` + (options?.systemPromptOverride !== undefined ? '|override' : '')
+  const cacheKey = `${roleId}` + (options?.systemPromptOverride !== undefined ? '|override' : '')
   const cached = systemPromptTokenCache.get(cacheKey)
   if (cached !== undefined) return cached
 

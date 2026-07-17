@@ -3,7 +3,8 @@ import { Addressed, EventEngine } from '@magnitudedev/event-core'
 import { Effect, Layer, Option } from 'effect'
 import type { ModelAttemptFailureSnapshot, ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
 import type { AppEvent } from '../src/events'
-import { toToolKeyErased } from '../src/tools/toolkits'
+import { toolUniverseToolkit, toToolKeyErased } from '../src/tools/toolkits'
+import { ToolUniverseSource } from '../src/ambient/tool-universe-ambient'
 import { DisplayTimelineProjection } from '../src/display'
 import { AgentRoutingProjection } from '../src/projections/agent-routing'
 import { AgentLifecycleProjection } from '../src/projections/agent-lifecycle'
@@ -85,6 +86,11 @@ const makeTestAgent = (name: string) =>
     }
   })
 
+const testRequirements = (store: Addressed.AddressedEntryStore) => Layer.merge(
+  Layer.succeed(Addressed.AddressedEntryStore, store),
+  Layer.succeed(ToolUniverseSource, { toolkit: toolUniverseToolkit }),
+)
+
 /**
  * Display addressed residency tests.
  *
@@ -100,7 +106,7 @@ describe('display addressed residency', () => {
     const TestAgent = makeTestAgent('DisplayAutoPinStreamingAgent')
 
     const client = await TestAgent.createClient(
-      Layer.succeed(Addressed.AddressedEntryStore, fixture.store)
+      testRequirements(fixture.store)
     )
 
     try {
@@ -135,7 +141,7 @@ describe('display addressed residency', () => {
     const TestAgent = makeTestAgent('DisplayAutoPinThinkingAgent')
 
     const client = await TestAgent.createClient(
-      Layer.succeed(Addressed.AddressedEntryStore, fixture.store)
+      testRequirements(fixture.store)
     )
 
     try {
@@ -144,7 +150,7 @@ describe('display addressed residency', () => {
         await client.send({
           type: 'skill_activated',
           forkId: null,
-          skillName: 'seed',
+          skillName: `seed-${index}`,
           skillPath: '/seed',
           source: 'user',
           message: `old ${index}`,
@@ -185,7 +191,7 @@ describe('display addressed residency', () => {
     const TestAgent = makeTestAgent('DisplayAutoPinCommunicationAgent')
 
     const client = await TestAgent.createClient(
-      Layer.succeed(Addressed.AddressedEntryStore, fixture.store)
+      testRequirements(fixture.store)
     )
 
     try {
@@ -206,7 +212,7 @@ describe('display addressed residency', () => {
         await client.send({
           type: 'skill_activated',
           forkId: 'worker-a',
-          skillName: 'seed',
+          skillName: `seed-${index}`,
           skillPath: '/seed',
           source: 'user',
           message: `old ${index}`,
@@ -244,9 +250,9 @@ describe('display addressed residency', () => {
       expect(messages).toHaveLength(51)
       expect(messages[50]).toMatchObject({
         type: 'agent_communication',
-        streamId: 'communication-message-1',
+        streamId: Option.some('communication-message-1'),
         content: 'hello worker',
-        status: 'streaming',
+        status: Option.some('streaming'),
       })
     } finally {
       await client.dispose()
@@ -258,7 +264,7 @@ describe('display addressed residency', () => {
     const TestAgent = makeTestAgent('DisplayKilledWorkerAgent')
 
     const client = await TestAgent.createClient(
-      Layer.succeed(Addressed.AddressedEntryStore, fixture.store)
+      testRequirements(fixture.store)
     )
 
     try {
@@ -319,7 +325,7 @@ describe('display addressed residency', () => {
     const TestAgent = makeTestAgent('DisplayAutoPinToolRejectionAgent')
 
     const client = await TestAgent.createClient(
-      Layer.succeed(Addressed.AddressedEntryStore, fixture.store)
+      testRequirements(fixture.store)
     )
 
     try {
@@ -378,7 +384,7 @@ describe('display addressed residency', () => {
     const TestAgent = makeTestAgent('DisplayAutoPinToolCancellationAgent')
 
     const client = await TestAgent.createClient(
-      Layer.succeed(Addressed.AddressedEntryStore, fixture.store)
+      testRequirements(fixture.store)
     )
 
     try {
@@ -439,7 +445,7 @@ describe('display addressed residency', () => {
     const TestAgent = makeTestAgent('DisplayAutoPinConnectionFailureAgent')
 
     const client = await TestAgent.createClient(
-      Layer.succeed(Addressed.AddressedEntryStore, fixture.store)
+      testRequirements(fixture.store)
     )
 
     try {

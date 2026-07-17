@@ -2,20 +2,16 @@ import { Context, Effect, Layer } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { createId } from "@magnitudedev/generate-id"
-import {
-  textParts,
-  type AppEvent,
-  type Attachment as AgentAttachment,
-} from "@magnitudedev/agent"
+import type { AppEvent } from "@magnitudedev/agent"
 import {
   SessionStartFailed,
-  type MessageAttachment,
   type SessionError,
   type InterruptTarget,
 } from "@magnitudedev/protocol"
 import { AgentRuntime } from "./agent-runtime"
 import type { SendUserMessageInput, SessionExecutionContext, UserBashCommandEvent } from "./session-types"
-import { materializeRawMessageAttachments } from "./attachments/materialize-raw-message-attachments"
+import { captureRawImages } from "./attachments/capture-raw-images"
+import { collectMentionOccurrences } from "./file-mentions"
 
 export interface SessionCommandsApi {
   readonly sendUserMessage: (input: SendUserMessageInput) => Effect.Effect<void, SessionError>
@@ -36,17 +32,6 @@ export class SessionCommands extends Context.Tag("SessionCommands")<
   SessionCommandsApi
 >() {}
 
-const toAgentAttachment = (attachment: MessageAttachment): AgentAttachment => {
-  switch (attachment.type) {
-    case "image":
-      return attachment
-    case "mention_file":
-    case "mention_file_range":
-    case "mention_directory":
-      return attachment
-  }
-}
-
 export const SessionCommandsLive: Layer.Layer<SessionCommands, never, AgentRuntime | FileSystem.FileSystem | Path.Path> =
   Layer.effect(
     SessionCommands,
@@ -56,29 +41,37 @@ export const SessionCommandsLive: Layer.Layer<SessionCommands, never, AgentRunti
       const pathService = yield* Path.Path
 
       const sendUserMessage = Effect.fn("acn.session-commands.send-user-message")(function* (input: SendUserMessageInput) {
-        if (!input.content.trim()) {
+        if (!input.content.trim() && input.imageAttachments.length === 0 && input.mentions.length === 0) {
           return yield* new SessionStartFailed({
             sessionId: input.sessionId,
             reason: "Message content cannot be empty",
           })
         }
         const entry = yield* runtime.requireOrStart(input.sessionId)
-        const attachments = yield* materializeRawMessageAttachments({
-          cwd: entry.cwd,
+        const imageParts = yield* captureRawImages({
           scratchpadPath: entry.scratchpadPath,
-          messageContent: input.content,
-          attachments: input.attachments,
+          attachments: input.imageAttachments,
         }).pipe(
           Effect.provideService(FileSystem.FileSystem, fs),
           Effect.provideService(Path.Path, pathService),
         )
+        const mentions = yield* collectMentionOccurrences(
+          entry.cwd,
+          entry.scratchpadPath,
+          input.content,
+          input.mentions,
+        ).pipe(Effect.mapError((error) => new SessionStartFailed({
+          sessionId: input.sessionId,
+          reason: error instanceof Error ? error.message : "Failed to collect mentions",
+        })))
         const event = {
           type: "user_message",
           messageId: input.messageId ?? createId(),
           timestamp: Date.now(),
           forkId: null,
-          content: textParts(input.content),
-          attachments: attachments.map(toAgentAttachment),
+          text: input.content,
+          mentions,
+          attachments: imageParts.map(image => ({ type: "image" as const, image })),
           mode: "text",
           synthetic: false,
           taskMode: input.taskMode,

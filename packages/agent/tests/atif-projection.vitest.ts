@@ -20,11 +20,11 @@ import { AgentRoutingProjection } from '../src/projections/agent-routing'
 import { AgentLifecycleProjection } from '../src/projections/agent-lifecycle'
 import { GoalProjection } from '../src/projections/goal'
 import { TurnProjection } from '../src/projections/turn'
-import { ConfigAmbient, buildConfigStateFromSlots } from '../src/ambient/config-ambient'
+import { buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 import { AtifAmbient, type AtifConfig } from '../src/ambient/atif-ambient'
 import type { AtifForkState, AtifTrajectory } from '../src/projections/atif'
 import { serializeAtif } from '../src/projections/atif/serialize'
-import { toToolKeyErased } from '../src/tools/toolkits'
+import { selectAgentToolKeys, toolUniverseToolkit, toToolKeyErased } from '../src/tools/toolkits'
 
 const mockModels = [
   { providerModelId: ProviderModelIdSchema.make('primary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' as const }, defaultReasoningEffort: ReasoningEffortSchema.make('none'), properties: { vision: new VisionProperty.states.Resolved({ value: true }), reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make('none')] }) }, slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
@@ -39,6 +39,13 @@ const mockConfigState = buildConfigStateFromSlots(mockModels as never, mockSlots
   softCapRatio: 0.9,
   softCapMaxTokens: 200_000,
 })
+const leaderToolKeys = selectAgentToolKeys({
+  roleId: 'leader', configState: mockConfigState, solo: false, vcsAvailable: false,
+})
+const serializationTools = {
+  universe: toolUniverseToolkit,
+  toolKeysByFork: new Map<string | null, readonly string[]>([[null, leaderToolKeys]]),
+}
 
 const ts = (n: number) => 1_700_100_000_000 + n
 
@@ -67,13 +74,7 @@ const makeAtif = async (events: AppEvent[], enabled: boolean, targetForkId: stri
     const bus = yield* (ProjectionBusTag<AppEvent>())
     const projection = yield* AtifProjection.Tag
 
-    // Set ambient config before processing events
     const ambientService = yield* AmbientServiceTag
-    yield* ambientService.register(ConfigAmbient)
-    yield* ambientService.update(ConfigAmbient, {
-      bySlot: {} as any,
-      catalogLoaded: false,
-    })
     yield* ambientService.register(AtifAmbient)
     yield* ambientService.update(AtifAmbient, {
       enabled,
@@ -106,7 +107,8 @@ describe('AtifProjection', () => {
         forkId,
         messageId: 'msg-1',
         timestamp: ts(1),
-        content: [{ _tag: 'TextPart', text: 'Hello' }],
+        text: 'Hello',
+        mentions: [],
         attachments: [],
         mode: 'text',
         synthetic: false,
@@ -124,7 +126,8 @@ describe('AtifProjection', () => {
         forkId,
         messageId: 'msg-1',
         timestamp: ts(1),
-        content: [{ _tag: 'TextPart', text: 'Hello' }],
+        text: 'Hello',
+        mentions: [],
         attachments: [],
         mode: 'text',
         synthetic: false,
@@ -457,7 +460,8 @@ describe('AtifProjection', () => {
         forkId,
         messageId: 'msg-1',
         timestamp: ts(1),
-        content: [{ _tag: 'TextPart', text: 'Continue' }],
+        text: 'Continue',
+        mentions: [],
         attachments: [],
         mode: 'text',
         synthetic: true,
@@ -559,7 +563,8 @@ describe('AtifProjection', () => {
         forkId,
         messageId: 'msg-1',
         timestamp: ts(1),
-        content: [{ _tag: 'TextPart', text: 'Do something' }],
+        text: 'Do something',
+        mentions: [],
         attachments: [],
         mode: 'text',
         synthetic: false,
@@ -681,7 +686,8 @@ describe('AtifProjection', () => {
         forkId,
         messageId: 'msg-1',
         timestamp: ts(1),
-        content: [{ _tag: 'TextPart', text: 'Hello' }],
+        text: 'Hello',
+        mentions: [],
         attachments: [],
         mode: 'text',
         synthetic: false,
@@ -707,7 +713,8 @@ describe('AtifProjection', () => {
         forkId: null,
         messageId: 'msg-1',
         timestamp: ts(1),
-        content: [{ _tag: 'TextPart', text: 'Hello' }],
+        text: 'Hello',
+        mentions: [],
         attachments: [],
         mode: 'text',
         synthetic: false,
@@ -733,7 +740,7 @@ describe('AtifProjection', () => {
       ['agent-scout-1', scoutFork],
     ])
 
-    const trajectory = serializeAtif(forks, { sessionId: 'test-session', configState: mockConfigState })
+    const trajectory = serializeAtif(forks, { sessionId: 'test-session', ...serializationTools })
 
     // Validate ATIF v1.7 structure
     expect(trajectory.schema_version).toBe('ATIF-v1.7')
@@ -1008,7 +1015,8 @@ describe('AtifProjection', () => {
         forkId,
         messageId: 'msg-1',
         timestamp: ts(1),
-        content: [{ _tag: 'TextPart', text: 'Create a hello world file' }],
+        text: 'Create a hello world file',
+        mentions: [],
         attachments: [],
         mode: 'text',
         synthetic: false,
@@ -1077,7 +1085,7 @@ describe('AtifProjection', () => {
       },
     ] as AppEvent[], true)
 
-    const trajectory = serializeAtif(new Map([[null, rootFork]]), { sessionId: 'session-test-001', configState: mockConfigState })
+    const trajectory = serializeAtif(new Map([[null, rootFork]]), { sessionId: 'session-test-001', ...serializationTools })
 
     // === ATIF v1.7 Structural Validation ===
 

@@ -26,7 +26,7 @@ import {
   useDisplayViewController,
   type CommandContext,
 } from '@magnitudedev/client-common'
-import type { RawMessageAttachment } from '@magnitudedev/sdk'
+import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { ROLE_TO_SLOT } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
 import { showRecentChatsOverlayAtom } from '../../state/cli-atoms'
@@ -118,11 +118,12 @@ export function ComposerContainer({
   const submitUserMessage = useCallback((payload: {
     message: string
     visibleMessage?: string
-    attachments: RawMessageAttachment[]
+    imageAttachments: RawImageAttachment[]
+    mentions: RawMentionOccurrence[]
   }): void => {
     composer.handleSend(
       payload.message,
-      payload.attachments,
+      { imageAttachments: payload.imageAttachments, mentions: payload.mentions },
       { visibleMessage: payload.visibleMessage },
     )
   }, [composer.handleSend])

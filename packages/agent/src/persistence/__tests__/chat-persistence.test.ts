@@ -4,7 +4,6 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { createId } from '@paralleldrive/cuid2'
 import type { AppEvent } from '../../events'
-import { textParts } from '../../content'
 
 interface StoredChatSession {
   readonly sessionId: string
@@ -49,7 +48,8 @@ const userMessage = (messageId: string, content: string): AppEvent => ({
   messageId,
   forkId: null,
   timestamp: 1,
-  content: textParts(content),
+  text: content,
+  mentions: [],
   attachments: [],
   mode: 'text',
   synthetic: false,

@@ -194,8 +194,21 @@ export type ProjectionAmbientHandlerPair<
   TReads extends readonly AnyProjectionResult[] = readonly [],
   TAmbients extends readonly AmbientDef<any, any>[] = readonly [],
   TAddressed extends ProjectionAddressedDescriptors = {}
-> =
-  ReturnType<ProjectionAmbientHandlerBuilder<TState, TSignalDefs, TReads, TAmbients, TAddressed>>
+> = {
+  [I in keyof TAmbients]: TAmbients[I] extends infer C
+    ? C extends AmbientDef<infer _Value, infer _Requirements> ? {
+        ambient: C
+        handler: (ctx: {
+          value: AmbientValueOf<C>
+          state: TState
+          emit: SignalEmitters<TSignalDefs>
+          read: ReadFn<TReads>
+          ambient: AmbientReader<TAmbients>
+          addressed: ProjectionAddressedHandles<TAddressed>
+        }) => ProjectionHandlerResult<TState>
+      } : never
+    : never
+}[number]
 
 // ---------------------------------------------------------------------------
 // Config and Result Types

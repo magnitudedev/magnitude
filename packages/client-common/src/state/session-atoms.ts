@@ -12,7 +12,7 @@ import { Atom } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import type { SessionOptions } from "@magnitudedev/sdk"
 import type { BashResult } from "../utils/bash-executor"
-import type { MentionAttachment } from "@magnitudedev/sdk"
+import type { InputMentionSegment } from "../types/store"
 
 /**
  * The agent-host CWD that will be used when creating a new session.
@@ -52,7 +52,7 @@ export const composerTextAtom = Atom.make("")
  * Composer attachment pills.
  * Restored queued input clears attachments by resetting this atom.
  */
-export const composerAttachmentsAtom = Atom.make<MentionAttachment[]>([])
+export const composerAttachmentsAtom = Atom.make<InputMentionSegment[]>([])
 
 /**
  * Composer history navigation index.

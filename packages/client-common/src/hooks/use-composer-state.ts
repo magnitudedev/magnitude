@@ -40,9 +40,8 @@ import {
   useDisplaySpeculator,
 } from "../sync/index"
 import type {
-  DisplayAttachment,
-  MentionAttachment,
-  RawMessageAttachment,
+  RawImageAttachment,
+  RawMentionOccurrence,
 } from "@magnitudedev/sdk"
 import { createId } from "@magnitudedev/generate-id"
 import type { BashResult } from "../utils/bash-executor"
@@ -63,7 +62,10 @@ export interface UseComposerStateResult {
   /** Send a message (auto-creates session if none selected). */
   handleSend: (
     text: string,
-    attachments?: readonly RawMessageAttachment[],
+    input?: {
+      readonly imageAttachments?: readonly RawImageAttachment[]
+      readonly mentions?: readonly RawMentionOccurrence[]
+    },
     opts?: { visibleMessage?: string; taskMode?: boolean },
   ) => void
   /** Interrupt the root agent */
@@ -151,20 +153,16 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     },
   }), [searchMentionsMutation])
 
-  const toOptimisticDisplayAttachments = (attachments: readonly RawMessageAttachment[]): DisplayAttachment[] =>
-    attachments.filter((attachment): attachment is MentionAttachment =>
-      attachment.type === "mention_file"
-      || attachment.type === "mention_file_range"
-      || attachment.type === "mention_directory"
-    )
-
   const handleSend = useCallback((
     text: string,
-    attachments?: readonly RawMessageAttachment[],
+    input?: {
+      readonly imageAttachments?: readonly RawImageAttachment[]
+      readonly mentions?: readonly RawMentionOccurrence[]
+    },
     opts?: { visibleMessage?: string; taskMode?: boolean },
   ): void => {
-    const rawMessageAttachments = attachments ?? []
-    const displayAttachments = toOptimisticDisplayAttachments(rawMessageAttachments)
+    const imageAttachments = input?.imageAttachments ?? []
+    const mentions = input?.mentions ?? []
     const taskMode = opts?.taskMode ?? false
     const visibleMessage = opts?.visibleMessage !== undefined ? Option.some(opts.visibleMessage) : Option.none<string>()
     const messageId = createId()
@@ -229,7 +227,8 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
             messageId: Option.some(messageId),
             content: text,
             taskMode,
-            attachments: rawMessageAttachments,
+            imageAttachments,
+            mentions,
             visibleMessage,
           },
           reactivityKeys: ["sessions"],
@@ -248,7 +247,8 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
             messageId: Option.some(messageId),
             content: text,
             taskMode,
-            attachments: rawMessageAttachments,
+            imageAttachments,
+            mentions,
             visibleMessage,
           },
           reactivityKeys: ["sessions"],
@@ -267,7 +267,8 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
             content: text,
             visibleMessage,
             taskMode,
-            attachments: rawMessageAttachments,
+            imageAttachments,
+            mentions,
           }),
           options: sessionCreateOptions,
           draftOwnerId: Option.some(getDraftSessionOwnerId()),

@@ -60,6 +60,22 @@ export const MentionAttachment = Schema.Union(
 )
 export type MentionAttachment = Schema.Schema.Type<typeof MentionAttachment>
 
+export const MentionPlacement = Schema.Union(
+  Schema.TaggedStruct("inline", {
+    start: Schema.Number,
+    end: Schema.Number,
+  }),
+  Schema.TaggedStruct("trailing", {}),
+)
+export type MentionPlacement = Schema.Schema.Type<typeof MentionPlacement>
+
+export const RawMentionOccurrence = Schema.Struct({
+  occurrenceId: Schema.String,
+  attachment: MentionAttachment,
+  placement: MentionPlacement,
+})
+export type RawMentionOccurrence = Schema.Schema.Type<typeof RawMentionOccurrence>
+
 export const ImageAttachment = Schema.Struct({
   type: Schema.Literal("image"),
   path: Schema.String,
@@ -69,12 +85,6 @@ export const ImageAttachment = Schema.Struct({
   height: Schema.Number,
 })
 export type ImageAttachment = Schema.Schema.Type<typeof ImageAttachment>
-
-export const RawMessageAttachment = Schema.Union(
-  RawImageAttachment,
-  MentionAttachment,
-)
-export type RawMessageAttachment = Schema.Schema.Type<typeof RawMessageAttachment>
 
 export const MessageAttachment = Schema.Union(
   ImageAttachment,

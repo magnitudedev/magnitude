@@ -1,7 +1,7 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { SessionError } from "../errors"
-import { RawMessageAttachment } from "../schemas/attachments"
+import { RawImageAttachment, RawMentionOccurrence } from "../schemas/attachments"
 
 export const SendMessage = Rpc.make("SendMessage", {
   payload: Schema.Struct({
@@ -10,7 +10,8 @@ export const SendMessage = Rpc.make("SendMessage", {
     content: Schema.String,
     visibleMessage: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
     taskMode: Schema.Boolean,
-    attachments: Schema.Array(RawMessageAttachment)
+    imageAttachments: Schema.Array(RawImageAttachment),
+    mentions: Schema.Array(RawMentionOccurrence)
   }),
   success: Schema.Struct({}),
   error: SessionError

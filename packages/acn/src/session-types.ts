@@ -4,7 +4,8 @@ import type {
   CodingAgentSession,
 } from "@magnitudedev/agent"
 import type {
-  RawMessageAttachment,
+  RawImageAttachment,
+  RawMentionOccurrence,
   StreamEvent as ProtocolStreamEvent,
 } from "@magnitudedev/protocol"
 
@@ -24,7 +25,8 @@ export interface SendUserMessageInput {
   readonly messageId?: string
   readonly content: string
   readonly taskMode: boolean
-  readonly attachments: ReadonlyArray<RawMessageAttachment>
+  readonly imageAttachments: ReadonlyArray<RawImageAttachment>
+  readonly mentions: ReadonlyArray<RawMentionOccurrence>
 }
 
 export interface SessionExecutionContext {

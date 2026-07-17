@@ -13,7 +13,7 @@
 import { Cause, Context, Duration, Effect, Layer, Stream } from 'effect'
 import * as HttpClient from '@effect/platform/HttpClient'
 import { formatStreamFailureMessage, Prompt } from '@magnitudedev/ai'
-import type { ModelStreamTerminal, TextPart, UserPart } from '@magnitudedev/ai'
+import type { ModelStreamTerminal } from '@magnitudedev/ai'
 import { logger } from '@magnitudedev/logger'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import { AgentModelResolver } from '../model/model-resolver'
@@ -45,13 +45,6 @@ export class ChatTitleServiceTag extends Context.Tag('ChatTitleService')<
 // Helpers
 // =============================================================================
 
-function extractTextFromParts(parts: readonly UserPart[]): string {
-  return parts
-    .filter((p): p is TextPart => p._tag === 'TextPart')
-    .map((p) => p.text)
-    .join(' ')
-}
-
 function streamTerminalErrorMessage(terminal: ModelStreamTerminal): string | null {
   switch (terminal._tag) {
     case 'StreamCompleted':
@@ -60,9 +53,6 @@ function streamTerminalErrorMessage(terminal: ModelStreamTerminal): string | nul
       return formatStreamFailureMessage(terminal.cause)
   }
 }
-
-// Re-export for worker convenience
-export { extractTextFromParts }
 
 // =============================================================================
 // Live Layer

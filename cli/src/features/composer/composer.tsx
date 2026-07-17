@@ -2,15 +2,9 @@ import { RGBA, TextAttributes, type KeyEvent } from '@opentui/core'
 import { useCallback, useRef, useState, useMemo } from 'react'
 import { Effect } from 'effect'
 import { Atom, useAtomMount, useAtomSet, useAtomValue as useAtomValueClientCommon } from '@effect-atom/atom-react'
-import type {
-  MentionAttachment,
-  RawImageAttachment,
-  RawMessageAttachment,
-  ReadFileResult,
-} from '@magnitudedev/sdk'
-import { imageMediaTypeFromFilename, filenameWithImageExtension, useAgentClient, mentionAttachmentFromSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
+import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
+import { filenameWithImageExtension, useAgentClient, mentionOccurrenceFromInputSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
 import { createId } from '@magnitudedev/generate-id'
-import path from 'path'
 import { BOX_CHARS } from '../../utils/ui-constants'
 import { orange } from '../../utils/theme'
 import { Button } from '../../components/button'
@@ -23,7 +17,7 @@ import { ContextUsageBar } from '../agent-status/context-usage-bar'
 import { AutopilotIndicator } from './autopilot-indicator'
 import { useFileMentions, type MentionSearchClient } from '@magnitudedev/client-common'
 import { useSlashCommands } from '@magnitudedev/client-common'
-import { readClipboardBitmap, readClipboardText, extractImageDimensions } from '../../utils/clipboard'
+import { readClipboardBitmap, readClipboardText } from '../../utils/clipboard'
 import { extractPastedPathCandidates, tryReadPastedImageFileCandidate, type ReadPastedImageFileParams } from '../../utils/pasted-image-path'
 import { autoScaleImageAttachmentIfNeeded } from '../../utils/image-scaling'
 import {
@@ -380,41 +374,6 @@ export function Composer(props: ComposerProps) {
   }, [runSlashCommand, setComposerText, setComposerAttachments, setComposerHasContent])
 
   const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }) => {
-    // Image files selected via @mention become pending image inputs
-    // (same path as pasted images), not file mentions.
-    const mediaType = item.contentType === 'text' ? imageMediaTypeFromFilename(item.path) : null
-    if (mediaType) {
-      if (cwd) {
-        void readFileMutation({
-          payload: { cwd, path: item.path, format: 'base64' },
-        }).then((read: ReadFileResult) => {
-          if (read.format !== 'base64' || read.content.length === 0) return
-          const buffer = Buffer.from(read.content, 'base64')
-          const dims = extractImageDimensions(buffer)
-          if (!dims) return
-          const newAttachment: PendingImageAttachment = {
-            type: 'raw_image_file',
-            data: read.content,
-            filename: filenameWithImageExtension(path.basename(item.path), mediaType),
-            mediaType,
-            width: dims.width,
-            height: dims.height,
-          }
-          setAttachments(prev => [...prev, newAttachment])
-        }).catch(() => { /* ignore read errors */ })
-      }
-      // Remove the @query from the input — the attachment pill replaces it
-      setInputValue(prev => {
-        const left = prev.text.slice(0, Math.max(0, prev.cursorPosition))
-        const match = left.match(/(?:^|\s)@([^\s@]*)$/)
-        if (!match) return prev
-        const atIndex = left.lastIndexOf('@')
-        if (atIndex < 0) return prev
-        return applyTextEditWithPastesAndMentions(prev, atIndex, left.length, '')
-      })
-      return
-    }
-
     setInputValue(prev => {
       const left = prev.text.slice(0, Math.max(0, prev.cursorPosition))
       const match = left.match(/(?:^|\s)@([^\s@]*)$/)
@@ -423,7 +382,7 @@ export function Composer(props: ComposerProps) {
       if (atIndex < 0) return prev
       return insertMentionSegment(prev, { path: item.path, contentType: item.contentType, lineRange: item.lineRange }, createId(), atIndex, left.length)
     })
-  }, [cwd, readFileMutation])
+  }, [])
 
   const onExpandDirectoryMention = useCallback((item: { path: string }) => {
     setInputValue(prev => {
@@ -548,7 +507,7 @@ export function Composer(props: ComposerProps) {
     setSavedDraft('')
   }, [setComposerText, setComposerAttachments, setComposerHasContent, setComposerHistoryIndex])
 
-  const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionInputs: MentionAttachment[] = []) => {
+  const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionInputs: RawMentionOccurrence[] = []) => {
     if (bashMode) {
       const trimmed = message.trim()
       if (!trimmed) return
@@ -562,13 +521,12 @@ export function Composer(props: ComposerProps) {
     clearSystemBanners()
 
     const content = message
-    const rawMessageAttachments: RawMessageAttachment[] = [...attachments, ...mentionInputs]
-
     try {
       submitUserMessage({
         message: content,
         visibleMessage,
-        attachments: rawMessageAttachments,
+        imageAttachments: attachments,
+        mentions: mentionInputs,
       })
     } catch (error) {
       showToast(`Message was not sent: ${error instanceof Error ? error.message : String(error)}`)
@@ -589,7 +547,7 @@ export function Composer(props: ComposerProps) {
     setSavedDraft('')
     if (inputValue.text.trim() || attachments.length > 0) {
       const { text, mentions } = reconstituteInputTextWithMentions(inputValue)
-      const mentionInputs = mentions.map(mentionAttachmentFromSegment)
+      const mentionInputs = mentions.map(mentionOccurrenceFromInputSegment)
       await handleSubmit(text, inputValue.text, mentionInputs)
     }
   }, [inputValue, attachments.length, handleSubmit, setComposerHistoryIndex])

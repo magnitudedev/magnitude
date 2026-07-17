@@ -21,12 +21,13 @@ import { WindowProjection } from '../window'
 import { SessionContextProjection } from '../projections/session-context'
 import { AgentLifecycleProjection, getAgentByForkId } from '../projections/agent-lifecycle'
 import { HarnessStateProjection } from '../projections/harness-state'
+import { AgentToolkitProjection, readCoherentAgentToolkit } from '../projections/agent-toolkit'
 import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { MAX_RETRIES } from '../util/retry-backoff'
 
 import { AgentModelResolver } from '../model/model-resolver'
 import { getAgentDefinition, getForkInfo } from '../agents/registry'
-import { getEffectiveToolkit } from '../tools/toolkits'
+import { materializeAgentToolkit } from '../tools/toolkits'
 import { createHarnessAdapter } from '../execution/harness-adapter'
 import { buildSystemPrompt } from '../prompts/system-prompt-builder'
 import { windowToPrompt, createAgentFormatter } from '../prompts/window-to-prompt'
@@ -36,16 +37,21 @@ import { ShadowVcs } from '@magnitudedev/vcs'
 import { ExecutionManager } from '../execution/types'
 import { SkillsAmbient } from '../ambient/skills-ambient'
 import { buildInterruptedTurnOutcome } from '../util/interrupt-utils'
-import type { ObservationPart } from '../events'
+import type { ContextPart } from '../content'
 import type { ObservablePart } from '../observables/types'
 import type { BaseCallOptions } from '@magnitudedev/sdk'
+import { normalizeVision } from '@magnitudedev/ai'
+import { captureContextImageInline, type ContextImageCaptureError } from '../util/capture-context-image'
 
-function toObservationPart(part: ObservablePart): ObservationPart {
+function captureObservablePart(
+  part: ObservablePart,
+  scratchpadPath: string,
+): Effect.Effect<ContextPart, ContextImageCaptureError> {
   switch (part._tag) {
     case 'TextPart':
-      return { type: 'text', text: part.text }
+      return Effect.succeed<ContextPart>({ _tag: 'ContextText', text: part.text })
     case 'ImagePart':
-      return { type: 'image', base64: part.data, mediaType: part.mediaType, dimensions: part.dimensions }
+      return captureContextImageInline({ base64: part.data, mediaType: part.mediaType, scratchpadPath, name: 'observation' })
   }
 }
 import { isToolKey, type ToolKey } from '../tools/toolkits'
@@ -54,7 +60,11 @@ import { isToolKey, type ToolKey } from '../tools/toolkits'
 import { buildStandardHooks } from '../execution/harness-hooks'
 import { TurnContextTag } from '../engine/turn-context'
 import { ConfigAmbient } from '../ambient/config-ambient'
+import { getSlotConfigForRole, getSlotConfigOrNull } from '../ambient/config-ambient'
+import { ROLE_TO_SLOT } from '@magnitudedev/roles'
+import { ImageQueryTarget } from '../tools/query-image'
 import { SessionOptionsAmbient } from '../ambient/session-ambient'
+import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
 
 function cortexDefectMessage(
   title: string,
@@ -136,21 +146,28 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // ──────────────────────────────────────────────────────────────────────
         // 2. Resolve model
         // ──────────────────────────────────────────────────────────────────────
+        const ambientService = yield* AmbientServiceTag
+        const { config: configState, toolkit: toolkitState } = yield* readCoherentAgentToolkit(read, forkId)
         const modelResolver = yield* AgentModelResolver
         const agentId = forkId
           ? getAgentByForkId(agentState, forkId)?.agentId ?? '000000000000'
           : '000000000000'
-        const agentModel = yield* modelResolver.resolvePrimary(roleId, agentId)
+        const activeSlot = getSlotConfigForRole(configState, roleId)
+        const agentModel = yield* modelResolver.resolveSlotConfig(activeSlot, agentId, roleId)
 
         // ──────────────────────────────────────────────────────────────────────
         // 3. Observations
         // ──────────────────────────────────────────────────────────────────────
         const execManager = yield* ExecutionManager
-        const observations: ObservationPart[] = []
+        const observations: ContextPart[] = []
         const boundObs = execManager.getObservables(forkId)
         for (const obs of boundObs) {
           const parts = yield* obs.observe()
-          observations.push(...parts.map(toObservationPart))
+          observations.push(...yield* Effect.forEach(
+            parts,
+            part => captureObservablePart(part, sessionCtx.context?.scratchpadPath ?? process.cwd()),
+            { concurrency: 'unbounded' },
+          ))
         }
         if (observations.length > 0) {
           yield* publish({ type: 'observations_captured', forkId, turnId, parts: observations })
@@ -159,20 +176,11 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // ──────────────────────────────────────────────────────────────────────
         // 4. Get toolkit and fork layer
         // ──────────────────────────────────────────────────────────────────────
-        const ambientService = yield* AmbientServiceTag
-        const configState = ambientService.getValue(ConfigAmbient)
         const sessionOptions = ambientService.getValue(SessionOptionsAmbient)
-        const vcsAvailable = sessionOptions.vcsAvailable
         const headless = sessionOptions.headless
         const forkLayer = execManager.getForkLayer(forkId)
-        // Read VCS tools through the fork layer so ShadowVcs stays fork-scoped
-        const vcsEntries = forkLayer
-          ? yield* Effect.gen(function* () {
-              const vcs = yield* ShadowVcs
-              return vcs.getTools()
-            }).pipe(Effect.provide(forkLayer))
-          : []
-        const toolkit = getEffectiveToolkit(roleId, configState, vcsEntries, { solo: sessionOptions.solo })
+        const universe = ambientService.getValue(ToolUniverseAmbient)
+        const toolkit = materializeAgentToolkit(universe, toolkitState.toolKeys)
         if (!forkLayer) {
           const message = [
             'Cortex defect: fork layer not initialized',
@@ -194,7 +202,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         }
 
         const turnContextLayer = Layer.succeed(TurnContextTag, { turnId, chainId, forkId })
-        const turnLayer = Layer.merge(forkLayer, turnContextLayer)
+        const activeSlotId = ROLE_TO_SLOT[roleId]
+        const otherSlot = getSlotConfigOrNull(configState, activeSlotId === 'primary' ? 'secondary' : 'primary')
+        const turnLayer = Layer.merge(Layer.merge(forkLayer, turnContextLayer), Layer.succeed(ImageQueryTarget, { slot: otherSlot }))
 
         // Record turn-start checkpoint — captures state at the turn boundary
         // so checkpoint_rollback can restore to "before this turn".
@@ -239,13 +249,13 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const systemPrompt = buildSystemPrompt({
           roleDef: agentDef,
           skills,
-          vcsAvailable,
+          vcsAvailable: sessionOptions.vcsAvailable,
           headless,
           systemPromptOverride: sessionOptions.systemPromptOverride,
         })
 
         const timezone = sessionCtx.context?.timezone ?? null
-        const formatter = createAgentFormatter(createToolResultFormatter(toolkit))
+        const formatter = createAgentFormatter(createToolResultFormatter(toolkit), { includeImageData: activeSlot.vision === true })
 
         const rawPrompt = windowToPrompt({
           windowState,
@@ -254,7 +264,11 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           formatter,
           autopilotEnabled: windowState.autopilotEnabled,
           leaderLastAutopilotKnowledge: windowState.consumerAutopilotKnowledge.leader,
+          includeImageData: activeSlot.vision === true,
         })
+        const prompt = activeSlot.vision === true
+          ? rawPrompt
+          : normalizeVision(rawPrompt, () => '')
 
         // With the file-based attachment system, images are stored as files in
         // the session scratchpad. The agent reads them with its existing file
@@ -294,7 +308,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // ──────────────────────────────────────────────────────────────────────
         // 8. Run turn
         // ──────────────────────────────────────────────────────────────────────
-        const liveTurn = yield* harness.runTurn(rawPrompt, runTurnOptions).pipe(
+        const liveTurn = yield* harness.runTurn(prompt, runTurnOptions).pipe(
           Effect.provide(turnLayer),
           Effect.catchAll((err: AgentStreamStartFailure) => Effect.gen(function* () {
             logger.error({ forkId, turnId, err }, '[Cortex] Pre-stream failure')

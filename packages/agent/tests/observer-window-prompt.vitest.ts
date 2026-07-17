@@ -47,31 +47,29 @@ describe('observerWindowToPrompt', () => {
           type: 'context',
           source: 'system',
           timeline: [
-            { kind: 'user_message', timestamp: Date.UTC(2026, 5, 12, 17, 14, 3), text: 'first', attachments: [], synthetic: Option.none() },
-            { kind: 'observation', timestamp: Date.UTC(2026, 5, 12, 17, 14, 10), parts: [{ _tag: 'TextPart', text: 'bookkeeping' }] },
+            { kind: 'user_message', timestamp: Date.UTC(2026, 5, 12, 17, 14, 3), items: [{ kind: 'body', parts: [{ _tag: 'ContextText', text: 'first' }] }], synthetic: Option.none() },
+            { kind: 'observation', timestamp: Date.UTC(2026, 5, 12, 17, 14, 10), parts: [{ _tag: 'ContextText', text: 'bookkeeping' }] },
             { kind: 'turn_start', timestamp: Date.UTC(2026, 5, 12, 17, 14, 12), turnId: 'turn-0' },
             {
               kind: 'user_message',
               timestamp: Date.UTC(2026, 5, 12, 17, 14, 21),
-              text: 'second',
               synthetic: Option.none(),
-              attachments: [{
-                kind: 'mention',
-                attachment: {
-                  type: 'mention_file_range',
-                  path: 'packages/agent/src/observer/prompt.ts',
-                  startLine: 10,
-                  endLine: 12,
+              items: [
+                { kind: 'body', parts: [{ _tag: 'ContextText', text: 'second ' }] },
+                {
+                  kind: 'mention',
+                  mention: {
+                    occurrence: {
+                      occurrenceId: 'mention-1',
+                      attachment: { type: 'mention_file_range', path: 'packages/agent/src/observer/prompt.ts', startLine: 10, endLine: 12 },
+                      placement: { _tag: 'inline', start: 7, end: 17 },
+                    },
+                    resolution: { status: 'resolved', parts: [{ _tag: 'ContextText', text: 'const marker = true' }], truncated: true },
+                  },
                 },
-                resolution: {
-                  status: 'resolved',
-                  content: 'const marker = true',
-                  truncated: true,
-                  originalBytes: 123,
-                },
-              }],
+              ],
             },
-            { kind: 'user_message', timestamp: Date.UTC(2026, 5, 12, 17, 15, 0), text: 'third', attachments: [], synthetic: Option.none() },
+            { kind: 'user_message', timestamp: Date.UTC(2026, 5, 12, 17, 15, 0), items: [{ kind: 'body', parts: [{ _tag: 'ContextText', text: 'third' }] }], synthetic: Option.none() },
           ],
           estimatedTokens: 1,
         },
@@ -84,7 +82,7 @@ describe('observerWindowToPrompt', () => {
     const text = textFromMessages(prompt.messages)
     expect(text).toContain('--- 2026-06-12 17:14:03 ---')
     expect(text).toContain('--- 17:15:00 ---')
-    expect(text).toContain('<user>\nsecond\n<mention path="packages/agent/src/observer/prompt.ts" type="file" lines="10-12" truncated="true" original_bytes="123">const marker = true</mention>\n</user>')
+    expect(text).toContain('<user>\nsecond <mention path="packages/agent/src/observer/prompt.ts" type="file" lines="10-12" truncated="true">const marker = true</mention>\n</user>')
     expect(text).toContain('<user>\nthird\n</user>')
     expect(text).not.toContain('at=')
     expect(text).not.toContain('<message from="user">')
@@ -96,20 +94,20 @@ describe('observerWindowToPrompt', () => {
         {
           type: 'session_context',
           source: 'system',
-          content: [{ _tag: 'TextPart', text: '<session_context>hidden session</session_context>' }],
+          content: [{ _tag: 'ContextText', text: '<session_context>hidden session</session_context>' }],
           estimatedTokens: 1,
         },
         {
           type: 'fork_context',
           source: 'system',
-          content: [{ _tag: 'TextPart', text: '<fork_context>hidden fork</fork_context>' }],
+          content: [{ _tag: 'ContextText', text: '<fork_context>hidden fork</fork_context>' }],
           estimatedTokens: 1,
         },
         {
           type: 'context',
           source: 'system',
           timeline: [
-            { kind: 'user_message', timestamp: Date.UTC(2026, 5, 12, 17, 14, 3), text: 'visible user request', attachments: [], synthetic: Option.none() },
+            { kind: 'user_message', timestamp: Date.UTC(2026, 5, 12, 17, 14, 3), items: [{ kind: 'body', parts: [{ _tag: 'ContextText', text: 'visible user request' }] }], synthetic: Option.none() },
           ],
           estimatedTokens: 1,
         },
