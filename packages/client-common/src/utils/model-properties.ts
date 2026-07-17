@@ -3,7 +3,6 @@ import type { ModelSummary, ReasoningEffort } from "@magnitudedev/sdk"
 export interface ReasoningEffortOption {
   readonly value: ReasoningEffort
   readonly label: string
-  readonly isDefault: boolean
 }
 
 export function formatReasoningEffort(effort: ReasoningEffort): string {
@@ -21,7 +20,6 @@ export function reasoningEffortOptions(model: ModelSummary): readonly ReasoningE
   return efforts.map((value) => ({
     value,
     label: formatReasoningEffort(value),
-    isDefault: value === model.defaultReasoningEffort,
   }))
 }
 

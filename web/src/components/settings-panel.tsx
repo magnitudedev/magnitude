@@ -874,7 +874,7 @@ function SlotCard({
           >
             {effortOptions.map((opt) => (
               <option key={opt.value} value={opt.value}>
-                {opt.label}{opt.isDefault ? " (default)" : ""}
+                {opt.label}
               </option>
             ))}
           </select>

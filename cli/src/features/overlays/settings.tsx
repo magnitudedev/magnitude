@@ -214,7 +214,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       onNone: () => [],
       onSome: ({ model }) => reasoningEffortOptions(model).map((option) => ({
           id: option.value,
-          label: `${option.label}${option.isDefault ? ' (default)' : ''}`,
+          label: option.label,
         })),
     })
   }, [dropdownTarget, models, selectedForSlot])
@@ -613,8 +613,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                 {/* Thinking dropdown — relative wrapper, dropdown floats below with absolute */}
                 {(() => {
                   const w = 18; const pad = 2; const border = 2; const arrow = '▾'
-                  const fullLabel = thinkingLabel + (Option.exists(selected, ({ model, slot }) =>
-                    slot.selection.reasoningEffort === model.defaultReasoningEffort) ? ' (def)' : '')
+                  const fullLabel = thinkingLabel
                   const maxLen = w - pad - border - arrow.length - 1
                   const trunc = fullLabel.length > maxLen ? fullLabel.slice(0, maxLen - 1) + '…' : fullLabel
                   const padded = trunc + ' '.repeat(Math.max(0, maxLen - trunc.length))

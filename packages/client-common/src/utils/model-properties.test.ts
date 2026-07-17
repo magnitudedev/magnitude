@@ -31,7 +31,7 @@ describe("model property presentation", () => {
     const value = model(new ReasoningProperty.states.Deferred({}))
 
     expect(reasoningEffortOptions(value)).toEqual([
-      { value: defaultEffort, label: "Default", isDefault: true },
+      { value: defaultEffort, label: "Default" },
     ])
     expect(reasoningPropertyLabel(value)).toContain("after loading")
   })
