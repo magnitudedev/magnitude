@@ -8,10 +8,44 @@ import {
   type LlamaCppReasoningEffortDefinition,
 } from "./reasoning-policy"
 
-export const LlamaCppReasoningTemplateOptionsSchema = Schema.Struct({
+const LlamaCppReasoningTemplateOptionsEncodedSchema = Schema.Struct({
+  enableThinking: Schema.optionalWith(Schema.NullOr(Schema.Boolean), { exact: true }),
+  reasoningEffort: Schema.optionalWith(
+    Schema.NullOr(Schema.String.pipe(Schema.minLength(1), Schema.maxLength(256))),
+    { exact: true },
+  ),
+})
+
+const LlamaCppReasoningTemplateOptionsTypeSchema = Schema.Struct({
   enableThinking: Schema.OptionFromSelf(Schema.Boolean),
   reasoningEffort: Schema.OptionFromSelf(Schema.String.pipe(Schema.minLength(1), Schema.maxLength(256))),
 })
+
+/**
+ * Omits absent template controls in newly encoded JSON while accepting the
+ * nullable representation written by development builds before this format
+ * was corrected.
+ */
+export const LlamaCppReasoningTemplateOptionsSchema = Schema.transform(
+  LlamaCppReasoningTemplateOptionsEncodedSchema,
+  LlamaCppReasoningTemplateOptionsTypeSchema,
+  {
+    decode: (encoded) => ({
+      enableThinking: Option.fromNullable(encoded.enableThinking),
+      reasoningEffort: Option.fromNullable(encoded.reasoningEffort),
+    }),
+    encode: (options) => ({
+      ...Option.match(options.enableThinking, {
+        onNone: () => ({}),
+        onSome: (enableThinking) => ({ enableThinking }),
+      }),
+      ...Option.match(options.reasoningEffort, {
+        onNone: () => ({}),
+        onSome: (reasoningEffort) => ({ reasoningEffort }),
+      }),
+    }),
+  },
+)
 export type LlamaCppReasoningTemplateOptions = typeof LlamaCppReasoningTemplateOptionsSchema.Type
 
 export const LlamaCppThinkingBudgetSchema = Schema.Union(

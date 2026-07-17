@@ -8,7 +8,7 @@
 import { useState, useCallback, type ReactNode } from "react"
 import { Cause, Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { deriveLlamaCppInstallationManagementView, formatTokensCompact, reasoningEffortOptions, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel } from "@magnitudedev/client-common"
+import { deriveLlamaCppInstallationManagementView, formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
 import type { CloudUsageResponse, UsagePeriod, SlotId, ReasoningEffort, LocalModelChoice } from "@magnitudedev/sdk"
 import { ModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS } from "@magnitudedev/sdk"
@@ -728,10 +728,11 @@ function SlotCard({
     onNone: () => "",
     onSome: ({ model }) => `${model.providerId}\0${model.providerModelId}`,
   })
-  const effortOptions = Option.match(selected, {
-    onNone: () => [],
-    onSome: ({ model }) => reasoningEffortOptions(model),
+  const effortControl = Option.match(selected, {
+    onNone: () => ({ _tag: "Unavailable", label: "Unassigned" } as const),
+    onSome: ({ model }) => reasoningEffortControl(model),
   })
+  const effortOptions = effortControl._tag === "Available" ? effortControl.options : []
   const currentEffort = Option.match(selected, {
     onNone: () => "",
     onSome: ({ slot }) => slot.selection.reasoningEffort,
@@ -859,7 +860,7 @@ function SlotCard({
           <select
             value={currentEffort}
             onChange={handleEffortChange}
-            disabled={Option.isNone(selected)}
+            disabled={effortControl._tag === "Unavailable"}
             style={{
               padding: "6px 10px",
               background: "var(--bg-input)",
@@ -872,6 +873,9 @@ function SlotCard({
               cursor: "pointer",
             }}
           >
+            {effortControl._tag === "Unavailable" && (
+              <option value={currentEffort}>{effortControl.label}</option>
+            )}
             {effortOptions.map((opt) => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}

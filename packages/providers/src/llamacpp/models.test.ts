@@ -55,4 +55,32 @@ describe("llama.cpp request options", () => {
       thinking_budget_tokens: 4_096,
     })
   })
+
+  it("omits reasoning fields when the resolved mapping supplies neither", async () => {
+    let body: Record<string, unknown> = {}
+    const mockClient = HttpClient.make((request) => {
+      body = JSON.parse(requestBodyText(request)) as Record<string, unknown>
+      return Effect.succeed(HttpClientResponse.fromWeb(
+        request,
+        new Response([
+          'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}',
+          "",
+          "data: [DONE]",
+          "",
+        ].join("\n"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      ))
+    })
+    const model = createLlamaCppCompatibleSpec({
+      modelId: "test-model",
+      endpoint: "http://127.0.0.1:8080/v1",
+    }).bind({ auth: Auth.bearer("test") })
+
+    await Effect.runPromise(Effect.gen(function* () {
+      const response = yield* model.stream(prompt, tools)
+      yield* Stream.runDrain(response.events)
+    }).pipe(Effect.provide(Layer.succeed(HttpClient.HttpClient, mockClient))))
+
+    expect(body).not.toHaveProperty("chat_template_kwargs")
+    expect(body).not.toHaveProperty("thinking_budget_tokens")
+  })
 })
