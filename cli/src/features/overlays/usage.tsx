@@ -25,21 +25,51 @@ const PERIODS: ReadonlyArray<{ id: UsagePeriod; label: string }> = [
 
 const DAILY_DAYS = 30
 const TOP_MODELS_COUNT = 5
+const USAGE_LIMIT_BAR_WIDTH = 18
 
-function formatDollars(cents: number): string {
-  const dollars = cents / 100
-  return dollars % 1 === 0 ? `$${dollars}` : `$${dollars.toFixed(2)}`
-}
+export function formatReset(remainingMs: number): string {
+  const minutes = Math.max(0, Math.ceil(remainingMs / (60 * 1000)))
+  if (minutes < 1) return '<1m'
+  if (minutes < 60) return `${minutes}m`
 
-function formatReset(remainingMs: number): string {
-  const hours = Math.max(1, Math.ceil(remainingMs / (60 * 60 * 1000)))
-  return hours < 24 ? `${hours}h` : `${Math.ceil(hours / 24)}d`
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  if (hours < 24) return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`
+
+  const days = Math.floor(hours / 24)
+  const remainingHours = hours % 24
+  return remainingHours > 0 ? `${days}d ${remainingHours}h` : `${days}d`
 }
 
 function formatTokens(n: number): string {
   if (n < 1000) return String(n)
   if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`
   return `${(n / 1_000_000).toFixed(1)}M`
+}
+
+export function usagePercentLeft(usedCents: number, limitCents: number): number {
+  if (limitCents <= 0) return 0
+  return Math.max(0, Math.min(100, Math.round((1 - usedCents / limitCents) * 100)))
+}
+
+function requestLabel(count: number): string {
+  return `${count} ${count === 1 ? 'request' : 'requests'}`
+}
+
+export function formatUsageSummary(totals: {
+  readonly requestCount: number
+  readonly inputTokens: number
+  readonly outputTokens: number
+}): string {
+  return `${requestLabel(totals.requestCount)}  ·  ${formatTokens(totals.inputTokens)} input tokens  ·  ${formatTokens(totals.outputTokens)} output tokens`
+}
+
+export function formatModelUsage(model: {
+  readonly requestCount: number
+  readonly inputTokens: number
+  readonly outputTokens: number
+}): string {
+  return `${requestLabel(model.requestCount)}  ·  ${formatTokens(model.inputTokens)} in / ${formatTokens(model.outputTokens)} out`
 }
 
 function formatDate(iso: string): string {
@@ -92,29 +122,18 @@ function TabBar({ value, onChange }: TabBarProps) {
   )
 }
 
-interface DailyBarProps {
+interface DailyUsageRowProps {
   date: string
   inputTokens: number
   outputTokens: number
   topModel: string | null
-  total: number
-  max: number
-  width: number
 }
 
-function DailyBar({ date, inputTokens, outputTokens, topModel, total, max, width }: DailyBarProps) {
+function DailyUsageRow({ date, inputTokens, outputTokens, topModel }: DailyUsageRowProps) {
   const theme = useTheme()
-  const ratio = max > 0 ? total / max : 0
-  const filled = Math.round(ratio * width)
-  const empty = Math.max(0, width - filled)
   return (
     <box style={{ flexDirection: 'row' }}>
       <text style={{ fg: theme.muted }}>{formatDate(date)}{'  '}</text>
-      <text>
-        <span fg={theme.primary}>{'▇'.repeat(filled)}</span>
-        <span fg={theme.border}>{'·'.repeat(empty)}</span>
-      </text>
-      <text style={{ fg: theme.muted }}>{'  '}</text>
       <text style={{ fg: theme.foreground }}>
         {formatTokens(inputTokens)} in / {formatTokens(outputTokens)} out
       </text>
@@ -123,6 +142,37 @@ function DailyBar({ date, inputTokens, outputTokens, topModel, total, max, width
           {`  · ${topModel}`}
         </text>
       )}
+    </box>
+  )
+}
+
+interface UsageLimitBarProps {
+  label: string
+  limitCents: number
+  usedCents: number
+  remainingMs: number
+}
+
+function UsageLimitBar({ label, limitCents, usedCents, remainingMs }: UsageLimitBarProps) {
+  const theme = useTheme()
+  const percentLeft = usagePercentLeft(usedCents, limitCents)
+  const filled = Math.round(percentLeft / 100 * USAGE_LIMIT_BAR_WIDTH)
+  const empty = USAGE_LIMIT_BAR_WIDTH - filled
+  const activeColor = percentLeft === 0 ? theme.error : theme.primary
+
+  return (
+    <box style={{ flexDirection: 'row' }}>
+      <text style={{ fg: theme.foreground }}>{label.padEnd(9)}</text>
+      <text>
+        <span fg={activeColor}>{'▇'.repeat(filled)}</span>
+        <span fg={theme.border}>{'·'.repeat(empty)}</span>
+      </text>
+      <text style={{ fg: percentLeft === 0 ? theme.error : theme.foreground }}>
+        {`  ${String(percentLeft).padStart(3)}% left`}
+      </text>
+      <text style={{ fg: theme.muted }}>
+        {` · resets in ${formatReset(remainingMs)}`}
+      </text>
     </box>
   )
 }
@@ -231,30 +281,21 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
   const theme = useTheme()
   const { subscription, usageWindows, usage } = data
 
-  // Compute the chart max for proportional bar widths.
-  const chartMax = useMemo(() => {
-    let m = 0
-    for (const p of usage.dailyTokens) {
-      const total = p.inputTokens + p.outputTokens
-      if (total > m) m = total
-    }
-    return m
-  }, [usage.dailyTokens])
-
-  const totalCostCents = usage.totals.costCents
   const topModels = usage.byModel.slice(0, TOP_MODELS_COUNT)
+  const usageLimitRows = [
+    { key: 'five_hour', label: '5-hour' },
+    { key: 'weekly', label: 'Weekly' },
+    { key: 'monthly', label: 'Monthly' },
+  ] as const
 
   return (
     <box style={{ flexDirection: 'column' }}>
       {/* Cloud subscription and current limit windows */}
       <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
         <text style={{ fg: theme.foreground }}>
-          <span attributes={TextAttributes.BOLD}>Cloud subscription: </span>
+          <span attributes={TextAttributes.BOLD}>Cloud plan: </span>
           <span fg={subscription.status === 'active' ? theme.primary : theme.muted}>
             {subscription.status === 'active' ? subscription.plan.label : 'Not subscribed'}
-          </span>
-          <span fg={theme.muted}>
-            {subscription.status === 'active' ? ' · $20/month' : ' · $10 first month, then $20/month'}
           </span>
         </text>
         {subscription.status !== 'active' && (
@@ -262,11 +303,25 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
             Magnitude Pro is required to use cloud models.
           </text>
         )}
-        {(Object.entries(usageWindows) as Array<[string, { limitCents: number; usedCents: number; remainingMs: number }]>).map(([window, budget]) => (
-          <text key={window} style={{ fg: budget.usedCents >= budget.limitCents ? theme.error : theme.muted }}>
-            {`${window === 'five_hour' ? '5h' : window}: ${formatDollars(budget.usedCents)} of ${formatDollars(budget.limitCents)} · resets in ${formatReset(budget.remainingMs)}`}
-          </text>
-        ))}
+        {subscription.status === 'active' && (
+          <box style={{ flexDirection: 'column', paddingTop: 1 }}>
+            <text style={{ fg: theme.foreground }}>
+              <span attributes={TextAttributes.BOLD}>Usage limits</span>
+            </text>
+            {usageLimitRows.map(({ key, label }) => {
+              const budget = usageWindows[key]
+              return budget ? (
+                <UsageLimitBar
+                  key={key}
+                  label={label}
+                  limitCents={budget.limitCents}
+                  usedCents={budget.usedCents}
+                  remainingMs={budget.remainingMs}
+                />
+              ) : null
+            })}
+          </box>
+        )}
       </box>
 
       <box style={{ paddingBottom: 1 }}>
@@ -281,7 +336,7 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
       {/* Period summary */}
       <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
         <text style={{ fg: loading ? theme.muted : theme.foreground }}>
-          {`${usage.totals.requestCount} reqs  ·  ${formatDollars(totalCostCents)} spend  ·  ${formatTokens(usage.totals.inputTokens)} in / ${formatTokens(usage.totals.outputTokens)} out`}
+          {formatUsageSummary(usage.totals)}
         </text>
         {loading && (
           <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{'  (loading…)'}</text>
@@ -296,18 +351,13 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
         {topModels.length === 0 && (
           <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>No usage in this period</text>
         )}
-        {topModels.map(m => {
-          const pct = totalCostCents > 0 ? Math.round((m.costCents / totalCostCents) * 100) : 0
-          return (
-            <box key={m.model} style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.foreground }}>{m.model.padEnd(28).slice(0, 28)}</text>
-              <text style={{ fg: theme.muted }}>{'  '}</text>
-              <text style={{ fg: theme.foreground }}>
-                {`${String(m.requestCount).padStart(4)} reqs  ${formatDollars(m.costCents).padStart(8)}  (${String(pct).padStart(2)}%)`}
-              </text>
-            </box>
-          )
-        })}
+        {topModels.map(m => (
+          <box key={m.model} style={{ flexDirection: 'row' }}>
+            <text style={{ fg: theme.foreground }}>{m.model.padEnd(28).slice(0, 28)}</text>
+            <text style={{ fg: theme.muted }}>{'  '}</text>
+            <text style={{ fg: theme.foreground }}>{formatModelUsage(m)}</text>
+          </box>
+        ))}
       </box>
 
       {/* Daily chart */}
@@ -319,15 +369,12 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
           <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>No daily activity</text>
         )}
         {usage.dailyTokens.map(d => (
-          <DailyBar
+          <DailyUsageRow
             key={d.date}
             date={d.date}
             inputTokens={d.inputTokens}
             outputTokens={d.outputTokens}
             topModel={d.topModel}
-            total={d.inputTokens + d.outputTokens}
-            max={chartMax}
-            width={20}
           />
         ))}
       </box>

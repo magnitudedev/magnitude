@@ -29,6 +29,15 @@ export interface TerminalKeyboardParams {
   dispatchErrorAction: (actionId: ActionId) => void
 }
 
+export function shouldExitOnCtrlC(input: {
+  readonly overlayActive: boolean
+  readonly composerHasContent: boolean
+  readonly rootMode: string
+}): boolean {
+  if (input.overlayActive) return true
+  return !input.composerHasContent && input.rootMode !== 'streaming'
+}
+
 export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardParams): void {
   const composerHasContent = useAtomValue(composerHasContentAtom)
   const { expandedForkStack, togglePresentationMode } = useDisplayViewController()
@@ -63,8 +72,7 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
       const isCtrlT = key.ctrl && key.name === 't' && !key.meta && !key.option
 
       if (isCtrlC) {
-        if (composerHasContent) return
-        if (rootMode === 'streaming') return
+        if (!shouldExitOnCtrlC({ overlayActive, composerHasContent, rootMode })) return
         key.preventDefault()
         process.kill(process.pid, 'SIGINT')
         return

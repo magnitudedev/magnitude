@@ -1,8 +1,12 @@
 import { beforeEach, expect, test, vi } from "vitest"
 import { Atom, Result } from "@effect-atom/atom-react"
 import { testRender } from "@opentui/react/test-utils"
-import type { LocalInferenceState } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema, type LocalInferenceState, type LocalModelRecommendation } from "@magnitudedev/sdk"
 import { act } from "react"
+
+const localInferenceActions = vi.hoisted(() => ({
+  downloadModel: vi.fn(),
+}))
 
 const emptyLocalInferenceState = {
   usage: null,
@@ -15,6 +19,50 @@ const emptyLocalInferenceState = {
   warnings: [],
 } as const satisfies LocalInferenceState
 
+const recommendedModel = {
+  configurationId: "recommended-model",
+  catalogModelId: "recommended-model-catalog",
+  badge: "recommended",
+  displayName: "Recommended Model",
+  family: "test",
+  architecture: "dense",
+  quantization: {
+    format: "UD-Q5_K_XL",
+    quantAwareCheckpoint: false,
+    fidelityLabel: "High fidelity",
+    fidelityEvidence: "Catalog evidence.",
+    fidelitySourceUrl: "https://example.invalid/model",
+  },
+  quantTag: "UD-Q5_K_XL",
+  repo: "example/recommended-model",
+  revision: "revision",
+  files: [{
+    path: "recommended-model.gguf",
+    sizeBytes: 10_000,
+    sha256: "sha256",
+    downloadUrl: "https://example.invalid/recommended-model.gguf",
+  }],
+  totalDownloadBytes: 10_000,
+  sourcePageUrl: "https://example.invalid/recommended-model",
+  license: { id: "test", url: "https://example.invalid/license", acknowledgementRequired: false },
+  contextTokens: 64_000,
+  servingProfile: {
+    sessionConcurrency: "one",
+    parallelSlots: 1,
+    contextTokensPerSlot: 64_000,
+    totalContextCapacityTokens: 64_000,
+    slotAllocation: "uniform",
+    runtimeProfileId: "test",
+  },
+  modelMaximumContextTokens: 64_000,
+  estimatedRuntimeBytes: 12_000,
+  stableCapacityBudgetBytes: 20_000,
+  fitMarginBytes: 8_000,
+  fitClass: "cpu_or_unified",
+  constrainedContext: false,
+  explanation: "Fits this machine.",
+} as const satisfies LocalModelRecommendation
+
 let localInferenceState: LocalInferenceState = emptyLocalInferenceState
 
 const textPosition = (frame: string, label: string): { x: number; y: number } => {
@@ -26,6 +74,7 @@ const textPosition = (frame: string, label: string): { x: number; y: number } =>
 
 beforeEach(() => {
   localInferenceState = emptyLocalInferenceState
+  localInferenceActions.downloadModel.mockClear()
 })
 
 vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
@@ -44,7 +93,7 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
     mutationResults: [Result.initial()],
     configureUsage: () => {},
     installDistribution: () => {},
-    downloadModel: () => {},
+    downloadModel: localInferenceActions.downloadModel,
     activateModel: () => {},
     deleteModel: () => {},
     restart: () => {},
@@ -131,6 +180,89 @@ test("recommendation controls follow the model list instead of filling the termi
     expect(frame.indexOf("↑/↓ choose")).toBeLessThan(frame.indexOf("Back (←)"))
     expect(frame.indexOf("Back (←)")).toBeLessThan(frame.indexOf("Skip for now"))
     expect(frame.split("\n")[textPosition(frame, "↑/↓ choose").y + 1]?.replaceAll("█", "").trim()).toBe("")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("clicking an already running model continues setup with that model", async () => {
+  localInferenceState = {
+    ...emptyLocalInferenceState,
+    usage: { sessionConcurrency: "one" },
+    distribution: { _tag: "Ready", build: 10011, source: "managed" },
+    activeBinding: {
+      _tag: "External",
+      selectionId: "running-model",
+      providerModelId: ProviderModelIdSchema.make("running-provider-model"),
+      contextTokens: 200_000,
+    },
+    choices: [{
+      _tag: "RunningExternal",
+      choiceId: "running-model",
+      displayName: "Qwen3.6 35B-A3B",
+      providerModelId: ProviderModelIdSchema.make("running-provider-model"),
+      contextTokens: 200_000,
+      fitClass: "cpu_or_unified",
+      compatible: true,
+      explanation: "Already running.",
+      residency: "loaded",
+      quantization: {
+        format: "UD-Q6_K_XL",
+        quantAwareCheckpoint: false,
+        fidelityLabel: "Very high fidelity",
+        fidelityEvidence: "Catalog evidence.",
+        fidelitySourceUrl: "https://example.invalid/model",
+      },
+      sizeBytes: 32_600_719_872,
+    }],
+  }
+  const view = await testRender(
+    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    { width: 120, height: 30 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
+    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
+    await act(view.renderOnce)
+
+    const runningModel = textPosition(view.captureCharFrame(), "Qwen3.6 35B-A3B")
+    await act(async () => view.mockMouse.moveTo(runningModel.x, runningModel.y))
+    await act(view.renderOnce)
+    await act(async () => view.mockMouse.click(runningModel.x, runningModel.y))
+    await act(view.renderOnce)
+
+    expect(view.captureCharFrame()).toContain("CLOUD MODELS (OPTIONAL)")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("clicking a possible download starts that model download", async () => {
+  localInferenceState = {
+    ...emptyLocalInferenceState,
+    usage: { sessionConcurrency: "one" },
+    distribution: { _tag: "Ready", build: 10011, source: "managed" },
+    recommendations: [recommendedModel],
+  }
+  const view = await testRender(
+    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    { width: 120, height: 30 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
+    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
+    await act(view.renderOnce)
+
+    const model = textPosition(view.captureCharFrame(), recommendedModel.displayName)
+    await act(async () => view.mockMouse.moveTo(model.x, model.y))
+    await act(view.renderOnce)
+    await act(async () => view.mockMouse.click(model.x, model.y))
+
+    expect(localInferenceActions.downloadModel).toHaveBeenCalledWith(recommendedModel.configurationId)
   } finally {
     await act(async () => view.renderer.destroy())
   }
