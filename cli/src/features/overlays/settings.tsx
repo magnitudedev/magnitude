@@ -10,6 +10,7 @@ import type { AuthInfo } from './auth-display'
 import type { UseModelConfigResult } from '@magnitudedev/client-common'
 import { ModelCatalogLifecycle, ModelSlotsLifecycle, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, DEFAULT_REASONING_EFFORT, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
+import { getCatalogFailureNotice } from './catalog-failure-notice'
 
 interface SettingsOverlayProps {
   isVisible: boolean
@@ -51,10 +52,6 @@ function formatContextWindow(tokens: number): string {
 function formatPricing(pricing: { input: number; output: number; cachedInput?: number }): string {
   return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
 }
-
-const formatCatalogFailures = (failures: readonly ProviderCatalogFailure[]): string => failures.length === 1
-  ? `${failures[0]!.providerId}: ${failures[0]!.message}`
-  : `${failures.length} model providers failed.`
 
 const disabledReasonLabel = (reason: "insufficient_resources" | "provider_unavailable" | "model_unavailable" | "incompatible_runtime" | "invalid_configuration"): string => ({
   insufficient_resources: 'not enough free memory',
@@ -130,6 +127,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     Result.isWaiting(modelConfig.catalogRefresh)
     || Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'refreshing'))
   )
+  const catalogUnavailable = Option.exists(
+    catalogState,
+    (state) => ModelCatalogLifecycle.is(state, 'unavailable'),
+  )
+  const catalogFailureNotice = getCatalogFailureNotice(catalogFailures, catalogUnavailable)
+  const noModelsConfigured = slots.every((slot) => slot.modelDisplayName === null)
 
   const [updateHovered, setUpdateHovered] = useState(false)
   const [disconnectHovered, setDisconnectHovered] = useState(false)
@@ -438,10 +441,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           <box key={provider.id} style={{ paddingBottom: 1 }}>
             <text style={{ fg: provider.status === 'error' ? theme.error : theme.warning }}>
               {provider.status === 'not_found'
-                ? `⚠ ${provider.displayName} not detected.${provider.hint ? ` ${provider.hint}` : ''}`
+                ? `${provider.displayName} not detected.${provider.hint ? ` ${provider.hint}` : ''}`
                 : provider.status === 'loading'
-                  ? `◐ ${provider.message ?? `${provider.displayName} is loading models...`}`
-                  : `✗ ${provider.displayName}: ${provider.message ?? 'Unknown provider error'}`}
+                  ? provider.message ?? `${provider.displayName} is loading models...`
+                  : `${provider.displayName}: ${provider.message ?? 'Unknown provider error'}`}
             </text>
           </box>
         ))}
@@ -449,28 +452,33 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           <box style={{ paddingBottom: 1 }}>
             <text style={{ fg: theme.error }}>
               {Option.isSome(catalogSnapshot)
-                ? '⚠ Lost contact with the model catalog; showing the last received state.'
-                : '✗ Unable to read the model catalog from the daemon.'}
+                ? 'Lost contact with the model catalog; showing the last received state.'
+                : 'Unable to read the model catalog from the daemon.'}
             </text>
           </box>
         )}
-        {catalogFailures.length > 0 && (
+        {noModelsConfigured && (
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable')) ? theme.error : theme.warning }}>
-              {Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable'))
-                ? `✗ Model catalog unavailable. ${formatCatalogFailures(catalogFailures)}`
-                : `⚠ Showing available or last-known models. ${formatCatalogFailures(catalogFailures)}`}
+            <text style={{ fg: theme.foreground }}>Warning: No providers connected (local or cloud)</text>
+          </box>
+        )}
+        {catalogFailureNotice && (
+          <box style={{ paddingBottom: 1 }}>
+            <text style={{
+              fg: catalogFailureNotice.tone === 'error' ? theme.error : theme.warning,
+            }}>
+              {catalogFailureNotice.message}
             </text>
           </box>
         )}
         {modelConfig && Result.isFailure(modelConfig.catalogRefresh) && (
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.error }}>✗ Failed to request a model catalog refresh.</text>
+            <text style={{ fg: theme.error }}>Failed to request a model catalog refresh.</text>
           </box>
         )}
         {modelConfig && Result.isFailure(modelConfig.slotUpdate) && (
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.error }}>✗ Failed to update model configuration.</text>
+            <text style={{ fg: theme.error }}>Failed to update model configuration.</text>
           </box>
         )}
         {SLOT_IDS.map((slotId) => {
@@ -539,8 +547,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                           backgroundColor: theme.terminalDetectedBg,
                         }}>
                           {dropdownItems.length === 0 ? (
-                            <text style={{ fg: Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable')) ? theme.error : theme.muted }}>
-                              <span attributes={TextAttributes.DIM}>{Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'unavailable')) ? 'Catalog unavailable' : 'No models'}</span>
+                            <text style={{ fg: catalogFailureNotice?.tone === 'error' ? theme.error : theme.muted }}>
+                              <span attributes={TextAttributes.DIM}>{catalogFailureNotice?.tone === 'error' ? 'Catalog unavailable' : 'No models configured'}</span>
                             </text>
                           ) : dropdownItems.map((item, index) => {
                             const sel = index === dropdownIndex

@@ -53,6 +53,7 @@ import {
   ModelSetupScreen,
   PreparingModelSetupScreen,
 } from './features/model-setup'
+import { blockingModelSlotsFailure } from './features/model-setup/model-slots-gate'
 
 export type { SessionStart }
 
@@ -183,16 +184,19 @@ function OnboardingGate(
   }
 
   if (ModelSlotsLifecycle.is(slotsState, 'unavailable')) {
-    return (
-      <FatalErrorScreen
-        error={`Failed to load model configuration: ${slotsState.failures.map((failure) => failure.message).join('; ')}`}
-        onRetry={retryProfiles}
-        onQuit={props.onExitApp}
-      />
-    )
+    const blockingFailure = blockingModelSlotsFailure(slotsState)
+    if (blockingFailure) {
+      return (
+        <FatalErrorScreen
+          error={`Failed to load model configuration: ${blockingFailure}`}
+          onRetry={retryProfiles}
+          onQuit={props.onExitApp}
+        />
+      )
+    }
   }
 
-  const modelsConfigured = Boolean(profiles?.primary && profiles.secondary)
+  const modelsConfigured = Boolean(profiles?.primary)
 
   return (
     <CliAppContent
