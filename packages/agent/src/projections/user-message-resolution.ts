@@ -1,15 +1,15 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
-import type { AppEvent, Attachment, MentionResolution } from '../events'
-import { UserPartSchema, type UserPart } from '@magnitudedev/ai'
+import type { AppEvent, ImageAttachment, MentionOccurrence, MentionResolution } from '../events'
 import { Schema } from 'effect'
-import { AgentMessageAttachmentSchema } from '../attachments'
+import { AgentImageAttachmentSchema, MentionOccurrenceSchema } from '../attachments'
 
 export interface UserMessageResolvedSignal {
   readonly messageId: string
   readonly forkId: string | null
   readonly timestamp: number
-  readonly content: readonly UserPart[]
-  readonly attachments: readonly Attachment[]
+  readonly text: string
+  readonly mentions: readonly MentionOccurrence[]
+  readonly attachments: readonly ImageAttachment[]
   readonly mode: 'text' | 'audio'
   readonly synthetic: boolean
   readonly taskMode: boolean
@@ -20,8 +20,9 @@ const StoredUserMessageRawSchema = Schema.Struct({
   messageId: Schema.String,
   forkId: Schema.NullOr(Schema.String),
   timestamp: Schema.Number,
-  content: Schema.Array(UserPartSchema),
-  attachments: Schema.Array(AgentMessageAttachmentSchema),
+  text: Schema.String,
+  mentions: Schema.Array(MentionOccurrenceSchema),
+  attachments: Schema.Array(AgentImageAttachmentSchema),
   mode: Schema.Literal('text', 'audio'),
   synthetic: Schema.Boolean,
   taskMode: Schema.Boolean,
@@ -52,7 +53,8 @@ export const UserMessageResolutionProjection = Projection.define<AppEvent>()({
         messageId: event.messageId,
         forkId: event.forkId,
         timestamp: event.timestamp,
-        content: event.content,
+        text: event.text,
+        mentions: event.mentions,
         attachments: event.attachments,
         mode: event.mode,
         synthetic: event.synthetic,
@@ -70,7 +72,8 @@ export const UserMessageResolutionProjection = Projection.define<AppEvent>()({
         messageId: raw.messageId,
         forkId: raw.forkId,
         timestamp: raw.timestamp,
-        content: raw.content,
+        text: raw.text,
+        mentions: raw.mentions,
         attachments: raw.attachments,
         mode: raw.mode,
         synthetic: raw.synthetic,

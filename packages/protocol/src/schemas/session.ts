@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { StreamHeartbeat } from "./events"
-import { RawMessageAttachment } from "./attachments"
+import { RawImageAttachment, RawMentionOccurrence } from "./attachments"
 export {
   RawClipboardImageAttachment,
   DisplayAttachment,
@@ -13,7 +13,7 @@ export {
   MentionFileAttachment,
   MentionFileRangeAttachment,
   MessageAttachment,
-  RawMessageAttachment,
+  RawMentionOccurrence,
 } from "./attachments"
 
 export const CreateSessionInitialMessage = Schema.TaggedStruct("message", {
@@ -21,7 +21,8 @@ export const CreateSessionInitialMessage = Schema.TaggedStruct("message", {
   content: Schema.String,
   visibleMessage: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   taskMode: Schema.Boolean,
-  attachments: Schema.Array(RawMessageAttachment),
+  imageAttachments: Schema.Array(RawImageAttachment),
+  mentions: Schema.Array(RawMentionOccurrence),
 })
 export type CreateSessionInitialMessage = Schema.Schema.Type<typeof CreateSessionInitialMessage>
 

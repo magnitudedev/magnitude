@@ -1,6 +1,7 @@
-import { UserPartSchema, type AssistantMessage, type ToolResultMessage } from '@magnitudedev/ai'
-import { AgentImageMediaTypeSchema, AgentMentionAttachmentSchema } from '../../attachments'
+import { type AssistantMessage, type ToolResultMessage } from '@magnitudedev/ai'
 import { Schema, Option } from 'effect'
+import { ContextPartSchema } from '../../content'
+import { MentionOccurrenceSchema } from '../../attachments'
 
 const ObserverJustificationSchema = Schema.Literal('difficulty', 'churn', 'frustration')
 
@@ -27,30 +28,34 @@ export const AgentAtomSchema = Schema.Union(
   Schema.Struct({ kind: Schema.Literal('idle'), timestamp: Schema.Number, reason: Schema.optionalWith(Schema.Literal('stable', 'interrupt', 'error'), { as: 'Option', exact: true }) }),
 )
 
-export const TimelineAttachmentSchema = Schema.Union(
+export const TimelineMentionSchema = Schema.Struct({
+  occurrence: MentionOccurrenceSchema,
+  resolution: Schema.Union(
+    Schema.Struct({
+      status: Schema.Literal('resolved'),
+      parts: Schema.Array(ContextPartSchema),
+      truncated: Schema.Boolean,
+    }),
+    Schema.Struct({
+      status: Schema.Literal('failed'),
+      reason: Schema.String,
+    }),
+  ),
+})
+
+export const TimelineUserMessageItemSchema = Schema.Union(
   Schema.Struct({
-    kind: Schema.Literal('image'),
-    path: Schema.String,
-    filename: Schema.String,
-    mediaType: AgentImageMediaTypeSchema,
-    width: Schema.Number,
-    height: Schema.Number,
+    kind: Schema.Literal('body'),
+    parts: Schema.Array(ContextPartSchema),
   }),
   Schema.Struct({
     kind: Schema.Literal('mention'),
-    attachment: AgentMentionAttachmentSchema,
-    resolution: Schema.Union(
-      Schema.Struct({
-        status: Schema.Literal('resolved'),
-        content: Schema.String,
-        truncated: Schema.Boolean,
-        originalBytes: Schema.Number,
-      }),
-      Schema.Struct({
-        status: Schema.Literal('failed'),
-        reason: Schema.String,
-      }),
-    ),
+    mention: TimelineMentionSchema,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal('attachment'),
+    attachmentType: Schema.Literal('image'),
+    parts: Schema.Array(ContextPartSchema),
   }),
 )
 
@@ -67,8 +72,7 @@ export const TimelineEntrySchema = Schema.Union(
   Schema.Struct({
     kind: Schema.Literal('user_message'),
     timestamp: Schema.Number,
-    text: Schema.String,
-    attachments: Schema.Array(TimelineAttachmentSchema),
+    items: Schema.Array(TimelineUserMessageItemSchema),
     synthetic: Schema.optionalWith(Schema.Boolean, { as: 'Option', exact: true }),
   }),
   Schema.Struct({ kind: Schema.Literal('coordinator_message'), timestamp: Schema.Number, text: Schema.String }),
@@ -118,7 +122,7 @@ export const TimelineEntrySchema = Schema.Union(
     cancelledCount: Schema.optionalWith(Schema.Number, { as: 'Option', exact: true }),
   }),
   Schema.Struct({ kind: Schema.Literal('task_reassigned'), timestamp: Schema.Number, text: Schema.String, oldTaskId: Schema.String, newTaskId: Schema.String }),
-  Schema.Struct({ kind: Schema.Literal('observation'), timestamp: Schema.Number, parts: Schema.Array(UserPartSchema) }),
+  Schema.Struct({ kind: Schema.Literal('observation'), timestamp: Schema.Number, parts: Schema.Array(ContextPartSchema) }),
   Schema.Struct({
     kind: Schema.Literal('detached_process_exited'),
     timestamp: Schema.Number,
@@ -146,7 +150,8 @@ export const TimelineEntrySchema = Schema.Union(
 )
 
 export type AgentAtom = typeof AgentAtomSchema.Type
-export type TimelineAttachment = typeof TimelineAttachmentSchema.Type
+export type TimelineMention = typeof TimelineMentionSchema.Type
+export type TimelineUserMessageItem = typeof TimelineUserMessageItemSchema.Type
 export type TimelineEntry = typeof TimelineEntrySchema.Type
 export type BackgroundProcessStatus = typeof BackgroundProcessStatusSchema.Type
 

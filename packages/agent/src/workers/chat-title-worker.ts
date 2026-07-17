@@ -1,7 +1,7 @@
 import { Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { ChatTitleServiceTag, extractTextFromParts } from './chat-title-service'
+import { ChatTitleServiceTag } from './chat-title-service'
 import { UserMessageResolutionProjection } from '../projections/user-message-resolution'
 import { ChatTitleProjection } from '../projections/chat-title'
 import { logger } from '@magnitudedev/logger'
@@ -19,7 +19,7 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
       UserMessageResolutionProjection.signals.userMessageResolved,
       (value, publish, read) =>
         Effect.gen(function* () {
-          logger.info({ forkId: value.forkId, synthetic: value.synthetic, contentCount: value.content.length }, '[chat-title-worker] Signal received')
+          logger.info({ forkId: value.forkId, synthetic: value.synthetic }, '[chat-title-worker] Signal received')
 
           // Only root fork, only real user messages
           if (value.forkId !== null || value.synthetic) {
@@ -53,7 +53,7 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
           }
 
           // Extract text content
-          const text = extractTextFromParts(value.content)
+          const text = value.text
           if (!text.trim()) {
             logger.info('[chat-title-worker] Skipping: no text content')
             return

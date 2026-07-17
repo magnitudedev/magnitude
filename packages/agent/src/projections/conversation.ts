@@ -12,8 +12,6 @@
 import { Projection } from '@magnitudedev/event-core'
 import { Schema } from 'effect'
 import type { AppEvent } from '../events'
-import { textOf } from '../content'
-// textOf already uses UserPart internally
 import { UserMessageResolutionProjection } from './user-message-resolution'
 
 export const ConversationEntrySchema = Schema.Struct({
@@ -88,7 +86,7 @@ export const ConversationProjection = Projection.define<AppEvent>()({
     on(UserMessageResolutionProjection.signals.userMessageResolved, ({ value, state }) => {
       if (value.forkId !== null) return state
 
-      const text = textOf(value.content)
+      const text = value.text
       if (!text.trim()) return state
 
       return {

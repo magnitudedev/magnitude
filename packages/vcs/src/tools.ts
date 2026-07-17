@@ -6,7 +6,7 @@
  */
 
 import { Effect, Option, Schema } from "effect"
-import { BaseStateSchema, defineHarnessTool, defineStateModel, type ToolkitEntry } from "@magnitudedev/harness"
+import { BaseStateSchema, defineHarnessTool, defineStateModel, defineToolkit, type ToolkitEntry } from "@magnitudedev/harness"
 import { ShadowVcs } from "./service"
 import { selectorToRestoreScope } from "./path-selector"
 import type { VcsFailure } from "./errors"
@@ -444,9 +444,12 @@ export interface VcsToolEntry {
   readonly tool: ToolkitEntry
 }
 
+/** Complete VCS-owned toolkit, preserving its exact entry types. */
+export const vcsToolkit = defineToolkit({
+  checkpointRollback: { tool: checkpointRollbackTool, state: checkpointRollbackModel },
+  checkpointChanges: { tool: checkpointChangesTool, state: checkpointChangesModel },
+})
+
 export function getVcsToolEntries(): ReadonlyArray<VcsToolEntry> {
-  return [
-    { key: 'checkpointRollback', tool: { tool: checkpointRollbackTool, state: checkpointRollbackModel } },
-    { key: 'checkpointChanges', tool: { tool: checkpointChangesTool, state: checkpointChangesModel } },
-  ]
+  return vcsToolkit.keys.map((key) => ({ key, tool: vcsToolkit.entries[key] }))
 }

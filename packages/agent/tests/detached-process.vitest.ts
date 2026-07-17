@@ -26,8 +26,8 @@ import { OutboundMessagesProjection } from '../src/projections/outbound-messages
 import { TaskGraphProjection } from '../src/projections/task-graph'
 import { TaskAssignmentProjection } from '../src/projections/task-assignment'
 import { HarnessStateProjection } from '../src/projections/harness-state'
-import { ConfigAmbient } from '../src/ambient/config-ambient'
 import { SkillsAmbient } from '../src/ambient/skills-ambient'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 const ts = (n: number) => 1_700_400_000_000 + n
 
@@ -38,7 +38,10 @@ const makeBaseLayer = () => {
     makeProjectionBusLayer<AppEvent>(),
     Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
   )
-  return Layer.provideMerge(makeAmbientServiceLayer<AppEvent>(), busLayer)
+  return Layer.merge(
+    Layer.provideMerge(makeAmbientServiceLayer<AppEvent>(), busLayer),
+    ToolUniverseSourceLive,
+  )
 }
 
 const makeDetachedProcessState = async (events: AppEvent[]): Promise<DetachedProcessState> => {
@@ -107,13 +110,8 @@ const makeWindowState = async (events: AppEvent[]): Promise<ForkWindowState> => 
     const projection = yield* WindowProjection.Tag
 
     const ambientService = yield* (yield* Effect.promise(() => import('@magnitudedev/event-core'))).AmbientServiceTag
-    yield* ambientService.register(ConfigAmbient)
-    yield* ambientService.update(ConfigAmbient, {
-      bySlot: {} as any,
-      catalogLoaded: false,
-    })
     yield* ambientService.register(SkillsAmbient)
-    yield* ambientService.update(SkillsAmbient, { skills: new Map(), orderedSkills: [] } as any)
+    yield* ambientService.update(SkillsAmbient, new Map())
 
     for (const event of events) {
       yield* bus.processEvent(event as any)

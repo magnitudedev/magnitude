@@ -22,6 +22,7 @@ import { AgentLifecycleProjection, type AgentLifecycleState } from '../src/proje
 import { GoalProjection } from '../src/projections/goal'
 import { HarnessStateProjection } from '../src/projections/harness-state'
 import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 const ts = (n: number) => 1_700_100_000_000 + n
 const InMemoryAddressedEntryStoreLive = Addressed.makeInMemoryAddressedEntryStoreLayer()
@@ -45,7 +46,7 @@ const runWithEvents = async (events: AppEvent[]): Promise<AgentLifecycleState> =
       HarnessStateProjection.Layer,
       UserMessageResolutionProjection.Layer,
     ),
-    baseLayer,
+    Layer.merge(baseLayer, ToolUniverseSourceLive),
   )
 
   const program = Effect.gen(function* () {

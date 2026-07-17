@@ -54,6 +54,7 @@ export type {
   ErrorDisplayMessage,
   RawFileImageAttachment,
   RawImageAttachment,
+  RawMentionOccurrence,
   ImageAttachment,
   ImageMediaType,
   InterruptedMessage,
@@ -77,7 +78,6 @@ export type {
   TaskDisplayRow,
   TimelineActivity,
   ToolMessage,
-  RawMessageAttachment,
 } from "@magnitudedev/protocol"
 export type * from "@magnitudedev/protocol"
 

@@ -12,11 +12,7 @@ function toLine(index: number, event: AppEvent): string | null {
   const ts = getEventTimestamp(event)
   switch (event.type) {
     case 'user_message': {
-      const contentText = event.content
-        .filter((c): c is Extract<(typeof event.content)[number], { _tag: 'TextPart' }> => c._tag === 'TextPart')
-        .map(c => c.text)
-        .join('\n')
-        .trim()
+      const contentText = event.text.trim()
       if (!contentText) return null
       return `[${index}] ${ts} user_message\n${contentText}`
     }

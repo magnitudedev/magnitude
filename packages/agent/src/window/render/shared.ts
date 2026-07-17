@@ -10,6 +10,7 @@ import type { WindowEntry, CompletedTurn, TurnFeedback } from '../types'
 import type { TimelineEntry } from '../inbox/types'
 import { renderTimeline } from '../inbox/render'
 import { renderFeedbackText } from '../../prompts/feedback-text'
+import { renderContextParts } from '../../content'
 
 // ---------------------------------------------------------------------------
 // system/fork/compacted → UserMessage
@@ -17,10 +18,11 @@ import { renderFeedbackText } from '../../prompts/feedback-text'
 
 export function systemEntryToMessages(
   entry: Extract<WindowEntry, { type: 'session_context' | 'fork_context' | 'compacted' | 'goal_injection' }>,
+  includeImageData: boolean,
 ): readonly [AiMessage] {
   return [{
     _tag: 'UserMessage',
-    parts: entry.content,
+    parts: renderContextParts(entry.content, { includeImageData }),
   }]
 }
 
@@ -31,11 +33,13 @@ export function systemEntryToMessages(
 export function contextEntryToMessages(
   entry: Extract<WindowEntry, { type: 'context' }>,
   timezone: string | null,
+  includeImageData: boolean,
 ): readonly AiMessage[] {
-  const parts = renderTimeline({
+  const contextParts = renderTimeline({
     timeline: entry.timeline,
     timezone,
   })
+  const parts = renderContextParts(contextParts, { includeImageData })
 
   const hasContent = parts.some(p => {
     if (p._tag === 'TextPart') return p.text.trim().length > 0

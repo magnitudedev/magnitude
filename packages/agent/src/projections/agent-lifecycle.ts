@@ -13,7 +13,6 @@ import type { AppEvent } from '../events'
 import { ROLE_IDS, type RoleId } from '../agents/role-validation'
 import { Schema } from 'effect'
 import { DisplayActivity } from '@magnitudedev/protocol'
-import type { ToolKey } from '../tools/toolkits'
 
 export const AgentLifecycleSchema = Schema.Literal('working', 'idle', 'killed')
 export type AgentLifecycleStatus = typeof AgentLifecycleSchema.Type

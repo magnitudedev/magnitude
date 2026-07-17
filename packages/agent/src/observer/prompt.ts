@@ -10,7 +10,8 @@
 import { Prompt, type Message as AiMessage, createToolCallId } from '@magnitudedev/ai'
 import type { ProviderToolCallId } from '@magnitudedev/ai'
 import { Option } from 'effect'
-import { ContentBuilder } from '../content'
+import { ContentBuilder } from '@magnitudedev/harness'
+import { renderContextParts, type ContextPart } from '../content'
 import { observerPrompt } from '@magnitudedev/roles'
 import type { ForkWindowState, WindowEntry, CompletedTurn } from '../window/types'
 import type { TimelineEntry } from '../window/inbox/types'
@@ -44,8 +45,8 @@ function hasRenderablePart(parts: readonly { readonly _tag: string; readonly tex
   return parts.some((part) => part._tag !== 'TextPart' || (part.text?.trim().length ?? 0) > 0)
 }
 
-function pushParts(builder: ContentBuilder, parts: readonly ReturnType<typeof renderTimelineUserMessageParts>[number][]): void {
-  for (const part of parts) {
+function pushParts(builder: ContentBuilder, parts: readonly ContextPart[]): void {
+  for (const part of renderContextParts(parts, { includeImageData: false })) {
     if (part._tag === 'TextPart') builder.pushText(part.text)
     else builder.pushPart(part)
   }
@@ -71,7 +72,6 @@ function renderSingleObserverUserMessage(
   pushParts(builder, renderTimelineUserMessageParts(entry, {
     open: '<user>\n',
     close: '\n</user>',
-    attachmentsInsideWrapper: true,
   }))
 }
 
@@ -347,7 +347,7 @@ export function observerWindowToPrompt(input: ObserverWindowPromptInput): Prompt
   for (const msg of windowState.messages) {
     switch (msg.type) {
       case 'compacted': {
-        messages.push(...systemEntryToMessages(msg))
+        messages.push(...systemEntryToMessages(msg, false))
         break
       }
 

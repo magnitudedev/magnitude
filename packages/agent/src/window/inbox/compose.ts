@@ -1,9 +1,10 @@
-import type { UserPart } from '@magnitudedev/ai'
 import { Option } from 'effect'
+import type { ContextPart } from '../../content'
+import type { ImageAttachment, MentionOccurrence, MentionResolution } from '../../events'
 import type { ObserverJustification } from '../../observer'
 import type {
   AgentAtom,
-  TimelineAttachment,
+  TimelineUserMessageItem,
   TimelineEntry,
 } from './types'
 
@@ -33,10 +34,54 @@ export interface ComposeContextDeps {
   ): { agentId: string; role: string; parentForkId: string | null } | null
 }
 
+export function composeTimelineUserMessageItems(input: {
+  readonly text: string
+  readonly mentions: readonly MentionOccurrence[]
+  readonly resolutions: readonly MentionResolution[]
+  readonly attachments: readonly ImageAttachment[]
+}): TimelineUserMessageItem[] {
+  const resolutionById = new Map(input.resolutions.map(resolution => [resolution.occurrenceId, resolution]))
+  const inline = input.mentions
+    .filter((mention): mention is MentionOccurrence & { placement: { _tag: 'inline'; start: number; end: number } } => mention.placement._tag === 'inline')
+    .sort((a, b) => a.placement.start - b.placement.start)
+  const items: TimelineUserMessageItem[] = []
+  let cursor = 0
+
+  const pushBody = (text: string) => {
+    if (text.length > 0) items.push({ kind: 'body', parts: [{ _tag: 'ContextText', text }] })
+  }
+  const pushMention = (occurrence: MentionOccurrence) => {
+    const resolution = resolutionById.get(occurrence.occurrenceId)
+    items.push({
+      kind: 'mention',
+      mention: {
+        occurrence,
+        resolution: resolution?.status === 'resolved'
+          ? { status: 'resolved', parts: resolution.parts, truncated: resolution.truncated }
+          : { status: 'failed', reason: resolution?.reason ?? 'Mention was not resolved' },
+      },
+    })
+  }
+
+  for (const occurrence of inline) {
+    pushBody(input.text.slice(cursor, occurrence.placement.start))
+    pushMention(occurrence)
+    cursor = occurrence.placement.end
+  }
+  pushBody(input.text.slice(cursor))
+
+  for (const occurrence of input.mentions) {
+    if (occurrence.placement._tag === 'trailing') pushMention(occurrence)
+  }
+  for (const attachment of input.attachments) {
+    items.push({ kind: 'attachment', attachmentType: 'image', parts: [attachment.image] })
+  }
+  return items
+}
+
 export function toTimelineUserMessage(args: {
   timestamp: number
-  text: string
-  attachments: readonly TimelineAttachment[]
+  items: readonly TimelineUserMessageItem[]
   synthetic: Option.Option<boolean>
 }): TimelineEntry {
   return {
@@ -203,7 +248,7 @@ export function toTimelineTaskReassigned(args: {
 
 export function toTimelineObservation(args: {
   timestamp: number
-  parts: readonly UserPart[]
+  parts: readonly ContextPart[]
 }): TimelineEntry {
   return {
     kind: 'observation',

@@ -23,6 +23,8 @@ import { Prompt, type Message as AiMessage } from '@magnitudedev/ai'
 import { Option } from 'effect'
 import type { ForkWindowState, CompletedTurn, WindowEntry } from '../types'
 import type { TimelineEntry } from '../inbox/types'
+import { renderTimeline } from '../inbox/render'
+import { renderContextParts } from '../../content'
 import {
   ensureTerminalUserMessage,
   systemEntryToMessages,
@@ -47,6 +49,12 @@ function renderUserMessage(text: string): string {
   return `<user>${text}</user>`
 }
 
+function renderTimelineEntryText(entry: TimelineEntry): string {
+  return renderContextParts(renderTimeline({ timeline: [entry], timezone: null }), {
+    includeImageData: false,
+  }).filter(part => part._tag === 'TextPart').map(part => part.text).join('')
+}
+
 function contextEntryToAdvisorMessages(
   timeline: readonly TimelineEntry[],
 ): AiMessage[] {
@@ -55,10 +63,11 @@ function contextEntryToAdvisorMessages(
 
   for (const entry of timeline) {
     if (entry.kind === 'user_message') {
+      const text = renderTimelineEntryText(entry)
       if (Option.getOrElse(entry.synthetic, () => false)) {
-        autopilotLines.push(entry.text)
+        autopilotLines.push(text)
       } else {
-        userLines.push(renderUserMessage(entry.text))
+        userLines.push(renderUserMessage(text))
       }
     }
   }
@@ -216,7 +225,7 @@ export function advisorWindowToPrompt(input: AdvisorWindowPromptInput): Prompt {
           messages.push(textMessage(renderToolWorkSummary(pendingWork)))
           pendingWork = createToolWorkSummary()
         }
-        messages.push(...systemEntryToMessages(msg))
+        messages.push(...systemEntryToMessages(msg, false))
         break
       }
 

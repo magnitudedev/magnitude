@@ -110,13 +110,6 @@ function toPreview(text: string): string {
   return normalized.slice(0, 117) + '...'
 }
 
-function extractTextFromParts(parts: readonly { readonly _tag: string; readonly text?: string }[]): string {
-  return parts
-    .filter((part) => part._tag === 'TextPart')
-    .map((part) => part.text ?? '')
-    .join('')
-}
-
 function clearTriggers(fork: TurnLifecycleState): TurnLifecycleState {
   return TurnLifecycle.hold(fork, {
     triggers: [],
@@ -494,7 +487,7 @@ export const TurnProjection = Projection.defineForked<AppEvent>()({
       const fork = state.forks.get(forkId)
       if (!fork) return state
 
-      const contentText = extractTextFromParts(value.content)
+      const contentText = value.text
 
       // Root is waiting_for_user → transition to idle with user trigger
       if (fork._tag === 'waiting_for_user') {

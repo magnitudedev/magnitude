@@ -196,8 +196,21 @@ export type ForkedAmbientHandlerPair<
   TReads extends readonly AnyProjectionResult[] = readonly [],
   TAmbients extends readonly AmbientDef<any, any>[] = readonly [],
   TAddressed extends ProjectionAddressedDescriptors = {}
-> =
-  ReturnType<ForkedAmbientHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients, TAddressed>>
+> = {
+  [I in keyof TAmbients]: TAmbients[I] extends infer C
+    ? C extends AmbientDef<infer _Value, infer _Requirements> ? {
+        ambient: C
+        handler: (ctx: {
+          value: AmbientValueOf<C>
+          state: ForkedState<TForkState>
+          emit: SignalEmitters<TSignalDefs>
+          read: ForkedSignalReadFn<TReads>
+          ambient: AmbientReader<TAmbients>
+          addressed: ProjectionForkedAddressedHandles<TAddressed>
+        }) => ProjectionHandlerResult<ForkedState<TForkState>>
+      } : never
+    : never
+}[number]
 
 // ---------------------------------------------------------------------------
 // Config and Result Types

@@ -24,7 +24,7 @@ import {
   type TurnOutcome as HarnessTurnOutcome,
 } from '@magnitudedev/harness'
 import type { AppEvent, TurnOutcomeEvent } from '../events'
-import { ToolkitAmbient } from '../ambient/toolkit-ambient'
+import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
 import { ToolHandleSchema, type ToolHandleFromSchema } from '../models/tool-handle-schema'
 
 // ── Translation: AppEvent → HarnessEvent ─────────────────────────────
@@ -200,7 +200,7 @@ const emptyHarnessTurnState: HarnessTurnState = {
 export const HarnessStateProjection = Projection.defineForked<AppEvent>()({
   name: 'HarnessState',
   forkState: HarnessTurnStateSchema,
-  ambients: [ToolkitAmbient] as const,
+  ambients: [ToolUniverseAmbient] as const,
   initialFork: emptyHarnessTurnState,
 
   eventHandlers: {
@@ -211,13 +211,13 @@ export const HarnessStateProjection = Projection.defineForked<AppEvent>()({
       engine: fork.engine,
     }),
 
-    thinking_start: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolkitAmbient)),
-    thinking_chunk: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolkitAmbient)),
-    thinking_end: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolkitAmbient)),
-    message_start: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolkitAmbient)),
-    message_chunk: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolkitAmbient)),
-    message_end: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolkitAmbient)),
-    tool_event: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolkitAmbient)),
+    thinking_start: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolUniverseAmbient)),
+    thinking_chunk: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolUniverseAmbient)),
+    thinking_end: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolUniverseAmbient)),
+    message_start: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolUniverseAmbient)),
+    message_chunk: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolUniverseAmbient)),
+    message_end: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolUniverseAmbient)),
+    tool_event: ({ event, fork, ambient }) => stepEvent(fork, event, ambient.get(ToolUniverseAmbient)),
 
     turn_outcome: ({ event, fork, ambient }) => {
       // Agent-only errors have no harness semantics — don't step the reducer.
@@ -231,7 +231,7 @@ export const HarnessStateProjection = Projection.defineForked<AppEvent>()({
       }
 
       // Harness-native outcomes: translate and step the reducer
-      const toolkit = ambient.get(ToolkitAmbient)
+      const toolkit = ambient.get(ToolUniverseAmbient)
       const harnessEvent = translateTurnOutcome({ ...event, outcome: event.outcome })
       const stepped = getCachedReducer(toolkit).step(fork, harnessEvent)
 
@@ -252,7 +252,7 @@ export const HarnessStateProjection = Projection.defineForked<AppEvent>()({
       // "interrupt" event — it handles interrupts via TurnEnd { Interrupted }.
       // But we haven't received TurnEnd yet at interrupt time.
       const handles = new Map(fork.handles.handles)
-      const toolkit = ambient.get(ToolkitAmbient)
+      const toolkit = ambient.get(ToolUniverseAmbient)
       for (const [id, handle] of handles) {
         const phase = handle.state.phase
         if (phase !== 'completed' && phase !== 'error' && phase !== 'rejected') {

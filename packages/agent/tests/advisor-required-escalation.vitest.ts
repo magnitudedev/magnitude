@@ -141,12 +141,13 @@ function userMessage(messageId: string, n: number): AppEvent {
     forkId: null,
     messageId,
     timestamp: ts(n),
-    content: [{ _tag: 'TextPart', text: 'please continue' }],
+    text: 'please continue',
+    mentions: [],
     attachments: [],
     mode: 'text',
     synthetic: false,
     taskMode: false,
-  } as any
+  }
 }
 
 function userMessageReady(messageId: string, n: number): AppEvent {

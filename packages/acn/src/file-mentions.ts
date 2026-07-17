@@ -2,7 +2,8 @@ import { homedir } from "node:os"
 import { extname, isAbsolute, relative, resolve, sep } from "node:path"
 import { statSync } from "node:fs"
 import { Effect } from "effect"
-import type { MentionAttachment, MessageAttachment, SessionError } from "@magnitudedev/protocol"
+import { createId } from "@magnitudedev/generate-id"
+import { SessionOperationFailed, type MentionAttachment, type RawMentionOccurrence, type SessionError } from "@magnitudedev/protocol"
 
 const TRAILING_PUNCTUATION = new Set([".", ",", ";", "!", "?", ")", "]", "}"])
 
@@ -53,7 +54,10 @@ function looksFileLike(raw: string): boolean {
 }
 
 function maskCode(text: string): string {
-  const chars = [...text]
+  // Mention placements use JavaScript string offsets (UTF-16 code units).
+  // split("") preserves that coordinate system; spreading would collapse
+  // surrogate pairs and shift every span after an astral character.
+  const chars = text.split("")
   let i = 0
   let inFence = false
   let lineStart = true
@@ -102,32 +106,26 @@ function stripTrailingPunctuation(raw: string): string {
   return value
 }
 
-function extractInlineMentionCandidates(text: string): string[] {
+interface InlineMentionCandidate {
+  readonly raw: string
+  readonly start: number
+  readonly end: number
+}
+
+function extractInlineMentionCandidates(text: string): InlineMentionCandidate[] {
   const masked = maskCode(text)
-  const candidates: string[] = []
+  const candidates: InlineMentionCandidate[] = []
   const regex = /(^|[\s([{])@([^\s<>"'`]+)/g
   let match: RegExpExecArray | null
   while ((match = regex.exec(masked)) !== null) {
     const raw = match[2]
     if (!raw) continue
     if (!looksFileLike(raw)) continue
-    candidates.push(raw)
+    const start = match.index + (match[1]?.length ?? 0)
+    const stripped = stripTrailingPunctuation(raw)
+    candidates.push({ raw, start, end: start + 1 + stripped.length })
   }
   return candidates
-}
-
-function mentionRange(mention: MentionAttachment): { start: number; end: number } | null {
-  return mention.type === "mention_file_range"
-    ? { start: mention.startLine, end: mention.endLine }
-    : null
-}
-
-function mentionKeyFromAttachment(cwd: string, mention: MentionAttachment): string {
-  const resolved = resolveSessionPath(mention.path, cwd)
-  const lineRange = mentionRange(mention)
-  return lineRange
-    ? `${resolved}:${lineRange.start}-${lineRange.end}`
-    : resolved
 }
 
 function expandExplicitMentionRange(mention: MentionAttachment): MentionAttachment {
@@ -136,15 +134,11 @@ function expandExplicitMentionRange(mention: MentionAttachment): MentionAttachme
   return { ...mention, startLine: range.start, endLine: range.end }
 }
 
-function mentionKey(resolved: string, lineRange?: { start: number; end: number }): string {
-  return lineRange ? `${resolved}:${lineRange.start}-${lineRange.end}` : resolved
-}
-
 function resolveInlineMentionCandidate(
   cwd: string,
   candidate: string,
   allowedPrefixes: readonly string[],
-): { attachment: MentionAttachment; key: string } | null {
+): MentionAttachment | null {
   const attempts = [candidate]
   const stripped = stripTrailingPunctuation(candidate)
   if (stripped !== candidate) attempts.push(stripped)
@@ -165,7 +159,7 @@ function resolveInlineMentionCandidate(
 
     if (info.isDirectory()) {
       const attachment: MentionAttachment = { type: "mention_directory", path: parsed.path }
-      return { attachment, key: mentionKey(absolutePath) }
+      return attachment
     }
 
     const attachment: MentionAttachment = parsed.lineRange
@@ -176,43 +170,68 @@ function resolveInlineMentionCandidate(
           endLine: parsed.lineRange.end,
         }
       : { type: "mention_file", path: parsed.path }
-    return { attachment, key: mentionKey(absolutePath, parsed.lineRange) }
+    return attachment
   }
 
   return null
 }
 
-export function mergeInlineMentions(
+function overlaps(start: number, end: number, otherStart: number, otherEnd: number): boolean {
+  return start < otherEnd && otherStart < end
+}
+
+function validateProvidedOccurrences(content: string, provided: readonly RawMentionOccurrence[]): RawMentionOccurrence[] {
+  const inline = provided
+    .filter((item): item is RawMentionOccurrence & { placement: { _tag: 'inline'; start: number; end: number } } => item.placement._tag === 'inline')
+    .sort((a, b) => a.placement.start - b.placement.start)
+  let previousEnd = -1
+  for (const occurrence of inline) {
+    const { start, end } = occurrence.placement
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > content.length) {
+      throw new Error(`Invalid mention span ${start}-${end}`)
+    }
+    if (start < previousEnd) throw new Error(`Overlapping mention span ${start}-${end}`)
+    if (!content.slice(start, end).startsWith('@')) throw new Error(`Mention span ${start}-${end} does not cover an @ mention`)
+    previousEnd = end
+  }
+  return [...inline, ...provided.filter(item => item.placement._tag === 'trailing')]
+}
+
+export function collectMentionOccurrences(
   cwd: string,
   scratchpadPath: string,
   content: string,
-  attachments: readonly MessageAttachment[],
-): Effect.Effect<MessageAttachment[], SessionError> {
-  return Effect.sync(() => {
-    const allowedPrefixes = scratchpadPath ? [scratchpadPath] : []
-    const merged: MessageAttachment[] = []
-    const seenMentions = new Set<string>()
+  provided: readonly RawMentionOccurrence[],
+): Effect.Effect<RawMentionOccurrence[], SessionError> {
+  return Effect.try({
+    try: () => {
+      const allowedPrefixes = scratchpadPath ? [scratchpadPath] : []
+      const validated = validateProvidedOccurrences(content, provided).map(item => ({
+        ...item,
+        attachment: expandExplicitMentionRange(item.attachment),
+      }))
+      const inline = validated.filter((item): item is RawMentionOccurrence & { placement: { _tag: 'inline'; start: number; end: number } } => item.placement._tag === 'inline')
+      const discovered: Array<RawMentionOccurrence & { placement: { _tag: 'inline'; start: number; end: number } }> = []
 
-    for (const attachment of attachments) {
-      if (attachment.type === "image") {
-        merged.push(attachment)
-        continue
+      for (const candidate of extractInlineMentionCandidates(content)) {
+        if (inline.some(item => overlaps(candidate.start, candidate.end, item.placement.start, item.placement.end))) continue
+        const resolved = resolveInlineMentionCandidate(cwd, candidate.raw, allowedPrefixes)
+        if (!resolved) continue
+        discovered.push({
+          occurrenceId: createId(),
+          attachment: resolved,
+          placement: { _tag: 'inline', start: candidate.start, end: candidate.end },
+        })
       }
-      const mention = expandExplicitMentionRange(attachment)
-      const key = mentionKeyFromAttachment(cwd, mention)
-      if (seenMentions.has(key)) continue
-      seenMentions.add(key)
-      merged.push(mention)
-    }
 
-    for (const candidate of extractInlineMentionCandidates(content)) {
-      const resolved = resolveInlineMentionCandidate(cwd, candidate, allowedPrefixes)
-      if (!resolved) continue
-      if (seenMentions.has(resolved.key)) continue
-      seenMentions.add(resolved.key)
-      merged.push(resolved.attachment)
-    }
-
-    return merged
+      const orderedInline: RawMentionOccurrence[] = [...inline, ...discovered]
+        .sort((a, b) => a.placement.start - b.placement.start)
+      const trailing = validated.filter(item => item.placement._tag === 'trailing')
+      return [...orderedInline, ...trailing]
+    },
+    catch: cause => new SessionOperationFailed({
+      operation: 'collect message mentions',
+      reason: cause instanceof Error ? cause.message : String(cause),
+    }),
   })
 }

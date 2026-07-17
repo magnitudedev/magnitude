@@ -3,120 +3,79 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { describe, expect, test } from "vitest"
 import { Effect } from "effect"
-import type { MessageAttachment } from "@magnitudedev/protocol"
-import { mergeInlineMentions } from "./file-mentions"
+import type { RawMentionOccurrence } from "@magnitudedev/protocol"
+import { collectMentionOccurrences } from "./file-mentions"
 
 async function makeCwd(): Promise<string> {
   return mkdtemp(join(tmpdir(), "magnitude-file-mentions-"))
 }
 
-async function merge(cwd: string, content: string, attachments: MessageAttachment[] = []): Promise<MessageAttachment[]> {
-  return Effect.runPromise(mergeInlineMentions(cwd, "", content, attachments))
+async function collect(
+  cwd: string,
+  text: string,
+  provided: readonly RawMentionOccurrence[] = [],
+): Promise<RawMentionOccurrence[]> {
+  return Effect.runPromise(collectMentionOccurrences(cwd, "", text, provided))
 }
 
-describe("mergeInlineMentions", () => {
-  test("adds attachments for inline file-like mentions that resolve under cwd", async () => {
+describe("collectMentionOccurrences", () => {
+  test("discovers every inline occurrence and preserves its UTF-16 span", async () => {
     const cwd = await makeCwd()
     await mkdir(join(cwd, "src"))
     await writeFile(join(cwd, "src", "app.ts"), "const app = true\n")
+    const text = "😀 see @src/app.ts, then @src/app.ts"
 
-    const attachments = await merge(cwd, "look at @src/app.ts")
+    const mentions = await collect(cwd, text)
 
-    expect(attachments).toEqual([
-      { type: "mention_file", path: "src/app.ts" },
+    expect(mentions).toHaveLength(2)
+    expect(mentions.map(({ attachment, placement }) => ({ attachment, placement }))).toEqual([
+      {
+        attachment: { type: "mention_file", path: "src/app.ts" },
+        placement: { _tag: "inline", start: text.indexOf("@src/app.ts"), end: text.indexOf("@src/app.ts") + 11 },
+      },
+      {
+        attachment: { type: "mention_file", path: "src/app.ts" },
+        placement: { _tag: "inline", start: text.lastIndexOf("@src/app.ts"), end: text.lastIndexOf("@src/app.ts") + 11 },
+      },
     ])
+    expect(mentions[0].occurrenceId).not.toBe(mentions[1].occurrenceId)
   })
 
-  test("skips social mentions and unresolved file-like candidates", async () => {
-    const cwd = await makeCwd()
-
-    const attachments = await merge(cwd, "thanks @alice and check @missing.ts")
-
-    expect(attachments).toEqual([])
-  })
-
-  test("strips trailing prose punctuation only as a fallback", async () => {
+  test("does not discover mentions inside inline or fenced code", async () => {
     const cwd = await makeCwd()
     await writeFile(join(cwd, "README.md"), "# hi\n")
-
-    const attachments = await merge(cwd, "read @README.md.")
-
-    expect(attachments).toEqual([
-      { type: "mention_file", path: "README.md" },
-    ])
+    const text = ["ignore `@README.md`", "```", "@README.md", "```"].join("\n")
+    expect(await collect(cwd, text)).toEqual([])
   })
 
-  test("does not parse mentions inside inline code or fenced code blocks", async () => {
+  test("keeps explicit trailing mentions after ordered inline mentions", async () => {
     const cwd = await makeCwd()
     await writeFile(join(cwd, "README.md"), "# hi\n")
-    await mkdir(join(cwd, "src"))
-    await writeFile(join(cwd, "src", "app.ts"), "const app = true\n")
-
-    const attachments = await merge(cwd, [
-      "ignore `@README.md`",
-      "```ts",
-      "@src/app.ts",
-      "```",
-    ].join("\n"))
-
-    expect(attachments).toEqual([])
-  })
-
-  test("classifies directories and images", async () => {
-    const cwd = await makeCwd()
-    await mkdir(join(cwd, "docs"))
-    await writeFile(join(cwd, "image.png"), "fake")
-
-    const attachments = await merge(cwd, "see @docs/ and @image.png")
-
-    expect(attachments).toEqual([
-      { type: "mention_directory", path: "docs/" },
-      { type: "mention_file", path: "image.png" },
-    ])
-  })
-
-  test("dedupes explicit and inline mentions by canonical path and range", async () => {
-    const cwd = await makeCwd()
-    await mkdir(join(cwd, "src"))
-    await writeFile(join(cwd, "src", "app.ts"), "const app = true\n")
-
-    const explicit: MessageAttachment = {
-      type: "mention_file",
-      path: "src/app.ts",
+    const text = "read @README.md"
+    const trailing: RawMentionOccurrence = {
+      occurrenceId: "trailing-1",
+      attachment: { type: "mention_file", path: "README.md" },
+      placement: { _tag: "trailing" },
     }
 
-    const attachments = await merge(cwd, "again @./src/app.ts and ranged @src/app.ts:12", [explicit])
+    const mentions = await collect(cwd, text, [trailing])
 
-    expect(attachments).toEqual([
-      explicit,
-      {
-        type: "mention_file_range",
-        path: "src/app.ts",
-        startLine: 2,
-        endLine: 22,
-      },
-    ])
+    expect(mentions).toHaveLength(2)
+    expect(mentions[0].placement._tag).toBe("inline")
+    expect(mentions[1]).toEqual(trailing)
   })
 
-  test("dedupes explicit single-line ranges against inline expanded ranges", async () => {
+  test("rejects overlapping or invalid explicit spans as a typed session error", async () => {
     const cwd = await makeCwd()
-    await mkdir(join(cwd, "src"))
-    await writeFile(join(cwd, "src", "app.ts"), "const app = true\n")
+    await writeFile(join(cwd, "README.md"), "# hi\n")
+    const occurrence: RawMentionOccurrence = {
+      occurrenceId: "bad-span",
+      attachment: { type: "mention_file", path: "README.md" },
+      placement: { _tag: "inline", start: 0, end: 4 },
+    }
 
-    const attachments = await merge(cwd, "same @src/app.ts:12", [{
-      type: "mention_file_range",
-      path: "./src/app.ts",
-      startLine: 12,
-      endLine: 12,
-    }])
-
-    expect(attachments).toEqual([
-      {
-        type: "mention_file_range",
-        path: "./src/app.ts",
-        startLine: 2,
-        endLine: 22,
-      },
-    ])
+    const result = await Effect.runPromise(Effect.either(collectMentionOccurrences(cwd, "", "read @README.md", [occurrence])))
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") expect(result.left._tag).toBe("SessionOperationFailed")
   })
 })

@@ -1,4 +1,5 @@
-import type { MentionAttachment } from "@magnitudedev/sdk"
+import type { MentionAttachment, RawMentionOccurrence } from "@magnitudedev/sdk"
+import type { InputMentionSegment } from "../types/store"
 
 export {
   canonicalExtensionForImageMediaType,
@@ -27,4 +28,12 @@ export function mentionAttachmentFromSegment(mention: MentionSegment): MentionAt
     }
   }
   return { type: "mention_file", path: mention.path }
+}
+
+export function mentionOccurrenceFromInputSegment(segment: InputMentionSegment): RawMentionOccurrence {
+  return {
+    occurrenceId: segment.id,
+    attachment: mentionAttachmentFromSegment(segment),
+    placement: { _tag: "inline", start: segment.start, end: segment.end },
+  }
 }

@@ -9,9 +9,8 @@
  */
 
 import { Schema } from 'effect'
-import { getEffectiveToolkit } from '../../tools/toolkits'
-import type { RoleId } from '../../agents/role-validation'
-import type { ConfigState } from '../../ambient/config-ambient'
+import { materializeAgentToolkit } from '../../tools/toolkits'
+import type { Toolkit } from '@magnitudedev/harness'
 import { makeNativeToolParametersJsonSchema, type JsonValue } from '@magnitudedev/ai'
 import type { JsonSchemaObject } from '@magnitudedev/utils/schema'
 
@@ -33,11 +32,10 @@ function schemaToJsonSchema(schema: Schema.Schema.AnyNoContext): JsonSchemaObjec
 }
 
 export function toolDefinitionsFromToolkit(
-  roleId: RoleId,
-  configState: ConfigState,
-  options?: { solo?: boolean },
+  universe: Toolkit,
+  toolKeys: readonly string[],
 ): readonly AtifToolDefinition[] {
-  const toolkit = getEffectiveToolkit(roleId, configState, undefined, options)
+  const toolkit = materializeAgentToolkit(universe, toolKeys)
   const defs: AtifToolDefinition[] = []
 
   for (const [key, entry] of Object.entries(toolkit.entries)) {

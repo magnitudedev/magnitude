@@ -10,6 +10,7 @@ import type { ToolResultEntry, ToolResult } from '@magnitudedev/harness'
 import { isImageValue, type ToolResultFormatter } from '@magnitudedev/harness'
 import { describeShape, estimateText } from '../../truncation'
 import { TRUNCATION_TOKEN_LIMIT } from '../../constants'
+import { renderContextParts, type ContextImageResult } from '../../content'
 
 // ---------------------------------------------------------------------------
 // Truncation override for large Success outputs
@@ -61,6 +62,7 @@ export function createTruncatingFormatter(
  */
 export function createAgentFormatter(
   harnessFormat: ToolResultFormatter,
+  options: { readonly includeImageData?: boolean } = {},
 ): ToolResultFormatter {
   return (entry: ToolResultEntry): readonly ToolResultPart[] => {
     if (entry.result._tag === 'Denied') {
@@ -73,6 +75,12 @@ export function createAgentFormatter(
         `This restriction exists to prevent accidental or catastrophic operations. Do not try to work around it — respect the intent of the restriction rather than finding methods that bypass the check. Provide the command to the user if you need them to run it.\n` +
         `</permission_rejected>`
       }]
+    }
+    if (entry.result._tag === 'Success') {
+      const output = entry.result.output as Partial<ContextImageResult> | undefined
+      if (output?._tag === 'ContextImageResult' && output.image) {
+        return renderContextParts([output.image], { includeImageData: options.includeImageData === true })
+      }
     }
     return harnessFormat(entry)
   }

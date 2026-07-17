@@ -17,9 +17,9 @@ import { GoalProjection } from '../src/projections/goal'
 import { HarnessStateProjection } from '../src/projections/harness-state'
 import { TurnProjection } from '../src/projections/turn'
 import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
-import { publishToolkit } from '../src/ambient/toolkit-ambient'
-import { shellToolkit, toToolKeyErased } from '../src/tools/toolkits'
+import { toToolKeyErased } from '../src/tools/toolkits'
 import type { DisplayMessage } from '../src/display/types'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 const ts = (n: number) => 1_700_300_000_000 + n
 const forkId = null
@@ -38,12 +38,15 @@ const runtimeLayer = Layer.provideMerge(
     UserMessageResolutionProjection.Layer,
     Layer.provide(DisplayTimelineProjection.Layer, InMemoryAddressedEntryStoreLive),
   ),
-  Layer.provideMerge(
-    makeAmbientServiceLayer<AppEvent>(),
+  Layer.merge(
     Layer.provideMerge(
-      makeProjectionBusLayer<AppEvent>(),
-      Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
+      makeAmbientServiceLayer<AppEvent>(),
+      Layer.provideMerge(
+        makeProjectionBusLayer<AppEvent>(),
+        Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
+      ),
     ),
+    ToolUniverseSourceLive,
   ),
 )
 
@@ -83,8 +86,6 @@ async function runDisplay(events: readonly AppEvent[]): Promise<readonly Display
   const program = Effect.gen(function* () {
     const bus = yield* ProjectionBusTag<AppEvent>()
     const timeline = yield* DisplayTimelineProjection.Tag
-
-    yield* publishToolkit(shellToolkit)
 
     for (const event of events) {
       yield* bus.processEvent(event as never)

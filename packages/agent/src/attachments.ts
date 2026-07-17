@@ -1,4 +1,5 @@
 import { Schema } from 'effect'
+import { ContextImagePartSchema, ContextPartSchema } from './content'
 
 export const AgentImageMediaTypeSchema = Schema.Literal(
   'image/png',
@@ -10,11 +11,7 @@ export type AgentImageMediaType = typeof AgentImageMediaTypeSchema.Type
 
 export const AgentImageAttachmentSchema = Schema.Struct({
   type: Schema.Literal('image'),
-  path: Schema.String,
-  filename: Schema.String,
-  mediaType: AgentImageMediaTypeSchema,
-  width: Schema.Number,
-  height: Schema.Number,
+  image: ContextImagePartSchema,
 })
 export type AgentImageAttachment = typeof AgentImageAttachmentSchema.Type
 
@@ -45,23 +42,32 @@ export const AgentMentionAttachmentSchema = Schema.Union(
 )
 export type AgentMentionAttachment = typeof AgentMentionAttachmentSchema.Type
 
-export const AgentMessageAttachmentSchema = Schema.Union(
-  AgentImageAttachmentSchema,
-  AgentMentionAttachmentSchema,
+export const MentionPlacementSchema = Schema.Union(
+  Schema.TaggedStruct('inline', {
+    start: Schema.Number,
+    end: Schema.Number,
+  }),
+  Schema.TaggedStruct('trailing', {}),
 )
-export type AgentMessageAttachment = typeof AgentMessageAttachmentSchema.Type
+export type MentionPlacement = typeof MentionPlacementSchema.Type
+
+export const MentionOccurrenceSchema = Schema.Struct({
+  occurrenceId: Schema.String,
+  attachment: AgentMentionAttachmentSchema,
+  placement: MentionPlacementSchema,
+})
+export type MentionOccurrence = typeof MentionOccurrenceSchema.Type
 
 export const MentionResolutionSchema = Schema.Union(
   Schema.Struct({
+    occurrenceId: Schema.String,
     status: Schema.Literal('resolved'),
-    attachment: AgentMentionAttachmentSchema,
-    content: Schema.String,
+    parts: Schema.Array(ContextPartSchema),
     truncated: Schema.Boolean,
-    originalBytes: Schema.Number,
   }),
   Schema.Struct({
+    occurrenceId: Schema.String,
     status: Schema.Literal('failed'),
-    attachment: AgentMentionAttachmentSchema,
     reason: Schema.String,
   }),
 )

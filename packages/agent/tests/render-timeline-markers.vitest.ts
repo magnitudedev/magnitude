@@ -17,7 +17,7 @@ const baseInput: RenderTimelineInput = {
 
 function textFromParts(parts: ReturnType<typeof renderTimeline>): string {
   return parts
-    .filter((p): p is { _tag: 'TextPart'; text: string } => p._tag === 'TextPart')
+    .filter((p): p is { _tag: 'ContextText'; text: string } => p._tag === 'ContextText')
     .map(p => p.text)
     .join('')
 }
@@ -36,11 +36,11 @@ function assertNoMarkers(text: string) {
 // ---------------------------------------------------------------------------
 
 function makeUserMessage(text: string, timestamp: number): TimelineEntry {
-  return { kind: 'user_message', timestamp, text, attachments: [], synthetic: Option.none() }
+  return { kind: 'user_message', timestamp, items: [{ kind: 'body', parts: [{ _tag: 'ContextText', text }] }], synthetic: Option.none() }
 }
 
 function makeObservation(timestamp: number, text = 'observing'): TimelineEntry {
-  return { kind: 'observation', timestamp, parts: [{ _tag: 'TextPart', text }] }
+  return { kind: 'observation', timestamp, parts: [{ _tag: 'ContextText', text }] }
 }
 
 function makeAgentBlock(agentId: string, timestamp: number, atoms: AgentAtom[], status: string = 'working'): TimelineEntry {
@@ -1155,16 +1155,17 @@ describe('user message with attachments', () => {
         {
           kind: 'user_message',
           timestamp: ts(0),
-          text: 'check this',
           synthetic: Option.none(),
-          attachments: [
+          items: [
+            { kind: 'body', parts: [{ _tag: 'ContextText', text: 'check this' }] },
             {
-              kind: 'image',
-              path: '/attachments/cat.png',
-              filename: 'cat.png',
-              mediaType: 'image/png',
-              width: 0,
-              height: 0,
+              kind: 'attachment',
+              attachmentType: 'image',
+              parts: [{
+                _tag: 'ContextImage', data: 'YWJj', path: '/attachments/cat.png',
+                mediaType: 'image/png', dimensions: { width: 1, height: 1 },
+                name: Option.some('cat.png'), byteSize: Option.some(3),
+              }],
             },
           ],
         },
@@ -1172,7 +1173,7 @@ describe('user message with attachments', () => {
     }))
     assertMarkers(text, ['--- 2024-05-06 12:00:00 ---'])
     expect(text).toContain('check this')
-    expect(text).toContain('<attachment path="/attachments/cat.png" filename="cat.png"')
+    expect(text).toContain('<attachment type="image" path="/attachments/cat.png">')
   })
 
   it('user message with mention attachment renders mention', () => {
@@ -1182,13 +1183,19 @@ describe('user message with attachments', () => {
         {
           kind: 'user_message',
           timestamp: ts(0),
-          text: 'look at this',
           synthetic: Option.none(),
-          attachments: [
+          items: [
+            { kind: 'body', parts: [{ _tag: 'ContextText', text: 'look at this ' }] },
             {
               kind: 'mention',
-              attachment: { type: 'mention_file', path: '/file.ts' },
-              resolution: { status: 'resolved', content: 'const x = 1', truncated: false, originalBytes: 0 },
+              mention: {
+                occurrence: {
+                  occurrenceId: 'mention-1',
+                  attachment: { type: 'mention_file', path: '/file.ts' },
+                  placement: { _tag: 'trailing' },
+                },
+                resolution: { status: 'resolved', parts: [{ _tag: 'ContextText', text: 'const x = 1' }], truncated: false },
+              },
             },
           ],
         },

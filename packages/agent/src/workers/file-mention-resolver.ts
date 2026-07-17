@@ -1,13 +1,19 @@
-import { relative, sep } from 'path'
-import { Effect } from 'effect'
+import { extname, relative, sep } from 'node:path'
+import { Data, Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
-import type { AppEvent, MentionAttachment, MentionResolution } from '../events'
+import type { AppEvent, MentionOccurrence } from '../events'
 import { resolveFileRefPath } from '../scratchpad/file-ref-resolution'
 import { SessionContextProjection } from '../projections/session-context'
 import { Fs } from '../services/fs'
+import { captureContextImageFromFile } from '../util/capture-context-image'
 
 const MAX_MENTION_TEXT_BYTES = 500 * 1024
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
+
+class MentionResolutionError extends Data.TaggedError('MentionResolutionError')<{
+  readonly message: string
+}> {}
 
 function isPathUnderPrefix(absolutePath: string, prefix: string): boolean {
   const rel = relative(prefix, absolutePath)
@@ -22,94 +28,102 @@ function isPathAllowed(absolutePath: string, cwd: string, allowedPrefixes?: stri
   return allowedPrefixes.some(prefix => isPathUnderPrefix(absolutePath, prefix))
 }
 
-async function resolveTextMention(
-  attachment: MentionAttachment,
+function resolveTextMention(
+  occurrence: MentionOccurrence,
   absolutePath: string,
   fs: Effect.Effect.Success<typeof Fs>,
-  lineRange: { start: number; end: number } | null
-): Promise<MentionResolution> {
-  const buffer = await Effect.runPromise(fs.readFile(absolutePath))
-  const originalBytes = buffer.byteLength
-  const truncated = originalBytes > MAX_MENTION_TEXT_BYTES
-  const contentBuffer = truncated ? buffer.subarray(0, MAX_MENTION_TEXT_BYTES) : buffer
-  let content = contentBuffer.toString('utf8')
+  lineRange: { start: number; end: number } | null,
+) {
+  return Effect.gen(function* () {
+    const buffer = yield* fs.readFile(absolutePath)
+    const truncated = buffer.byteLength > MAX_MENTION_TEXT_BYTES
+    const contentBuffer = truncated ? buffer.subarray(0, MAX_MENTION_TEXT_BYTES) : buffer
+    let content = contentBuffer.toString('utf8')
 
-  if (lineRange) {
-    const lines = content.split('\n')
-    // Clamp to available lines (1-indexed, inclusive)
-    // The expanded range from CLI may exceed the file's actual line count — clamp end to lines.length
-    const start = Math.max(1, lineRange.start)
-    const end = Math.min(lines.length, lineRange.end)
-    if (start <= end) {
-      content = lines.slice(start - 1, end).join('\n')
-    } else {
-      content = ''
+    if (lineRange) {
+      const lines = content.split('\n')
+      const start = Math.max(1, lineRange.start)
+      const end = Math.min(lines.length, lineRange.end)
+      content = start <= end ? lines.slice(start - 1, end).join('\n') : ''
     }
-  }
 
-  return {
-    status: 'resolved',
-    attachment,
-    content,
-    truncated,
-    originalBytes,
-  }
+    return {
+      occurrenceId: occurrence.occurrenceId,
+      status: 'resolved' as const,
+      parts: [{ _tag: 'ContextText' as const, text: content }],
+      truncated,
+    }
+  })
 }
 
-async function resolveDirectoryMention(attachment: MentionAttachment, absolutePath: string, fs: Effect.Effect.Success<typeof Fs>): Promise<MentionResolution> {
-  const entries = await Effect.runPromise(fs.walk(absolutePath))
-  const lines: string[] = []
-  for (const entry of entries) {
-    const relPath = relative(absolutePath, entry.fullPath)
-    if (!relPath || relPath.startsWith('..')) continue
-    lines.push(`<entry path="${relPath}" name="${entry.name}" type="${entry.type}" depth="${entry.depth}" />`)
-  }
-  const content = `<tree>${lines.join('')}</tree>`
-  return {
-    status: 'resolved',
-    attachment,
-    content,
-    truncated: false,
-    originalBytes: Buffer.byteLength(content, 'utf8'),
-  }
+function resolveDirectoryMention(
+  occurrence: MentionOccurrence,
+  absolutePath: string,
+  fs: Effect.Effect.Success<typeof Fs>,
+) {
+  return Effect.gen(function* () {
+    const entries = yield* fs.walk(absolutePath)
+    const lines: string[] = []
+    for (const entry of entries) {
+      const relPath = relative(absolutePath, entry.fullPath)
+      if (!relPath || relPath.startsWith('..')) continue
+      lines.push(`<entry path="${relPath}" name="${entry.name}" type="${entry.type}" depth="${entry.depth}" />`)
+    }
+    return {
+      occurrenceId: occurrence.occurrenceId,
+      status: 'resolved' as const,
+      parts: [{ _tag: 'ContextText' as const, text: `<tree>${lines.join('')}</tree>` }],
+      truncated: false,
+    }
+  })
 }
 
-async function resolveMention(
+function resolveMention(
   cwd: string,
   scratchpadPath: string,
-  attachment: MentionAttachment,
+  occurrence: MentionOccurrence,
   fs: Effect.Effect.Success<typeof Fs>,
-  allowedPrefixes?: string[]
-): Promise<MentionResolution> {
-  const resolved = resolveFileRefPath(attachment.path, cwd, scratchpadPath)
-  if (!resolved) {
-    throw new Error(`Path not found: ${attachment.path}`)
-  }
+  allowedPrefixes?: string[],
+) {
+  return Effect.gen(function* () {
+    const attachment = occurrence.attachment
+    const resolved = resolveFileRefPath(attachment.path, cwd, scratchpadPath)
+    if (!resolved) return yield* new MentionResolutionError({ message: `Path not found: ${attachment.path}` })
 
-  const absolutePath = resolved.resolvedPath
-  if (!isPathAllowed(absolutePath, cwd, allowedPrefixes)) {
-    throw new Error(`Path is outside cwd: ${attachment.path}`)
-  }
+    const absolutePath = resolved.resolvedPath
+    if (!isPathAllowed(absolutePath, cwd, allowedPrefixes)) {
+      return yield* new MentionResolutionError({ message: `Path is outside cwd: ${attachment.path}` })
+    }
 
-  const fileStat = await Effect.runPromise(fs.stat(absolutePath))
+    const fileStat = yield* fs.stat(absolutePath)
+    if (attachment.type === 'mention_directory') {
+      if (!fileStat.isDirectory()) return yield* new MentionResolutionError({ message: `Mention is not a directory: ${attachment.path}` })
+      return yield* resolveDirectoryMention(occurrence, absolutePath, fs)
+    }
+    if (fileStat.isDirectory()) return yield* new MentionResolutionError({ message: `Mention expected file but got directory: ${attachment.path}` })
 
-  if (attachment.type === 'mention_directory') {
-    if (!fileStat.isDirectory()) throw new Error(`Mention is not a directory: ${attachment.path}`)
-    return resolveDirectoryMention(attachment, absolutePath, fs)
-  }
+    if (attachment.type === 'mention_file' && IMAGE_EXTENSIONS.has(extname(attachment.path).toLowerCase())) {
+      const image = yield* captureContextImageFromFile({
+        absolutePath,
+        logicalPath: attachment.path,
+      })
+      return {
+        occurrenceId: occurrence.occurrenceId,
+        status: 'resolved' as const,
+        parts: [image],
+        truncated: false,
+      }
+    }
 
-  if (fileStat.isDirectory()) {
-    throw new Error(`Mention expected file but got directory: ${attachment.path}`)
-  }
-
-  return resolveTextMention(
-    attachment,
-    absolutePath,
-    fs,
-    attachment.type === 'mention_file_range'
-      ? { start: attachment.startLine, end: attachment.endLine }
-      : null,
-  )
+    return yield* resolveTextMention(
+      occurrence,
+      absolutePath,
+      fs,
+      attachment.type === 'mention_file_range'
+        ? { start: attachment.startLine, end: attachment.endLine }
+        : null,
+    )
+  })
 }
 
 export const FileMentionResolver = Worker.define<AppEvent>()({
@@ -117,14 +131,7 @@ export const FileMentionResolver = Worker.define<AppEvent>()({
 
   eventHandlers: {
     user_message: (event, publish, read) => Effect.gen(function* () {
-      const mentions = event.attachments.filter((attachment): attachment is MentionAttachment =>
-        attachment.type === 'mention_file'
-        || attachment.type === 'mention_file_range'
-        || attachment.type === 'mention_directory'
-      )
-
-      // No mentions — immediate passthrough
-      if (mentions.length === 0) {
+      if (event.mentions.length === 0) {
         yield* publish({
           type: 'user_message_ready',
           messageId: event.messageId,
@@ -138,32 +145,40 @@ export const FileMentionResolver = Worker.define<AppEvent>()({
       const sessionContext = yield* read(SessionContextProjection)
       const cwd = sessionContext.context?.cwd
       const scratchpadPath = sessionContext.context?.scratchpadPath
-      if (!scratchpadPath) throw new Error('scratchpadPath not available in session context')
+      if (!scratchpadPath) {
+        yield* publish({
+          type: 'user_message_ready',
+          messageId: event.messageId,
+          forkId: event.forkId,
+          mentionResolutions: event.mentions.map(occurrence => ({
+            occurrenceId: occurrence.occurrenceId,
+            status: 'failed',
+            reason: 'scratchpadPath not available in session context',
+          })),
+        })
+        return
+      }
 
-      const mentionResolutions = yield* Effect.promise(async () => {
-        const results: MentionResolution[] = []
-        for (const mention of mentions) {
+      const mentionResolutions = yield* Effect.forEach(
+        event.mentions,
+        (occurrence) => {
           if (!cwd) {
-            results.push({
-              status: 'failed',
-              attachment: mention,
+            return Effect.succeed({
+              occurrenceId: occurrence.occurrenceId,
+              status: 'failed' as const,
               reason: 'Missing session cwd',
             })
-            continue
           }
-
-          try {
-            results.push(await resolveMention(cwd, scratchpadPath, mention, fs, [scratchpadPath]))
-          } catch (error) {
-            results.push({
-              status: 'failed',
-              attachment: mention,
-              reason: error instanceof Error ? error.message : String(error),
-            })
-          }
-        }
-        return results
-      })
+          return resolveMention(cwd, scratchpadPath, occurrence, fs, [scratchpadPath]).pipe(
+            Effect.catchAll((error) => Effect.succeed({
+              occurrenceId: occurrence.occurrenceId,
+              status: 'failed' as const,
+              reason: error instanceof MentionResolutionError ? error.message : String(error),
+            })),
+          )
+        },
+        { concurrency: 'unbounded' },
+      )
 
       yield* publish({
         type: 'user_message_ready',
@@ -175,8 +190,8 @@ export const FileMentionResolver = Worker.define<AppEvent>()({
       Effect.catchAllCause(cause =>
         Effect.sync(() => {
           logger.error({ cause: cause.toString() }, '[FileMentionResolver] Unexpected error while resolving file mentions')
-        })
-      )
-    )
-  }
+        }),
+      ),
+    ),
+  },
 })

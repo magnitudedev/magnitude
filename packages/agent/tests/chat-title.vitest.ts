@@ -54,7 +54,8 @@ function userMessage(messageId: string, text: string): AppEvent {
     forkId: null,
     messageId,
     timestamp: Date.now(),
-    content: [{ _tag: 'TextPart', text }],
+    text,
+    mentions: [],
     attachments: [],
     mode: 'text',
     synthetic: false,
@@ -154,6 +155,7 @@ function makeTitleModel(title: string | null, options?: { failAfterOutput?: bool
   }
 
   const layer = Layer.succeed(AgentModelResolver, {
+    resolveSlotConfig: () => Effect.succeed(model),
     resolvePrimary: () => Effect.sync(() => {
       primaryResolutions += 1
       return model

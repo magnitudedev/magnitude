@@ -1,7 +1,8 @@
-import { AssistantMessageSchema, UserPartSchema } from '@magnitudedev/ai'
+import { AssistantMessageSchema } from '@magnitudedev/ai'
 import { ToolResultEntrySchema } from '@magnitudedev/harness'
 import { Schema, Option } from 'effect'
 import { TimelineEntrySchema } from './inbox/types'
+import { ContextPartSchema } from '../content'
 
 // ---------------------------------------------------------------------------
 // CompletedTurn / TurnFeedback
@@ -31,11 +32,11 @@ export type CompletedTurn = typeof CompletedTurnSchema.Type
 export type WindowEntrySource = 'user' | 'agent' | 'system'
 
 export const WindowEntrySchema = Schema.Union(
-  Schema.Struct({ type: Schema.Literal('session_context'), source: Schema.Literal('system'), content: Schema.Array(UserPartSchema), estimatedTokens: Schema.Number }),
+  Schema.Struct({ type: Schema.Literal('session_context'), source: Schema.Literal('system'), content: Schema.Array(ContextPartSchema), estimatedTokens: Schema.Number }),
   Schema.Struct({ type: Schema.Literal('assistant_turn'), source: Schema.Literal('agent'), turn: CompletedTurnSchema, strategyId: Schema.Literal('native'), estimatedTokens: Schema.Number }),
-  Schema.Struct({ type: Schema.Literal('compacted'), source: Schema.Literal('system'), content: Schema.Array(UserPartSchema), estimatedTokens: Schema.Number }),
-  Schema.Struct({ type: Schema.Literal('fork_context'), source: Schema.Literal('system'), content: Schema.Array(UserPartSchema), estimatedTokens: Schema.Number }),
-  Schema.Struct({ type: Schema.Literal('goal_injection'), source: Schema.Literal('system'), content: Schema.Array(UserPartSchema), estimatedTokens: Schema.Number }),
+  Schema.Struct({ type: Schema.Literal('compacted'), source: Schema.Literal('system'), content: Schema.Array(ContextPartSchema), estimatedTokens: Schema.Number }),
+  Schema.Struct({ type: Schema.Literal('fork_context'), source: Schema.Literal('system'), content: Schema.Array(ContextPartSchema), estimatedTokens: Schema.Number }),
+  Schema.Struct({ type: Schema.Literal('goal_injection'), source: Schema.Literal('system'), content: Schema.Array(ContextPartSchema), estimatedTokens: Schema.Number }),
   Schema.Struct({ type: Schema.Literal('context'), source: Schema.Literal('system'), timeline: Schema.Array(TimelineEntrySchema), estimatedTokens: Schema.Number }),
   Schema.Struct({
     type: Schema.Literal('observer_turn'),

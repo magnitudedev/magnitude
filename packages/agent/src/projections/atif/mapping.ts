@@ -13,10 +13,9 @@ import type {
   CompactionPrepared,
   Interrupt,
   ObserverOutcome,
-  ObservationPart,
-  Attachment,
   TurnOutcome,
 } from '../../events'
+import type { ContextPart } from '../../content'
 import type {
   AtifStepDraft,
   AtifStepSource,
@@ -52,57 +51,33 @@ function assertMediaType(mt: string): AtifImageSource['media_type'] {
   }
 }
 
-function partsToAtifMessage(parts: readonly ObservationPart[]): AtifMessage {
+function partsToAtifMessage(parts: readonly ContextPart[]): AtifMessage {
   const result: AtifContentPart[] = []
   for (const part of parts) {
-    if (part.type === 'text') {
+    if (part._tag === 'ContextText') {
       result.push({ type: 'text', text: part.text })
-    } else if (part.type === 'image') {
+    } else if (part._tag === 'ContextImage') {
       result.push({
         type: 'image',
-        source: { media_type: assertMediaType(part.mediaType), path: 'inline' },
+        source: { media_type: assertMediaType(part.mediaType), path: part.path },
       })
     }
   }
   return result.length === 1 && result[0].type === 'text' ? result[0].text : result
 }
 
-function observationToAtifMessage(parts: readonly ObservationPart[] | undefined): AtifMessage {
+function observationToAtifMessage(parts: readonly ContextPart[] | undefined): AtifMessage {
   if (!parts || parts.length === 0) return ''
   return partsToAtifMessage(parts)
 }
 
-/**
- * Convert UserPart[] (content from events.ts) to ATIF message.
- * Handles TextPart, ImagePart, and other part types.
- */
-function userPartsToAtifMessage(
-  parts: readonly { readonly _tag: string; readonly text?: string; readonly base64?: string; readonly mediaType?: string }[]
-): AtifMessage {
-  const result: AtifContentPart[] = []
-  for (const part of parts) {
-    if (part._tag === 'TextPart') {
-      result.push({ type: 'text', text: part.text ?? '' })
-    } else if (part._tag === 'ImagePart' && part.base64 && part.mediaType) {
-      result.push({
-        type: 'image',
-        source: { media_type: assertMediaType(part.mediaType), path: 'inline' },
-      })
-    }
-  }
-  return result.length === 1 && result[0].type === 'text' ? result[0].text : result
-}
-
-/**
- * Convert attachments (files) to ATIF content parts appended to the message.
- */
-function attachmentsToContentParts(attachments: readonly Attachment[]): AtifImagePart[] {
+function attachmentsToContentParts(attachments: UserMessage['attachments']): AtifImagePart[] {
   const parts: AtifImagePart[] = []
   for (const att of attachments) {
     if (att.type === 'image') {
       parts.push({
         type: 'image',
-        source: { media_type: assertMediaType(att.mediaType), path: att.path },
+        source: { media_type: assertMediaType(att.image.mediaType), path: att.image.path },
       })
     }
   }
@@ -110,21 +85,9 @@ function attachmentsToContentParts(attachments: readonly Attachment[]): AtifImag
 }
 
 function buildUserMessage(event: UserMessage): AtifMessage {
-  const contentParts = userPartsToAtifMessage(event.content)
   const attachmentParts = attachmentsToContentParts(event.attachments)
-
-  if (typeof contentParts === 'string') {
-    if (attachmentParts.length > 0) {
-      return [{ type: 'text', text: contentParts }, ...attachmentParts]
-    }
-    return contentParts
-  }
-
-  // contentParts is AtifContentPart[]
-  if (attachmentParts.length > 0) {
-    return [...contentParts, ...attachmentParts]
-  }
-  return contentParts.length === 1 && contentParts[0].type === 'text' ? contentParts[0].text : contentParts
+  if (attachmentParts.length === 0) return event.text
+  return [{ type: 'text', text: event.text }, ...attachmentParts]
 }
 
 type JsonRecord = Readonly<Record<string, JsonValue>>
@@ -278,7 +241,7 @@ export function addObservationToStep(
         } else if (output != null && typeof output === 'object') {
           const out = output as Record<string, unknown>
           if ('parts' in out && Array.isArray(out.parts)) {
-            content = observationToAtifMessage(out.parts as readonly ObservationPart[])
+            content = observationToAtifMessage(out.parts as readonly ContextPart[])
           } else {
             try {
               content = JSON.stringify(output)
@@ -323,7 +286,7 @@ export function addObservationToStep(
       default: {
         // Fallback for unknown result shapes
         if ('parts' in result && Array.isArray(result.parts)) {
-          content = observationToAtifMessage(result.parts as readonly ObservationPart[])
+          content = observationToAtifMessage(result.parts as readonly ContextPart[])
         } else if ('output' in result) {
           content = typeof result.output === 'string' ? result.output : JSON.stringify(result.output)
         } else {

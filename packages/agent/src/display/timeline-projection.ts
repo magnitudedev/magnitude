@@ -15,7 +15,6 @@ import { DisplayMessage as ProtocolDisplayMessageSchema } from '@magnitudedev/pr
 import type { ToolStepPresentation } from '@magnitudedev/protocol'
 import { Effect, Option } from 'effect'
 import type { AppEvent } from '../events'
-import { textOf } from '../content'
 import { outcomeWillChainContinue } from '../events'
 
 import { AgentRoutingProjection } from '../projections/agent-routing'
@@ -470,7 +469,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
 
   eventHandlers: {
     user_message: ({ event, fork, addressed }) => {
-      const content = textOf(event.content)
+      const content = event.text
       const messageType: 'user_message' | 'queued_user_message' =
         fork._currentTurnId !== null ? 'queued_user_message' : 'user_message'
 
@@ -484,11 +483,11 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
           .filter((attachment): attachment is Extract<typeof attachment, { type: 'image' }> => attachment.type === 'image')
           .map(attachment => ({
             type: attachment.type,
-            path: attachment.path,
-            filename: attachment.filename,
-            mediaType: attachment.mediaType,
-            width: attachment.width,
-            height: attachment.height,
+            path: attachment.image.path,
+            filename: Option.getOrElse(attachment.image.name, () => attachment.image.path.split('/').pop() ?? 'image'),
+            mediaType: attachment.image.mediaType,
+            width: attachment.image.dimensions.width,
+            height: attachment.image.dimensions.height,
           })),
       })
     },

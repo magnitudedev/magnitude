@@ -30,6 +30,7 @@ import { DisplayTimelineProjection } from '../src/display'
 import { HarnessStateProjection } from '../src/projections/harness-state'
 import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
 import type { DisplayMessage } from '../src/display'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 // Materialize timeline messages for assertions — accepts the normalized
 // byId/order display form or a plain array (addressed readAll results).
@@ -65,7 +66,7 @@ const runDisplay = async (events: readonly TimestampedAppEvent[]): Promise<reado
       UserMessageResolutionProjection.Layer,
       Layer.provide(DisplayTimelineProjection.Layer, InMemoryAddressedEntryStoreLive),
     ),
-    baseLayer,
+    Layer.merge(baseLayer, ToolUniverseSourceLive),
   )
   const program = Effect.gen(function* () {
     const bus = yield* (ProjectionBusTag<AppEvent>())
@@ -89,7 +90,8 @@ const userMessage = (messageId: string, timestamp: number, text: string): Timest
   messageId,
   forkId,
   timestamp,
-  content: [{ _tag: 'TextPart', text }],
+  text,
+  mentions: [],
   attachments: [],
   mode: 'text',
   synthetic: false,

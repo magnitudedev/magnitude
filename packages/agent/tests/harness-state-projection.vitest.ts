@@ -10,9 +10,9 @@ import {
 } from '@magnitudedev/event-core'
 import type { ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
 import type { AppEvent } from '../src/events'
-import { publishToolkit } from '../src/ambient/toolkit-ambient'
 import { HarnessStateProjection, type HarnessTurnState } from '../src/projections/harness-state'
-import { shellToolkit, toToolKeyErased } from '../src/tools/toolkits'
+import { toToolKeyErased } from '../src/tools/toolkits'
+import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 
 const makeHarnessState = async (events: readonly Timestamped<AppEvent>[]): Promise<HarnessTurnState> => {
   const baseBusLayer = Layer.provideMerge(
@@ -23,11 +23,12 @@ const makeHarnessState = async (events: readonly Timestamped<AppEvent>[]): Promi
     makeAmbientServiceLayer<AppEvent>(),
     baseBusLayer,
   )
-  const runtimeLayer = Layer.provideMerge(HarnessStateProjection.Layer, baseLayer)
+  const runtimeLayer = Layer.provideMerge(
+    HarnessStateProjection.Layer,
+    Layer.merge(baseLayer, ToolUniverseSourceLive),
+  )
 
   const program = Effect.gen(function* () {
-    yield* publishToolkit(shellToolkit)
-
     const bus = yield* ProjectionBusTag<AppEvent>()
     const projection = yield* HarnessStateProjection.Tag
 

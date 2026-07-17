@@ -26,6 +26,8 @@ import {
   defaultDisplayViewShape,
 } from '../../src/display-view'
 import { makeCountingAddressedEntryStore } from '../helpers/counting-addressed-store'
+import { ToolUniverseSource } from '../../src/ambient/tool-universe-ambient'
+import { toolUniverseToolkit } from '../../src/tools/toolkits'
 
 const TestAgent = EventEngine.make<AppEvent>()({
   name: 'DisplayViewRuntimeTestAgent',
@@ -64,7 +66,10 @@ const rootSmallShape: DisplayViewShape = {
 const provideRuntime = (storeLayer: Layer.Layer<Addressed.AddressedEntryStore>) =>
   Layer.provideMerge(
     DisplayViewRuntimeLive,
-    Layer.provideMerge(TestAgent.EngineLayer, storeLayer)
+    Layer.provideMerge(TestAgent.EngineLayer, Layer.merge(
+      storeLayer,
+      Layer.succeed(ToolUniverseSource, { toolkit: toolUniverseToolkit }),
+    ))
   )
 
 describe('display view runtime', () => {

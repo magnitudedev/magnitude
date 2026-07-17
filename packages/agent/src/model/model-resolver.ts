@@ -21,6 +21,7 @@ const LEADER_TRAITS = ['ATTENTIVE', 'STRATEGIC', 'PROACTIVE', 'RESPECTFUL', 'GRO
 export interface AgentModelResolverService {
   readonly resolvePrimary: (roleId: RoleId, agentId?: string) => Effect.Effect<AgentBoundModel, never, AmbientService>
   readonly resolveSecondary: (agentId?: string) => Effect.Effect<AgentBoundModel, never, AmbientService>
+  readonly resolveSlotConfig: (slot: SlotConfig, agentId?: string, roleId?: RoleId) => Effect.Effect<AgentBoundModel, never, AmbientService>
 }
 
 /** @effect-expect-leaking AmbientService */
@@ -101,6 +102,11 @@ export const AgentModelResolverLive = (
       }
 
       return {
+        resolveSlotConfig: (slot, agentId, roleId) => resolveFromSlot(slot, agentId ?? '000000000000', {
+          roleId,
+          maxToolCalls: MAX_TOOL_CALLS,
+          traits: roleId === 'leader' && !disableTraits ? LEADER_TRAITS : undefined,
+        }),
         resolvePrimary: (roleId: RoleId, agentId?: string) =>
           Effect.gen(function* () {
             const ambientService = yield* AmbientServiceTag

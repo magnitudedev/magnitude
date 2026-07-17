@@ -1,5 +1,4 @@
-import { ContentBuilder } from '../../content'
-import type { UserPart } from '@magnitudedev/ai'
+import { ContextBuilder, type ContextPart } from '../../content'
 import { Option } from 'effect'
 import {
   WORKER_PROGRESS_USER_MESSAGE_REMINDER,
@@ -40,11 +39,9 @@ function renderAgentAtom(atom: AgentAtom): string {
 }
 
 function renderTimelineTextLines(
-  entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_start_hook' | 'task_idle_hook' | 'task_complete_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' | 'task_reassigned' | 'turn_start' | 'turn_end' | 'background_processes' }>,
+  entry: Exclude<TimelineEntry, { kind: 'user_message' | 'observation' | 'lifecycle_hook' | 'task_start_hook' | 'task_idle_hook' | 'task_complete_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' | 'task_reassigned' | 'turn_start' | 'turn_end' | 'background_processes' }>,
 ): string[] {
   switch (entry.kind) {
-    case 'user_message':
-      return [`<message from="user">${entry.text}</message>`]
     case 'coordinator_message':
       return [`<message from="coordinator">${entry.text}</message>`]
     case 'user_bash_command':
@@ -172,8 +169,8 @@ function renderTaskUpdateLine(entry: Extract<TimelineEntry, { kind: 'task_update
   return `- Task ${entry.taskId} status changed: ${previousStatus} -> ${nextStatus}`
 }
 
-export function renderTimeline(input: RenderTimelineInput): UserPart[] {
-  const builder = new ContentBuilder()
+export function renderTimeline(input: RenderTimelineInput): ContextPart[] {
+  const builder = new ContextBuilder()
 
   if (input.timeline.length === 0) return builder.build()
 
@@ -249,7 +246,7 @@ export function renderTimeline(input: RenderTimelineInput): UserPart[] {
         emitTimeBoundary(entry.timestamp)
         const parts = renderTimelineUserMessageParts(entry)
         for (const part of parts) {
-          if (part._tag === 'TextPart') builder.pushText(`\n${part.text}`)
+          if (part._tag === 'ContextText') builder.pushText(`\n${part.text}`)
           else builder.pushPart(part)
         }
         const bullet = maybeAttentionBullet(entry, input.timezone)
@@ -262,7 +259,7 @@ export function renderTimeline(input: RenderTimelineInput): UserPart[] {
       case 'observation': {
         emitTimeBoundary(entry.timestamp)
         for (const part of entry.parts) {
-          if (part._tag === 'TextPart') builder.pushText(`\n${part.text}`)
+          if (part._tag === 'ContextText') builder.pushText(`\n${part.text}`)
           else builder.pushPart(part)
         }
         break

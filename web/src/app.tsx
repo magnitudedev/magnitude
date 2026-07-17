@@ -616,7 +616,7 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
       role={composer.roleLabel}
       isStreaming={composer.isStreaming}
       bashMode={composer.bashMode}
-      onSend={(text, attachments) => { void composer.handleSend(text, attachments) }}
+      onSend={(text, mentions) => { void composer.handleSend(text, { mentions }) }}
       onInterrupt={composer.handleInterrupt}
       onRunBash={(command) => { void composer.handleRunBash(command) }}
       onSlashCommand={composer.handleSlashCommand}

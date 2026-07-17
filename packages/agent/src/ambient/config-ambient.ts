@@ -1,23 +1,15 @@
-import { Ambient, AmbientServiceTag } from '@magnitudedev/event-core'
-import { Effect, Option } from 'effect'
+import { Ambient } from '@magnitudedev/event-core'
+import { Effect } from 'effect'
 
-import {
-  ModelCatalogLifecycle,
-  ModelSlotsLifecycle,
-  type ModelCatalog,
-  type ModelSlots,
-  type ModelSummary,
-  type SlotStates,
-} from '@magnitudedev/sdk'
+import type { ModelSummary, SlotStates } from '@magnitudedev/sdk'
 import { type SlotId } from '@magnitudedev/roles'
 import { type ReasoningEffort } from '@magnitudedev/ai'
 import {
   computeContextLimits,
   DEFAULT_CONTEXT_LIMIT_POLICY,
   type ResolvedContextLimitPolicy,
-  type MagnitudeStorageShape,
 } from '@magnitudedev/storage'
-import { ROLE_TO_SLOT, SLOT_IDS, type RoleId } from '@magnitudedev/roles'
+import { ROLE_TO_SLOT, type RoleId } from '@magnitudedev/roles'
 
 import { OUTPUT_TOKEN_RESERVE } from '../constants'
 
@@ -34,18 +26,39 @@ export interface SlotConfig {
   readonly isFallback: boolean
 }
 
+export interface ReadyAgentSlot {
+  readonly _tag: 'Ready'
+  readonly config: SlotConfig
+}
+
+export interface UnavailableAgentSlot {
+  readonly _tag: 'Unavailable'
+  readonly slotId: SlotId
+  readonly reason: string
+}
+
+export type AgentSlotState = ReadyAgentSlot | UnavailableAgentSlot
+
 export interface ConfigState {
-  readonly bySlot: Readonly<Record<SlotId, SlotConfig>>
+  readonly revision: number
+  readonly bySlot: Readonly<Record<SlotId, AgentSlotState>>
   readonly catalogLoaded: boolean
 }
 
 export function getSlotConfig(state: ConfigState, slotId: SlotId): SlotConfig {
-  return state.bySlot[slotId]
+  const slot = state.bySlot[slotId]
+  if (slot._tag === 'Unavailable') throw new NoModelForSlotError(slotId)
+  return slot.config
+}
+
+export function getSlotConfigOrNull(state: ConfigState, slotId: SlotId): SlotConfig | null {
+  const slot = state.bySlot[slotId]
+  return slot._tag === 'Ready' ? slot.config : null
 }
 
 export function getSlotConfigForRole(state: ConfigState, roleId: RoleId): SlotConfig {
   const slotId = ROLE_TO_SLOT[roleId]
-  return state.bySlot[slotId]
+  return getSlotConfig(state, slotId)
 }
 
 export class NoModelForSlotError extends Error {
@@ -60,7 +73,11 @@ export class NoModelForSlotError extends Error {
 export const ConfigAmbient = Ambient.define<ConfigState, never>({
   name: 'Config',
   initial: Effect.succeed({
-    bySlot: {} as Record<SlotId, SlotConfig>,
+    bySlot: {
+      primary: { _tag: 'Unavailable', slotId: 'primary', reason: 'not_loaded' },
+      secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'not_loaded' },
+    },
+    revision: 0,
     catalogLoaded: false,
   }),
 })
@@ -69,11 +86,13 @@ export function buildConfigStateFromSlots(
   catalogModels: readonly ModelSummary[],
   slots: SlotStates,
   policy: ResolvedContextLimitPolicy,
+  revision = 0,
 ): ConfigState {
-  const bySlot = {} as Record<SlotId, SlotConfig>
-  for (const slotId of SLOT_IDS) {
+  const buildSlot = (slotId: SlotId): AgentSlotState => {
     const slot = slots[slotId]
-    if (slot._tag !== 'Ready') throw new NoModelForSlotError(slotId)
+    if (slot._tag !== 'Ready') {
+      return { _tag: 'Unavailable', slotId, reason: slot._tag }
+    }
     const hardCap = slot.contextWindow - OUTPUT_TOKEN_RESERVE
     const { softCap } = computeContextLimits(hardCap, policy)
     const selectedModel = catalogModels.find((model) => model.providerId === slot.selection.providerId
@@ -82,54 +101,28 @@ export function buildConfigStateFromSlots(
     const vision = visionProperty?._tag === 'Cached' || visionProperty?._tag === 'Resolved' || visionProperty?._tag === 'Refreshing'
       ? visionProperty.value
       : undefined
-    bySlot[slotId] = {
-      slotId,
-      providerId: slot.selection.providerId,
-      providerModelId: slot.selection.providerModelId,
-      profile: { contextWindow: slot.contextWindow, maxOutputTokens: slot.maxOutputTokens },
-      vision,
-      hardCap,
-      softCap,
-      reasoningEffort: slot.selection.reasoningEffort,
-      isUserOverride: slot.source === 'user',
-      isFallback: false,
+    return {
+      _tag: 'Ready',
+      config: {
+        slotId,
+        providerId: slot.selection.providerId,
+        providerModelId: slot.selection.providerModelId,
+        profile: { contextWindow: slot.contextWindow, maxOutputTokens: slot.maxOutputTokens },
+        vision,
+        hardCap,
+        softCap,
+        reasoningEffort: slot.selection.reasoningEffort,
+        isUserOverride: slot.source === 'user',
+        isFallback: false,
+      },
     }
   }
-  return { bySlot, catalogLoaded: true }
-}
-
-export function publishConfigFromModelResources(
-  storage: MagnitudeStorageShape,
-  modelCatalog: Effect.Effect<ModelCatalog>,
-  modelSlots: Effect.Effect<ModelSlots>,
-) {
-  return Effect.gen(function* () {
-    const ambientService = yield* AmbientServiceTag
-    const catalog = yield* modelCatalog
-    const slotSnapshot = yield* modelSlots
-    const models = ModelCatalogLifecycle.match(catalog.state, {
-      loading: () => [] as readonly ModelSummary[],
-      ready: ({ models }) => models,
-      refreshing: ({ models }) => models,
-      degraded: ({ models }) => models,
-      unavailable: () => [] as readonly ModelSummary[],
-    })
-    const slots = Option.match(ModelSlotsLifecycle.match(slotSnapshot.state, {
-      loading: () => Option.none<SlotStates>(),
-      ready: ({ slots }) => Option.some(slots),
-      refreshing: ({ slots }) => Option.some(slots),
-      degraded: ({ slots }) => Option.some(slots),
-      unavailable: ({ slots }) => Option.some(slots),
-    }), {
-      onNone: () => { throw new NoModelForSlotError('primary') },
-      onSome: (value) => value,
-    })
-    const policy = yield* storage.config.getContextLimitPolicy()
-    const newState = Effect.sync(() => buildConfigStateFromSlots(models, slots, policy))
-
-    yield* ambientService.update(
-      ConfigAmbient,
-      yield* newState,
-    )
-  })
+  return {
+    revision,
+    bySlot: {
+      primary: buildSlot('primary'),
+      secondary: buildSlot('secondary'),
+    },
+    catalogLoaded: true,
+  }
 }

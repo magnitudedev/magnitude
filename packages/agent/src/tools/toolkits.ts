@@ -6,11 +6,11 @@
  * keys that catalog.ts used (e.g., 'fileRead', 'shell', 'webSearch').
  */
 
-import { defineToolkit, mergeToolkits, type Toolkit, type ToolkitKeys } from '@magnitudedev/harness'
+import { defineToolkit, mergeToolkits, type Toolkit, type ToolkitEntry, type ToolkitKeys } from '@magnitudedev/harness'
 import type { RoleId } from '../agents/role-validation'
 import type { ConfigState } from '../ambient/config-ambient'
-import { getSlotConfigForRole } from '../ambient/config-ambient'
-import type { VcsToolEntry } from '@magnitudedev/vcs'
+import { ROLE_TO_SLOT } from '@magnitudedev/roles'
+import { vcsToolkit } from '@magnitudedev/vcs'
 import type { ToolKeyErased } from './types'
 
 // --- Tools ---
@@ -71,7 +71,16 @@ export const webToolkit = defineToolkit({
   webFetch:  { tool: webFetchTool,  state: webFetchModel },
 })
 
-export const taskToolkit = defineToolkit({
+type TaskToolkitEntries = {
+  readonly createTask: ToolkitEntry
+  readonly updateTask: ToolkitEntry
+  readonly spawnWorker: ToolkitEntry
+  readonly killWorker: ToolkitEntry
+  readonly reassignWorker: ToolkitEntry
+  readonly messageWorker: ToolkitEntry
+}
+
+export const taskToolkit: Toolkit<TaskToolkitEntries> = defineToolkit({
   createTask:      { tool: createTaskTool,      state: createTaskModel },
   updateTask:      { tool: updateTaskTool,      state: updateTaskModel },
   spawnWorker:     { tool: spawnWorkerTool,     state: spawnWorkerModel },
@@ -112,29 +121,21 @@ const criticBase = mergeToolkits(
   mergeToolkits(skillToolkit, compactToolkit),
 )
 
-/** fs + shell + web + task + advisor + goal + skill + compact — base leader toolkit (VCS merged dynamically) */
+/** fs + shell + web + task + advisor + goal + skill + compact. */
 export const leaderToolkit = mergeToolkits(
-  mergeToolkits(workerBase, mergeToolkits(taskToolkit, mergeToolkits(advisorConsultToolkit, goalToolkit))),
-  defineToolkit({}),  // placeholder for VCS tools — merged dynamically at runtime
+  workerBase,
+  mergeToolkits(taskToolkit, mergeToolkits(advisorConsultToolkit, goalToolkit)),
 )
+
+/** Complete executable tool universe understood by this agent runtime. */
+export const toolUniverseToolkit = mergeToolkits(leaderToolkit, vcsToolkit)
 
 // =============================================================================
 // Role → Toolkit mapping
 // =============================================================================
 
-const ROLE_TOOLKITS: Record<RoleId, Toolkit> = {
-  leader:    leaderToolkit,
-  engineer:  workerBase,
-  artisan:   workerBase,
-  scientist: workerBase,
-  scout:     workerBase,
-  architect: workerBase,
-  critic:    criticBase,
-  advisor:   compactToolkit,
-}
-
 // =============================================================================
-// ToolKey — derived from leaderToolkit plus VCS keys
+// ToolKey — derived from the complete executable universe
 // =============================================================================
 
 /** Tools that should not be displayed in the UI */
@@ -143,83 +144,79 @@ export const HIDDEN_TOOLS: ReadonlySet<string> = new Set([
   'messageWorker', 'messageAdvisor', 'finishGoal', 'compact',
 ])
 
-export type ToolKey = ToolkitKeys<typeof leaderToolkit> | 'checkpointRollback' | 'checkpointChanges'
+export type ToolKey = ToolkitKeys<typeof toolUniverseToolkit>
 
 export function isToolKey(value: string): value is ToolKey {
-  return value in leaderToolkit.entries ||
-    value === 'checkpointRollback' ||
-    value === 'checkpointChanges'
+  return value in toolUniverseToolkit.entries
 }
+
+export interface AgentToolSelectionInput {
+  readonly roleId: RoleId
+  readonly configState: ConfigState
+  readonly solo: boolean
+  readonly vcsAvailable: boolean
+}
+
+function baseToolKeys(roleId: RoleId): readonly ToolKey[] {
+  switch (roleId) {
+    case 'leader':
+      return leaderToolkit.keys
+    case 'critic':
+      return criticBase.keys
+    case 'advisor':
+      return compactToolkit.keys
+    default:
+      return workerBase.keys
+  }
+}
+
+/** Sole policy for selecting ordered tool keys for an agent fork. */
+export function selectAgentToolKeys(input: AgentToolSelectionInput): readonly ToolKey[] {
+  const { roleId, configState, solo, vcsAvailable } = input
+  let keys = [...baseToolKeys(roleId)]
+
+  if (roleId === 'leader') {
+    keys = keys.filter(key => key !== 'messageAdvisor')
+    if (solo) {
+      const soloExcluded = new Set<ToolKey>(['createTask', 'updateTask', 'spawnWorker', 'killWorker', 'reassignWorker', 'messageWorker'])
+      keys = keys.filter(key => !soloExcluded.has(key))
+    }
+    if (vcsAvailable) keys.push('checkpointRollback', 'checkpointChanges')
+  }
+
+  const activeSlotId = ROLE_TO_SLOT[roleId]
+  const otherSlotId = activeSlotId === 'primary' ? 'secondary' : 'primary'
+  const activeSlot = configState.bySlot[activeSlotId]
+  const otherSlot = configState.bySlot[otherSlotId]
+  const activeHasVision = activeSlot._tag === 'Ready' && activeSlot.config.vision === true
+  const otherHasVision = otherSlot._tag === 'Ready' && otherSlot.config.vision === true
+  keys = keys.filter(key => key !== 'fileView' && key !== 'queryImage')
+  if (activeHasVision) keys.push('fileView')
+  else if (otherHasVision) keys.push('queryImage')
+
+  return keys
+}
+
+export function materializeAgentToolkit(universe: Toolkit, toolKeys: readonly string[]): Toolkit {
+  const missing = toolKeys.filter(key => !(key in universe.entries))
+  if (missing.length > 0) throw new Error(`Tool universe is missing selected keys: ${missing.join(', ')}`)
+  let bySelection = materializedToolkits.get(universe)
+  if (!bySelection) {
+    bySelection = new Map()
+    materializedToolkits.set(universe, bySelection)
+  }
+  const selection = JSON.stringify(toolKeys)
+  const existing = bySelection.get(selection)
+  if (existing) return existing
+  const toolkit = universe.pick(...toolKeys)
+  bySelection.set(selection, toolkit)
+  return toolkit
+}
+
+const materializedToolkits = new WeakMap<Toolkit, Map<string, Toolkit>>()
 
 // Convert a precise ToolKey to the erased branded type used in events.
 // This is a zero-cost cast — the brand is structural and adds no runtime overhead.
 export function toToolKeyErased(key: ToolKey): ToolKeyErased {
   return key as ToolKeyErased
-}
-
-/**
- * Get the static toolkit for a given role.
- * Returns a Toolkit with entries keyed by the canonical tool keys
- * (fileRead, shell, webSearch, etc.).
- */
-function getBaseToolkit(roleId: RoleId): Toolkit {
-  return ROLE_TOOLKITS[roleId]
-}
-
-/**
- * Merge VCS tool entries into a base toolkit.
- */
-function mergeVcsTools(base: Toolkit, vcsEntries: ReadonlyArray<VcsToolEntry>): Toolkit {
-  const allEntries: Record<string, any> = { ...base.entries }
-  for (const { key, tool } of vcsEntries) {
-    allEntries[key] = tool
-  }
-  return defineToolkit(allEntries)
-}
-
-/**
- * Get the effective toolkit for a role, with runtime availability filtering applied.
- *
- * Currently filters:
- * - `fileView`/`queryImage`: one removed based on model vision capability
- * - VCS tools: merged dynamically from the VCS service
- */
-export function getEffectiveToolkit(
-  roleId: RoleId,
-  configState: ConfigState,
-  vcsEntries?: ReadonlyArray<VcsToolEntry>,
-  options?: { solo?: boolean },
-): Toolkit {
-  let toolkit = getBaseToolkit(roleId)
-
-  // Merge VCS tools dynamically when provided
-  if (roleId === 'leader' && vcsEntries && vcsEntries.length > 0) {
-    toolkit = mergeVcsTools(toolkit, vcsEntries)
-  }
-
-  // TEMPORARILY DISABLED: advisor consultation.
-  // Keep advisorConsultToolkit and static ToolKey support for historical state,
-  // but remove messageAdvisor from all runtime tool availability surfaces.
-  if (roleId === 'leader' && 'messageAdvisor' in toolkit.entries) {
-    toolkit = toolkit.omit('messageAdvisor')
-  }
-
-  // Solo mode: remove task/worker tools from the leader toolkit.
-  if (roleId === 'leader' && options?.solo) {
-    for (const key of ['createTask', 'updateTask', 'spawnWorker', 'killWorker', 'reassignWorker', 'messageWorker'] as const) {
-      if (key in toolkit.entries) {
-        toolkit = toolkit.omit(key)
-      }
-    }
-  }
-
-  // Vision-based image tool selection
-  if ('fileView' in toolkit.entries) {
-    const hasVision = getSlotConfigForRole(configState, roleId)?.vision === true
-    toolkit = hasVision
-      ? toolkit.omit('queryImage')
-      : toolkit.omit('fileView')
-  }
-
-  return toolkit
 }
