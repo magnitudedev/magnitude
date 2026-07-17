@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest"
 import {
   ProviderIdSchema,
   ProviderModelIdSchema,
+  ModelDiscoveryOperationIdSchema,
   ReasoningEffortSchema,
   ReasoningProperty,
   VisionProperty,
   type ModelSummary,
 } from "@magnitudedev/sdk"
-import { reasoningEffortOptions, reasoningPropertyLabel, visionPropertyLabel } from "./model-properties"
+import { reasoningEffortControl, reasoningPropertyLabel, visionPropertyLabel } from "./model-properties"
 
 const defaultEffort = ReasoningEffortSchema.make("high")
 const lowEffort = ReasoningEffortSchema.make("low")
@@ -27,20 +28,29 @@ const model = (
 })
 
 describe("model property presentation", () => {
-  it("shows only the provider default before reasoning discovery", () => {
+  it("does not expose the provider fallback before reasoning discovery", () => {
     const value = model(new ReasoningProperty.states.Deferred({}))
 
-    expect(reasoningEffortOptions(value)).toEqual([
-      { value: defaultEffort, label: "High" },
-    ])
+    expect(reasoningEffortControl(value)).toEqual({ _tag: "Unavailable", label: "Load to inspect" })
     expect(reasoningPropertyLabel(value)).toContain("after loading")
   })
 
-  it("renders the exact cached effort list without a global catalog", () => {
+  it("renders exactly the cached effort list without inserting the default", () => {
     const value = model(new ReasoningProperty.states.Cached({ value: [defaultEffort, lowEffort] }))
 
-    expect(reasoningEffortOptions(value).map((option) => option.value)).toEqual([defaultEffort, lowEffort])
+    expect(reasoningEffortControl(value)).toEqual({
+      _tag: "Available",
+      options: [
+        { value: defaultEffort, label: "High" },
+        { value: lowEffort, label: "Low" },
+      ],
+    })
     expect(reasoningPropertyLabel(value)).toContain("cached")
+  })
+
+  it("represents active inspection without a selectable fallback", () => {
+    const value = model(new ReasoningProperty.states.Discovering({ operationId: ModelDiscoveryOperationIdSchema.make("inspection"), phase: "inspecting" }))
+    expect(reasoningEffortControl(value)).toEqual({ _tag: "Unavailable", label: "Inspecting…" })
   })
 
   it("renders resolved vision directly", () => {

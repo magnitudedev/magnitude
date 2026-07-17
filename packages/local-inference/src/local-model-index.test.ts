@@ -6,6 +6,7 @@ import {
   makeLocalModelIndexStore,
 } from "./local-model-index"
 import { LlamaFitAssessmentKey, NormalizedLlamaModelPath } from "./llamacpp"
+import { ReasoningEffortSchema } from "@magnitudedev/ai"
 
 describe("LocalModelIndexStore", () => {
   it("serializes independent artifact and discovered-property updates", async () => {
@@ -48,6 +49,44 @@ describe("LocalModelIndexStore", () => {
       fitAssessments: [],
     })
     expect(Schema.is(LocalModelIndexSchema)(index)).toBe(true)
+  })
+
+  it("round-trips reasoning profiles through their actual JSON representation", () => {
+    const index = {
+      ...emptyLocalModelIndex(),
+      discoveredProperties: [{
+        modelPath: "/models/thinking.gguf",
+        visionInspections: [],
+        reasoningInspections: [{
+          routeId: "managed:thinking",
+          fingerprint: "fingerprint-thinking",
+          profile: {
+            defaultReasoningEffort: ReasoningEffortSchema.make("high"),
+            effortMappings: [
+              {
+                reasoningEffort: ReasoningEffortSchema.make("none"),
+                templateOptions: { enableThinking: Option.some(false), reasoningEffort: Option.none() },
+                thinkingBudget: { _tag: "Disabled" as const },
+              },
+              {
+                reasoningEffort: ReasoningEffortSchema.make("high"),
+                templateOptions: { enableThinking: Option.some(true), reasoningEffort: Option.none() },
+                thinkingBudget: { _tag: "Enabled" as const, tokens: 4_096 },
+              },
+            ],
+          },
+        }],
+      }],
+    }
+
+    const encoded = Schema.encodeSync(LocalModelIndexSchema)(index)
+    const json = JSON.parse(JSON.stringify(encoded))
+    const decoded = Schema.decodeUnknownSync(LocalModelIndexSchema)(json)
+
+    expect(json.discoveredProperties[0].reasoningInspections[0].profile.effortMappings[0].templateOptions).toEqual({
+      enableThinking: false,
+    })
+    expect(decoded).toEqual(index)
   })
 
   it("rejects invalid cache contents", () => {

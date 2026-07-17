@@ -43,6 +43,8 @@ export const makeDirectoryModelSource = (options: DirectoryModelSourceOptions): 
     const root = path.resolve(options.root)
     const rootReal = yield* fs.realPath(root).pipe(Effect.mapError((error) => new SourceDiscoveryError({ sourceId: id, operation: "read-root", reason: normalizeFileSystemFailure(error), path: root })))
     const events: SourceDiscoveryEventType[] = []
+    const discoveredFiles = new Set<string>()
+    const visitedDirectories = new Set<string>([rootReal])
 
     const visit = (directory: string, depth: number): Effect.Effect<void, never> => Effect.gen(function* () {
       const names = yield* fs.readDirectory(directory).pipe(Effect.match({
@@ -70,8 +72,15 @@ export const makeDirectoryModelSource = (options: DirectoryModelSourceOptions): 
             continue
           }
           const targetInfo = yield* fs.stat(target.right).pipe(Effect.either)
-          if (targetInfo._tag === "Right" && targetInfo.right.type === "Directory" && options.recursive && depth < options.maxDepth) yield* visit(target.right, depth + 1)
-          else if (targetInfo._tag === "Right" && targetInfo.right.type === "File") files.push(sourceEntry(target.right, relative, targetInfo.right))
+          if (targetInfo._tag === "Right" && targetInfo.right.type === "Directory" && options.recursive && depth < options.maxDepth) {
+            if (!visitedDirectories.has(target.right)) {
+              visitedDirectories.add(target.right)
+              yield* visit(target.right, depth + 1)
+            }
+          } else if (targetInfo._tag === "Right" && targetInfo.right.type === "File" && !discoveredFiles.has(target.right)) {
+            discoveredFiles.add(target.right)
+            files.push(sourceEntry(target.right, relative, targetInfo.right))
+          }
           continue
         }
         const info = yield* fs.stat(absolute).pipe(Effect.either)
@@ -80,7 +89,13 @@ export const makeDirectoryModelSource = (options: DirectoryModelSourceOptions): 
           continue
         }
         if (info.right.type === "Directory" && options.recursive && depth < options.maxDepth) yield* visit(absolute, depth + 1)
-        else if (info.right.type === "File") files.push(sourceEntry(absolute, relative, info.right))
+        else if (info.right.type === "File") {
+          const canonical = yield* fs.realPath(absolute).pipe(Effect.either)
+          if (canonical._tag === "Right" && !discoveredFiles.has(canonical.right)) {
+            discoveredFiles.add(canonical.right)
+            files.push(sourceEntry(canonical.right, relative, info.right))
+          }
+        }
       }
       if (files.length > 0) {
         const relativeDirectory = path.relative(root, directory) || "."
@@ -112,12 +127,15 @@ export const makeDirectoryModelSource = (options: DirectoryModelSourceOptions): 
 
 const ManifestFile = Schema.Struct({
   key: SourceFileKey, path: Schema.String, role: ModelFileRoleSchema,
-  shardIndex: Schema.OptionFromUndefinedOr(Schema.NonNegativeInt), sizeBytes: Schema.NonNegativeInt, sha256: Sha256Digest,
+  shardIndex: Schema.optionalWith(Schema.NonNegativeInt, { as: "Option", exact: true }), sizeBytes: Schema.NonNegativeInt, sha256: Sha256Digest,
 })
 const ManifestRelationship = Schema.Struct({ kind: SourceFileRelationshipKind, from: SourceFileKey, to: SourceFileKey })
 const OwnedManifest = Schema.Struct({
   version: Schema.Literal(1), artifactKey: ModelArtifactKey, files: Schema.Array(ManifestFile), relationships: Schema.Array(ManifestRelationship),
-  origin: Schema.OptionFromUndefinedOr(Schema.Struct({ kind: Schema.Literal("huggingface"), repository: ModelOriginRepositoryId, revision: ModelOriginRevisionId })),
+  origin: Schema.optionalWith(
+    Schema.Struct({ kind: Schema.Literal("huggingface"), repository: ModelOriginRepositoryId, revision: ModelOriginRevisionId }),
+    { as: "Option", exact: true },
+  ),
 })
 type OwnedManifest = Schema.Schema.Type<typeof OwnedManifest>
 const OwnedManifestJson = Schema.parseJson(OwnedManifest, { space: 2 })

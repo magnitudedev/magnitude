@@ -5,22 +5,30 @@ export interface ReasoningEffortOption {
   readonly label: string
 }
 
+export type ReasoningEffortControl =
+  | { readonly _tag: "Available"; readonly options: readonly ReasoningEffortOption[] }
+  | { readonly _tag: "Unavailable"; readonly label: string }
+
 export function formatReasoningEffort(effort: ReasoningEffort): string {
   return String(effort)
     .replace(/[_-]+/g, " ")
     .replace(/\b\w/g, (character) => character.toUpperCase())
 }
 
-export function reasoningEffortOptions(model: ModelSummary): readonly ReasoningEffortOption[] {
+export function reasoningEffortControl(model: ModelSummary): ReasoningEffortControl {
   const property = model.properties.reasoning
-  const discovered = property._tag === "Cached" || property._tag === "Resolved" || property._tag === "Refreshing"
-    ? property.value
-    : [model.defaultReasoningEffort]
-  const efforts = [...new Set([model.defaultReasoningEffort, ...discovered])]
-  return efforts.map((value) => ({
-    value,
-    label: formatReasoningEffort(value),
-  }))
+  switch (property._tag) {
+    case "Cached":
+    case "Resolved":
+    case "Refreshing":
+      return {
+        _tag: "Available",
+        options: property.value.map((value) => ({ value, label: formatReasoningEffort(value) })),
+      }
+    case "Deferred": return { _tag: "Unavailable", label: "Load to inspect" }
+    case "Discovering": return { _tag: "Unavailable", label: property.phase === "loading" ? "Loading…" : "Inspecting…" }
+    case "Failed": return { _tag: "Unavailable", label: "Inspection failed" }
+  }
 }
 
 export function reasoningPropertyLabel(model: ModelSummary): string {

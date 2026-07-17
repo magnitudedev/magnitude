@@ -572,6 +572,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       .filter((route): route is ManagedRoute => route._tag === "Managed")
       .map((route) => [route.record.id, route] as const))
     const groups = new Map<ProviderModelId, { path: LlamaCpp.NormalizedLlamaModelPath; routes: LlamaLogicalRoute[] }>()
+    const managedModelPaths = new Set<string>()
     const addRoute = (providerModelId: ProviderModelId, path: LlamaCpp.NormalizedLlamaModelPath, route: LlamaLogicalRoute) => {
       const group = groups.get(providerModelId) ?? { path, routes: [] }
       group.routes.push(route)
@@ -583,6 +584,8 @@ export const LocalModelProviderSourceLive: Layer.Layer<
         ? undefined
         : retainedManagedRoutes.get(record.id)
       if (retainedRoute) {
+        if (managedModelPaths.has(retainedRoute.modelPath)) return
+        managedModelPaths.add(retainedRoute.modelPath)
         const loaded = Option.exists(runtime, ({ instances }) => instances.some((instance) =>
           instance.ownership === "managed" && instance.models.some((model) =>
             (String(model.id) === retainedRoute.request?.servedModelId || Option.contains(model.reportedModelPath, retainedRoute.modelPath))
@@ -598,6 +601,8 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       if (Option.isNone(resolved)) return
       const modelPath = LlamaCpp.normalizeLlamaModelPath(resolved.value.primaryPath)
       if (!modelPath || !LlamaCpp.isAbsoluteLlamaModelPath(modelPath)) return
+      if (managedModelPaths.has(modelPath)) return
+      managedModelPaths.add(modelPath)
       const providerModelId = providerModelIdForModelPath(modelPath)
       const context = record.metadata.trainedContextTokens
       const profile = Option.isSome(context) ? yield* profileFor(context.value) : undefined
@@ -631,7 +636,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
         fitAssessment: Option.none(),
         productRank: productRankFor(record),
       })
-    }), { concurrency: 4, discard: true })
+    }), { concurrency: 1, discard: true })
 
     if (Option.isSome(runtime)) {
       for (const [priority, instance] of runtime.value.instances.entries()) {
@@ -1011,7 +1016,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
   ) => Effect.gen(function* () {
     const routes = logical.routes.filter(routeCanBeAcquired)
     if (routes.length === 0) return yield* acquisitionError(logical.providerModelId, "No usable serving route exists for this model.")
-    const results = yield* Effect.forEach(routes, (route) =>
+    const outcomes = yield* Effect.forEach(routes, (route) =>
       Effect.scoped(Effect.gen(function* () {
         const lease = yield* acquireRoute(logical, route)
         return yield* inspectLoadedRoute(logical, route, {
@@ -1019,7 +1024,13 @@ export const LocalModelProviderSourceLive: Layer.Layer<
           authorization: lease.target.authorization,
           servedModelId: LlamaServedModelIdSchema.make(lease.target.model),
         }, requested).pipe(Effect.mapError((cause) => acquisitionError(logical.providerModelId, cause)))
-      })), { concurrency: 1 })
+      })).pipe(Effect.either), { concurrency: 1 })
+    const failures = outcomes.flatMap((outcome) => outcome._tag === "Left" ? [outcome.left] : [])
+    const results = outcomes.flatMap((outcome) => outcome._tag === "Right" ? [outcome.right] : [])
+    yield* Effect.forEach(failures, (cause) => Effect.logWarning("Local model route inspection failed").pipe(
+      Effect.annotateLogs({ providerModelId: logical.providerModelId, cause: String(cause) }),
+    ), { discard: true })
+    if (results.length === 0) return yield* failures[0]!
     return results.at(-1)!
   })
 

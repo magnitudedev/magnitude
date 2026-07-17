@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest"
-import { Option } from "effect"
-import { buildLlamaCppReasoningProfile } from "./reasoning-profile"
+import { Option, Schema } from "effect"
+import {
+  buildLlamaCppReasoningProfile,
+  LlamaCppReasoningProfileSchema,
+  LlamaCppReasoningTemplateOptionsSchema,
+} from "./reasoning-profile"
 import {
   LlamaCppNativeReasoningEffortSchema,
   llamaCppReasoningDefinitionForNativeValue,
@@ -11,6 +15,26 @@ const definition = (nativeValue: string) => llamaCppReasoningDefinitionForNative
 )
 
 describe("llama.cpp reasoning profile construction", () => {
+  it("omits absent template options from JSON", () => {
+    const profile = buildLlamaCppReasoningProfile({ enableThinkingToggle: true, symbolicEfforts: [] })
+    const encoded = Schema.encodeSync(LlamaCppReasoningProfileSchema)(profile)
+    expect(encoded.effortMappings.map(({ templateOptions }) => templateOptions)).toEqual([
+      { enableThinking: false },
+      { enableThinking: true },
+    ])
+    expect(Schema.decodeUnknownSync(LlamaCppReasoningProfileSchema)(JSON.parse(JSON.stringify(encoded)))).toEqual(profile)
+  })
+
+  it("reads the legacy nullable template-option encoding", () => {
+    expect(Schema.decodeUnknownSync(LlamaCppReasoningTemplateOptionsSchema)({
+      enableThinking: null,
+      reasoningEffort: null,
+    })).toEqual({
+      enableThinking: Option.none(),
+      reasoningEffort: Option.none(),
+    })
+  })
+
   it("uses the policy toggle fallbacks when only the boolean control is detected", () => {
     expect(buildLlamaCppReasoningProfile({
       enableThinkingToggle: true,

@@ -7,7 +7,7 @@ import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
-import { deriveLlamaCppInstallationManagementView, reasoningEffortOptions, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
+import { deriveLlamaCppInstallationManagementView, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
 import { ModelCatalogLifecycle, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
@@ -212,10 +212,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     }
     return Option.match(selectedForSlot(dropdownTarget.slotId), {
       onNone: () => [],
-      onSome: ({ model }) => reasoningEffortOptions(model).map((option) => ({
-          id: option.value,
-          label: option.label,
-        })),
+      onSome: ({ model }) => {
+        const control = reasoningEffortControl(model)
+        return control._tag === 'Available'
+          ? control.options.map((option) => ({ id: option.value, label: option.label }))
+          : []
+      },
     })
   }, [dropdownTarget, models, selectedForSlot])
 
@@ -538,9 +540,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           const modelLabel = Option.match(selected, { onNone: () => '—', onSome: ({ model }) => model.displayName })
           const thinkingLabel = Option.match(selected, {
             onNone: () => '—',
-            onSome: ({ model, slot }) => reasoningEffortOptions(model)
-              .find((option) => option.value === slot.selection.reasoningEffort)?.label ?? '—',
+            onSome: ({ model, slot }) => {
+              const control = reasoningEffortControl(model)
+              return control._tag === 'Available'
+                ? control.options.find((option) => option.value === slot.selection.reasoningEffort)?.label ?? '—'
+                : control.label
+            },
           })
+          const thinkingAvailable = Option.exists(selected, ({ model }) => reasoningEffortControl(model)._tag === 'Available')
           const loading = catalogLoading
           const isThisDropdownOpen = dropdownTarget?.slotId === slotId
 
@@ -621,17 +628,19 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                   return (
                     <box style={{ position: 'relative', flexDirection: 'column', width: w, zIndex: 200 }}>
                       <Button
-                        onClick={() => isOpen ? closeDropdown() : openDropdown({ slotId, field: 'thinking' })}
+                        onClick={() => {
+                          if (thinkingAvailable) isOpen ? closeDropdown() : openDropdown({ slotId, field: 'thinking' })
+                        }}
                         onMouseOver={() => setThinkingHovered(prev => ({ ...prev, [slotId]: true }))}
                         onMouseOut={() => setThinkingHovered(prev => ({ ...prev, [slotId]: false }))}
                         style={{
                           borderStyle: 'rounded',
-                          borderColor: isOpen || thinkingHovered[slotId] ? theme.primary : theme.border,
+                          borderColor: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.primary : theme.border,
                           paddingLeft: 1, paddingRight: 1, width: w, flexDirection: 'row',
                         }}
                       >
-                        <text style={{ fg: isOpen || thinkingHovered[slotId] ? theme.primary : theme.foreground, flexGrow: 1 }}>{padded}</text>
-                        <text style={{ fg: isOpen || thinkingHovered[slotId] ? theme.primary : theme.muted }}>{arrow}</text>
+                        <text style={{ fg: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.primary : thinkingAvailable ? theme.foreground : theme.muted, flexGrow: 1 }}>{padded}</text>
+                        <text style={{ fg: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.primary : theme.muted }}>{arrow}</text>
                       </Button>
                       {isOpen && (
                         <box style={{
