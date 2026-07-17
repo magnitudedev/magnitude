@@ -5,14 +5,12 @@
  * the CLI's slash-command surface (overlays, system messages, bash mode).
  */
 import { useCallback, useMemo, useRef, type ReactNode } from 'react'
-import { Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
-import { Option } from 'effect'
+import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import type { KeyEvent } from '@opentui/core'
 import {
   useComposerState,
   useInterruptActions,
   useSessionActions,
-  useModelConfig,
   useSlotProfiles,
   useDisplayState,
   getFork,
@@ -29,13 +27,13 @@ import {
   type CommandContext,
 } from '@magnitudedev/client-common'
 import type { RawMessageAttachment } from '@magnitudedev/sdk'
-import { ModelSlotsLifecycle, ROLE_TO_SLOT } from '@magnitudedev/sdk'
+import { ROLE_TO_SLOT } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
 import { showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
 import { INIT_PROMPT } from '../../commands/init-prompt'
 import { Composer } from './composer'
-import { allowProviderMessageSend, hasExplicitModelSlots } from './provider-send-guard'
+import { allowProviderMessageSend } from './provider-send-guard'
 
 export function ComposerContainer({
   chatColumnWidth,
@@ -62,24 +60,6 @@ export function ComposerContainer({
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
   const { startNewSession } = useSessionActions()
-  const modelConfig = useModelConfig()
-  const slotConfig = Option.getOrNull(Option.flatMap(Result.value(modelConfig.slots), ({ state }) =>
-    ModelSlotsLifecycle.match(state, {
-      loading: () => Option.none(),
-      ready: ({ config }) => Option.some(config.slots),
-      refreshing: ({ config }) => Option.some(config.slots),
-      degraded: ({ config }) => Option.some(config.slots),
-      unavailable: ({ config }) => Option.some(config.slots),
-    })))
-
-  // The onboarding snapshot and model configuration are invalidated by the
-  // same activation mutation, but they are separate RPC projections. During
-  // the transition out of onboarding, the snapshot can briefly retain its
-  // pre-activation value while the model-slot snapshot already contains the slots
-  // that were just persisted. Explicit slots are sufficient proof that a
-  // provider is configured; provider availability failures belong to the send
-  // path and must be surfaced as their real error, not as "not configured".
-  const canSendMessages = modelsConfigured || hasExplicitModelSlots(slotConfig)
 
   const showErrorToast = useCallback((message: string) => {
     addEphemeralMessage(message, theme.error)
@@ -109,7 +89,7 @@ export function ComposerContainer({
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
-    if (!allowProviderMessageSend(canSendMessages, showErrorToast)) return
+    if (!allowProviderMessageSend(modelsConfigured, showErrorToast)) return
     composer.handleSend(text)
   }
 
@@ -154,7 +134,7 @@ export function ComposerContainer({
       status={rootTimeline?.mode ?? 'idle'}
       hasRunningForks={(rootActor?.work.activeChildCount ?? 0) > 0}
       bashMode={composer.bashMode}
-      modelsConfigured={canSendMessages}
+      modelsConfigured={modelsConfigured}
       modelSummary={{
         role: rootRoleLabel,
         model: composer.model || '-',
