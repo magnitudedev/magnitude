@@ -14,7 +14,7 @@ import {
 } from "@magnitudedev/sdk"
 import { selectedSlotModel } from "./model-slots"
 
-const defaultEffort = ReasoningEffortSchema.make("Default")
+const defaultEffort = ReasoningEffortSchema.make("high")
 
 const model = (id: string): ModelSummary => ({
   providerId: ProviderIdSchema.make("llamacpp"),

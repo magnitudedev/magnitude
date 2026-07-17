@@ -35,6 +35,7 @@ export interface LlamaCppCallOptions {
   readonly maxTokens?: number
   readonly toolChoice?: LlamaCppToolChoice
   readonly chatTemplateKwargs?: Readonly<Record<string, unknown>>
+  readonly thinkingBudgetTokens?: number
   readonly temperature?: number
   readonly topP?: number
   readonly stop?: readonly string[]

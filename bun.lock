@@ -254,6 +254,7 @@
         "@huggingface/gguf": "0.4.2",
         "@huggingface/hub": "2.13.3",
         "@huggingface/tasks": "0.21.24",
+        "@magnitudedev/ai": "workspace:*",
         "effect": "3.21.2",
       },
       "devDependencies": {
@@ -385,6 +386,7 @@
       "dependencies": {
         "@effect/platform": "^0.96.0",
         "@effect/platform-bun": "^0.90.0",
+        "@magnitudedev/ai": "workspace:*",
         "@magnitudedev/scratchpad": "workspace:*",
         "effect": "^3.21.2",
       },

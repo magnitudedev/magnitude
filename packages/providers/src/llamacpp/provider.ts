@@ -30,6 +30,7 @@ export interface LlamaCppInferenceLease {
   readonly servedModelId: LlamaServedModelId
   readonly reasoningEffort: ReasoningEffort
   readonly chatTemplateKwargs: Option.Option<Readonly<Record<string, unknown>>>
+  readonly thinkingBudgetTokens: Option.Option<number>
 }
 
 /**
@@ -126,6 +127,7 @@ const dynamicBoundModel = (
           defaults: {
             ...callOptions(options?.defaults),
             ...(Option.isSome(lease.chatTemplateKwargs) ? { chatTemplateKwargs: lease.chatTemplateKwargs.value } : {}),
+            ...(Option.isSome(lease.thinkingBudgetTokens) ? { thinkingBudgetTokens: lease.thinkingBudgetTokens.value } : {}),
           },
           ...(options?.imagePlaceholders ? { imagePlaceholders: options.imagePlaceholders } : {}),
         }),

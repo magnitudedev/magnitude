@@ -27,6 +27,9 @@ const llamacppOptions = {
   chatTemplateKwargs: Option.define(
     (v: Readonly<Record<string, unknown>>) => ({ chat_template_kwargs: v }),
   ),
+  thinkingBudgetTokens: Option.define(
+    (v: number) => ({ thinking_budget_tokens: v }),
+  ),
   temperature: Option.define(
     (v: number) => ({ temperature: v }),
   ),
