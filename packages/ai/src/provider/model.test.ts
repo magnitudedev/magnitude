@@ -24,10 +24,13 @@ describe("provider identity brands", () => {
       displayName: "Qwen 3",
       contextWindow: 32_768,
       maxOutputTokens: 8_192,
-      capabilities: { vision: false },
+      defaultReasoningEffort: "none",
+      properties: {
+        vision: { _tag: "Resolved", value: false },
+        reasoning: { _tag: "Resolved", value: ["none"] },
+      },
       availability: { _tag: "Available" },
       pricing: { input: 0, output: 0, cached_input: null },
-      reasoningEfforts: ["none"],
     })
 
     expect(model.providerId).toBe("llamacpp")

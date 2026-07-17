@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Effect, Ref } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import type { ProviderAuth } from "@magnitudedev/protocol"
-import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, type ProviderClientShape } from "@magnitudedev/sdk"
+import { ModelDiscoveryOperationIdSchema, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty, type ProviderClientShape } from "@magnitudedev/sdk"
 import {
   makeDelegatingProviderClient,
   resolveEndpointProviderAuthFromStorage,
@@ -74,9 +74,12 @@ const providerClient = (label: string): ProviderClientShape => ({
       displayName: label,
       contextWindow: 1,
       maxOutputTokens: 1,
-      capabilities: { vision: false },
+      defaultReasoningEffort: ReasoningEffortSchema.make("none"),
+      properties: {
+        vision: new VisionProperty.states.Resolved({ value: false }),
+        reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make("none")] }),
+      },
       availability: { _tag: "Available" },
-      reasoningEfforts: [],
       pricing: { input: 0, output: 0, cached_input: null },
     }]),
     get: () => Effect.die("not used"),
@@ -89,6 +92,8 @@ const providerClient = (label: string): ProviderClientShape => ({
   listProviders: Effect.succeed([]),
   sessionId: "session",
   resolveModel: () => Effect.die("not used"),
+  discoverModelProperties: () => Effect.succeed(ModelDiscoveryOperationIdSchema.make("test")),
+  requestAttribution: () => ({ requestStarted: Effect.void }),
   webSearch: () => Effect.die("not used"),
   usage: () => Effect.die("not used"),
   runtimeConfig: { disableTraits: false },

@@ -21,11 +21,11 @@ export const LlamaServerHealth = Schema.Literal("ready", "loading", "unavailable
 export type LlamaServerHealth = Schema.Schema.Type<typeof LlamaServerHealth>
 export const LlamaServerMode = Schema.Literal("router", "single-model", "unknown")
 export type LlamaServerMode = Schema.Schema.Type<typeof LlamaServerMode>
-export const LlamaServerOperation = Schema.Literal("health", "models", "props", "events", "load", "unload")
+export const LlamaServerOperation = Schema.Literal("health", "models", "props", "apply-template", "events", "load", "unload")
 export type LlamaServerOperation = Schema.Schema.Type<typeof LlamaServerOperation>
 export const LlamaServerFailureReason = Schema.Literal("transport", "rejected", "invalid-response")
 export type LlamaServerFailureReason = Schema.Schema.Type<typeof LlamaServerFailureReason>
-export const LlamaServerResponseSchema = Schema.Literal("HealthResponse", "ModelsResponse", "PropsResponse", "ModelEvent")
+export const LlamaServerResponseSchema = Schema.Literal("HealthResponse", "ModelsResponse", "PropsResponse", "ApplyTemplateResponse", "ModelEvent")
 export type LlamaServerResponseSchema = Schema.Schema.Type<typeof LlamaServerResponseSchema>
 export const LlamaServerMethod = Schema.Literal("GET", "POST")
 export type LlamaServerMethod = Schema.Schema.Type<typeof LlamaServerMethod>
@@ -114,6 +114,11 @@ export interface LlamaRouterController {
 export interface LlamaServerClient {
   readonly observer: LlamaServerObserver
   readonly controller: LlamaRouterController
+  readonly props: (model: Option.Option<LlamaServedModelId>) => Effect.Effect<LlamaModelProperties, LlamaServerError>
+  readonly applyTemplate: (
+    model: LlamaServedModelId,
+    request: LlamaApplyTemplateRequest,
+  ) => Effect.Effect<LlamaApplyTemplateResponse, LlamaServerError>
 }
 export interface LlamaServerClientOptions {
   readonly origin: URL
@@ -185,8 +190,37 @@ const PropsResponse = Schema.Struct({
   model_path: Schema.optional(Schema.String),
   model_ftype: Schema.optional(Schema.String),
   default_generation_settings: Schema.optional(Schema.Struct({ n_ctx: Schema.optional(NonNegative) })),
+  modalities: Schema.optional(Schema.Struct({
+    vision: Schema.optional(Schema.Boolean),
+    audio: Schema.optional(Schema.Boolean),
+    video: Schema.optional(Schema.Boolean),
+  })),
+  chat_template: Schema.optional(Schema.String),
+  chat_template_tool_use: Schema.optional(Schema.String),
 })
 type PropsResponse = Schema.Schema.Type<typeof PropsResponse>
+export const LlamaModelPropertiesSchema = Schema.Struct({
+  modelPath: Schema.OptionFromSelf(NormalizedLlamaModelPath),
+  contextTokens: Schema.OptionFromSelf(NonNegative),
+  modalities: Schema.Struct({
+    vision: Schema.Boolean,
+    audio: Schema.Boolean,
+    video: Schema.Boolean,
+  }),
+  build: Schema.OptionFromSelf(Schema.String),
+  chatTemplate: Schema.OptionFromSelf(Schema.String),
+  chatTemplateToolUse: Schema.OptionFromSelf(Schema.String),
+})
+export type LlamaModelProperties = typeof LlamaModelPropertiesSchema.Type
+
+export interface LlamaApplyTemplateRequest {
+  readonly messages: readonly Record<string, unknown>[]
+  readonly tools?: readonly Record<string, unknown>[]
+  readonly toolChoice?: unknown
+  readonly chatTemplateKwargs?: Readonly<Record<string, unknown>>
+}
+const ApplyTemplateResponse = Schema.Struct({ prompt: Schema.String })
+export type LlamaApplyTemplateResponse = typeof ApplyTemplateResponse.Type
 const HealthResponse = Schema.Struct({ status: Schema.Literal("ok") })
 const ModelEvent = Schema.parseJson(Schema.Struct({
   model: Schema.Union(Schema.Literal("*"), LlamaServedModelIdSchema),
@@ -327,6 +361,37 @@ export const makeLlamaServerClient = (
     )
   }
 
+  const modelProperties = (model: Option.Option<LlamaServedModelId>) => props(model).pipe(
+    Effect.map((value): LlamaModelProperties => ({
+      modelPath: pipe(optionalText(value.model_path), Option.flatMap((path) => Option.fromNullable(normalizeLlamaModelPath(path)))),
+      contextTokens: propsContextSize(Option.some(value)),
+      modalities: {
+        vision: value.modalities?.vision === true,
+        audio: value.modalities?.audio === true,
+        video: value.modalities?.video === true,
+      },
+      build: optionalText(value.build_info),
+      chatTemplate: Option.fromNullable(value.chat_template),
+      chatTemplateToolUse: Option.fromNullable(value.chat_template_tool_use),
+    })),
+  )
+
+  const applyTemplate = (model: LlamaServedModelId, templateRequest: LlamaApplyTemplateRequest) => {
+    const query = `?model=${encodeURIComponent(model)}&autoload=false`
+    const body = {
+      model,
+      messages: [...templateRequest.messages],
+      ...(templateRequest.tools === undefined ? {} : { tools: [...templateRequest.tools] }),
+      ...(templateRequest.toolChoice === undefined ? {} : { tool_choice: templateRequest.toolChoice }),
+      ...(templateRequest.chatTemplateKwargs === undefined ? {} : { chat_template_kwargs: templateRequest.chatTemplateKwargs }),
+    }
+    return json("apply-template", "ApplyTemplateResponse", ApplyTemplateResponse, `/apply-template${query}`, "POST", Option.some(body)).pipe(
+      Effect.catchTag("LlamaServerError", (error) => Option.contains(error.status, 404)
+        ? json("apply-template", "ApplyTemplateResponse", ApplyTemplateResponse, `/v1/apply-template${query}`, "POST", Option.some(body))
+        : Effect.fail(error)),
+    )
+  }
+
   const health = request("health", "/health").pipe(
     Effect.flatMap((response) => response.json.pipe(
       Effect.mapError(() => new LlamaServerError({ operation: "health", reason: "invalid-response", status: Option.none(), schema: Option.some("HealthResponse"), issues: noIssues })),
@@ -445,6 +510,8 @@ export const makeLlamaServerClient = (
   ).pipe(Effect.asVoid)
 
   return {
+    props: modelProperties,
+    applyTemplate,
     observer: {
       health,
       models,

@@ -1,24 +1,23 @@
 import { Ambient, AmbientServiceTag } from '@magnitudedev/event-core'
-import { Effect } from 'effect'
-import { FetchHttpClient } from '@effect/platform'
+import { Effect, Option } from 'effect'
 
-import { ProviderClient } from '@magnitudedev/sdk'
 import {
-  resolveSlotModel,
-  type SlotId,
-} from '@magnitudedev/roles'
-import {
-  type ModelProfile,
-  type ProviderModel,
-} from '@magnitudedev/ai'
+  ModelCatalogLifecycle,
+  ModelSlotsLifecycle,
+  type ModelCatalog,
+  type ModelSlots,
+  type ModelSummary,
+  type SlotStates,
+} from '@magnitudedev/sdk'
+import { type SlotId } from '@magnitudedev/roles'
+import { type ReasoningEffort } from '@magnitudedev/ai'
 import {
   computeContextLimits,
   DEFAULT_CONTEXT_LIMIT_POLICY,
   type ResolvedContextLimitPolicy,
   type MagnitudeStorageShape,
-  type ModelConfig,
 } from '@magnitudedev/storage'
-import { ROLE_TO_SLOT, SLOT_IDS, DEFAULT_REASONING_EFFORT, type RoleId } from '@magnitudedev/roles'
+import { ROLE_TO_SLOT, SLOT_IDS, type RoleId } from '@magnitudedev/roles'
 
 import { OUTPUT_TOKEN_RESERVE } from '../constants'
 
@@ -26,10 +25,11 @@ export interface SlotConfig {
   readonly slotId: SlotId
   readonly providerId: string
   readonly providerModelId: string
-  readonly profile: ModelProfile
+  readonly profile: { readonly contextWindow: number; readonly maxOutputTokens: number }
+  readonly vision: boolean | undefined
   readonly hardCap: number
   readonly softCap: number
-  readonly reasoningEffort: string
+  readonly reasoningEffort: ReasoningEffort
   readonly isUserOverride: boolean
   readonly isFallback: boolean
 }
@@ -57,46 +57,6 @@ export class NoModelForSlotError extends Error {
   }
 }
 
-export function buildConfigState<T extends ProviderModel & { readonly slots?: readonly SlotId[] }>(
-  catalogModels: readonly T[] | null,
-  userConfig: ModelConfig | null,
-  policy: ResolvedContextLimitPolicy,
-): ConfigState {
-  const bySlot = {} as Record<SlotId, SlotConfig>
-  for (const slotId of SLOT_IDS) {
-    const userSlotConfig = userConfig?.slots?.[slotId]
-    const intent = userConfig?.localSlotIntent?.[slotId]
-    const eligibleModels = intent === 'local'
-      ? catalogModels?.filter((model) => model.providerId === 'llamacpp') ?? null
-      : intent === 'cloud'
-        ? catalogModels?.filter((model) => model.providerId !== 'llamacpp') ?? null
-        : catalogModels
-    const resolved = resolveSlotModel(eligibleModels, userSlotConfig, slotId)
-    if (resolved === null) {
-      throw new NoModelForSlotError(slotId)
-    }
-
-    const reasoningEffort = userSlotConfig?.reasoningEffort
-      ?? DEFAULT_REASONING_EFFORT[slotId]
-
-    const hardCap = resolved.profile.contextWindow - OUTPUT_TOKEN_RESERVE
-    const { softCap } = computeContextLimits(hardCap, policy)
-
-    bySlot[slotId] = {
-      slotId,
-      providerId: resolved.providerId,
-      providerModelId: resolved.providerModelId,
-      profile: resolved.profile,
-      hardCap,
-      softCap,
-      reasoningEffort,
-      isUserOverride: resolved.isUserOverride,
-      isFallback: resolved.isFallback,
-    }
-  }
-  return { bySlot, catalogLoaded: catalogModels !== null }
-}
-
 export const ConfigAmbient = Ambient.define<ConfigState, never>({
   name: 'Config',
   initial: Effect.succeed({
@@ -105,22 +65,67 @@ export const ConfigAmbient = Ambient.define<ConfigState, never>({
   }),
 })
 
-export function publishConfigFromCatalog(storage: MagnitudeStorageShape) {
+export function buildConfigStateFromSlots(
+  catalogModels: readonly ModelSummary[],
+  slots: SlotStates,
+  policy: ResolvedContextLimitPolicy,
+): ConfigState {
+  const bySlot = {} as Record<SlotId, SlotConfig>
+  for (const slotId of SLOT_IDS) {
+    const slot = slots[slotId]
+    if (slot._tag !== 'Ready') throw new NoModelForSlotError(slotId)
+    const hardCap = slot.contextWindow - OUTPUT_TOKEN_RESERVE
+    const { softCap } = computeContextLimits(hardCap, policy)
+    const selectedModel = catalogModels.find((model) => model.providerId === slot.selection.providerId
+      && model.providerModelId === slot.selection.providerModelId)
+    const visionProperty = selectedModel?.properties.vision
+    const vision = visionProperty?._tag === 'Cached' || visionProperty?._tag === 'Resolved' || visionProperty?._tag === 'Refreshing'
+      ? visionProperty.value
+      : undefined
+    bySlot[slotId] = {
+      slotId,
+      providerId: slot.selection.providerId,
+      providerModelId: slot.selection.providerModelId,
+      profile: { contextWindow: slot.contextWindow, maxOutputTokens: slot.maxOutputTokens },
+      vision,
+      hardCap,
+      softCap,
+      reasoningEffort: slot.selection.reasoningEffort,
+      isUserOverride: slot.source === 'user',
+      isFallback: false,
+    }
+  }
+  return { bySlot, catalogLoaded: true }
+}
+
+export function publishConfigFromModelResources(
+  storage: MagnitudeStorageShape,
+  modelCatalog: Effect.Effect<ModelCatalog>,
+  modelSlots: Effect.Effect<ModelSlots>,
+) {
   return Effect.gen(function* () {
-    const client = yield* ProviderClient
     const ambientService = yield* AmbientServiceTag
-
-    const models = yield* client.catalog.list.pipe(
-      Effect.provide(FetchHttpClient.layer),
-      Effect.catchAll((err) =>
-        Effect.logWarning(`Failed to fetch model catalog: ${err}`)
-          .pipe(Effect.as(null))
-      ),
-    )
-
+    const catalog = yield* modelCatalog
+    const slotSnapshot = yield* modelSlots
+    const models = ModelCatalogLifecycle.match(catalog.state, {
+      loading: () => [] as readonly ModelSummary[],
+      ready: ({ models }) => models,
+      refreshing: ({ models }) => models,
+      degraded: ({ models }) => models,
+      unavailable: () => [] as readonly ModelSummary[],
+    })
+    const slots = Option.match(ModelSlotsLifecycle.match(slotSnapshot.state, {
+      loading: () => Option.none<SlotStates>(),
+      ready: ({ slots }) => Option.some(slots),
+      refreshing: ({ slots }) => Option.some(slots),
+      degraded: ({ slots }) => Option.some(slots),
+      unavailable: ({ slots }) => Option.some(slots),
+    }), {
+      onNone: () => { throw new NoModelForSlotError('primary') },
+      onSome: (value) => value,
+    })
     const policy = yield* storage.config.getContextLimitPolicy()
-    const modelConfig = yield* storage.config.getModelConfig()
-    const newState = Effect.sync(() => buildConfigState(models, modelConfig, policy))
+    const newState = Effect.sync(() => buildConfigStateFromSlots(models, slots, policy))
 
     yield* ambientService.update(
       ConfigAmbient,

@@ -1,7 +1,7 @@
 import * as BunContext from "@effect/platform-bun/BunContext"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
-import { Effect, Option, Stream } from "effect"
+import { Effect, Option, Ref, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelArtifactKey,
@@ -112,19 +112,27 @@ describe("ModelFileRegistry", () => {
       const registry = yield* makeModelFileRegistry({
         sources: [ModelFileSourceRegistration.ReadOnly({ source })],
         formats: [format],
+        initialIndex: Option.none(),
       })
+      const changes = yield* Ref.make(0)
+      yield* registry.changes.pipe(
+        Stream.runForEach(() => Ref.update(changes, (current) => current + 1)),
+        Effect.forkScoped,
+      )
+      yield* Effect.yieldNow()
       const initial = yield* registry.inspect("changed")
-      const persistedIndex = yield* registry.index!
+      const persistedIndex = yield* registry.artifactIndex
       const hydratedRegistry = yield* makeModelFileRegistry({
         sources: [ModelFileSourceRegistration.ReadOnly({ source })],
         formats: [format],
-        initialIndex: persistedIndex,
+        initialIndex: Option.some(persistedIndex),
       })
       const hydrated = yield* hydratedRegistry.inspect("cached")
       const afterHydration = { discoveryCount, inspectionCount }
       yield* registry.inspect("cached")
       const afterCached = { discoveryCount, inspectionCount }
       yield* registry.inspect("changed")
+      yield* Effect.yieldNow()
       const afterChanged = { discoveryCount, inspectionCount }
       yield* registry.inspect("full")
       const afterFull = { discoveryCount, inspectionCount }
@@ -142,6 +150,7 @@ describe("ModelFileRegistry", () => {
         afterFull,
         primaryPath: beforeChange.primaryPath,
         afterChange,
+        changes: yield* Ref.get(changes),
       }
     }).pipe(Effect.provide(BunContext.layer))))
 
@@ -155,5 +164,6 @@ describe("ModelFileRegistry", () => {
     if (result.afterChange._tag === "Left") {
       expect(result.afterChange.left.reason).toBe("changed")
     }
+    expect(result.changes).toBe(1)
   })
 })

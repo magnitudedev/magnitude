@@ -5,5 +5,3 @@ export { classifyMagnitudeRejectedResponse, tryParseErrorBody, type ParsedMagnit
 export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./contract"
 export type { MagnitudeModelInfo, MagnitudeRawModel, ModelListResponse, ToolChoice, MagnitudeAdditionalOptions, MagnitudeApiError, MagnitudeErrorType, MagnitudeErrorCode, MagnitudeErrorDetails, UsageLimitDetails, SubscriptionRequiredDetails, BillingWindowBudget, BillingWindowName, ProSubscriptionStatus, ReasoningEffort, ModelPricingInfo } from "./contract"
 export type { CloudUsageResponse, UsagePeriod } from "./usage"
-export type { ModelProfile } from "@magnitudedev/ai"
-export { toModelProfile } from "@magnitudedev/ai"

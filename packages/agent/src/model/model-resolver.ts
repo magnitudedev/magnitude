@@ -1,5 +1,5 @@
 import { Context, Effect, Layer } from 'effect'
-import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema } from '@magnitudedev/sdk'
+import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import type { RoleId } from '../agents/role-validation'
 import { ConfigAmbient, getSlotConfig, getSlotConfigForRole, type SlotConfig } from '../ambient/config-ambient'
@@ -29,7 +29,18 @@ export class AgentModelResolver extends Context.Tag('AgentModelResolver')<
   AgentModelResolverService
 >() {}
 
-export const AgentModelResolverLive = (debug?: boolean) =>
+export interface ReasoningEffortFallbackInput {
+  readonly slotId: SlotId
+  readonly providerId: ProviderId
+  readonly providerModelId: ProviderModelId
+  readonly requested: ReasoningEffort
+  readonly fallback: ReasoningEffort
+}
+
+export const AgentModelResolverLive = (
+  debug?: boolean,
+  applyReasoningEffortFallback: (input: ReasoningEffortFallbackInput) => Effect.Effect<void, unknown> = () => Effect.void,
+) =>
   Layer.effect(
     AgentModelResolver,
     Effect.gen(function* () {
@@ -50,13 +61,25 @@ export const AgentModelResolverLive = (debug?: boolean) =>
         return Effect.gen(function* () {
           const defaults = {
             maxTokens: options.maxTokensOverride ?? slotConfig.profile.maxOutputTokens,
-            reasoningEffort: slotConfig.reasoningEffort,
+            reasoningEffort: ReasoningEffortSchema.make(slotConfig.reasoningEffort),
           }
-          const capabilities = { vision: slotConfig.profile.capabilities.vision }
 
-          const rawModel = yield* client.resolveModel(ProviderIdSchema.make(slotConfig.providerId), ProviderModelIdSchema.make(slotConfig.providerModelId), {
+          const providerId = ProviderIdSchema.make(slotConfig.providerId)
+          const providerModelId = ProviderModelIdSchema.make(slotConfig.providerModelId)
+          const rawModel = yield* client.resolveModel(providerId, providerModelId, {
             defaults,
-            capabilities,
+            requestAttribution: client.requestAttribution(
+              providerId,
+              providerModelId,
+              slotConfig.slotId,
+            ),
+            reasoningEffortFallback: (requested, fallback) => applyReasoningEffortFallback({
+              slotId: slotConfig.slotId,
+              providerId,
+              providerModelId,
+              requested,
+              fallback,
+            }),
             agentId,
             ...(options.roleId ? { roleId: options.roleId } : {}),
             ...(options.traits ? { traits: options.traits } : {}),

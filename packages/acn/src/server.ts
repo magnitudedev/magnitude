@@ -173,14 +173,15 @@ const makeAcnServicesBase = (debug: boolean) => {
   )
 
   const localServices = addLocalInferenceServices(storageServices)
+  const withSharedClient = Layer.provideMerge(SharedProviderClientLive, localServices)
+  const withAccount = Layer.provideMerge(AccountLive, withSharedClient)
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
-    localServices,
+    withAccount,
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withPropagation = Layer.provideMerge(ModelConfigurationPropagationLive, withRuntime)
-  const withSharedClient = Layer.provideMerge(SharedProviderClientLive, withPropagation)
-  const withDrafts = Layer.provideMerge(SessionDraftsLive, withSharedClient)
+  const withDrafts = Layer.provideMerge(SessionDraftsLive, withPropagation)
   const withDestroyer = Layer.provideMerge(SessionDestroyerLive, withDrafts)
   return Layer.provideMerge(AcnActivityTrackerLive, withDestroyer)
 }
@@ -193,7 +194,7 @@ const localInferencePlatformLayer = () => {
     return LocalInferencePlatformLive({
       root: `${root}/local-inference`,
       indexPath: paths.localModelIndexFile,
-      configuredExecutable: Option.fromNullable(process.env.LLAMA_CPP_SERVER_PATH?.trim() || undefined),
+      configuredServerExecutable: Option.fromNullable(process.env.LLAMA_CPP_SERVER_PATH?.trim() || undefined),
       external: resolveLlamaCppAuth(storage).pipe(
         Effect.flatMap((auth) => auth
           ? Effect.try({
@@ -224,8 +225,7 @@ const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
   const withCommandTracking = Layer.provideMerge(AcnRpcCommandActivityLive, services)
   const withCommands = Layer.provideMerge(SessionCommandsLive, withCommandTracking)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
-  const withAccount = Layer.provideMerge(AccountLive, withLifecycle)
-  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withAccount)
+  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withLifecycle)
   const withStreams = Layer.provideMerge(DisplayViewStreamsLive, withActiveSessionStatuses)
   return withStreams
 }

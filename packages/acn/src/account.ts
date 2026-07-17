@@ -13,7 +13,10 @@ import {
   toMagnitudeModelInfo,
   ProviderIdSchema,
   ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  type ReasoningEffort,
   type ProviderId,
+  type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { isEnvFlagOn } from "@magnitudedev/utils"
 import { ProviderClientRegistry } from "./shared-client"
@@ -25,6 +28,7 @@ import {
   SessionOperationFailed,
   type SessionError,
   type SlotProfiles,
+  type SlotStates,
   type ModelSummary,
   type ModelCatalog,
   type ModelSlots,
@@ -43,7 +47,12 @@ import {
   type ModelSlotsState,
   type ProviderCatalogFailure,
   type ModelSlotsFailure,
+  ProviderCatalogStale,
   ProviderCatalogUnavailable,
+  SlotUnassigned,
+  SlotPending,
+  SlotReady,
+  SlotBlocked,
 } from "@magnitudedev/protocol"
 import { SessionStore } from "./session-store"
 import { LocalModelProviderSource } from "./local-inference/provider-source"
@@ -53,8 +62,6 @@ import { makeMirroredResource } from "./mirrored-resource"
 
 import {
   SLOT_IDS,
-  DEFAULT_REASONING_EFFORT,
-  resolveSlotModel,
 } from "@magnitudedev/roles"
 
 export interface AccountApi {
@@ -68,6 +75,13 @@ export interface AccountApi {
   readonly modelSlots: Effect.Effect<ModelSlots>
   readonly watchModelSlots: Stream.Stream<MirroredResourceInvalidation>
   readonly updateModelSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, SessionError>
+  readonly applyReasoningEffortFallback: (input: {
+    readonly slotId: SlotId
+    readonly providerId: ProviderId
+    readonly providerModelId: ProviderModelId
+    readonly requested: ReasoningEffort
+    readonly fallback: ReasoningEffort
+  }) => Effect.Effect<void, SessionError>
   readonly getCloudUsage: (query?: UsageQuery) => Effect.Effect<CloudUsageResponse, SessionError>
 }
 
@@ -119,9 +133,9 @@ function toModelSummary(model: ProviderModel): ModelSummary {
     ...(slots.length > 0 ? { slots: [...slots] } : {}),
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
-    capabilities: { ...(model.capabilities.vision === undefined ? {} : { vision: model.capabilities.vision }) },
+    defaultReasoningEffort: model.defaultReasoningEffort,
+    properties: model.properties,
     availability: model.availability,
-    reasoningEfforts: [...model.reasoningEfforts],
     pricing: model.pricing ? {
       input: model.pricing.input,
       output: model.pricing.output,
@@ -136,7 +150,7 @@ interface BuiltCatalogState {
 }
 
 interface BuiltSlotState {
-  readonly slotProfiles: SlotProfiles
+  readonly slots: SlotStates
   readonly modelConfig: ModelConfigResponse
 }
 
@@ -167,7 +181,7 @@ function buildSlotState(
       Effect.mapError(toAccountError(operation)),
     )
     return {
-      slotProfiles: slotProfilesFromModels(models, modelConfig),
+      slots: slotStatesFromModels(models, modelConfig),
       modelConfig: {
         slots: Object.fromEntries(Object.entries(modelConfig?.slots ?? {}).map(([slotId, slot]) => [slotId, {
           ...(storedProviderId(slot?.providerId) ? { providerId: storedProviderId(slot?.providerId)! } : {}),
@@ -180,22 +194,19 @@ function buildSlotState(
   })
 }
 
-/**
- * Build slot profiles from catalog models + user config.
- * Uses `resolveSlotModel`.
- */
-function slotProfilesFromModels(
+/** Build authoritative slot state from provider models and persisted intent. */
+export function slotStatesFromModels(
   models: readonly ProviderModel[],
   userConfig: {
     readonly slots?: Partial<Record<SlotId, { readonly providerId?: string; readonly providerModelId?: string; readonly reasoningEffort?: string }>>
     readonly localSlotIntent?: Partial<Record<SlotId, "local" | "cloud">>
   } | null,
-): SlotProfiles {
+): SlotStates {
   const routableModels = models.map((model) => ({
     ...model,
     slots: slotsForModel(model),
   }))
-  let profiles: SlotProfiles = {}
+  const states = {} as Record<SlotId, SlotStates[SlotId]>
   for (const slotId of SLOT_IDS) {
     const userSlotConfig = userConfig?.slots?.[slotId]
     const intent = userConfig?.localSlotIntent?.[slotId]
@@ -204,32 +215,81 @@ function slotProfilesFromModels(
       : intent === "cloud"
         ? routableModels.filter((model) => model.providerId !== "llamacpp")
         : routableModels
-    const resolved = resolveSlotModel(eligibleModels, userSlotConfig, slotId)
-    if (!resolved) continue
-    const model = routableModels.find((candidate) =>
-      candidate.providerId === resolved.providerId
-      && candidate.providerModelId === resolved.providerModelId)
-    if (!model) continue
-
-    const requestedEffort = userSlotConfig?.reasoningEffort ?? DEFAULT_REASONING_EFFORT[slotId]
-    const reasoningEffort = model.reasoningEfforts.includes(requestedEffort)
-      ? requestedEffort
-      : model.reasoningEfforts[0] ?? "none"
-
-    profiles = {
-      ...profiles,
-      [slotId]: {
-        slotId,
-        providerId: ProviderIdSchema.make(resolved.providerId),
-        providerModelId: ProviderModelIdSchema.make(resolved.providerModelId),
-        modelDisplayName: model.displayName,
-        contextWindow: model.contextWindow,
-        maxOutputTokens: model.maxOutputTokens,
-        capabilities: { vision: model.capabilities.vision ?? false },
-        reasoningEffort,
-        isUserOverride: resolved.isUserOverride,
-      },
+    const hasOverride = userSlotConfig?.providerId !== undefined && userSlotConfig.providerModelId !== undefined
+    const selected = hasOverride
+      ? routableModels.find((candidate) => candidate.providerId === userSlotConfig.providerId && candidate.providerModelId === userSlotConfig.providerModelId)
+      : eligibleModels.find((model) => model.availability._tag === "Available" && model.slots.includes(slotId))
+        ?? eligibleModels.find((model) => model.availability._tag === "Available")
+    if (!selected) {
+      states[slotId] = new SlotUnassigned({ slotId, reason: models.length === 0 ? "provider_unavailable" : "no_candidate" })
+      continue
     }
+    const requestedEffort = userSlotConfig?.reasoningEffort
+      ? ReasoningEffortSchema.make(userSlotConfig.reasoningEffort)
+      : selected.defaultReasoningEffort
+    const reasoning = selected.properties.reasoning
+    const hasKnownEfforts = reasoning._tag === "Cached" || reasoning._tag === "Resolved" || reasoning._tag === "Refreshing"
+    const knownEfforts = hasKnownEfforts
+      ? reasoning.value
+      : []
+    const waitingForReasoning = requestedEffort !== selected.defaultReasoningEffort && !hasKnownEfforts
+    const reasoningEffort = requestedEffort === selected.defaultReasoningEffort
+      || knownEfforts.includes(requestedEffort)
+      || waitingForReasoning
+      ? requestedEffort
+      : selected.defaultReasoningEffort
+    const selection = {
+      providerId: selected.providerId,
+      providerModelId: selected.providerModelId,
+      reasoningEffort,
+    }
+    const source = hasOverride ? "user" as const : "automatic" as const
+    if (selected.availability._tag === "Disabled") {
+      const reason = selected.availability.reason === "model_unavailable"
+        ? "model_unavailable" as const
+        : selected.availability.reason === "installation_unavailable"
+          ? "installation_unavailable" as const
+        : selected.availability.reason === "incompatible_runtime"
+          ? "incompatible_runtime" as const
+          : "invalid_configuration" as const
+      states[slotId] = new SlotBlocked({ slotId, selection, source, reason })
+      continue
+    }
+    if (requestedEffort !== selected.defaultReasoningEffort && reasoning._tag === "Failed") {
+      states[slotId] = new SlotBlocked({ slotId, selection, source, reason: "property_discovery_failed" })
+      continue
+    }
+    if (waitingForReasoning) {
+      states[slotId] = new SlotPending({ slotId, selection, source, waitingFor: ["reasoning"] })
+      continue
+    }
+    states[slotId] = new SlotReady({
+      slotId,
+      selection,
+      source,
+      modelDisplayName: selected.displayName,
+      contextWindow: selected.contextWindow,
+      maxOutputTokens: selected.maxOutputTokens,
+    })
+  }
+  return states as SlotStates
+}
+
+function compatibilityProfiles(states: SlotStates): SlotProfiles {
+  let profiles: SlotProfiles = {}
+  for (const slotId of SLOT_IDS) {
+    const state = states[slotId]
+    if (state._tag !== "Ready") continue
+    profiles = { ...profiles, [slotId]: {
+        slotId,
+        providerId: state.selection.providerId,
+        providerModelId: state.selection.providerModelId,
+        modelDisplayName: state.modelDisplayName,
+        contextWindow: state.contextWindow,
+        maxOutputTokens: state.maxOutputTokens,
+        reasoningEffort: state.selection.reasoningEffort,
+        isUserOverride: state.source === "user",
+      } }
   }
   return profiles
 }
@@ -250,6 +310,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       const modelConfiguration = yield* LocalModelConfiguration
       const scope = yield* Scope.Scope
       const snapshotLock = yield* Effect.makeSemaphore(1)
+      const slotMutationLock = yield* Effect.makeSemaphore(1)
       const catalogResource = yield* makeMirroredResource<ModelCatalogState>(new ModelCatalogLoading({}))
       const slotResource = yield* makeMirroredResource<ModelSlotsState>(new ModelSlotsLoading({}))
       const providerCatalogs = yield* Ref.make<Pick<FoldedProviderCatalogs, "byProvider" | "failuresByProvider">>({
@@ -281,7 +342,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           ready: (current) => ModelSlotsLifecycle.transition(current, "refreshing", { failures: [] }),
           refreshing: (current) => current,
           degraded: (current) => ModelSlotsLifecycle.transition(current, "refreshing", {}),
-          unavailable: (current) => ModelSlotsLifecycle.transition(current, "refreshing", { profiles: {} }),
+          unavailable: (current) => ModelSlotsLifecycle.transition(current, "refreshing", {}),
         }))
       })
 
@@ -310,18 +371,18 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         slotResource.update((state) => {
           if (failures.length === 0) {
             if (ModelSlotsLifecycle.is(state, "loading") || ModelSlotsLifecycle.is(state, "refreshing")) {
-              return ModelSlotsLifecycle.transition(state, "ready", { profiles: list.slotProfiles, config: list.modelConfig })
+              return ModelSlotsLifecycle.transition(state, "ready", { slots: list.slots, config: list.modelConfig })
             }
             return invalidSlotTransition(state, "publish ready")
           }
-          if (Object.keys(list.slotProfiles).length > 0) {
+          if (Object.values(list.slots).some((slot) => slot._tag === "Ready")) {
             if (ModelSlotsLifecycle.is(state, "loading") || ModelSlotsLifecycle.is(state, "refreshing")) {
-              return ModelSlotsLifecycle.transition(state, "degraded", { profiles: list.slotProfiles, config: list.modelConfig, failures })
+              return ModelSlotsLifecycle.transition(state, "degraded", { slots: list.slots, config: list.modelConfig, failures })
             }
             return invalidSlotTransition(state, "publish degraded")
           }
           if (ModelSlotsLifecycle.is(state, "loading") || ModelSlotsLifecycle.is(state, "refreshing")) {
-            return ModelSlotsLifecycle.transition(state, "unavailable", { config: list.modelConfig, failures })
+            return ModelSlotsLifecycle.transition(state, "unavailable", { slots: list.slots, config: list.modelConfig, failures })
           }
           return invalidSlotTransition(state, "publish unavailable")
         })
@@ -334,12 +395,13 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           if (ModelSlotsLifecycle.is(state, "loading")) {
             return ModelSlotsLifecycle.transition(state, "unavailable", {
               config: { slots: {}, localSlotIntent: {} },
+              slots: slotStatesFromModels([], null),
               failures: [failure],
             })
           }
           if (ModelSlotsLifecycle.is(state, "refreshing")) {
             const failures = [...state.failures, failure]
-            return Object.keys(state.profiles).length > 0
+            return Object.values(state.slots).some((slot) => slot._tag === "Ready")
               ? ModelSlotsLifecycle.transition(state, "degraded", { failures })
               : ModelSlotsLifecycle.transition(state, "unavailable", { failures })
           }
@@ -374,6 +436,64 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           return sharedClient
         })
 
+      const persistRemovedEffortFallbacks = (models: readonly ProviderModel[]) => Effect.gen(function* () {
+        const configured = yield* modelConfiguration.getModels
+        const updates: Partial<Record<SlotId, SlotModelConfig>> = {}
+        for (const slotId of SLOT_IDS) {
+          const slot = configured?.slots?.[slotId]
+          if (!slot?.providerId || !slot.providerModelId || !slot.reasoningEffort) continue
+          const model = models.find((candidate) => candidate.providerId === slot.providerId
+            && candidate.providerModelId === slot.providerModelId)
+          if (!model || model.properties.reasoning._tag !== "Resolved") continue
+          if (slot.reasoningEffort === model.defaultReasoningEffort
+            || model.properties.reasoning.value.includes(slot.reasoningEffort)) continue
+          updates[slotId] = {
+            providerId: model.providerId,
+            providerModelId: model.providerModelId,
+            reasoningEffort: model.defaultReasoningEffort,
+          }
+        }
+        if (Object.keys(updates).length > 0) yield* modelConfiguration.updateSlots(updates)
+      })
+
+      const discoverSelectedProperties = (
+        models: readonly ProviderModel[],
+        slots: SlotStates,
+        retryFailed: boolean,
+      ) => Effect.forEach(
+        [...new Map(Object.values(slots).flatMap((slot) => slot._tag === "Unassigned"
+          ? []
+          : [[`${slot.selection.providerId}\0${slot.selection.providerModelId}`, slot.selection] as const])).values()],
+        (selection) => {
+          const model = models.find((candidate) => candidate.providerId === selection.providerId
+            && candidate.providerModelId === selection.providerModelId)
+          if (!model || model.availability._tag !== "Available") return Effect.void
+          const properties = (["vision", "reasoning"] as const).filter((property) => {
+            const state = model.properties[property]
+            return state._tag === "Deferred" || retryFailed && state._tag === "Failed"
+          })
+          return properties.length === 0
+            ? Effect.void
+            : sharedClient.discoverModelProperties(selection.providerId, {
+                providerModelId: selection.providerModelId,
+                properties,
+              }).pipe(Effect.ignore)
+        },
+        { discard: true },
+      )
+
+      const publishFoldedCatalog = (folded: FoldedProviderCatalogs) => Effect.gen(function* () {
+        yield* Ref.set(providerCatalogs, folded)
+        yield* persistRemovedEffortFallbacks(folded.models)
+        const providers = yield* sharedClient.listProviders
+        yield* publishCatalog(buildCatalogState(folded.models, providers), folded.failures)
+        const slots = yield* buildSlotState(folded.models, storage, "build model slots").pipe(
+          Effect.tapError(markSlotConfigurationFailed),
+        )
+        yield* publishSlots(slots, folded.failures)
+        yield* discoverSelectedProperties(folded.models, slots.slots, false)
+      }).pipe(Effect.provide(FetchHttpClient.layer))
+
       const rebuildSnapshots = (force: boolean, providerId: Option.Option<ProviderId> = Option.none()) => snapshotLock.withPermits(1)(
         Effect.gen(function* () {
           yield* markCatalogRefreshing
@@ -383,19 +503,41 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
             Effect.provide(FetchHttpClient.layer),
           )
           const folded = foldProviderCatalogOutcomes(yield* Ref.get(providerCatalogs), outcomes)
-          yield* Ref.set(providerCatalogs, folded)
-          const providers = yield* sharedClient.listProviders.pipe(
-            Effect.provide(FetchHttpClient.layer),
-          )
-          yield* publishCatalog(buildCatalogState(folded.models, providers), folded.failures)
-          const slots = yield* buildSlotState(folded.models, storage, "build model slots").pipe(
-            Effect.tapError(markSlotConfigurationFailed),
-          )
-          yield* publishSlots(slots, folded.failures)
+          yield* publishFoldedCatalog(folded)
         }).pipe(Effect.catchAll((cause) => Effect.logWarning("Model resource refresh failed").pipe(
           Effect.annotateLogs({ operation: "rebuild-model-resources", cause: String(cause) }),
         ))),
       )
+
+      const rebuildLocalSnapshots = snapshotLock.withPermits(1)(Effect.gen(function* () {
+        yield* markCatalogRefreshing
+        const local = yield* localModels.catalog.list.pipe(
+          Effect.provide(FetchHttpClient.layer),
+          Effect.either,
+        )
+        const current = yield* Ref.get(providerCatalogs)
+        const providerId = ProviderIdSchema.make("llamacpp")
+        const byProvider = new Map(current.byProvider)
+        const failuresByProvider = new Map(current.failuresByProvider)
+        if (local._tag === "Right") {
+          byProvider.set(providerId, local.right)
+          failuresByProvider.delete(providerId)
+        } else {
+          const retained = byProvider.get(providerId) ?? []
+          const message = local.left.message
+          failuresByProvider.set(providerId, retained.length > 0
+            ? new ProviderCatalogStale({ providerId, message })
+            : new ProviderCatalogUnavailable({ providerId, message }))
+        }
+        yield* publishFoldedCatalog({
+          byProvider,
+          failuresByProvider,
+          models: [...byProvider.values()].flat(),
+          failures: [...failuresByProvider.values()],
+        })
+      }).pipe(Effect.catchAll((cause) => Effect.logWarning("Local model resource refresh failed").pipe(
+        Effect.annotateLogs({ operation: "rebuild-local-model-resources", cause: String(cause) }),
+      ))))
 
       const rebuildSlotSnapshot = snapshotLock.withPermits(1)(Effect.gen(function* () {
         yield* slotResource.update((state) => ModelSlotsLifecycle.match(state, {
@@ -403,7 +545,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           ready: (current) => ModelSlotsLifecycle.transition(current, "refreshing", { failures: [] }),
           refreshing: (current) => current,
           degraded: (current) => ModelSlotsLifecycle.transition(current, "refreshing", {}),
-          unavailable: (current) => ModelSlotsLifecycle.transition(current, "refreshing", { profiles: {} }),
+          unavailable: (current) => ModelSlotsLifecycle.transition(current, "refreshing", {}),
         }))
         const models = yield* catalogModels
         const list = yield* buildSlotState(models, storage, "build model slots").pipe(
@@ -427,7 +569,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
 
       yield* refreshInBackground(false)
       yield* Effect.forkIn(localModels.changes.pipe(
-        Stream.runForEach(() => observeResourceDefects("rebuild-model-resources", rebuildSnapshots(false))),
+        Stream.runForEach(() => observeResourceDefects("rebuild-local-model-resources", rebuildLocalSnapshots)),
       ), scope)
       yield* Effect.forkIn(modelConfiguration.changes.pipe(
         Stream.runForEach(() => observeResourceDefects("rebuild-model-slots", rebuildSlotSnapshot.pipe(
@@ -468,7 +610,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
               Effect.flatMap(Schema.decodeUnknown(MagnitudeModelListResponseSchema)),
             )
             const models = body.data.map(toMagnitudeModelInfo)
-            return slotProfilesFromModels(models, null)
+            return compatibilityProfiles(slotStatesFromModels(models, null))
           }).pipe(
             Effect.provide(FetchHttpClient.layer),
             Effect.mapError(toAccountError("list public slot profiles")),
@@ -479,7 +621,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         refreshModelCatalog: (providerId) => refreshInBackground(true, providerId),
         modelSlots: slotResource.get,
         watchModelSlots: slotResource.changes,
-        updateModelSlots: (slots) => Effect.gen(function* () {
+        updateModelSlots: (slots) => slotMutationLock.withPermits(1)(Effect.gen(function* () {
           const models = yield* catalogModels
           for (const [slotId, slot] of Object.entries(slots)) {
             if (!slot?.providerId || !slot.providerModelId) continue
@@ -494,13 +636,44 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           const normalized = Object.fromEntries(Object.entries(slots).map(([slotId, slot]) => {
             if (!slot?.providerId || !slot.providerModelId) return [slotId, slot]
             const model = models.find((candidate) => candidate.providerId === slot.providerId && candidate.providerModelId === slot.providerModelId)
-            if (!model || !slot.reasoningEffort || model.reasoningEfforts.includes(slot.reasoningEffort)) return [slotId, slot]
-            return [slotId, { ...slot, reasoningEffort: model.reasoningEfforts[0] ?? "none" }]
+            if (!model || !slot.reasoningEffort) return [slotId, slot]
+            const reasoning = model.properties.reasoning
+            const efforts = reasoning._tag === "Cached" || reasoning._tag === "Resolved" || reasoning._tag === "Refreshing"
+              ? reasoning.value
+              : []
+            if (slot.reasoningEffort === model.defaultReasoningEffort || efforts.includes(slot.reasoningEffort)) return [slotId, slot]
+            return [slotId, { ...slot, reasoningEffort: model.defaultReasoningEffort }]
           })) as typeof slots
           yield* modelConfiguration.updateSlots(normalized)
-        }).pipe(
+          yield* rebuildSlotSnapshot
+          const currentSlots = (yield* slotResource.get).state
+          yield* Effect.forkIn(ModelSlotsLifecycle.match(currentSlots, {
+            loading: () => Effect.void,
+            ready: (state) => discoverSelectedProperties(models, state.slots, true),
+            refreshing: (state) => discoverSelectedProperties(models, state.slots, true),
+            degraded: (state) => discoverSelectedProperties(models, state.slots, true),
+            unavailable: (state) => discoverSelectedProperties(models, state.slots, true),
+          }), scope)
+        })).pipe(
           Effect.mapError(toAccountError("update model slots")),
-          Effect.andThen(rebuildSlotSnapshot),
+        ),
+
+        applyReasoningEffortFallback: (input) => slotMutationLock.withPermits(1)(Effect.gen(function* () {
+          const configured = yield* modelConfiguration.getModels
+          const current = configured?.slots?.[input.slotId]
+          if (!current
+            || current.providerId !== input.providerId
+            || current.providerModelId !== input.providerModelId
+            || current.reasoningEffort !== input.requested) return
+          yield* modelConfiguration.updateSlots({
+            [input.slotId]: {
+              ...current,
+              reasoningEffort: input.fallback,
+            },
+          })
+          yield* rebuildSlotSnapshot
+        })).pipe(
+          Effect.mapError(toAccountError("apply reasoning effort fallback")),
         ),
 
         getCloudUsage: (query) =>

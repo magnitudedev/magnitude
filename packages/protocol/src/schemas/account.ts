@@ -1,5 +1,12 @@
 import { Schema } from "effect"
-import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema } from "@magnitudedev/ai"
+import {
+  ModelFamilyIdSchema,
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  ReasoningProperty,
+  VisionProperty,
+} from "@magnitudedev/ai"
 import { FSM } from "@magnitudedev/utils"
 import { MirroredSnapshotSchema } from "./mirrored-resource"
 
@@ -35,8 +42,7 @@ export const SlotProfile = Schema.Struct({
   modelDisplayName: Schema.String,
   contextWindow: Schema.Number,
   maxOutputTokens: Schema.Number,
-  capabilities: Schema.Struct({ vision: Schema.Boolean }),
-  reasoningEffort: Schema.String,            // plain string — values come from ProviderModel.reasoningEfforts
+  reasoningEffort: ReasoningEffortSchema,
   isUserOverride: Schema.Boolean,
 })
 export type SlotProfile = Schema.Schema.Type<typeof SlotProfile>
@@ -50,7 +56,7 @@ export type SlotProfiles = Schema.Schema.Type<typeof SlotProfiles>
 export const SlotModelConfigSchema = Schema.Struct({
   providerId: Schema.optional(ProviderIdSchema),
   providerModelId: Schema.optional(ProviderModelIdSchema),
-  reasoningEffort: Schema.optional(Schema.String),
+  reasoningEffort: Schema.optional(ReasoningEffortSchema),
 })
 export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
 
@@ -81,6 +87,7 @@ export const ProviderModelDisabledReason = Schema.Literal(
   "insufficient_resources",
   "provider_unavailable",
   "model_unavailable",
+  "installation_unavailable",
   "incompatible_runtime",
   "invalid_configuration",
 )
@@ -104,9 +111,12 @@ export const ModelSummarySchema = Schema.Struct({
   slots: Schema.optional(Schema.Array(SlotId)),
   contextWindow: Schema.Number,
   maxOutputTokens: Schema.Number,
-  capabilities: Schema.Struct({ vision: Schema.optional(Schema.Boolean) }),
+  defaultReasoningEffort: ReasoningEffortSchema,
+  properties: Schema.Struct({
+    vision: VisionProperty.Schema,
+    reasoning: ReasoningProperty.Schema,
+  }),
   availability: ProviderModelAvailability,
-  reasoningEfforts: Schema.Array(Schema.String),
   pricing: Schema.optional(Schema.Struct({
     input: Schema.Number,
     output: Schema.Number,
@@ -188,8 +198,43 @@ export type ModelCatalogState = typeof ModelCatalogStateSchema.Type
 export const ModelCatalogSchema = MirroredSnapshotSchema(ModelCatalogStateSchema)
 export type ModelCatalog = Schema.Schema.Type<typeof ModelCatalogSchema>
 
+export const SlotSelectionSourceSchema = Schema.Literal("automatic", "user")
+export const SlotSelectionSchema = Schema.Struct({
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
+  reasoningEffort: ReasoningEffortSchema,
+})
+export class SlotUnassigned extends Schema.TaggedClass<SlotUnassigned>()("Unassigned", {
+  slotId: SlotId,
+  reason: Schema.Literal("no_candidate", "provider_unavailable"),
+}) {}
+export class SlotPending extends Schema.TaggedClass<SlotPending>()("Pending", {
+  slotId: SlotId,
+  selection: SlotSelectionSchema,
+  source: SlotSelectionSourceSchema,
+  waitingFor: Schema.Array(Schema.Literal("vision", "reasoning")).pipe(Schema.minItems(1)),
+}) {}
+export class SlotReady extends Schema.TaggedClass<SlotReady>()("Ready", {
+  slotId: SlotId,
+  selection: SlotSelectionSchema,
+  source: SlotSelectionSourceSchema,
+  modelDisplayName: Schema.String,
+  contextWindow: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  maxOutputTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
+}) {}
+export class SlotBlocked extends Schema.TaggedClass<SlotBlocked>()("Blocked", {
+  slotId: SlotId,
+  selection: SlotSelectionSchema,
+  source: SlotSelectionSourceSchema,
+  reason: Schema.Literal("model_unavailable", "model_removed", "installation_unavailable", "incompatible_runtime", "invalid_configuration", "property_discovery_failed"),
+}) {}
+export const SlotStateSchema = Schema.Union(SlotUnassigned, SlotPending, SlotReady, SlotBlocked)
+export type SlotState = typeof SlotStateSchema.Type
+export const SlotStatesSchema = Schema.Record({ key: SlotId, value: SlotStateSchema })
+export type SlotStates = typeof SlotStatesSchema.Type
+
 const SlotSnapshotFields = {
-  profiles: SlotProfiles,
+  slots: SlotStatesSchema,
   config: ModelConfigResponseSchema,
 } as const
 
@@ -205,6 +250,7 @@ export class ModelSlotsDegraded extends Schema.TaggedClass<ModelSlotsDegraded>()
 }) {}
 export class ModelSlotsUnavailable extends Schema.TaggedClass<ModelSlotsUnavailable>()("unavailable", {
   config: ModelConfigResponseSchema,
+  slots: SlotStatesSchema,
   failures: Schema.Array(ModelSlotsFailureSchema),
 }) {}
 

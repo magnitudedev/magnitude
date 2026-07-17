@@ -1,4 +1,5 @@
 import type { ToolCallId } from "../prompt/ids"
+import type { ReasoningEffort } from "./model"
 
 /**
  * Tool choice — the universal shape every provider accepts.
@@ -26,6 +27,6 @@ export type ToolChoice =
 export interface BaseCallOptions {
   readonly maxTokens?: number
   readonly toolChoice?: ToolChoice
-  readonly reasoningEffort?: string
+  readonly reasoningEffort?: ReasoningEffort
   readonly generateToolCallId?: () => ToolCallId
 }

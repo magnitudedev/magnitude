@@ -2,9 +2,13 @@ import { Effect, Option, Schema } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import { MagnitudeModelListResponseSchema, type MagnitudeModelInfo, type MagnitudeRawModel } from "./contract"
-import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, type AuthApplicator, type ModelCatalog, type ModelFamilyId } from "@magnitudedev/ai"
+import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty, type AuthApplicator, type ModelCatalog, type ModelFamilyId } from "@magnitudedev/ai"
 
 type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
+
+const MAGNITUDE_REASONING_EFFORTS = ["none", "low", "medium", "high", "max"]
+  .map((effort) => ReasoningEffortSchema.make(effort))
+const MAGNITUDE_DEFAULT_REASONING_EFFORT = ReasoningEffortSchema.make("high")
 
 /**
  * Map a raw Magnitude API model to a MagnitudeModelInfo (without modelFamilyId).
@@ -17,10 +21,13 @@ export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWith
     displayName: raw.displayName,
     contextWindow: raw.contextWindow,
     maxOutputTokens: raw.maxOutputTokens,
-    capabilities: { vision: raw.capabilities?.vision ?? false },
+    defaultReasoningEffort: MAGNITUDE_DEFAULT_REASONING_EFFORT,
+    properties: {
+      vision: new VisionProperty.states.Resolved({ value: raw.capabilities?.vision ?? false }),
+      reasoning: new ReasoningProperty.states.Resolved({ value: MAGNITUDE_REASONING_EFFORTS }),
+    },
     availability: AVAILABLE_PROVIDER_MODEL,
     pricing: raw.pricing ?? { input: 0, output: 0, cached_input: null },
-    reasoningEfforts: raw.reasoningEfforts ?? ["none"],
     object: raw.object,
     owned_by: raw.owned_by,
     roles: raw.roles,

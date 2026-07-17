@@ -12,7 +12,7 @@ export const buildLocalInferenceSelections = (
   state: LocalInferenceState,
 ): LocalInferenceSelection[] => {
   const choices = state.choices
-    .filter((choice) => choice.compatible)
+    .filter((choice) => choice.availability._tag === "Available")
     .map((choice): LocalInferenceSelection => ({
       kind: choice._tag === "RunningExternal" || choice._tag === "RunningManaged" ? "running" : "stored",
       id: choice.choiceId,
@@ -70,4 +70,15 @@ export const selectionMetadata = (selection: LocalInferenceSelection): string =>
       ? "Context unavailable"
       : `${formatContext(selection.choice.contextTokens)} context`
   return `${quantization} · ${size} · ${context}`
+}
+
+export const selectionCapacityWarning = (selection: LocalInferenceSelection): string | null => {
+  if (selection.kind === "recommendation") return null
+  const fit = selection.choice.fitAssessment
+  if (fit._tag !== "Estimated" || fit.result !== "capacity_risk") return null
+  const constrained = fit.domains.filter(({ marginBytes }) => marginBytes < 0)
+  const capacity = constrained.reduce((total, domain) => total + domain.stableCapacityBytes, 0)
+  return capacity > 0
+    ? `Memory warning: estimated ${formatBytes(fit.estimatedTotalBytes)}; constrained hardware capacity ${formatBytes(capacity)}. Loading may fail or affect system performance.`
+    : `Memory warning: estimated ${formatBytes(fit.estimatedTotalBytes)} may exceed this machine's stable capacity.`
 }

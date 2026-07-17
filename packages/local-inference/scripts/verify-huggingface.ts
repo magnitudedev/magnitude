@@ -154,6 +154,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const registry = yield* makeModelFileRegistry({
       sources: [ModelFileSourceRegistration.Deletable({ source })],
       formats: [gguf],
+      initialIndex: Option.none(),
     })
     const snapshot = yield* registry.inspect("full")
     assert(snapshot.issues.length === 0, `registry inspection reported ${snapshot.issues.length} issue(s)`)

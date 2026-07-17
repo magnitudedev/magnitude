@@ -4,12 +4,10 @@ import { makeAgentBoundModel } from '../model/agent-model'
 import { createTestBoundModel, type TestModelConfig } from './test-model'
 import type { RoleId } from '../agents/role-validation'
 import { ROLE_TO_SLOT } from '@magnitudedev/roles'
-import type { ModelProfile } from '@magnitudedev/ai'
 
-const DEFAULT_TEST_PROFILE: ModelProfile = {
+const DEFAULT_TEST_PROFILE = {
   contextWindow: 200_000,
   maxOutputTokens: 32_768,
-  capabilities: { vision: true },
 }
 
 export function makeTestModelResolver(config: TestModelConfig = {}): Layer.Layer<AgentModelResolver> {

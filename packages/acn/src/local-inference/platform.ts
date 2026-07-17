@@ -12,14 +12,19 @@ import {
   Exit,
   Layer,
   Option,
+  PubSub,
   Redacted,
   Ref,
   Scope,
+  Stream,
 } from "effect"
 import {
   Hardware,
   HuggingFace,
   LlamaCpp,
+  LocalModelIndexSchema,
+  type LocalModelIndexStoreApi,
+  makeLocalModelIndexStore,
   ModelFiles,
 } from "@magnitudedev/local-inference"
 import { readStructuredFile, writeStructuredFileAtomic } from "@magnitudedev/storage"
@@ -31,21 +36,25 @@ export interface ExternalLlamaConfiguration {
 }
 
 interface ActiveInstances {
-  readonly key: string
   readonly externalKey: string
   readonly scope: Scope.CloseableScope
-  readonly cli: Option.Option<LlamaCpp.LlamaCli>
   readonly registry: LlamaCpp.LlamaInstanceRegistryApi
 }
 
 export interface LocalInferencePlatformApi {
+  readonly modelIndex: LocalModelIndexStoreApi
   readonly files: ModelFiles.ModelFileRegistryApi
   readonly hardware: Hardware.HostHardwareApi
-  readonly distribution: LlamaCpp.LlamaDistributionApi
+  readonly installations: LlamaCpp.LlamaCppInstallationRegistryApi
   readonly hub: HuggingFace.HuggingFaceHubApi
   readonly downloads: HuggingFace.HuggingFaceDownloadApi
-  readonly cli: Effect.Effect<LlamaCpp.LlamaCli, LlamaCpp.LlamaDistributionError>
-  readonly instances: Effect.Effect<LlamaCpp.LlamaInstanceRegistryApi, LlamaCpp.LlamaDistributionError>
+  readonly cli: Effect.Effect<LlamaCpp.LlamaCli, LlamaCpp.LlamaCppInstallationUnavailable>
+  readonly instances: Effect.Effect<LlamaCpp.LlamaInstanceRegistryApi>
+  readonly instanceChanges: Stream.Stream<LlamaCpp.LlamaInstanceRegistryApi>
+  readonly serverClient: (
+    origin: URL,
+    authorization: Option.Option<Redacted.Redacted<string>>,
+  ) => Effect.Effect<LlamaCpp.LlamaServerClient>
 }
 
 export class LocalInferencePlatform extends Context.Tag("LocalInferencePlatform")<
@@ -56,7 +65,7 @@ export class LocalInferencePlatform extends Context.Tag("LocalInferencePlatform"
 export interface LocalInferencePlatformOptions {
   readonly root: string
   readonly indexPath: string
-  readonly configuredExecutable: Option.Option<string>
+  readonly configuredServerExecutable: Option.Option<string>
   readonly external: Effect.Effect<readonly ExternalLlamaConfiguration[]>
 }
 
@@ -111,10 +120,21 @@ export const LocalInferencePlatformLive = (
     ignore: Option.some((relative) => relative.includes("/.locks/") || relative.endsWith(".lock")),
   })
   const gguf = yield* ModelFiles.makeGgufFormat()
-  const persistedIndex = yield* readStructuredFile(options.indexPath, ModelFiles.LocalModelFileIndexSchema).pipe(
-    Effect.map((result) => result._tag === "Present" ? result.value : undefined),
-    Effect.catchAll(() => Effect.succeed(undefined)),
+  const persistedIndex = yield* readStructuredFile(options.indexPath, LocalModelIndexSchema).pipe(
+    Effect.option,
+    Effect.map(Option.flatMap((result) => result._tag === "Present"
+      ? Option.some(result.value)
+      : Option.none())),
   )
+  const modelIndex = yield* makeLocalModelIndexStore({
+    initialIndex: persistedIndex,
+    persist: (index) => writeStructuredFileAtomic(options.indexPath, LocalModelIndexSchema, index).pipe(
+      Effect.provideService(FileSystem.FileSystem, fs),
+      Effect.catchAll((cause) => Effect.logWarning("Failed to persist local model index").pipe(
+        Effect.annotateLogs({ cause: String(cause) }),
+      )),
+    ),
+  })
   const registry = yield* ModelFiles.makeModelFileRegistry({
     sources: [
       ModelFiles.ModelFileSourceRegistration.Deletable({ source: managedSource }),
@@ -122,28 +142,31 @@ export const LocalInferencePlatformLive = (
       ModelFiles.ModelFileSourceRegistration.ReadOnly({ source: externalCacheSource }),
     ],
     formats: [gguf],
-    initialIndex: persistedIndex,
+    initialIndex: Option.map(persistedIndex, (index) => index.artifacts),
   })
-  const persistIndex = registry.index.pipe(
-    Effect.flatMap((index) => writeStructuredFileAtomic(options.indexPath, ModelFiles.LocalModelFileIndexSchema, index)),
-    Effect.provideService(FileSystem.FileSystem, fs),
-    Effect.catchAll((cause) => Effect.logWarning("Failed to persist local model index").pipe(
-      Effect.annotateLogs({ cause: String(cause) }),
-    )),
-  )
+  const persistArtifacts = registry.artifactIndex.pipe(Effect.flatMap(modelIndex.replaceArtifacts))
   const files: ModelFiles.ModelFileRegistryApi = {
     ...registry,
     inspect: (refresh) => registry.inspect(refresh).pipe(
-      Effect.tap(() => refresh === "cached" ? Effect.void : persistIndex),
+      Effect.tap(() => refresh === "cached" ? Effect.void : persistArtifacts),
+    ),
+    remove: (id) => registry.remove(id).pipe(
+      Effect.zipRight(persistArtifacts),
     ),
   }
-  const distribution = yield* LlamaCpp.makeLlamaDistribution({
-    configuredExecutable: options.configuredExecutable,
+  const managedVariant = host.platform === "darwin"
+    ? host.nativeArchitecture === "arm64" ? Option.some(LlamaCpp.LlamaDistributionVariantId.make("macos-arm64-metal")) : Option.some(LlamaCpp.LlamaDistributionVariantId.make("macos-x64-cpu"))
+    : host.platform === "linux"
+      ? host.nativeArchitecture === "arm64" ? Option.some(LlamaCpp.LlamaDistributionVariantId.make("linux-arm64-cpu")) : Option.some(LlamaCpp.LlamaDistributionVariantId.make("linux-x64-cpu"))
+      : Option.none<LlamaCpp.LlamaDistributionVariantId>()
+  const installations = yield* LlamaCpp.makeLlamaCppInstallationRegistry({
+    configuredServerExecutable: options.configuredServerExecutable,
     managedRoot: path.join(options.root, "llamacpp", "distribution"),
+    searchPath: (process.env.PATH ?? "").split(delimiter).filter(Boolean),
+    managedVariant,
     manifest: LlamaCpp.DEFAULT_LLAMA_DISTRIBUTION_MANIFEST,
     platform: platform(),
     nativeArchitecture: host.nativeArchitecture,
-    searchPath: (process.env.PATH ?? "").split(delimiter).filter(Boolean),
   })
   const connection = {
     hubUrl: Option.none<URL>(),
@@ -160,7 +183,15 @@ export const LocalInferencePlatformLive = (
   }).pipe(Effect.provideService(HuggingFace.StorageCapacity, capacity))
 
   const active = yield* Ref.make<Option.Option<ActiveInstances>>(Option.none())
+  const instanceChanges = yield* PubSub.unbounded<LlamaCpp.LlamaInstanceRegistryApi>()
   const lock = yield* Effect.makeSemaphore(1)
+  const selectedCli = installations.selected.pipe(Effect.flatMap((installation) => LlamaCpp.makeLlamaCli(installation).pipe(
+    Effect.provideService(CommandExecutor.CommandExecutor, executor),
+  )))
+  const managedCli = selectedCli.pipe(
+    Effect.map(Option.some),
+    Effect.catchTag("LlamaCppInstallationUnavailable", () => Effect.succeed(Option.none<LlamaCpp.LlamaCli>())),
+  )
 
   const resolveActive = lock.withPermits(1)(Effect.gen(function* () {
     const external = yield* options.external
@@ -169,27 +200,13 @@ export const LocalInferencePlatformLive = (
       onSome: (value) => createHash("sha256").update(Redacted.value(value)).digest("hex"),
     })}`).join("\0")
     const current = yield* Ref.get(active)
-    if (Option.isSome(current) && current.value.externalKey === externalKey && Option.isSome(current.value.cli)) return current.value
-    const binary = yield* distribution.resolve.pipe(Effect.option)
-    const key = [
-      Option.match(binary, { onNone: () => "no-binary", onSome: (value) => value.fingerprint }),
-      externalKey,
-    ].join("\0")
-    if (Option.isSome(current) && current.value.key === key) return current.value
+    if (Option.isSome(current) && current.value.externalKey === externalKey) return current.value
     if (Option.isSome(current)) yield* Scope.close(current.value.scope, Exit.void)
-    const cli = yield* Option.match(binary, {
-      onNone: () => Effect.succeed(Option.none<LlamaCpp.LlamaCli>()),
-      onSome: (value) => LlamaCpp.makeLlamaCli().pipe(
-        Effect.provideService(LlamaCpp.LlamaBinary, value),
-        Effect.provideService(CommandExecutor.CommandExecutor, executor),
-        Effect.map(Option.some),
-      ),
-    })
     const scope = yield* Scope.make()
     const port = yield* freePort()
     if (port <= 0) return yield* Effect.die("Unable to reserve a loopback port for llama.cpp")
     const registry = yield* LlamaCpp.makeLlamaInstanceRegistry({
-      cli,
+      managedCli,
       modelFiles: files,
       presetPath: path.join(options.root, "llamacpp", "runtime", "models.ini"),
       host: "127.0.0.1",
@@ -208,8 +225,9 @@ export const LocalInferencePlatformLive = (
       Effect.provideService(Path.Path, path),
       Effect.provideService(HttpClient.HttpClient, http),
     )
-    const next = { key, externalKey, scope, cli, registry }
+    const next = { externalKey, scope, registry }
     yield* Ref.set(active, Option.some(next))
+    yield* PubSub.publish(instanceChanges, registry)
     return next
   }))
 
@@ -217,20 +235,28 @@ export const LocalInferencePlatformLive = (
     onNone: () => Effect.void,
     onSome: (value) => Scope.close(value.scope, Exit.void),
   }))))
+  yield* installations.changes.pipe(
+    Stream.runForEach(() => Ref.get(active).pipe(Effect.flatMap(Option.match({
+      onNone: () => Effect.void,
+      onSome: (value) => value.registry.reconcileManagedInstallation,
+    })))),
+    Effect.forkScoped,
+  )
 
   return {
+    modelIndex,
     files,
     hardware,
-    distribution,
+    installations,
     hub,
     downloads,
-    cli: resolveActive.pipe(Effect.flatMap((value) => Option.match(value.cli, {
-      onNone: () => distribution.resolve.pipe(Effect.flatMap((binary) => LlamaCpp.makeLlamaCli().pipe(
-        Effect.provideService(LlamaCpp.LlamaBinary, binary),
-        Effect.provideService(CommandExecutor.CommandExecutor, executor),
-      ))),
-      onSome: Effect.succeed,
-    }))),
+    cli: selectedCli,
     instances: resolveActive.pipe(Effect.map((value) => value.registry)),
+    instanceChanges: Stream.fromPubSub(instanceChanges),
+    serverClient: (origin, authorization) => LlamaCpp.makeLlamaServerClient({
+      origin,
+      authorization,
+      timeout: Option.some("30 seconds"),
+    }).pipe(Effect.provideService(HttpClient.HttpClient, http)),
   }
 }))

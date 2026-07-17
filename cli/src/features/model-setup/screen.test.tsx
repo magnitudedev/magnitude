@@ -1,5 +1,6 @@
 import { beforeEach, expect, test, vi } from "vitest"
 import { Atom, Result } from "@effect-atom/atom-react"
+import { Option } from "effect"
 import { testRender } from "@opentui/react/test-utils"
 import { ProviderModelIdSchema, type LocalInferenceState, type LocalModelRecommendation } from "@magnitudedev/sdk"
 import { act } from "react"
@@ -11,7 +12,15 @@ const localInferenceActions = vi.hoisted(() => ({
 const emptyLocalInferenceState = {
   usage: null,
   activeBinding: null,
-  distribution: { _tag: "Missing" },
+  llamaCpp: {
+    minimumBuild: 8868,
+    recommendedBuild: 10011,
+    installations: [],
+    selectedInstallationId: Option.none(),
+    activeManagedInstallationId: Option.none(),
+    managedInstall: { availability: { _tag: "Available", build: 10011 }, operation: { _tag: "Idle" } },
+    diagnostics: [],
+  },
   host: { _tag: "Unavailable", message: "not needed" },
   choices: [],
   operations: [],
@@ -91,8 +100,10 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   useLocalInferenceState: () => ({
     state: Result.success(localInferenceState),
     mutationResults: [Result.initial()],
+    mutationBusy: false,
+    mutationFailure: Option.none(),
     configureUsage: () => {},
-    installDistribution: () => {},
+    installLlamaCpp: () => {},
     downloadModel: localInferenceActions.downloadModel,
     activateModel: () => {},
     deleteModel: () => {},
@@ -189,7 +200,11 @@ test("clicking an already running model continues setup with that model", async 
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
-    distribution: { _tag: "Ready", build: 10011, source: "managed" },
+    llamaCpp: {
+      ...emptyLocalInferenceState.llamaCpp,
+      installations: [{ id: "managed", executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" }, build: 10011, ownership: "magnitude", discoveries: [] }],
+      selectedInstallationId: Option.some("managed"),
+    },
     activeBinding: {
       _tag: "External",
       selectionId: "running-model",
@@ -203,7 +218,8 @@ test("clicking an already running model continues setup with that model", async 
       providerModelId: ProviderModelIdSchema.make("running-provider-model"),
       contextTokens: 200_000,
       fitClass: "cpu_or_unified",
-      compatible: true,
+      availability: { _tag: "Available" },
+      fitAssessment: { _tag: "NotAssessed" },
       explanation: "Already running.",
       residency: "loaded",
       quantization: {
@@ -243,7 +259,11 @@ test("clicking a possible download starts that model download", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
-    distribution: { _tag: "Ready", build: 10011, source: "managed" },
+    llamaCpp: {
+      ...emptyLocalInferenceState.llamaCpp,
+      installations: [{ id: "managed", executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" }, build: 10011, ownership: "magnitude", discoveries: [] }],
+      selectedInstallationId: Option.some("managed"),
+    },
     recommendations: [recommendedModel],
   }
   const view = await testRender(

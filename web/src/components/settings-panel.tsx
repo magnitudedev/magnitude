@@ -6,12 +6,12 @@
  * No modal chrome — fills its parent container.
  */
 import { useState, useCallback, type ReactNode } from "react"
-import { Option } from "effect"
+import { Cause, Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { formatTokensCompact } from "@magnitudedev/client-common"
+import { deriveLlamaCppInstallationManagementView, formatTokensCompact, reasoningEffortOptions, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
-import type { CloudUsageResponse, UsagePeriod, SlotId, ReasoningEffort } from "@magnitudedev/sdk"
-import { ModelCatalogLifecycle, ModelSlotsLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS, DEFAULT_REASONING_EFFORT } from "@magnitudedev/sdk"
+import type { CloudUsageResponse, UsagePeriod, SlotId, ReasoningEffort, LocalModelChoice } from "@magnitudedev/sdk"
+import { ModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS } from "@magnitudedev/sdk"
 import type { UseModelConfigResult } from "@magnitudedev/client-common"
 
 export type { UsagePeriod } from "@magnitudedev/sdk"
@@ -29,17 +29,6 @@ const catalogModelsOf = (modelConfig: UseModelConfigResult) => Option.flatMap(
     refreshing: ({ models }) => Option.some(models),
     degraded: ({ models }) => Option.some(models),
     unavailable: () => Option.none(),
-  }),
-)
-
-const slotConfigurationOf = (modelConfig: UseModelConfigResult) => Option.flatMap(
-  Result.value(modelConfig.slots),
-  ({ state }) => ModelSlotsLifecycle.match(state, {
-    loading: () => Option.none(),
-    ready: ({ config }) => Option.some(config),
-    refreshing: ({ config }) => Option.some(config),
-    degraded: ({ config }) => Option.some(config),
-    unavailable: ({ config }) => Option.some(config),
   }),
 )
 
@@ -185,6 +174,16 @@ function SettingsTab({
   const [inputKey, setInputKey] = useState("")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const localInference = useLocalInferenceState()
+  const localSnapshot = Result.value(localInference.state)
+  const llamaView = Option.map(localSnapshot, deriveLlamaCppInstallationManagementView)
+  const localFailure = Result.isFailure(localInference.state)
+    ? Option.some(Cause.pretty(localInference.state.cause))
+    : localInference.mutationFailure
+  const localChoices = Option.match(localSnapshot, {
+    onNone: () => [] as const,
+    onSome: ({ choices }) => choices,
+  })
   const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
   const catalogLoading = Option.match(catalogState, {
     onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
@@ -225,6 +224,58 @@ function SettingsTab({
 
   return (
     <div className="settings-api-key-section">
+      {Option.isNone(llamaView) && (
+        <section style={{ marginBottom: 24, paddingBottom: 20, borderBottom: "1px solid var(--border-subtle)", fontSize: 13, color: Option.isSome(localFailure) ? "var(--accent-danger)" : "var(--fg-secondary)" }}>
+          {Option.getOrElse(localFailure, () => "Inspecting llama.cpp installations…")}
+        </section>
+      )}
+      {Option.isSome(llamaView) && (
+        <section style={{ marginBottom: 24, paddingBottom: 20, borderBottom: "1px solid var(--border-subtle)" }}>
+          <h3 style={{ fontFamily: "var(--font-sans)", fontSize: 15, fontWeight: 600, color: "var(--fg-primary)", marginBottom: 8 }}>llama.cpp</h3>
+          <div style={{ fontSize: 13, color: llamaView.value.status === "ready" ? "var(--accent-success)" : "var(--accent-warning)", marginBottom: 4 }}>
+            {llamaView.value.status === "ready"
+              ? Option.match(llamaView.value.selected, { onNone: () => "Ready", onSome: (installation) => `${installation.ownership === "magnitude" ? "Managed by Magnitude" : "User installation"} · b${installation.build}` })
+              : llamaView.value.status === "outdated"
+                ? Option.match(llamaView.value.representativeOutdated, { onNone: () => "Outdated", onSome: (installation) => `b${installation.build} is outdated` })
+                : "Not installed for managed local inference"}
+          </div>
+          <div style={{ fontSize: 12, color: "var(--fg-secondary)", marginBottom: 10 }}>
+            Minimum b{llamaView.value.minimumBuild} · recommended b{llamaView.value.recommendedBuild}
+          </div>
+          {llamaView.value.managedInstall.operation._tag === "Running" && (
+            <div style={{ fontSize: 12, color: "var(--accent-primary)", marginBottom: 8, textTransform: "capitalize" }}>{llamaView.value.managedInstall.operation.stage}…</div>
+          )}
+          {llamaView.value.managedInstall.operation._tag === "Failed" && (
+            <div style={{ fontSize: 12, color: "var(--accent-danger)", marginBottom: 8 }}>{llamaView.value.managedInstall.operation.message}</div>
+          )}
+          {llamaView.value.managedInstall.availability._tag === "UnsupportedPlatform" && (
+            <div style={{ fontSize: 12, color: "var(--accent-warning)", marginBottom: 8 }}>{llamaView.value.managedInstall.availability.reason}</div>
+          )}
+          {Option.isSome(localFailure) && (
+            <div style={{ fontSize: 12, color: "var(--accent-danger)", marginBottom: 8 }}>{localFailure.value}</div>
+          )}
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            {llamaView.value.managedInstallRecommended && llamaView.value.managedInstall.availability._tag === "Available" && llamaView.value.managedInstall.operation._tag !== "Running" && (
+              <SettingsButton onClick={localInference.installLlamaCpp} disabled={localInference.mutationBusy}>Install b{llamaView.value.recommendedBuild}</SettingsButton>
+            )}
+            <SettingsButton onClick={localInference.refreshInstallations} disabled={localInference.mutationBusy}>Refresh detection</SettingsButton>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {llamaView.value.installations.map((installation) => (
+              <div key={installation.id} style={{ fontSize: 12, color: "var(--fg-secondary)", padding: "8px 10px", border: "1px solid var(--border-subtle)", borderRadius: 6 }}>
+                <div style={{ color: "var(--fg-primary)" }}>
+                  b{installation.build} · {installation.ownership === "magnitude" ? "Magnitude" : "User"}
+                  {Option.exists(llamaView.value.selected, (selected) => selected.id === installation.id) ? " · selected" : ""}
+                  {Option.exists(llamaView.value.active, (active) => active.id === installation.id) ? " · active" : ""}
+                </div>
+                <div style={{ overflowWrap: "anywhere" }}>Server: {installation.executables.serverPath}</div>
+                <div style={{ overflowWrap: "anywhere" }}>Fit analysis: {installation.executables.fitParamsPath}</div>
+                <div>{installation.discoveries.map((discovery) => discovery._tag === "Path" ? `PATH #${discovery.priority + 1}` : discovery._tag).join(" · ")}</div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       <h3
         style={{
           fontFamily: "var(--font-sans)",
@@ -341,6 +392,7 @@ function SettingsTab({
               key={entry.slotId}
               entry={entry}
               modelConfig={modelConfig}
+              localChoices={localChoices}
               isLast={i === slots.length - 1}
             />
           ))}
@@ -629,14 +681,6 @@ function UsageTab({
 
 // ── Helpers ──
 
-const REASONING_OPTIONS: { value: ReasoningEffort; label: string }[] = [
-  { value: "none", label: "None" },
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "max", label: "Max" },
-]
-
 function formatContextWindowCompact(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
   if (tokens >= 1_000) return `${Math.round(tokens / 1000)}K`
@@ -647,22 +691,32 @@ function formatPricing(pricing: { input: number; output: number }): string {
   return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
 }
 
+function formatMemoryGiB(bytes: number): string {
+  const gib = bytes / 1024 ** 3
+  return `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB`
+}
+
 function SlotCard({
   entry,
   modelConfig,
+  localChoices,
   isLast,
 }: {
   entry: SlotEntry
   modelConfig?: UseModelConfigResult
+  localChoices: readonly LocalModelChoice[]
   isLast: boolean
 }): ReactNode {
   const slotId = entry.slotId
   const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
-  const models = modelConfig ? Option.getOrNull(catalogModelsOf(modelConfig)) : null
-  const slotConfiguration = modelConfig ? Option.getOrNull(slotConfigurationOf(modelConfig)) : null
-  const currentOverride = slotConfiguration?.slots[slotId] ?? null
-  const defaultEffort = DEFAULT_REASONING_EFFORT[slotId]
-  const currentEffort = currentOverride?.reasoningEffort ?? defaultEffort
+  const models = modelConfig ? catalogModelsOf(modelConfig) : Option.none()
+  const slotsState = modelConfig
+    ? Option.map(Result.value(modelConfig.slots), ({ state }) => state)
+    : Option.none()
+  const selected = Option.flatMap(
+    Option.all({ catalog: catalogState, slots: slotsState }),
+    ({ catalog, slots }) => selectedSlotModel(catalog, slots, slotId),
+  )
   const transportFailed = modelConfig !== undefined && Result.isFailure(modelConfig.catalog)
   const transportHasSnapshot = modelConfig !== undefined && Option.isSome(Result.value(modelConfig.catalog))
   const loading = Option.match(catalogState, {
@@ -670,22 +724,38 @@ function SlotCard({
     onSome: (state) => ModelCatalogLifecycle.is(state, "loading"),
   })
 
-  // Find the currently effective model: user override, then first model for this slot, then first overall
-  const effectiveModelId = currentOverride?.providerModelId
-    ?? models?.find(m => m.slots?.includes(slotId))?.providerModelId
-    ?? models?.[0]?.providerModelId
-    ?? null
+  const effectiveModelKey = Option.match(selected, {
+    onNone: () => "",
+    onSome: ({ model }) => `${model.providerId}\0${model.providerModelId}`,
+  })
+  const effortOptions = Option.match(selected, {
+    onNone: () => [],
+    onSome: ({ model }) => reasoningEffortOptions(model),
+  })
+  const currentEffort = Option.match(selected, {
+    onNone: () => "",
+    onSome: ({ slot }) => slot.selection.reasoningEffort,
+  })
+  const capacityRisk = Option.flatMap(selected, ({ model }) => {
+    if (model.providerId !== "llamacpp") return Option.none()
+    const choice = localChoices.find((candidate) => candidate.providerModelId === model.providerModelId)
+    if (choice?.fitAssessment._tag !== "Estimated" || choice.fitAssessment.result !== "capacity_risk") return Option.none()
+    return Option.some(choice.fitAssessment)
+  })
 
   const handleModelChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
-      const value = e.target.value
+      const [providerId, providerModelId] = e.target.value.split("\0")
       if (modelConfig) {
-        if (!value) {
+        if (!providerId || !providerModelId) {
           void modelConfig.updateSlotModel(slotId, null, null)
         } else {
-          const model = models?.find(m => m.providerModelId === value)
-          if (model) {
-            void modelConfig.updateSlotModel(slotId, model.providerId, model.providerModelId)
+          const model = Option.flatMap(models, (catalogModels) => Option.fromNullable(
+            catalogModels.find((candidate) => candidate.providerId === providerId
+              && candidate.providerModelId === providerModelId),
+          ))
+          if (Option.isSome(model)) {
+            void modelConfig.updateSlotModel(slotId, model.value.providerId, model.value.providerModelId)
           }
         }
       }
@@ -695,12 +765,14 @@ function SlotCard({
 
   const handleEffortChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
-      const value = e.target.value as ReasoningEffort | "default"
-      if (modelConfig) {
-        void modelConfig.updateSlotReasoning(slotId, value === "default" ? null : value)
-      }
+      if (!modelConfig || Option.isNone(selected)) return
+      const value = e.target.value as ReasoningEffort
+      void modelConfig.updateSlotReasoning(
+        slotId,
+        value === selected.value.model.defaultReasoningEffort ? null : value,
+      )
     },
-    [modelConfig, slotId],
+    [modelConfig, selected, slotId],
   )
 
   return (
@@ -725,7 +797,7 @@ function SlotCard({
             Unable to load available models
           </span>
         </div>
-      ) : loading && models === null ? (
+      ) : loading && Option.isNone(models) ? (
         <div style={{ marginBottom: 4 }}>
           <div style={{
             height: 32,
@@ -752,7 +824,7 @@ function SlotCard({
           <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
           {/* Model dropdown */}
           <select
-            value={effectiveModelId ?? ""}
+            value={effectiveModelKey}
             onChange={handleModelChange}
             style={{
               padding: "6px 10px",
@@ -767,11 +839,15 @@ function SlotCard({
               minWidth: 200,
             }}
           >
-            {models && models.length > 0 ? (
-              models.map((model) => (
-                <option key={model.providerModelId} value={model.providerModelId}>
+            {Option.isNone(selected) && <option value="" disabled>Unassigned</option>}
+            {Option.isSome(models) && models.value.length > 0 ? (
+              models.value.map((model) => (
+                <option key={`${model.providerId}:${model.providerModelId}`} value={`${model.providerId}\0${model.providerModelId}`}>
                   {model.displayName} — {formatContextWindowCompact(model.contextWindow)} ctx
                   {model.pricing ? ` — ${formatPricing(model.pricing)}` : ""}
+                  {model.providerId === "llamacpp" && localChoices.some((choice) => choice.providerModelId === model.providerModelId
+                    && choice.fitAssessment._tag === "Estimated"
+                    && choice.fitAssessment.result === "capacity_risk") ? " — memory warning" : ""}
                 </option>
               ))
             ) : (
@@ -781,8 +857,9 @@ function SlotCard({
 
           {/* Thinking level dropdown */}
           <select
-            value={currentOverride?.reasoningEffort ?? "default"}
+            value={currentEffort}
             onChange={handleEffortChange}
+            disabled={Option.isNone(selected)}
             style={{
               padding: "6px 10px",
               background: "var(--bg-input)",
@@ -795,16 +872,23 @@ function SlotCard({
               cursor: "pointer",
             }}
           >
-            <option value="default">
-              {REASONING_OPTIONS.find((opt) => opt.value === defaultEffort)?.label} (default)
-            </option>
-            {REASONING_OPTIONS.map((opt) => (
+            {effortOptions.map((opt) => (
               <option key={opt.value} value={opt.value}>
-                {opt.label}
+                {opt.label}{opt.isDefault ? " (default)" : ""}
               </option>
             ))}
           </select>
           </div>
+          {Option.isSome(capacityRisk) && (
+            <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-warning)" }}>
+              Estimated memory use is {formatMemoryGiB(capacityRisk.value.estimatedTotalBytes)}, above this machine&apos;s stable capacity. Loading may fail or affect system performance.
+            </div>
+          )}
+          {Option.isSome(selected) && (
+            <div style={{ marginBottom: 4, fontSize: 12, color: "var(--fg-tertiary)" }}>
+              {visionPropertyLabel(selected.value.model)} · {reasoningPropertyLabel(selected.value.model)}
+            </div>
+          )}
         </div>
       )}
 

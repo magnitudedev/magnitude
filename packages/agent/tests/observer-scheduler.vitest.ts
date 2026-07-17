@@ -15,7 +15,6 @@ import {
   type ToolDefinition,
 } from '@magnitudedev/ai'
 import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/sdk'
-import type { ModelProfile } from '@magnitudedev/ai'
 
 import type { AppEvent, TurnOutcomeEvent } from '../src/events'
 import { AgentModelResolver } from '../src/model/model-resolver'
@@ -33,10 +32,9 @@ import { UserMessageResolutionProjection } from '../src/projections/user-message
 import { WorkerActivityProjection } from '../src/projections/worker-activity'
 import { WindowProjection } from '../src/window'
 
-const profile: ModelProfile = {
+const profile = {
   contextWindow: 100_000,
   maxOutputTokens: 4096,
-  capabilities: { vision: true },
 }
 
 const testModelSpec: ModelSpec<BaseCallOptions> = {

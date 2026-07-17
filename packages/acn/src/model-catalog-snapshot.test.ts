@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest"
 import {
   ProviderIdSchema,
   ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  ReasoningProperty,
+  VisionProperty,
   type ProviderModel,
 } from "@magnitudedev/sdk"
 import { ModelCatalogError } from "@magnitudedev/sdk"
@@ -13,10 +16,13 @@ const model = (providerId: string, providerModelId: string): ProviderModel => ({
   displayName: providerModelId,
   contextWindow: 8_192,
   maxOutputTokens: 1_024,
-  capabilities: { vision: false },
+  defaultReasoningEffort: ReasoningEffortSchema.make("none"),
+  properties: {
+    vision: new VisionProperty.states.Resolved({ value: false }),
+    reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make("none")] }),
+  },
   availability: { _tag: "Available" },
   pricing: { input: 0, output: 0, cached_input: null },
-  reasoningEfforts: ["none"],
 })
 
 describe("provider catalog outcomes", () => {

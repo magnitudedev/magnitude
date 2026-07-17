@@ -26,7 +26,7 @@ import { OutboundMessagesProjection } from '../src/projections/outbound-messages
 import { TaskGraphProjection } from '../src/projections/task-graph'
 import { TaskAssignmentProjection } from '../src/projections/task-assignment'
 import { HarnessStateProjection } from '../src/projections/harness-state'
-import { ConfigAmbient, buildConfigState } from '../src/ambient/config-ambient'
+import { ConfigAmbient } from '../src/ambient/config-ambient'
 import { SkillsAmbient } from '../src/ambient/skills-ambient'
 
 const ts = (n: number) => 1_700_400_000_000 + n

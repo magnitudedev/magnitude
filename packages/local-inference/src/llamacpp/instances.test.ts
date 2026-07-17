@@ -4,7 +4,7 @@ import * as FetchHttpClient from "@effect/platform/FetchHttpClient"
 import * as Path from "@effect/platform/Path"
 import * as Scope from "effect/Scope"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Effect, Exit, Option, Redacted, Ref } from "effect"
+import { Effect, Exit, Option, Redacted, Ref, Stream } from "effect"
 import {
   ModelFileFormatId,
   ModelFileId,
@@ -19,7 +19,9 @@ import {
   ContextSize,
   FlashAttentionSelection,
   GpuLayerSelection,
-  LlamaBinaryFingerprint,
+  LlamaCppExecutableFingerprint,
+  LlamaCppInstallationId,
+  LlamaBuildNumber,
   LlamaModelRequest,
   LlamaServedModelId,
   MicroBatchSize,
@@ -62,6 +64,7 @@ describe("llama instance registry", () => {
     loaded = false
     const closed = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const processClosed = yield* Ref.make(false)
+      const startedInstallations = yield* Ref.make<readonly LlamaCppInstallationId[]>([])
       const fs = yield* FileSystem.FileSystem
       const path = yield* Path.Path
       const temporary = yield* fs.makeTempDirectoryScoped()
@@ -91,21 +94,25 @@ describe("llama instance registry", () => {
           version: [{ key: SourceFileKey.make("model"), sizeBytes: 4, modifiedAtMillis: Option.none() }],
         }),
         remove: () => Effect.void,
-        index: Effect.succeed({ capturedAt: new Date(), sets: [], issues: [] }),
+        artifactIndex: Effect.succeed({ capturedAt: new Date(), sets: [], issues: [] }),
+        changes: Stream.empty,
       }
-      const cli: LlamaCli = {
-        binary: {
-          executable: "/test/llama-server",
-          distributionDirectory: "/test",
-          build: { versionOutput: "test", buildNumber: Option.none(), commit: Option.none() },
-          source: "configured",
-          fingerprint: LlamaBinaryFingerprint.make("test-fingerprint"),
+      const makeCli = (id: string, fingerprint: string): LlamaCli => ({
+        installation: {
+          id: LlamaCppInstallationId.make(id),
+          build: LlamaBuildNumber.make(10011),
+          commit: Option.none(),
+          ownership: "user",
+          discoveries: [{ _tag: "Configured", requestedPath: "/test/llama-server" }],
+          executables: {
+            server: { path: "/test/llama-server", fingerprint: LlamaCppExecutableFingerprint.make(`${fingerprint}-server`) },
+            fitParams: { path: "/test/llama-fit-params", fingerprint: LlamaCppExecutableFingerprint.make(`${fingerprint}-fit`) },
+          },
         },
-        version: Effect.succeed({ versionOutput: "test", buildNumber: Option.none(), commit: Option.none() }),
-        capabilities: Effect.succeed({ fitPrint: false, listDevices: false, apiKey: true, presets: true, noModelsAutoload: true, modelsMax: true, modelSleepIdleSeconds: true, helpOutput: "" }),
         listDevices: Effect.dieMessage("unused"),
         assessFit: () => Effect.dieMessage("unused"),
         startRouter: () => Effect.gen(function* () {
+          yield* Ref.update(startedInstallations, (started) => [...started, LlamaCppInstallationId.make(id)])
           yield* Effect.addFinalizer(() => Ref.set(processClosed, true))
           return {
             origin: new URL(`http://127.0.0.1:${server.port}`),
@@ -113,7 +120,10 @@ describe("llama instance registry", () => {
             sanitizedOutput: Effect.succeed(""),
           }
         }),
-      }
+      })
+      const firstCli = makeCli("first-installation", "first-fingerprint")
+      const secondCli = makeCli("second-installation", "second-fingerprint")
+      const selectedCli = yield* Ref.make(firstCli)
       const profile = yield* makeLlamaExecutionProfile({
         contextSize: ContextSize.ModelDefault(), outputLimit: OutputLimit.RuntimeDefault(), parallelSlots: 1,
         gpuLayers: GpuLayerSelection.Fit(), splitMode: "layer", tensorSplit: Option.none(), kvCache: { key: "f16", value: "f16" },
@@ -124,22 +134,56 @@ describe("llama instance registry", () => {
         onSome: Effect.succeed,
       })
       const registry = yield* makeLlamaInstanceRegistry({
-        cli: Option.some(cli), modelFiles, presetPath: path.join(temporary, "presets.ini"), host: "127.0.0.1", port,
+        managedCli: Ref.get(selectedCli).pipe(Effect.map(Option.some)), modelFiles, presetPath: path.join(temporary, "presets.ini"), host: "127.0.0.1", port,
         apiKey: Redacted.make("managed-secret"), modelsMax: 1,
         external: [],
       })
+      const observationChanges = yield* Ref.make(0)
+      yield* registry.changes.pipe(
+        Stream.runForEach(() => Ref.update(observationChanges, (count) => count + 1)),
+        Effect.forkScoped,
+      )
+      yield* Effect.yieldNow()
+      yield* registry.refresh
       const leaseScope = yield* Scope.make()
       const servedModelId = LlamaServedModelId.make("managed-model")
       yield* registry.acquire(LlamaModelRequest.Managed({ request: { modelFileId, servedModelId, profile } })).pipe(
         Effect.provideService(Scope.Scope, leaseScope),
       )
+      yield* registry.refresh
+      yield* Effect.yieldNow()
       const guarded = yield* registry.stopManaged.pipe(Effect.either)
+      yield* Ref.set(selectedCli, secondCli)
+      yield* registry.reconcileManagedInstallation
+      yield* registry.refresh
+      const activeWhileLeased = (yield* registry.snapshot).activeManagedInstallationId
       yield* Scope.close(leaseScope, Exit.void)
+      const replacementScope = yield* Scope.make()
+      yield* registry.acquire(LlamaModelRequest.Managed({ request: { modelFileId, servedModelId, profile } })).pipe(
+        Effect.provideService(Scope.Scope, replacementScope),
+      )
+      yield* registry.refresh
+      const activeAfterRelease = (yield* registry.snapshot).activeManagedInstallationId
+      yield* Scope.close(replacementScope, Exit.void)
       yield* registry.stopManaged
-      return { guarded: guarded._tag, processClosed: yield* Ref.get(processClosed) }
+      return {
+        guarded: guarded._tag,
+        activeWhileLeased,
+        activeAfterRelease,
+        startedInstallations: yield* Ref.get(startedInstallations),
+        processClosed: yield* Ref.get(processClosed),
+        observationChanges: yield* Ref.get(observationChanges),
+      }
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
 
     expect(closed.guarded).toBe("Left")
+    expect(Option.getOrThrow(closed.activeWhileLeased)).toBe(LlamaCppInstallationId.make("first-installation"))
+    expect(Option.getOrThrow(closed.activeAfterRelease)).toBe(LlamaCppInstallationId.make("second-installation"))
+    expect(closed.startedInstallations).toEqual([
+      LlamaCppInstallationId.make("first-installation"),
+      LlamaCppInstallationId.make("second-installation"),
+    ])
     expect(closed.processClosed).toBe(true)
+    expect(closed.observationChanges).toBeGreaterThan(0)
   })
 })

@@ -13,7 +13,6 @@ import {
   type ToolDefinition,
 } from '@magnitudedev/ai'
 import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/sdk'
-import type { ModelProfile } from '@magnitudedev/ai'
 
 const traceMock = vi.hoisted(() => ({
   sessionId: 'session-1' as string | null,
@@ -31,10 +30,9 @@ const { makeAgentBoundModel, AgentModelOperationContextTag } = await import('../
 const { TurnContextTag } = await import('../src/engine/turn-context')
 const { ForkContext } = Fork
 
-const profile: ModelProfile = {
+const profile = {
   contextWindow: 100_000,
   maxOutputTokens: 4096,
-  capabilities: { vision: true },
 }
 
 const testModelSpec: ModelSpec<BaseCallOptions> = {

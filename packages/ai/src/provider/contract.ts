@@ -1,9 +1,10 @@
 import type { Effect, Option } from "effect"
 import type { BoundModel } from "../model/bound-model"
-import type { ModelFamilyId, ProviderId, ProviderModel, ProviderModelId } from "./model"
+import type { ModelFamilyId, ProviderId, ProviderModel, ProviderModelId, ReasoningEffort } from "./model"
 import type { ModelCatalog } from "./catalog"
-import type { ProviderModelCapabilities, ImagePlaceholderConfig } from "../model/capabilities"
+import type { ImagePlaceholderConfig } from "../model/capabilities"
 import type { BaseCallOptions, ToolChoice } from "./call-options"
+import type { ModelDiscoveryOperationId, ModelPropertyDiscoveryError, ModelPropertyDiscoveryRequest } from "./discoverable-property"
 
 /**
  * The base provider interface — defines what a provider is.
@@ -19,6 +20,10 @@ export interface Provider<
   readonly id: ProviderId
   readonly displayName: string
   readonly catalog: ModelCatalog<TModel>
+
+  readonly discoverModelProperties: (
+    request: ModelPropertyDiscoveryRequest,
+  ) => Effect.Effect<ModelDiscoveryOperationId, ModelPropertyDiscoveryError>
 
   /**
    * Bind a model for inference.
@@ -48,8 +53,13 @@ export interface Provider<
  */
 export interface ProviderModelBindOptions {
   readonly defaults?: Partial<BaseCallOptions>
-  readonly capabilities?: ProviderModelCapabilities
   readonly imagePlaceholders?: ImagePlaceholderConfig
+  readonly requestAttribution?: RequestAttribution
+  /** Awaited when a bound default effort is invalidated by authoritative runtime inspection. */
+  readonly reasoningEffortFallback?: (
+    requested: ReasoningEffort,
+    fallback: ReasoningEffort,
+  ) => Effect.Effect<void, unknown, never>
   /** Agent ID — used by providers that support tracing/metadata. Ignored by others. */
   readonly agentId?: string
   /** Role ID — used by providers that support tracing/metadata. Ignored by others. */
@@ -92,4 +102,8 @@ export interface UsageExtension<TResponse = UsageResponse, TError = unknown, R =
   readonly usage: (
     query?: UsageQuery,
   ) => Effect.Effect<TResponse, TError, R>
+}
+/** Process-local request attribution, such as per-slot MRU updates. */
+export interface RequestAttribution {
+  readonly requestStarted: Effect.Effect<void, never, never>
 }

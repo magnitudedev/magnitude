@@ -11,8 +11,6 @@ import { classifyLlamaCppRejectedResponse } from "./errors"
 import type { LlamaCppCallOptions, LlamaCppToolChoice } from "./contract"
 
 export type { LlamaCppCallOptions, LlamaCppToolChoice } from "./contract"
-export type { ModelProfile } from "@magnitudedev/ai"
-export { toModelProfile } from "@magnitudedev/ai"
 
 export type LlamaCppModelSpec = ModelSpec<LlamaCppCallOptions>
 
@@ -26,8 +24,8 @@ const llamacppOptions = {
   toolChoice: Option.define(
     (v: LlamaCppToolChoice) => ({ tool_choice: v }),
   ),
-  reasoningEffort: Option.define(
-    (v: string) => ({ reasoning_effort: v }),
+  chatTemplateKwargs: Option.define(
+    (v: Readonly<Record<string, unknown>>) => ({ chat_template_kwargs: v }),
   ),
   temperature: Option.define(
     (v: number) => ({ temperature: v }),
@@ -60,6 +58,9 @@ export function wrapAsBaseModel(
 ): BoundModel<BaseCallOptions> {
   return {
     stream: (prompt, tools, options) =>
-      internal.stream(prompt, tools, options),
+      internal.stream(prompt, tools, options ? {
+        ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+        ...(options.toolChoice === undefined ? {} : { toolChoice: options.toolChoice }),
+      } : undefined),
   }
 }

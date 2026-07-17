@@ -6,8 +6,11 @@ import type {
   ModelCatalog,
   Provider,
   ProviderModelBindOptions,
+  ModelPropertyDiscoveryRequest,
+  ModelDiscoveryOperationId,
+  ModelPropertyDiscoveryError,
 } from "@magnitudedev/ai"
-import { ProviderIdSchema, StreamStartOperationalFailure, type ProviderModelId } from "@magnitudedev/ai"
+import { ProviderIdSchema, StreamStartOperationalFailure, type ProviderModelId, type ReasoningEffort } from "@magnitudedev/ai"
 import { createLlamaCppCompatibleSpec, wrapAsBaseModel } from "./models"
 import type { LlamaCppCallOptions, LlamaCppModelInfo, LlamaServedModelId, LlamaServingRouteId } from "./contract"
 
@@ -25,7 +28,8 @@ export interface LlamaCppInferenceLease {
   readonly origin: URL
   readonly authorization: Option.Option<Redacted.Redacted<string>>
   readonly servedModelId: LlamaServedModelId
-  readonly requestStarted: Effect.Effect<void>
+  readonly reasoningEffort: ReasoningEffort
+  readonly chatTemplateKwargs: Option.Option<Readonly<Record<string, unknown>>>
 }
 
 /**
@@ -35,8 +39,12 @@ export interface LlamaCppInferenceLease {
  */
 export interface LlamaCppProviderSource {
   readonly catalog: ModelCatalog<LlamaCppModelInfo>
+  readonly discoverModelProperties: (
+    request: ModelPropertyDiscoveryRequest,
+  ) => Effect.Effect<ModelDiscoveryOperationId, ModelPropertyDiscoveryError>
   readonly acquire: (
     providerModelId: ProviderModelId,
+    reasoningEffort: ReasoningEffort | undefined,
   ) => Effect.Effect<LlamaCppInferenceLease, LlamaCppAcquisitionError, Scope.Scope>
   readonly status: Effect.Effect<{
     readonly status: "ok" | "loading" | "not_found" | "error"
@@ -55,7 +63,6 @@ const callOptions = (defaults: Partial<BaseCallOptions> | undefined): Partial<Ll
     ? {
         ...(defaults.maxTokens === undefined ? {} : { maxTokens: defaults.maxTokens }),
         ...(defaults.toolChoice === undefined ? {} : { toolChoice: defaults.toolChoice }),
-        ...(defaults.reasoningEffort === undefined ? {} : { reasoningEffort: defaults.reasoningEffort }),
       }
     : undefined
 
@@ -76,7 +83,8 @@ const dynamicBoundModel = (
   stream: (prompt, tools, requestOptions) => Effect.gen(function* () {
     const scope = yield* Scope.make()
     return yield* Effect.gen(function* () {
-      const lease = yield* source.acquire(providerModelId).pipe(
+      const reasoningEffort = requestOptions?.reasoningEffort ?? options?.defaults?.reasoningEffort
+      const lease = yield* source.acquire(providerModelId, reasoningEffort).pipe(
         Effect.provideService(Scope.Scope, scope),
         Effect.mapError((cause) => new StreamStartOperationalFailure({
           call: {
@@ -91,17 +99,38 @@ const dynamicBoundModel = (
           },
         })),
       )
+      if (requestOptions?.reasoningEffort === undefined
+        && reasoningEffort !== undefined
+        && lease.reasoningEffort !== reasoningEffort) {
+        yield* (options?.reasoningEffortFallback?.(reasoningEffort, lease.reasoningEffort) ?? Effect.void).pipe(
+          Effect.mapError((cause) => new StreamStartOperationalFailure({
+            call: {
+              provider: PROVIDER_ID,
+              model: providerModelId,
+              method: "POST",
+              url: `llamacpp://reasoning-fallback/${encodeURIComponent(providerModelId)}`,
+            },
+            reason: {
+              _tag: "RequestFailedBeforeResponse",
+              cause: { _tag: "ErrorCause", name: "ReasoningEffortFallbackFailed", message: cause instanceof Error ? cause.message : String(cause) },
+            },
+          })),
+        )
+      }
       const result = yield* wrapAsBaseModel(
         createLlamaCppCompatibleSpec({
           modelId: lease.servedModelId,
           endpoint: inferenceEndpoint(lease),
         }).bind({
           auth: authFor(lease),
-          defaults: callOptions(options?.defaults),
+          defaults: {
+            ...callOptions(options?.defaults),
+            ...(Option.isSome(lease.chatTemplateKwargs) ? { chatTemplateKwargs: lease.chatTemplateKwargs.value } : {}),
+          },
           ...(options?.imagePlaceholders ? { imagePlaceholders: options.imagePlaceholders } : {}),
         }),
       ).stream(prompt, tools, requestOptions)
-      yield* lease.requestStarted
+      yield* (options?.requestAttribution?.requestStarted ?? Effect.void)
       return {
         ...result,
         events: result.events.pipe(Stream.ensuring(Scope.close(scope, Exit.void))),
@@ -115,6 +144,7 @@ export function createLlamaCppProvider(source: LlamaCppProviderSource): LlamaCpp
     id: PROVIDER_ID,
     displayName: "Llama.cpp",
     catalog: source.catalog,
+    discoverModelProperties: source.discoverModelProperties,
     bindModel: (providerModelId, options) => Effect.succeed(dynamicBoundModel(source, providerModelId, options)),
     classifyModelFamily: () => Option.none(),
   }

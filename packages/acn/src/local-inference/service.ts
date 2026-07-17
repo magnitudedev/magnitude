@@ -1,10 +1,10 @@
 import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
-import * as HttpClient from "@effect/platform/HttpClient"
 import {
   LocalInferenceError,
   type MirroredResourceInvalidation,
   type LocalInferenceHostProfile,
-  type LocalInferenceState,
+  type LocalInferenceSnapshot,
+  LocalInferenceState,
   type LocalInferenceUsageSelection,
   type LocalModelChoice,
 } from "@magnitudedev/protocol"
@@ -17,12 +17,14 @@ import { LocalInferencePlatform } from "./platform"
 import { LocalModelProviderSource, type LlamaLogicalRoute } from "./provider-source"
 import { configuredParallelSlots } from "./recommendations"
 import { recommendLocalModels } from "./recommendations"
+import { makeMirroredResource } from "../mirrored-resource"
 
 export interface LocalInferenceApi {
-  readonly state: Effect.Effect<LocalInferenceState, LocalInferenceError>
+  readonly state: Effect.Effect<LocalInferenceSnapshot, LocalInferenceError>
   readonly watchState: Stream.Stream<MirroredResourceInvalidation, LocalInferenceError>
   readonly configureUsage: (selection: LocalInferenceUsageSelection) => Effect.Effect<void, LocalInferenceError>
-  readonly installDistribution: Effect.Effect<void, LocalInferenceError>
+  readonly installLlamaCpp: Effect.Effect<string, LocalInferenceError>
+  readonly refreshInstallations: Effect.Effect<void, LocalInferenceError>
   readonly downloadModel: (configurationId: string) => Effect.Effect<void, LocalInferenceError>
   readonly activateModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
   readonly deleteModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
@@ -80,36 +82,28 @@ const hostToWire = (
 export const LocalInferenceLive: Layer.Layer<
   LocalInference,
   never,
-  LocalInferencePlatform | LocalModelProviderSource | LocalModelConfiguration | HttpClient.HttpClient
-> = Layer.effect(LocalInference, Effect.gen(function* () {
+  LocalInferencePlatform | LocalModelProviderSource | LocalModelConfiguration
+> = Layer.scoped(LocalInference, Effect.gen(function* () {
   const platform = yield* LocalInferencePlatform
   const source = yield* LocalModelProviderSource
   const configuration = yield* LocalModelConfiguration
-  const http = yield* HttpClient.HttpClient
   const lock = yield* Effect.makeSemaphore(1)
-  const distributionCache = yield* Ref.make<Option.Option<LlamaCpp.LlamaDistributionStatus>>(Option.none())
-  const distributionStatus = Ref.get(distributionCache).pipe(Effect.flatMap(Option.match({
-    onNone: () => platform.distribution.status.pipe(Effect.tap((status) => Ref.set(distributionCache, Option.some(status)))),
-    onSome: Effect.succeed,
-  })))
+  const hostSnapshot = yield* platform.hardware.inspect.pipe(Effect.either)
+  const initialRegistry = yield* platform.instances.pipe(Effect.option)
+  const activeRegistry = yield* Ref.make(initialRegistry)
   const configured = configuration.get.pipe(Effect.mapError(fromConfiguration))
 
   const configureUsage = (selection: LocalInferenceUsageSelection) => lock.withPermits(1)(
     configuration.updateUsage(selection).pipe(Effect.mapError(fromConfiguration)),
   )
 
-  const installDistribution = platform.hardware.inspect.pipe(
-    Effect.flatMap((host) => {
-      const id = host.platform === "darwin"
-        ? host.nativeArchitecture === "arm64" ? "macos-arm64-metal" : "macos-x64-cpu"
-        : host.platform === "linux"
-          ? host.nativeArchitecture === "arm64" ? "linux-arm64-cpu" : "linux-x64-cpu"
-          : null
-      return platform.distribution.install(id ? Option.some(LlamaCpp.LlamaDistributionVariantId.make(id)) : Option.none())
-    }),
-    Effect.asVoid,
-    Effect.tap(() => platform.distribution.status.pipe(Effect.flatMap((status) => Ref.set(distributionCache, Option.some(status))))),
-    Effect.mapError((cause) => mapFailure("install llama.cpp distribution", cause)),
+  const installLlamaCpp = platform.installations.installManaged.pipe(
+    Effect.map(String),
+    Effect.mapError((cause) => mapFailure("install managed llama.cpp", cause)),
+  )
+  const refreshInstallations = platform.installations.refresh.pipe(
+    Effect.zipRight(platform.instances.pipe(Effect.asVoid)),
+    Effect.mapError((cause) => mapFailure("refresh llama.cpp installations", cause)),
   )
 
   const downloadModel = (configurationId: string) => Effect.gen(function* () {
@@ -128,11 +122,6 @@ export const LocalInferenceLive: Layer.Layer<
     )
     yield* platform.files.inspect("changed")
   })
-
-  const catalogModels = source.catalog.list.pipe(
-    Effect.mapError((cause) => mapFailure("inspect local models", cause)),
-    Effect.provideService(HttpClient.HttpClient, http),
-  )
 
   const matchCatalogEntry = (record: ModelFiles.ModelFileRecord | undefined) => record
     ? LOCAL_MODEL_CATALOG.find((entry) =>
@@ -154,7 +143,6 @@ export const LocalInferenceLive: Layer.Layer<
     const logical = yield* resolveSelectedModel(selectionId)
     const model = logical?.providerModel
     if (!logical || !model || model.availability._tag === "Disabled") return yield* localError("invalid_selection", "activate local model", "The requested local model is unavailable.")
-    yield* source.warm(logical.providerModelId).pipe(Effect.mapError((cause) => mapFailure("activate local model", cause)))
     const managed = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
     const external = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "External" }> => route._tag === "External")
     const binding: DurableLocalModelBinding = !managed && external
@@ -174,6 +162,7 @@ export const LocalInferenceLive: Layer.Layer<
           parallelSlots: configuredParallelSlots(),
         }
     yield* configuration.activateLocal(binding).pipe(Effect.mapError(fromConfiguration))
+    yield* source.warm(logical.providerModelId).pipe(Effect.mapError((cause) => mapFailure("activate local model", cause)))
   }))
 
   const deleteModel = (selectionId: string) => lock.withPermits(1)(Effect.gen(function* () {
@@ -202,15 +191,22 @@ export const LocalInferenceLive: Layer.Layer<
     yield* source.stopManaged.pipe(Effect.mapError((cause) => mapFailure("disable local inference", cause)))
   }))
 
-  const state = Effect.gen(function* () {
-    const [config, distribution, hostResult, models, logicalModels, files, operations] = yield* Effect.all([
+  const buildState = Effect.gen(function* () {
+    const [config, installationState, logicalModels, files, operations, instanceSnapshot] = yield* Effect.all([
       configured,
-      distributionStatus,
-      platform.hardware.inspect.pipe(Effect.either),
-      catalogModels,
+      platform.installations.snapshot,
       source.logicalModels,
       platform.files.inspect("cached"),
       source.operations,
+      Ref.get(activeRegistry).pipe(Effect.flatMap(Option.match({
+        onNone: () => Effect.succeed({
+          instances: [],
+          failures: [],
+          capturedAt: new Date(),
+          activeManagedInstallationId: Option.none(),
+        } satisfies LlamaCpp.LlamaInstanceSnapshot),
+        onSome: (registry) => registry.snapshot,
+      }))),
     ], { concurrency: 4 })
     const choices: LocalModelChoice[] = [...logicalModels.values()].map((logical) => {
       const model = logical.providerModel
@@ -221,14 +217,28 @@ export const LocalInferenceLive: Layer.Layer<
       const runningExternal = logical?.routes.some((route) => route._tag === "External" && route.healthy && (route.observation.status === "loaded" || route.observation.status === "sleeping")) ?? false
       const runningManaged = logical?.routes.some((route) => route._tag === "Managed" && route.loaded) ?? false
       const residency = runningExternal || runningManaged ? "loaded" as const : "unloaded" as const
+      const availability = model?.availability ?? { _tag: "Disabled" as const, reason: "model_unavailable" as const }
+      const fitAssessment = managed && !runningManaged
+        ? Option.match(managed.fitAssessment, {
+          onNone: () => ({ _tag: "NotAssessed" as const }),
+          onSome: (assessment) => ({ _tag: "Estimated" as const, ...assessment }),
+        })
+        : { _tag: "NotAssessed" as const }
       const common = {
         choiceId: curated?.id ?? logical.providerModelId,
         displayName: logical.information.displayName,
         providerModelId: logical.providerModelId,
         ...(model ? { contextTokens: model.contextWindow } : {}),
         fitClass: "unknown" as const,
-        compatible: model?.availability._tag === "Available",
-        explanation: !model ? "Metadata required for safe inference is unavailable." : model.availability._tag === "Available" ? "Runnable with the active llama.cpp distribution." : `Unavailable: ${model.availability.reason}`,
+        availability,
+        fitAssessment,
+        explanation: !model
+          ? "Metadata required for safe inference is unavailable."
+          : availability._tag === "Disabled"
+            ? `Unavailable: ${availability.reason}`
+            : fitAssessment._tag === "Estimated" && fitAssessment.result === "capacity_risk"
+              ? "Estimated memory exceeds stable capacity; loading may fail or affect system performance."
+              : "Runnable with the selected llama.cpp installation.",
         residency,
         ...(record ? { sizeBytes: record.sizeBytes } : {}),
       }
@@ -238,8 +248,21 @@ export const LocalInferenceLive: Layer.Layer<
         ? { _tag: "StoredOwned" as const, ...common }
         : { _tag: "StoredExternal" as const, ...common }
     })
-    const binary = Option.orElse(distribution.configured, () => Option.orElse(distribution.managed, () => distribution.path))
     const activeProviderModelId = config.binding ? storedProviderModelId(config.binding.providerModelId) : undefined
+    const installOperation = installationState.managedInstall.operation
+    const clientInstallOperation = installOperation._tag === "Running"
+      ? {
+          ...installOperation,
+          operationId: String(installOperation.operationId),
+          stage: installOperation.stage === "Resolving"
+            ? "preparing" as const
+            : installOperation.stage === "Downloading"
+              ? "downloading" as const
+              : "installing" as const,
+        }
+      : installOperation._tag === "Failed"
+        ? { ...installOperation, operationId: String(installOperation.operationId) }
+        : installOperation
     return {
       usage: config.usage ?? null,
       activeBinding: config.binding && activeProviderModelId
@@ -247,31 +270,97 @@ export const LocalInferenceLive: Layer.Layer<
           ? { _tag: "Managed" as const, selectionId: config.binding.selectionId, providerModelId: activeProviderModelId, contextTokens: config.binding.contextTokens }
           : { _tag: "External" as const, selectionId: config.binding.selectionId, providerModelId: activeProviderModelId, contextTokens: config.binding.contextTokens }
         : null,
-      distribution: Option.match(binary, {
-        onNone: () => ({ _tag: "Missing" as const }),
-        onSome: (value) => ({ _tag: "Ready" as const, build: Option.getOrElse(value.build.buildNumber, () => 1), source: value.source === "path" ? "configured" as const : value.source }),
-      }),
-      host: hostResult._tag === "Right"
-        ? { _tag: "Available" as const, profile: hostToWire(hostResult.right, []) }
-        : { _tag: "Unavailable" as const, message: hostResult.left.message },
+      llamaCpp: {
+        minimumBuild: installationState.minimumBuild,
+        recommendedBuild: installationState.recommendedBuild,
+        installations: installationState.installations.map((installation) => ({
+          id: String(installation.id),
+          build: installation.build,
+          ownership: installation.ownership,
+          executables: {
+            serverPath: installation.executables.server.path,
+            fitParamsPath: installation.executables.fitParams.path,
+          },
+          discoveries: installation.discoveries,
+        })),
+        selectedInstallationId: Option.map(installationState.selectedInstallationId, String),
+        activeManagedInstallationId: Option.map(instanceSnapshot.activeManagedInstallationId, String),
+        managedInstall: {
+          availability: installationState.managedInstall.availability._tag === "Available"
+            ? { _tag: "Available" as const, build: installationState.managedInstall.availability.build }
+            : installationState.managedInstall.availability,
+          operation: clientInstallOperation,
+        },
+        diagnostics: installationState.diagnostics.map((diagnostic) => ({ code: diagnostic._tag, message: diagnostic.reason })),
+      },
+      host: hostSnapshot._tag === "Right"
+        ? { _tag: "Available" as const, profile: hostToWire(hostSnapshot.right, []) }
+        : { _tag: "Unavailable" as const, message: hostSnapshot.left.message },
       choices,
       operations,
-      recommendations: config.usage && hostResult._tag === "Right"
-        ? recommendLocalModels({ systemMemoryBytes: hostResult.right.totalMemoryBytes, acceleratorDomains: [] }, config.usage)
+      recommendations: config.usage && hostSnapshot._tag === "Right"
+        ? recommendLocalModels({ systemMemoryBytes: hostSnapshot.right.totalMemoryBytes, acceleratorDomains: [] }, config.usage)
         : [],
-      warnings: files.issues.map((issue) => ({ code: issue.code, message: issue.message })),
+      warnings: [
+        ...files.issues.map((issue) => ({ code: issue.code, message: issue.message })),
+        ...instanceSnapshot.instances.flatMap((instance) => instance.diagnostics.map((diagnostic) => ({
+          code: diagnostic.code,
+          message: diagnostic.message,
+        }))),
+        ...instanceSnapshot.failures.map((failure) => ({
+          code: `runtime_${failure.reason}`,
+          message: `Unable to observe llama.cpp instance ${failure.instanceId}: ${failure.reason}`,
+        })),
+      ],
     } satisfies LocalInferenceState
   })
 
-  const watchState = Stream.concat(Stream.make(undefined), Stream.tick("500 millis")).pipe(
-    Stream.mapEffect(() => state),
-    Stream.changesWith((previous, current) => JSON.stringify(previous) === JSON.stringify(current)),
-    Stream.mapAccum(0, (revision): readonly [number, MirroredResourceInvalidation] => [
-      revision + 1,
-      { _tag: "changed", revision: revision + 1 },
-    ]),
+  const initialState = yield* buildState.pipe(Effect.orDie)
+  const stateResource = yield* makeMirroredResource(initialState)
+  const publishState = buildState.pipe(
+    Effect.flatMap((next) => stateResource.setIfChanged(next, Schema.equivalence(LocalInferenceState))),
+    Effect.asVoid,
+  )
+  const registryChanges = Stream.concat(
+    Option.match(initialRegistry, {
+      onNone: () => Stream.empty,
+      onSome: Stream.make,
+    }),
+    platform.instanceChanges,
+  ).pipe(
+    Stream.tap((registry) => Ref.set(activeRegistry, Option.some(registry))),
+    Stream.flatMap((registry) => Stream.concat(Stream.make(undefined), registry.changes), {
+      concurrency: 1,
+      switch: true,
+    }),
+  )
+  const triggers = Stream.mergeAll([
+    configuration.changes,
+    platform.installations.changes,
+    source.stateChanges,
+    platform.files.changes.pipe(Stream.map(() => undefined)),
+    registryChanges,
+  ], { concurrency: "unbounded" })
+  yield* triggers.pipe(
+    Stream.debounce("50 millis"),
+    Stream.runForEach(() => publishState.pipe(
+      Effect.catchAll((cause) => Effect.logWarning("Local inference state projection failed").pipe(
+        Effect.annotateLogs({ cause: String(cause) }),
+      )),
+    )),
+    Effect.forkScoped,
   )
 
-  return LocalInference.of({ state, watchState, configureUsage, installDistribution, downloadModel, activateModel, deleteModel, restart, disable })
+  return LocalInference.of({
+    state: stateResource.get,
+    watchState: stateResource.changes,
+    configureUsage,
+    installLlamaCpp: installLlamaCpp.pipe(Effect.tap(() => publishState)),
+    refreshInstallations: refreshInstallations.pipe(Effect.tap(() => publishState)),
+    downloadModel,
+    activateModel,
+    deleteModel,
+    restart,
+    disable,
+  })
 }))
-

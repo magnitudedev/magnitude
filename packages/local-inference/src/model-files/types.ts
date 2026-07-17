@@ -221,7 +221,7 @@ export const InspectedModelArtifactSchema = Schema.Struct({
   warnings: Schema.Array(ModelFileWarningSchema),
 })
 
-export const LocalModelFileIndexSchema = Schema.Struct({
+export const ModelArtifactIndexSchema = Schema.Struct({
   capturedAt: Schema.DateFromString,
   sets: Schema.Array(Schema.Struct({
     sourceId: ModelFileSourceId,
@@ -237,7 +237,7 @@ export const LocalModelFileIndexSchema = Schema.Struct({
     sourceKey: Schema.optionalWith(SourceFileKey, { as: "Option", exact: true }),
   })),
 })
-export type LocalModelFileIndex = Schema.Schema.Type<typeof LocalModelFileIndexSchema>
+export type ModelArtifactIndex = Schema.Schema.Type<typeof ModelArtifactIndexSchema>
 
 export interface ModelFileFormat {
   readonly id: ModelFileFormatId
@@ -317,7 +317,8 @@ export interface ModelFileRegistryApi {
   readonly get: (id: ModelFileId) => Effect.Effect<ModelFileRecord, ModelFileNotFound>
   readonly resolve: (id: ModelFileId) => Effect.Effect<ResolvedModelFiles, ModelFileResolveError>
   readonly remove: (id: ModelFileId) => Effect.Effect<void, ModelFileDeleteError>
-  readonly index: Effect.Effect<LocalModelFileIndex>
+  readonly artifactIndex: Effect.Effect<ModelArtifactIndex>
+  readonly changes: Stream.Stream<void>
 }
 export class ModelFileRegistry extends Context.Tag("@magnitudedev/local-inference/ModelFileRegistry")<ModelFileRegistry, ModelFileRegistryApi>() {}
 

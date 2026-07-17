@@ -1,4 +1,5 @@
 import { Schema } from 'effect'
+import { ReasoningEffortSchema } from '@magnitudedev/ai'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {
@@ -32,7 +33,7 @@ export type SlotId = Schema.Schema.Type<typeof SlotIdSchema>
 export const SlotModelConfigSchema = Schema.Struct({
   providerId: Schema.optional(Schema.String),
   providerModelId: Schema.optional(Schema.String),
-  reasoningEffort: Schema.optional(Schema.String),
+  reasoningEffort: Schema.optional(ReasoningEffortSchema),
 })
 export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
 

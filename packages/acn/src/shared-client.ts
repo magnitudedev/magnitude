@@ -10,6 +10,7 @@ import {
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
 import { LocalModelProviderSource } from "./local-inference/provider-source"
+import { LocalModelConfiguration } from "./local-inference/model-configuration"
 
 const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,
@@ -78,6 +79,14 @@ export const makeDelegatingProviderClient = (
   resolveModel: (providerId, providerModelId, options) => Ref.get(ref).pipe(
     Effect.flatMap((client) => client.resolveModel(providerId, providerModelId, options)),
   ),
+  discoverModelProperties: (providerId, request) => Ref.get(ref).pipe(
+    Effect.flatMap((client) => client.discoverModelProperties(providerId, request)),
+  ),
+  requestAttribution: (providerId, providerModelId, key) => ({
+    requestStarted: Ref.get(ref).pipe(
+      Effect.flatMap((client) => client.requestAttribution(providerId, providerModelId, key).requestStarted),
+    ),
+  }),
   webSearch: (query, schema) => Ref.get(ref).pipe(
     Effect.flatMap((client) => client.webSearch(query, schema)),
   ),
@@ -100,12 +109,13 @@ export class ProviderClientRegistry extends Context.Tag("ProviderClientRegistry"
 export const ProviderClientRegistryLive: Layer.Layer<
   ProviderClientRegistry,
   never,
-  MagnitudeStorage | LocalModelProviderSource
+  MagnitudeStorage | LocalModelProviderSource | LocalModelConfiguration
 > = Layer.effect(
   ProviderClientRegistry,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
     const llamacpp = yield* LocalModelProviderSource
+    const modelConfiguration = yield* LocalModelConfiguration
     const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
     const lock = yield* Effect.makeSemaphore(1)
 
@@ -127,7 +137,15 @@ export const ProviderClientRegistryLive: Layer.Layer<
           ? llamacpp.catalog.get(providerId, providerModelId)
           : client.catalog.get(providerId, providerModelId),
       }
-      const fileBacked: ProviderClientShape = { ...client, catalog }
+      const fileBacked: ProviderClientShape = {
+        ...client,
+        catalog,
+        requestAttribution: (providerId, providerModelId, key) => ({
+          requestStarted: providerId === "llamacpp" && (key === "primary" || key === "secondary")
+            ? modelConfiguration.recordUse(key, providerModelId).pipe(Effect.ignore)
+            : Effect.void,
+        }),
+      }
       return fileBacked
     })
 

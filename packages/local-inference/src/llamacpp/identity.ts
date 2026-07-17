@@ -3,8 +3,12 @@ import { Schema } from "effect"
 const id = <const Brand extends string>(brand: Brand, max = 1024) => Schema.String.pipe(Schema.minLength(1), Schema.maxLength(max), Schema.brand(brand))
 export const LlamaDistributionVariantId = id("LlamaDistributionVariantId")
 export type LlamaDistributionVariantId = Schema.Schema.Type<typeof LlamaDistributionVariantId>
-export const LlamaBinaryFingerprint = id("LlamaBinaryFingerprint", 256)
-export type LlamaBinaryFingerprint = Schema.Schema.Type<typeof LlamaBinaryFingerprint>
+export const LlamaCppExecutableFingerprint = id("LlamaCppExecutableFingerprint", 256)
+export type LlamaCppExecutableFingerprint = Schema.Schema.Type<typeof LlamaCppExecutableFingerprint>
+export const LlamaCppInstallationId = id("LlamaCppInstallationId", 256)
+export type LlamaCppInstallationId = Schema.Schema.Type<typeof LlamaCppInstallationId>
+export const LlamaInstallOperationId = id("LlamaInstallOperationId", 256)
+export type LlamaInstallOperationId = Schema.Schema.Type<typeof LlamaInstallOperationId>
 export const LlamaBuildCommitId = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{7,64}$/i), Schema.brand("LlamaBuildCommitId"))
 export type LlamaBuildCommitId = Schema.Schema.Type<typeof LlamaBuildCommitId>
 export const LlamaDeviceId = id("LlamaDeviceId", 512)
@@ -19,6 +23,8 @@ export const LlamaExecutionProfileId = id("LlamaExecutionProfileId")
 export type LlamaExecutionProfileId = Schema.Schema.Type<typeof LlamaExecutionProfileId>
 export const LlamaFitPlanId = id("LlamaFitPlanId")
 export type LlamaFitPlanId = Schema.Schema.Type<typeof LlamaFitPlanId>
+export const LlamaFitAssessmentKey = id("LlamaFitAssessmentKey")
+export type LlamaFitAssessmentKey = Schema.Schema.Type<typeof LlamaFitAssessmentKey>
 export const LlamaOperationId = id("LlamaOperationId")
 export type LlamaOperationId = Schema.Schema.Type<typeof LlamaOperationId>
 export const ExternalServerConfigId = id("ExternalServerConfigId")

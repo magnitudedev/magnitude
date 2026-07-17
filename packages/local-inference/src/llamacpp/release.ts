@@ -17,7 +17,10 @@ const variant = (
   architecture,
   archiveUrl: releaseUrl(file),
   sha256: Sha256Digest.make(sha256),
-  executableRelativePath: "llama-b10011/llama-server",
+  executables: {
+    server: "llama-b10011/llama-server",
+    fitParams: "llama-b10011/llama-fit-params",
+  },
   archive: "tar.gz",
 })
 
