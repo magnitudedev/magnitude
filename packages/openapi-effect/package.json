@@ -1,0 +1,25 @@
+{
+  "name": "@magnitudedev/openapi-effect",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bunx --bun vitest run"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.96.0",
+    "effect": "^3.21.2",
+    "prettier": "^2.8.8"
+  },
+  "devDependencies": {
+    "@types/prettier": "^2.7.3",
+    "@types/bun": "latest",
+    "vitest": "^3.2.4"
+  }
+}
