@@ -18,6 +18,7 @@ import {
   selectedInferenceIndex,
   selectionMetadata,
   selectionTitle,
+  type LocalInferenceSelection,
 } from "./view-model"
 
 interface LocalInferenceScreenProps {
@@ -156,35 +157,39 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     setRequestedStage("models")
   }, [busy, concurrency, local])
 
-  const confirmModel = useCallback(() => {
+  const confirmSelection = useCallback((selection: LocalInferenceSelection | undefined) => {
     if (busy) return
     if (state.distribution._tag !== "Ready") {
       local.installDistribution()
       return
     }
-    if (!selected) return
-    if (selected.kind === "running") {
-      if (state.activeBinding?.providerModelId === selected.choice.providerModelId) {
+    if (!selection) return
+    if (selection.kind === "running") {
+      if (state.activeBinding?.providerModelId === selection.choice.providerModelId) {
         onConfigured()
-      } else if (selected.choice._tag === "RunningExternal") {
-        setPendingActivationId(selected.id)
-        local.activateModel(selected.id)
+      } else if (selection.choice._tag === "RunningExternal") {
+        setPendingActivationId(selection.id)
+        local.activateModel(selection.id)
       }
       return
     }
-    if (selected.kind === "stored") {
-      setPendingActivationId(selected.id)
-      local.activateModel(selected.id)
+    if (selection.kind === "stored") {
+      setPendingActivationId(selection.id)
+      local.activateModel(selection.id)
       return
     }
-    const stored = state.choices.some((choice) => choice.choiceId === selected.id && choice._tag === "StoredOwned")
+    const stored = state.choices.some((choice) => choice.choiceId === selection.id && choice._tag === "StoredOwned")
     if (stored) {
-      setPendingActivationId(selected.id)
-      local.activateModel(selected.id)
+      setPendingActivationId(selection.id)
+      local.activateModel(selection.id)
     } else {
-      local.downloadModel(selected.id)
+      local.downloadModel(selection.id)
     }
-  }, [busy, local, onConfigured, selected, state.activeBinding, state.choices, state.distribution._tag])
+  }, [busy, local, onConfigured, state.activeBinding, state.choices, state.distribution._tag])
+
+  const confirmModel = useCallback(() => {
+    confirmSelection(selected)
+  }, [confirmSelection, selected])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c") return
@@ -318,8 +323,11 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{sectionLabel}</text>
               <text style={{ fg: theme.border }}>  {localModelSectionRule(sectionLabel)}</text>
             </box>}
-            <box
+            <Button
               id={`local-model-${index}`}
+              onClick={() => confirmSelection(selection)}
+              onMouseOver={() => { if (!busy) setSelectedId(selection.id) }}
+              cursor={busy ? "default" : "pointer"}
               style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: index === selectedIndex ? theme.primary : theme.border, paddingLeft: 1, paddingRight: 1, marginBottom: 1, flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}
             >
               <text style={{ fg: index === selectedIndex ? theme.primary : theme.foreground }} attributes={TextAttributes.BOLD}>
@@ -328,7 +336,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               </text>
               <text style={{ fg: theme.muted }}>{selectionMetadata(selection)}</text>
               {selection.kind === "recommendation" && <text style={{ fg: theme.muted }}>{selection.recommendation.quantization.fidelityLabel}</text>}
-            </box>
+            </Button>
             </Fragment>
           })}
         {details && selected?.kind === "recommendation" && (
