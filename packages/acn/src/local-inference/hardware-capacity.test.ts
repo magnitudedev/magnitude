@@ -40,7 +40,10 @@ const device = (input: {
 describe("llama.cpp hardware topology", () => {
   test("aliases Apple Metal capacity to the unified system-memory domain", () => {
     const machine = host("darwin", "arm64", 64)
-    const devices = [device({ id: "Metal0", backend: "Metal", type: "IGPU", totalGiB: 48 })]
+    const devices = [
+      device({ id: "Metal0", backend: "Metal", type: "IGPU", totalGiB: 48 }),
+      device({ id: "Accelerate", backend: "BLAS", type: "ACCEL", totalGiB: 0 }),
+    ]
     const capacity = detectedInferenceCapacity(machine, devices)
 
     expect(capacity.systemMemoryBytes).toBe(64 * GIB)
@@ -52,9 +55,11 @@ describe("llama.cpp hardware topology", () => {
     }])
     expect(hostToWire(machine, devices).memoryDomains[1]).toMatchObject({
       kind: "unified_working_set",
+      totalCapacityBytes: 48 * GIB,
       sharesSystemMemory: true,
-      deviceNames: ["Metal: Metal0"],
+      deviceNames: ["Metal0"],
     })
+    expect(hostToWire(machine, devices).memoryDomains).toHaveLength(2)
   })
 
   test("keeps discrete CUDA memory separate from Linux system memory", () => {

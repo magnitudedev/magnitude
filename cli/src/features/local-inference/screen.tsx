@@ -13,6 +13,7 @@ import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   buildLocalInferenceSelections,
+  describeLocalHardware,
   formatBytes,
   formatContext,
   selectedInferenceIndex,
@@ -129,7 +130,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const selectedIndex = selectedInferenceIndex(selections, selectedId)
   const selected = selections[selectedIndex]
   const busy = local.mutationBusy
-  const installationReady = Option.isSome(state.llamaCpp.selectedInstallationId)
   const error = local.mutationFailure
   const usageReady = state.usage?.sessionConcurrency === concurrency
   const stage = requestedStage === "models" && usageReady ? "models" : "usage"
@@ -157,10 +157,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 
   const confirmSelection = useCallback((selection: LocalInferenceSelection | undefined) => {
     if (busy) return
-    if (!installationReady) {
-      local.installLlamaCpp()
-      return
-    }
     if (!selection) return
     if (selection.kind === "running") {
       if (state.activeBinding?.providerModelId === selection.choice.providerModelId) {
@@ -183,7 +179,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     } else {
       local.downloadModel(selection.id)
     }
-  }, [installationReady, busy, local, onConfigured, state.activeBinding, state.choices])
+  }, [busy, local, onConfigured, state.activeBinding, state.choices])
 
   const confirmModel = useCallback(() => {
     confirmSelection(selected)
@@ -283,6 +279,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   }
 
   const host = state.host._tag === "Available" ? state.host.profile : null
+  const hardware = host ? describeLocalHardware(host) : null
   const firstRunningIndex = selections.findIndex((selection) => selection.kind === "running")
   const firstStoredIndex = selections.findIndex((selection) => selection.kind === "stored")
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
@@ -299,15 +296,36 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       <box style={{ flexDirection: "column", paddingTop: 1, paddingBottom: 1 }}>
       <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
       <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
-      <text style={{ fg: theme.muted }}>
-        {host ? `${formatBytes(host.systemMemoryBytes)} total system memory` : "System memory unavailable"}
-      </text>
       </box>
-      {!installationReady && (
-        <box style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: theme.warning, paddingLeft: 1, paddingRight: 1 }}>
-          <text style={{ fg: theme.warning }}>Install llama.cpp to download or run a recommended model.</text>
+      <box style={{ flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH, paddingBottom: 1 }}>
+        <box style={{ flexDirection: "row", paddingBottom: 1 }}>
+          <text style={{ fg: hardware ? theme.foreground : theme.warning }} attributes={TextAttributes.BOLD}>
+            {hardware ? "HARDWARE DETECTED" : "HARDWARE DETECTION UNAVAILABLE"}
+          </text>
+          <text style={{ fg: theme.border }}>
+            {"  "}{localModelSectionRule(hardware ? "HARDWARE DETECTED" : "HARDWARE DETECTION UNAVAILABLE")}
+          </text>
         </box>
-      )}
+        {hardware ? (
+          <box style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: theme.border, paddingLeft: 1, paddingRight: 1, flexDirection: "column", width: "100%" }}>
+            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
+            {hardware.system.details.map((detail) => (
+              <text key={detail} style={{ fg: theme.muted }}>{detail}</text>
+            ))}
+            {hardware.accelerators.map((accelerator) => (
+              <box key={`${accelerator.name}:${accelerator.details}`} style={{ flexDirection: "column", paddingTop: 1 }}>
+                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{accelerator.name}</text>
+                <text style={{ fg: theme.muted }}>{accelerator.details}</text>
+              </box>
+            ))}
+            {hardware.accelerators.length === 0 && !host?.memoryDomains.some((domain) => domain.kind === "unified_working_set") && (
+              <text style={{ fg: theme.muted }}>CPU inference · No GPU detected by llama.cpp</text>
+            )}
+          </box>
+        ) : (
+          <text style={{ fg: theme.muted }}>{state.host._tag === "Unavailable" ? state.host.message : "Hardware information is unavailable."}</text>
+        )}
+      </box>
       <box style={{ flexDirection: "column" }}>
         {selections.length === 0
           ? <text style={{ fg: theme.warning }}>No curated model currently fits this configuration.</text>
@@ -363,7 +381,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       <text style={{ fg: theme.muted, marginTop: 1 }}>
         ↑/↓ choose · D details
         {selected?.kind === "recommendation"
-          ? installationReady ? " · Enter download" : " · Enter install"
+          ? " · Enter download"
           : " · Enter use"}
       </text>
       <box style={{ paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: "row" }}>

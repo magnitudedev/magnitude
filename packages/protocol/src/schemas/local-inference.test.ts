@@ -35,6 +35,7 @@ describe("local inference protocol schemas", () => {
       memoryDomains: [{
         id: "gpu:0",
         kind: "physical_device",
+        totalCapacityBytes: 24 * 1024 ** 3,
         stableCapacityBytes: 24 * 1024 ** 3,
         currentFreeBytes: 1,
         sharesSystemMemory: false,
