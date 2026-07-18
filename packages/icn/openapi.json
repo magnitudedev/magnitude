@@ -376,6 +376,20 @@
         },
         "additionalProperties": false
       },
+      "CacheTypeResponse": {
+        "type": "string",
+        "enum": [
+          "f32",
+          "f16",
+          "bf16",
+          "q8_0",
+          "q4_0",
+          "q4_1",
+          "iq4_nl",
+          "q5_0",
+          "q5_1"
+        ]
+      },
       "ChatCompletionChunk": {
         "type": "object",
         "required": [
@@ -784,6 +798,109 @@
         },
         "additionalProperties": false
       },
+      "ExecutionConfigResponse": {
+        "type": "object",
+        "required": [
+          "requested",
+          "resolved"
+        ],
+        "properties": {
+          "requested": {
+            "$ref": "#/components/schemas/ExecutionSettingsResponse"
+          },
+          "resolved": {
+            "$ref": "#/components/schemas/ExecutionSettingsResponse",
+            "description": "Concrete parameters passed to libllama after common/fit and thread selection."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ExecutionSettingsResponse": {
+        "type": "object",
+        "required": [
+          "gpu_layers",
+          "use_mmap",
+          "use_mlock",
+          "split_mode",
+          "cache_type_k",
+          "cache_type_v",
+          "offload_kqv",
+          "operation_offload",
+          "swa_full",
+          "kv_unified",
+          "flash_attention"
+        ],
+        "properties": {
+          "gpu_layers": {
+            "$ref": "#/components/schemas/GpuLayersResponse"
+          },
+          "use_mmap": {
+            "type": "boolean"
+          },
+          "use_mlock": {
+            "type": "boolean"
+          },
+          "split_mode": {
+            "$ref": "#/components/schemas/SplitModeResponse"
+          },
+          "tensor_split": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "cache_type_k": {
+            "$ref": "#/components/schemas/CacheTypeResponse"
+          },
+          "cache_type_v": {
+            "$ref": "#/components/schemas/CacheTypeResponse"
+          },
+          "offload_kqv": {
+            "type": "boolean"
+          },
+          "operation_offload": {
+            "type": "boolean"
+          },
+          "swa_full": {
+            "type": "boolean"
+          },
+          "kv_unified": {
+            "type": "boolean"
+          },
+          "threads": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "threads_batch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "flash_attention": {
+            "$ref": "#/components/schemas/FlashAttentionResponse"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FlashAttentionResponse": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "disabled",
+          "enabled"
+        ]
+      },
       "FunctionDefinitionRequest": {
         "type": "object",
         "required": [
@@ -835,6 +952,58 @@
         "type": "string",
         "enum": [
           "function"
+        ]
+      },
+      "GpuLayersResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "auto"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "all"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "value",
+              "mode"
+            ],
+            "properties": {
+              "value": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "count"
+                ]
+              }
+            }
+          }
         ]
       },
       "GrammarTriggerResponse": {
@@ -1048,6 +1217,7 @@
           "model_size_bytes",
           "default_generation_settings",
           "modalities",
+          "execution",
           "chat_template",
           "template_fingerprint",
           "template_capabilities",
@@ -1077,6 +1247,9 @@
           },
           "modalities": {
             "$ref": "#/components/schemas/Modalities"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ExecutionConfigResponse"
           },
           "chat_template": {
             "type": "string"
@@ -1174,6 +1347,15 @@
               }
             }
           }
+        ]
+      },
+      "SplitModeResponse": {
+        "type": "string",
+        "enum": [
+          "none",
+          "layer",
+          "row",
+          "tensor"
         ]
       },
       "StopRequest": {

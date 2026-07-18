@@ -92,6 +92,20 @@ export const ApplyTemplateResponse = S.Struct({
 export type ApplyTemplateResponse = S.Schema.Type<typeof ApplyTemplateResponse>
 export type ApplyTemplateResponseEncoded = S.Schema.Encoded<typeof ApplyTemplateResponse>
 
+export const CacheTypeResponse = S.Union(
+  S.Literal("f32"),
+  S.Literal("f16"),
+  S.Literal("bf16"),
+  S.Literal("q8_0"),
+  S.Literal("q4_0"),
+  S.Literal("q4_1"),
+  S.Literal("iq4_nl"),
+  S.Literal("q5_0"),
+  S.Literal("q5_1"),
+)
+export type CacheTypeResponse = S.Schema.Type<typeof CacheTypeResponse>
+export type CacheTypeResponseEncoded = S.Schema.Encoded<typeof CacheTypeResponse>
+
 export const ChatCompletionChunk = S.Struct({
   choices: S.Array(S.suspend((): S.Schema<ChunkChoice, ChunkChoiceEncoded> => ChunkChoice)),
   created: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -298,6 +312,48 @@ export const ErrorResponse = S.Struct({
 export type ErrorResponse = S.Schema.Type<typeof ErrorResponse>
 export type ErrorResponseEncoded = S.Schema.Encoded<typeof ErrorResponse>
 
+export const ExecutionConfigResponse = S.Struct({
+  requested: S.suspend(
+    (): S.Schema<ExecutionSettingsResponse, ExecutionSettingsResponseEncoded> => ExecutionSettingsResponse,
+  ),
+  resolved: S.suspend(
+    (): S.Schema<ExecutionSettingsResponse, ExecutionSettingsResponseEncoded> => ExecutionSettingsResponse,
+  ),
+})
+export type ExecutionConfigResponse = S.Schema.Type<typeof ExecutionConfigResponse>
+export type ExecutionConfigResponseEncoded = S.Schema.Encoded<typeof ExecutionConfigResponse>
+
+export const ExecutionSettingsResponse = S.Struct({
+  cache_type_k: S.suspend((): S.Schema<CacheTypeResponse, CacheTypeResponseEncoded> => CacheTypeResponse),
+  cache_type_v: S.suspend((): S.Schema<CacheTypeResponse, CacheTypeResponseEncoded> => CacheTypeResponse),
+  flash_attention: S.suspend(
+    (): S.Schema<FlashAttentionResponse, FlashAttentionResponseEncoded> => FlashAttentionResponse,
+  ),
+  gpu_layers: S.suspend((): S.Schema<GpuLayersResponse, GpuLayersResponseEncoded> => GpuLayersResponse),
+  kv_unified: S.Boolean,
+  offload_kqv: S.Boolean,
+  operation_offload: S.Boolean,
+  split_mode: S.suspend((): S.Schema<SplitModeResponse, SplitModeResponseEncoded> => SplitModeResponse),
+  swa_full: S.Boolean,
+  tensor_split: S.optionalWith(S.Union(S.Array(S.Number), S.Null), { exact: true, as: "Option" }),
+  threads: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
+  threads_batch: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
+  use_mlock: S.Boolean,
+  use_mmap: S.Boolean,
+})
+export type ExecutionSettingsResponse = S.Schema.Type<typeof ExecutionSettingsResponse>
+export type ExecutionSettingsResponseEncoded = S.Schema.Encoded<typeof ExecutionSettingsResponse>
+
+export const FlashAttentionResponse = S.Union(S.Literal("auto"), S.Literal("disabled"), S.Literal("enabled"))
+export type FlashAttentionResponse = S.Schema.Type<typeof FlashAttentionResponse>
+export type FlashAttentionResponseEncoded = S.Schema.Encoded<typeof FlashAttentionResponse>
+
 export const FunctionDefinitionRequest = S.Struct({
   description: S.optionalWith(S.String, { exact: true, as: "Option" }),
   name: S.String,
@@ -322,6 +378,30 @@ export type FunctionToolChoiceRequestEncoded = S.Schema.Encoded<typeof FunctionT
 export const FunctionType = S.Literal("function")
 export type FunctionType = S.Schema.Type<typeof FunctionType>
 export type FunctionTypeEncoded = S.Schema.Encoded<typeof FunctionType>
+
+export const GpuLayersResponse = S.Union(
+  S.extend(
+    S.Struct({
+      mode: S.Literal("auto"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      mode: S.Literal("all"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      mode: S.Literal("count"),
+      value: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type GpuLayersResponse = S.Schema.Type<typeof GpuLayersResponse>
+export type GpuLayersResponseEncoded = S.Schema.Encoded<typeof GpuLayersResponse>
 
 export const GrammarTriggerResponse = S.Union(
   S.extend(
@@ -414,6 +494,9 @@ export const PropsResponse = S.Struct({
   default_generation_settings: S.suspend(
     (): S.Schema<DefaultGenerationSettings, DefaultGenerationSettingsEncoded> => DefaultGenerationSettings,
   ),
+  execution: S.suspend(
+    (): S.Schema<ExecutionConfigResponse, ExecutionConfigResponseEncoded> => ExecutionConfigResponse,
+  ),
   general_architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
   general_name: S.optionalWith(S.String, { exact: true, as: "Option" }),
   modalities: S.suspend((): S.Schema<Modalities, ModalitiesEncoded> => Modalities),
@@ -468,6 +551,10 @@ export const ResponseFormatRequest = S.Union(
 )
 export type ResponseFormatRequest = S.Schema.Type<typeof ResponseFormatRequest>
 export type ResponseFormatRequestEncoded = S.Schema.Encoded<typeof ResponseFormatRequest>
+
+export const SplitModeResponse = S.Union(S.Literal("none"), S.Literal("layer"), S.Literal("row"), S.Literal("tensor"))
+export type SplitModeResponse = S.Schema.Type<typeof SplitModeResponse>
+export type SplitModeResponseEncoded = S.Schema.Encoded<typeof SplitModeResponse>
 
 export const StopRequest = S.Union(S.String, S.Array(S.String))
 export type StopRequest = S.Schema.Type<typeof StopRequest>
