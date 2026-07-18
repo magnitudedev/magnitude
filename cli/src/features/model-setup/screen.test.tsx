@@ -259,11 +259,6 @@ test("clicking a possible download starts that model download", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
-    llamaCpp: {
-      ...emptyLocalInferenceState.llamaCpp,
-      installations: [{ id: "managed", executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" }, build: 10011, ownership: "magnitude", discoveries: [] }],
-      selectedInstallationId: Option.some("managed"),
-    },
     recommendations: [recommendedModel],
   }
   const view = await testRender(
@@ -277,12 +272,77 @@ test("clicking a possible download starts that model download", async () => {
     await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
     await act(view.renderOnce)
 
+    expect(view.captureCharFrame()).not.toContain("Install llama.cpp")
     const model = textPosition(view.captureCharFrame(), recommendedModel.displayName)
     await act(async () => view.mockMouse.moveTo(model.x, model.y))
     await act(view.renderOnce)
     await act(async () => view.mockMouse.click(model.x, model.y))
 
     expect(localInferenceActions.downloadModel).toHaveBeenCalledWith(recommendedModel.configurationId)
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("recommendations show a human-readable detected hardware panel before models", async () => {
+  const gib = 1024 ** 3
+  localInferenceState = {
+    ...emptyLocalInferenceState,
+    usage: { sessionConcurrency: "one" },
+    llamaCpp: {
+      ...emptyLocalInferenceState.llamaCpp,
+      installations: [{ id: "managed", executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" }, build: 10011, ownership: "magnitude", discoveries: [] }],
+      selectedInstallationId: Option.some("managed"),
+    },
+    host: {
+      _tag: "Available",
+      profile: {
+        platform: "darwin",
+        architecture: "arm64",
+        systemMemoryBytes: 64 * gib,
+        cpuModel: "Apple M4 Max",
+        logicalCores: 16,
+        memoryDomains: [{
+          id: "system",
+          kind: "system",
+          totalCapacityBytes: 64 * gib,
+          stableCapacityBytes: 51.2 * gib,
+          currentFreeBytes: null,
+          sharesSystemMemory: false,
+          backendNames: [],
+          deviceNames: [],
+          splitGroupId: null,
+        }, {
+          id: "metal",
+          kind: "unified_working_set",
+          totalCapacityBytes: 48 * gib,
+          stableCapacityBytes: 43.2 * gib,
+          currentFreeBytes: null,
+          sharesSystemMemory: true,
+          backendNames: ["Metal"],
+          deviceNames: ["Apple M4 Max"],
+          splitGroupId: null,
+        }],
+      },
+    },
+    recommendations: [recommendedModel],
+  }
+  const view = await testRender(
+    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    { width: 120, height: 35 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
+    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
+    await act(view.renderOnce)
+    const frame = view.captureCharFrame()
+    expect(frame).toContain("HARDWARE DETECTED")
+    expect(frame).toContain("Apple M4 Max")
+    expect(frame).toContain("macOS · Apple Silicon · 16 logical CPU cores")
+    expect(frame).toContain("64.0 GiB unified memory · Metal GPU acceleration")
+    expect(frame.indexOf("HARDWARE DETECTED")).toBeLessThan(frame.indexOf("RECOMMENDED DOWNLOADS"))
   } finally {
     await act(async () => view.renderer.destroy())
   }

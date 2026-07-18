@@ -1,4 +1,5 @@
 import type {
+  LocalInferenceHostProfile,
   LocalInferenceState,
   LocalModelChoice,
   LocalModelRecommendation,
@@ -51,6 +52,79 @@ export const formatContext = (tokens: number): string => tokens < 1_000
   : tokens % 1_024 === 0
     ? `${tokens / 1_024}K`
     : `${Math.round(tokens / 1_000)}K`
+
+export interface LocalHardwarePresentation {
+  readonly system: {
+    readonly name: string
+    readonly details: readonly string[]
+  }
+  readonly accelerators: readonly {
+    readonly name: string
+    readonly details: string
+  }[]
+}
+
+const platformLabel = (platform: string): string => {
+  if (platform === "darwin") return "macOS"
+  if (platform === "linux") return "Linux"
+  if (platform === "win32") return "Windows"
+  return platform
+}
+
+const architectureLabel = (architecture: string): string => {
+  if (architecture === "arm64") return "ARM64"
+  if (architecture === "x64") return "x86-64"
+  return architecture
+}
+
+const unique = (values: readonly string[]): string[] =>
+  [...new Set(values.map((value) => value.trim()).filter(Boolean))]
+
+const accelerationLabel = (backends: readonly string[]): string =>
+  unique(backends).length > 0
+    ? `${unique(backends).join(" + ")} GPU acceleration`
+    : "GPU acceleration"
+
+export const describeLocalHardware = (
+  host: LocalInferenceHostProfile,
+): LocalHardwarePresentation => {
+  const accelerators = host.memoryDomains.filter((domain) => domain.kind !== "system")
+  const unified = accelerators.filter((domain) => domain.kind === "unified_working_set")
+  const discrete = accelerators.filter((domain) => domain.kind === "physical_device")
+  const appleUnified = host.platform === "darwin"
+    && host.architecture === "arm64"
+    && unified.length > 0
+  const systemName = host.cpuModel?.trim() || (
+    host.platform === "darwin" && host.architecture === "arm64"
+      ? "Apple Silicon"
+      : "CPU"
+  )
+  const systemDetails = [
+    `${platformLabel(host.platform)} · ${host.platform === "darwin" && host.architecture === "arm64" ? "Apple Silicon" : architectureLabel(host.architecture)} · ${host.logicalCores} logical CPU core${host.logicalCores === 1 ? "" : "s"}`,
+    `${formatBytes(host.systemMemoryBytes)} ${appleUnified ? "unified" : "system"} memory${appleUnified ? ` · ${accelerationLabel(unified.flatMap((domain) => domain.backendNames))}` : ""}`,
+  ]
+
+  const visibleAccelerators = appleUnified ? discrete : accelerators
+  return {
+    system: { name: systemName, details: systemDetails },
+    accelerators: visibleAccelerators.map((domain) => {
+      const names = unique(domain.deviceNames)
+      const backends = unique(domain.backendNames)
+      const name = names.length > 0
+        ? names.join(" + ")
+        : domain.kind === "unified_working_set"
+          ? "Integrated GPU"
+          : `${backends[0] ?? "Local"} GPU`
+      const memory = domain.kind === "unified_working_set"
+        ? `${formatBytes(domain.totalCapacityBytes)} shared memory`
+        : `${formatBytes(domain.totalCapacityBytes)} VRAM`
+      return {
+        name,
+        details: `${memory} · ${accelerationLabel(backends)}`,
+      }
+    }),
+  }
+}
 
 export const selectionTitle = (selection: LocalInferenceSelection): string =>
   selection.kind === "recommendation" ? selection.recommendation.displayName : selection.choice.displayName

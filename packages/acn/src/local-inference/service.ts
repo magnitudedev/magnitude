@@ -107,6 +107,7 @@ const normalizedDeviceDomains = (
   const candidates = visibleDevices.flatMap((device) => Option.match(device.totalMemoryBytes, {
     onNone: () => [],
     onSome: (capacityBytes) => {
+      if (capacityBytes <= 0) return []
       const backend = backendFromDevice(device)
       const type = Option.getOrElse(device.type, () => "").toLowerCase()
       if (type === "cpu" || backend.toLowerCase() === "cpu" || String(device.id).toLowerCase() === "host") return []
@@ -189,6 +190,7 @@ export const hostToWire = (
     {
       id: "system",
       kind: "system",
+      totalCapacityBytes: host.totalMemoryBytes,
       stableCapacityBytes: systemCapacityBudget(host.totalMemoryBytes),
       currentFreeBytes: host.availableMemoryBytes,
       sharesSystemMemory: false,
@@ -199,13 +201,14 @@ export const hostToWire = (
     ...normalizedDeviceDomains(host, devices).map((domain) => ({
       id: domain.id,
       kind: domain.sharesSystemMemory ? "unified_working_set" as const : "physical_device" as const,
+      totalCapacityBytes: domain.capacityBytes,
       stableCapacityBytes: domain.sharesSystemMemory
         ? Math.min(systemCapacityBudget(host.totalMemoryBytes), acceleratorCapacityBudget(domain.capacityBytes))
         : acceleratorCapacityBudget(domain.capacityBytes),
       currentFreeBytes: domain.freeBytes,
       sharesSystemMemory: domain.sharesSystemMemory,
       backendNames: [domain.backend],
-      deviceNames: domain.deviceNames.map((name) => `${domain.backend}: ${name}`),
+      deviceNames: domain.deviceNames,
       splitGroupId: domain.splitGroupId,
     })),
   ],
