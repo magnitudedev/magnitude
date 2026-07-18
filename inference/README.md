@@ -84,6 +84,19 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 The second command prints OpenAI-compatible `data:` frames followed by `data: [DONE]`. Stop the
 server with Ctrl-C.
 
+Set the top-level request field `"timings_per_token": true` to enable llama.cpp-compatible
+cumulative timing snapshots on streamed model updates. A sampled token can produce zero or several
+semantic deltas. The initial `{"role":"assistant","content":null}` delta belongs to the first
+sampled-token result: when that result also has parser deltas, only its last parser delta receives
+the snapshot; when it has none, the role delta receives it. Later results with no parser delta emit
+no SSE event, so the server never creates a timing-only event.
+
+The flag controls ordinary partial snapshots, but llama.cpp has one termination edge: a full stop
+word detected before a partial result is sent makes that result include timings even when the flag
+is false. EOS and length termination are detected after their partial-result timing decision and do
+not do so. The final timing summary is always present on the finish chunk or, when `include_usage`
+is enabled, the empty-choices usage chunk.
+
 To use a real GGUF model:
 
 ```sh
@@ -138,7 +151,7 @@ Inference validation has three complementary categories:
    `llama-server` endpoints to measure the complete engine, including scheduling, concurrency,
    prefix reuse, mixed prefill/decode work, latency, throughput, fairness, memory, and failures.
 
-The primitive suites make failures attributable; the composite suite establishes whether the
+The primitive suites make failures attributable; the composite benchmark establishes whether the
 complete engine is competitive. Composite fixtures define requests or deterministic agentic
 workflows together with prompt/output sizes, shared-prefix topology, arrival schedule, concurrency,
 and cold/warm state. Strict comparisons use identical model bytes, templates, settings, sampling,

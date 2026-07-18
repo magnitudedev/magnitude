@@ -262,11 +262,20 @@ pub struct GenerationMetrics {
     pub parser_ms: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GenerationSnapshot {
+    pub cached_prompt_tokens: usize,
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub metrics: GenerationMetrics,
+}
+
 #[derive(Debug, Clone)]
 pub struct Generation {
     pub text: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
+    pub cached_prompt_tokens: usize,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub finish_reason: FinishReason,
@@ -446,6 +455,7 @@ pub struct ChatRequest {
     pub temperature: f32,
     pub top_p: f32,
     pub seed: u32,
+    pub timings_per_token: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -520,6 +530,11 @@ pub struct ModelModalities {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferenceEvent {
+    /// Begins the assistant stream for the first sampled-token result.
+    ///
+    /// Keeping this in the sampled result group lets transports reproduce llama.cpp's timing
+    /// placement when the first token produces no semantic parser delta.
+    StreamStart,
     ContentDelta {
         text: String,
     },
@@ -532,6 +547,12 @@ pub enum InferenceEvent {
         name: Option<String>,
         arguments: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct InferenceStreamEvent {
+    pub delta: InferenceEvent,
+    pub timings: Option<GenerationSnapshot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -586,7 +607,7 @@ pub trait CompletionBackend: Send + Sync + 'static {
     fn complete(
         &self,
         request: ChatRequest,
-        on_event: &mut dyn FnMut(InferenceEvent) -> Result<(), InferenceError>,
+        on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
     ) -> Result<Generation, InferenceError>;
 }
 

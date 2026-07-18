@@ -8,6 +8,7 @@ import { IcnClientError, makeIcnClient } from "./client.js";
 const request: ChatCompletionRequestEncoded = {
   messages: [{ role: "user", content: "hello" }],
   stream: true,
+  timings_per_token: true,
 };
 
 const completion = {
@@ -21,6 +22,17 @@ const completion = {
       delta: { content: "hello" },
     },
   ],
+  timings: {
+    cache_n: 0,
+    prompt_n: 4,
+    prompt_ms: 2,
+    prompt_per_token_ms: 0.5,
+    prompt_per_second: 2_000,
+    predicted_n: 1,
+    predicted_ms: 0.001,
+    predicted_per_token_ms: 0.001,
+    predicted_per_second: 1_000_000,
+  },
 };
 
 const provide = <A, E>(
@@ -76,6 +88,7 @@ describe("IcnClient", () => {
     expect(Option.getOrNull(result.chunks[0]!.choices[0]!.delta.content)).toBe(
       "hello"
     );
+    expect(Option.getOrNull(result.chunks[0]!.timings)?.predicted_n).toBe(1);
     expect(seen).toEqual(["/health", "/v1/chat/completions"]);
   });
 
