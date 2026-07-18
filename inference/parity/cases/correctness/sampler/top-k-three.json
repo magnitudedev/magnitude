@@ -1,0 +1,56 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.sampler.top-k-three",
+  "title": "Top-k sampler transformation",
+  "description": "Apply only the top-k sampler to four controlled candidates and compare its transformed ordering and values; seeded distribution selection is a separate case.",
+  "category": "correctness",
+  "primitive": "C6",
+  "adapter": "differential",
+  "operation": "sampler.apply",
+  "status": "active",
+  "tags": ["model-free", "oracle-smoke", "upstream-vector"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-sampling.cpp",
+    "upstream_case": "test_top_k({0.1, 0.2, 0.3, 0.4}, ..., 3)"
+  },
+  "inputs": {
+    "candidates": [
+      { "id": 0, "logit": -2.302585092994046, "probability": 0.1 },
+      { "id": 1, "logit": -1.6094379124341003, "probability": 0.2 },
+      { "id": 2, "logit": -1.2039728043259361, "probability": 0.3 },
+      { "id": 3, "logit": -0.916290731874155, "probability": 0.4 }
+    ],
+    "samplers": [
+      { "type": "top-k", "k": 3 }
+    ],
+    "selection": { "type": "none" }
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": null,
+    "capabilities": ["sampler.top-k"]
+  },
+  "invocations": {
+    "reference": {
+      "kind": "native-oracle",
+      "target": "oracle",
+      "operation": "sampler.apply"
+    },
+    "candidate": {
+      "kind": "icn-probe",
+      "target": "icn-probe",
+      "operation": "sampler.apply"
+    }
+  },
+  "comparison": {
+    "kind": "numeric",
+    "paths": ["/candidates"],
+    "exact_paths": ["/sorted", "/selectedIndex", "/selectedToken"],
+    "absolute_tolerance": 0.000001,
+    "relative_tolerance": 0.000001,
+    "nan_equal": false
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "performance.batched-bench.two-sequence-independent-prompts",
+  "title": "Two-sequence independent-prompt batch throughput",
+  "description": "Compare the official llama-batched-bench independent-prompt workload shape with an ICN-native equivalent: the same prompt and generation lengths, sequence count, batching mode, and synchronization boundaries, while each producer supplies model-valid synthetic tokens through its own adapter.",
+  "category": "performance",
+  "primitive": "P5",
+  "adapter": "upstream-tool",
+  "operation": "llama-batched-bench.sequence-throughput",
+  "status": "planned",
+  "tags": ["model-smoke", "probe-gap", "workload-shape"],
+  "prerequisites": [
+    "correctness.config.context-defaults",
+    "correctness.decode.single-batch-logits"
+  ],
+  "source": {
+    "kind": "upstream-defined",
+    "upstream_file": "tools/batched-bench/batched-bench.cpp",
+    "note": "This is workload-shape parity, not token-identical same-work evidence: llama-batched-bench generates model-valid synthetic tokens internally, so exact token identity is intentionally outside the claim. It tests explicit batch construction and execution, not ICN request scheduling."
+  },
+  "inputs": {
+    "parallel_sequences": 2,
+    "shared_prompt": false,
+    "prompt_tokens": 64,
+    "generation_tokens_per_sequence": 16,
+    "context_tokens": 160,
+    "batch_tokens": 64,
+    "micro_batch_tokens": 64,
+    "kv_unified": false,
+    "expected_kv_tokens": 160,
+    "separate_generation": false,
+    "repetitions": 10,
+    "effective_engine_configuration": "profile"
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["batched-decode", "llama-batched-bench"]
+  },
+  "invocations": {
+    "reference": { "kind": "upstream-tool", "target": "llama-batched-bench", "operation": "llama-batched-bench.sequence-throughput" },
+    "candidate": { "kind": "icn-probe", "operation": "llama-batched-bench.sequence-throughput" }
+  },
+  "comparison": {
+    "kind": "performance-ratio",
+    "metric": "tokens_per_second",
+    "statistic": "median",
+    "minimum_ratio": 0.97,
+    "direction": "candidate-over-reference"
+  },
+  "timing": {
+    "included": ["prompt batches", "generation batches", "upstream-defined synchronization"],
+    "excluded": ["model load", "context construction", "warm-up", "request scheduling", "result serialization"],
+    "warmup_iterations": 1,
+    "measurement_iterations": 10,
+    "synchronize": true
+  }
+}

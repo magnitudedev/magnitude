@@ -1,0 +1,26 @@
+{
+  "schema_version": "1",
+  "id": "chatml-basic-input",
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "add_generation_prompt": true,
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer plainly."
+    },
+    {
+      "role": "user",
+      "content": "Say hello to 世界."
+    },
+    {
+      "role": "assistant",
+      "content": "Hello, 世界."
+    },
+    {
+      "role": "user",
+      "content": "Now say goodbye."
+    }
+  ],
+  "tools": []
+}

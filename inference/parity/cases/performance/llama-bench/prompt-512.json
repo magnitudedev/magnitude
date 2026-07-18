@@ -1,0 +1,59 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "performance.llama-bench.prompt-512",
+  "title": "Same-work 512-token prompt processing",
+  "description": "Compare official llama-bench prompt processing with the low-level ICN candidate over the same model, context, batch, synchronization, and ten raw repetitions.",
+  "category": "performance",
+  "primitive": "P1",
+  "adapter": "upstream-tool",
+  "operation": "llama-bench.prompt-processing",
+  "status": "active",
+  "tags": ["model-smoke", "same-work"],
+  "prerequisites": [
+    "correctness.config.context-defaults",
+    "correctness.metadata.stable-fields",
+    "correctness.decode.single-batch-logits"
+  ],
+  "source": {
+    "kind": "upstream-defined",
+    "upstream_file": "tools/llama-bench/llama-bench.cpp",
+    "upstream_case": "test_prompt"
+  },
+  "inputs": {
+    "prompt_tokens": 512,
+    "generation_tokens": 0,
+    "context_depth": 0,
+    "batch_tokens": 512,
+    "micro_batch_tokens": 512,
+    "repetitions": 10,
+    "warmup": true,
+    "token_schedule": "pinned-llama-bench-c-rand-default",
+    "effective_engine_configuration": "profile"
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["llama-bench", "prompt-decode"]
+  },
+  "invocations": {
+    "reference": { "kind": "upstream-tool", "target": "llama-bench", "operation": "llama-bench.prompt-processing" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "llama-bench.prompt-processing" }
+  },
+  "comparison": {
+    "kind": "performance-ratio",
+    "metric": "tokens_per_second",
+    "statistic": "median",
+    "minimum_ratio": 0.97,
+    "direction": "candidate-over-reference",
+    "exact_output_paths": [""]
+  },
+  "timing": {
+    "included": ["thread-count application", "batch allocation and fill", "decode calls", "backend synchronization"],
+    "excluded": ["model load", "context construction", "memory clear", "warm-up", "result serialization"],
+    "warmup_iterations": 1,
+    "measurement_iterations": 10,
+    "synchronize": true
+  }
+}

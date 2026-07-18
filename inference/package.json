@@ -4,11 +4,27 @@
   "scripts": {
     "build": "cargo build -p icn-server",
     "build:release": "cargo build --release -p icn-server",
+    "build:reference": "bun run scripts/build-reference.ts",
+    "build:candidate": "bun run scripts/build-candidate.ts",
     "check": "cargo check --workspace",
     "test": "cargo test --workspace",
+    "test:upstream": "bun run scripts/test-upstream.ts",
+    "fit": "cargo run -p icn-fit --",
+    "parity": "cargo run -p icn-parity -- run --root parity --profile pr",
+    "parity:validate": "cargo run -p icn-parity -- validate --root parity",
+    "parity:list": "cargo run -p icn-parity -- list --root parity",
+    "parity:models": "cargo run -p icn-parity -- models --root parity list",
+    "parity:models:verify": "cargo run -p icn-parity -- models --root parity verify",
+    "parity:models:fetch": "cargo run -p icn-parity -- models --root parity fetch",
+    "parity:test": "cargo test -p icn-parity",
+    "parity:test:ts": "bunx --bun vitest run scripts/*.test.ts",
+    "parity:typecheck": "bunx tsc -p tsconfig.json",
     "dev": "cargo run -p icn-server -- serve --fake",
     "serve": "cargo run -p icn-server -- serve",
     "doctor": "cargo run -p icn-server -- doctor",
-    "version": "cargo run -p icn-server -- version --json"
+    "version": "cargo run -p icn-server -- version --json",
+    "verify:native-pin": "bun run scripts/verify-native-pin.ts",
+    "verify:bridge": "bun run scripts/verify-bridge-manifest.ts",
+    "verify:safe-bindings": "bun run scripts/verify-safe-binding-boundary.ts"
   }
 }

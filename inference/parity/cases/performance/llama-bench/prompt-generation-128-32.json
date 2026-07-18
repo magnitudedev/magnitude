@@ -1,0 +1,59 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "performance.llama-bench.prompt-generation-128-32",
+  "title": "Upstream-defined combined prompt and generation",
+  "description": "Measure the official pg composition—128 prompt tokens followed by 32 generation decodes—inside one matched interval, without request-level work.",
+  "category": "performance",
+  "primitive": "P3",
+  "adapter": "upstream-tool",
+  "operation": "llama-bench.prompt-generation",
+  "status": "active",
+  "tags": ["model-smoke", "same-work"],
+  "prerequisites": [
+    "correctness.config.context-defaults",
+    "correctness.metadata.stable-fields",
+    "correctness.decode.single-batch-logits"
+  ],
+  "source": {
+    "kind": "upstream-defined",
+    "upstream_file": "tools/llama-bench/llama-bench.cpp",
+    "upstream_case": "pg"
+  },
+  "inputs": {
+    "prompt_tokens": 128,
+    "generation_tokens": 32,
+    "context_depth": 0,
+    "batch_tokens": 128,
+    "micro_batch_tokens": 128,
+    "repetitions": 10,
+    "warmup": true,
+    "token_schedule": "pinned-llama-bench-c-rand-default",
+    "effective_engine_configuration": "profile"
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["llama-bench", "prompt-generation-decode"]
+  },
+  "invocations": {
+    "reference": { "kind": "upstream-tool", "target": "llama-bench", "operation": "llama-bench.prompt-generation" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "llama-bench.prompt-generation" }
+  },
+  "comparison": {
+    "kind": "performance-ratio",
+    "metric": "tokens_per_second",
+    "statistic": "median",
+    "minimum_ratio": 0.97,
+    "direction": "candidate-over-reference",
+    "exact_output_paths": [""]
+  },
+  "timing": {
+    "included": ["prompt decode", "generation decodes", "required synchronization"],
+    "excluded": ["model load", "context construction", "memory clear", "warm-up", "sampling", "result serialization"],
+    "warmup_iterations": 1,
+    "measurement_iterations": 10,
+    "synchronize": true
+  }
+}

@@ -1,0 +1,503 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magnitude.dev/schemas/inference/parity/case.schema.json",
+  "title": "ICN primitive parity case",
+  "description": "A neutral, engine-independent primitive operation and its comparison contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "title",
+    "description",
+    "category",
+    "primitive",
+    "adapter",
+    "operation",
+    "status",
+    "source",
+    "inputs",
+    "requirements",
+    "invocations",
+    "comparison"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^(correctness|performance)\\.[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "enum": ["correctness", "performance"]
+    },
+    "primitive": {
+      "type": "string",
+      "pattern": "^[CP](?:[0-9]|1[0-3])$"
+    },
+    "adapter": {
+      "enum": ["upstream-test", "upstream-tool", "upstream-qualification", "differential"]
+    },
+    "operation": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$"
+    },
+    "status": {
+      "description": "Planned cases remain declarative until both invocations are implemented; disabled cases require an explicit reason.",
+      "enum": ["active", "planned", "disabled"]
+    },
+    "disabled_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "prerequisites": {
+      "description": "Correctness case IDs that must pass for the same applicable model/backend before this claim can be interpreted.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^correctness\\.[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "inputs": {
+      "description": "Operation-specific neutral input. It must not contain CLI flags, Rust types, C structs, or HTTP payloads.",
+      "type": "object"
+    },
+    "requirements": {
+      "$ref": "#/$defs/requirements"
+    },
+    "invocations": {
+      "$ref": "#/$defs/invocations"
+    },
+    "comparison": {
+      "$ref": "#/$defs/comparator"
+    },
+    "timing": {
+      "$ref": "#/$defs/timing"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "category": { "const": "correctness" }
+        },
+        "required": ["category"]
+      },
+      "then": {
+        "properties": {
+          "primitive": { "type": "string", "pattern": "^C(?:[0-9]|1[0-3])$" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": { "const": "performance" }
+        },
+        "required": ["category"]
+      },
+      "then": {
+        "required": ["timing", "prerequisites"],
+        "properties": {
+          "primitive": { "type": "string", "pattern": "^P[0-8]$" },
+          "timing": { "$ref": "#/$defs/timing" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "disabled" }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["disabled_reason"],
+        "properties": {
+          "disabled_reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adapter": { "const": "upstream-test" }
+        },
+        "required": ["adapter"]
+      },
+      "then": {
+        "properties": {
+          "invocations": {
+            "type": "object",
+            "required": ["reference"],
+            "properties": {
+              "reference": {
+                "type": "object",
+                "properties": {
+                  "kind": { "const": "upstream-test" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adapter": { "const": "upstream-tool" }
+        },
+        "required": ["adapter"]
+      },
+      "then": {
+        "properties": {
+          "invocations": {
+            "type": "object",
+            "required": ["reference", "candidate"],
+            "properties": {
+              "reference": {
+                "type": "object",
+                "properties": {
+                  "kind": { "const": "upstream-tool" }
+                }
+              },
+              "candidate": { "$ref": "#/$defs/invocation" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adapter": { "const": "upstream-qualification" }
+        },
+        "required": ["adapter"]
+      },
+      "then": {
+        "properties": {
+          "invocations": {
+            "type": "object",
+            "required": ["reference"],
+            "properties": {
+              "reference": {
+                "type": "object",
+                "properties": {
+                  "kind": { "const": "upstream-tool" }
+                }
+              },
+              "candidate": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adapter": { "const": "differential" }
+        },
+        "required": ["adapter"]
+      },
+      "then": {
+        "properties": {
+          "invocations": {
+            "type": "object",
+            "required": ["reference", "candidate"],
+            "properties": {
+              "reference": {
+                "type": "object",
+                "properties": {
+                  "kind": { "const": "native-oracle" }
+                }
+              },
+              "candidate": {
+                "type": "object",
+                "properties": {
+                  "kind": { "const": "icn-probe" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["upstream-derived", "upstream-defined", "magnitude-defined"]
+        },
+        "upstream_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "upstream_case": {
+          "type": "string",
+          "minLength": 1
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "fixtureRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^fixtures/[^/].+$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "modelSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "all_tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "any_tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offline", "fixtures", "capabilities"],
+      "properties": {
+        "offline": {
+          "const": true
+        },
+        "fixtures": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fixtureRef" },
+          "uniqueItems": true
+        },
+        "model": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/modelSelector" }
+          ],
+          "default": null
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+          },
+          "uniqueItems": true
+        },
+        "backends": {
+          "type": "array",
+          "items": {
+            "enum": ["cpu", "metal", "cuda", "vulkan", "kompute", "sycl", "opencl"]
+          },
+          "uniqueItems": true
+        },
+        "architecture_tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["upstream-test", "upstream-tool", "native-oracle", "icn-probe"]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$"
+        }
+      }
+    },
+    "invocations": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "reference": { "$ref": "#/$defs/invocation" },
+        "candidate": { "$ref": "#/$defs/invocation" }
+      }
+    },
+    "jsonPointerArray": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "comparator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "exact" },
+            "paths": { "$ref": "#/$defs/jsonPointerArray" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "structural" },
+            "paths": { "$ref": "#/$defs/jsonPointerArray" },
+            "ignore_paths": { "$ref": "#/$defs/jsonPointerArray" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "paths", "absolute_tolerance", "relative_tolerance"],
+          "properties": {
+            "kind": { "const": "numeric" },
+            "paths": { "$ref": "#/$defs/jsonPointerArray" },
+            "exact_paths": { "$ref": "#/$defs/jsonPointerArray" },
+            "absolute_tolerance": { "type": "number", "minimum": 0 },
+            "relative_tolerance": { "type": "number", "minimum": 0 },
+            "nan_equal": { "type": "boolean", "default": false }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "accepted_classes"],
+          "properties": {
+            "kind": { "const": "outcome-agreement" },
+            "accepted_classes": {
+              "type": "array",
+              "items": {
+                "enum": ["success", "unsupported", "invalid-input", "cancelled"]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metric", "statistic", "direction"],
+          "anyOf": [
+            {
+              "required": ["minimum_ratio"],
+              "properties": {
+                "minimum_ratio": { "type": "number", "exclusiveMinimum": 0 }
+              }
+            },
+            {
+              "required": ["maximum_ratio"],
+              "properties": {
+                "maximum_ratio": { "type": "number", "exclusiveMinimum": 0 }
+              }
+            }
+          ],
+          "properties": {
+            "kind": { "const": "performance-ratio" },
+            "metric": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+            },
+            "statistic": { "enum": ["median", "mean", "minimum"] },
+            "minimum_ratio": { "type": "number", "exclusiveMinimum": 0 },
+            "maximum_ratio": { "type": "number", "exclusiveMinimum": 0 },
+            "direction": { "enum": ["candidate-over-reference", "reference-over-candidate"] },
+            "exact_output_paths": { "$ref": "#/$defs/jsonPointerArray" }
+          }
+        }
+      ]
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["included", "excluded", "warmup_iterations", "measurement_iterations", "synchronize"],
+      "properties": {
+        "included": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "excluded": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "warmup_iterations": { "type": "integer", "minimum": 0 },
+        "measurement_iterations": { "type": "integer", "minimum": 1 },
+        "synchronize": { "type": "boolean" }
+      }
+    }
+  }
+}

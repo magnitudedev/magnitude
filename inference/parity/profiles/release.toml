@@ -1,0 +1,53 @@
+schema_version = 1
+id = "release"
+description = "All active primitive cases with controlled-host performance gating and fully preserved evidence."
+
+[selection]
+statuses = ["active"]
+include_case_ids = []
+include_primitives = [
+  "C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13",
+  "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8",
+]
+include_tags = []
+exclude_case_ids = []
+exclude_tags = ["artifact-gap"]
+
+[upstream]
+build_profile = "cargo-equivalent"
+
+[execution]
+offline = true
+max_parallel = 1
+case_timeout_seconds = 3600
+fail_fast = false
+performance_engine_order = "alternate"
+
+[engine]
+backend = "auto"
+threads = "physical-cores"
+gpu_layers = "all"
+flash_attention = "auto"
+
+[models]
+verify_before_run = true
+allow_fetch = false
+ids = ["stories15m-q4-0"]
+
+[performance]
+enabled = true
+paired_repetitions = 20
+require_controlled_host = true
+require_exclusive_device = true
+
+[results]
+preserve_raw_evidence = true
+preserve_raw_samples = true
+write_comparisons = true
+
+[gates]
+fail_on_invalid = true
+fail_on_error = true
+fail_on_skipped = true
+fail_on_performance = true
+require_correctness_before_performance = true

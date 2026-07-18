@@ -1,0 +1,12 @@
+{
+  "schema_version": "1",
+  "id": "content-replay",
+  "description": "UTF-8 content replayed whole and across adversarial byte-safe chunk partitions.",
+  "parser": "content-only",
+  "input": "Plain text, then Unicode: 世界 — café — 🌍.",
+  "chunkings": [
+    ["Plain text, then Unicode: 世界 — café — 🌍."],
+    ["Plain text, ", "then Unicode: ", "世界", " — café — ", "🌍."],
+    ["P", "lain text, then Unicode: 世界 — café — 🌍", "."]
+  ]
+}

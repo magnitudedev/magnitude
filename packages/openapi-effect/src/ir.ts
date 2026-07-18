@@ -67,6 +67,7 @@ export type SchemaNode = Data.TaggedEnum<{
   };
   Object: {
     readonly properties: readonly ObjectProperty[];
+    readonly propertyNames: Option.Option<SchemaNode>;
     readonly additionalProperties: AdditionalProperties;
     readonly source: SourceLocation;
   };

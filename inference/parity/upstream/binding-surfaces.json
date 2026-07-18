@@ -1,0 +1,290 @@
+{
+  "schemaVersion": 1,
+  "bindingsRevision": "a412b782219bedf437534626b28d2906d3e5b5fa",
+  "llamaCppRevision": "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66",
+  "surfaces": [
+    {
+      "id": "common-chat",
+      "upstreamFiles": [
+        "common/chat.h",
+        "common/chat.cpp"
+      ],
+      "upstreamSymbols": [
+        "common_chat_templates_init",
+        "common_chat_templates_was_explicit",
+        "common_chat_templates_source",
+        "common_chat_templates_get_caps",
+        "common_chat_templates_support_enable_thinking",
+        "common_chat_templates_apply",
+        "common_chat_parse"
+      ],
+      "bridgeSymbols": [
+        "llama_rs_chat_templates_init",
+        "llama_rs_chat_templates_free",
+        "llama_rs_chat_templates_source",
+        "llama_rs_chat_templates_capabilities",
+        "llama_rs_chat_templates_was_explicit",
+        "llama_rs_chat_templates_prepare",
+        "llama_rs_chat_prepared_free",
+        "llama_rs_chat_prepared_format",
+        "llama_rs_chat_prepared_reasoning_format",
+        "llama_rs_chat_prepared_grammar_lazy",
+        "llama_rs_chat_prepared_supports_thinking",
+        "llama_rs_chat_prepared_get_string",
+        "llama_rs_chat_prepared_string_list_count",
+        "llama_rs_chat_prepared_string_list_get",
+        "llama_rs_chat_prepared_grammar_trigger_count",
+        "llama_rs_chat_prepared_grammar_trigger_get",
+        "llama_rs_chat_prepared_message_span_count",
+        "llama_rs_chat_prepared_message_span_get",
+        "llama_rs_chat_parser_init",
+        "llama_rs_chat_parser_free",
+        "llama_rs_chat_parser_parse",
+        "llama_rs_chat_stream_init",
+        "llama_rs_chat_stream_push",
+        "llama_rs_chat_stream_prepare_finish",
+        "llama_rs_chat_finish_delta_batch",
+        "llama_rs_chat_finish_parse_result",
+        "llama_rs_chat_stream_commit_finish",
+        "llama_rs_chat_finish_free",
+        "llama_rs_chat_stream_free",
+        "llama_rs_chat_delta_batch_free",
+        "llama_rs_chat_delta_batch_count",
+        "llama_rs_chat_delta_batch_get",
+        "llama_rs_chat_parse_result_free",
+        "llama_rs_chat_parse_result_get_string",
+        "llama_rs_chat_parse_result_tool_call_count",
+        "llama_rs_chat_parse_result_tool_call_get",
+        "llama_rs_chat_grammar_trigger_clear",
+        "llama_rs_chat_message_span_clear"
+      ],
+      "rustModules": [
+        "llama-cpp-2/src/common_chat.rs"
+      ],
+      "rustSymbols": [
+        "CommonChatTemplates",
+        "ChatPrepareOptions",
+        "PreparedChat",
+        "ChatParserOptions",
+        "ChatParser",
+        "ChatStreamParser",
+        "ChatSemanticDelta",
+        "ParsedChatMessage"
+      ]
+    },
+    {
+      "id": "common-sampling",
+      "upstreamFiles": [
+        "common/sampling.h",
+        "common/sampling.cpp",
+        "common/reasoning-budget.h"
+      ],
+      "upstreamSymbols": [
+        "common_sampler_init",
+        "common_sampler_accept",
+        "common_sampler_sample",
+        "common_sampler_reset",
+        "common_sampler_get_seed",
+        "common_sampler_reasoning_budget_force",
+        "common_sampler_last",
+        "common_sampler_print",
+        "common_reasoning_budget_force"
+      ],
+      "bridgeSymbols": [
+        "llama_rs_common_sampler_init",
+        "llama_rs_common_sampler_free",
+        "llama_rs_common_sampler_accept",
+        "llama_rs_common_sampler_sample",
+        "llama_rs_common_sampler_reset",
+        "llama_rs_common_sampler_seed",
+        "llama_rs_common_sampler_reasoning_budget_force",
+        "llama_rs_common_sampler_last",
+        "llama_rs_common_sampler_description",
+        "llama_rs_common_sampler_perf",
+        "llama_rs_common_sampler_perf_reset"
+      ],
+      "rustModules": [
+        "llama-cpp-2/src/common_sampling.rs"
+      ],
+      "rustSymbols": [
+        "CommonSampler",
+        "CommonSamplerConfig",
+        "CommonSamplerType",
+        "CommonGrammar",
+        "CommonGrammarTrigger",
+        "CommonReasoningBudget",
+        "ReasoningBudgetLimit",
+        "CommonSamplerPerformance"
+      ]
+    },
+    {
+      "id": "json-schema-grammar",
+      "upstreamFiles": [
+        "common/json-schema-to-grammar.h",
+        "common/json-schema-to-grammar.cpp"
+      ],
+      "upstreamSymbols": [
+        "json_schema_to_grammar"
+      ],
+      "bridgeSymbols": [
+        "llama_rs_json_schema_to_grammar"
+      ],
+      "rustModules": [
+        "llama-cpp-2/src/lib.rs"
+      ],
+      "rustSymbols": [
+        "json_schema_to_grammar"
+      ]
+    },
+    {
+      "id": "common-fit-and-memory",
+      "upstreamFiles": [
+        "common/fit.h",
+        "common/fit.cpp",
+        "include/llama.h"
+      ],
+      "upstreamSymbols": [
+        "common_fit_params",
+        "common_get_device_memory_data",
+        "llama_get_memory_breakdown"
+      ],
+      "bridgeSymbols": [
+        "llama_rs_fit_report_create",
+        "llama_rs_fit_report_free",
+        "llama_rs_fit_report_get_summary",
+        "llama_rs_fit_report_device_count",
+        "llama_rs_fit_report_get_device",
+        "llama_rs_fit_report_tensor_split_count",
+        "llama_rs_fit_report_get_tensor_split",
+        "llama_rs_fit_report_placement_count",
+        "llama_rs_fit_report_get_placement",
+        "llama_rs_fit_report_initial_error",
+        "llama_rs_fit_report_fitted_error",
+        "llama_rs_context_memory_report_create",
+        "llama_rs_context_memory_report_free",
+        "llama_rs_context_memory_report_device_count",
+        "llama_rs_context_memory_report_device_get",
+        "llama_rs_context_memory_report_other_count",
+        "llama_rs_context_memory_report_other_get",
+        "llama_rs_memory_breakdown_print"
+      ],
+      "rustModules": [
+        "llama-cpp-2/src/model/params/fit.rs",
+        "llama-cpp-2/src/context/memory.rs",
+        "llama-cpp-2/src/context.rs"
+      ],
+      "rustSymbols": [
+        "fit_params_report",
+        "FitReport",
+        "FitConfiguration",
+        "FitStatus",
+        "ContextMemoryReport",
+        "ContextDeviceMemory",
+        "memory_report",
+        "print_memory_breakdown"
+      ]
+    },
+    {
+      "id": "executor-public-c",
+      "upstreamFiles": [
+        "include/llama.h",
+        "ggml/include/ggml-cpu.h"
+      ],
+      "upstreamSymbols": [
+        "llama_model_params",
+        "llama_context_params",
+        "llama_batch_init",
+        "llama_decode",
+        "llama_get_logits_ith",
+        "llama_memory_can_shift",
+        "llama_memory_seq_pos_min",
+        "llama_memory_seq_rm",
+        "llama_n_ctx_seq",
+        "llama_n_rs_seq",
+        "llama_synchronize",
+        "llama_set_n_threads",
+        "llama_set_abort_callback",
+        "ggml_threadpool_new",
+        "llama_attach_threadpool"
+      ],
+      "bridgeSymbols": [],
+      "rustModules": [
+        "llama-cpp-2/src/model/params.rs",
+        "llama-cpp-2/src/context/params.rs",
+        "llama-cpp-2/src/context/params/get_set.rs",
+        "llama-cpp-2/src/llama_batch.rs",
+        "llama-cpp-2/src/context.rs",
+        "llama-cpp-2/src/context/kv_cache.rs",
+        "llama-cpp-2/src/context/session.rs",
+        "llama-cpp-2/src/llama_backend.rs"
+      ],
+      "rustSymbols": [
+        "LlamaGpuLayers",
+        "with_gpu_layers",
+        "with_tensor_split",
+        "tensor_split",
+        "LlamaContextParams",
+        "with_offload_kqv",
+        "with_op_offload",
+        "with_flash_attention",
+        "LlamaBatch",
+        "decode",
+        "get_logits_ith",
+        "memory_can_shift",
+        "clear_kv_cache_seq",
+        "LlamaAbortHandle",
+        "install_abort_callback",
+        "LlamaThreadPool",
+        "attach_threadpool",
+        "attach_threadpools"
+      ]
+    },
+    {
+      "id": "mtmd",
+      "upstreamFiles": [
+        "tools/mtmd/mtmd.h",
+        "tools/mtmd/mtmd-helper.h",
+        "tools/mtmd/clip.h"
+      ],
+      "upstreamSymbols": [
+        "mtmd_init_from_file",
+        "mtmd_tokenize",
+        "mtmd_helper_eval_chunks",
+        "mtmd_helper_bitmap_init_from_buf",
+        "mtmd_helper_bitmap_init_from_file",
+        "mtmd_get_memory_usage"
+      ],
+      "bridgeSymbols": [
+        "llama_rs_mtmd_context_init_from_file",
+        "llama_rs_mtmd_bitmap_init_image",
+        "llama_rs_mtmd_bitmap_init_audio",
+        "llama_rs_mtmd_bitmap_init_from_file",
+        "llama_rs_mtmd_bitmap_init_from_buffer",
+        "llama_rs_mtmd_bitmap_set_id",
+        "llama_rs_mtmd_input_chunks_init",
+        "llama_rs_mtmd_tokenize",
+        "llama_rs_mtmd_encode_chunk",
+        "llama_rs_mtmd_eval_chunks",
+        "llama_rs_mtmd_capabilities_from_file",
+        "llama_rs_mtmd_memory_report_create",
+        "llama_rs_mtmd_memory_report_free",
+        "llama_rs_mtmd_memory_report_count",
+        "llama_rs_mtmd_memory_report_get"
+      ],
+      "rustModules": [
+        "llama-cpp-2/src/mtmd.rs"
+      ],
+      "rustSymbols": [
+        "MtmdContext",
+        "MtmdContextParams",
+        "MtmdBitmap",
+        "MtmdInputChunks",
+        "MtmdInputChunk",
+        "MtmdFileCapabilities",
+        "mtmd_capabilities_from_file",
+        "mtmd_memory_usage",
+        "eval_chunks"
+      ]
+    }
+  ]
+}

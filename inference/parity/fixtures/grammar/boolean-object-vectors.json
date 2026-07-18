@@ -1,0 +1,17 @@
+{
+  "schema_version": "1",
+  "id": "boolean-object-vectors",
+  "description": "Controlled complete strings for a minimal JSON-object grammar.",
+  "accepted": [
+    "{\"answer\":true}",
+    "{ \"answer\" : false }",
+    "{\n\"answer\": true\n}"
+  ],
+  "rejected": [
+    "{}",
+    "{\"answer\":null}",
+    "{\"answer\":1}",
+    "{\"other\":true}",
+    "{\"answer\":true} trailing"
+  ]
+}

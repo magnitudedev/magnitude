@@ -1,0 +1,68 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.parser.content-only-unicode",
+  "title": "Prepared content-only chat parsing",
+  "description": "Prepare the pinned ChatML template as a truthful content-only parser, parse fixed Unicode bytes through the reusable snapshot parser, and compare every declared stateful chunk partition including semantic deltas and final messages; model generation is absent.",
+  "category": "correctness",
+  "primitive": "C8",
+  "adapter": "differential",
+  "operation": "chat-parser.inspect",
+  "status": "active",
+  "tags": ["model-free", "oracle-smoke", "prepared-chat", "stateful", "unicode"],
+  "source": {
+    "kind": "magnitude-defined",
+    "note": "The explicit ChatML template is prepared with use_jinja=false and force_pure_content=true because llama.cpp's Jinja autoparser truthfully reports peg-native; a PEG-native vector belongs in a separate case."
+  },
+  "inputs": {
+    "template_fixture": "fixtures/templates/chatml-basic.jinja",
+    "input_fixture": "fixtures/templates/chatml-basic-input.json",
+    "content_fixture": "fixtures/parser/content-replay.json",
+    "use_jinja": false,
+    "force_pure_content": true,
+    "parser_options": {
+      "reasoning_in_content": false,
+      "parse_tool_calls": false,
+      "is_continuation": false,
+      "echo": false,
+      "debug": false
+    }
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [
+      {
+        "id": "content-replay",
+        "path": "fixtures/parser/content-replay.json",
+        "sha256": "73c40bd90e63e3b51f10524e675cb18f43e32ac2227720a50125a1184e22cf69"
+      },
+      {
+        "id": "chatml-basic-template",
+        "path": "fixtures/templates/chatml-basic.jinja",
+        "sha256": "f26fd6284d6bc05d057a4b5800e2a268a85df6546edf484d979e23a51ed7886d"
+      },
+      {
+        "id": "chatml-basic-input",
+        "path": "fixtures/templates/chatml-basic-input.json",
+        "sha256": "31c9ce9978be560f49d12179b4600fa23c8fff9948a4412beab006671b188fba"
+      }
+    ],
+    "model": null,
+    "capabilities": ["common-chat", "chat-parser.content-only", "chat-parser.stream"]
+  },
+  "invocations": {
+    "reference": {
+      "kind": "native-oracle",
+      "target": "oracle",
+      "operation": "chat-parser.inspect"
+    },
+    "candidate": {
+      "kind": "icn-probe",
+      "target": "icn-probe",
+      "operation": "chat-parser.inspect"
+    }
+  },
+  "comparison": {
+    "kind": "exact"
+  }
+}

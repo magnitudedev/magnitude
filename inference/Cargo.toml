@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/icn-api", "crates/icn-core", "crates/icn-llamacpp", "crates/icn-server"]
+members = ["crates/icn-api", "crates/icn-core", "crates/icn-fit", "crates/icn-llamacpp", "crates/icn-parity", "crates/icn-parity-probe", "crates/icn-server"]
+exclude = ["native/llama-cpp-rs"]
 resolver = "2"
 
 [workspace.package]
@@ -10,20 +11,25 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1.0.100"
 axum = "0.8.8"
+base64 = "0.22.1"
+bytes = "1.12.1"
 clap = { version = "4.5.54", features = ["derive"] }
 encoding_rs = "0.8.35"
 futures-util = "0.3.31"
+getrandom = "0.4.3"
 http-body-util = "0.1.3"
+hyper = { version = "1.10.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
 icn-api = { path = "crates/icn-api" }
 icn-core = { path = "crates/icn-core" }
-icn-llamacpp = { path = "crates/icn-llamacpp" }
-llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "7f0a0d95514aebe86efab16527745852ee72931c", default-features = false, features = ["common"] }
+icn-llamacpp = { path = "crates/icn-llamacpp", default-features = false }
+llama-cpp-2 = { path = "native/llama-cpp-rs/llama-cpp-2", default-features = false, features = ["common"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10.9"
 thiserror = "2.0.17"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1.18"
 tower = "0.5.3"
 utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order"] }
 utoipa-axum = "0.2.0"
-

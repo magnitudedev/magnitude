@@ -1,0 +1,44 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "performance.backend-ops.native-perf-qualification",
+  "title": "Native backend operation performance qualification",
+  "description": "Run the pinned backend operation perf mode as a native dependency/build qualification; it is not a binding-overhead claim when both paths link the same build.",
+  "category": "performance",
+  "primitive": "P0",
+  "adapter": "upstream-qualification",
+  "operation": "backend-ops.perf",
+  "status": "active",
+  "tags": ["model-free", "native-qualification"],
+  "prerequisites": ["correctness.baseline.focused-upstream-tests"],
+  "source": {
+    "kind": "upstream-defined",
+    "upstream_file": "tests/test-backend-ops.cpp",
+    "note": "The one-sided qualification adapter invokes the pinned perf corpus directly and requires SQL evidence for every selected operation."
+  },
+  "inputs": {
+    "mode": "perf",
+    "run_policy": "upstream-adaptive",
+    "operations": ["MUL_MAT", "ROPE", "SOFT_MAX", "FLASH_ATTN_EXT"]
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": null,
+    "capabilities": ["backend-ops-perf"]
+  },
+  "invocations": {
+    "reference": { "kind": "upstream-tool", "target": "backend-ops-perf", "operation": "backend-ops.perf" }
+  },
+  "comparison": {
+    "kind": "outcome-agreement",
+    "accepted_classes": ["success"]
+  },
+  "timing": {
+    "included": ["one repeated ggml operation"],
+    "excluded": ["backend initialization", "tensor construction", "result serialization"],
+    "warmup_iterations": 0,
+    "measurement_iterations": 1,
+    "synchronize": true
+  }
+}

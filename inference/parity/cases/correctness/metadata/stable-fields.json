@@ -1,0 +1,29 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.metadata.stable-fields",
+  "title": "Stable model metadata",
+  "description": "Load each compatible registered GGUF without creating a context and compare only the stable model, dimensional, architecture, and vocabulary fields exposed by both native boundaries.",
+  "category": "correctness",
+  "primitive": "C2",
+  "adapter": "differential",
+  "operation": "model.metadata",
+  "status": "active",
+  "tags": ["model-smoke", "model-matrix"],
+  "source": {
+    "kind": "magnitude-defined",
+    "note": "The projection intentionally excludes descriptions, chat templates, and implementation-specific metadata values that are not shared stable primitives."
+  },
+  "inputs": {},
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["model-metadata"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "model.metadata" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "model.metadata" }
+  },
+  "comparison": { "kind": "structural" }
+}

@@ -1,6 +1,12 @@
 node_modules
+# Rust/CMake outputs, including temporary standalone parity-crate builds.
 inference/target/
+inference/**/target/
 inference/dist/
+# Optional workspace-local model cache; the default cache is under inference/target/.
+inference/.parity-models/
+# Parity evidence uses unique, immutable run directories and is never source.
+inference/results/parity/
 .turbo
 dist
 /bin

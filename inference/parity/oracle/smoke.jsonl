@@ -1,0 +1,4 @@
+{"schemaVersion":1,"caseId":"protocol","operation":"protocol.describe","input":{}}
+{"schemaVersion":1,"caseId":"top-k","operation":"sampler.apply","input":{"candidates":[{"id":0,"logit":-2.3025851},{"id":1,"logit":-1.6094379},{"id":2,"logit":-1.2039728},{"id":3,"logit":-0.9162907}],"samplers":[{"type":"top-k","k":3}],"selection":{"type":"distribution","seed":0}}}
+{"schemaVersion":1,"caseId":"chat-template","operation":"chat-template.render","input":{"template":"{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if add_generation_prompt %}assistant: {% endif %}","messages":[{"role":"user","content":"Hello"}],"addGenerationPrompt":true,"nowUnixSeconds":0}}
+{"schemaVersion":1,"caseId":"schema-grammar","operation":"grammar.json-schema-to-grammar","input":{"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]},"forceGbnf":true}}

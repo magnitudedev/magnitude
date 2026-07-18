@@ -1,0 +1,59 @@
+Window zero begins before the rain reaches the first lamp.
+Every small machine should make its measured boundary explicit.
+Numbers remain useful only when both engines perform the same work.
+The parser receives café, 世界, and a small blue globe.
+
+Window one starts beside a quiet river and a copper bridge.
+Tokens cross the bridge in a fixed and documented order.
+The context retains positions, sequence identifiers, and exact bytes.
+A sampler sees red, green, blue, and amber candidates.
+
+Window two contains ordinary words and punctuation: commas, stops, and dashes.
+It also contains 17, 23, 41, and 89 as stable numeric inputs.
+No generated answer is used as a substitute for primitive evidence.
+The output remains attributable to one deliberately narrow operation.
+
+Window three repeats a state transition after clearing the native memory view.
+The first sequence keeps its prefix while the second sequence moves forward.
+Save, restore, remove, copy, and decode each have distinct contracts.
+Evidence records the requested configuration and the effective configuration.
+
+Window four checks Unicode without treating text as an opaque success signal.
+The bytes encode naïve, jalapeño, 東京, κόσμος, and 🌍.
+Detokenization must preserve the byte sequence selected by the fixture.
+Chunk boundaries must not alter the final parser state.
+
+Window five describes a model loaded from a digest-verified local artifact.
+The registry identifies the file by size, hash, role, and capability tags.
+Acquisition happens before an offline parity run begins.
+An unverified file cannot silently replace the accepted artifact.
+
+Window six measures prompt processing without token sampling or rendering.
+Warm-up, allocation, and model loading remain outside the declared timer.
+Raw repetitions survive beside their median and absolute deviation.
+A faster candidate is an improvement, not a symmetric-bound failure.
+
+Window seven measures single-token decode with explicit synchronization.
+Thread count, batch size, micro-batch size, and context size are identical.
+The comparison becomes invalid when effective native work cannot be proven.
+Diagnostic measurements never masquerade as release-gating evidence.
+
+Window eight applies a controlled sampler to a fixed candidate vector.
+Token identifiers and retained ordering are exact structural properties.
+Probabilities use an explicit absolute and relative numeric tolerance.
+Seeded selection returns a typed outcome instead of fuzzy prose.
+
+Window nine renders a chat template from prerecorded deterministic messages.
+Tool syntax, reasoning markers, stop strings, and triggers are isolated fields.
+Model decoding and network transport do not belong inside this comparison.
+The native helper and the production binding receive the same neutral input.
+
+Window ten scores likelihood over a fixed sliding corpus schedule.
+Perplexity and uncertainty summarize logits without sampling a response.
+The stride, context, batch, and scoring boundaries are declared in the case.
+Preflight rejects a corpus that cannot fill two effective context windows.
+
+Window eleven closes with stable ASCII and another Unicode boundary: finé.
+Reference and candidate evidence retain source, compiler, and binary identity.
+Errors use typed classes so unsupported capability differs from execution failure.
+The final comparison states pass, fail, invalid, or skipped without ambiguity.

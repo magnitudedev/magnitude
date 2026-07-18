@@ -6,11 +6,20 @@ license.workspace = true
 
 [dependencies]
 encoding_rs.workspace = true
+getrandom.workspace = true
 icn-core.workspace = true
 llama-cpp-2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.180"
 
 [features]
 default = []
 cuda = ["llama-cpp-2/cuda"]
 metal = ["llama-cpp-2/metal"]
+mtmd = ["llama-cpp-2/mtmd"]
+parity-probe = []
 vulkan = ["llama-cpp-2/vulkan"]

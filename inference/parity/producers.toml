@@ -1,0 +1,37 @@
+schema_version = 1
+
+# Local producers are resolved explicitly by runner settings. No developer or
+# CI filesystem path is part of the parity contract.
+
+[[producers]]
+id = "icn-probe"
+kind = "icn-probe"
+program_setting = "icn_probe"
+decoder = "probe-jsonl"
+stdin = "probe-jsonl"
+timeout_seconds = 300
+max_stdout_bytes = 67108864
+max_stderr_bytes = 8388608
+args = []
+capabilities = [
+  "chat-parser.bench",
+  "chat-parser.inspect",
+  "chat-template.bench",
+  "chat-template.render",
+  "configuration.inspect",
+  "decode.abort",
+  "decode.abort-recovery",
+  "decode.execute-plan",
+  "grammar.json-schema-to-grammar",
+  "llama-bench.context-depth",
+  "llama-bench.prompt-generation",
+  "llama-bench.prompt-processing",
+  "llama-bench.token-generation",
+  "model.metadata",
+  "reasoning-budget.inspect",
+  "sampler.apply",
+  "sampler.bench",
+  "state.execute-script",
+  "tokenizer.token-to-piece",
+  "tokenizer.tokenize",
+]

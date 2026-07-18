@@ -1,0 +1,15 @@
+schema_version = 1
+
+[profiles.upstream-default]
+description = "Pinned llama.cpp defaults, with only the selected backend and deterministic portability flags overridden."
+definitions = {}
+darwin_definitions = {}
+metal_definitions = {}
+osx_architecture_from_host = false
+
+[profiles.cargo-equivalent]
+description = "Native flags matched to the Cargo build for binding-overhead comparisons."
+definitions = { GGML_BLAS = "OFF", GGML_OPENMP = "OFF" }
+darwin_definitions = { GGML_ACCELERATE = "ON" }
+metal_definitions = { GGML_METAL_EMBED_LIBRARY = "ON" }
+osx_architecture_from_host = true

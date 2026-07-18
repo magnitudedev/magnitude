@@ -132,6 +132,62 @@ describe("compileOpenApi", () => {
     }
   });
 
+  it("supports propertyNames as a strongly typed record-key schema", async () => {
+    const result = await compile({
+      openapi: "3.1.0",
+      info: { title: "Property names", version: "1" },
+      components: {
+        schemas: {
+          Labels: {
+            type: "object",
+            propertyNames: { type: "string", pattern: "^[a-z]+$" },
+            additionalProperties: { type: "integer" },
+          },
+        },
+      },
+      paths: {},
+    });
+    const schemas = HashMap.get(result.files, "schemas.ts");
+    expect(schemas._tag).toBe("Some");
+    if (schemas._tag === "Some") {
+      expect(schemas.value).toContain(
+        'key: S.String.pipe(S.pattern(new RegExp("^[a-z]+$")))'
+      );
+    }
+  });
+
+  it("proves referenced oneOf branches exclusive pairwise", async () => {
+    const result = await compile({
+      openapi: "3.1.0",
+      info: { title: "Referenced union", version: "1" },
+      components: {
+        schemas: {
+          Choice: {
+            oneOf: [
+              { $ref: "#/components/schemas/Mode" },
+              { $ref: "#/components/schemas/Named" },
+              { $ref: "#/components/schemas/Allowed" },
+            ],
+          },
+          Mode: { type: "string", enum: ["auto", "none"] },
+          Named: {
+            type: "object",
+            required: ["type"],
+            properties: { type: { const: "named" } },
+          },
+          Allowed: {
+            type: "object",
+            required: ["type"],
+            properties: { type: { const: "allowed" } },
+          },
+        },
+      },
+      paths: {},
+    });
+    const schemas = HashMap.get(result.files, "schemas.ts");
+    expect(schemas._tag).toBe("Some");
+  });
+
   it("is deterministic across input record ordering", async () => {
     const reversed = {
       ...document,

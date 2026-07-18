@@ -1,0 +1,63 @@
+{
+  "schema_version": "1",
+  "id": "upstream-sampling-basic",
+  "description": "Small deterministic sampler vectors adapted from pinned llama.cpp test-sampling.cpp.",
+  "source": {
+    "file": "tests/test-sampling.cpp",
+    "revision": "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66"
+  },
+  "vectors": [
+    {
+      "id": "temperature-identity",
+      "candidates": [
+        { "id": 0, "probability": 0.1 },
+        { "id": 1, "probability": 0.2 },
+        { "id": 2, "probability": 0.3 },
+        { "id": 3, "probability": 0.4 }
+      ],
+      "samplers": [
+        { "kind": "temperature", "temperature": 1.0 },
+        { "kind": "distribution", "seed": 0 }
+      ]
+    },
+    {
+      "id": "top-k-three",
+      "candidates": [
+        { "id": 0, "probability": 0.1 },
+        { "id": 1, "probability": 0.2 },
+        { "id": 2, "probability": 0.3 },
+        { "id": 3, "probability": 0.4 }
+      ],
+      "samplers": [
+        { "kind": "top-k", "k": 3 },
+        { "kind": "distribution", "seed": 0 }
+      ]
+    },
+    {
+      "id": "top-p-eight-tenths",
+      "candidates": [
+        { "id": 0, "probability": 0.1 },
+        { "id": 1, "probability": 0.2 },
+        { "id": 2, "probability": 0.3 },
+        { "id": 3, "probability": 0.4 }
+      ],
+      "samplers": [
+        { "kind": "top-p", "p": 0.8, "minimum_keep": 0 },
+        { "kind": "distribution", "seed": 0 }
+      ]
+    },
+    {
+      "id": "min-p-half",
+      "candidates": [
+        { "id": 0, "probability": 0.1 },
+        { "id": 1, "probability": 0.2 },
+        { "id": 2, "probability": 0.3 },
+        { "id": 3, "probability": 0.4 }
+      ],
+      "samplers": [
+        { "kind": "min-p", "p": 0.51, "minimum_keep": 0 },
+        { "kind": "distribution", "seed": 0 }
+      ]
+    }
+  ]
+}
