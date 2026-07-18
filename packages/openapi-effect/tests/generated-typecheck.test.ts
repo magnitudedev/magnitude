@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { Effect, HashMap } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileOpenApi } from "../src/index.js";
-import { ndjsonConfig, ndjsonDocument } from "./fixtures.js";
+import { sseDocument, streamConfig } from "./fixtures.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -18,10 +18,10 @@ afterEach(async () => {
 describe("generated TypeScript", () => {
   it("type-checks against Magnitude's installed Effect 3 platform", async () => {
     const recursiveDocument = {
-      ...ndjsonDocument,
+      ...sseDocument,
       components: {
         schemas: {
-          ...ndjsonDocument.components.schemas,
+          ...sseDocument.components.schemas,
           Node: {
             type: "object",
             required: ["value"],
@@ -35,7 +35,7 @@ describe("generated TypeScript", () => {
       },
     } as const;
     const generated = await Effect.runPromise(
-      compileOpenApi(recursiveDocument, ndjsonConfig)
+      compileOpenApi(recursiveDocument, streamConfig)
     );
     const directory = await mkdtemp(
       resolve(processCwd(), ".generated-typecheck-")

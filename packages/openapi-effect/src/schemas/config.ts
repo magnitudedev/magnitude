@@ -16,18 +16,15 @@ export class OutputLayout extends Schema.Class<OutputLayout>(
   }),
 }) {}
 
-export class NdjsonTransport extends Schema.TaggedClass<NdjsonTransport>(
-  "OpenApiEffect.NdjsonTransport"
-)("Ndjson", {
-  extension: ExtensionKey,
-  value: Schema.String,
-  eventSchemaExtension: ExtensionKey,
-  mediaType: Schema.optionalWith(Schema.String, {
-    default: () => "application/x-ndjson",
+export class StreamTransport extends Schema.Class<StreamTransport>(
+  "OpenApiEffect.StreamTransport"
+)({
+  extension: Schema.optionalWith(ExtensionKey, {
+    default: () => "x-magnitude-stream" as const,
   }),
 }) {}
 
-export const Transport = Schema.Union(NdjsonTransport);
+export const Transport = Schema.Union(StreamTransport);
 export type Transport = typeof Transport.Type;
 
 export class OpenApiEffectConfig extends Schema.Class<OpenApiEffectConfig>(

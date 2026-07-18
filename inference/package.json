@@ -1,0 +1,14 @@
+{
+  "name": "@magnitudedev/inference",
+  "private": true,
+  "scripts": {
+    "build": "cargo build -p icn-server",
+    "build:release": "cargo build --release -p icn-server",
+    "check": "cargo check --workspace",
+    "test": "cargo test --workspace",
+    "dev": "cargo run -p icn-server -- serve --fake",
+    "serve": "cargo run -p icn-server -- serve",
+    "doctor": "cargo run -p icn-server -- doctor",
+    "version": "cargo run -p icn-server -- version --json"
+  }
+}

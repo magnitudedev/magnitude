@@ -14,9 +14,10 @@ export {
 } from "./errors.js";
 export {
   OpenApiEffectConfig,
-  NdjsonTransport,
+  StreamTransport,
   OutputLayout,
 } from "./schemas/config.js";
+export { StreamMetadata } from "./schemas/stream.js";
 export {
   OpenApiDocument,
   OpenApiSchema,

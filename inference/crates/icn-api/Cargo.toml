@@ -1,0 +1,24 @@
+[package]
+name = "icn-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "export-openapi"
+path = "src/bin/export-openapi.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+icn-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+utoipa.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower.workspace = true

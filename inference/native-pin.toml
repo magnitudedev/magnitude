@@ -1,0 +1,9 @@
+[llama_cpp_rs]
+repository = "https://github.com/utilityai/llama-cpp-rs"
+revision = "7f0a0d95514aebe86efab16527745852ee72931c"
+release = "0.1.151"
+
+[llama_cpp]
+repository = "https://github.com/ggml-org/llama.cpp"
+revision = "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66"
+
