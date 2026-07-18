@@ -39,7 +39,10 @@ describe("compileOpenApi", () => {
     ).toContain("export const Model");
     expect(
       schemas.pipe((value) => (value._tag === "Some" ? value.value : ""))
-    ).toContain('O.Option<string | null>');
+    ).toContain("export type Model = S.Schema.Type<typeof Model>");
+    expect(
+      schemas.pipe((value) => (value._tag === "Some" ? value.value : ""))
+    ).toContain("export type ModelEncoded = S.Schema.Encoded<typeof Model>");
     expect(
       schemas.pipe((value) => (value._tag === "Some" ? value.value : ""))
     ).toContain('as: "Option"');
