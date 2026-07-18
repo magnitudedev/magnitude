@@ -107,6 +107,8 @@ export const LocalInferenceLlamaCppState = Schema.Struct({
 export type LocalInferenceLlamaCppState = Schema.Schema.Type<typeof LocalInferenceLlamaCppState>
 
 export const LocalInferenceHostProfile = Schema.Struct({
+  platform: Schema.String,
+  architecture: Schema.String,
   systemMemoryBytes: NonNegativeNumber,
   cpuModel: Schema.NullOr(Schema.String),
   logicalCores: PositiveInteger,
@@ -116,6 +118,7 @@ export const LocalInferenceHostProfile = Schema.Struct({
     stableCapacityBytes: NonNegativeNumber,
     currentFreeBytes: Schema.NullOr(NonNegativeNumber),
     sharesSystemMemory: Schema.Boolean,
+    backendNames: Schema.Array(Schema.String),
     deviceNames: Schema.Array(Schema.String),
     splitGroupId: Schema.NullOr(Schema.String),
   })),

@@ -88,8 +88,17 @@ export const DurableLocalModelBindingSchema = Schema.Union(
 )
 export type DurableLocalModelBinding = Schema.Schema.Type<typeof DurableLocalModelBindingSchema>
 
+export const SelectedLocalModelProfileSchema = Schema.Struct({
+  configurationId: Schema.String,
+  catalogModelId: Schema.String,
+  contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  parallelSlots: Schema.Number.pipe(Schema.int(), Schema.positive()),
+})
+export type SelectedLocalModelProfile = Schema.Schema.Type<typeof SelectedLocalModelProfileSchema>
+
 export const LocalInferenceConfigSchema = Schema.Struct({
   usage: Schema.optional(LocalInferenceUsageSelectionSchema),
+  selectedProfile: Schema.optional(SelectedLocalModelProfileSchema),
   binding: Schema.optional(DurableLocalModelBindingSchema),
 })
 export type LocalInferenceConfig = Schema.Schema.Type<typeof LocalInferenceConfigSchema>
