@@ -6,7 +6,10 @@ import type { LlamaCppHostProfile } from "./recommendations"
 import { LOCAL_MODEL_CATALOG } from "./catalog"
 import {
   GIB,
+  estimateKvCacheBytes,
+  estimateRecurrentStateBytes,
   estimateRuntimeBytes,
+  evaluateCatalog,
   parallelSlotsForUsage,
   recommendLocalModels,
   stableCapacityFromHost,
@@ -41,7 +44,7 @@ describe("local inference recommendation policy", () => {
     [8, undefined],
     [16, "Qwen3.5 4B"],
     [24, "Gemma 4 12B"],
-    [32, "Qwen3.6 27B"],
+    [32, "Qwen3.6 35B-A3B"],
     [48, "Qwen3.6 35B-A3B"],
     [64, "Qwen3.6 35B-A3B"],
     [128, "NVIDIA Nemotron 3 Super 120B-A12B"],
@@ -62,8 +65,8 @@ describe("local inference recommendation policy", () => {
 
   test("changes recommendations when identical hardware reserves more context windows", () => {
     expect(recommendLocalModels(cpu(32), ONE_SESSION)[0]).toMatchObject({
-      displayName: "Qwen3.6 27B",
-      contextTokens: 200_000,
+      displayName: "Qwen3.6 35B-A3B",
+      contextTokens: 100_000,
       servingProfile: { parallelSlots: 1 },
     })
     expect(recommendLocalModels(cpu(32), THREE_SESSIONS)[0]).toMatchObject({
@@ -103,10 +106,23 @@ describe("local inference recommendation policy", () => {
     expect(nine).toBeLessThan(one * 9)
   })
 
+  test("derives KV and recurrent memory from pinned GGUF architecture metadata", () => {
+    const qwen = LOCAL_MODEL_CATALOG.find((item) => item.id === "qwen3.6-35b-a3b:UD-Q6_K_XL")!
+    expect(estimateKvCacheBytes(qwen, 100_000, 1)).toBe(2_048_000_000)
+    expect(estimateKvCacheBytes(qwen, 100_000, 3)).toBe(6_144_000_000)
+    expect(estimateRecurrentStateBytes(qwen, 1)).toBe(64_389_120)
+
+    const gemma = LOCAL_MODEL_CATALOG.find((item) => item.id === "gemma-4-12b-it-qat:UD-Q4_K_XL")!
+    const at100K = estimateKvCacheBytes(gemma, 100_000, 1)
+    const at200K = estimateKvCacheBytes(gemma, 200_000, 1)
+    expect(at200K - at100K).toBe(1_638_400_000)
+    expect(at200K).toBeLessThan(at100K * 2)
+  })
+
   test("changes quant formats with headroom instead of always defaulting to Q4", () => {
-    expect(recommendLocalModels(cpu(48), ONE_SESSION)[0]?.quantization.format).toBe("UD-Q5_K_XL")
+    expect(recommendLocalModels(cpu(48), ONE_SESSION)[0]?.quantization.format).toBe("UD-Q6_K_XL")
     expect(recommendLocalModels(cpu(64), ONE_SESSION)[0]?.quantization.format).toBe("UD-Q8_K_XL")
-    expect(recommendLocalModels(cpu(64), THREE_SESSIONS)[0]?.quantization.format).toBe("UD-Q4_K_XL")
+    expect(recommendLocalModels(cpu(64), THREE_SESSIONS)[0]?.quantization.format).toBe("UD-Q8_K_XL")
   })
 
   test("returns three useful choices whenever three configurations fit", () => {
@@ -189,7 +205,23 @@ describe("local inference recommendation policy", () => {
     const stable = stableCapacityFromHost(host)
     expect(stable.acceleratorDomains).toHaveLength(1)
     expect(stable.acceleratorDomains[0]?.capacityBytes).toBe(28 * GIB)
-    expect(recommendLocalModels(stable, ONE_SESSION)[0]?.displayName).toBe("Qwen3.6 27B")
+    expect(recommendLocalModels(stable, ONE_SESSION)[0]?.displayName).toBe("Qwen3.6 35B-A3B")
+  })
+
+  test("reports a full discrete-accelerator fit for a qualifying recommendation", () => {
+    const configurations = evaluateCatalog({
+      systemMemoryBytes: 64 * GIB,
+      acceleratorDomains: [{
+        memoryDomainId: "cuda:0",
+        capacityBytes: 21.6 * GIB,
+        sharesSystemMemory: false,
+        preferredBackend: "CUDA",
+      }],
+    }, ONE_SESSION)
+    expect(configurations).toContainEqual(expect.objectContaining({
+      entry: expect.objectContaining({ displayName: "Gemma 4 26B-A4B" }),
+      fitClass: "full_accelerator",
+    }))
   })
 
   test("combines discrete accelerator capacity only for an explicit supported split group", () => {

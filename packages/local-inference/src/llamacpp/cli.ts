@@ -18,7 +18,9 @@ export type LlamaStartFailureReason = Schema.Schema.Type<typeof LlamaStartFailur
 export interface LlamaDevice {
   readonly id: Schema.Schema.Type<typeof LlamaDeviceId>
   readonly name: Option.Option<string>
+  readonly backend: Option.Option<string>
   readonly type: Option.Option<string>
+  readonly physicalId: Option.Option<string>
   readonly totalMemoryBytes: Option.Option<number>
   readonly freeMemoryBytes: Option.Option<number>
 }
@@ -61,7 +63,15 @@ export interface LlamaCli {
   ) => Effect.Effect<RunningLlamaProcess, LlamaStartError, Scope.Scope>
 }
 
-const DeviceJson = Schema.Struct({ id: LlamaDeviceId, name: Schema.optional(Schema.String), type: Schema.optional(Schema.String), total_memory: Schema.optional(Schema.NonNegativeInt), free_memory: Schema.optional(Schema.NonNegativeInt) })
+const DeviceJson = Schema.Struct({
+  id: LlamaDeviceId,
+  name: Schema.optional(Schema.String),
+  backend: Schema.optional(Schema.String),
+  type: Schema.optional(Schema.String),
+  device_id: Schema.optional(Schema.String),
+  total_memory: Schema.optional(Schema.NonNegativeInt),
+  free_memory: Schema.optional(Schema.NonNegativeInt),
+})
 const DeviceListJson = Schema.parseJson(Schema.Array(DeviceJson))
 const cliError = (operation: LlamaCliOperation, reason: LlamaCliError["reason"]) => LlamaCliError.make(operation, reason)
 const startError = (operation: LlamaStartOperation, reason: LlamaStartFailureReason) => new LlamaStartError({ operation, reason })
@@ -78,7 +88,15 @@ const documentedDevices = (output: string): Effect.Effect<readonly LlamaDevice[]
     })
     if (Option.isNone(values)) return yield* LlamaCliError.make("list-devices", "invalid-output")
     const id = yield* Schema.decodeUnknown(LlamaDeviceId)(values.value.rawId).pipe(Effect.mapError(() => LlamaCliError.make("list-devices", "invalid-output")))
-    devices.push({ id, name: Option.some(values.value.name), type: Option.none(), totalMemoryBytes: Option.some(Number(values.value.totalMiB) * 1024 * 1024), freeMemoryBytes: Option.some(Number(values.value.freeMiB) * 1024 * 1024) })
+    devices.push({
+      id,
+      name: Option.some(values.value.name),
+      backend: Option.none(),
+      type: Option.none(),
+      physicalId: Option.none(),
+      totalMemoryBytes: Option.some(Number(values.value.totalMiB) * 1024 * 1024),
+      freeMemoryBytes: Option.some(Number(values.value.freeMiB) * 1024 * 1024),
+    })
   }
   if (devices.length === 0) return yield* new LlamaCliError({ operation: "list-devices", reason: "invalid-output", field: Option.none() })
   return devices
@@ -105,7 +123,15 @@ export const makeLlamaCli = (installation: LlamaCppInstallation): Effect.Effect<
       const rawOutput = yield* output(installation.executables.server.path, "list-devices", ["--list-devices"])
       const decoded = yield* Schema.decode(DeviceListJson)(rawOutput).pipe(Effect.option)
       const devices = Option.isSome(decoded)
-        ? decoded.value.map((item) => ({ id: item.id, name: Option.fromNullable(item.name), type: Option.fromNullable(item.type), totalMemoryBytes: Option.fromNullable(item.total_memory), freeMemoryBytes: Option.fromNullable(item.free_memory) }))
+        ? decoded.value.map((item) => ({
+          id: item.id,
+          name: Option.fromNullable(item.name),
+          backend: Option.fromNullable(item.backend),
+          type: Option.fromNullable(item.type),
+          physicalId: Option.fromNullable(item.device_id),
+          totalMemoryBytes: Option.fromNullable(item.total_memory),
+          freeMemoryBytes: Option.fromNullable(item.free_memory),
+        }))
         : yield* documentedDevices(rawOutput)
       return { serverFingerprint: installation.executables.server.fingerprint, capturedAt: new Date(), devices, rawOutput }
     }),

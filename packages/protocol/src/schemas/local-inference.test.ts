@@ -27,6 +27,8 @@ describe("local inference protocol schemas", () => {
   }
   test("keeps stable capacity distinct from point-in-time free memory", () => {
     const decoded = Schema.decodeUnknownSync(LocalInferenceHostProfile)({
+      platform: "linux",
+      architecture: "x64",
       systemMemoryBytes: 64 * 1024 ** 3,
       cpuModel: "test cpu",
       logicalCores: 12,
@@ -36,6 +38,7 @@ describe("local inference protocol schemas", () => {
         stableCapacityBytes: 24 * 1024 ** 3,
         currentFreeBytes: 1,
         sharesSystemMemory: false,
+        backendNames: ["CUDA"],
         deviceNames: ["test gpu"],
         splitGroupId: null,
       }],

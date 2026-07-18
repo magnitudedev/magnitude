@@ -30,7 +30,7 @@ import {
   type LocalSlotCandidate,
 } from "./model-configuration"
 import { configuredParallelSlots } from "./recommendations"
-import { LOCAL_MODEL_CATALOG } from "./catalog"
+import { LOCAL_MODEL_CATALOG, catalogEntryForModelReferences } from "./catalog"
 import { isOpaqueLlamaRoutingName, providerModelIdForModelPath } from "./identity"
 
 const ZERO_PRICING = { input: 0, output: 0, cached_input: null } as const
@@ -156,10 +156,13 @@ export class LocalModelProviderSource extends Context.Tag("LocalModelProviderSou
   LocalModelProviderSourceApi
 >() {}
 
-const profileFor = (contextTokens: number) => LlamaCpp.makeLlamaExecutionProfile({
+const profileFor = (
+  contextTokens: number,
+  parallelSlots = configuredParallelSlots(),
+) => LlamaCpp.makeLlamaExecutionProfile({
   contextSize: LlamaCpp.ContextSize.Tokens({ value: contextTokens }),
   outputLimit: LlamaCpp.OutputLimit.RuntimeDefault(),
-  parallelSlots: configuredParallelSlots(),
+  parallelSlots,
   gpuLayers: LlamaCpp.GpuLayerSelection.Fit(),
   splitMode: "layer",
   tensorSplit: Option.none(),
@@ -560,6 +563,7 @@ export const LocalModelProviderSourceLive: Layer.Layer<
     reassessManaged = true,
   ) => rebuildLock.withPermits(1)(Effect.gen(function* () {
     const records = (yield* platform.files.inspect(fileRefresh)).records
+    const localConfig = yield* configuration.get
     const registry = assessAvailability
       ? Option.some(yield* platform.instances)
       : Option.none<LlamaCpp.LlamaInstanceRegistryApi>()
@@ -604,8 +608,19 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       if (managedModelPaths.has(modelPath)) return
       managedModelPaths.add(modelPath)
       const providerModelId = providerModelIdForModelPath(modelPath)
-      const context = record.metadata.trainedContextTokens
-      const profile = Option.isSome(context) ? yield* profileFor(context.value) : undefined
+      const catalogEntry = catalogEntryForModelReferences([
+        resolved.value.primaryPath,
+        ...resolved.value.shardPaths,
+      ])
+      const selectedProfile = catalogEntry?.id === localConfig.selectedProfile?.catalogModelId
+        ? localConfig.selectedProfile
+        : undefined
+      const context = selectedProfile
+        ? Option.some(selectedProfile.contextTokens)
+        : record.metadata.trainedContextTokens
+      const profile = Option.isSome(context)
+        ? yield* profileFor(context.value, selectedProfile?.parallelSlots)
+        : undefined
       const request = profile ? {
         modelFileId: record.id,
         servedModelId: LlamaCpp.LlamaServedModelId.make(providerModelId),
@@ -679,7 +694,9 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       const external = group.routes.filter((route): route is ExternalRoute => route._tag === "External")
       const context = firstSome([
         ...external.map((route) => route.observation.activeContextTokens),
-        ...managed.map((route) => route.record.metadata.trainedContextTokens),
+        ...managed.map((route) => route.request?.profile.contextSize._tag === "Tokens"
+          ? Option.some(route.request.profile.contextSize.value)
+          : route.record.metadata.trainedContextTokens),
       ])
       const previousModel = previous.get(providerModelId)?.providerModel
       const cachedProperties = yield* platform.modelIndex.discoveredProperties(group.path)
@@ -1293,6 +1310,16 @@ export const LocalModelProviderSourceLive: Layer.Layer<
       Stream.runForEach(() => rebuild("cached", true, true).pipe(
           Effect.tap(() => requestFitReconciliation),
           Effect.catchAll((cause) => Effect.logWarning("Local installation-dependent model update failed").pipe(
+          Effect.annotateLogs({ cause: String(cause) }),
+        )),
+      )),
+      Effect.forkScoped,
+    )
+    yield* configuration.changes.pipe(
+      Stream.debounce("25 millis"),
+      Stream.runForEach(() => rebuild("cached", true, true).pipe(
+        Effect.tap(() => requestFitReconciliation),
+        Effect.catchAll((cause) => Effect.logWarning("Local model configuration update failed").pipe(
           Effect.annotateLogs({ cause: String(cause) }),
         )),
       )),

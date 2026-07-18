@@ -58,7 +58,8 @@ describe("LocalModelProviderSource", () => {
       cpuModel: Option.none<string>(), logicalCores: 1, totalMemoryBytes: 64 * GIBIBYTE, availableMemoryBytes: GIBIBYTE,
     }
     const devices: readonly LlamaCpp.LlamaDevice[] = [{
-      id: LlamaCpp.LlamaDeviceId.make("MTL0"), name: Option.none(), type: Option.none(),
+      id: LlamaCpp.LlamaDeviceId.make("MTL0"), name: Option.none(), backend: Option.some("Metal"),
+      type: Option.some("IGPU"), physicalId: Option.none(),
       totalMemoryBytes: Option.some(48 * GIBIBYTE), freeMemoryBytes: Option.some(GIBIBYTE),
     }]
     expect(llamaFitEstimateFitsStableCapacity(plan, host, devices)).toBe(false)
@@ -96,7 +97,8 @@ describe("LocalModelProviderSource", () => {
       cpuModel: Option.none<string>(), logicalCores: 1, totalMemoryBytes: 64 * GIBIBYTE, availableMemoryBytes: GIBIBYTE,
     }
     const devices: readonly LlamaCpp.LlamaDevice[] = [{
-      id: LlamaCpp.LlamaDeviceId.make("CUDA0"), name: Option.none(), type: Option.none(),
+      id: LlamaCpp.LlamaDeviceId.make("CUDA0"), name: Option.none(), backend: Option.some("CUDA"),
+      type: Option.some("GPU"), physicalId: Option.some("0000:01:00.0"),
       totalMemoryBytes: Option.some(16 * GIBIBYTE), freeMemoryBytes: Option.some(GIBIBYTE),
     }]
     expect(llamaFitEstimateFitsStableCapacity(plan, host, devices)).toBe(false)
@@ -217,7 +219,7 @@ describe("LocalModelProviderSource", () => {
       serverClient: () => Effect.dieMessage("unused"),
     } as LocalInferencePlatformApi
     const configuration = {
-      get: Effect.succeed({}), getModels: Effect.succeed({}), updateUsage: () => Effect.void, updateSlots: () => Effect.void,
+      get: Effect.succeed({}), getModels: Effect.succeed({}), updateUsage: () => Effect.void, selectProfile: () => Effect.void, updateSlots: () => Effect.void,
       reconcileSlots: () => Effect.succeed(false), recordUse: () => Effect.void,
       activateLocal: () => Effect.void, disableLocal: Effect.void, changes: Stream.empty,
     } as LocalModelConfigurationApi

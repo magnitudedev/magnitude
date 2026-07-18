@@ -7,6 +7,7 @@ import {
   type DurableLocalModelBinding,
   type LocalInferenceConfig,
   type MagnitudeConfig,
+  type SelectedLocalModelProfile,
   type SlotId,
   type SlotModelConfig,
 } from "@magnitudedev/storage"
@@ -21,6 +22,7 @@ export interface LocalModelConfigurationApi {
   readonly get: Effect.Effect<LocalInferenceConfig, ModelConfigurationError>
   readonly getModels: Effect.Effect<MagnitudeConfig["models"], ModelConfigurationError>
   readonly updateUsage: (usage: LocalInferenceUsageSelection) => Effect.Effect<void, ModelConfigurationError>
+  readonly selectProfile: (profile: SelectedLocalModelProfile) => Effect.Effect<void, ModelConfigurationError>
   readonly updateSlots: (
     slots: Partial<Record<SlotId, SlotModelConfig>>,
   ) => Effect.Effect<void, ModelConfigurationError>
@@ -261,6 +263,18 @@ export const makeLocalModelConfiguration = (
       }
     }).pipe(
       Effect.mapError((cause) => configurationError("update local inference usage", cause)),
+      Effect.zipRight(publish),
+    ),
+
+    selectProfile: (profile) => storage.update((current) => ({
+      ...current,
+      localInference: {
+        ...current.localInference,
+        selectedProfile: profile,
+      },
+    })).pipe(
+      Effect.mapError((cause) => configurationError("select local model profile", cause)),
+      Effect.asVoid,
       Effect.zipRight(publish),
     ),
 
