@@ -1,0 +1,66 @@
+schema_version = 1
+id = "pr"
+description = "Fast deterministic qualification across focused upstream tests, model-free primitives, and pinned tiny-model primitive cases."
+
+[selection]
+statuses = ["active"]
+include_case_ids = [
+  "correctness.baseline.focused-upstream-tests",
+  "correctness.config.context-defaults",
+  "correctness.metadata.stable-fields",
+  "correctness.tokenizer.unicode-special-flags",
+  "correctness.tokenizer.token-to-piece-unicode-bytes",
+  "correctness.sampler.top-k-three",
+  "correctness.sampler.distribution-four-seeded",
+  "correctness.reasoning-budget.controllable-force",
+  "correctness.chat-template.chatml-basic",
+  "correctness.grammar.json-schema-boolean-object",
+  "correctness.parser.content-only-unicode",
+  "correctness.decode.single-batch-logits",
+  "correctness.cancellation.decode-abort",
+  "correctness.cancellation.decode-abort-recovery",
+  "correctness.state.remove-and-redecode",
+]
+include_primitives = []
+include_tags = []
+exclude_case_ids = []
+exclude_tags = ["artifact-gap"]
+
+[upstream]
+build_profile = "cargo-equivalent"
+
+[execution]
+offline = true
+max_parallel = 1
+case_timeout_seconds = 300
+fail_fast = false
+performance_engine_order = "alternate"
+
+[engine]
+backend = "auto"
+threads = "physical-cores"
+gpu_layers = "all"
+flash_attention = "auto"
+
+[models]
+verify_before_run = true
+allow_fetch = false
+ids = ["stories15m-q4-0"]
+
+[performance]
+enabled = false
+paired_repetitions = 1
+require_controlled_host = false
+require_exclusive_device = false
+
+[results]
+preserve_raw_evidence = true
+preserve_raw_samples = true
+write_comparisons = true
+
+[gates]
+fail_on_invalid = true
+fail_on_error = true
+fail_on_skipped = true
+fail_on_performance = false
+require_correctness_before_performance = true

@@ -136,7 +136,6 @@ const unsupportedSchemaKeywords = (
   ...keywordWhenPresent("else", schema.else),
   ...keywordWhenPresent("patternProperties", schema.patternProperties),
   ...keywordWhenPresent("unevaluatedProperties", schema.unevaluatedProperties),
-  ...keywordWhenPresent("propertyNames", schema.propertyNames),
   ...keywordWhenPresent("prefixItems", schema.prefixItems),
   ...keywordWhenPresent("contains", schema.contains),
   ...keywordWhenPresent("contentSchema", schema.contentSchema),
@@ -249,7 +248,10 @@ const normalizeSchema = (
         );
         return SchemaNode.Never({ source });
       }
-      if (mode === "OneOf" && !isProvablyExclusive(members)) {
+      if (
+        mode === "OneOf" &&
+        !isProvablyExclusiveSchemas(values, context.document)
+      ) {
         yield* report(
           context,
           "schema.oneOf-overlap",
@@ -421,7 +423,31 @@ const normalizeSchema = (
                 pointerChild(pointer, "additionalProperties")
               ),
             });
-        return SchemaNode.Object({ properties, additionalProperties, source });
+        const propertyNames = Option.isSome(schema.propertyNames)
+          ? Option.some(
+              yield* normalizeSchema(
+                schema.propertyNames.value,
+                pointerChild(pointer, "propertyNames")
+              )
+            )
+          : Option.none<SchemaNodeType>();
+        if (
+          Option.isSome(propertyNames) &&
+          !isPropertyNameSchema(propertyNames.value, context.document)
+        ) {
+          yield* report(
+            context,
+            "schema.propertyNames-non-string",
+            pointerChild(pointer, "propertyNames"),
+            "propertyNames must describe string property keys"
+          );
+        }
+        return SchemaNode.Object({
+          properties,
+          propertyNames,
+          additionalProperties,
+          source,
+        });
       }
     }
     yield* report(
@@ -433,81 +459,144 @@ const normalizeSchema = (
     return SchemaNode.Never({ source });
   });
 
-const primitiveCategory = (schema: SchemaNodeType): Option.Option<string> =>
-  SchemaNode.$match(schema, {
-    JsonValue: () => Option.none(),
-    Never: () => Option.none(),
-    Null: () => Option.some("null"),
-    Literal: ({ value }) => Option.some(value === null ? "null" : typeof value),
-    Enum: ({ values }) => {
-      const categories = new Set(
-        values.map((value) => (value === null ? "null" : typeof value))
-      );
-      return categories.size === 1
-        ? Option.fromNullable([...categories][0])
-        : Option.none();
-    },
-    String: () => Option.some("string"),
-    Number: () => Option.some("number"),
-    Boolean: () => Option.some("boolean"),
-    Array: () => Option.some("array"),
-    Object: () => Option.none(),
-    Union: () => Option.none(),
-    Ref: () => Option.none(),
-  });
+const resolveSchemaReference = (
+  schema: OpenApiSchemaType,
+  document: OpenApiDocument,
+  visited: ReadonlySet<string> = new Set()
+): OpenApiSchemaType => {
+  if (schema === true || schema === false || Option.isNone(schema.$ref))
+    return schema;
+  const name = directRefName(schema.$ref.value, "schemas");
+  if (Option.isNone(name) || visited.has(name.value)) return schema;
+  return Option.flatMap(document.components, ({ schemas }) =>
+    Option.flatMap(schemas, (values) => Option.fromNullable(values[name.value]))
+  ).pipe(
+    Option.map((target) =>
+      resolveSchemaReference(
+        target,
+        document,
+        new Set([...visited, name.value])
+      )
+    ),
+    Option.getOrElse(() => schema)
+  );
+};
 
-const discriminator = (
-  schema: SchemaNodeType
-): Option.Option<readonly [string, JsonPrimitive]> =>
-  SchemaNode.$match(schema, {
-    Object: ({ properties }) => {
-      return Option.fromNullable(
-        properties.find(
-          (candidate) =>
-            candidate.required &&
-            (candidate.schema._tag === "Literal" ||
-              (candidate.schema._tag === "Enum" &&
-                candidate.schema.values.length === 1))
-        )
-      ).pipe(
-        Option.flatMap((property) =>
-          property.schema._tag === "Literal"
-            ? Option.some([property.name, property.schema.value] as const)
-            : property.schema._tag === "Enum"
-            ? Option.map(
-                Option.fromNullable(property.schema.values[0]),
-                (value) => [property.name, value] as const
-              )
-            : Option.none()
-        )
-      );
-    },
-    JsonValue: () => Option.none(),
-    Never: () => Option.none(),
-    Null: () => Option.none(),
-    Literal: () => Option.none(),
-    Enum: () => Option.none(),
-    String: () => Option.none(),
-    Number: () => Option.none(),
-    Boolean: () => Option.none(),
-    Array: () => Option.none(),
-    Union: () => Option.none(),
-    Ref: () => Option.none(),
-  });
+const resolveComponentSchema = (
+  name: string,
+  document: OpenApiDocument
+): Option.Option<OpenApiSchemaType> =>
+  Option.flatMap(document.components, ({ schemas }) =>
+    Option.flatMap(schemas, (values) => Option.fromNullable(values[name]))
+  );
 
-const isProvablyExclusive = (members: readonly SchemaNodeType[]): boolean => {
-  const categories = members.map(primitiveCategory);
+const rawSchemaCategory = (
+  input: OpenApiSchemaType,
+  document: OpenApiDocument
+): Option.Option<string> => {
+  const schema = resolveSchemaReference(input, document);
+  if (schema === true || schema === false) return Option.none();
+  if (Option.isSome(schema.const) && isPrimitive(schema.const.value))
+    return Option.some(
+      schema.const.value === null ? "null" : typeof schema.const.value
+    );
+  if (Option.isSome(schema.enum)) {
+    const categories = new Set(
+      schema.enum.value
+        .filter(isPrimitive)
+        .map((value) => (value === null ? "null" : typeof value))
+    );
+    return categories.size === 1
+      ? Option.fromNullable([...categories][0])
+      : Option.none();
+  }
+  if (Option.isNone(schema.type) || typeof schema.type.value !== "string")
+    return Option.none();
+  return Option.some(
+    schema.type.value === "integer" ? "number" : schema.type.value
+  );
+};
+
+const rawDiscriminator = (
+  input: OpenApiSchemaType,
+  document: OpenApiDocument
+): Option.Option<readonly [string, JsonPrimitive]> => {
+  const schema = resolveSchemaReference(input, document);
+  if (schema === true || schema === false || Option.isNone(schema.properties))
+    return Option.none();
+  const required = new Set(
+    Option.getOrElse(schema.required, () => [] as const)
+  );
+  for (const [name, candidateInput] of Object.entries(
+    schema.properties.value
+  )) {
+    if (!required.has(name)) continue;
+    const candidate = resolveSchemaReference(candidateInput, document);
+    if (candidate === true || candidate === false) continue;
+    if (Option.isSome(candidate.const) && isPrimitive(candidate.const.value))
+      return Option.some([name, candidate.const.value] as const);
+    if (
+      Option.isSome(candidate.enum) &&
+      candidate.enum.value.length === 1 &&
+      isPrimitive(candidate.enum.value[0])
+    )
+      return Option.some([name, candidate.enum.value[0]] as const);
+  }
+  return Option.none();
+};
+
+const schemasAreProvablyDisjoint = (
+  left: OpenApiSchemaType,
+  right: OpenApiSchemaType,
+  document: OpenApiDocument
+): boolean => {
+  const leftCategory = rawSchemaCategory(left, document);
+  const rightCategory = rawSchemaCategory(right, document);
   if (
-    categories.every(Option.isSome) &&
-    new Set(categories.map(({ value }) => value)).size === categories.length
+    Option.isSome(leftCategory) &&
+    Option.isSome(rightCategory) &&
+    leftCategory.value !== rightCategory.value
   )
     return true;
-  const discriminators = members.map(discriminator);
-  if (!discriminators.every(Option.isSome)) return false;
+  const leftDiscriminator = rawDiscriminator(left, document);
+  const rightDiscriminator = rawDiscriminator(right, document);
   return (
-    new Set(discriminators.map(({ value }) => value[0])).size === 1 &&
-    new Set(discriminators.map(({ value }) => JSON.stringify(value[1])))
-      .size === discriminators.length
+    Option.isSome(leftDiscriminator) &&
+    Option.isSome(rightDiscriminator) &&
+    leftDiscriminator.value[0] === rightDiscriminator.value[0] &&
+    JSON.stringify(leftDiscriminator.value[1]) !==
+      JSON.stringify(rightDiscriminator.value[1])
+  );
+};
+
+const isProvablyExclusiveSchemas = (
+  schemas: readonly OpenApiSchemaType[],
+  document: OpenApiDocument
+): boolean =>
+  schemas.every((left, leftIndex) =>
+    schemas.every(
+      (right, rightIndex) =>
+        leftIndex >= rightIndex ||
+        schemasAreProvablyDisjoint(left, right, document)
+    )
+  );
+
+const isPropertyNameSchema = (
+  schema: SchemaNodeType,
+  document: OpenApiDocument
+): boolean => {
+  if (schema._tag === "Never" || schema._tag === "String") return true;
+  if (schema._tag === "Literal") return typeof schema.value === "string";
+  if (schema._tag === "Enum")
+    return schema.values.every((value) => typeof value === "string");
+  if (schema._tag === "Union")
+    return schema.members.every((member) =>
+      isPropertyNameSchema(member, document)
+    );
+  if (schema._tag !== "Ref") return false;
+  return resolveComponentSchema(schema.target, document).pipe(
+    Option.flatMap((target) => rawSchemaCategory(target, document)),
+    Option.contains("string")
   );
 };
 

@@ -1,0 +1,35 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.tokenizer.unicode-special-flags",
+  "title": "Unicode tokenization with explicit special-token policy",
+  "description": "Tokenize fixed UTF-8 bytes with the production binding's explicit BOS and special-token policy and compare only the resulting token IDs; token-to-piece and detokenization are separate properties.",
+  "category": "correctness",
+  "primitive": "C3",
+  "adapter": "differential",
+  "operation": "tokenizer.tokenize",
+  "status": "active",
+  "tags": ["model-smoke", "unicode"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-tokenizer-0.cpp",
+    "note": "A small cross-encoding smoke vector using parseSpecial=true, which is the production safe binding's exposed policy; broad family and random-input coverage remains in focused upstream tests."
+  },
+  "inputs": {
+    "text": "Hello, 世界 — café — 🌍!",
+    "addSpecial": true,
+    "parseSpecial": true,
+    "includePieces": false
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["tokenizer"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "tokenizer.tokenize" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "tokenizer.tokenize" }
+  },
+  "comparison": { "kind": "exact", "paths": ["/tokens"] }
+}

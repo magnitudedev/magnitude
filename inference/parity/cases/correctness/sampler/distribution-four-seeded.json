@@ -1,0 +1,46 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.sampler.distribution-four-seeded",
+  "title": "Seeded distribution selection",
+  "description": "Apply only the seeded native distribution sampler to four controlled logits and compare its normalized probabilities and selected token; top-k transformation is a separate case.",
+  "category": "correctness",
+  "primitive": "C6",
+  "adapter": "differential",
+  "operation": "sampler.apply",
+  "status": "active",
+  "tags": ["model-free", "oracle-smoke", "upstream-derived"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-sampling.cpp",
+    "note": "The pinned sampling tests use llama_sampler_init_dist(0) to normalize candidate probabilities after controlled transformations; this case isolates that seeded distribution primitive."
+  },
+  "inputs": {
+    "candidates": [
+      { "id": 0, "logit": -2.302585092994046, "probability": 0.1 },
+      { "id": 1, "logit": -1.6094379124341003, "probability": 0.2 },
+      { "id": 2, "logit": -1.2039728043259361, "probability": 0.3 },
+      { "id": 3, "logit": -0.916290731874155, "probability": 0.4 }
+    ],
+    "samplers": [],
+    "selection": { "type": "distribution", "seed": 0 }
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": null,
+    "capabilities": ["sampler.distribution"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "sampler.apply" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "sampler.apply" }
+  },
+  "comparison": {
+    "kind": "numeric",
+    "paths": ["/candidates"],
+    "exact_paths": ["/sorted", "/selectedIndex", "/selectedToken"],
+    "absolute_tolerance": 0.000001,
+    "relative_tolerance": 0.000001,
+    "nan_equal": false
+  }
+}

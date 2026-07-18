@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magnitude.dev/schemas/inference/parity/comparison.schema.json",
+  "title": "ICN primitive parity comparison",
+  "description": "The result of comparing reference and candidate evidence outside both engine processes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "category",
+    "primitive",
+    "recorded_at",
+    "reference",
+    "candidate",
+    "comparator",
+    "validity",
+    "status",
+    "mismatches",
+    "metrics",
+    "warnings"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": "1" },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^(correctness|performance)\\.[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+    },
+    "category": { "enum": ["correctness", "performance"] },
+    "primitive": { "type": "string", "pattern": "^[CP](?:[0-9]|1[0-3])$" },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "reference": { "$ref": "#/$defs/evidenceRef" },
+    "candidate": { "$ref": "#/$defs/evidenceRef" },
+    "comparator": {
+      "description": "The resolved comparator copied from the case so a comparison is self-describing.",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["exact", "structural", "numeric", "outcome-agreement", "performance-ratio"]
+        }
+      }
+    },
+    "validity": { "$ref": "#/$defs/validity" },
+    "status": { "enum": ["pass", "fail", "invalid", "skipped"] },
+    "mismatches": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/mismatch" }
+    },
+    "metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metric" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "invalid" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "validity": {
+            "type": "object",
+            "properties": { "valid": { "const": false } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "enum": ["pass", "fail"] } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "validity": {
+            "type": "object",
+            "properties": { "valid": { "const": true } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "pass" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": { "mismatches": { "type": "array", "maxItems": 0 } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "fail" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": { "mismatches": { "type": "array", "minItems": 1 } }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "producer_role"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "producer_role": { "enum": ["reference", "candidate"] }
+      }
+    },
+    "validity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "reasons", "matched_work"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "matched_work": { "type": "boolean" },
+        "engine_order": { "enum": ["reference-first", "candidate-first", "alternating-pairs", "not-applicable"] },
+        "contamination_warnings": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "mismatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "message"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+        },
+        "kind": {
+          "enum": ["missing", "unexpected", "type", "value", "numeric-tolerance", "outcome", "performance-bound"]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "reference": {},
+        "candidate": {},
+        "absolute_difference": { "type": "number", "minimum": 0 },
+        "relative_difference": { "type": "number", "minimum": 0 },
+        "tolerance": { "type": "number", "minimum": 0 }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "unit", "value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+        },
+        "unit": {
+          "enum": ["ns", "us", "ms", "s", "tokens/s", "bytes/s", "GB/s", "FLOP/s", "bytes", "count", "ratio"]
+        },
+        "value": { "type": "number" },
+        "reference_value": { "type": "number" },
+        "candidate_value": { "type": "number" }
+      }
+    }
+  }
+}

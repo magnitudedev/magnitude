@@ -124,7 +124,7 @@ const emitSchemaExpression = (
           ),
         ]
       ),
-    Object: ({ properties, additionalProperties }) => {
+    Object: ({ properties, propertyNames, additionalProperties }) => {
       const fields = properties
         .map(
           (property) =>
@@ -142,12 +142,16 @@ const emitSchemaExpression = (
       const struct = `S.Struct({${
         fields.length === 0 ? "" : `\n${fields}\n`
       }})`;
+      const key = Option.match(propertyNames, {
+        onNone: () => "S.String",
+        onSome: (schema) => emitSchemaExpression(schema, components, namespace),
+      });
       return AdditionalProperties.$match(additionalProperties, {
         Forbidden: () => struct,
         Allowed: () =>
-          `S.extend(${struct}, S.Record({ key: S.String, value: JsonValue }))`,
+          `S.extend(${struct}, S.Record({ key: ${key}, value: JsonValue }))`,
         Typed: ({ schema }) =>
-          `S.extend(${struct}, S.Record({ key: S.String, value: ${emitSchemaExpression(
+          `S.extend(${struct}, S.Record({ key: ${key}, value: ${emitSchemaExpression(
             schema,
             components,
             namespace
@@ -182,16 +186,28 @@ const emitType = (
     String: () => "string",
     Number: () => "number",
     Boolean: () => "boolean",
-    Array: ({ items }) => `ReadonlyArray<${emitType(items, components, decoded)}>`,
+    Array: ({ items }) =>
+      `ReadonlyArray<${emitType(items, components, decoded)}>`,
     Object: ({ properties, additionalProperties }) => {
       const fields = properties
-        .map(
-          (property) =>
-            property.required
-              ? `readonly ${quote(property.name)}: ${emitType(property.schema, components, decoded)}`
-              : decoded
-                ? `readonly ${quote(property.name)}: O.Option<${emitType(property.schema, components, decoded)}>`
-                : `readonly ${quote(property.name)}?: ${emitType(property.schema, components, decoded)}`
+        .map((property) =>
+          property.required
+            ? `readonly ${quote(property.name)}: ${emitType(
+                property.schema,
+                components,
+                decoded
+              )}`
+            : decoded
+            ? `readonly ${quote(property.name)}: O.Option<${emitType(
+                property.schema,
+                components,
+                decoded
+              )}>`
+            : `readonly ${quote(property.name)}?: ${emitType(
+                property.schema,
+                components,
+                decoded
+              )}`
         )
         .join("; ");
       const object = `{ ${fields} }`;
@@ -207,7 +223,9 @@ const emitType = (
       });
     },
     Union: ({ members }) =>
-      members.map((member) => `(${emitType(member, components, decoded)})`).join(" | "),
+      members
+        .map((member) => `(${emitType(member, components, decoded)})`)
+        .join(" | "),
     Ref: ({ target }) =>
       `${componentName(target, components)}${decoded ? "" : "Encoded"}`,
   });
@@ -229,8 +247,12 @@ const schemaReferences = (schema: SchemaNodeType): ReadonlySet<string> => {
       },
       Array: ({ items }) => visit(items),
       Union: ({ members }) => members.forEach(visit),
-      Object: ({ properties, additionalProperties }) => {
+      Object: ({ properties, propertyNames, additionalProperties }) => {
         properties.forEach(({ schema }) => visit(schema));
+        Option.match(propertyNames, {
+          onNone: () => undefined,
+          onSome: visit,
+        });
         AdditionalProperties.$match(additionalProperties, {
           Allowed: () => undefined,
           Forbidden: () => undefined,

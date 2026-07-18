@@ -1,0 +1,37 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.baseline.focused-upstream-tests",
+  "title": "Pinned upstream focused tests",
+  "description": "Qualify the exact pinned native source and selected backend with llama.cpp's focused primitive tests before interpreting differential evidence.",
+  "category": "correctness",
+  "primitive": "C0",
+  "adapter": "upstream-test",
+  "operation": "baseline.ctest",
+  "status": "active",
+  "tags": ["model-smoke", "native-qualification", "pr"],
+  "source": {
+    "kind": "upstream-defined",
+    "upstream_file": "tests/CMakeLists.txt",
+    "note": "The concrete test inventory is owned by upstream/targets.toml#focused-tests."
+  },
+  "inputs": {},
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": {
+      "ids": ["stories15m-q4-0"]
+    },
+    "capabilities": ["upstream-tests"]
+  },
+  "invocations": {
+    "reference": {
+      "kind": "upstream-test",
+      "target": "focused-tests"
+    }
+  },
+  "comparison": {
+    "kind": "outcome-agreement",
+    "accepted_classes": ["success"]
+  }
+}

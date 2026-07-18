@@ -1,0 +1,191 @@
+schema_version = 1
+default_targets = [
+  "focused-tests",
+  "backend-ops-perf",
+  "llama-bench",
+  "llama-batched-bench",
+  "llama-perplexity",
+  "oracle",
+]
+
+[[targets]]
+id = "focused-tests"
+kind = "ctest-suite"
+description = "Focused upstream correctness tests that qualify the pinned native baseline."
+requires_tests = true
+requires_tools = true
+requires_server = true
+cmake_targets = [
+  "test-tokenizer-0",
+  "test-sampling",
+  "test-backend-sampler",
+  "test-reasoning-budget",
+  "test-chat",
+  "test-chat-auto-parser",
+  "test-chat-peg-parser",
+  "test-chat-template",
+  "test-json-partial",
+  "test-regex-partial",
+  "test-json-schema-to-grammar",
+  "test-grammar-parser",
+  "test-grammar-integration",
+  "test-thread-safety",
+  "test-barrier",
+  "test-model-load-cancel",
+  "test-state-restore-fragmented",
+  "test-recurrent-state-rollback",
+  "test-save-load-state",
+  "test-quantize-fns",
+  "test-rope",
+  "test-llama-archs",
+  "test-gguf",
+  "test-mtmd-c-api",
+]
+artifacts = [
+  "test-tokenizer-0",
+  "test-sampling",
+  "test-backend-sampler",
+  "test-reasoning-budget",
+  "test-chat",
+  "test-chat-auto-parser",
+  "test-chat-peg-parser",
+  "test-chat-template",
+  "test-json-partial",
+  "test-regex-partial",
+  "test-json-schema-to-grammar",
+  "test-grammar-parser",
+  "test-grammar-integration",
+  "test-thread-safety",
+  "test-barrier",
+  "test-model-load-cancel",
+  "test-state-restore-fragmented",
+  "test-recurrent-state-rollback",
+  "test-save-load-state",
+  "test-quantize-fns",
+  "test-rope",
+  "test-llama-archs",
+  "test-gguf",
+  "test-mtmd-c-api",
+]
+ctest_names = [
+  "test-tokenizer-0-gemma-4",
+  "test-tokenizer-0-qwen35",
+  "test-sampling",
+  "test-backend-sampler",
+  "test-reasoning-budget",
+  "test-chat",
+  "test-chat-auto-parser",
+  "test-chat-peg-parser",
+  "test-chat-template",
+  "test-json-partial",
+  "test-regex-partial",
+  "test-json-schema-to-grammar",
+  "test-grammar-parser",
+  "test-grammar-integration",
+  "test-thread-safety",
+  "test-barrier",
+  "test-model-load-cancel",
+  "test-state-restore-fragmented",
+  "test-recurrent-state-rollback",
+  "test-save-load-state",
+  "test-quantize-fns",
+  "test-rope",
+  "test-llama-archs",
+  "test-gguf",
+  "test-mtmd-c-api",
+]
+ctest_setup_names = ["test-download-model"]
+ctest_model_fixtures = [
+  { setup_name = "test-download-model", model_id = "stories15m-q4-0", artifact_role = "model", destination = "tinyllamas/stories15M-q4_0.gguf" },
+]
+
+[[targets]]
+id = "backend-ops"
+kind = "ctest-suite"
+description = "Backend operation correctness/support executable; its perf mode is deliberately selected separately from PR tests."
+requires_tests = true
+requires_tools = false
+requires_server = false
+cmake_targets = ["test-backend-ops"]
+artifacts = ["test-backend-ops"]
+ctest_names = ["test-backend-ops"]
+ctest_setup_names = []
+ctest_model_fixtures = []
+
+[[targets]]
+id = "quantize-perf"
+kind = "upstream-tool"
+description = "Native quantize/dequantize micro-performance executable; excluded from the default build selection."
+requires_tests = true
+requires_tools = false
+requires_server = false
+cmake_targets = ["test-quantize-perf"]
+artifacts = ["test-quantize-perf"]
+ctest_names = ["test-quantize-perf"]
+ctest_setup_names = []
+ctest_model_fixtures = []
+
+[[targets]]
+id = "backend-ops-perf"
+kind = "upstream-tool"
+description = "Direct machine-readable backend operation performance qualification; deliberately separate from the backend-ops CTest route."
+requires_tests = true
+requires_tools = false
+requires_server = false
+cmake_targets = ["test-backend-ops"]
+artifacts = ["test-backend-ops"]
+ctest_names = []
+ctest_setup_names = []
+ctest_model_fixtures = []
+
+[[targets]]
+id = "llama-bench"
+kind = "upstream-tool"
+description = "Canonical prompt-processing and token-generation decode throughput tool."
+requires_tests = false
+requires_tools = true
+requires_server = false
+cmake_targets = ["llama-bench"]
+artifacts = ["llama-bench"]
+ctest_names = []
+ctest_setup_names = []
+ctest_model_fixtures = []
+
+[[targets]]
+id = "llama-batched-bench"
+kind = "upstream-tool"
+description = "Canonical explicit multi-sequence batch throughput tool."
+requires_tests = false
+requires_tools = true
+requires_server = false
+cmake_targets = ["llama-batched-bench"]
+artifacts = ["llama-batched-bench"]
+ctest_names = []
+ctest_setup_names = []
+ctest_model_fixtures = []
+
+[[targets]]
+id = "llama-perplexity"
+kind = "upstream-tool"
+description = "Canonical model likelihood and numerical-fidelity tool."
+requires_tests = false
+requires_tools = true
+requires_server = false
+cmake_targets = ["llama-perplexity"]
+artifacts = ["llama-perplexity"]
+ctest_names = []
+ctest_setup_names = []
+ctest_model_fixtures = []
+
+[[targets]]
+id = "oracle"
+kind = "oracle"
+description = "Thin JSON-lines native oracle for isolated primitives without official machine-readable tools."
+requires_tests = false
+requires_tools = false
+requires_server = false
+cmake_targets = ["llama-parity-oracle"]
+artifacts = ["llama-parity-oracle"]
+ctest_names = []
+ctest_setup_names = []
+ctest_model_fixtures = []

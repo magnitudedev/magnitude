@@ -19,7 +19,8 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [features]
-default = []
+default = ["mtmd"]
 cuda = ["icn-llamacpp/cuda"]
 metal = ["icn-llamacpp/metal"]
+mtmd = ["icn-llamacpp/mtmd"]
 vulkan = ["icn-llamacpp/vulkan"]

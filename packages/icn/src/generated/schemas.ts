@@ -13,6 +13,35 @@ export const JsonValue: S.Schema<JsonValue, JsonValue> = S.suspend(
     S.Union(S.String, S.Number, S.Boolean, S.Null, S.Array(JsonValue), S.Record({ key: S.String, value: JsonValue })),
 )
 
+export const AllowedToolRequest = S.Struct({
+  function: S.suspend((): S.Schema<FunctionNameRequest, FunctionNameRequestEncoded> => FunctionNameRequest),
+  type: S.suspend((): S.Schema<FunctionType, FunctionTypeEncoded> => FunctionType),
+})
+export type AllowedToolRequest = S.Schema.Type<typeof AllowedToolRequest>
+export type AllowedToolRequestEncoded = S.Schema.Encoded<typeof AllowedToolRequest>
+
+export const AllowedToolsChoiceRequest = S.Struct({
+  allowed_tools: S.suspend((): S.Schema<AllowedToolsRequest, AllowedToolsRequestEncoded> => AllowedToolsRequest),
+  type: S.suspend((): S.Schema<AllowedToolsType, AllowedToolsTypeEncoded> => AllowedToolsType),
+})
+export type AllowedToolsChoiceRequest = S.Schema.Type<typeof AllowedToolsChoiceRequest>
+export type AllowedToolsChoiceRequestEncoded = S.Schema.Encoded<typeof AllowedToolsChoiceRequest>
+
+export const AllowedToolsModeRequest = S.Union(S.Literal("auto"), S.Literal("required"))
+export type AllowedToolsModeRequest = S.Schema.Type<typeof AllowedToolsModeRequest>
+export type AllowedToolsModeRequestEncoded = S.Schema.Encoded<typeof AllowedToolsModeRequest>
+
+export const AllowedToolsRequest = S.Struct({
+  mode: S.suspend((): S.Schema<AllowedToolsModeRequest, AllowedToolsModeRequestEncoded> => AllowedToolsModeRequest),
+  tools: S.Array(S.suspend((): S.Schema<AllowedToolRequest, AllowedToolRequestEncoded> => AllowedToolRequest)),
+})
+export type AllowedToolsRequest = S.Schema.Type<typeof AllowedToolsRequest>
+export type AllowedToolsRequestEncoded = S.Schema.Encoded<typeof AllowedToolsRequest>
+
+export const AllowedToolsType = S.Literal("allowed_tools")
+export type AllowedToolsType = S.Schema.Type<typeof AllowedToolsType>
+export type AllowedToolsTypeEncoded = S.Schema.Encoded<typeof AllowedToolsType>
+
 export const ApiErrorBody = S.Struct({
   code: S.String,
   message: S.String,
@@ -21,12 +50,62 @@ export const ApiErrorBody = S.Struct({
 export type ApiErrorBody = S.Schema.Type<typeof ApiErrorBody>
 export type ApiErrorBodyEncoded = S.Schema.Encoded<typeof ApiErrorBody>
 
+export const ApplyTemplateRequest = S.Struct({
+  chat_template_kwargs: S.optionalWith(
+    S.extend(S.Struct({}), S.Record({ key: S.String, value: S.suspend((): S.Schema<Value, ValueEncoded> => Value) })),
+    { exact: true, as: "Option" },
+  ),
+  messages: S.Array(S.suspend((): S.Schema<ChatMessageRequest, ChatMessageRequestEncoded> => ChatMessageRequest)),
+  model: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  parallel_tool_calls: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+  response_format: S.optionalWith(
+    S.suspend((): S.Schema<ResponseFormatRequest, ResponseFormatRequestEncoded> => ResponseFormatRequest),
+    { exact: true, as: "Option" },
+  ),
+  tool_choice: S.optionalWith(
+    S.suspend((): S.Schema<ToolChoiceRequest, ToolChoiceRequestEncoded> => ToolChoiceRequest),
+    { exact: true, as: "Option" },
+  ),
+  tools: S.optionalWith(S.Array(S.suspend((): S.Schema<ChatToolRequest, ChatToolRequestEncoded> => ChatToolRequest)), {
+    exact: true,
+    as: "Option",
+  }),
+})
+export type ApplyTemplateRequest = S.Schema.Type<typeof ApplyTemplateRequest>
+export type ApplyTemplateRequestEncoded = S.Schema.Encoded<typeof ApplyTemplateRequest>
+
+export const ApplyTemplateResponse = S.Struct({
+  additional_stops: S.Array(S.String),
+  generation_prompt: S.String,
+  grammar: S.String,
+  grammar_lazy: S.Boolean,
+  grammar_triggers: S.Array(
+    S.suspend((): S.Schema<GrammarTriggerResponse, GrammarTriggerResponseEncoded> => GrammarTriggerResponse),
+  ),
+  preserved_tokens: S.Array(S.String),
+  prompt: S.String,
+  supports_thinking: S.Boolean,
+  template_fingerprint: S.String,
+  thinking_end_tag: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  thinking_start_tag: S.optionalWith(S.String, { exact: true, as: "Option" }),
+})
+export type ApplyTemplateResponse = S.Schema.Type<typeof ApplyTemplateResponse>
+export type ApplyTemplateResponseEncoded = S.Schema.Encoded<typeof ApplyTemplateResponse>
+
 export const ChatCompletionChunk = S.Struct({
   choices: S.Array(S.suspend((): S.Schema<ChunkChoice, ChunkChoiceEncoded> => ChunkChoice)),
   created: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  error: S.optionalWith(
+    S.suspend((): S.Schema<ApiErrorBody, ApiErrorBodyEncoded> => ApiErrorBody),
+    { exact: true, as: "Option" },
+  ),
   id: S.String,
   model: S.String,
   object: S.String,
+  timings: S.optionalWith(
+    S.suspend((): S.Schema<Timings, TimingsEncoded> => Timings),
+    { exact: true, as: "Option" },
+  ),
   usage: S.optionalWith(
     S.suspend((): S.Schema<Usage, UsageEncoded> => Usage),
     { exact: true, as: "Option" },
@@ -36,6 +115,10 @@ export type ChatCompletionChunk = S.Schema.Type<typeof ChatCompletionChunk>
 export type ChatCompletionChunkEncoded = S.Schema.Encoded<typeof ChatCompletionChunk>
 
 export const ChatCompletionRequest = S.Struct({
+  chat_template_kwargs: S.optionalWith(
+    S.extend(S.Struct({}), S.Record({ key: S.String, value: S.suspend((): S.Schema<Value, ValueEncoded> => Value) })),
+    { exact: true, as: "Option" },
+  ),
   max_completion_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), {
     exact: true,
     as: "Option",
@@ -43,24 +126,126 @@ export const ChatCompletionRequest = S.Struct({
   max_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   messages: S.Array(S.suspend((): S.Schema<ChatMessageRequest, ChatMessageRequestEncoded> => ChatMessageRequest)),
   model: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  parallel_tool_calls: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+  reasoning_effort: S.optionalWith(
+    S.suspend((): S.Schema<ReasoningEffortRequest, ReasoningEffortRequestEncoded> => ReasoningEffortRequest),
+    { exact: true, as: "Option" },
+  ),
+  response_format: S.optionalWith(
+    S.suspend((): S.Schema<ResponseFormatRequest, ResponseFormatRequestEncoded> => ResponseFormatRequest),
+    { exact: true, as: "Option" },
+  ),
   seed: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  stop: S.optionalWith(
+    S.suspend((): S.Schema<StopRequest, StopRequestEncoded> => StopRequest),
+    { exact: true, as: "Option" },
+  ),
   stream: S.Boolean,
   stream_options: S.optionalWith(
     S.suspend((): S.Schema<StreamOptions, StreamOptionsEncoded> => StreamOptions),
     { exact: true, as: "Option" },
   ),
   temperature: S.optionalWith(S.Number, { exact: true, as: "Option" }),
+  thinking_budget_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), {
+    exact: true,
+    as: "Option",
+  }),
+  tool_choice: S.optionalWith(
+    S.suspend((): S.Schema<ToolChoiceRequest, ToolChoiceRequestEncoded> => ToolChoiceRequest),
+    { exact: true, as: "Option" },
+  ),
+  tools: S.optionalWith(S.Array(S.suspend((): S.Schema<ChatToolRequest, ChatToolRequestEncoded> => ChatToolRequest)), {
+    exact: true,
+    as: "Option",
+  }),
   top_p: S.optionalWith(S.Number, { exact: true, as: "Option" }),
 })
 export type ChatCompletionRequest = S.Schema.Type<typeof ChatCompletionRequest>
 export type ChatCompletionRequestEncoded = S.Schema.Encoded<typeof ChatCompletionRequest>
 
-export const ChatMessageRequest = S.Struct({
-  content: S.String,
-  role: S.String,
-})
+export const ChatContentPartRequest = S.Union(
+  S.extend(
+    S.Struct({
+      text: S.String,
+      type: S.Literal("text"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      image_url: S.suspend((): S.Schema<ImageUrlRequest, ImageUrlRequestEncoded> => ImageUrlRequest),
+      type: S.Literal("image_url"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ChatContentPartRequest = S.Schema.Type<typeof ChatContentPartRequest>
+export type ChatContentPartRequestEncoded = S.Schema.Encoded<typeof ChatContentPartRequest>
+
+export const ChatContentRequest = S.Union(
+  S.String,
+  S.Array(S.suspend((): S.Schema<ChatContentPartRequest, ChatContentPartRequestEncoded> => ChatContentPartRequest)),
+)
+export type ChatContentRequest = S.Schema.Type<typeof ChatContentRequest>
+export type ChatContentRequestEncoded = S.Schema.Encoded<typeof ChatContentRequest>
+
+export const ChatMessageRequest = S.Union(
+  S.extend(
+    S.Struct({
+      content: S.String,
+      role: S.Literal("system"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      content: S.suspend((): S.Schema<ChatContentRequest, ChatContentRequestEncoded> => ChatContentRequest),
+      role: S.Literal("user"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      content: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+      reasoning_content: S.optionalWith(S.String, { exact: true, as: "Option" }),
+      role: S.Literal("assistant"),
+      tool_calls: S.optionalWith(
+        S.Array(S.suspend((): S.Schema<ChatToolCallRequest, ChatToolCallRequestEncoded> => ChatToolCallRequest)),
+        { exact: true, as: "Option" },
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      content: S.suspend((): S.Schema<ChatContentRequest, ChatContentRequestEncoded> => ChatContentRequest),
+      role: S.Literal("tool"),
+      tool_call_id: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
 export type ChatMessageRequest = S.Schema.Type<typeof ChatMessageRequest>
 export type ChatMessageRequestEncoded = S.Schema.Encoded<typeof ChatMessageRequest>
+
+export const ChatToolCallRequest = S.Struct({
+  function: S.suspend(
+    (): S.Schema<NamedFunctionCallRequest, NamedFunctionCallRequestEncoded> => NamedFunctionCallRequest,
+  ),
+  id: S.String,
+  type: S.suspend((): S.Schema<FunctionType, FunctionTypeEncoded> => FunctionType),
+})
+export type ChatToolCallRequest = S.Schema.Type<typeof ChatToolCallRequest>
+export type ChatToolCallRequestEncoded = S.Schema.Encoded<typeof ChatToolCallRequest>
+
+export const ChatToolRequest = S.Struct({
+  function: S.suspend(
+    (): S.Schema<FunctionDefinitionRequest, FunctionDefinitionRequestEncoded> => FunctionDefinitionRequest,
+  ),
+  type: S.suspend((): S.Schema<FunctionType, FunctionTypeEncoded> => FunctionType),
+})
+export type ChatToolRequest = S.Schema.Type<typeof ChatToolRequest>
+export type ChatToolRequestEncoded = S.Schema.Encoded<typeof ChatToolRequest>
 
 export const ChunkChoice = S.Struct({
   delta: S.suspend((): S.Schema<ChunkDelta, ChunkDeltaEncoded> => ChunkDelta),
@@ -72,10 +257,40 @@ export type ChunkChoiceEncoded = S.Schema.Encoded<typeof ChunkChoice>
 
 export const ChunkDelta = S.Struct({
   content: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  reasoning_content: S.optionalWith(S.String, { exact: true, as: "Option" }),
   role: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  tool_calls: S.optionalWith(S.Array(S.suspend((): S.Schema<ChunkToolCall, ChunkToolCallEncoded> => ChunkToolCall)), {
+    exact: true,
+    as: "Option",
+  }),
 })
 export type ChunkDelta = S.Schema.Type<typeof ChunkDelta>
 export type ChunkDeltaEncoded = S.Schema.Encoded<typeof ChunkDelta>
+
+export const ChunkFunctionDelta = S.Struct({
+  arguments: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  name: S.optionalWith(S.String, { exact: true, as: "Option" }),
+})
+export type ChunkFunctionDelta = S.Schema.Type<typeof ChunkFunctionDelta>
+export type ChunkFunctionDeltaEncoded = S.Schema.Encoded<typeof ChunkFunctionDelta>
+
+export const ChunkToolCall = S.Struct({
+  function: S.optionalWith(
+    S.suspend((): S.Schema<ChunkFunctionDelta, ChunkFunctionDeltaEncoded> => ChunkFunctionDelta),
+    { exact: true, as: "Option" },
+  ),
+  id: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  index: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  type: S.optionalWith(S.String, { exact: true, as: "Option" }),
+})
+export type ChunkToolCall = S.Schema.Type<typeof ChunkToolCall>
+export type ChunkToolCallEncoded = S.Schema.Encoded<typeof ChunkToolCall>
+
+export const DefaultGenerationSettings = S.Struct({
+  n_ctx: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type DefaultGenerationSettings = S.Schema.Type<typeof DefaultGenerationSettings>
+export type DefaultGenerationSettingsEncoded = S.Schema.Encoded<typeof DefaultGenerationSettings>
 
 export const ErrorResponse = S.Struct({
   error: S.suspend((): S.Schema<ApiErrorBody, ApiErrorBodyEncoded> => ApiErrorBody),
@@ -83,12 +298,93 @@ export const ErrorResponse = S.Struct({
 export type ErrorResponse = S.Schema.Type<typeof ErrorResponse>
 export type ErrorResponseEncoded = S.Schema.Encoded<typeof ErrorResponse>
 
+export const FunctionDefinitionRequest = S.Struct({
+  description: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  name: S.String,
+  parameters: S.suspend((): S.Schema<Value, ValueEncoded> => Value),
+})
+export type FunctionDefinitionRequest = S.Schema.Type<typeof FunctionDefinitionRequest>
+export type FunctionDefinitionRequestEncoded = S.Schema.Encoded<typeof FunctionDefinitionRequest>
+
+export const FunctionNameRequest = S.Struct({
+  name: S.String,
+})
+export type FunctionNameRequest = S.Schema.Type<typeof FunctionNameRequest>
+export type FunctionNameRequestEncoded = S.Schema.Encoded<typeof FunctionNameRequest>
+
+export const FunctionToolChoiceRequest = S.Struct({
+  function: S.suspend((): S.Schema<FunctionNameRequest, FunctionNameRequestEncoded> => FunctionNameRequest),
+  type: S.suspend((): S.Schema<FunctionType, FunctionTypeEncoded> => FunctionType),
+})
+export type FunctionToolChoiceRequest = S.Schema.Type<typeof FunctionToolChoiceRequest>
+export type FunctionToolChoiceRequestEncoded = S.Schema.Encoded<typeof FunctionToolChoiceRequest>
+
+export const FunctionType = S.Literal("function")
+export type FunctionType = S.Schema.Type<typeof FunctionType>
+export type FunctionTypeEncoded = S.Schema.Encoded<typeof FunctionType>
+
+export const GrammarTriggerResponse = S.Union(
+  S.extend(
+    S.Struct({
+      token: S.Number.pipe(S.int()),
+      type: S.Literal("token"),
+      value: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("word"),
+      value: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("pattern"),
+      value: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("pattern_full"),
+      value: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type GrammarTriggerResponse = S.Schema.Type<typeof GrammarTriggerResponse>
+export type GrammarTriggerResponseEncoded = S.Schema.Encoded<typeof GrammarTriggerResponse>
+
 export const HealthResponse = S.Struct({
   status: S.String,
   version: S.String,
 })
 export type HealthResponse = S.Schema.Type<typeof HealthResponse>
 export type HealthResponseEncoded = S.Schema.Encoded<typeof HealthResponse>
+
+export const ImageUrlRequest = S.Struct({
+  url: S.String,
+})
+export type ImageUrlRequest = S.Schema.Type<typeof ImageUrlRequest>
+export type ImageUrlRequestEncoded = S.Schema.Encoded<typeof ImageUrlRequest>
+
+export const JsonSchemaRequest = S.Struct({
+  name: S.String,
+  schema: S.suspend((): S.Schema<Value, ValueEncoded> => Value),
+  strict: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+})
+export type JsonSchemaRequest = S.Schema.Type<typeof JsonSchemaRequest>
+export type JsonSchemaRequestEncoded = S.Schema.Encoded<typeof JsonSchemaRequest>
+
+export const Modalities = S.Struct({
+  audio: S.Boolean,
+  video: S.Boolean,
+  vision: S.Boolean,
+})
+export type Modalities = S.Schema.Type<typeof Modalities>
+export type ModalitiesEncoded = S.Schema.Encoded<typeof Modalities>
 
 export const Model = S.Struct({
   id: S.String,
@@ -105,11 +401,124 @@ export const ModelList = S.Struct({
 export type ModelList = S.Schema.Type<typeof ModelList>
 export type ModelListEncoded = S.Schema.Encoded<typeof ModelList>
 
+export const NamedFunctionCallRequest = S.Struct({
+  arguments: S.String,
+  name: S.String,
+})
+export type NamedFunctionCallRequest = S.Schema.Type<typeof NamedFunctionCallRequest>
+export type NamedFunctionCallRequestEncoded = S.Schema.Encoded<typeof NamedFunctionCallRequest>
+
+export const PropsResponse = S.Struct({
+  build_info: S.String,
+  chat_template: S.String,
+  default_generation_settings: S.suspend(
+    (): S.Schema<DefaultGenerationSettings, DefaultGenerationSettingsEncoded> => DefaultGenerationSettings,
+  ),
+  general_architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  general_name: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  modalities: S.suspend((): S.Schema<Modalities, ModalitiesEncoded> => Modalities),
+  model_path: S.String,
+  model_size_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  sliding_window_tokens: S.Number.pipe(S.int()),
+  template_capabilities: S.suspend(
+    (): S.Schema<TemplateCapabilitiesResponse, TemplateCapabilitiesResponseEncoded> => TemplateCapabilitiesResponse,
+  ),
+  template_fingerprint: S.String,
+  training_context_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type PropsResponse = S.Schema.Type<typeof PropsResponse>
+export type PropsResponseEncoded = S.Schema.Encoded<typeof PropsResponse>
+
+export const ReasoningEffortRequest = S.Union(
+  S.Literal("none"),
+  S.Literal("low"),
+  S.Literal("medium"),
+  S.Literal("high"),
+)
+export type ReasoningEffortRequest = S.Schema.Type<typeof ReasoningEffortRequest>
+export type ReasoningEffortRequestEncoded = S.Schema.Encoded<typeof ReasoningEffortRequest>
+
+export const ResponseFormatRequest = S.Union(
+  S.extend(
+    S.Struct({
+      type: S.Literal("text"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("json_object"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      grammar: S.String,
+      type: S.Literal("grammar"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      json_schema: S.suspend((): S.Schema<JsonSchemaRequest, JsonSchemaRequestEncoded> => JsonSchemaRequest),
+      type: S.Literal("json_schema"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ResponseFormatRequest = S.Schema.Type<typeof ResponseFormatRequest>
+export type ResponseFormatRequestEncoded = S.Schema.Encoded<typeof ResponseFormatRequest>
+
+export const StopRequest = S.Union(S.String, S.Array(S.String))
+export type StopRequest = S.Schema.Type<typeof StopRequest>
+export type StopRequestEncoded = S.Schema.Encoded<typeof StopRequest>
+
 export const StreamOptions = S.Struct({
   include_usage: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
 })
 export type StreamOptions = S.Schema.Type<typeof StreamOptions>
 export type StreamOptionsEncoded = S.Schema.Encoded<typeof StreamOptions>
+
+export const TemplateCapabilitiesResponse = S.Struct({
+  enable_thinking: S.Boolean,
+  object_arguments: S.Boolean,
+  parallel_tool_calls: S.Boolean,
+  preserve_reasoning: S.Boolean,
+  string_content: S.Boolean,
+  system_role: S.Boolean,
+  tool_calls: S.Boolean,
+  tools: S.Boolean,
+  typed_content: S.Boolean,
+})
+export type TemplateCapabilitiesResponse = S.Schema.Type<typeof TemplateCapabilitiesResponse>
+export type TemplateCapabilitiesResponseEncoded = S.Schema.Encoded<typeof TemplateCapabilitiesResponse>
+
+export const Timings = S.Struct({
+  parser_ms: S.Number,
+  predicted_ms: S.Number,
+  predicted_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  predicted_per_second: S.Number,
+  prompt_ms: S.Number,
+  prompt_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  prompt_per_second: S.Number,
+  queue_ms: S.Number,
+  sampler_ms: S.Number,
+  time_to_first_token_ms: S.Number,
+})
+export type Timings = S.Schema.Type<typeof Timings>
+export type TimingsEncoded = S.Schema.Encoded<typeof Timings>
+
+export const ToolChoiceModeRequest = S.Union(S.Literal("none"), S.Literal("auto"), S.Literal("required"))
+export type ToolChoiceModeRequest = S.Schema.Type<typeof ToolChoiceModeRequest>
+export type ToolChoiceModeRequestEncoded = S.Schema.Encoded<typeof ToolChoiceModeRequest>
+
+export const ToolChoiceRequest = S.Union(
+  S.suspend((): S.Schema<ToolChoiceModeRequest, ToolChoiceModeRequestEncoded> => ToolChoiceModeRequest),
+  S.suspend((): S.Schema<FunctionToolChoiceRequest, FunctionToolChoiceRequestEncoded> => FunctionToolChoiceRequest),
+  S.suspend((): S.Schema<AllowedToolsChoiceRequest, AllowedToolsChoiceRequestEncoded> => AllowedToolsChoiceRequest),
+)
+export type ToolChoiceRequest = S.Schema.Type<typeof ToolChoiceRequest>
+export type ToolChoiceRequestEncoded = S.Schema.Encoded<typeof ToolChoiceRequest>
 
 export const Usage = S.Struct({
   completion_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -118,3 +527,7 @@ export const Usage = S.Struct({
 })
 export type Usage = S.Schema.Type<typeof Usage>
 export type UsageEncoded = S.Schema.Encoded<typeof Usage>
+
+export const Value = JsonValue
+export type Value = S.Schema.Type<typeof Value>
+export type ValueEncoded = S.Schema.Encoded<typeof Value>

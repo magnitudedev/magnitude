@@ -1,0 +1,34 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.tokenizer.token-to-piece-unicode-bytes",
+  "title": "Exact per-token piece bytes",
+  "description": "Convert a token vector scoped to the pinned model into individual piece-byte arrays through the production token-to-piece binding, then compare each piece and their concatenation exactly without assuming valid UTF-8 at intermediate boundaries.",
+  "category": "correctness",
+  "primitive": "C3",
+  "adapter": "differential",
+  "operation": "tokenizer.token-to-piece",
+  "status": "active",
+  "tags": ["model-smoke", "oracle-smoke", "unicode"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-tokenizer-0.cpp",
+    "note": "The token IDs are scoped to the exact stories15m-q4-0 vocabulary and were produced by the companion tokenize vector. The claim is per-token conversion through the public model API, not a composite bulk-detokenization helper."
+  },
+  "inputs": {
+    "tokens": [1, 15043, 29892, 29871, 30793, 30967, 813, 274, 28059, 813, 29871, 31494, 29991],
+    "special": true,
+    "lstrip": null
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "ids": ["stories15m-q4-0"] },
+    "capabilities": ["tokenizer.token-to-piece"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "tokenizer.token-to-piece" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "tokenizer.token-to-piece" }
+  },
+  "comparison": { "kind": "exact" }
+}

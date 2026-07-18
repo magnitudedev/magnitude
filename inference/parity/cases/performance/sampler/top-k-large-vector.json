@@ -1,0 +1,51 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "performance.sampler.top-k-large-vector",
+  "title": "Top-k sampler wrapper micro-performance",
+  "description": "Apply and reset top-k over the same deterministic 131072-candidate vector on both sides; model decode is absent.",
+  "category": "performance",
+  "primitive": "P6",
+  "adapter": "differential",
+  "operation": "sampler.bench",
+  "status": "active",
+  "tags": ["model-free", "same-work"],
+  "prerequisites": ["correctness.sampler.top-k-three"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-sampling.cpp",
+    "upstream_case": "test_perf top_k(40)"
+  },
+  "inputs": {
+    "candidate_count": 131072,
+    "candidate_generator": { "kind": "seeded-uniform-logits", "seed": 0, "minimum": -1.0, "maximum": 1.0 },
+    "sampler": { "type": "top-k", "k": 40 },
+    "warmup_iterations": 1,
+    "iterations": 32
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": null,
+    "capabilities": ["sampler.top-k"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "sampler.bench" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "sampler.bench" }
+  },
+  "comparison": {
+    "kind": "performance-ratio",
+    "metric": "duration",
+    "statistic": "median",
+    "maximum_ratio": 1.03,
+    "direction": "candidate-over-reference",
+    "exact_output_paths": [""]
+  },
+  "timing": {
+    "included": ["candidate copy", "sampler apply", "sampler reset", "deterministic semantic-result fold"],
+    "excluded": ["candidate generation", "sampler construction", "result serialization"],
+    "warmup_iterations": 1,
+    "measurement_iterations": 32,
+    "synchronize": false
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.config.context-defaults",
+  "title": "Effective context configuration",
+  "description": "Construct one context from neutral parameters and compare every publicly observable effective native value without decoding.",
+  "category": "correctness",
+  "primitive": "C1",
+  "adapter": "differential",
+  "operation": "configuration.inspect",
+  "status": "active",
+  "tags": ["model-smoke"],
+  "source": {
+    "kind": "magnitude-defined",
+    "note": "The projection contains only live values publicly readable from both constructed contexts; unobservable requested fields are excluded."
+  },
+  "inputs": {
+    "context": {
+      "context_tokens": 256,
+      "batch_tokens": 128,
+      "micro_batch_tokens": 128,
+      "sequences": 1,
+      "threads": 1,
+      "batch_threads": 1,
+      "embeddings": false,
+      "offload_kqv": true
+    }
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["configuration-readback"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "configuration.inspect" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "configuration.inspect" }
+  },
+  "comparison": { "kind": "structural" }
+}

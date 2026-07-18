@@ -1,0 +1,51 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.decode.single-batch-logits",
+  "title": "Explicit single-sequence decode plan",
+  "description": "Submit an explicit token, position, sequence-ID, and logits plan to matched CPU-resident contexts and compare the observed decode status and selected logits without sampling.",
+  "category": "correctness",
+  "primitive": "C9",
+  "adapter": "differential",
+  "operation": "decode.execute-plan",
+  "status": "active",
+  "tags": ["model-smoke"],
+  "source": {
+    "kind": "magnitude-defined",
+    "note": "The batch plan is explicit; no tokenization, sampling, output conversion, or request scheduler participates."
+  },
+  "inputs": {
+    "nGpuLayers": 0,
+    "useMmap": true,
+    "useMlock": false,
+    "offloadKqv": false,
+    "operationOffload": false,
+    "flashAttention": "off",
+    "threads": 1,
+    "batchThreads": 1,
+    "context_tokens": 32,
+    "batch": [
+      { "token": 1, "position": 0, "sequence_ids": [0], "request_logits": false },
+      { "token": 2, "position": 1, "sequence_ids": [0], "request_logits": true }
+    ],
+    "logit_indices": [0, 1, 2, 3]
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["batch-decode", "logit-readback"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "decode.execute-plan" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "decode.execute-plan" }
+  },
+  "comparison": {
+    "kind": "numeric",
+    "paths": ["/logits"],
+    "exact_paths": ["/status"],
+    "absolute_tolerance": 0.00001,
+    "relative_tolerance": 0.00001,
+    "nan_equal": false
+  }
+}

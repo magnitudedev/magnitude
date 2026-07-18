@@ -3,6 +3,14 @@ import * as HttpApiSchema from "@effect/platform/HttpApiSchema"
 import * as S from "effect/Schema"
 import * as Schemas from "./schemas.js"
 
+export const applyChatTemplateOperation = {
+  operationId: "applyChatTemplate",
+  transport: "http",
+  method: "POST",
+  path: "/v1/apply-template",
+  group: "chat",
+} as const
+
 export const createChatCompletionOperation = {
   operationId: "createChatCompletion",
   transport: "sse",
@@ -23,6 +31,14 @@ export const createChatCompletionOperation = {
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     },
   ],
+} as const
+
+export const getModelPropertiesOperation = {
+  operationId: "getModelProperties",
+  transport: "http",
+  method: "GET",
+  path: "/v1/props",
+  group: "models",
 } as const
 
 export const healthOperation = {

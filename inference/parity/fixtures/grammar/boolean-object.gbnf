@@ -1,0 +1,3 @@
+root ::= "{" ws "\"answer\"" ws ":" ws boolean ws "}"
+boolean ::= "true" | "false"
+ws ::= [ \t\n\r]*

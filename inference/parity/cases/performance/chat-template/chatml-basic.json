@@ -1,0 +1,52 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "performance.chat-template.chatml-basic",
+  "title": "Common-chat preparation micro-performance",
+  "description": "Repeatedly prepare the fixed ChatML request through common-chat with handles constructed outside the timer; tokenization and generation are absent.",
+  "category": "performance",
+  "primitive": "P7",
+  "adapter": "differential",
+  "operation": "chat-template.bench",
+  "status": "active",
+  "tags": ["model-free", "same-work"],
+  "prerequisites": ["correctness.chat-template.chatml-basic"],
+  "source": {
+    "kind": "magnitude-defined",
+    "note": "Custom microbenchmark justified by the binding boundary around common-chat preparation."
+  },
+  "inputs": {
+    "template_fixture": "fixtures/templates/chatml-basic.jinja",
+    "input_fixture": "fixtures/templates/chatml-basic-input.json",
+    "warmup_iterations": 10,
+    "iterations": 1000
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [
+      { "id": "chatml-basic-template", "path": "fixtures/templates/chatml-basic.jinja", "sha256": "f26fd6284d6bc05d057a4b5800e2a268a85df6546edf484d979e23a51ed7886d" },
+      { "id": "chatml-basic-input", "path": "fixtures/templates/chatml-basic-input.json", "sha256": "31c9ce9978be560f49d12179b4600fa23c8fff9948a4412beab006671b188fba" }
+    ],
+    "model": null,
+    "capabilities": ["common-chat", "jinja"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "chat-template.bench" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "chat-template.bench" }
+  },
+  "comparison": {
+    "kind": "performance-ratio",
+    "metric": "duration",
+    "statistic": "median",
+    "maximum_ratio": 1.03,
+    "direction": "candidate-over-reference",
+    "exact_output_paths": [""]
+  },
+  "timing": {
+    "included": ["neutral request conversion", "common-chat preparation", "semantic result extraction"],
+    "excluded": ["template handle construction", "tokenization", "generation", "result serialization"],
+    "warmup_iterations": 10,
+    "measurement_iterations": 1000,
+    "synchronize": false
+  }
+}

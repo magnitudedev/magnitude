@@ -1,0 +1,52 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.grammar.json-schema-boolean-object",
+  "title": "JSON Schema to native grammar conversion",
+  "description": "Convert one closed boolean-object JSON Schema through the production common helper's default grammar selection and compare the exact normalized result.",
+  "category": "correctness",
+  "primitive": "C5",
+  "adapter": "differential",
+  "operation": "grammar.json-schema-to-grammar",
+  "status": "active",
+  "tags": ["model-free", "oracle-smoke", "upstream-vector"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-json-schema-to-grammar.cpp",
+    "note": "The case is intentionally small; upstream focused tests provide broader schema coverage."
+  },
+  "inputs": {
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["answer"],
+      "properties": {
+        "answer": { "type": "boolean" }
+      }
+    },
+    "forceGbnf": false
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": null,
+    "capabilities": ["json-schema-to-grammar"]
+  },
+  "invocations": {
+    "reference": {
+      "kind": "native-oracle",
+      "target": "oracle",
+      "operation": "grammar.json-schema-to-grammar"
+    },
+    "candidate": {
+      "kind": "icn-probe",
+      "target": "icn-probe",
+      "operation": "grammar.json-schema-to-grammar"
+    }
+  },
+  "comparison": {
+    "kind": "exact",
+    "paths": ["/grammar"]
+  }
+}

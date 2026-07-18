@@ -1,0 +1,41 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.mtmd.preprocess-structure",
+  "title": "Multimodal preprocessing structure",
+  "description": "Compare projector capabilities, media preprocessing structure, and positions without generating a chat response.",
+  "category": "correctness",
+  "primitive": "C12",
+  "adapter": "differential",
+  "operation": "mtmd.preprocess",
+  "status": "disabled",
+  "disabled_reason": "No immutable compatible model/projector/media artifact tuple is registered, the parity producers do not yet have a qualified MTMD build feature, and the runner cannot yet resolve the three distinct artifact roles into each invocation.",
+  "tags": ["artifact-gap", "multimodal", "oracle-gap", "probe-gap"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-mtmd-c-api.c",
+    "note": "Enable only after closing the artifact-tuple, producer build-feature, and runner role-path gaps together."
+  },
+  "inputs": {
+    "operation": "preprocess"
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["multimodal", "projector"] },
+    "capabilities": ["mtmd-preprocess"],
+    "architecture_tags": ["multimodal"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "mtmd.preprocess" },
+    "candidate": { "kind": "icn-probe", "operation": "mtmd.preprocess" }
+  },
+  "comparison": {
+    "kind": "numeric",
+    "paths": ["/numeric"],
+    "exact_paths": ["/capabilities", "/chunks", "/positions", "/outcome"],
+    "absolute_tolerance": 0.00001,
+    "relative_tolerance": 0.00001,
+    "nan_equal": false
+  }
+}

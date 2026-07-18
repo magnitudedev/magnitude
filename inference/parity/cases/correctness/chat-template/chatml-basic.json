@@ -1,0 +1,53 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.chat-template.chatml-basic",
+  "title": "Standalone ChatML template rendering",
+  "description": "Render a fixed normalized conversation through one common-chat preparation and compare only its prompt representation; capability discovery, parsing, model decode, and tokenization are separate properties.",
+  "category": "correctness",
+  "primitive": "C4",
+  "adapter": "differential",
+  "operation": "chat-template.render",
+  "status": "active",
+  "tags": ["model-free", "oracle-smoke", "unicode", "upstream-vector"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-chat-template.cpp",
+    "upstream_case": "chatml"
+  },
+  "inputs": {
+    "template": "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}",
+    "bosToken": "<s>",
+    "eosToken": "</s>",
+    "addGenerationPrompt": true,
+    "messages": [
+      { "role": "system", "content": "Answer plainly." },
+      { "role": "user", "content": "Say hello to 世界." },
+      { "role": "assistant", "content": "Hello, 世界." },
+      { "role": "user", "content": "Now say goodbye." }
+    ],
+    "tools": []
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": null,
+    "capabilities": ["common-chat", "jinja"]
+  },
+  "invocations": {
+    "reference": {
+      "kind": "native-oracle",
+      "target": "oracle",
+      "operation": "chat-template.render"
+    },
+    "candidate": {
+      "kind": "icn-probe",
+      "target": "icn-probe",
+      "operation": "chat-template.render"
+    }
+  },
+  "comparison": {
+    "kind": "exact",
+    "paths": ["/format", "/prompt", "/generationPrompt", "/messageSpans"]
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.fidelity.tiny-corpus-perplexity",
+  "title": "Tiny-corpus likelihood fidelity",
+  "description": "Score a fixed local corpus with identical windowing and compare likelihood statistics without sampling or generated prose.",
+  "category": "correctness",
+  "primitive": "C13",
+  "adapter": "upstream-tool",
+  "operation": "model.score-perplexity",
+  "status": "disabled",
+  "disabled_reason": "ICN does not expose a production corpus-scoring API; a parity-only perplexity loop would validate benchmark scaffolding rather than the production inference boundary.",
+  "tags": ["model-smoke", "production-api-gap"],
+  "source": {
+    "kind": "upstream-defined",
+    "upstream_file": "tools/perplexity/perplexity.cpp",
+    "note": "The official tool can serve as a reference only after ICN exposes a production scoring API with an explicit corpus-windowing contract."
+  },
+  "inputs": {
+    "corpus": "fixtures/corpora/tiny-fidelity.txt",
+    "context_tokens": 128,
+    "batch_tokens": 128,
+    "micro_batch_tokens": 128,
+    "stride_tokens": 0,
+    "minimum_corpus_tokens": 256
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [
+      {
+        "id": "tiny-fidelity-corpus",
+        "path": "fixtures/corpora/tiny-fidelity.txt",
+        "sha256": "beb8d8e3de96eba859b2940ef1e21046813be8738c661434a7d47a5638aaff13"
+      }
+    ],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["logit-scoring"]
+  },
+  "invocations": {
+    "reference": { "kind": "upstream-tool", "target": "llama-perplexity", "operation": "model.score-perplexity" },
+    "candidate": { "kind": "icn-probe", "operation": "model.score-perplexity" }
+  },
+  "comparison": {
+    "kind": "numeric",
+    "paths": ["/perplexity", "/uncertainty"],
+    "absolute_tolerance": 0.00001,
+    "relative_tolerance": 0.00001,
+    "nan_equal": false
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.reasoning-budget.controllable-force",
+  "title": "Controllable reasoning-budget force sequence",
+  "description": "Construct the production CommonSampler with model-tokenized reasoning tags, exercise its public force and last-token observations around one complete forced ending sequence, and compare those bounded observations exactly.",
+  "category": "correctness",
+  "primitive": "C7",
+  "adapter": "differential",
+  "operation": "reasoning-budget.inspect",
+  "status": "active",
+  "tags": ["model-smoke", "oracle-smoke", "upstream-derived"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-reasoning-budget.cpp",
+    "upstream_case": "controllable forcing",
+    "note": "The parity boundary deliberately exposes only public CommonSampler behavior: model-tokenized configuration, force_reasoning_end return values, and last_token. It does not inspect the standalone sampler's internal state."
+  },
+  "inputs": {
+    "budgetTokens": 2,
+    "startTag": "<think>",
+    "endTag": "</think>",
+    "forcedMessage": "\n",
+    "controllable": true
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "ids": ["stories15m-q4-0"] },
+    "capabilities": ["reasoning-budget.inspect"]
+  },
+  "invocations": {
+    "reference": {
+      "kind": "native-oracle",
+      "target": "oracle",
+      "operation": "reasoning-budget.inspect"
+    },
+    "candidate": {
+      "kind": "icn-probe",
+      "target": "icn-probe",
+      "operation": "reasoning-budget.inspect"
+    }
+  },
+  "comparison": {
+    "kind": "exact"
+  }
+}

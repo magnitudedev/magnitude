@@ -1,0 +1,41 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.cancellation.decode-abort",
+  "title": "Pre-signalled decode abort",
+  "description": "Submit one explicit token to a matched CPU-resident context whose public abort callback is already signalled, synchronize, and compare only the native decode outcome class.",
+  "category": "correctness",
+  "primitive": "C11",
+  "adapter": "differential",
+  "operation": "decode.abort",
+  "status": "active",
+  "tags": ["model-smoke", "oracle-smoke"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "include/llama.h",
+    "note": "This isolates llama_context_set_abort_callback behavior during decode. It does not claim HTTP disconnect, scheduler cancellation, callback timing, or implementation-private callback counts."
+  },
+  "inputs": {
+    "nGpuLayers": 0,
+    "useMmap": true,
+    "useMlock": false,
+    "contextTokens": 32,
+    "threads": 1,
+    "batchThreads": 1,
+    "offloadKqv": false,
+    "operationOffload": false,
+    "flashAttention": "off",
+    "token": 1
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["decode.abort"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "decode.abort" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "decode.abort" }
+  },
+  "comparison": { "kind": "exact" }
+}

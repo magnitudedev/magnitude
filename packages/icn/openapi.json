@@ -30,6 +30,56 @@
         }
       }
     },
+    "/v1/apply-template": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "applyChatTemplate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Prepared llama.cpp chat prompt and constraints",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyTemplateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Template preparation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "tags": [
@@ -107,10 +157,104 @@
           }
         }
       }
+    },
+    "/v1/props": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelProperties",
+        "responses": {
+          "200": {
+            "description": "Loaded model and active template properties",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PropsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Properties unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "AllowedToolRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "function"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/FunctionType"
+          },
+          "function": {
+            "$ref": "#/components/schemas/FunctionNameRequest"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AllowedToolsChoiceRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "allowed_tools"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/AllowedToolsType"
+          },
+          "allowed_tools": {
+            "$ref": "#/components/schemas/AllowedToolsRequest"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AllowedToolsModeRequest": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "required"
+        ]
+      },
+      "AllowedToolsRequest": {
+        "type": "object",
+        "required": [
+          "mode",
+          "tools"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/AllowedToolsModeRequest"
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AllowedToolRequest"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "AllowedToolsType": {
+        "type": "string",
+        "enum": [
+          "allowed_tools"
+        ]
+      },
       "ApiErrorBody": {
         "type": "object",
         "required": [
@@ -126,6 +270,107 @@
             "type": "string"
           },
           "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ApplyTemplateRequest": {
+        "type": "object",
+        "required": [
+          "messages"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatMessageRequest"
+            }
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatToolRequest"
+            }
+          },
+          "tool_choice": {
+            "$ref": "#/components/schemas/ToolChoiceRequest"
+          },
+          "parallel_tool_calls": {
+            "type": "boolean"
+          },
+          "response_format": {
+            "$ref": "#/components/schemas/ResponseFormatRequest"
+          },
+          "chat_template_kwargs": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Value"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ApplyTemplateResponse": {
+        "type": "object",
+        "required": [
+          "prompt",
+          "generation_prompt",
+          "grammar",
+          "grammar_lazy",
+          "grammar_triggers",
+          "preserved_tokens",
+          "additional_stops",
+          "supports_thinking",
+          "template_fingerprint"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string"
+          },
+          "generation_prompt": {
+            "type": "string"
+          },
+          "grammar": {
+            "type": "string"
+          },
+          "grammar_lazy": {
+            "type": "boolean"
+          },
+          "grammar_triggers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrammarTriggerResponse"
+            }
+          },
+          "preserved_tokens": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "additional_stops": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "supports_thinking": {
+            "type": "boolean"
+          },
+          "thinking_start_tag": {
+            "type": "string"
+          },
+          "thinking_end_tag": {
+            "type": "string"
+          },
+          "template_fingerprint": {
             "type": "string"
           }
         },
@@ -163,6 +408,12 @@
           },
           "usage": {
             "$ref": "#/components/schemas/Usage"
+          },
+          "timings": {
+            "$ref": "#/components/schemas/Timings"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorBody"
           }
         },
         "additionalProperties": false
@@ -206,6 +457,41 @@
             "format": "int32",
             "minimum": 0
           },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatToolRequest"
+            }
+          },
+          "tool_choice": {
+            "$ref": "#/components/schemas/ToolChoiceRequest"
+          },
+          "parallel_tool_calls": {
+            "type": "boolean"
+          },
+          "reasoning_effort": {
+            "$ref": "#/components/schemas/ReasoningEffortRequest"
+          },
+          "thinking_budget_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "response_format": {
+            "$ref": "#/components/schemas/ResponseFormatRequest"
+          },
+          "chat_template_kwargs": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Value"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "stop": {
+            "$ref": "#/components/schemas/StopRequest"
+          },
           "stream": {
             "type": "boolean"
           },
@@ -215,18 +501,182 @@
         },
         "additionalProperties": false
       },
-      "ChatMessageRequest": {
-        "type": "object",
-        "required": [
-          "role",
-          "content"
-        ],
-        "properties": {
-          "role": {
+      "ChatContentPartRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "image_url",
+              "type"
+            ],
+            "properties": {
+              "image_url": {
+                "$ref": "#/components/schemas/ImageUrlRequest"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "image_url"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ChatContentRequest": {
+        "oneOf": [
+          {
             "type": "string"
           },
-          "content": {
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatContentPartRequest"
+            }
+          }
+        ]
+      },
+      "ChatMessageRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "content",
+              "role"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "system"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "content",
+              "role"
+            ],
+            "properties": {
+              "content": {
+                "$ref": "#/components/schemas/ChatContentRequest"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "user"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "role"
+            ],
+            "properties": {
+              "content": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reasoning_content": {
+                "type": "string"
+              },
+              "tool_calls": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ChatToolCallRequest"
+                }
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "assistant"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "tool_call_id",
+              "content",
+              "role"
+            ],
+            "properties": {
+              "tool_call_id": {
+                "type": "string"
+              },
+              "content": {
+                "$ref": "#/components/schemas/ChatContentRequest"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "tool"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ChatToolCallRequest": {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "function"
+        ],
+        "properties": {
+          "id": {
             "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/FunctionType"
+          },
+          "function": {
+            "$ref": "#/components/schemas/NamedFunctionCallRequest"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatToolRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "function"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/FunctionType"
+          },
+          "function": {
+            "$ref": "#/components/schemas/FunctionDefinitionRequest"
           }
         },
         "additionalProperties": false
@@ -260,6 +710,64 @@
           },
           "content": {
             "type": "string"
+          },
+          "reasoning_content": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChunkToolCall"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChunkFunctionDelta": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChunkToolCall": {
+        "type": "object",
+        "required": [
+          "index"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "function": {
+            "$ref": "#/components/schemas/ChunkFunctionDelta"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DefaultGenerationSettings": {
+        "type": "object",
+        "required": [
+          "n_ctx"
+        ],
+        "properties": {
+          "n_ctx": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -276,6 +784,140 @@
         },
         "additionalProperties": false
       },
+      "FunctionDefinitionRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "parameters"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/Value"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FunctionNameRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FunctionToolChoiceRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "function"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/FunctionType"
+          },
+          "function": {
+            "$ref": "#/components/schemas/FunctionNameRequest"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FunctionType": {
+        "type": "string",
+        "enum": [
+          "function"
+        ]
+      },
+      "GrammarTriggerResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "value",
+              "token",
+              "type"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "token": {
+                "type": "integer",
+                "format": "int32"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "token"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "value",
+              "type"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "word"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "value",
+              "type"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "pattern"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "value",
+              "type"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "pattern_full"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "HealthResponse": {
         "type": "object",
         "required": [
@@ -288,6 +930,57 @@
           },
           "version": {
             "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ImageUrlRequest": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "JsonSchemaRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "schema"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "schema": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "strict": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Modalities": {
+        "type": "object",
+        "required": [
+          "vision",
+          "audio",
+          "video"
+        ],
+        "properties": {
+          "vision": {
+            "type": "boolean"
+          },
+          "audio": {
+            "type": "boolean"
+          },
+          "video": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -331,6 +1024,171 @@
         },
         "additionalProperties": false
       },
+      "NamedFunctionCallRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "arguments"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PropsResponse": {
+        "type": "object",
+        "required": [
+          "build_info",
+          "model_path",
+          "model_size_bytes",
+          "default_generation_settings",
+          "modalities",
+          "chat_template",
+          "template_fingerprint",
+          "template_capabilities",
+          "training_context_tokens",
+          "sliding_window_tokens"
+        ],
+        "properties": {
+          "build_info": {
+            "type": "string"
+          },
+          "model_path": {
+            "type": "string"
+          },
+          "model_size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "general_name": {
+            "type": "string"
+          },
+          "general_architecture": {
+            "type": "string"
+          },
+          "default_generation_settings": {
+            "$ref": "#/components/schemas/DefaultGenerationSettings"
+          },
+          "modalities": {
+            "$ref": "#/components/schemas/Modalities"
+          },
+          "chat_template": {
+            "type": "string"
+          },
+          "template_fingerprint": {
+            "type": "string"
+          },
+          "template_capabilities": {
+            "$ref": "#/components/schemas/TemplateCapabilitiesResponse"
+          },
+          "training_context_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "sliding_window_tokens": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReasoningEffortRequest": {
+        "type": "string",
+        "enum": [
+          "none",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "ResponseFormatRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "json_object"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "grammar",
+              "type"
+            ],
+            "properties": {
+              "grammar": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "grammar"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "json_schema",
+              "type"
+            ],
+            "properties": {
+              "json_schema": {
+                "$ref": "#/components/schemas/JsonSchemaRequest"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "json_schema"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "StopRequest": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      },
       "StreamOptions": {
         "type": "object",
         "properties": {
@@ -339,6 +1197,131 @@
           }
         },
         "additionalProperties": false
+      },
+      "TemplateCapabilitiesResponse": {
+        "type": "object",
+        "required": [
+          "string_content",
+          "typed_content",
+          "tools",
+          "tool_calls",
+          "parallel_tool_calls",
+          "system_role",
+          "preserve_reasoning",
+          "object_arguments",
+          "enable_thinking"
+        ],
+        "properties": {
+          "string_content": {
+            "type": "boolean"
+          },
+          "typed_content": {
+            "type": "boolean"
+          },
+          "tools": {
+            "type": "boolean"
+          },
+          "tool_calls": {
+            "type": "boolean"
+          },
+          "parallel_tool_calls": {
+            "type": "boolean"
+          },
+          "system_role": {
+            "type": "boolean"
+          },
+          "preserve_reasoning": {
+            "type": "boolean"
+          },
+          "object_arguments": {
+            "type": "boolean"
+          },
+          "enable_thinking": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Timings": {
+        "type": "object",
+        "required": [
+          "prompt_n",
+          "prompt_ms",
+          "prompt_per_second",
+          "predicted_n",
+          "predicted_ms",
+          "predicted_per_second",
+          "queue_ms",
+          "time_to_first_token_ms",
+          "sampler_ms",
+          "parser_ms"
+        ],
+        "properties": {
+          "prompt_n": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "prompt_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "prompt_per_second": {
+            "type": "number",
+            "format": "double"
+          },
+          "predicted_n": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "predicted_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "predicted_per_second": {
+            "type": "number",
+            "format": "double"
+          },
+          "queue_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "time_to_first_token_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "sampler_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "parser_ms": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ToolChoiceModeRequest": {
+        "type": "string",
+        "enum": [
+          "none",
+          "auto",
+          "required"
+        ]
+      },
+      "ToolChoiceRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ToolChoiceModeRequest"
+          },
+          {
+            "$ref": "#/components/schemas/FunctionToolChoiceRequest"
+          },
+          {
+            "$ref": "#/components/schemas/AllowedToolsChoiceRequest"
+          }
+        ]
       },
       "Usage": {
         "type": "object",
@@ -365,7 +1348,8 @@
           }
         },
         "additionalProperties": false
-      }
+      },
+      "Value": {}
     }
   }
 }

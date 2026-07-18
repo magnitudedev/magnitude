@@ -1,0 +1,60 @@
+schema_version = 1
+artifact_root_env = "ICN_PARITY_MODEL_DIR"
+
+# Registry entries are immutable artifacts, not convenient aliases. A model is
+# accepted only after its exact revision, files, sizes, and digests are known.
+# The runner resolves registry IDs under artifact_root_env and never downloads
+# during a parity run.
+
+[[models]]
+id = "stories15m-q4-0"
+status = "accepted"
+kind = "model"
+display_name = "TinyLlama stories15M Q4_0 upstream test fixture"
+valid_for = [
+  "C0",
+  "C1",
+  "C2",
+  "C3",
+  "C7",
+  "C9",
+  "C10",
+  "C11",
+  "C13",
+  "P1",
+  "P2",
+  "P3",
+  "P4",
+  "P5",
+]
+
+[models.source]
+provider = "huggingface"
+repository = "ggml-org/models"
+revision = "main"
+integrity = "digest-pinned"
+note = "The pinned upstream CMake fixture uses the mutable main ref; artifact identity is therefore the mandatory SHA-256 below, not the repository ref."
+
+[models.access]
+public = true
+gated = false
+authentication_required = false
+
+[models.license]
+identifier = "unknown"
+redistribution = "not-assumed"
+note = "The artifact repository has no model card or declared license. Use is limited to local upstream compatibility testing until independently reviewed."
+
+[models.attributes]
+architecture_tags = ["decoder-only", "full-attention", "llama", "tiny", "upstream-fixture"]
+tokenizer_family = "llama-spm"
+template_family = "none"
+quantization = "Q4_0"
+parameter_scale = "15M"
+
+[[models.files]]
+role = "model"
+path = "tinyllamas/stories15M-q4_0.gguf"
+bytes = 19077344
+sha256 = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
+url = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf"

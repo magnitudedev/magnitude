@@ -1,0 +1,59 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "performance.llama-bench.context-depth-128",
+  "title": "Decode at 128-token context depth",
+  "description": "Prepare an identical 128-token sequence state outside the timer, then compare one upstream-defined generation workload at that depth.",
+  "category": "performance",
+  "primitive": "P4",
+  "adapter": "upstream-tool",
+  "operation": "llama-bench.context-depth",
+  "status": "active",
+  "tags": ["model-smoke", "same-work"],
+  "prerequisites": [
+    "correctness.config.context-defaults",
+    "correctness.decode.single-batch-logits",
+    "correctness.state.remove-and-redecode"
+  ],
+  "source": {
+    "kind": "upstream-defined",
+    "upstream_file": "tools/llama-bench/llama-bench.cpp",
+    "upstream_case": "n_depth"
+  },
+  "inputs": {
+    "prompt_tokens": 0,
+    "context_depth": 128,
+    "generation_tokens": 32,
+    "batch_tokens": 512,
+    "micro_batch_tokens": 512,
+    "repetitions": 10,
+    "warmup": true,
+    "token_schedule": "pinned-llama-bench-c-rand-default",
+    "effective_engine_configuration": "profile"
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["llama-bench", "context-depth"]
+  },
+  "invocations": {
+    "reference": { "kind": "upstream-tool", "target": "llama-bench", "operation": "llama-bench.context-depth" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "llama-bench.context-depth" }
+  },
+  "comparison": {
+    "kind": "performance-ratio",
+    "metric": "tokens_per_second",
+    "statistic": "median",
+    "minimum_ratio": 0.97,
+    "direction": "candidate-over-reference",
+    "exact_output_paths": [""]
+  },
+  "timing": {
+    "included": ["one-token decode calls", "backend synchronization"],
+    "excluded": ["model load", "context construction", "context-depth preparation", "warm-up", "sampling", "result serialization"],
+    "warmup_iterations": 1,
+    "measurement_iterations": 10,
+    "synchronize": true
+  }
+}

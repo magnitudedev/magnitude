@@ -29,6 +29,14 @@ export class SseParser {
     }
     return events;
   }
+
+  /** Dispatch the final unterminated event block when the transport reaches EOF. */
+  finish(): ReadonlyArray<SseEvent> {
+    if (this.buffer.length === 0) return [];
+    const block = this.buffer;
+    this.buffer = "";
+    return Option.toArray(parseBlock(block));
+  }
 }
 
 const findBoundary = (
@@ -76,9 +84,8 @@ const parseBlock = (block: string): Option.Option<SseEvent> => {
     : Option.some(new SseEvent({ data: data.join("\n"), event, id, retry }));
 };
 
-export const decodeSseJson = <A, I, R>(
-  schema: Schema.Schema<A, I, R>
-) =>
+export const decodeSseJson =
+  <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   (event: SseEvent): Effect.Effect<A, SseDecodeError, R> =>
     Schema.decodeUnknown(Schema.parseJson(schema))(event.data).pipe(
       Effect.mapError((cause) => new SseDecodeError({ event, cause }))

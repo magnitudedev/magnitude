@@ -1,0 +1,53 @@
+{
+  "$schema": "../../../schemas/case.schema.json",
+  "schema_version": "1",
+  "id": "correctness.state.remove-and-redecode",
+  "title": "Sequence-state removal and re-decode",
+  "description": "Prepare a short explicit sequence in matched CPU-resident contexts, remove a bounded position range, and compare operation results and post-transition logits.",
+  "category": "correctness",
+  "primitive": "C10",
+  "adapter": "differential",
+  "operation": "state.execute-script",
+  "status": "active",
+  "tags": ["full-attention", "model-smoke"],
+  "source": {
+    "kind": "upstream-derived",
+    "upstream_file": "tests/test-state-restore-fragmented.cpp",
+    "note": "This ordinary-attention smoke case cannot qualify SWA, recurrent, or hybrid state."
+  },
+  "inputs": {
+    "nGpuLayers": 0,
+    "useMmap": true,
+    "useMlock": false,
+    "offloadKqv": false,
+    "operationOffload": false,
+    "flashAttention": "off",
+    "threads": 1,
+    "batchThreads": 1,
+    "prepare_tokens": [1, 2, 3, 4],
+    "sequence_id": 0,
+    "operations": [
+      { "type": "remove", "position_start": 2, "position_end": 4 },
+      { "type": "decode", "token": 3, "position": 2, "request_logits": true }
+    ]
+  },
+  "requirements": {
+    "offline": true,
+    "fixtures": [],
+    "model": { "all_tags": ["decoder-only"] },
+    "capabilities": ["sequence-state"],
+    "architecture_tags": ["full-attention"]
+  },
+  "invocations": {
+    "reference": { "kind": "native-oracle", "target": "oracle", "operation": "state.execute-script" },
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "state.execute-script" }
+  },
+  "comparison": {
+    "kind": "numeric",
+    "paths": ["/logits"],
+    "exact_paths": ["/operations/0/success", "/operations/1/status", "/state"],
+    "absolute_tolerance": 0.00001,
+    "relative_tolerance": 0.00001,
+    "nan_equal": false
+  }
+}
