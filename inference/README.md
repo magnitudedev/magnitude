@@ -126,6 +126,26 @@ include `llama-bench`, `llama-batched-bench`, `llama-perplexity`, `backend-ops`,
 CMake tree, uses an allowlisted build environment, and records compile/link evidence for assertion
 and sanitizer status; an earlier CMake cache is never reused as parity evidence.
 
+## Inference testing philosophy
+
+Inference validation has three complementary categories:
+
+1. **Correctness parity** compares the smallest observable native and ICN operations: outputs,
+   effective configuration, and state transitions.
+2. **Performance parity** times those same isolated operations only after both sides prove they
+   performed equivalent work.
+3. **Composite inference benchmarking** sends controlled completion workloads to ICN and pinned
+   `llama-server` endpoints to measure the complete engine, including scheduling, concurrency,
+   prefix reuse, mixed prefill/decode work, latency, throughput, fairness, memory, and failures.
+
+The primitive suites make failures attributable; the composite suite establishes whether the
+complete engine is competitive. Composite fixtures define requests or deterministic agentic
+workflows together with prompt/output sizes, shared-prefix topology, arrival schedule, concurrency,
+and cold/warm state. Strict comparisons use identical model bytes, templates, settings, sampling,
+and token work; response or work divergence is a correctness result and invalidates timing. The
+same fixtures should support ICN-versus-llama.cpp comparison, ICN regression testing, and an opt-in
+public hardware benchmark exposed through the server and CLI.
+
 ## Primitive parity
 
 `parity/` contains neutral cases, fixtures, profiles, the content-addressed model registry, upstream

@@ -156,6 +156,31 @@ describe("compileOpenApi", () => {
     }
   });
 
+  it("applies propertyNames to declared properties when additional properties are forbidden", async () => {
+    const result = await compile({
+      openapi: "3.1.0",
+      info: { title: "Closed property names", version: "1" },
+      components: {
+        schemas: {
+          ClosedLabels: {
+            type: "object",
+            properties: { foo: { type: "string" } },
+            propertyNames: { type: "string", pattern: "^bar$" },
+            additionalProperties: false,
+          },
+        },
+      },
+      paths: {},
+    });
+    const schemas = HashMap.get(result.files, "schemas.ts");
+    expect(schemas._tag).toBe("Some");
+    if (schemas._tag === "Some") {
+      expect(schemas.value).toContain(
+        'Object.keys(value).every(S.is(S.String.pipe(S.pattern(new RegExp("^bar$")))))'
+      );
+    }
+  });
+
   it("proves referenced oneOf branches exclusive pairwise", async () => {
     const result = await compile({
       openapi: "3.1.0",

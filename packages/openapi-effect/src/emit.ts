@@ -147,7 +147,12 @@ const emitSchemaExpression = (
         onSome: (schema) => emitSchemaExpression(schema, components, namespace),
       });
       return AdditionalProperties.$match(additionalProperties, {
-        Forbidden: () => struct,
+        Forbidden: () =>
+          Option.match(propertyNames, {
+            onNone: () => struct,
+            onSome: () =>
+              `${struct}.pipe(S.filter((value) => Object.keys(value).every(S.is(${key})), { message: () => "Object contains a property name that does not satisfy propertyNames" }))`,
+          }),
         Allowed: () =>
           `S.extend(${struct}, S.Record({ key: ${key}, value: JsonValue }))`,
         Typed: ({ schema }) =>
