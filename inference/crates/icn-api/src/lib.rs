@@ -14,12 +14,12 @@ use axum::{Json, Router};
 use icn_core::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
     ChatTemplateRequest, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FinishReason,
-    FlashAttention, Generation, GenerationMetrics, GpuLayers, GrammarTrigger, ImageInput,
-    InferenceError, InferenceEvent, ModelModalities, ModelProperties, PreparedChatInfo,
-    ReasoningControl, ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
-    ToolDefinition,
+    FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
+    ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent, ModelModalities,
+    ModelProperties, PreparedChatInfo, ReasoningControl, ResponseFormat, SplitMode,
+    TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -35,6 +35,15 @@ const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_SEED: u32 = 42;
 const STREAM_EXTENSION: &str = "x-magnitude-stream";
+
+fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(JsonValue::deserialize(deserializer)?
+        .as_bool()
+        .unwrap_or(false))
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -284,6 +293,9 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[schema(nullable = false)]
     pub stream_options: Option<StreamOptions>,
+    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
+    #[schema(default = false)]
+    pub timings_per_token: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -518,8 +530,7 @@ pub struct ChunkDelta {
     #[schema(nullable = false)]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub content: Option<String>,
+    pub content: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub reasoning_content: Option<String>,
@@ -565,16 +576,21 @@ pub struct Usage {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Timings {
+    pub cache_n: u64,
     pub prompt_n: u64,
     pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
     pub prompt_per_second: f64,
     pub predicted_n: u64,
     pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
     pub predicted_per_second: f64,
-    pub queue_ms: f64,
-    pub time_to_first_token_ms: f64,
-    pub sampler_ms: f64,
-    pub parser_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub draft_n: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub draft_n_accepted: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -719,27 +735,16 @@ async fn chat_completions(
     let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
 
     tokio::task::spawn_blocking(move || {
-        if !emit_chunk(
-            &sender,
-            &choice_chunk(
-                &id,
-                created,
-                &model,
-                ChunkDelta {
-                    role: Some("assistant".into()),
-                    ..ChunkDelta::default()
-                },
-                None,
-                None,
-            ),
-        ) {
-            return;
-        }
-        let mut callback = |event: InferenceEvent| {
+        let mut callback = |event: InferenceStreamEvent| {
+            let InferenceStreamEvent {
+                delta: event,
+                timings,
+            } = event;
             let delta = inference_event_delta(event)?;
+            let timings = timings.map(|snapshot| snapshot_timings(&snapshot));
             if emit_chunk(
                 &sender,
-                &choice_chunk(&id, created, &model, delta, None, None),
+                &choice_chunk(&id, created, &model, delta, None, timings),
             ) {
                 Ok(())
             } else {
@@ -765,7 +770,7 @@ async fn chat_completions(
             FinishReason::Length => "length",
             FinishReason::ToolCalls => "tool_calls",
         };
-        let terminal_timings = (!include_usage).then(|| timings(&generation));
+        let terminal_timings = (!include_usage).then(|| generation_timings(&generation));
         if !emit_chunk(
             &sender,
             &choice_chunk(
@@ -832,7 +837,7 @@ fn usage_chunk(
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
         }),
-        timings: Some(timings(generation)),
+        timings: Some(generation_timings(generation)),
         error: None,
     }
 }
@@ -850,25 +855,71 @@ fn error_chunk(id: &str, created: u64, model: &str, error: ApiErrorBody) -> Chat
     }
 }
 
-fn timings(generation: &Generation) -> Timings {
+fn generation_timings(generation: &Generation) -> Timings {
+    timing_values(
+        generation.cached_prompt_tokens,
+        generation.prompt_tokens,
+        generation.generated_tokens,
+        &generation.metrics,
+    )
+}
+
+fn snapshot_timings(snapshot: &GenerationSnapshot) -> Timings {
+    timing_values(
+        snapshot.cached_prompt_tokens,
+        snapshot.prompt_tokens,
+        snapshot.generated_tokens,
+        &snapshot.metrics,
+    )
+}
+
+fn timing_values(
+    cached_prompt_tokens: usize,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    metrics: &GenerationMetrics,
+) -> Timings {
+    let prompt_n = prompt_tokens.saturating_sub(cached_prompt_tokens);
     Timings {
-        prompt_n: generation.prompt_tokens as u64,
-        prompt_ms: generation.metrics.prompt_ms,
-        prompt_per_second: generation.metrics.prompt_tokens_per_second,
-        predicted_n: generation.generated_tokens as u64,
-        predicted_ms: generation.metrics.decode_ms,
-        predicted_per_second: generation.metrics.decode_tokens_per_second,
-        queue_ms: generation.metrics.queue_ms,
-        time_to_first_token_ms: generation.metrics.time_to_first_token_ms,
-        sampler_ms: generation.metrics.sampler_ms,
-        parser_ms: generation.metrics.parser_ms,
+        cache_n: cached_prompt_tokens as u64,
+        prompt_n: prompt_n as u64,
+        prompt_ms: metrics.prompt_ms,
+        prompt_per_token_ms: per_token_ms(prompt_n, metrics.prompt_ms),
+        prompt_per_second: rate(prompt_n, metrics.prompt_ms),
+        predicted_n: generated_tokens as u64,
+        predicted_ms: metrics.decode_ms,
+        predicted_per_token_ms: per_token_ms(generated_tokens, metrics.decode_ms),
+        predicted_per_second: rate(generated_tokens, metrics.decode_ms),
+        draft_n: None,
+        draft_n_accepted: None,
+    }
+}
+
+fn per_token_ms(tokens: usize, elapsed_ms: f64) -> f64 {
+    if tokens == 0 {
+        0.0
+    } else {
+        elapsed_ms / tokens as f64
+    }
+}
+
+fn rate(tokens: usize, elapsed_ms: f64) -> f64 {
+    if tokens == 0 || elapsed_ms <= 0.0 {
+        0.0
+    } else {
+        1_000.0 * tokens as f64 / elapsed_ms
     }
 }
 
 fn inference_event_delta(event: InferenceEvent) -> Result<ChunkDelta, InferenceError> {
     Ok(match event {
+        InferenceEvent::StreamStart => ChunkDelta {
+            role: Some("assistant".into()),
+            content: Some(None),
+            ..ChunkDelta::default()
+        },
         InferenceEvent::ContentDelta { text } => ChunkDelta {
-            content: Some(text),
+            content: Some(Some(text)),
             ..ChunkDelta::default()
         },
         InferenceEvent::ReasoningDelta { text } => ChunkDelta {
@@ -962,6 +1013,7 @@ fn validate_apply_template_request(
         stop: None,
         stream: true,
         stream_options: None,
+        timings_per_token: false,
     })?;
     Ok(request.template)
 }
@@ -1152,6 +1204,7 @@ fn validate_request(request: ChatCompletionRequest) -> Result<(ChatRequest, bool
             temperature,
             top_p,
             seed: request.seed.unwrap_or(DEFAULT_SEED),
+            timings_per_token: request.timings_per_token,
         },
         request
             .stream_options
@@ -1781,18 +1834,32 @@ impl CompletionBackend for FakeBackend {
     fn complete(
         &self,
         request: ChatRequest,
-        on_event: &mut dyn FnMut(InferenceEvent) -> Result<(), InferenceError>,
+        on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
     ) -> Result<Generation, InferenceError> {
-        for token in self.response.split_inclusive(' ') {
-            on_event(InferenceEvent::ContentDelta {
-                text: token.to_owned(),
+        let prompt_tokens = request.template.messages.len();
+        on_event(InferenceStreamEvent {
+            delta: InferenceEvent::StreamStart,
+            timings: None,
+        })?;
+        for (index, token) in self.response.split_inclusive(' ').enumerate() {
+            on_event(InferenceStreamEvent {
+                delta: InferenceEvent::ContentDelta {
+                    text: token.to_owned(),
+                },
+                timings: request.timings_per_token.then(|| GenerationSnapshot {
+                    cached_prompt_tokens: 0,
+                    prompt_tokens,
+                    generated_tokens: index + 1,
+                    metrics: GenerationMetrics::default(),
+                }),
             })?;
         }
         Ok(Generation {
             text: self.response.clone(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
-            prompt_tokens: request.template.messages.len(),
+            cached_prompt_tokens: 0,
+            prompt_tokens,
             generated_tokens: self.response.split_whitespace().count(),
             finish_reason: FinishReason::Stop,
             metrics: GenerationMetrics::default(),
@@ -1845,8 +1912,35 @@ mod tests {
     }
 
     struct ScriptedBackend {
-        events: Vec<InferenceEvent>,
+        events: Vec<InferenceStreamEvent>,
         fail: bool,
+    }
+
+    fn stream_event(delta: InferenceEvent) -> InferenceStreamEvent {
+        InferenceStreamEvent {
+            delta,
+            timings: None,
+        }
+    }
+
+    fn timed_stream_event(
+        delta: InferenceEvent,
+        generated_tokens: usize,
+        decode_ms: f64,
+    ) -> InferenceStreamEvent {
+        InferenceStreamEvent {
+            delta,
+            timings: Some(GenerationSnapshot {
+                cached_prompt_tokens: 0,
+                prompt_tokens: 11,
+                generated_tokens,
+                metrics: GenerationMetrics {
+                    prompt_ms: 2.0,
+                    decode_ms,
+                    ..GenerationMetrics::default()
+                },
+            }),
+        }
     }
 
     impl CompletionBackend for ScriptedBackend {
@@ -1857,8 +1951,17 @@ mod tests {
         fn complete(
             &self,
             _request: ChatRequest,
-            on_event: &mut dyn FnMut(InferenceEvent) -> Result<(), InferenceError>,
+            on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
         ) -> Result<Generation, InferenceError> {
+            if !matches!(
+                self.events.first().map(|event| &event.delta),
+                Some(InferenceEvent::StreamStart)
+            ) {
+                on_event(InferenceStreamEvent {
+                    delta: InferenceEvent::StreamStart,
+                    timings: None,
+                })?;
+            }
             for event in &self.events {
                 on_event(event.clone())?;
             }
@@ -1873,6 +1976,7 @@ mod tests {
                     name: "lookup".into(),
                     arguments: "{}".into(),
                 }],
+                cached_prompt_tokens: 0,
                 prompt_tokens: 11,
                 generated_tokens: 7,
                 finish_reason: FinishReason::ToolCalls,
@@ -1911,6 +2015,27 @@ mod tests {
         assert!(schemas["ChunkDelta"]["properties"]["tool_calls"].is_object());
         assert!(schemas["ChatCompletionChunk"]["properties"]["error"].is_object());
         assert!(schemas["ChatCompletionChunk"]["properties"]["timings"].is_object());
+        assert_eq!(
+            schemas["ChatCompletionRequest"]["properties"]["timings_per_token"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schemas["ChatCompletionRequest"]["properties"]["timings_per_token"]["default"],
+            false
+        );
+        for field in [
+            "cache_n",
+            "prompt_n",
+            "prompt_ms",
+            "prompt_per_token_ms",
+            "prompt_per_second",
+            "predicted_n",
+            "predicted_ms",
+            "predicted_per_token_ms",
+            "predicted_per_second",
+        ] {
+            assert!(schemas["Timings"]["properties"][field].is_object());
+        }
     }
 
     #[tokio::test]
@@ -2033,7 +2158,8 @@ mod tests {
             "top_p": 0.75,
             "seed": 9,
             "stream": true,
-            "stream_options": {"include_usage": true}
+            "stream_options": {"include_usage": true},
+            "timings_per_token": true
         }));
 
         let (request, include_usage) = validate_request(request).unwrap();
@@ -2100,6 +2226,7 @@ mod tests {
         assert_eq!(request.temperature, 0.25);
         assert_eq!(request.top_p, 0.75);
         assert_eq!(request.seed, 9);
+        assert!(request.timings_per_token);
     }
 
     #[test]
@@ -2134,6 +2261,28 @@ mod tests {
         assert_eq!(request.template.response_format, ResponseFormat::Text);
         assert!(request.template.template_args.is_empty());
         assert!(request.stop.is_empty());
+        assert!(!request.timings_per_token);
+    }
+
+    #[test]
+    fn timing_control_matches_llama_cpp_tolerant_boolean_semantics() {
+        for value in [
+            JsonValue::Null,
+            json!(false),
+            json!("true"),
+            json!(1),
+            json!({"enabled": true}),
+        ] {
+            let mut request = minimal_request();
+            request["timings_per_token"] = value;
+            let (request, _) = validate_request(request_from_json(request)).unwrap();
+            assert!(!request.timings_per_token);
+        }
+
+        let mut request = minimal_request();
+        request["timings_per_token"] = json!(true);
+        let (request, _) = validate_request(request_from_json(request)).unwrap();
+        assert!(request.timings_per_token);
     }
 
     #[test]
@@ -2221,27 +2370,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streams_llama_compatible_cumulative_timings_on_group_terminal_deltas() {
+        let backend = ScriptedBackend {
+            events: vec![
+                stream_event(InferenceEvent::ReasoningDelta {
+                    text: "buffered group prefix".into(),
+                }),
+                timed_stream_event(
+                    InferenceEvent::ContentDelta {
+                        text: "first group end".into(),
+                    },
+                    1,
+                    0.001,
+                ),
+                timed_stream_event(
+                    InferenceEvent::ContentDelta {
+                        text: "second group".into(),
+                    },
+                    2,
+                    4.0,
+                ),
+            ],
+            fail: false,
+        };
+        let mut request = minimal_request();
+        request["timings_per_token"] = json!(true);
+
+        let (status, body) = post_chat(backend, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunks = stream_json(&body);
+
+        assert_eq!(chunks.len(), 5);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert!(chunks[0].get("timings").is_none());
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["reasoning_content"],
+            "buffered group prefix"
+        );
+        assert!(chunks[1].get("timings").is_none());
+        assert_eq!(chunks[2]["timings"]["predicted_n"], 1);
+        assert_eq!(chunks[2]["timings"]["predicted_ms"], 0.001);
+        assert_eq!(chunks[3]["timings"]["predicted_n"], 2);
+        assert_eq!(chunks[3]["timings"]["predicted_ms"], 4.0);
+
+        let terminal = &chunks[4];
+        assert_eq!(terminal["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(terminal["timings"]["predicted_n"], 7);
+        let timing_fields = terminal["timings"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            timing_fields,
+            BTreeSet::from([
+                "cache_n",
+                "predicted_ms",
+                "predicted_n",
+                "predicted_per_second",
+                "predicted_per_token_ms",
+                "prompt_ms",
+                "prompt_n",
+                "prompt_per_second",
+                "prompt_per_token_ms",
+            ])
+        );
+        assert_eq!(terminal["timings"]["cache_n"], 0);
+        assert_eq!(terminal["timings"]["prompt_n"], 11);
+        assert_eq!(terminal["timings"]["prompt_per_second"], 5_500.0);
+        assert!(
+            (terminal["timings"]["prompt_per_token_ms"].as_f64().unwrap() - 2.0 / 11.0).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (terminal["timings"]["predicted_per_token_ms"]
+                .as_f64()
+                .unwrap()
+                - 3.0 / 7.0)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[tokio::test]
+    async fn first_sample_without_semantic_delta_attaches_timing_to_role() {
+        let backend = ScriptedBackend {
+            events: vec![timed_stream_event(InferenceEvent::StreamStart, 1, 0.001)],
+            fail: false,
+        };
+        let mut request = minimal_request();
+        request["timings_per_token"] = json!(true);
+        request["stream_options"] = json!({"include_usage": true});
+
+        let (status, body) = post_chat(backend, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunks = stream_json(&body);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert!(chunks[0]["choices"][0]["delta"]["content"].is_null());
+        assert_eq!(chunks[0]["timings"]["predicted_n"], 1);
+        assert_eq!(chunks[0]["timings"]["predicted_ms"], 0.001);
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
+        assert!(chunks[1].get("timings").is_none());
+        assert_eq!(chunks[2]["choices"], json!([]));
+        assert_eq!(chunks[2]["timings"]["predicted_n"], 7);
+    }
+
+    #[tokio::test]
+    async fn backend_signaled_stop_word_partial_timing_is_kept_when_flag_is_false() {
+        let backend = ScriptedBackend {
+            events: vec![timed_stream_event(InferenceEvent::StreamStart, 1, 0.001)],
+            fail: false,
+        };
+        let mut request = minimal_request();
+        request["timings_per_token"] = json!(false);
+
+        let (status, body) = post_chat(backend, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunks = stream_json(&body);
+
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[0]["timings"]["predicted_n"], 1);
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(chunks[1]["timings"]["predicted_n"], 7);
+    }
+
+    #[tokio::test]
+    async fn false_timing_control_suppresses_partial_snapshots_but_not_final_timings() {
+        let backend = ScriptedBackend {
+            events: vec![stream_event(InferenceEvent::ContentDelta {
+                text: "answer".into(),
+            })],
+            fail: false,
+        };
+        let mut request = minimal_request();
+        request["timings_per_token"] = json!(false);
+
+        let (status, body) = post_chat(backend, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunks = stream_json(&body);
+        assert!(chunks[0].get("timings").is_none());
+        assert!(chunks[1].get("timings").is_none());
+        assert_eq!(chunks[2]["timings"]["predicted_n"], 7);
+    }
+
+    #[tokio::test]
     async fn streams_reasoning_content_tool_calls_finish_usage_and_timings() {
         let backend = ScriptedBackend {
             events: vec![
-                InferenceEvent::ReasoningDelta {
+                stream_event(InferenceEvent::ReasoningDelta {
                     text: "thought".into(),
-                },
-                InferenceEvent::ContentDelta {
+                }),
+                stream_event(InferenceEvent::ContentDelta {
                     text: "answer".into(),
-                },
-                InferenceEvent::ToolCallDelta {
+                }),
+                stream_event(InferenceEvent::ToolCallDelta {
                     index: 0,
                     id: Some("call-1".into()),
                     name: Some("lookup".into()),
                     arguments: "{".into(),
-                },
-                InferenceEvent::ToolCallDelta {
+                }),
+                stream_event(InferenceEvent::ToolCallDelta {
                     index: 0,
                     id: None,
                     name: None,
                     arguments: "}".into(),
-                },
+                }),
             ],
             fail: false,
         };
@@ -2266,20 +2562,21 @@ mod tests {
             "lookup"
         );
         assert_eq!(chunks[5]["choices"][0]["finish_reason"], "tool_calls");
+        assert!(chunks[5].get("timings").is_none());
         assert_eq!(chunks[6]["choices"], json!([]));
         assert_eq!(chunks[6]["usage"]["prompt_tokens"], 11);
         assert_eq!(chunks[6]["usage"]["completion_tokens"], 7);
         assert_eq!(chunks[6]["usage"]["total_tokens"], 18);
         assert_eq!(chunks[6]["timings"]["prompt_ms"], 2.0);
-        assert_eq!(chunks[6]["timings"]["predicted_per_second"], 6.0);
+        assert_eq!(chunks[6]["timings"]["predicted_per_second"], 7_000.0 / 3.0);
     }
 
     #[tokio::test]
     async fn backend_failure_is_an_explicit_stream_error_followed_by_done() {
         let backend = ScriptedBackend {
-            events: vec![InferenceEvent::ContentDelta {
+            events: vec![stream_event(InferenceEvent::ContentDelta {
                 text: "partial".into(),
-            }],
+            })],
             fail: true,
         };
         let (status, body) = post_chat(backend, minimal_request()).await;

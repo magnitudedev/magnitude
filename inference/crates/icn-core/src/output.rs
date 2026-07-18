@@ -19,6 +19,12 @@ impl Utf8Buffer {
         self.drain(true)
     }
 
+    /// Returns whether a partial UTF-8 code point is waiting for more token-piece bytes.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     fn drain(&mut self, final_chunk: bool) -> String {
         let mut output = String::new();
         loop {

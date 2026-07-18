@@ -15,10 +15,10 @@ use icn_core::output::{StopBuffer, Utf8Buffer};
 use icn_core::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatRequest, ChatTemplateRequest,
     CompletionBackend, ExecutionConfig, ExecutionConfigReport, FinishReason, FlashAttention,
-    Generation, GenerationMetrics, GpuLayers, GrammarTrigger, ImageInput, InferenceError,
-    InferenceEvent, ModelConfig, ModelModalities, ModelProperties, PreparedChatInfo,
-    ProjectorConfig, ReasoningControl, ResponseFormat, SplitMode, TemplateCapabilities, ToolCall,
-    ToolChoice,
+    Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger, ImageInput,
+    InferenceError, InferenceEvent, InferenceStreamEvent, ModelConfig, ModelModalities,
+    ModelProperties, PreparedChatInfo, ProjectorConfig, ReasoningControl, ResponseFormat,
+    SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
 };
 use llama_cpp_2::TokenToStringError;
 use llama_cpp_2::common_chat::{
@@ -81,7 +81,7 @@ enum ExecutorCommand {
 }
 
 enum ExecutorItem {
-    Event(InferenceEvent),
+    Event(InferenceStreamEvent),
     Completed(Generation),
     Failed(InferenceError),
 }
@@ -114,6 +114,7 @@ struct ActiveRequest<'model> {
     multimodal_prompt: Option<MultimodalPrompt>,
     generation_limit: usize,
     generated_tokens: usize,
+    timings_per_token: bool,
     sampler: CommonSampler<'model>,
     utf8: Utf8Buffer,
     stops: StopBuffer,
@@ -121,7 +122,8 @@ struct ActiveRequest<'model> {
     queue_ms: f64,
     prompt_started_at: Option<Instant>,
     prompt_ms: f64,
-    decode_started_at: Option<Instant>,
+    generation_started_at: Option<Instant>,
+    last_sample_at: Option<Instant>,
     first_event_at: Option<Instant>,
     queued_at: Instant,
 }
@@ -207,7 +209,7 @@ impl CompletionBackend for LlamaCompletionBackend {
     fn complete(
         &self,
         request: ChatRequest,
-        on_event: &mut dyn FnMut(InferenceEvent) -> Result<(), InferenceError>,
+        on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
     ) -> Result<Generation, InferenceError> {
         let (events, event_receiver) = sync_channel(EVENT_QUEUE_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -957,17 +959,8 @@ fn decode_batch<'model>(
     }
 
     context.decode(&mut batch).map_err(backend_error)?;
-    let decoded_at = Instant::now();
     for (sequence_id, batch_index) in logits {
         let request = request_by_sequence(active, sequence_id)?;
-        if request.prompt_offset == request.prompt.len()
-            && matches!(request.phase, RequestPhase::Prefill)
-        {
-            request.prompt_ms = request.prompt_started_at.map_or(0.0, |started| {
-                decoded_at.duration_since(started).as_secs_f64() * 1_000.0
-            });
-            request.decode_started_at = Some(decoded_at);
-        }
         request.phase = RequestPhase::ReadyToSample { batch_index };
     }
     Ok(true)
@@ -1023,13 +1016,8 @@ fn decode_multimodal_prefill<'model>(
         return Err(InferenceError::Cancelled);
     }
     let next_position = result?;
-    let decoded_at = Instant::now();
     request.next_position = next_position;
     request.prompt_offset = request.prompt.len();
-    request.prompt_ms = request.prompt_started_at.map_or(0.0, |prompt_started| {
-        decoded_at.duration_since(prompt_started).as_secs_f64() * 1_000.0
-    });
-    request.decode_started_at = Some(decoded_at);
     request.phase = RequestPhase::ReadyToSample { batch_index: -1 };
     Ok(true)
 }
@@ -1596,6 +1584,7 @@ impl<'model> ActiveRequest<'model> {
                 generation_limit: (request.max_tokens as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
                 generated_tokens: 0,
+                timings_per_token: request.timings_per_token,
                 sampler,
                 utf8: Utf8Buffer::default(),
                 stops: StopBuffer::new(stops),
@@ -1603,7 +1592,8 @@ impl<'model> ActiveRequest<'model> {
                 queue_ms: admitted_at.duration_since(queued_at).as_secs_f64() * 1_000.0,
                 prompt_started_at: None,
                 prompt_ms: 0.0,
-                decode_started_at: None,
+                generation_started_at: None,
+                last_sample_at: None,
                 first_event_at: None,
                 queued_at,
             })
@@ -1624,14 +1614,23 @@ impl<'model> ActiveRequest<'model> {
         self.sampler
             .accept_generated(token)
             .map_err(backend_error)?;
+        let sampled_at = Instant::now();
         let is_eog = model.is_eog_token(token);
         account_sample(&mut self.generated_tokens);
+        self.record_sample(sampled_at);
+        let starts_stream = self.generated_tokens == 1;
         if is_eog {
+            let events = sampled_result_events(Vec::new(), starts_stream);
+            let timings = (partial_timing_eligible(self.timings_per_token, false)
+                && !events.is_empty())
+            .then(|| self.generation_snapshot());
+            self.enqueue_events(events, timings)?;
             return Ok(Some(FinishReason::Stop));
         }
 
         let decoded = self.utf8.push(&token_piece_bytes(model, token)?);
-        if self.emit_decoded(decoded)? {
+        let has_complete_utf8 = !decoded.is_empty() || !self.utf8.has_pending();
+        if has_complete_utf8 && self.emit_decoded(decoded, self.timings_per_token, starts_stream)? {
             return Ok(Some(FinishReason::Stop));
         }
         if self.generated_tokens >= self.generation_limit {
@@ -1646,52 +1645,102 @@ impl<'model> ActiveRequest<'model> {
         Ok(None)
     }
 
-    fn emit_decoded(&mut self, decoded: String) -> Result<bool, InferenceError> {
-        if decoded.is_empty() {
-            return Ok(false);
+    fn record_sample(&mut self, sampled_at: Instant) {
+        if self.generation_started_at.is_none() {
+            self.prompt_ms = self.prompt_started_at.map_or(0.0, |prompt_started| {
+                sampled_at.duration_since(prompt_started).as_secs_f64() * 1_000.0
+            });
+            self.generation_started_at = Some(sampled_at);
         }
+        self.last_sample_at = Some(sampled_at);
+    }
+
+    fn emit_decoded(
+        &mut self,
+        decoded: String,
+        with_timings: bool,
+        starts_stream: bool,
+    ) -> Result<bool, InferenceError> {
         let output = self.stops.push(&decoded);
-        self.emit_parsed(output.text)?;
-        Ok(output.matched.is_some())
+        let matched = output.matched.is_some();
+        self.emit_parsed(
+            output.text,
+            partial_timing_eligible(with_timings, matched),
+            starts_stream,
+        )?;
+        Ok(matched)
     }
 
-    fn emit_parsed(&mut self, text: String) -> Result<(), InferenceError> {
-        if text.is_empty() {
-            return Ok(());
+    fn emit_parsed(
+        &mut self,
+        text: String,
+        with_timings: bool,
+        starts_stream: bool,
+    ) -> Result<(), InferenceError> {
+        let events = if text.is_empty() {
+            Vec::new()
+        } else {
+            self.semantic.push(text)?
+        };
+        if !events.is_empty() {
+            self.first_event_at.get_or_insert_with(Instant::now);
         }
-        let events = self.semantic.push(text)?;
-        self.enqueue_events(events)
+        let events = sampled_result_events(events, starts_stream);
+        let timings = (with_timings && !events.is_empty()).then(|| self.generation_snapshot());
+        self.enqueue_events(events, timings)
     }
 
-    fn enqueue_events(&mut self, events: Vec<InferenceEvent>) -> Result<(), InferenceError> {
+    fn enqueue_events(
+        &mut self,
+        events: Vec<InferenceEvent>,
+        timings: Option<GenerationSnapshot>,
+    ) -> Result<(), InferenceError> {
         if self.outbound.len() + events.len() > OUTBOUND_QUEUE_CAPACITY {
             return Err(InferenceError::Backend(format!(
                 "semantic event burst exceeded the bounded outbound capacity ({OUTBOUND_QUEUE_CAPACITY})"
             )));
         }
-        for event in events {
-            self.first_event_at.get_or_insert_with(Instant::now);
+        for event in stream_events_with_timings(events, timings) {
+            if !matches!(&event.delta, InferenceEvent::StreamStart) {
+                self.first_event_at.get_or_insert_with(Instant::now);
+            }
             self.outbound.push_back(ExecutorItem::Event(event));
         }
         Ok(())
     }
 
-    fn complete(&mut self, reason: FinishReason) -> Result<(), InferenceError> {
-        if !self.stops.is_stopped() {
-            let final_utf8 = self.utf8.finish();
-            let _ = self.emit_decoded(final_utf8)?;
-            let tail = self.stops.finish();
-            self.emit_parsed(tail)?;
-        }
-        let (parsed, final_events) = self.semantic.finish()?;
-        self.enqueue_events(final_events)?;
-        let now = Instant::now();
-        let decode_ms = self.decode_started_at.map_or(0.0, |started| {
-            now.duration_since(started).as_secs_f64() * 1_000.0
-        });
+    fn generation_snapshot(&self) -> GenerationSnapshot {
+        let decode_ms = generation_elapsed_ms(self.generation_started_at, self.last_sample_at);
         let time_to_first_token_ms = self.first_event_at.map_or(0.0, |instant| {
             instant.duration_since(self.queued_at).as_secs_f64() * 1_000.0
         });
+        GenerationSnapshot {
+            cached_prompt_tokens: 0,
+            prompt_tokens: self.prompt_tokens,
+            generated_tokens: self.generated_tokens,
+            metrics: GenerationMetrics {
+                queue_ms: self.queue_ms,
+                prompt_ms: self.prompt_ms,
+                decode_ms,
+                time_to_first_token_ms,
+                prompt_tokens_per_second: rate(self.prompt_tokens, self.prompt_ms),
+                decode_tokens_per_second: rate(self.generated_tokens, decode_ms),
+                sampler_ms: self.sampler.performance().sample_milliseconds,
+                parser_ms: self.semantic.parser_ms(),
+            },
+        }
+    }
+
+    fn complete(&mut self, reason: FinishReason) -> Result<(), InferenceError> {
+        if !self.stops.is_stopped() {
+            let final_utf8 = self.utf8.finish();
+            let _ = self.emit_decoded(final_utf8, false, false)?;
+            let tail = self.stops.finish();
+            self.emit_parsed(tail, false, false)?;
+        }
+        let (parsed, final_events) = self.semantic.finish()?;
+        self.enqueue_events(final_events, None)?;
+        let snapshot = self.generation_snapshot();
         let ParsedChatMessage {
             content,
             reasoning_content,
@@ -1699,7 +1748,6 @@ impl<'model> ActiveRequest<'model> {
             ..
         } = parsed;
         let has_tool_calls = !tool_calls.is_empty();
-        let sampler_ms = self.sampler.performance().sample_milliseconds;
         let tool_calls = tool_calls
             .into_iter()
             .enumerate()
@@ -1713,23 +1761,15 @@ impl<'model> ActiveRequest<'model> {
             text: content,
             reasoning: reasoning_content.unwrap_or_default(),
             tool_calls,
-            prompt_tokens: self.prompt_tokens,
-            generated_tokens: self.generated_tokens,
+            cached_prompt_tokens: snapshot.cached_prompt_tokens,
+            prompt_tokens: snapshot.prompt_tokens,
+            generated_tokens: snapshot.generated_tokens,
             finish_reason: if has_tool_calls {
                 FinishReason::ToolCalls
             } else {
                 reason
             },
-            metrics: GenerationMetrics {
-                queue_ms: self.queue_ms,
-                prompt_ms: self.prompt_ms,
-                decode_ms,
-                time_to_first_token_ms,
-                prompt_tokens_per_second: rate(self.prompt_tokens, self.prompt_ms),
-                decode_tokens_per_second: rate(self.generated_tokens, decode_ms),
-                sampler_ms,
-                parser_ms: self.semantic.parser_ms(),
-            },
+            metrics: snapshot.metrics,
         };
         self.phase = RequestPhase::Terminal;
         if self.outbound.len() == OUTBOUND_QUEUE_CAPACITY {
@@ -2192,6 +2232,47 @@ fn tool_call_id(index: usize, native: Option<&str>) -> String {
         .unwrap_or_else(|| format!("call_icn_{index}"))
 }
 
+fn stream_events_with_timings(
+    events: Vec<InferenceEvent>,
+    mut timings: Option<GenerationSnapshot>,
+) -> impl Iterator<Item = InferenceStreamEvent> {
+    let last = events.len().checked_sub(1);
+    events
+        .into_iter()
+        .enumerate()
+        .map(move |(index, delta)| InferenceStreamEvent {
+            delta,
+            timings: if Some(index) == last {
+                timings.take()
+            } else {
+                None
+            },
+        })
+}
+
+fn sampled_result_events(
+    mut semantic_events: Vec<InferenceEvent>,
+    starts_stream: bool,
+) -> Vec<InferenceEvent> {
+    if starts_stream {
+        semantic_events.insert(0, InferenceEvent::StreamStart);
+    }
+    semantic_events
+}
+
+fn partial_timing_eligible(timings_per_token: bool, stopped_before_send: bool) -> bool {
+    timings_per_token || stopped_before_send
+}
+
+fn generation_elapsed_ms(started: Option<Instant>, last_sampled: Option<Instant>) -> f64 {
+    match (started, last_sampled) {
+        (Some(started), Some(last_sampled)) => {
+            (last_sampled.duration_since(started).as_secs_f64() * 1_000.0).max(0.001)
+        }
+        _ => 0.0,
+    }
+}
+
 fn rate(tokens: usize, milliseconds: f64) -> f64 {
     if tokens == 0 || milliseconds <= 0.0 {
         0.0
@@ -2252,6 +2333,7 @@ mod tests {
             temperature: 0.0,
             top_p: 0.95,
             seed: 42,
+            timings_per_token: false,
         }
     }
 
@@ -2764,5 +2846,102 @@ mod tests {
         account_sample(&mut generated_tokens);
         account_sample(&mut generated_tokens); // the second accepted sample may be EOG
         assert_eq!(generated_tokens, 2);
+    }
+
+    #[test]
+    fn sampled_token_timings_are_attached_only_to_the_last_semantic_delta() {
+        let snapshot = GenerationSnapshot {
+            cached_prompt_tokens: 0,
+            prompt_tokens: 11,
+            generated_tokens: 3,
+            metrics: GenerationMetrics::default(),
+        };
+        let events = vec![
+            InferenceEvent::StreamStart,
+            InferenceEvent::ReasoningDelta {
+                text: "thinking".into(),
+            },
+            InferenceEvent::ContentDelta {
+                text: "answer".into(),
+            },
+        ];
+
+        let events = stream_events_with_timings(events, Some(snapshot)).collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 3);
+        assert!(events[0].timings.is_none());
+        assert!(events[1].timings.is_none());
+        assert_eq!(events[2].timings.as_ref().unwrap().prompt_tokens, 11);
+        assert_eq!(events[2].timings.as_ref().unwrap().generated_tokens, 3);
+    }
+
+    #[test]
+    fn first_sample_without_semantic_delta_attaches_timing_to_stream_start() {
+        let snapshot = GenerationSnapshot {
+            cached_prompt_tokens: 0,
+            prompt_tokens: 11,
+            generated_tokens: 1,
+            metrics: GenerationMetrics {
+                decode_ms: 0.001,
+                ..GenerationMetrics::default()
+            },
+        };
+
+        let events =
+            stream_events_with_timings(sampled_result_events(Vec::new(), true), Some(snapshot))
+                .collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].delta, InferenceEvent::StreamStart));
+        assert_eq!(events[0].timings.as_ref().unwrap().generated_tokens, 1);
+        assert_eq!(events[0].timings.as_ref().unwrap().metrics.decode_ms, 0.001);
+    }
+
+    #[test]
+    fn later_parser_empty_sampled_result_has_no_transport_event() {
+        assert!(sampled_result_events(Vec::new(), false).is_empty());
+    }
+
+    #[test]
+    fn partial_timing_eligibility_matches_llama_stop_detection_order() {
+        assert!(!partial_timing_eligible(false, false));
+        assert!(partial_timing_eligible(true, false));
+        assert!(partial_timing_eligible(false, true));
+        assert!(partial_timing_eligible(true, true));
+    }
+
+    #[test]
+    fn empty_or_final_parser_groups_do_not_emit_per_token_timings() {
+        let snapshot = GenerationSnapshot {
+            cached_prompt_tokens: 0,
+            prompt_tokens: 11,
+            generated_tokens: 3,
+            metrics: GenerationMetrics::default(),
+        };
+        assert_eq!(
+            stream_events_with_timings(Vec::new(), Some(snapshot)).count(),
+            0
+        );
+
+        let final_events = stream_events_with_timings(
+            vec![InferenceEvent::ContentDelta {
+                text: "tail".into(),
+            }],
+            None,
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(final_events.len(), 1);
+        assert!(final_events[0].timings.is_none());
+    }
+
+    #[test]
+    fn generation_clock_matches_llama_first_token_floor() {
+        let started = Instant::now();
+        assert_eq!(generation_elapsed_ms(Some(started), Some(started)), 0.001);
+        assert_eq!(
+            generation_elapsed_ms(Some(started), Some(started + Duration::from_millis(12))),
+            12.0
+        );
+        assert_eq!(generation_elapsed_ms(None, None), 0.0);
     }
 }

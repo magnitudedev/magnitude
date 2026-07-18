@@ -164,6 +164,7 @@ export const ChatCompletionRequest = S.Struct({
     exact: true,
     as: "Option",
   }),
+  timings_per_token: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   tool_choice: S.optionalWith(
     S.suspend((): S.Schema<ToolChoiceRequest, ToolChoiceRequestEncoded> => ToolChoiceRequest),
     { exact: true, as: "Option" },
@@ -270,7 +271,7 @@ export type ChunkChoice = S.Schema.Type<typeof ChunkChoice>
 export type ChunkChoiceEncoded = S.Schema.Encoded<typeof ChunkChoice>
 
 export const ChunkDelta = S.Struct({
-  content: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  content: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   reasoning_content: S.optionalWith(S.String, { exact: true, as: "Option" }),
   role: S.optionalWith(S.String, { exact: true, as: "Option" }),
   tool_calls: S.optionalWith(S.Array(S.suspend((): S.Schema<ChunkToolCall, ChunkToolCallEncoded> => ChunkToolCall)), {
@@ -581,16 +582,17 @@ export type TemplateCapabilitiesResponse = S.Schema.Type<typeof TemplateCapabili
 export type TemplateCapabilitiesResponseEncoded = S.Schema.Encoded<typeof TemplateCapabilitiesResponse>
 
 export const Timings = S.Struct({
-  parser_ms: S.Number,
+  cache_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  draft_n: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  draft_n_accepted: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   predicted_ms: S.Number,
   predicted_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   predicted_per_second: S.Number,
+  predicted_per_token_ms: S.Number,
   prompt_ms: S.Number,
   prompt_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   prompt_per_second: S.Number,
-  queue_ms: S.Number,
-  sampler_ms: S.Number,
-  time_to_first_token_ms: S.Number,
+  prompt_per_token_ms: S.Number,
 })
 export type Timings = S.Schema.Type<typeof Timings>
 export type TimingsEncoded = S.Schema.Encoded<typeof Timings>

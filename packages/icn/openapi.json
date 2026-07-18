@@ -511,6 +511,10 @@
           },
           "stream_options": {
             "$ref": "#/components/schemas/StreamOptions"
+          },
+          "timings_per_token": {
+            "type": "boolean",
+            "default": false
           }
         },
         "additionalProperties": false
@@ -723,7 +727,10 @@
             "type": "string"
           },
           "content": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_content": {
             "type": "string"
@@ -1427,24 +1434,32 @@
       "Timings": {
         "type": "object",
         "required": [
+          "cache_n",
           "prompt_n",
           "prompt_ms",
+          "prompt_per_token_ms",
           "prompt_per_second",
           "predicted_n",
           "predicted_ms",
-          "predicted_per_second",
-          "queue_ms",
-          "time_to_first_token_ms",
-          "sampler_ms",
-          "parser_ms"
+          "predicted_per_token_ms",
+          "predicted_per_second"
         ],
         "properties": {
+          "cache_n": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
           "prompt_n": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
           "prompt_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "prompt_per_token_ms": {
             "type": "number",
             "format": "double"
           },
@@ -1461,25 +1476,23 @@
             "type": "number",
             "format": "double"
           },
+          "predicted_per_token_ms": {
+            "type": "number",
+            "format": "double"
+          },
           "predicted_per_second": {
             "type": "number",
             "format": "double"
           },
-          "queue_ms": {
-            "type": "number",
-            "format": "double"
+          "draft_n": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
-          "time_to_first_token_ms": {
-            "type": "number",
-            "format": "double"
-          },
-          "sampler_ms": {
-            "type": "number",
-            "format": "double"
-          },
-          "parser_ms": {
-            "type": "number",
-            "format": "double"
+          "draft_n_accepted": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         },
         "additionalProperties": false
