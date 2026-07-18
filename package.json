@@ -6,6 +6,7 @@
     "cli",
     "desktop",
     "web",
+    "inference",
     "packages/*"
   ],
   "scripts": {
@@ -38,7 +39,19 @@
     "prepare": "effect-language-service patch",
     "els": "effect-language-service",
     "web": "bun run web/scripts/dev-server.ts",
-    "desktop": "cd desktop && bun run dev"
+    "desktop": "cd desktop && bun run dev",
+    "icn:generate": "bun run --cwd packages/icn generate",
+    "icn:check-generated": "bun run --cwd packages/icn check-generated",
+    "icn:openapi": "cargo run --manifest-path inference/Cargo.toml -p icn-api --bin export-openapi --",
+    "icn:verify-native-pin": "bun run inference/scripts/verify-native-pin.ts",
+    "icn:check": "cargo check --manifest-path inference/Cargo.toml --workspace",
+    "icn:build": "cargo build --manifest-path inference/Cargo.toml -p icn-server",
+    "icn:build:release": "cargo build --release --manifest-path inference/Cargo.toml -p icn-server",
+    "icn:test": "cargo test --manifest-path inference/Cargo.toml --workspace",
+    "icn:dev": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- serve --fake",
+    "icn:serve": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- serve",
+    "icn:doctor": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- doctor",
+    "icn:version": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- version --json"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",

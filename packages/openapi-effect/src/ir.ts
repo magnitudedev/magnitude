@@ -127,6 +127,19 @@ export interface OperationResponse {
   readonly source: SourceLocation;
 }
 
+export type StreamTermination = Data.TaggedEnum<{
+  Sentinel: { readonly value: string };
+  Eof: Record<never, never>;
+  LongLived: Record<never, never>;
+}>;
+export const StreamTermination = Data.taggedEnum<StreamTermination>();
+
+export type StreamReconnect = Data.TaggedEnum<{
+  None: Record<never, never>;
+  LastEventId: Record<never, never>;
+}>;
+export const StreamReconnect = Data.taggedEnum<StreamReconnect>();
+
 interface OperationCommon {
   readonly operationId: string;
   readonly name: string;
@@ -143,9 +156,13 @@ export type Operation = Data.TaggedEnum<{
   Http: OperationCommon & {
     readonly responses: readonly OperationResponse[];
   };
-  Ndjson: OperationCommon & {
+  Stream: OperationCommon & {
+    readonly framing: "Sse" | "Ndjson";
     readonly eventSchema: SchemaNode;
     readonly mediaType: string;
+    readonly responseStatus: number;
+    readonly termination: StreamTermination;
+    readonly reconnect: StreamReconnect;
     readonly errors: readonly OperationResponse[];
   };
 }>;

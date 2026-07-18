@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/icn-api", "crates/icn-core", "crates/icn-llamacpp", "crates/icn-server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+axum = "0.8.8"
+clap = { version = "4.5.54", features = ["derive"] }
+encoding_rs = "0.8.35"
+futures-util = "0.3.31"
+http-body-util = "0.1.3"
+icn-api = { path = "crates/icn-api" }
+icn-core = { path = "crates/icn-core" }
+icn-llamacpp = { path = "crates/icn-llamacpp" }
+llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "7f0a0d95514aebe86efab16527745852ee72931c", default-features = false, features = ["common"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.17"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = "0.1.18"
+tower = "0.5.3"
+utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order"] }
+utoipa-axum = "0.2.0"
+

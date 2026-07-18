@@ -83,6 +83,9 @@
         "vite": "^6.0.0",
       },
     },
+    "inference": {
+      "name": "@magnitudedev/inference",
+    },
     "packages/acn": {
       "name": "@magnitudedev/acn",
       "version": "0.0.1",
@@ -244,6 +247,20 @@
       },
       "devDependencies": {
         "@types/bun": "latest",
+      },
+    },
+    "packages/icn": {
+      "name": "@magnitudedev/icn",
+      "version": "0.0.1",
+      "dependencies": {
+        "@effect/platform": "^0.96.0",
+        "@magnitudedev/openapi-effect": "workspace:*",
+        "effect": "3.21.2",
+      },
+      "devDependencies": {
+        "@effect/platform-bun": "^0.90.0",
+        "@types/bun": "latest",
+        "vitest": "^3.2.4",
       },
     },
     "packages/local-inference": {
@@ -803,6 +820,10 @@
     "@magnitudedev/generate-id": ["@magnitudedev/generate-id@workspace:packages/generate-id"],
 
     "@magnitudedev/harness": ["@magnitudedev/harness@workspace:packages/harness"],
+
+    "@magnitudedev/icn": ["@magnitudedev/icn@workspace:packages/icn"],
+
+    "@magnitudedev/inference": ["@magnitudedev/inference@workspace:inference"],
 
     "@magnitudedev/local-inference": ["@magnitudedev/local-inference@workspace:packages/local-inference"],
 

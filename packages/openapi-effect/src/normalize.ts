@@ -4,6 +4,8 @@ import {
   AdditionalProperties,
   Operation,
   SchemaNode,
+  StreamReconnect,
+  StreamTermination,
   type ComponentSchema,
   type HttpMethod,
   type MediaType,
@@ -17,7 +19,10 @@ import {
 } from "./ir.js";
 import type { OpenApiEffectConfig } from "./schemas/config.js";
 import {
-  OpenApiSchema,
+  StreamMetadata,
+  type StreamMetadata as StreamMetadataType,
+} from "./schemas/stream.js";
+import {
   ReferenceObject,
   type ComponentsObject,
   type OpenApiDocument,
@@ -925,10 +930,7 @@ const normalizeOperation = (
       );
     }
     const configuredExtensions: ReadonlySet<string> = new Set(
-      context.config.transports.flatMap((transport) => [
-        transport.extension,
-        transport.eventSchemaExtension,
-      ])
+      context.config.transports.map(({ extension }) => extension)
     );
     for (const extension of Object.keys(operation).filter((key) =>
       key.startsWith("x-")
@@ -1002,10 +1004,7 @@ const normalizeOperation = (
     }
 
     const matchedTransports = context.config.transports.filter((transport) =>
-      Option.contains(
-        Option.fromNullable(operation[transport.extension]),
-        transport.value
-      )
+      Option.isSome(Option.fromNullable(operation[transport.extension]))
     );
     if (matchedTransports.length > 1) {
       yield* report(
@@ -1030,62 +1029,88 @@ const normalizeOperation = (
     const matchedTransport = Option.fromNullable(matchedTransports[0]);
     if (matchedTransports.length === 1 && Option.isSome(matchedTransport)) {
       const transport = matchedTransport.value;
-      const eventValue = Option.fromNullable(
-        operation[transport.eventSchemaExtension]
-      );
-      if (Option.isNone(eventValue)) {
-        yield* report(
-          context,
-          "transport.event-schema-required",
-          pointer,
-          `Missing ${transport.eventSchemaExtension}`
-        );
-        return Option.none();
-      }
-      const encodedSchema: JsonValue =
-        typeof eventValue.value === "string"
-          ? { $ref: eventValue.value }
-          : eventValue.value;
-      const decodedSchema = yield* Schema.decodeUnknown(OpenApiSchema)(
-        encodedSchema
+      const extensionPointer = pointerChild(pointer, transport.extension);
+      const metadata = yield* Schema.decodeUnknown(StreamMetadata)(
+        operation[transport.extension],
+        { onExcessProperty: "error" }
       ).pipe(
         Effect.map(Option.some),
         Effect.catchTag("ParseError", () =>
           Effect.as(
             report(
               context,
-              "transport.event-schema-invalid",
-              pointer,
-              `${transport.eventSchemaExtension} is not an OpenAPI schema`
+              "transport.metadata-invalid",
+              extensionPointer,
+              `${transport.extension} does not match the configured stream metadata schema`
             ),
-            Option.none<OpenApiSchemaType>()
+            Option.none<StreamMetadataType>()
           )
         )
       );
-      if (Option.isNone(decodedSchema)) return Option.none();
-      const mediaTypeMatches = yield* Effect.forEach(
-        Object.values(operation.responses),
-        (response) =>
-          Effect.gen(function* () {
-            const resolved = yield* resolveResponse(response, pointer);
-            return (
-              Option.isSome(resolved) &&
-              Option.isSome(resolved.value.content) &&
-              transport.mediaType in resolved.value.content.value
-            );
-          })
-      );
-      const hasMediaType = mediaTypeMatches.some(Boolean);
-      if (!hasMediaType)
+      if (Option.isNone(metadata)) return Option.none();
+      const stream = metadata.value;
+      if (stream.responseStatus < 200 || stream.responseStatus >= 300) {
         yield* report(
           context,
-          "transport.media-type-required",
-          pointer,
-          `Expected ${transport.mediaType} response`
+          "transport.success-status-required",
+          extensionPointer,
+          "Stream responseStatus must be an exact 2xx status"
         );
+      }
+      const statusKey = String(stream.responseStatus);
+      const declaredResponse = Option.fromNullable(
+        operation.responses[statusKey]
+      );
+      const expectedMediaType =
+        stream.framing === "sse" ? "text/event-stream" : "application/x-ndjson";
+      if (Option.isNone(declaredResponse)) {
+        yield* report(
+          context,
+          "transport.response-missing",
+          pointerChild(pointer, "responses"),
+          `Stream response ${statusKey} is not documented`
+        );
+      } else {
+        const resolvedResponse = yield* resolveResponse(
+          declaredResponse.value,
+          pointerChild(pointerChild(pointer, "responses"), statusKey)
+        );
+        const media = Option.flatMap(resolvedResponse, (response) =>
+          Option.flatMap(response.content, (content) =>
+            Option.fromNullable(content[expectedMediaType])
+          )
+        );
+        if (Option.isNone(media)) {
+          yield* report(
+            context,
+            "transport.media-type-required",
+            pointerChild(pointerChild(pointer, "responses"), statusKey),
+            `Expected ${expectedMediaType} response content`
+          );
+        } else {
+          const responseBody = yield* normalizeSchema(
+            Option.getOrElse(media.value.schema, () => false),
+            pointerChild(
+              pointerChild(
+                pointerChild(pointerChild(pointer, "responses"), statusKey),
+                "content"
+              ),
+              expectedMediaType
+            )
+          );
+          if (responseBody._tag !== "String") {
+            yield* report(
+              context,
+              "transport.response-body-string-required",
+              pointerChild(pointerChild(pointer, "responses"), statusKey),
+              "The standard OpenAPI stream response body must be a string"
+            );
+          }
+        }
+      }
       const eventSchema = yield* normalizeSchema(
-        decodedSchema.value,
-        pointerChild(pointer, transport.eventSchemaExtension)
+        stream.data.schema,
+        pointerChild(pointerChild(extensionPointer, "data"), "schema")
       );
       if (eventSchema._tag !== "Ref") {
         yield* report(
@@ -1101,10 +1126,24 @@ const normalizeOperation = (
         )
       );
       return Option.some(
-        Operation.Ndjson({
+        Operation.Stream({
           ...common,
+          framing: stream.framing === "sse" ? "Sse" : "Ndjson",
           eventSchema,
-          mediaType: transport.mediaType,
+          mediaType: expectedMediaType,
+          responseStatus: stream.responseStatus,
+          termination:
+            stream.termination.type === "sentinel"
+              ? StreamTermination.Sentinel({
+                  value: stream.termination.value,
+                })
+              : stream.termination.type === "eof"
+              ? StreamTermination.Eof()
+              : StreamTermination.LongLived(),
+          reconnect:
+            stream.reconnect.type === "last-event-id"
+              ? StreamReconnect.LastEventId()
+              : StreamReconnect.None(),
           errors: yield* normalizeResponses(
             errorResponses,
             pointerChild(pointer, "responses"),

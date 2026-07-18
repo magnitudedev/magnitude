@@ -1,16 +1,10 @@
-import { NdjsonTransport, OpenApiEffectConfig } from "../src/index.js";
+import { OpenApiEffectConfig, StreamTransport } from "../src/index.js";
 
 export const config = new OpenApiEffectConfig({ apiName: "ExampleApi" });
 
-export const ndjsonConfig = new OpenApiEffectConfig({
+export const streamConfig = new OpenApiEffectConfig({
   apiName: "ExampleApi",
-  transports: [
-    new NdjsonTransport({
-      extension: "x-magnitude-transport",
-      value: "ndjson",
-      eventSchemaExtension: "x-magnitude-event-schema",
-    }),
-  ],
+  transports: [new StreamTransport({})],
 });
 
 export const document = {
@@ -57,6 +51,28 @@ export const document = {
             type: "object",
             required: ["type"],
             properties: { type: { const: "finished" } },
+            additionalProperties: false,
+          },
+        ],
+      },
+      LifecycleEvent: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["type", "handle"],
+            properties: {
+              type: { const: "model_loaded" },
+              handle: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+          {
+            type: "object",
+            required: ["type", "handle"],
+            properties: {
+              type: { const: "model_unloaded" },
+              handle: { type: "string" },
+            },
             additionalProperties: false,
           },
         ],
@@ -140,8 +156,17 @@ export const ndjsonDocument = {
       post: {
         operationId: "generate",
         tags: ["generation"],
-        "x-magnitude-transport": "ndjson",
-        "x-magnitude-event-schema": "#/components/schemas/GenerationEvent",
+        "x-magnitude-stream": {
+          version: 1,
+          responseStatus: 200,
+          framing: "ndjson",
+          data: {
+            encoding: "json",
+            schema: { $ref: "#/components/schemas/GenerationEvent" },
+          },
+          termination: { type: "eof" },
+          reconnect: { type: "none" },
+        },
         requestBody: {
           required: true,
           content: {
@@ -162,6 +187,75 @@ export const ndjsonDocument = {
                 schema: { $ref: "#/components/schemas/Problem" },
               },
             },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+export const sseDocument = {
+  ...document,
+  paths: {
+    ...document.paths,
+    "/chat/completions": {
+      post: {
+        operationId: "chatCompletions",
+        tags: ["generation"],
+        "x-magnitude-stream": {
+          version: 1,
+          responseStatus: 200,
+          framing: "sse",
+          data: {
+            encoding: "json",
+            schema: { $ref: "#/components/schemas/GenerationEvent" },
+          },
+          termination: { type: "sentinel", value: "[DONE]" },
+          reconnect: { type: "none" },
+        },
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/OpenModelRequest" },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "OpenAI-compatible event stream",
+            content: { "text/event-stream": { schema: { type: "string" } } },
+          },
+          "400": {
+            description: "Invalid request",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Problem" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/events": {
+      get: {
+        operationId: "watchLifecycle",
+        tags: ["lifecycle"],
+        "x-magnitude-stream": {
+          version: 1,
+          responseStatus: 200,
+          framing: "sse",
+          data: {
+            encoding: "json",
+            schema: { $ref: "#/components/schemas/LifecycleEvent" },
+          },
+          termination: { type: "long-lived" },
+          reconnect: { type: "last-event-id" },
+        },
+        responses: {
+          "200": {
+            description: "Lifecycle event stream",
+            content: { "text/event-stream": { schema: { type: "string" } } },
           },
         },
       },
