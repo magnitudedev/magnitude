@@ -45,6 +45,10 @@ where
         .unwrap_or(false))
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone)]
 pub struct AppState {
     backend: Arc<dyn CompletionBackend>,
@@ -293,6 +297,12 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[schema(nullable = false)]
     pub stream_options: Option<StreamOptions>,
+    #[serde(default = "default_true")]
+    #[schema(default = true)]
+    pub cache_prompt: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
+    #[schema(default = false)]
+    pub ignore_eos: bool,
     #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     #[schema(default = false)]
     pub timings_per_token: bool,
@@ -1013,6 +1023,8 @@ fn validate_apply_template_request(
         stop: None,
         stream: true,
         stream_options: None,
+        cache_prompt: true,
+        ignore_eos: false,
         timings_per_token: false,
     })?;
     Ok(request.template)
@@ -1204,6 +1216,8 @@ fn validate_request(request: ChatCompletionRequest) -> Result<(ChatRequest, bool
             temperature,
             top_p,
             seed: request.seed.unwrap_or(DEFAULT_SEED),
+            cache_prompt: request.cache_prompt,
+            ignore_eos: request.ignore_eos,
             timings_per_token: request.timings_per_token,
         },
         request
@@ -2159,6 +2173,8 @@ mod tests {
             "seed": 9,
             "stream": true,
             "stream_options": {"include_usage": true},
+            "cache_prompt": false,
+            "ignore_eos": true,
             "timings_per_token": true
         }));
 
@@ -2226,6 +2242,8 @@ mod tests {
         assert_eq!(request.temperature, 0.25);
         assert_eq!(request.top_p, 0.75);
         assert_eq!(request.seed, 9);
+        assert!(!request.cache_prompt);
+        assert!(request.ignore_eos);
         assert!(request.timings_per_token);
     }
 
@@ -2261,6 +2279,8 @@ mod tests {
         assert_eq!(request.template.response_format, ResponseFormat::Text);
         assert!(request.template.template_args.is_empty());
         assert!(request.stop.is_empty());
+        assert!(request.cache_prompt);
+        assert!(!request.ignore_eos);
         assert!(!request.timings_per_token);
     }
 

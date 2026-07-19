@@ -159,6 +159,10 @@ and token work; response or work divergence is a correctness result and invalida
 same fixtures should support ICN-versus-llama.cpp comparison, ICN regression testing, and an opt-in
 public hardware benchmark exposed through the server and CLI.
 
+The versioned suite lives in [`benchmark/`](benchmark/), and the reusable library plus CLI is the
+`benchmark-runner` crate. It always exercises the configured HTTP endpoint, whether invoked from
+developer tooling or application code.
+
 ## Primitive parity
 
 `parity/` contains neutral cases, fixtures, profiles, the content-addressed model registry, upstream

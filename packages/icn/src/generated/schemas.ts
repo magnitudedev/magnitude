@@ -129,10 +129,12 @@ export type ChatCompletionChunk = S.Schema.Type<typeof ChatCompletionChunk>
 export type ChatCompletionChunkEncoded = S.Schema.Encoded<typeof ChatCompletionChunk>
 
 export const ChatCompletionRequest = S.Struct({
+  cache_prompt: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   chat_template_kwargs: S.optionalWith(
     S.extend(S.Struct({}), S.Record({ key: S.String, value: S.suspend((): S.Schema<Value, ValueEncoded> => Value) })),
     { exact: true, as: "Option" },
   ),
+  ignore_eos: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   max_completion_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), {
     exact: true,
     as: "Option",

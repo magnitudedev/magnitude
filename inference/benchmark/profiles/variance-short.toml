@@ -1,0 +1,7 @@
+schema_version = 2
+id = "variance-short"
+description = "Repeated single-request E1-SS measurements for variance diagnosis."
+cases = ["E1/ss"]
+repetitions = 20
+warmups = 3
+request_timeout_seconds = 300

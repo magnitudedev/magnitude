@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "suite_version": "3",
+  "prompt_short_tokens": 512,
+  "prompt_long_tokens": 3072,
+  "output_short_tokens": 21,
+  "output_long_tokens": 219,
+  "carrier_block": "Module cedar validates an immutable request record. The record contains an identifier, a bounded payload, a monotonic sequence number, and a checksum. Validation preserves input order and returns one explicit status for every record.",
+  "answer_short": "amber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper",
+  "answer_long": "amber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper\namber cedar cobalt delta ember fable granite harbor iris juniper",
+  "tool_fixture": {
+    "path": "src/example.ts",
+    "before": "export function status(): string {\n  return \"OLD_STATUS\";\n}\n",
+    "old_text": "OLD_STATUS",
+    "new_text": "READY_STATUS",
+    "tool_name": "replace_text",
+    "tool_result": "Replacement applied successfully.",
+    "final_acknowledgement": "EDIT_APPLIED"
+  }
+}

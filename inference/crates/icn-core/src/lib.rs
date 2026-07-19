@@ -455,6 +455,11 @@ pub struct ChatRequest {
     pub temperature: f32,
     pub top_p: f32,
     pub seed: u32,
+    /// Whether a capable endpoint may reuse resident prompt state. ICN currently accepts this
+    /// compatibility control but always evaluates the full prompt.
+    pub cache_prompt: bool,
+    /// Continue sampling through model EOG tokens until the explicit generation limit.
+    pub ignore_eos: bool,
     pub timings_per_token: bool,
 }
 

@@ -1,0 +1,9 @@
+schema_version = 2
+id = "development"
+description = "All core properties with short repetitions for scheduler and endpoint development."
+cases = ["E1/*", "E2/*", "E3/*", "E4/*", "E5/*", "E6/*", "E7/*"]
+repetitions = 2
+warmups = 1
+concurrency = [1, 2, 4]
+closed_loop_multiplier = 2
+request_timeout_seconds = 600

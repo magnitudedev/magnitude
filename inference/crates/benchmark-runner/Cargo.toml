@@ -1,0 +1,31 @@
+[package]
+name = "benchmark-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Controlled Chat Completions inference benchmark library and CLI"
+
+[lib]
+name = "benchmark_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "benchmark-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "process", "time"] }
+toml.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile = "3.24.0"
+tokio-stream.workspace = true

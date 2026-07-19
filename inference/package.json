@@ -6,6 +6,8 @@
     "build:release": "cargo build --release -p icn-server",
     "build:reference": "bun run scripts/build-reference.ts",
     "build:candidate": "bun run scripts/build-candidate.ts",
+    "benchmark": "cargo run -p benchmark-runner --",
+    "benchmark:validate": "cargo run -p benchmark-runner -- validate --root benchmark",
     "check": "cargo check --workspace",
     "test": "cargo test --workspace",
     "test:upstream": "bun run scripts/test-upstream.ts",

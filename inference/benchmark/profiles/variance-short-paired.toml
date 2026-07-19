@@ -1,0 +1,9 @@
+schema_version = 2
+id = "variance-short-paired"
+description = "Alternating matched ICN/llama.cpp E1-SS pairs for variance diagnosis."
+cases = ["E1/ss"]
+repetitions = 20
+warmups = 3
+request_timeout_seconds = 300
+paired = true
+confidence_half_width_ratio = 0.05
