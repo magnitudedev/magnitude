@@ -1,4 +1,3 @@
-schema_version = 2
 id = "smoke"
 description = "Fast endpoint and workload smoke; timings are diagnostic."
 cases = ["E1/*", "E3/*", "E7/*"]

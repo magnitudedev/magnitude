@@ -1,4 +1,3 @@
-schema_version = 2
 id = "development"
 description = "All core properties with short repetitions for scheduler and endpoint development."
 cases = ["E1/*", "E2/*", "E3/*", "E4/*", "E5/*", "E6/*", "E7/*"]
