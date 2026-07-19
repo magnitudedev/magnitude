@@ -1,0 +1,6 @@
+id = "direct-llamacpp-cache"
+description = "Warmed direct ICN versus llama-server cache and fanout comparison."
+cases = ["E4/*", "E5/*"]
+repetitions = 5
+warmups = 1
+request_timeout_seconds = 600

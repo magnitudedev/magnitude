@@ -221,6 +221,7 @@ pub fn resolve_and_assess(
         mtp_report.as_ref().map(|report| report.devices.as_slice()),
         mtp_includes_model(requested),
         &projector_memory,
+        requested.radix_cache.host_bytes,
         policy,
     )?;
     if preferred.fits {
@@ -248,6 +249,7 @@ pub fn resolve_and_assess(
                 mtp_report.as_ref().map(|report| report.devices.as_slice()),
                 mtp_includes_model(plan),
                 &projector_memory,
+                plan.radix_cache.host_bytes,
                 policy,
             )
         })
@@ -481,6 +483,7 @@ fn capacity_summary(
     mtp_devices: Option<&[FitDeviceEstimate]>,
     mtp_includes_model: bool,
     projectors: &[ProjectorMemory],
+    host_cache_bytes: u64,
     policy: CapacityPolicy,
 ) -> Result<CapacitySummary, AssessmentError> {
     #[cfg(not(feature = "mtmd"))]
@@ -537,6 +540,18 @@ fn capacity_summary(
     }
     if domains.is_empty() {
         return Err(AssessmentError::MissingMeasurements);
+    }
+    if host_cache_bytes > 0 {
+        let host_index = if unified {
+            0
+        } else {
+            domains
+                .iter()
+                .position(|domain| domain.name.to_ascii_lowercase().contains("cpu"))
+                .unwrap_or(0)
+        };
+        let host_domain = &mut domains[host_index];
+        host_domain.required_bytes = host_domain.required_bytes.saturating_add(host_cache_bytes);
     }
     let mut required_bytes = 0_u64;
     let mut available_bytes = 0_u64;
@@ -934,6 +949,7 @@ mod tests {
             None,
             false,
             &[],
+            100,
             CapacityPolicy {
                 reserve_bytes_per_domain: 100,
             },
@@ -941,7 +957,7 @@ mod tests {
         .unwrap();
         assert!(summary.fits);
         assert_eq!(summary.available_bytes, 900);
-        assert_eq!(summary.required_bytes, 400);
+        assert_eq!(summary.required_bytes, 500);
     }
 
     #[test]
@@ -974,6 +990,7 @@ mod tests {
             Some(&[mtp]),
             false,
             &[],
+            0,
             CapacityPolicy {
                 reserve_bytes_per_domain: 0,
             },

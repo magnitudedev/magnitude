@@ -42,6 +42,7 @@ use llama_cpp_2::mtp::{MtpOperations, MtpParams, MtpSession};
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
 
+mod radix_cache;
 mod scheduler;
 
 #[cfg(feature = "parity-probe")]
@@ -61,7 +62,8 @@ mod multimodal {
 
 use multimodal::{MultimodalPrompt, MultimodalRuntime};
 use scheduler::{
-    BatchPlanner, BatchWork, PromptCheckpoint, SequenceCache, SequencePool, WorkCandidate, WorkKind,
+    BatchPlanner, BatchWork, PromptCheckpoint, RadixAttach, SequenceCache, SequencePool,
+    WorkCandidate, WorkKind,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -75,6 +77,7 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 // reach the command queue before beginning that first blocking decode. This mirrors the natural
 // task coalescing in llama-server's update loop without delaying an already-active sequence.
 const IDLE_ADMISSION_COALESCE_INTERVAL: Duration = Duration::from_millis(1);
+const RADIX_FANOUT_MIN_TOKENS: usize = 64;
 
 type ExclusiveNativeTask = Box<dyn FnOnce(&LlamaBackend) + Send + 'static>;
 
@@ -129,6 +132,8 @@ struct ActiveRequest<'model> {
     prompt_offset: usize,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
+    radix_attach: RadixAttach,
+    radix_published_tokens: usize,
     prompt_checkpoints: Vec<PromptCheckpoint>,
     pending_checkpoint_prefixes: VecDeque<usize>,
     next_position: i32,
@@ -867,6 +872,13 @@ fn run_scheduler<'model>(
     commands: &Receiver<ExecutorCommand>,
 ) {
     let mut sequence_pool = SequencePool::new(config.max_sequences);
+    if config.radix_cache.enabled
+        && mtp.is_none()
+        && draft_context.is_none()
+        && context.kv_pages_supported()
+    {
+        sequence_pool.enable_radix(&config.radix_cache);
+    }
     let mut planner = BatchPlanner::new(config.prefill_quantum as usize);
     let mut decode_buffer = LlamaBatch::new(context.n_batch() as usize, 1);
     let mut queued = VecDeque::<QueuedCompletion>::new();
@@ -970,6 +982,7 @@ fn run_scheduler<'model>(
                 draft_context.as_deref_mut(),
                 mtp.as_deref_mut(),
                 multimodal,
+                &mut sequence_pool,
                 &mut planner,
                 &mut decode_buffer,
                 &mut active,
@@ -1119,20 +1132,80 @@ fn admit_requests<'model>(
     active: &mut Vec<ActiveRequest<'model>>,
 ) {
     while !queued.is_empty() {
-        let matching_prompt = queued.front().and_then(|queued| {
-            (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
-                .then(|| {
-                    prepare_chat(
-                        chat_templates,
-                        &queued.request.template,
-                        multimodal.map(multimodal_marker),
-                    )
-                    .and_then(|prepared| plain_prompt(model, &prepared))
-                    .map(|prompt| prompt.text_tokens)
-                    .ok()
+        let radix_prompt = sequence_pool
+            .radix_enabled()
+            .then(|| {
+                queued.front().and_then(|queued| {
+                    request_images(&queued.request.template)
+                        .is_empty()
+                        .then(|| {
+                            prepare_chat(
+                                chat_templates,
+                                &queued.request.template,
+                                multimodal.map(multimodal_marker),
+                            )
+                            .and_then(|prepared| plain_prompt(model, &prepared))
+                            .map(|prompt| prompt.text_tokens)
+                            .ok()
+                        })
+                        .flatten()
                 })
-                .flatten()
-        });
+            })
+            .flatten();
+        let matching_prompt = (!sequence_pool.radix_enabled())
+            .then(|| queued.front())
+            .flatten()
+            .and_then(|queued| {
+                (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
+                    .then(|| {
+                        prepare_chat(
+                            chat_templates,
+                            &queued.request.template,
+                            multimodal.map(multimodal_marker),
+                        )
+                        .and_then(|prepared| plain_prompt(model, &prepared))
+                        .map(|prompt| prompt.text_tokens)
+                        .ok()
+                    })
+                    .flatten()
+            });
+        if let Some(prompt) = radix_prompt.as_deref() {
+            let context_capacity = context.n_ctx_seq() as usize;
+            if let Err(error) = validate_prompt_capacity(prompt.len(), context_capacity) {
+                let queued_request = queued
+                    .pop_front()
+                    .expect("radix prompt came from the front of the queue");
+                let error = if queued_request.cancelled.load(Ordering::Acquire) {
+                    InferenceError::Cancelled
+                } else {
+                    error
+                };
+                let _ = queued_request.events.try_send(ExecutorItem::Failed(error));
+                continue;
+            }
+            let (cached, device_cached) = sequence_pool.cached_radix_prefix(&prompt);
+            let materializing_shared_prefix = active.iter().any(|request| {
+                common_token_prefix(&request.prompt, &prompt) >= RADIX_FANOUT_MIN_TOKENS
+                    && common_token_prefix(&request.prompt, &prompt) > cached
+            });
+            if materializing_shared_prefix {
+                break;
+            }
+            // Account for prompt cells promised to already-admitted requests but not yet decoded.
+            // The unified pool cannot overcommit these the way independent per-sequence streams
+            // can. Cold radix leaves are evicted first; if active paths still consume the budget,
+            // keep this request queued instead of admitting a batch that native decode must fail.
+            let reserved = active
+                .iter()
+                .map(|request| request.prompt.len().saturating_sub(request.prompt_offset))
+                .sum::<usize>();
+            // Lower-tier pages avoid model evaluation but still require native cells when
+            // promoted. Reserve those cells just like uncached prompt tokens.
+            let required = reserved.saturating_add(prompt.len().saturating_sub(device_cached));
+            if !sequence_pool.ensure_free_radix_cells(context, required) {
+                break;
+            }
+        }
         let sequence_id = match matching_prompt.as_deref() {
             Some(prompt) => sequence_pool.acquire_matching(prompt),
             None => sequence_pool.acquire(),
@@ -1150,7 +1223,9 @@ fn admit_requests<'model>(
             sequence_pool.release(sequence_id);
             continue;
         }
-        let cached = sequence_pool.take_cache(sequence_id);
+        let cached = (!sequence_pool.radix_enabled())
+            .then(|| sequence_pool.take_cache(sequence_id))
+            .flatten();
         match ActiveRequest::admit(
             model,
             chat_templates,
@@ -1163,6 +1238,30 @@ fn admit_requests<'model>(
             cached.as_ref(),
         ) {
             Ok(mut request) => {
+                if sequence_pool.radix_enabled() {
+                    match sequence_pool.attach_radix_prefix(context, sequence_id, &request.prompt) {
+                        Ok(attached) => {
+                            request.prompt_offset = attached.cached_tokens;
+                            request.cached_prompt_tokens = attached.cached_tokens;
+                            request.radix_attach = attached;
+                            request.prompt_checkpoints.clear();
+                            request.pending_checkpoint_prefixes.clear();
+                            active.push(request);
+                        }
+                        Err(error) => {
+                            let _ = request
+                                .events
+                                .try_send(ExecutorItem::Failed(backend_error(error)));
+                            if clear_sequence(context, mtp.as_deref_mut(), sequence_id).is_ok() {
+                                sequence_pool.retain_radix_prefix(context, sequence_id, &[], 0);
+                                sequence_pool.release(sequence_id);
+                            } else {
+                                sequence_pool.quarantine(sequence_id);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let requested_start = request.prompt_offset;
                 let partial = clear_sequence_range(
                     context,
@@ -1240,6 +1339,20 @@ fn sample_ready_requests<'model>(
             release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
             continue;
         }
+        if request.cacheable
+            && sequence_pool.radix_enabled()
+            && request.radix_published_tokens < request.prompt_offset
+        {
+            let sequence_id = request.sequence_id.expect("ready request owns a sequence");
+            if sequence_pool.publish_active_radix_prefix(
+                context,
+                sequence_id,
+                &request.cache_history,
+                request.prompt_offset,
+            ) {
+                request.radix_published_tokens = request.prompt_offset;
+            }
+        }
         if !request.mtp_started
             && request.multimodal_prompt.is_none()
             && let Some(operations) = mtp.as_deref_mut()
@@ -1275,6 +1388,7 @@ fn decode_batch<'model>(
     mut draft_context: Option<&mut LlamaContext<'model>>,
     mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
+    sequence_pool: &mut SequencePool,
     planner: &mut BatchPlanner,
     batch: &mut LlamaBatch<'_>,
     active: &mut [ActiveRequest<'model>],
@@ -1424,6 +1538,19 @@ fn decode_batch<'model>(
     );
     if plan.is_empty() {
         return Ok(false);
+    }
+    let required_cells = plan
+        .iter()
+        .map(|work| match work {
+            BatchWork::Decode { .. } => 1,
+            BatchWork::Prefill { tokens, .. } => *tokens,
+        })
+        .sum::<usize>()
+        .saturating_add(draft_extra_tokens);
+    if !sequence_pool.ensure_free_radix_cells(context, required_cells) {
+        return Err(InferenceError::Backend(format!(
+            "radix KV cache could not free {required_cells} cells for the next batch"
+        )));
     }
 
     batch.clear();
@@ -1772,6 +1899,29 @@ fn release_sequence(
     let Some(sequence_id) = request.sequence_id.take() else {
         return;
     };
+    if sequence_pool.radix_enabled() {
+        let resident_tokens = if matches!(request.phase, RequestPhase::Prefill) {
+            request.prompt_offset
+        } else {
+            request.cache_history.len()
+        };
+        sequence_pool.retain_radix_prefix(
+            context,
+            sequence_id,
+            &request.cache_history,
+            request.cacheable.then_some(resident_tokens).unwrap_or(0),
+        );
+        match clear_sequence(context, mtp, sequence_id) {
+            Ok(()) => sequence_pool.release(sequence_id),
+            Err(error) => {
+                sequence_pool.quarantine(sequence_id);
+                request.phase = RequestPhase::Terminal;
+                request.outbound.clear();
+                request.outbound.push_back(ExecutorItem::Failed(error));
+            }
+        }
+        return;
+    }
     if request.cache_prompt && request.cacheable {
         sequence_pool.release_cached(
             sequence_id,
@@ -1913,6 +2063,19 @@ fn validate_model_config(config: &ResolvedExecutionPlan) -> Result<(), Inference
     if config.context_size < config.max_sequences {
         return Err(InferenceError::InvalidConfig(
             "context_size must provide at least one token per sequence".into(),
+        ));
+    }
+    if config.radix_cache.page_tokens.get() > config.context_size {
+        return Err(InferenceError::InvalidConfig(format!(
+            "radix cache page_tokens ({}) cannot exceed context_size ({})",
+            config.radix_cache.page_tokens, config.context_size
+        )));
+    }
+    if (config.radix_cache.host_bytes > 0 || config.radix_cache.disk_bytes > 0)
+        && (!config.radix_cache.enabled || !config.execution.kv_unified)
+    {
+        return Err(InferenceError::InvalidConfig(
+            "lower radix KV tiers require radix caching and unified KV (`--kv-unified`)".into(),
         ));
     }
     if config.prefill_quantum == 0 || config.prefill_quantum > config.batch_size {
@@ -2255,6 +2418,18 @@ fn multimodal_modalities(_runtime: &MultimodalRuntime<'_>) -> ModelModalities {
     ModelModalities::default()
 }
 
+fn validate_prompt_capacity(
+    prompt_tokens: usize,
+    context_capacity: usize,
+) -> Result<(), InferenceError> {
+    if prompt_tokens >= context_capacity {
+        return Err(InferenceError::InvalidConfig(format!(
+            "prompt ({prompt_tokens} tokens) leaves no generation capacity in the effective per-sequence context ({context_capacity})"
+        )));
+    }
+    Ok(())
+}
+
 impl<'model> ActiveRequest<'model> {
     #[allow(clippy::too_many_arguments)]
     fn admit(
@@ -2297,11 +2472,7 @@ impl<'model> ActiveRequest<'model> {
                 ));
             }
             let prompt_tokens = tokenized.total_tokens;
-            if prompt_tokens >= context_capacity {
-                return Err(InferenceError::InvalidConfig(format!(
-                    "prompt ({prompt_tokens} tokens) leaves no generation capacity in the effective per-sequence context ({context_capacity})"
-                )));
-            }
+            validate_prompt_capacity(prompt_tokens, context_capacity)?;
 
             let mut sampler = make_sampler(model, &request, &prepared)?;
             sampler
@@ -2357,6 +2528,8 @@ impl<'model> ActiveRequest<'model> {
                 prompt_offset: cached_prompt_tokens,
                 prompt_tokens,
                 cached_prompt_tokens,
+                radix_attach: RadixAttach::default(),
+                radix_published_tokens: cached_prompt_tokens,
                 prompt_checkpoints,
                 pending_checkpoint_prefixes: pending_checkpoint_prefixes.into(),
                 next_position: tokenized.next_position,
@@ -2529,6 +2702,10 @@ impl<'model> ActiveRequest<'model> {
                 decode_tokens_per_second: rate(self.generated_tokens, decode_ms),
                 sampler_ms: self.sampler.performance().sample_milliseconds,
                 parser_ms: self.semantic.parser_ms(),
+                cache_device_tokens: self.radix_attach.device_tokens,
+                cache_host_tokens: self.radix_attach.host_tokens,
+                cache_disk_tokens: self.radix_attach.disk_tokens,
+                cache_promotion_ms: self.radix_attach.promotion_ms,
                 draft_tokens: self.draft_tokens,
                 accepted_draft_tokens: self.accepted_draft_tokens,
                 draft_ms: self.draft_ms,
@@ -3161,6 +3338,15 @@ mod tests {
     }
 
     #[test]
+    fn prompt_capacity_reserves_at_least_one_generation_token() {
+        assert!(validate_prompt_capacity(127, 128).is_ok());
+        assert_eq!(
+            validate_prompt_capacity(128, 128).unwrap_err().to_string(),
+            "invalid configuration: prompt (128 tokens) leaves no generation capacity in the effective per-sequence context (128)"
+        );
+    }
+
+    #[test]
     fn image_parts_become_explicit_native_media_markers_in_order() {
         let templates = CommonChatTemplates::from_template(TYPED_CHAT, None, None).unwrap();
         let mut request = request();
@@ -3206,6 +3392,7 @@ mod tests {
             ubatch_size: 32,
             max_sequences,
             prefill_quantum: 16,
+            radix_cache: Default::default(),
             execution: ExecutionConfig {
                 gpu_layers: GpuLayers::Count(0),
                 threads: NonZeroU32::new(1),

@@ -10,7 +10,8 @@ use icn_api::{AppState, FakeBackend, app};
 use icn_contracts::{
     CacheType, CompletionBackend, ComponentRole, ExecutionConfig, FlashAttention, GpuLayers,
     HardwareAssessment, HardwareUnknownReason, InventoryError, LoadStage, ModelHardwareAssessor,
-    ModelId, ModelInventory, ModelStatus, ProjectorConfig, ResolvedExecutionPlan, SplitMode,
+    ModelId, ModelInventory, ModelStatus, ProjectorConfig, RadixCacheConfig, ResolvedExecutionPlan,
+    SplitMode,
 };
 use icn_engine::{LlamaCompletionBackend, resolve_execution_plan};
 use icn_hardware::{CapacityPolicy, assess as assess_hardware, assess_with_backend};
@@ -116,6 +117,18 @@ enum Command {
         swa_full: bool,
         #[arg(long)]
         kv_unified: bool,
+        /// Disable automatic radix-prefix KV reuse even when unified KV supports native pages.
+        #[arg(long)]
+        no_radix_cache: bool,
+        /// Strict lazy-allocation budget for serialized KV pages retained in system RAM.
+        #[arg(long, default_value_t = 0)]
+        radix_cache_host_bytes: u64,
+        /// Strict budget for serialized KV pages retained on local storage.
+        #[arg(long, default_value_t = 0)]
+        radix_cache_disk_bytes: u64,
+        /// Storage directory for the disk KV tier (required when its budget is non-zero).
+        #[arg(long)]
+        radix_cache_dir: Option<PathBuf>,
         #[arg(long)]
         threads: Option<NonZeroU32>,
         #[arg(long)]
@@ -140,6 +153,7 @@ struct RuntimePlanDefaults {
     ubatch_size: u32,
     max_sequences: u32,
     prefill_quantum: u32,
+    radix_cache: RadixCacheConfig,
     execution: ExecutionConfig,
     projector_use_gpu: bool,
     projector_warmup: bool,
@@ -181,6 +195,7 @@ fn base_plan(
         ubatch_size: defaults.ubatch_size,
         max_sequences: defaults.max_sequences,
         prefill_quantum: defaults.prefill_quantum,
+        radix_cache: defaults.radix_cache.clone(),
         execution: defaults.execution.clone(),
         projector: projector_path.map(|path| {
             let mut projector = ProjectorConfig::new(path);
@@ -356,6 +371,10 @@ async fn main() -> anyhow::Result<()> {
             no_op_offload,
             swa_full,
             kv_unified,
+            no_radix_cache,
+            radix_cache_host_bytes,
+            radix_cache_disk_bytes,
+            radix_cache_dir,
             threads,
             threads_batch,
             flash_attention,
@@ -382,6 +401,13 @@ async fn main() -> anyhow::Result<()> {
                 ubatch_size,
                 max_sequences,
                 prefill_quantum: prefill_quantum.unwrap_or(batch_size),
+                radix_cache: RadixCacheConfig {
+                    enabled: !no_radix_cache,
+                    page_tokens: NonZeroU32::new(16).expect("16 is non-zero"),
+                    host_bytes: radix_cache_host_bytes,
+                    disk_bytes: radix_cache_disk_bytes,
+                    disk_path: radix_cache_dir,
+                },
                 execution: ExecutionConfig {
                     gpu_layers,
                     use_mmap: !no_mmap,
@@ -554,12 +580,16 @@ async fn main() -> anyhow::Result<()> {
                 let properties = backend
                     .properties()
                     .context("failed to read loaded model properties")?;
-                let execution = serde_json::to_value(&properties.execution.resolved)
-                    .ok()
-                    .and_then(|value| value.as_object().cloned())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
+                let mut execution: std::collections::BTreeMap<_, _> =
+                    serde_json::to_value(&properties.execution.resolved)
+                        .ok()
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+                if let Ok(radix_cache) = serde_json::to_value(&assessed.plan.radix_cache) {
+                    execution.insert("radix_cache".to_owned(), radix_cache);
+                }
                 inventory
                     .update_status(
                         &inventory_id,
@@ -636,6 +666,10 @@ mod tests {
             no_op_offload,
             swa_full,
             kv_unified,
+            no_radix_cache,
+            radix_cache_host_bytes,
+            radix_cache_disk_bytes,
+            radix_cache_dir,
             threads,
             threads_batch,
             ..
@@ -650,6 +684,10 @@ mod tests {
         assert_eq!(cache_type_k, CacheType::F16);
         assert_eq!(cache_type_v, CacheType::F16);
         assert!(!no_kv_offload && !no_op_offload && !swa_full && !kv_unified);
+        assert!(!no_radix_cache);
+        assert_eq!(radix_cache_host_bytes, 0);
+        assert_eq!(radix_cache_disk_bytes, 0);
+        assert!(radix_cache_dir.is_none());
         assert!(threads.is_none() && threads_batch.is_none());
 
         let explicit = Cli::try_parse_from([
@@ -670,6 +708,12 @@ mod tests {
             "6",
             "--threads-batch",
             "8",
+            "--radix-cache-host-bytes",
+            "50000000000",
+            "--radix-cache-disk-bytes",
+            "100000000000",
+            "--radix-cache-dir",
+            "/tmp/icn-cache",
         ])
         .unwrap();
         let Command::Serve {
@@ -681,6 +725,9 @@ mod tests {
             cache_type_k,
             threads,
             threads_batch,
+            radix_cache_host_bytes,
+            radix_cache_disk_bytes,
+            radix_cache_dir,
             ..
         } = explicit.command
         else {
@@ -693,6 +740,9 @@ mod tests {
         assert_eq!(cache_type_k, CacheType::Q8_0);
         assert_eq!(threads, NonZeroU32::new(6));
         assert_eq!(threads_batch, NonZeroU32::new(8));
+        assert_eq!(radix_cache_host_bytes, 50_000_000_000);
+        assert_eq!(radix_cache_disk_bytes, 100_000_000_000);
+        assert_eq!(radix_cache_dir, Some(PathBuf::from("/tmp/icn-cache")));
     }
 
     #[test]
