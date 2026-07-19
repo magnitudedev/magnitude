@@ -1,3 +1,11 @@
+---
+applies_to:
+  - inference/crates/icn-engine/src/scheduler.rs
+  - inference/crates/icn-engine/src/lib.rs
+  - inference/crates/icn-contracts/src/lib.rs
+  - inference/crates/icn-server/src/main.rs
+---
+
 # Inference scheduler design
 
 Status: implemented policy, with planned sophistication explicitly excluded below.

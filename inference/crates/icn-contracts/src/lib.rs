@@ -517,7 +517,16 @@ pub enum AllowedToolsMode {
 pub enum ReasoningControl {
     ModelDefault,
     Disabled,
-    Enabled { budget_tokens: Option<u32> },
+    Enabled {
+        budget_tokens: Option<u32>,
+    },
+    Resolved {
+        effort: NormalizedReasoningEffort,
+        controls: NativeReasoningControls,
+        automatic_budget: AutomaticReasoningBudget,
+        explicit_budget_tokens: Option<u32>,
+        template_fingerprint: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -608,6 +617,7 @@ pub struct ModelProperties {
     pub sliding_window_tokens: i32,
     pub chat_template: String,
     pub capabilities: TemplateCapabilities,
+    pub reasoning: ReasoningProfile,
     pub modalities: ModelModalities,
     pub mtp: MtpRuntimeProperties,
     pub execution: ExecutionConfigReport,

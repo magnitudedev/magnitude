@@ -2235,6 +2235,7 @@ fn model_properties(
 ) -> Result<ModelProperties, InferenceError> {
     let chat_template = templates.source(None).map_err(backend_error)?;
     let capabilities = templates.capabilities().map_err(backend_error)?;
+    let reasoning = icn_reasoning::inspect_templates(templates).map_err(backend_error)?;
     Ok(ModelProperties {
         model_path: config.model_path.clone(),
         model_size_bytes: model.size(),
@@ -2256,6 +2257,7 @@ fn model_properties(
             object_arguments: capabilities.supports_object_arguments,
             enable_thinking: capabilities.supports_enable_thinking,
         },
+        reasoning: reasoning.profile,
         modalities,
         mtp: match &config.mtp {
             icn_contracts::MtpConfig::Disabled { reason } => {
@@ -2878,8 +2880,37 @@ fn prepare_chat(
         ));
     }
 
-    let template_kwargs = request
-        .template_args
+    let mut effective_template_args = request.template_args.clone();
+    let enable_thinking = match &request.reasoning {
+        ReasoningControl::ModelDefault => None,
+        ReasoningControl::Disabled => Some(false),
+        ReasoningControl::Enabled { .. } => Some(true),
+        ReasoningControl::Resolved {
+            controls,
+            template_fingerprint,
+            ..
+        } => {
+            let source = templates.source(None).map_err(backend_error)?;
+            let actual_fingerprint = fingerprint(&source);
+            if &actual_fingerprint != template_fingerprint {
+                return Err(InferenceError::InvalidConfig(format!(
+                    "reasoning recipe template fingerprint mismatch: expected {template_fingerprint}, got {actual_fingerprint}"
+                )));
+            }
+            for (key, value) in &controls.template_args {
+                if let Some(existing) = effective_template_args.get(key)
+                    && existing != value
+                {
+                    return Err(InferenceError::InvalidConfig(format!(
+                        "reasoning recipe conflicts with chat_template_kwargs.{key}"
+                    )));
+                }
+                effective_template_args.insert(key.clone(), value.clone());
+            }
+            controls.enable_thinking
+        }
+    };
+    let template_kwargs = effective_template_args
         .iter()
         .map(|(key, value)| {
             Ok(ChatTemplateKwarg {
@@ -2888,8 +2919,6 @@ fn prepare_chat(
             })
         })
         .collect::<Result<Vec<_>, InferenceError>>()?;
-    let enable_thinking = !matches!(request.reasoning, ReasoningControl::Disabled);
-
     templates
         .prepare(&ChatPrepareOptions {
             messages,
@@ -3000,10 +3029,22 @@ fn make_sampler<'model>(
             })
             .collect()
     });
-    let reasoning_budget = match request.template.reasoning {
+    let reasoning_budget_tokens = match &request.template.reasoning {
         ReasoningControl::Enabled {
             budget_tokens: Some(tokens),
-        } => {
+        } => Some(*tokens),
+        ReasoningControl::Resolved {
+            automatic_budget,
+            explicit_budget_tokens,
+            ..
+        } => explicit_budget_tokens.or(match automatic_budget {
+            icn_contracts::AutomaticReasoningBudget::Disabled => None,
+            icn_contracts::AutomaticReasoningBudget::FixedTokens { tokens } => Some(*tokens),
+        }),
+        _ => None,
+    };
+    let reasoning_budget = match reasoning_budget_tokens {
+        Some(tokens) => {
             let start_tag = prepared.thinking_start_tag().ok_or_else(|| {
                 InferenceError::InvalidConfig(
                     "the active template does not expose a reasoning start tag for budgeting"
@@ -3023,7 +3064,7 @@ fn make_sampler<'model>(
                 controllable: true,
             })
         }
-        _ => None,
+        None => None,
     };
 
     CommonSampler::new(
@@ -3304,6 +3345,8 @@ mod tests {
 {%- endfor -%}
 {%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}{%- endif -%}"#;
 
+    const AUTHORED_DISABLED: &str = r#"{% set enable_thinking = enable_thinking | default(false) %}{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}assistant:"#;
+
     fn request() -> ChatRequest {
         ChatRequest {
             template: ChatTemplateRequest {
@@ -3335,6 +3378,41 @@ mod tests {
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
         );
         assert!(!prepared.parser_definition().is_empty());
+    }
+
+    #[test]
+    fn model_default_omits_enable_thinking() {
+        let templates = CommonChatTemplates::from_template(AUTHORED_DISABLED, None, None).unwrap();
+        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
+        assert!(!prepared.prompt().contains("<think>"));
+    }
+
+    #[test]
+    fn resolved_recipe_applies_controls_and_checks_fingerprint() {
+        let templates = CommonChatTemplates::from_template(AUTHORED_DISABLED, None, None).unwrap();
+        let mut request = request();
+        request.template.reasoning = ReasoningControl::Resolved {
+            effort: icn_contracts::NormalizedReasoningEffort("high".into()),
+            controls: icn_contracts::NativeReasoningControls {
+                enable_thinking: Some(true),
+                template_args: BTreeMap::new(),
+            },
+            automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
+            explicit_budget_tokens: None,
+            template_fingerprint: fingerprint(AUTHORED_DISABLED),
+        };
+        let prepared = prepare_chat(&templates, &request.template, None).unwrap();
+        assert!(prepared.prompt().contains("<think>"));
+
+        if let ReasoningControl::Resolved {
+            template_fingerprint,
+            ..
+        } = &mut request.template.reasoning
+        {
+            *template_fingerprint = "sha256:stale".into();
+        }
+        let error = prepare_chat(&templates, &request.template, None).unwrap_err();
+        assert!(error.to_string().contains("fingerprint mismatch"));
     }
 
     #[test]

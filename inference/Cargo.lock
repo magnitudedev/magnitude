@@ -1390,6 +1390,7 @@ dependencies = [
  "encoding_rs",
  "getrandom 0.4.3",
  "icn-contracts",
+ "icn-reasoning",
  "libc",
  "llama-cpp-2",
  "serde",

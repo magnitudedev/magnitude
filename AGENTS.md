@@ -61,6 +61,15 @@ Run targeted type checks per package — do not run project-wide `tsc -b`
 
 When significant bug is being reported or a large spec is being created, place under `bugs/YY-MM-DD/` or `specs/YY-MM-DD/`.
 
+## Design Documents
+
+`design/` contains the durable source of truth for architecture and behavior. Follow `design/AGENTS.md`: use `bun design-docs` to find applicable documents, preserve their guarantees, and update them and their applicability whenever the design or ownership changes.
+
+```bash
+bun design-docs inference/crates/icn-engine/src/scheduler.rs
+bun design-docs --changed --explain
+```
+
 ## Info Docs
 
 Use `info/` for concise, high-level Markdown documents for humans and LLMs. These docs should describe architecture, systems, expected behavior, and durable project context without depending on brittle file names or code snippets unless they are highly relevant.
