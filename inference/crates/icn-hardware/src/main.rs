@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
-use icn_fit::{CacheType, FitFlashAttention, FitOptions, FitRequest};
+use icn_hardware::{
+    CacheType, FitContextType, FitFlashAttention, FitOptions, FitRequest, GpuLayers, SplitMode,
+};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -96,6 +98,7 @@ impl std::str::FromStr for ContextArg {
 #[derive(Clone, Copy, Debug)]
 enum GpuLayersArg {
     Auto,
+    All,
     Count(u32),
 }
 
@@ -105,6 +108,9 @@ impl std::str::FromStr for GpuLayersArg {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.eq_ignore_ascii_case("auto") {
             return Ok(Self::Auto);
+        }
+        if value.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
         }
         value
             .parse::<u32>()
@@ -155,9 +161,14 @@ fn main() -> anyhow::Result<()> {
         micro_batch_tokens: args.ubatch_size,
         sequence_count: args.sequences,
         gpu_layers: match args.gpu_layers {
-            GpuLayersArg::Auto => None,
-            GpuLayersArg::Count(value) => Some(value),
+            GpuLayersArg::Auto => GpuLayers::Auto,
+            GpuLayersArg::All => GpuLayers::All,
+            GpuLayersArg::Count(value) => GpuLayers::Count(value),
         },
+        split_mode: SplitMode::Layer,
+        tensor_split: None,
+        use_mmap: true,
+        use_mlock: false,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
         flash_attention: args.flash_attention.into(),
@@ -165,12 +176,15 @@ fn main() -> anyhow::Result<()> {
         operation_offload: !args.no_op_offload,
         swa_full: args.swa_full,
         kv_unified: args.kv_unified,
+        context_type: FitContextType::Target,
+        recurrent_snapshots: 0,
+        maximum_outputs: None,
     };
     let request = FitRequest {
         model: args.model,
         options,
     };
-    let report = icn_fit::estimate(&request).context("model fit failed")?;
+    let report = icn_hardware::estimate(&request).context("model fit failed")?;
     let output = Output {
         schema_version: 1,
         implementation: "magnitude-icn",

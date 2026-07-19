@@ -1,0 +1,8 @@
+id = "concurrency-c4-diagnostic"
+description = "Paired four-sequence prefill/decode diagnostic for scheduler iteration."
+cases = ["E2/*"]
+repetitions = 1
+warmups = 0
+concurrency = [4]
+closed_loop_multiplier = 2
+request_timeout_seconds = 600

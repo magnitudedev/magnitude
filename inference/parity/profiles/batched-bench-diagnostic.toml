@@ -1,0 +1,54 @@
+schema_version = 1
+id = "batched-bench-diagnostic"
+description = "Focused sequential native batched-decode throughput diagnostic on an uncontrolled developer host."
+
+[selection]
+statuses = ["active"]
+include_case_ids = [
+  "correctness.config.context-defaults",
+  "correctness.decode.single-batch-logits",
+  "performance.batched-bench.two-sequence-independent-prompts",
+]
+include_primitives = []
+include_tags = []
+exclude_case_ids = []
+exclude_tags = []
+
+[upstream]
+build_profile = "cargo-equivalent"
+
+[execution]
+offline = true
+max_parallel = 1
+case_timeout_seconds = 1800
+fail_fast = false
+performance_engine_order = "alternate"
+
+[engine]
+backend = "auto"
+threads = "physical-cores"
+gpu_layers = "all"
+flash_attention = "auto"
+
+[models]
+verify_before_run = true
+allow_fetch = false
+ids = ["stories15m-q4-0"]
+
+[performance]
+enabled = true
+paired_repetitions = 3
+require_controlled_host = false
+require_exclusive_device = false
+
+[results]
+preserve_raw_evidence = true
+preserve_raw_samples = true
+write_comparisons = true
+
+[gates]
+fail_on_invalid = true
+fail_on_error = true
+fail_on_skipped = true
+fail_on_performance = false
+require_correctness_before_performance = false

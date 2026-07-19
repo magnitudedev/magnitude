@@ -1,8 +1,9 @@
 # Magnitude ICN
 
-This workspace builds the Inference Control Node. `icn-api` is the backend-neutral Axum/Utoipa
-boundary and can export OpenAPI without compiling llama.cpp. `icn-core` owns the backend contract,
-`icn-llamacpp` adapts the pinned Rust bindings, and `icn-server` assembles the executable.
+This workspace builds the Inference Control Node. `icn-contracts` defines transport- and
+backend-neutral contracts; `icn-models`, `icn-hardware`, and `icn-reasoning` own model lifecycle,
+fit assessment, and template reasoning inspection; `icn-engine` owns live inference; `icn-api`
+exports the HTTP/OpenAPI boundary; and `icn-server` is the composition root.
 
 The native dependency has two independently recorded revisions in `native-pin.toml`: the exact
 `llama-cpp-rs` commit and the llama.cpp gitlink embedded by that commit. The editable binding source
@@ -174,7 +175,7 @@ same-work performance ratios.
 
 Parity execution never uses a generated chat response or HTTP exchange as primitive evidence.
 The production `icn-probe` exposes the active paired operations through production-owned
-`icn-llamacpp` code; descriptor status remains authoritative, with genuine artifact or production
+`icn-engine` code; descriptor status remains authoritative, with genuine artifact or production
 API gaps kept `planned` or `disabled`. The `diagnostic` profile is an uncontrolled, non-gating
 two-sided functional smoke. `native-diagnostic` separately runs the one-sided native C0/P0 checks
 without making a candidate-parity or controlled-performance claim. Generated run directories live

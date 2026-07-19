@@ -1,7 +1,7 @@
 use std::ffi::CString;
 
 use getrandom::fill;
-use icn_core::{
+use icn_contracts::{
     FlashAttention, ImageInput, ImageInputLimits, InferenceError, ModelModalities, ProjectorConfig,
 };
 use llama_cpp_2::context::LlamaContext;

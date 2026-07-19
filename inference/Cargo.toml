@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/benchmark-runner", "crates/icn-api", "crates/icn-core", "crates/icn-fit", "crates/icn-llamacpp", "crates/icn-parity", "crates/icn-parity-probe", "crates/icn-server"]
+members = ["crates/benchmark-runner", "crates/icn-api", "crates/icn-contracts", "crates/icn-engine", "crates/icn-hardware", "crates/icn-models", "crates/icn-mtp", "crates/icn-parity", "crates/icn-parity-probe", "crates/icn-reasoning", "crates/icn-server"]
 exclude = ["native/llama-cpp-rs"]
 resolver = "2"
 
@@ -16,14 +16,22 @@ bytes = "1.12.1"
 clap = { version = "4.5.54", features = ["derive"] }
 encoding_rs = "0.8.35"
 futures-util = "0.3.31"
+fs2 = "0.4.3"
 getrandom = "0.4.3"
+hf-hub = { version = "1.0.0", features = ["rustls-tls"] }
 http-body-util = "0.1.3"
 hyper = { version = "1.10.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
 icn-api = { path = "crates/icn-api" }
-icn-core = { path = "crates/icn-core" }
-icn-llamacpp = { path = "crates/icn-llamacpp", default-features = false }
+icn-contracts = { path = "crates/icn-contracts" }
+icn-engine = { path = "crates/icn-engine", default-features = false }
+icn-hardware = { path = "crates/icn-hardware", default-features = false }
+icn-models = { path = "crates/icn-models" }
+icn-mtp = { path = "crates/icn-mtp", default-features = false }
+icn-reasoning = { path = "crates/icn-reasoning" }
 llama-cpp-2 = { path = "native/llama-cpp-rs/llama-cpp-2", default-features = false, features = ["common"] }
+libc = "0.2.180"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"

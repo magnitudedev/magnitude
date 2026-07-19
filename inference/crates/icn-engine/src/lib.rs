@@ -1,7 +1,6 @@
 //! Persistent llama.cpp executor for ICN.
 
 use std::collections::VecDeque;
-use std::ffi::CString;
 use std::num::{NonZeroI32, NonZeroU32};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
@@ -11,15 +10,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use icn_core::output::{StopBuffer, Utf8Buffer};
-use icn_core::{
+use icn_contracts::output::{StopBuffer, Utf8Buffer};
+use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatRequest, ChatTemplateRequest,
     CompletionBackend, ExecutionConfig, ExecutionConfigReport, FinishReason, FlashAttention,
     Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger, ImageInput,
-    InferenceError, InferenceEvent, InferenceStreamEvent, ModelConfig, ModelModalities,
-    ModelProperties, PreparedChatInfo, ProjectorConfig, ReasoningControl, ResponseFormat,
+    InferenceError, InferenceEvent, InferenceStreamEvent, ModelModalities, ModelProperties,
+    PreparedChatInfo, ProjectorConfig, ReasoningControl, ResolvedExecutionPlan, ResponseFormat,
     SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
 };
+use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
 use llama_cpp_2::common_chat::{
     ChatContent as NativeChatContent, ChatContentPart as NativeChatContentPart,
@@ -32,12 +32,13 @@ use llama_cpp_2::common_sampling::{
     CommonSamplerConfig, ReasoningBudgetLimit,
 };
 use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::context::params::LlamaContextType;
 use llama_cpp_2::context::params::{FlashAttentionPolicy, KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::fit::FitStatus;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::mtp::{MtpOperations, MtpParams, MtpSession};
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
 
@@ -59,12 +60,23 @@ mod multimodal {
 }
 
 use multimodal::{MultimodalPrompt, MultimodalRuntime};
-use scheduler::{BatchPlanner, BatchWork, SequencePool, WorkCandidate, WorkKind};
+use scheduler::{
+    BatchPlanner, BatchWork, PromptCheckpoint, SequenceCache, SequencePool, WorkCandidate, WorkKind,
+};
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
-const EVENT_QUEUE_CAPACITY: usize = 16;
+// Keep transport serialization off the native decode critical path. This remains bounded, but is
+// large enough for a full batch of per-token semantic events while the async HTTP task catches up.
+const EVENT_QUEUE_CAPACITY: usize = 512;
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// A native prefill can occupy the scheduler thread for seconds on large models. When an idle
+// endpoint receives an explicitly concurrent burst, give sibling requests one millisecond to
+// reach the command queue before beginning that first blocking decode. This mirrors the natural
+// task coalescing in llama-server's update loop without delaying an already-active sequence.
+const IDLE_ADMISSION_COALESCE_INTERVAL: Duration = Duration::from_millis(1);
+
+type ExclusiveNativeTask = Box<dyn FnOnce(&LlamaBackend) + Send + 'static>;
 
 enum ExecutorCommand {
     Complete {
@@ -76,6 +88,9 @@ enum ExecutorCommand {
     ApplyTemplate {
         request: ChatTemplateRequest,
         response: SyncSender<Result<PreparedChatInfo, InferenceError>>,
+    },
+    RunExclusiveNative {
+        task: ExclusiveNativeTask,
     },
     Shutdown,
 }
@@ -108,12 +123,27 @@ struct ActiveRequest<'model> {
     outbound: VecDeque<ExecutorItem>,
     phase: RequestPhase,
     prompt: Vec<LlamaToken>,
+    /// Tokens whose target KV state is known to be committed. The currently
+    /// sampled decode token is deliberately excluded until verification.
+    cache_history: Vec<LlamaToken>,
     prompt_offset: usize,
     prompt_tokens: usize,
+    cached_prompt_tokens: usize,
+    prompt_checkpoints: Vec<PromptCheckpoint>,
+    pending_checkpoint_prefixes: VecDeque<usize>,
     next_position: i32,
     multimodal_prompt: Option<MultimodalPrompt>,
     generation_limit: usize,
     generated_tokens: usize,
+    mtp_started: bool,
+    mtp_draft: Vec<LlamaToken>,
+    mtp_indices: Vec<i32>,
+    draft_tokens: usize,
+    accepted_draft_tokens: usize,
+    draft_ms: f64,
+    verification_ms: f64,
+    cache_prompt: bool,
+    cacheable: bool,
     ignore_eos: bool,
     timings_per_token: bool,
     sampler: CommonSampler<'model>,
@@ -153,7 +183,10 @@ pub struct LlamaCompletionBackend {
 
 impl LlamaCompletionBackend {
     /// Load a model and initialize its persistent context before returning.
-    pub fn load(model_id: impl Into<String>, config: ModelConfig) -> Result<Self, InferenceError> {
+    pub fn load(
+        model_id: impl Into<String>,
+        config: ResolvedExecutionPlan,
+    ) -> Result<Self, InferenceError> {
         validate_model_config(&config)?;
         let model_id = model_id.into();
         let (commands, command_receiver) = sync_channel(COMMAND_QUEUE_CAPACITY);
@@ -180,6 +213,40 @@ impl LlamaCompletionBackend {
             }
         }
     }
+
+    /// Run model-free native planning against the executor's initialized llama.cpp backend.
+    ///
+    /// The operation waits until resident inference work is idle and then runs on the executor
+    /// thread. This is intended for native helpers such as `common/fit` that require initialized
+    /// devices and process-global serialization, not for model inference or arbitrary callbacks.
+    pub fn run_exclusive_native<T, F>(&self, operation: F) -> Result<T, InferenceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&LlamaBackend) -> T + Send + 'static,
+    {
+        let (response, receiver) = sync_channel(1);
+        let task = Box::new(move |backend: &LlamaBackend| {
+            let _ = response.send(operation(backend));
+        });
+        self.commands
+            .try_send(ExecutorCommand::RunExclusiveNative { task })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => InferenceError::Overloaded,
+                TrySendError::Disconnected(_) => InferenceError::ExecutorStopped,
+            })?;
+        receiver.recv().map_err(|_| InferenceError::ExecutorStopped)
+    }
+}
+
+/// Resolve platform-dependent worker-pool defaults once, before hardware
+/// assessment and loading consume the plan.
+pub fn resolve_execution_plan(
+    mut plan: ResolvedExecutionPlan,
+) -> Result<ResolvedExecutionPlan, InferenceError> {
+    let (threads, threads_batch) = resolved_thread_counts_with_defaults(&plan.execution)?;
+    plan.execution.threads = NonZeroU32::new(threads.get().cast_unsigned());
+    plan.execution.threads_batch = NonZeroU32::new(threads_batch.get().cast_unsigned());
+    Ok(plan)
 }
 
 impl CompletionBackend for LlamaCompletionBackend {
@@ -253,7 +320,7 @@ impl Drop for LlamaCompletionBackend {
 }
 
 fn executor_main(
-    config: ModelConfig,
+    config: ResolvedExecutionPlan,
     commands: Receiver<ExecutorCommand>,
     ready: SyncSender<Result<ModelProperties, InferenceError>>,
 ) {
@@ -271,7 +338,7 @@ fn executor_main(
             return;
         }
     };
-    let mut context_params = native_context_params(&config, threads, threads_batch);
+    let context_params = native_context_params(&config, threads, threads_batch);
     let model_params = match native_model_params(&config.execution) {
         Ok(params) => params,
         Err(error) => {
@@ -279,36 +346,7 @@ fn executor_main(
             return;
         }
     };
-    let mut model_params = std::pin::pin!(model_params);
-    if config.execution.gpu_layers == GpuLayers::Auto {
-        let model_path = match CString::new(config.model_path.to_string_lossy().as_bytes()) {
-            Ok(path) => path,
-            Err(error) => {
-                let _ = ready.send(Err(backend_error(error)));
-                return;
-            }
-        };
-        let mut margins = vec![1024 * 1024 * 1024; llama_cpp_2::max_devices()];
-        let report = match model_params.as_mut().fit_params_report(
-            &model_path,
-            &mut context_params,
-            &mut margins,
-            4_096,
-        ) {
-            Ok(report) => report,
-            Err(error) => {
-                let _ = ready.send(Err(backend_error(error)));
-                return;
-            }
-        };
-        if report.status != FitStatus::Success {
-            let _ = ready.send(Err(InferenceError::Backend(format!(
-                "llama.cpp automatic placement failed with {:?}: {:?}",
-                report.status, report.warnings
-            ))));
-            return;
-        }
-    }
+    let model_params = std::pin::pin!(model_params);
     let resolved_execution = resolved_execution_config(
         &config.execution,
         model_params.as_ref().get_ref(),
@@ -333,11 +371,78 @@ fn executor_main(
             return;
         }
     };
-    let mut context = match model.new_context(&backend, context_params) {
+    let context = match model.new_context(&backend, context_params) {
         Ok(context) => context,
         Err(error) => {
             let _ = ready.send(Err(backend_error(error)));
             return;
+        }
+    };
+    let mut context = Some(context);
+    let draft_model = match &config.mtp {
+        icn_contracts::MtpConfig::Enabled {
+            source: icn_contracts::MtpSource::Separate { model_path },
+            ..
+        } => {
+            match LlamaModel::load_from_file(&backend, model_path, model_params.as_ref().get_ref())
+            {
+                Ok(model) => Some(model),
+                Err(error) => {
+                    let _ = ready.send(Err(backend_error(error)));
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+    if let icn_contracts::MtpConfig::Enabled { source, .. } = &config.mtp {
+        let inspected = draft_model.as_ref().unwrap_or(&model).mtp_info();
+        let expected = match source {
+            icn_contracts::MtpSource::Bundled => llama_cpp_2::mtp::MtpModelKind::Bundled,
+            icn_contracts::MtpSource::Separate { .. } => llama_cpp_2::mtp::MtpModelKind::Draft,
+        };
+        if inspected.map(|info| info.kind) != Some(expected) {
+            let _ = ready.send(Err(InferenceError::InvalidConfig(format!(
+                "loaded MTP artifact role changed after preflight: expected {expected:?}, got {inspected:?}"
+            ))));
+            return;
+        }
+    }
+    let mut mtp = match &config.mtp {
+        icn_contracts::MtpConfig::Disabled { .. } => None,
+        icn_contracts::MtpConfig::Enabled {
+            n_max,
+            n_min,
+            p_min,
+            cache_type_k,
+            cache_type_v,
+            ..
+        } => {
+            let draft_context_params = native_context_params(&config, threads, threads_batch)
+                .with_context_type(LlamaContextType::Mtp)
+                .with_type_k(native_cache_type(*cache_type_k))
+                .with_type_v(native_cache_type(*cache_type_v))
+                .with_n_rs_seq(0)
+                .with_n_outputs_max(NonZeroU32::new(config.max_sequences));
+            let draft_model = draft_model.as_ref().unwrap_or(&model);
+            match MtpSession::new_linked(
+                context.take().expect("target context is constructed once"),
+                draft_model,
+                &backend,
+                draft_context_params,
+                MtpParams {
+                    n_max: i32::try_from(*n_max).unwrap_or(i32::MAX),
+                    n_min: i32::try_from(*n_min).unwrap_or(i32::MAX),
+                    p_min: *p_min,
+                },
+                config.max_sequences,
+            ) {
+                Ok(mtp) => Some(mtp),
+                Err(error) => {
+                    let _ = ready.send(Err(backend_error(error)));
+                    return;
+                }
+            }
         }
     };
     let mut multimodal = {
@@ -371,19 +476,88 @@ fn executor_main(
             return;
         }
     };
-    if threads == threads_batch {
+    if let Some(mtp) = mtp.as_mut() {
+        let mut draft_main_pool =
+            match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads)) {
+                Ok(pool) => pool,
+                Err(error) => {
+                    let _ = ready.send(Err(backend_error(error)));
+                    return;
+                }
+            };
+        let (context, draft_context, mut operations) = mtp.split_all_mut();
+        if threads == threads_batch {
+            let mut draft_attached = draft_context.attach_threadpool(&mut draft_main_pool);
+            let mut attached = context.attach_threadpool(&mut main_pool);
+            run_initialized_executor(
+                &backend,
+                &config,
+                resolved_execution,
+                &model,
+                &chat_templates,
+                &mut attached,
+                Some(&mut draft_attached),
+                Some(&mut operations),
+                &mut multimodal,
+                &commands,
+                &ready,
+            );
+        } else {
+            let mut batch_pool =
+                match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        let _ = ready.send(Err(backend_error(error)));
+                        return;
+                    }
+                };
+            let mut draft_batch_pool =
+                match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        let _ = ready.send(Err(backend_error(error)));
+                        return;
+                    }
+                };
+            let mut draft_attached =
+                draft_context.attach_threadpools(&mut draft_main_pool, &mut draft_batch_pool);
+            let mut attached = context.attach_threadpools(&mut main_pool, &mut batch_pool);
+            run_initialized_executor(
+                &backend,
+                &config,
+                resolved_execution,
+                &model,
+                &chat_templates,
+                &mut attached,
+                Some(&mut draft_attached),
+                Some(&mut operations),
+                &mut multimodal,
+                &commands,
+                &ready,
+            );
+        }
+    } else if threads == threads_batch {
+        let mut context = context
+            .take()
+            .expect("non-MTP target context remains owned");
         let mut attached = context.attach_threadpool(&mut main_pool);
         run_initialized_executor(
+            &backend,
             &config,
             resolved_execution,
             &model,
             &chat_templates,
             &mut attached,
+            None,
+            None,
             &mut multimodal,
             &commands,
             &ready,
         );
     } else {
+        let mut context = context
+            .take()
+            .expect("non-MTP target context remains owned");
         let mut batch_pool =
             match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
                 Ok(pool) => pool,
@@ -394,11 +568,14 @@ fn executor_main(
             };
         let mut attached = context.attach_threadpools(&mut main_pool, &mut batch_pool);
         run_initialized_executor(
+            &backend,
             &config,
             resolved_execution,
             &model,
             &chat_templates,
             &mut attached,
+            None,
+            None,
             &mut multimodal,
             &commands,
             &ready,
@@ -409,14 +586,28 @@ fn executor_main(
 fn resolved_thread_counts(
     execution: &ExecutionConfig,
 ) -> Result<(NonZeroI32, NonZeroI32), InferenceError> {
-    let main = match execution.threads {
-        Some(threads) => nonzero_i32(threads, "threads")?,
-        None => available_math_threads(),
-    };
-    let batch = match execution.threads_batch {
-        Some(threads) => nonzero_i32(threads, "threads_batch")?,
-        None => main,
-    };
+    let main = execution.threads.ok_or_else(|| {
+        InferenceError::InvalidConfig("execution plan is missing resolved threads".to_owned())
+    })?;
+    let batch = execution.threads_batch.ok_or_else(|| {
+        InferenceError::InvalidConfig("execution plan is missing resolved threads_batch".to_owned())
+    })?;
+    Ok((
+        nonzero_i32(main, "threads")?,
+        nonzero_i32(batch, "threads_batch")?,
+    ))
+}
+
+fn resolved_thread_counts_with_defaults(
+    execution: &ExecutionConfig,
+) -> Result<(NonZeroI32, NonZeroI32), InferenceError> {
+    let main = execution.threads.map_or_else(
+        || Ok(available_math_threads()),
+        |value| nonzero_i32(value, "threads"),
+    )?;
+    let batch = execution
+        .threads_batch
+        .map_or(Ok(main), |value| nonzero_i32(value, "threads_batch"))?;
     Ok((main, batch))
 }
 
@@ -533,16 +724,20 @@ fn native_model_params(execution: &ExecutionConfig) -> Result<LlamaModelParams, 
 }
 
 fn native_context_params(
-    config: &ModelConfig,
+    config: &ResolvedExecutionPlan,
     threads: NonZeroI32,
     threads_batch: NonZeroI32,
 ) -> LlamaContextParams {
     let execution = &config.execution;
-    LlamaContextParams::default()
+    let mut params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(config.context_size))
         .with_n_batch(config.batch_size)
         .with_n_ubatch(config.ubatch_size)
         .with_n_seq_max(config.max_sequences)
+        // Match llama-server's server_n_outputs_max(): ordinary generation emits at most one
+        // logit row per sequence. Leaving this at zero makes llama.cpp reserve n_batch rows,
+        // which is dramatically more output work for large vocabularies.
+        .with_n_outputs_max(NonZeroU32::new(config.max_sequences.min(config.batch_size)))
         .with_n_threads(threads.get())
         .with_n_threads_batch(threads_batch.get())
         .with_type_k(native_cache_type(execution.cache_type_k))
@@ -555,7 +750,18 @@ fn native_context_params(
             FlashAttention::Auto => FlashAttentionPolicy::Auto,
             FlashAttention::Disabled => FlashAttentionPolicy::Disabled,
             FlashAttention::Enabled => FlashAttentionPolicy::Enabled,
-        })
+        });
+    if let icn_contracts::MtpConfig::Enabled { n_max, .. } = config.mtp {
+        // Recurrent architectures cannot remove an arbitrary speculative suffix from their
+        // state. llama.cpp keeps one rollback snapshot per possible draft token instead.
+        params = params.with_n_rs_seq(n_max);
+        let outputs = config
+            .max_sequences
+            .saturating_mul(n_max.saturating_add(1))
+            .min(config.batch_size);
+        params = params.with_n_outputs_max(NonZeroU32::new(outputs));
+    }
+    params
 }
 
 fn native_cache_type(cache_type: CacheType) -> KvCacheType {
@@ -597,16 +803,19 @@ fn trimmed_tensor_split(weights: &[f32]) -> Option<Vec<f32>> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_initialized_executor<'model>(
-    config: &ModelConfig,
+    backend: &LlamaBackend,
+    config: &ResolvedExecutionPlan,
     resolved_execution: ExecutionConfig,
     model: &'model LlamaModel,
     chat_templates: &CommonChatTemplates,
     context: &mut LlamaContext<'model>,
+    draft_context: Option<&mut LlamaContext<'model>>,
+    mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
     ready: &SyncSender<Result<ModelProperties, InferenceError>>,
 ) {
-    if let Err(error) = warm_up(model, context) {
+    if let Err(error) = warm_up(model, context, mtp.as_deref_mut()) {
         let _ = ready.send(Err(error));
         return;
     }
@@ -630,20 +839,38 @@ fn run_initialized_executor<'model>(
     if ready.send(Ok(properties)).is_err() {
         return;
     }
-    run_scheduler(config, model, chat_templates, context, multimodal, commands);
+    run_scheduler(
+        backend,
+        config,
+        model,
+        chat_templates,
+        context,
+        draft_context,
+        mtp,
+        multimodal,
+        commands,
+    );
 }
 
+// The scheduler composition root receives each owned runtime subsystem explicitly. Keeping these
+// borrows visible is clearer than hiding them behind a second mutable service-locator struct.
+#[allow(clippy::too_many_arguments)]
 fn run_scheduler<'model>(
-    config: &ModelConfig,
+    backend: &LlamaBackend,
+    config: &ResolvedExecutionPlan,
     model: &'model LlamaModel,
     chat_templates: &CommonChatTemplates,
     context: &mut LlamaContext<'model>,
+    mut draft_context: Option<&mut LlamaContext<'model>>,
+    mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
 ) {
     let mut sequence_pool = SequencePool::new(config.max_sequences);
     let mut planner = BatchPlanner::new(config.prefill_quantum as usize);
+    let mut decode_buffer = LlamaBatch::new(context.n_batch() as usize, 1);
     let mut queued = VecDeque::<QueuedCompletion>::new();
+    let mut exclusive_native = VecDeque::<ExclusiveNativeTask>::new();
     let mut active = Vec::<ActiveRequest<'_>>::new();
     let mut shutting_down = false;
     let max_tracked = COMMAND_QUEUE_CAPACITY + config.max_sequences as usize;
@@ -654,22 +881,60 @@ fn run_scheduler<'model>(
             chat_templates,
             multimodal.as_ref().map(multimodal_marker),
             &mut queued,
+            &mut exclusive_native,
             &active,
             max_tracked,
             &mut shutting_down,
         );
 
-        cleanup_requests(context, &mut sequence_pool, &mut active);
+        if active.is_empty()
+            && queued.is_empty()
+            && !shutting_down
+            && let Some(task) = exclusive_native.pop_front()
+        {
+            task(backend);
+            continue;
+        }
+
+        if active.is_empty() && !queued.is_empty() && !shutting_down {
+            let deadline = Instant::now() + IDLE_ADMISSION_COALESCE_INTERVAL;
+            while queued.len() < config.max_sequences as usize {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match commands.recv_timeout(remaining) {
+                    Ok(command) => handle_command(
+                        command,
+                        chat_templates,
+                        multimodal.as_ref().map(multimodal_marker),
+                        &mut queued,
+                        &mut exclusive_native,
+                        0,
+                        max_tracked,
+                        &mut shutting_down,
+                    ),
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        shutting_down = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
 
         if shutting_down {
             fail_queued(&mut queued, InferenceError::ExecutorStopped);
             fail_active(
                 context,
+                mtp.as_deref_mut(),
                 &mut sequence_pool,
                 &mut active,
                 InferenceError::ExecutorStopped,
             );
-            cleanup_requests(context, &mut sequence_pool, &mut active);
+            cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
             if active.is_empty() {
                 break;
             }
@@ -679,19 +944,36 @@ fn run_scheduler<'model>(
                 chat_templates,
                 multimodal.as_ref(),
                 context,
+                draft_context.as_deref_mut(),
+                mtp.as_deref_mut(),
                 &mut sequence_pool,
                 &mut queued,
                 &mut active,
             );
         }
 
-        sample_ready_requests(model, context, &mut sequence_pool, &mut active);
-        cleanup_requests(context, &mut sequence_pool, &mut active);
+        sample_ready_requests(
+            model,
+            context,
+            mtp.as_deref_mut(),
+            &mut sequence_pool,
+            &mut active,
+        );
+        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
 
         let decoded = if shutting_down {
             false
         } else {
-            match decode_batch(context, multimodal, &mut planner, &mut active) {
+            match decode_batch(
+                model,
+                context,
+                draft_context.as_deref_mut(),
+                mtp.as_deref_mut(),
+                multimodal,
+                &mut planner,
+                &mut decode_buffer,
+                &mut active,
+            ) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     // A failed decode can leave shared native memory in an uncertain state. Fail
@@ -699,18 +981,28 @@ fn run_scheduler<'model>(
                     // work rather than guessing which sequence committed.
                     context.synchronize();
                     context.clear_memory(false);
+                    if let Some(draft_context) = draft_context.as_deref_mut() {
+                        draft_context.synchronize();
+                        draft_context.clear_memory(false);
+                    }
                     let failure = if matches!(error, InferenceError::Cancelled) {
                         InferenceError::Cancelled
                     } else {
                         InferenceError::Backend(error.to_string())
                     };
-                    fail_active(context, &mut sequence_pool, &mut active, failure);
+                    fail_active(
+                        context,
+                        mtp.as_deref_mut(),
+                        &mut sequence_pool,
+                        &mut active,
+                        failure,
+                    );
                     false
                 }
             }
         };
 
-        cleanup_requests(context, &mut sequence_pool, &mut active);
+        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
 
         if !decoded {
             match commands.recv_timeout(IDLE_POLL_INTERVAL) {
@@ -719,6 +1011,7 @@ fn run_scheduler<'model>(
                     chat_templates,
                     multimodal.as_ref().map(multimodal_marker),
                     &mut queued,
+                    &mut exclusive_native,
                     active.len(),
                     max_tracked,
                     &mut shutting_down,
@@ -730,11 +1023,15 @@ fn run_scheduler<'model>(
     }
 }
 
+// Command dispatch keeps completion admission and exclusive native work as distinct bounded
+// queues; listing both mutable destinations makes their ordering and ownership explicit.
+#[allow(clippy::too_many_arguments)]
 fn drain_commands(
     commands: &Receiver<ExecutorCommand>,
     chat_templates: &CommonChatTemplates,
     media_marker: Option<&str>,
     queued: &mut VecDeque<QueuedCompletion>,
+    exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
     active: &[ActiveRequest<'_>],
     max_tracked: usize,
     shutting_down: &mut bool,
@@ -746,6 +1043,7 @@ fn drain_commands(
                 chat_templates,
                 media_marker,
                 queued,
+                exclusive_native,
                 active.len(),
                 max_tracked,
                 shutting_down,
@@ -759,11 +1057,13 @@ fn drain_commands(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     command: ExecutorCommand,
     chat_templates: &CommonChatTemplates,
     media_marker: Option<&str>,
     queued: &mut VecDeque<QueuedCompletion>,
+    exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
     active_count: usize,
     max_tracked: usize,
     shutting_down: &mut bool,
@@ -797,24 +1097,52 @@ fn handle_command(
             };
             let _ = response.send(result);
         }
+        ExecutorCommand::RunExclusiveNative { task } => {
+            if !*shutting_down {
+                exclusive_native.push_back(task);
+            }
+        }
         ExecutorCommand::Shutdown => *shutting_down = true,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admit_requests<'model>(
     model: &'model LlamaModel,
     chat_templates: &CommonChatTemplates,
     multimodal: Option<&MultimodalRuntime<'model>>,
     context: &mut LlamaContext<'model>,
+    mut draft_context: Option<&mut LlamaContext<'model>>,
+    mut mtp: Option<&mut MtpOperations<'_>>,
     sequence_pool: &mut SequencePool,
     queued: &mut VecDeque<QueuedCompletion>,
     active: &mut Vec<ActiveRequest<'model>>,
 ) {
-    while let Some(sequence_id) = sequence_pool.acquire() {
-        let Some(queued_request) = queued.pop_front() else {
-            sequence_pool.release(sequence_id);
+    while !queued.is_empty() {
+        let matching_prompt = queued.front().and_then(|queued| {
+            (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
+                .then(|| {
+                    prepare_chat(
+                        chat_templates,
+                        &queued.request.template,
+                        multimodal.map(multimodal_marker),
+                    )
+                    .and_then(|prepared| plain_prompt(model, &prepared))
+                    .map(|prompt| prompt.text_tokens)
+                    .ok()
+                })
+                .flatten()
+        });
+        let sequence_id = match matching_prompt.as_deref() {
+            Some(prompt) => sequence_pool.acquire_matching(prompt),
+            None => sequence_pool.acquire(),
+        };
+        let Some(sequence_id) = sequence_id else {
             break;
         };
+        let queued_request = queued
+            .pop_front()
+            .expect("queue was checked before acquiring a sequence");
         if queued_request.cancelled.load(Ordering::Acquire) {
             let _ = queued_request
                 .events
@@ -822,23 +1150,71 @@ fn admit_requests<'model>(
             sequence_pool.release(sequence_id);
             continue;
         }
-        if let Err(error) = clear_sequence(context, sequence_id) {
-            let _ = queued_request.events.try_send(ExecutorItem::Failed(error));
-            sequence_pool.quarantine(sequence_id);
-            continue;
-        }
+        let cached = sequence_pool.take_cache(sequence_id);
         match ActiveRequest::admit(
             model,
             chat_templates,
             multimodal,
             context.n_ctx_seq() as usize,
+            context.n_batch() as usize,
+            context.n_ubatch() as usize,
             sequence_id,
             queued_request,
+            cached.as_ref(),
         ) {
-            Ok(request) => active.push(request),
+            Ok(mut request) => {
+                let requested_start = request.prompt_offset;
+                let partial = clear_sequence_range(
+                    context,
+                    mtp.as_deref_mut(),
+                    sequence_id,
+                    i32::try_from(requested_start).unwrap_or(i32::MAX),
+                    -1,
+                );
+                if partial.is_err() && requested_start > 0 {
+                    let checkpoint = cached.as_ref().and_then(|cache| {
+                        cache
+                            .checkpoints
+                            .iter()
+                            .rev()
+                            .find(|checkpoint| checkpoint.prefix <= requested_start)
+                    });
+                    let restored = checkpoint.is_some_and(|checkpoint| {
+                        restore_prompt_checkpoint(
+                            context,
+                            draft_context.as_deref_mut(),
+                            sequence_id,
+                            checkpoint,
+                        )
+                    });
+                    request.prompt_offset = checkpoint
+                        .filter(|_| restored)
+                        .map_or(0, |value| value.prefix);
+                    request.cached_prompt_tokens = request.prompt_offset;
+                    if clear_sequence_range(
+                        context,
+                        mtp.as_deref_mut(),
+                        sequence_id,
+                        i32::try_from(request.prompt_offset).unwrap_or(i32::MAX),
+                        -1,
+                    )
+                    .is_err()
+                    {
+                        let _ =
+                            request
+                                .events
+                                .try_send(ExecutorItem::Failed(InferenceError::Backend(format!(
+                                    "llama.cpp refused to reset cached sequence {sequence_id}"
+                                ))));
+                        sequence_pool.quarantine(sequence_id);
+                        continue;
+                    }
+                }
+                active.push(request);
+            }
             Err((events, error)) => {
                 let _ = events.try_send(ExecutorItem::Failed(error));
-                if clear_sequence(context, sequence_id).is_ok() {
+                if clear_sequence(context, mtp.as_deref_mut(), sequence_id).is_ok() {
                     sequence_pool.release(sequence_id);
                 } else {
                     sequence_pool.quarantine(sequence_id);
@@ -851,6 +1227,7 @@ fn admit_requests<'model>(
 fn sample_ready_requests<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
+    mut mtp: Option<&mut MtpOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut [ActiveRequest<'model>],
 ) {
@@ -860,33 +1237,159 @@ fn sample_ready_requests<'model>(
         };
         if request.cancelled.load(Ordering::Acquire) {
             cancel_request(request);
-            release_sequence(context, sequence_pool, request);
+            release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
             continue;
+        }
+        if !request.mtp_started
+            && request.multimodal_prompt.is_none()
+            && let Some(operations) = mtp.as_deref_mut()
+        {
+            let sequence_id = request.sequence_id.expect("ready request owns a sequence");
+            if let Err(error) = operations.begin(sequence_id, &request.cache_history) {
+                fail_request(request, backend_error(error));
+                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                continue;
+            }
+            request.mtp_started = true;
         }
         match request.sample_next(model, context, batch_index) {
             Ok(Some(reason)) => {
                 if let Err(error) = request.complete(reason) {
                     fail_request(request, error);
                 }
-                release_sequence(context, sequence_pool, request);
+                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
             }
             Ok(None) => {}
             Err(error) => {
                 fail_request(request, error);
-                release_sequence(context, sequence_pool, request);
+                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_batch<'model>(
+    model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
+    mut draft_context: Option<&mut LlamaContext<'model>>,
+    mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     planner: &mut BatchPlanner,
+    batch: &mut LlamaBatch<'_>,
     active: &mut [ActiveRequest<'model>],
 ) -> Result<bool, InferenceError> {
     if decode_multimodal_prefill(context, multimodal, active)? {
         return Ok(true);
+    }
+
+    let can_checkpoint_prompt = mtp.is_none() || draft_context.is_some();
+    if can_checkpoint_prompt {
+        for request in active.iter_mut().filter(|request| {
+            request.cache_prompt
+                && request.cacheable
+                && matches!(request.phase, RequestPhase::Prefill)
+                && request.pending_checkpoint_prefixes.front().copied()
+                    == Some(request.prompt_offset)
+        }) {
+            let prefix = request
+                .pending_checkpoint_prefixes
+                .pop_front()
+                .expect("checkpoint position was matched");
+            let sequence_id = request
+                .sequence_id
+                .expect("prefill request owns a sequence");
+            let target_checkpoint = context
+                .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
+                .ok()
+                .filter(|checkpoint| !checkpoint.is_empty());
+            let draft_checkpoint = draft_context.as_deref_mut().and_then(|draft_context| {
+                draft_context
+                    .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
+                    .ok()
+                    .filter(|checkpoint| !checkpoint.is_empty())
+            });
+            if let Some(target) = target_checkpoint
+                && (mtp.is_none() || draft_checkpoint.is_some())
+            {
+                request.prompt_checkpoints.push(PromptCheckpoint {
+                    target,
+                    draft: draft_checkpoint,
+                    prefix,
+                });
+                request
+                    .prompt_checkpoints
+                    .sort_by_key(|checkpoint| checkpoint.prefix);
+                if request.prompt_checkpoints.len() > 32 {
+                    request.prompt_checkpoints.remove(0);
+                }
+            }
+        }
+    }
+
+    let mut draft_extra_tokens = 0_usize;
+    if let Some(operations) = mtp.as_mut() {
+        let mut drafted_sequences = Vec::new();
+        let started = Instant::now();
+        let decode_count = active
+            .iter()
+            .filter(|request| {
+                request.sequence_id.is_some()
+                    && request.outbound.is_empty()
+                    && matches!(request.phase, RequestPhase::Decode { .. })
+            })
+            .count();
+        let mut extra_budget = (context.n_batch() as usize).saturating_sub(decode_count);
+        for request in active.iter_mut().filter(|request| {
+            request.mtp_started
+                && request.mtp_draft.is_empty()
+                && request.sequence_id.is_some()
+                && request.outbound.is_empty()
+                && matches!(request.phase, RequestPhase::Decode { .. })
+        }) {
+            let RequestPhase::Decode { token, position } = request.phase else {
+                unreachable!()
+            };
+            let remaining = request
+                .generation_limit
+                .saturating_sub(request.generated_tokens);
+            let n_max = remaining
+                .min(operations.max_draft_tokens())
+                .min(extra_budget);
+            if n_max == 0 {
+                continue;
+            }
+            let sequence_id = request.sequence_id.expect("selected request owns sequence");
+            operations
+                .prepare_draft(sequence_id, position, token, &request.cache_history, n_max)
+                .map_err(backend_error)?;
+            extra_budget -= n_max;
+            drafted_sequences.push(sequence_id);
+        }
+        if !drafted_sequences.is_empty() {
+            operations.draft_all().map_err(backend_error)?;
+            let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+            for sequence_id in drafted_sequences {
+                let request = request_by_sequence(active, sequence_id)?;
+                request.mtp_draft = operations.take_draft(sequence_id).map_err(backend_error)?;
+                let RequestPhase::Decode { position, .. } = request.phase else {
+                    return Err(InferenceError::Backend(
+                        "MTP request left decode state while drafting".into(),
+                    ));
+                };
+                // MTP autoregressively advances its draft context while producing the
+                // proposal. The target verification batch will mirror the sampled token
+                // and accepted proposal back into that context, so discard the temporary
+                // speculative suffix first. This is the same transition performed by
+                // llama.cpp's server immediately after common_speculative_draft().
+                operations
+                    .remove_sequence_range(sequence_id, position, -1)
+                    .map_err(backend_error)?;
+                draft_extra_tokens = draft_extra_tokens.saturating_add(request.mtp_draft.len());
+                request.draft_tokens = request.draft_tokens.saturating_add(request.mtp_draft.len());
+                request.draft_ms += elapsed;
+            }
+        }
     }
 
     let candidates = active
@@ -900,7 +1403,14 @@ fn decode_batch<'model>(
             let sequence_id = request.sequence_id?;
             let kind = match request.phase {
                 RequestPhase::Prefill => WorkKind::Prefill {
-                    remaining: request.prompt.len().saturating_sub(request.prompt_offset),
+                    remaining: request
+                        .pending_checkpoint_prefixes
+                        .front()
+                        .filter(|_| can_checkpoint_prompt && request.cache_prompt)
+                        .map_or_else(
+                            || request.prompt.len().saturating_sub(request.prompt_offset),
+                            |prefix| prefix.saturating_sub(request.prompt_offset),
+                        ),
                 },
                 RequestPhase::Decode { .. } => WorkKind::Decode,
                 RequestPhase::ReadyToSample { .. } | RequestPhase::Terminal => return None,
@@ -908,12 +1418,15 @@ fn decode_batch<'model>(
             Some(WorkCandidate { sequence_id, kind })
         })
         .collect::<Vec<_>>();
-    let plan = planner.plan(&candidates, context.n_batch() as usize);
+    let plan = planner.plan(
+        &candidates,
+        (context.n_batch() as usize).saturating_sub(draft_extra_tokens),
+    );
     if plan.is_empty() {
         return Ok(false);
     }
 
-    let mut batch = LlamaBatch::new(context.n_batch() as usize, 1);
+    batch.clear();
     let mut logits = Vec::<(i32, i32)>::new();
     let batch_started = Instant::now();
 
@@ -926,10 +1439,28 @@ fn decode_batch<'model>(
                         "scheduler selected sequence {sequence_id} for decode in the wrong state"
                     )));
                 };
+                request.mtp_indices.clear();
                 batch
                     .add(token, position, &[sequence_id], true)
                     .map_err(backend_error)?;
-                logits.push((sequence_id, batch.n_tokens() - 1));
+                request.mtp_indices.push(batch.n_tokens() - 1);
+                if request.mtp_draft.is_empty() {
+                    logits.push((sequence_id, batch.n_tokens() - 1));
+                } else {
+                    for (offset, draft) in request.mtp_draft.iter().copied().enumerate() {
+                        let draft_position = position
+                            .checked_add(i32::try_from(offset + 1).map_err(backend_error)?)
+                            .ok_or_else(|| {
+                                InferenceError::Backend(
+                                    "speculative position exceeded i32::MAX".into(),
+                                )
+                            })?;
+                        batch
+                            .add(draft, draft_position, &[sequence_id], true)
+                            .map_err(backend_error)?;
+                        request.mtp_indices.push(batch.n_tokens() - 1);
+                    }
+                }
             }
             BatchWork::Prefill {
                 sequence_id,
@@ -959,12 +1490,102 @@ fn decode_batch<'model>(
         }
     }
 
-    context.decode(&mut batch).map_err(backend_error)?;
+    let verification_started = Instant::now();
+    context.decode(batch).map_err(backend_error)?;
+    if let Some(operations) = mtp.as_mut() {
+        operations.process(batch).map_err(backend_error)?;
+    }
+    let verification_ms = verification_started.elapsed().as_secs_f64() * 1_000.0;
     for (sequence_id, batch_index) in logits {
         let request = request_by_sequence(active, sequence_id)?;
+        if let RequestPhase::Decode { token, .. } = request.phase {
+            request.cache_history.push(token);
+        }
         request.phase = RequestPhase::ReadyToSample { batch_index };
     }
+    if let Some(operations) = mtp.as_mut() {
+        verify_mtp_batch(model, context, operations, active, verification_ms)?;
+    }
     Ok(true)
+}
+
+fn verify_mtp_batch<'model>(
+    model: &'model LlamaModel,
+    context: &mut LlamaContext<'model>,
+    operations: &mut MtpOperations<'_>,
+    active: &mut [ActiveRequest<'model>],
+    verification_ms: f64,
+) -> Result<(), InferenceError> {
+    for request in active
+        .iter_mut()
+        .filter(|request| !request.mtp_draft.is_empty())
+    {
+        let sequence_id = request
+            .sequence_id
+            .ok_or_else(|| InferenceError::Backend("MTP request lost its sequence".into()))?;
+        let RequestPhase::Decode {
+            token: pending,
+            position: _,
+        } = request.phase
+        else {
+            return Err(InferenceError::Backend(
+                "MTP verification request was not in decode state".into(),
+            ));
+        };
+        let accepted = request
+            .sampler
+            .sample_and_accept_n(context, &request.mtp_indices, &request.mtp_draft, false)
+            .map_err(backend_error)?;
+        if accepted.is_empty() {
+            return Err(InferenceError::Backend(
+                "native speculative verification returned no continuation token".into(),
+            ));
+        }
+        let accepted_drafts = accepted.len() - 1;
+        operations
+            .accept(
+                sequence_id,
+                u16::try_from(accepted_drafts).map_err(backend_error)?,
+            )
+            .map_err(backend_error)?;
+
+        request.cache_history.push(pending);
+        request
+            .cache_history
+            .extend(accepted.iter().take(accepted_drafts).copied());
+        let next_position = i32::try_from(request.cache_history.len()).map_err(backend_error)?;
+        operations
+            .remove_sequence_range(sequence_id, next_position, -1)
+            .map_err(backend_error)?;
+        request.accepted_draft_tokens = request
+            .accepted_draft_tokens
+            .saturating_add(accepted_drafts);
+        request.verification_ms += verification_ms;
+        request.mtp_draft.clear();
+        request.mtp_indices.clear();
+
+        let mut terminal = None;
+        for token in accepted.iter().copied() {
+            if let Some(reason) = request.emit_accepted_token(model, token)? {
+                terminal = Some(reason);
+                break;
+            }
+        }
+        if let Some(reason) = terminal {
+            request.complete(reason)?;
+            request.phase = RequestPhase::Terminal;
+        } else {
+            let continuation = *accepted.last().expect("checked non-empty");
+            request.phase = RequestPhase::Decode {
+                token: continuation,
+                position: next_position,
+            };
+            request.next_position = next_position.checked_add(1).ok_or_else(|| {
+                InferenceError::Backend("generation position exceeded i32::MAX".into())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "mtmd")]
@@ -1054,8 +1675,33 @@ fn request_by_sequence<'a, 'model>(
         })
 }
 
+fn common_token_prefix(left: &[LlamaToken], right: &[LlamaToken]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn restore_prompt_checkpoint(
+    context: &mut LlamaContext<'_>,
+    draft_context: Option<&mut LlamaContext<'_>>,
+    sequence_id: i32,
+    checkpoint: &PromptCheckpoint,
+) -> bool {
+    if let Some(draft_context) = draft_context {
+        let Some(draft_checkpoint) = checkpoint.draft.as_ref() else {
+            return false;
+        };
+        if !draft_context.restore_sequence_state(draft_checkpoint, sequence_id) {
+            return false;
+        }
+    }
+    context.restore_sequence_state(&checkpoint.target, sequence_id)
+}
+
 fn cleanup_requests(
     context: &mut LlamaContext<'_>,
+    mut mtp: Option<&mut MtpOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut Vec<ActiveRequest<'_>>,
 ) {
@@ -1065,14 +1711,34 @@ fn cleanup_requests(
             && !matches!(active[index].phase, RequestPhase::Terminal)
         {
             cancel_request(&mut active[index]);
-            release_sequence(context, sequence_pool, &mut active[index]);
+            release_sequence(
+                context,
+                mtp.as_deref_mut(),
+                sequence_pool,
+                &mut active[index],
+            );
         }
         match flush_outbound(&mut active[index]) {
             FlushOutcome::Empty if matches!(active[index].phase, RequestPhase::Terminal) => {
-                active.remove(index);
+                release_sequence(
+                    context,
+                    mtp.as_deref_mut(),
+                    sequence_pool,
+                    &mut active[index],
+                );
+                if active[index].outbound.is_empty() {
+                    active.remove(index);
+                } else {
+                    index += 1;
+                }
             }
             FlushOutcome::Disconnected => {
-                release_sequence(context, sequence_pool, &mut active[index]);
+                release_sequence(
+                    context,
+                    mtp.as_deref_mut(),
+                    sequence_pool,
+                    &mut active[index],
+                );
                 active.remove(index);
             }
             FlushOutcome::Empty | FlushOutcome::Backpressured => index += 1,
@@ -1099,16 +1765,27 @@ fn flush_outbound(request: &mut ActiveRequest<'_>) -> FlushOutcome {
 
 fn release_sequence(
     context: &mut LlamaContext<'_>,
+    mtp: Option<&mut MtpOperations<'_>>,
     sequence_pool: &mut SequencePool,
     request: &mut ActiveRequest<'_>,
 ) {
     let Some(sequence_id) = request.sequence_id.take() else {
         return;
     };
+    if request.cache_prompt && request.cacheable {
+        sequence_pool.release_cached(
+            sequence_id,
+            SequenceCache {
+                prompt: request.prompt.clone(),
+                checkpoints: std::mem::take(&mut request.prompt_checkpoints),
+            },
+        );
+        return;
+    }
     // Full sequence removal is supported for every llama.cpp memory implementation. This is the
     // sole cache policy required by this milestone: a sequence is never reassigned while resident
     // state still belongs to the previous request.
-    match clear_sequence(context, sequence_id) {
+    match clear_sequence(context, mtp, sequence_id) {
         Ok(()) => sequence_pool.release(sequence_id),
         Err(error) => {
             // Never hand a sequence to another request unless native state removal succeeded.
@@ -1120,10 +1797,33 @@ fn release_sequence(
     }
 }
 
-fn clear_sequence(context: &mut LlamaContext<'_>, sequence_id: i32) -> Result<(), InferenceError> {
+fn clear_sequence(
+    context: &mut LlamaContext<'_>,
+    mtp: Option<&mut MtpOperations<'_>>,
+    sequence_id: i32,
+) -> Result<(), InferenceError> {
+    clear_sequence_range(context, mtp, sequence_id, 0, -1)
+}
+
+fn clear_sequence_range(
+    context: &mut LlamaContext<'_>,
+    mtp: Option<&mut MtpOperations<'_>>,
+    sequence_id: i32,
+    start: i32,
+    end: i32,
+) -> Result<(), InferenceError> {
+    if let Some(mtp) = mtp {
+        return mtp
+            .remove_sequence_range(sequence_id, start, end)
+            .map_err(backend_error);
+    }
     let sequence = u32::try_from(sequence_id).map_err(backend_error)?;
     let removed = context
-        .clear_kv_cache_seq(Some(sequence), None, None)
+        .clear_kv_cache_seq(
+            Some(sequence),
+            (start > 0).then_some(start as u32),
+            (end >= 0).then_some(end as u32),
+        )
         .map_err(backend_error)?;
     if removed {
         Ok(())
@@ -1136,6 +1836,7 @@ fn clear_sequence(context: &mut LlamaContext<'_>, sequence_id: i32) -> Result<()
 
 fn fail_request(request: &mut ActiveRequest<'_>, error: InferenceError) {
     request.phase = RequestPhase::Terminal;
+    request.cacheable = false;
     if request.outbound.len() >= OUTBOUND_QUEUE_CAPACITY {
         request.outbound.clear();
     }
@@ -1144,6 +1845,7 @@ fn fail_request(request: &mut ActiveRequest<'_>, error: InferenceError) {
 
 fn cancel_request(request: &mut ActiveRequest<'_>) {
     request.outbound.clear();
+    request.cacheable = false;
     fail_request(request, InferenceError::Cancelled);
 }
 
@@ -1157,6 +1859,7 @@ fn fail_queued(queued: &mut VecDeque<QueuedCompletion>, reason: InferenceError) 
 
 fn fail_active(
     context: &mut LlamaContext<'_>,
+    mut mtp: Option<&mut MtpOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut [ActiveRequest<'_>],
     reason: InferenceError,
@@ -1165,7 +1868,7 @@ fn fail_active(
         if !matches!(request.phase, RequestPhase::Terminal) {
             fail_request(request, clone_inference_error(&reason));
         }
-        release_sequence(context, sequence_pool, request);
+        release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
     }
 }
 
@@ -1180,7 +1883,7 @@ fn clone_inference_error(error: &InferenceError) -> InferenceError {
     }
 }
 
-fn validate_model_config(config: &ModelConfig) -> Result<(), InferenceError> {
+fn validate_model_config(config: &ResolvedExecutionPlan) -> Result<(), InferenceError> {
     if !config.model_path.is_file() {
         return Err(InferenceError::InvalidConfig(format!(
             "GGUF model does not exist: {}",
@@ -1223,10 +1926,10 @@ fn validate_model_config(config: &ModelConfig) -> Result<(), InferenceError> {
                 .into(),
         ));
     }
-    if config.execution.gpu_layers == GpuLayers::Auto && config.execution.tensor_split.is_some() {
+    if config.execution.gpu_layers == GpuLayers::Auto {
         return Err(InferenceError::InvalidConfig(
-            "gpu_layers=auto cannot be combined with tensor_split because common/fit owns placement"
-                .into(),
+            "the engine requires a resolved GPU-layer plan; run icn-hardware assessment before loading"
+                .to_owned(),
         ));
     }
     if config.execution.split_mode == SplitMode::None && config.execution.tensor_split.is_some() {
@@ -1245,6 +1948,12 @@ fn validate_model_config(config: &ModelConfig) -> Result<(), InferenceError> {
     {
         return Err(InferenceError::InvalidConfig(
             "thread counts must not exceed i32::MAX".into(),
+        ));
+    }
+    if config.execution.threads.is_none() || config.execution.threads_batch.is_none() {
+        return Err(InferenceError::InvalidConfig(
+            "the engine requires resolved thread counts; call resolve_execution_plan first"
+                .to_owned(),
         ));
     }
     if config.execution.flash_attention == FlashAttention::Disabled
@@ -1270,7 +1979,7 @@ fn validate_model_config(config: &ModelConfig) -> Result<(), InferenceError> {
 
 #[cfg(not(feature = "mtmd"))]
 fn validate_projector_config(
-    _config: &ModelConfig,
+    _config: &ResolvedExecutionPlan,
     _projector: &ProjectorConfig,
 ) -> Result<(), InferenceError> {
     Err(InferenceError::InvalidConfig(
@@ -1281,7 +1990,7 @@ fn validate_projector_config(
 
 #[cfg(feature = "mtmd")]
 fn validate_projector_config(
-    config: &ModelConfig,
+    config: &ResolvedExecutionPlan,
     projector: &ProjectorConfig,
 ) -> Result<(), InferenceError> {
     if !projector.path.is_file() {
@@ -1331,7 +2040,11 @@ fn validate_projector_config(
     Ok(())
 }
 
-fn warm_up(model: &LlamaModel, context: &mut LlamaContext<'_>) -> Result<(), InferenceError> {
+fn warm_up(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    mtp: Option<&mut MtpOperations<'_>>,
+) -> Result<(), InferenceError> {
     let tokens = model
         .str_to_token(" ", AddBos::Always)
         .map_err(backend_error)?;
@@ -1339,6 +2052,9 @@ fn warm_up(model: &LlamaModel, context: &mut LlamaContext<'_>) -> Result<(), Inf
         let mut batch = LlamaBatch::new(1, 1);
         batch.add(token, 0, &[0], false).map_err(backend_error)?;
         context.decode(&mut batch).map_err(backend_error)?;
+        if let Some(mtp) = mtp {
+            mtp.process(&batch).map_err(backend_error)?;
+        }
         context.synchronize();
         context.clear_kv_cache();
     }
@@ -1347,7 +2063,7 @@ fn warm_up(model: &LlamaModel, context: &mut LlamaContext<'_>) -> Result<(), Inf
 }
 
 fn model_properties(
-    config: &ModelConfig,
+    config: &ResolvedExecutionPlan,
     resolved_execution: ExecutionConfig,
     model: &LlamaModel,
     context: &LlamaContext<'_>,
@@ -1378,6 +2094,25 @@ fn model_properties(
             enable_thinking: capabilities.supports_enable_thinking,
         },
         modalities,
+        mtp: match &config.mtp {
+            icn_contracts::MtpConfig::Disabled { reason } => {
+                icn_contracts::MtpRuntimeProperties::Disabled {
+                    reason: reason.clone(),
+                }
+            }
+            icn_contracts::MtpConfig::Enabled {
+                source,
+                n_max,
+                n_min,
+                p_min,
+                ..
+            } => icn_contracts::MtpRuntimeProperties::Enabled {
+                source: source.clone(),
+                n_max: *n_max,
+                n_min: *n_min,
+                p_min: *p_min,
+            },
+        },
         execution: ExecutionConfigReport {
             requested: config.execution.clone(),
             resolved: resolved_execution,
@@ -1521,13 +2256,17 @@ fn multimodal_modalities(_runtime: &MultimodalRuntime<'_>) -> ModelModalities {
 }
 
 impl<'model> ActiveRequest<'model> {
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         model: &'model LlamaModel,
         chat_templates: &CommonChatTemplates,
         multimodal: Option<&MultimodalRuntime<'model>>,
         context_capacity: usize,
+        batch_size: usize,
+        ubatch_size: usize,
         sequence_id: i32,
         queued: QueuedCompletion,
+        cached: Option<&SequenceCache>,
     ) -> Result<Self, (SyncSender<ExecutorItem>, InferenceError)> {
         let QueuedCompletion {
             request,
@@ -1570,6 +2309,42 @@ impl<'model> ActiveRequest<'model> {
                 .map_err(backend_error)?;
             let mut stops = request.stop.clone();
             stops.extend(prepared.additional_stops().iter().cloned());
+            let mut cached_prompt_tokens = if request.cache_prompt && tokenized.multimodal.is_none()
+            {
+                cached.map_or(0, |cached| {
+                    common_token_prefix(&cached.prompt, &tokenized.text_tokens)
+                })
+            } else {
+                0
+            };
+            // The last prompt token must be evaluated to obtain logits for the first sample.
+            if cached_prompt_tokens == tokenized.text_tokens.len() {
+                cached_prompt_tokens = cached_prompt_tokens.saturating_sub(1);
+            }
+            let cacheable = tokenized.multimodal.is_none();
+            let prompt_checkpoints = cached.map_or_else(Vec::new, |cache| {
+                cache
+                    .checkpoints
+                    .iter()
+                    .filter(|checkpoint| checkpoint.prefix <= cached_prompt_tokens)
+                    .cloned()
+                    .collect()
+            });
+            // Match llama-server's two bounded-memory prompt checkpoints: one micro-batch
+            // before the end and one four tokens before the end. The former permits an exact
+            // rollback across a changed prompt tail; the latter makes identical prompts cheap.
+            let mut pending_checkpoint_prefixes = [4_usize.saturating_add(ubatch_size), 4]
+                .into_iter()
+                .map(|offset| {
+                    tokenized
+                        .text_tokens
+                        .len()
+                        .saturating_sub(offset.min(batch_size))
+                })
+                .filter(|prefix| *prefix > cached_prompt_tokens && *prefix > 0)
+                .collect::<Vec<_>>();
+            pending_checkpoint_prefixes.sort_unstable();
+            pending_checkpoint_prefixes.dedup();
 
             Ok(Self {
                 sequence_id: Some(sequence_id),
@@ -1577,14 +2352,27 @@ impl<'model> ActiveRequest<'model> {
                 cancelled,
                 outbound: VecDeque::new(),
                 phase: RequestPhase::Prefill,
+                cache_history: tokenized.text_tokens.clone(),
                 prompt: tokenized.text_tokens,
-                prompt_offset: 0,
+                prompt_offset: cached_prompt_tokens,
                 prompt_tokens,
+                cached_prompt_tokens,
+                prompt_checkpoints,
+                pending_checkpoint_prefixes: pending_checkpoint_prefixes.into(),
                 next_position: tokenized.next_position,
                 multimodal_prompt: tokenized.multimodal,
                 generation_limit: (request.max_tokens as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
                 generated_tokens: 0,
+                mtp_started: false,
+                mtp_draft: Vec::new(),
+                mtp_indices: Vec::new(),
+                draft_tokens: 0,
+                accepted_draft_tokens: 0,
+                draft_ms: 0.0,
+                verification_ms: 0.0,
+                cache_prompt: request.cache_prompt,
+                cacheable,
                 ignore_eos: request.ignore_eos,
                 timings_per_token: request.timings_per_token,
                 sampler,
@@ -1616,6 +2404,23 @@ impl<'model> ActiveRequest<'model> {
         self.sampler
             .accept_generated(token)
             .map_err(backend_error)?;
+        if let Some(reason) = self.emit_accepted_token(model, token)? {
+            return Ok(Some(reason));
+        }
+
+        let position = self.next_position;
+        self.next_position = self.next_position.checked_add(1).ok_or_else(|| {
+            InferenceError::Backend("generation position exceeded i32::MAX".into())
+        })?;
+        self.phase = RequestPhase::Decode { token, position };
+        Ok(None)
+    }
+
+    fn emit_accepted_token(
+        &mut self,
+        model: &LlamaModel,
+        token: LlamaToken,
+    ) -> Result<Option<FinishReason>, InferenceError> {
         let sampled_at = Instant::now();
         let is_eog = model.is_eog_token(token);
         account_sample(&mut self.generated_tokens);
@@ -1639,11 +2444,6 @@ impl<'model> ActiveRequest<'model> {
             return Ok(Some(FinishReason::Length));
         }
 
-        let position = self.next_position;
-        self.next_position = self.next_position.checked_add(1).ok_or_else(|| {
-            InferenceError::Backend("generation position exceeded i32::MAX".into())
-        })?;
-        self.phase = RequestPhase::Decode { token, position };
         Ok(None)
     }
 
@@ -1717,7 +2517,7 @@ impl<'model> ActiveRequest<'model> {
             instant.duration_since(self.queued_at).as_secs_f64() * 1_000.0
         });
         GenerationSnapshot {
-            cached_prompt_tokens: 0,
+            cached_prompt_tokens: self.cached_prompt_tokens,
             prompt_tokens: self.prompt_tokens,
             generated_tokens: self.generated_tokens,
             metrics: GenerationMetrics {
@@ -1729,6 +2529,10 @@ impl<'model> ActiveRequest<'model> {
                 decode_tokens_per_second: rate(self.generated_tokens, decode_ms),
                 sampler_ms: self.sampler.performance().sample_milliseconds,
                 parser_ms: self.semantic.parser_ms(),
+                draft_tokens: self.draft_tokens,
+                accepted_draft_tokens: self.accepted_draft_tokens,
+                draft_ms: self.draft_ms,
+                verification_ms: self.verification_ms,
             },
         }
     }
@@ -1927,7 +2731,7 @@ fn prepare_chat(
 
 fn select_tools(
     request: &ChatTemplateRequest,
-) -> Result<(Vec<&icn_core::ToolDefinition>, ChatToolChoice), InferenceError> {
+) -> Result<(Vec<&icn_contracts::ToolDefinition>, ChatToolChoice), InferenceError> {
     let selected = match &request.tool_choice {
         ToolChoice::None => return Ok((Vec::new(), ChatToolChoice::None)),
         ToolChoice::Auto => return Ok((request.tools.iter().collect(), ChatToolChoice::Auto)),
@@ -2301,7 +3105,7 @@ fn backend_error(error: impl std::fmt::Display) -> InferenceError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use icn_core::{ChatMessage, ChatRole, ReasoningControl, ResponseFormat, ToolDefinition};
+    use icn_contracts::{ChatMessage, ChatRole, ReasoningControl, ResponseFormat, ToolDefinition};
 
     use super::*;
 
@@ -2393,9 +3197,9 @@ mod tests {
         );
     }
 
-    fn model_config_with_projector(max_sequences: u32) -> ModelConfig {
+    fn model_config_with_projector(max_sequences: u32) -> ResolvedExecutionPlan {
         let executable = std::env::current_exe().unwrap();
-        ModelConfig {
+        ResolvedExecutionPlan {
             model_path: executable.clone(),
             context_size: 128,
             batch_size: 32,
@@ -2409,10 +3213,11 @@ mod tests {
                 ..ExecutionConfig::default()
             },
             projector: Some(ProjectorConfig::new(executable)),
+            mtp: icn_contracts::MtpConfig::default(),
         }
     }
 
-    fn model_config() -> ModelConfig {
+    fn model_config() -> ResolvedExecutionPlan {
         let mut config = model_config_with_projector(1);
         config.projector = None;
         config
@@ -2505,6 +3310,22 @@ mod tests {
         assert!(!context.kv_unified());
         assert_eq!(context.n_threads(), 3);
         assert_eq!(context.n_threads_batch(), 5);
+        assert_eq!(context.n_outputs_max(), NonZeroU32::new(1));
+
+        let mut parallel = model_config_with_projector(4);
+        parallel.projector = None;
+        let parallel_context = native_context_params(&parallel, threads, threads_batch);
+        assert_eq!(parallel_context.n_outputs_max(), NonZeroU32::new(4));
+        parallel.mtp = icn_contracts::MtpConfig::Enabled {
+            source: icn_contracts::MtpSource::Bundled,
+            n_max: 5,
+            n_min: 1,
+            p_min: 0.1,
+            cache_type_k: CacheType::F16,
+            cache_type_v: CacheType::F16,
+        };
+        let speculative_context = native_context_params(&parallel, threads, threads_batch);
+        assert_eq!(speculative_context.n_outputs_max(), NonZeroU32::new(24));
 
         config.execution.gpu_layers = GpuLayers::All;
         let all = native_model_params(&config.execution).unwrap();
@@ -2523,7 +3344,7 @@ mod tests {
             validate_model_config(&config)
                 .unwrap_err()
                 .to_string()
-                .contains("common/fit owns placement")
+                .contains("requires a resolved GPU-layer plan")
         );
 
         config.execution.gpu_layers = GpuLayers::All;

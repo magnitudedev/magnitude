@@ -8,8 +8,8 @@
   "primitive": "P5",
   "adapter": "upstream-tool",
   "operation": "llama-batched-bench.sequence-throughput",
-  "status": "planned",
-  "tags": ["model-smoke", "probe-gap", "workload-shape"],
+  "status": "active",
+  "tags": ["model-smoke", "workload-shape"],
   "prerequisites": [
     "correctness.config.context-defaults",
     "correctness.decode.single-batch-logits"
@@ -30,7 +30,7 @@
     "kv_unified": false,
     "expected_kv_tokens": 160,
     "separate_generation": false,
-    "repetitions": 10,
+    "repetitions": 1,
     "effective_engine_configuration": "profile"
   },
   "requirements": {
@@ -41,7 +41,7 @@
   },
   "invocations": {
     "reference": { "kind": "upstream-tool", "target": "llama-batched-bench", "operation": "llama-batched-bench.sequence-throughput" },
-    "candidate": { "kind": "icn-probe", "operation": "llama-batched-bench.sequence-throughput" }
+    "candidate": { "kind": "icn-probe", "target": "icn-probe", "operation": "llama-batched-bench.sequence-throughput" }
   },
   "comparison": {
     "kind": "performance-ratio",
@@ -54,7 +54,7 @@
     "included": ["prompt batches", "generation batches", "upstream-defined synchronization"],
     "excluded": ["model load", "context construction", "warm-up", "request scheduling", "result serialization"],
     "warmup_iterations": 1,
-    "measurement_iterations": 10,
+    "measurement_iterations": 1,
     "synchronize": true
   }
 }

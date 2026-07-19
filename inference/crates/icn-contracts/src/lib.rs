@@ -4,10 +4,17 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod inventory;
 pub mod output;
 
-#[derive(Debug, Clone)]
-pub struct ModelConfig {
+pub use inventory::*;
+
+/// Fully resolved model, component, context, and execution configuration.
+///
+/// Hardware assessment and the engine must consume this same value. Neither
+/// layer is permitted to apply independent execution defaults.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ResolvedExecutionPlan {
     pub model_path: PathBuf,
     /// Total context capacity shared by all concurrently resident sequences.
     pub context_size: u32,
@@ -21,6 +28,54 @@ pub struct ModelConfig {
     pub execution: ExecutionConfig,
     /// Optional multimodal projector loaded into the same model executor.
     pub projector: Option<ProjectorConfig>,
+    /// Fully resolved speculative-decoding configuration.
+    pub mtp: MtpConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MtpConfig {
+    Disabled {
+        reason: String,
+    },
+    Enabled {
+        source: MtpSource,
+        n_max: u32,
+        n_min: u32,
+        p_min: f32,
+        cache_type_k: CacheType,
+        cache_type_v: CacheType,
+    },
+}
+
+impl Default for MtpConfig {
+    fn default() -> Self {
+        Self::Disabled {
+            reason: "not_supported".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MtpSource {
+    /// Prediction layers are executable from the target GGUF itself.
+    Bundled,
+    /// Prediction layers are executable from a distinct GGUF linked to the target context.
+    Separate { model_path: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MtpRuntimeProperties {
+    Disabled {
+        reason: String,
+    },
+    Enabled {
+        source: MtpSource,
+        n_max: u32,
+        n_min: u32,
+        p_min: f32,
+    },
 }
 
 /// llama.cpp execution settings whose values affect loading or context allocation.
@@ -176,7 +231,7 @@ impl std::str::FromStr for CacheType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectorConfig {
     pub path: PathBuf,
     pub use_gpu: bool,
@@ -201,7 +256,7 @@ impl ProjectorConfig {
 }
 
 /// Resource limits applied before native media preprocessing allocates decoded pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ImageInputLimits {
     pub max_images: NonZeroU32,
     /// Maximum compressed bytes accepted for one image after data-URL decoding.
@@ -260,6 +315,10 @@ pub struct GenerationMetrics {
     pub decode_tokens_per_second: f64,
     pub sampler_ms: f64,
     pub parser_ms: f64,
+    pub draft_tokens: usize,
+    pub accepted_draft_tokens: usize,
+    pub draft_ms: f64,
+    pub verification_ms: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -522,6 +581,7 @@ pub struct ModelProperties {
     pub chat_template: String,
     pub capabilities: TemplateCapabilities,
     pub modalities: ModelModalities,
+    pub mtp: MtpRuntimeProperties,
     pub execution: ExecutionConfigReport,
     pub template_fingerprint: String,
 }

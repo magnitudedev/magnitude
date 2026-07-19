@@ -1,0 +1,16 @@
+[package]
+name = "icn-mtp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+icn-contracts.workspace = true
+llama-cpp-2.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+cuda = ["llama-cpp-2/cuda"]
+metal = ["llama-cpp-2/metal"]
+vulkan = ["llama-cpp-2/vulkan"]

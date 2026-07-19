@@ -1,0 +1,8 @@
+id = "concurrency-development"
+description = "Focused prefill and decode continuous-batching diagnostic."
+cases = ["E2/*"]
+repetitions = 2
+warmups = 0
+concurrency = [1, 2, 4]
+closed_loop_multiplier = 2
+request_timeout_seconds = 600

@@ -796,7 +796,7 @@ const main = async () => {
     flag: "wx",
   });
   console.log(`Candidate build manifest: ${manifestPath}`);
-  console.log("Claim scope: production ICN parity probe through icn-llamacpp.");
+  console.log("Claim scope: production ICN parity probe through icn-engine.");
 };
 
 if (import.meta.main) {

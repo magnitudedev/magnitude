@@ -1,5 +1,5 @@
 [package]
-name = "icn-fit"
+name = "icn-hardware"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-icn-core.workspace = true
+icn-contracts.workspace = true
 llama-cpp-2 = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -21,4 +21,5 @@ thiserror.workspace = true
 default = []
 cuda = ["llama-cpp-2/cuda"]
 metal = ["llama-cpp-2/metal"]
+mtmd = ["llama-cpp-2/mtmd"]
 vulkan = ["llama-cpp-2/vulkan"]

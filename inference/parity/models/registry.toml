@@ -58,3 +58,41 @@ path = "tinyllamas/stories15M-q4_0.gguf"
 bytes = 19077344
 sha256 = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
 url = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf"
+
+[[models]]
+id = "qwen3.6-35b-a3b-ud-q4-k-m"
+status = "accepted"
+kind = "model"
+display_name = "Qwen3.6 35B-A3B UD Q4_K_M"
+valid_for = ["C1", "C9", "P5"]
+
+[models.source]
+provider = "huggingface"
+repository = "unsloth/Qwen3.6-35B-A3B-GGUF"
+revision = "a483e9e6cbd595906af30beda3187c2663a1118c"
+integrity = "digest-pinned"
+note = "The managed-model end-to-end test resolved this immutable commit and verified the complete GGUF digest before parity registration."
+
+[models.access]
+public = true
+gated = false
+authentication_required = false
+
+[models.license]
+identifier = "unknown"
+redistribution = "not-assumed"
+note = "Local benchmark use is accepted by exact artifact digest; this registry does not make a redistribution claim."
+
+[models.attributes]
+architecture_tags = ["decoder-only", "moe", "qwen3.5", "qwen3.6", "production-benchmark"]
+tokenizer_family = "qwen"
+template_family = "qwen"
+quantization = "UD-Q4_K_M"
+parameter_scale = "35B-A3B"
+
+[[models.files]]
+role = "model"
+path = "qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+bytes = 22134528992
+sha256 = "ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
+url = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"

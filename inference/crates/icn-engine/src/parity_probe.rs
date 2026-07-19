@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use icn_core::{ExecutionConfig, FlashAttention, GpuLayers, ModelConfig};
+use icn_contracts::{ExecutionConfig, FlashAttention, GpuLayers, ResolvedExecutionPlan};
 use llama_cpp_2::common_chat::{
     ChatContent, ChatContinuation, ChatFormat, ChatGrammarTrigger, ChatMessage, ChatParserOptions,
     ChatPrepareOptions, ChatReasoningFormat, ChatSemanticDelta, ChatTemplateKwarg, ChatTool,
@@ -39,7 +39,7 @@ use llama_cpp_2::{
     LlamaBackendDeviceType, LogOptions, list_llama_ggml_backend_devices, send_logs_to_tracing,
 };
 
-const OPERATIONS: [&str; 21] = [
+const OPERATIONS: [&str; 22] = [
     "protocol.describe",
     "configuration.inspect",
     "model.metadata",
@@ -54,6 +54,7 @@ const OPERATIONS: [&str; 21] = [
     "llama-bench.token-generation",
     "llama-bench.prompt-generation",
     "llama-bench.context-depth",
+    "llama-batched-bench.sequence-throughput",
     "sampler.bench",
     "chat-template.bench",
     "chat-parser.inspect",
@@ -138,6 +139,7 @@ pub fn execute(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
         | "llama-bench.token-generation"
         | "llama-bench.prompt-generation"
         | "llama-bench.context-depth") => llama_bench(operation, input),
+        "llama-batched-bench.sequence-throughput" => llama_batched_bench(input),
         _ => Err(ProbeError::invalid(
             "unsupported-operation",
             format!("unsupported operation: {operation}"),
@@ -162,7 +164,7 @@ fn configuration_inspect(input: &Map<String, Value>) -> Result<Value, ProbeError
         threads_batch: NonZeroU32::new(input.context.batch_threads),
         ..ExecutionConfig::default()
     };
-    let config = ModelConfig {
+    let config = ResolvedExecutionPlan {
         model_path: input.model_path.clone(),
         context_size: input.context.context_tokens,
         batch_size: input.context.batch_tokens,
@@ -171,6 +173,7 @@ fn configuration_inspect(input: &Map<String, Value>) -> Result<Value, ProbeError
         prefill_quantum: input.context.batch_tokens,
         execution,
         projector: None,
+        mtp: icn_contracts::MtpConfig::default(),
     };
     let params = super::native_context_params(&config, threads, batch_threads);
     let context = loaded
@@ -869,6 +872,329 @@ fn state_execute_script(input: &Map<String, Value>) -> Result<Value, ProbeError>
     }))
 }
 
+fn llama_batched_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> {
+    let input: LlamaBatchedBenchInput = decode_input(input)?;
+    input.validate()?;
+    send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
+
+    let threads = nonzero_i32(input.engine_configuration.threads, "threads")?;
+    let flash_attention = match input.engine_configuration.flash_attention.as_str() {
+        "auto" => FlashAttention::Auto,
+        "on" => FlashAttention::Enabled,
+        "off" => FlashAttention::Disabled,
+        value => {
+            return Err(ProbeError::invalid(
+                "invalid-engine-configuration",
+                format!("unsupported flashAttention policy: {value}"),
+            ));
+        }
+    };
+    let flash_attention_value = match flash_attention {
+        FlashAttention::Auto => -1,
+        FlashAttention::Disabled => 0,
+        FlashAttention::Enabled => 1,
+    };
+    let (gpu_layers, normalized_gpu_layers) = input.engine_configuration.gpu_layers.normalized()?;
+    let batched_bench_gpu_layers = input
+        .engine_configuration
+        .gpu_layers
+        .batched_bench_value()?;
+    let execution = ExecutionConfig {
+        gpu_layers,
+        threads: NonZeroU32::new(input.engine_configuration.threads),
+        threads_batch: NonZeroU32::new(input.engine_configuration.threads),
+        flash_attention,
+        kv_unified: input.kv_unified,
+        ..ExecutionConfig::default()
+    };
+    let config = ResolvedExecutionPlan {
+        model_path: input.model_path.clone(),
+        context_size: input.context_tokens,
+        batch_size: input.batch_tokens,
+        ubatch_size: input.micro_batch_tokens,
+        max_sequences: input.parallel_sequences,
+        prefill_quantum: input.batch_tokens,
+        execution,
+        projector: None,
+        mtp: icn_contracts::MtpConfig::default(),
+    };
+    if !config.model_path.is_file() {
+        return Err(ProbeError::invalid(
+            "invalid-model-path",
+            format!(
+                "modelPath is not a regular file: {}",
+                config.model_path.display()
+            ),
+        ));
+    }
+
+    let backend =
+        LlamaBackend::init().map_err(|error| ProbeError::runtime("backend-initialize", error))?;
+    let model_params = super::native_model_params(&config.execution)
+        .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?;
+    let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
+        .map_err(|error| ProbeError::runtime("model-load", error))?;
+    // The official batched-bench leaves n_outputs_max at zero (n_batch) and uses the context's
+    // default CPU backend pool. Preserve both details here; production server construction is
+    // compared separately by the endpoint benchmark.
+    let context_params =
+        super::native_context_params(&config, threads, threads).with_n_outputs_max(None);
+    let mut context = model
+        .new_context(&backend, context_params)
+        .map_err(|error| ProbeError::runtime("context-create", error))?;
+    let vocabulary_size = model.n_vocab();
+    if vocabulary_size <= 0 {
+        return Err(ProbeError::runtime(
+            "invalid-vocabulary",
+            "loaded model reports no vocabulary tokens",
+        ));
+    }
+    let (_, _, devices) = benchmark_hardware_identity()?;
+
+    // Upstream performs one 16-token synchronized warmup before clearing logical memory for the
+    // measured row.
+    let mut warmup = LlamaBatch::new(16, 1);
+    for position in 0..16_i32 {
+        warmup
+            .add(
+                next_llama_bench_token(vocabulary_size),
+                position,
+                &[0],
+                false,
+            )
+            .map_err(|error| ProbeError::runtime("warmup-batch", error))?;
+    }
+    context
+        .decode(&mut warmup)
+        .map_err(|error| ProbeError::runtime("warmup-decode", error))?;
+    context.synchronize();
+    context.clear_memory(false);
+
+    // Upstream constructs the complete prompt batch before starting its prompt
+    // timer, then presents n_batch-sized views to decode. Prepare equivalent
+    // chunks here so Rust allocation and batch population are excluded too.
+    let mut prompt_batches = prepare_batched_prompt(&input, vocabulary_size)?;
+    let prompt_started = Instant::now();
+    for batch in &mut prompt_batches {
+        context
+            .decode(batch)
+            .map_err(|error| ProbeError::runtime("prompt-decode", error))?;
+    }
+    context.synchronize();
+    let prompt_seconds = prompt_started.elapsed().as_secs_f64();
+
+    if input.shared_prompt {
+        for sequence_id in 1..input.parallel_sequences {
+            context
+                .copy_kv_cache_seq(
+                    0,
+                    i32::try_from(sequence_id).expect("validated sequence"),
+                    None,
+                    None,
+                )
+                .map_err(|error| ProbeError::runtime("shared-prompt-copy", error))?;
+        }
+        if !input.kv_unified {
+            let mut dummy = LlamaBatch::new(1, 1);
+            dummy
+                .add(
+                    next_llama_bench_token(vocabulary_size),
+                    i32::try_from(input.prompt_tokens).expect("validated prompt length"),
+                    &[0],
+                    true,
+                )
+                .map_err(|error| ProbeError::runtime("shared-prompt-dummy-batch", error))?;
+            context
+                .decode(&mut dummy)
+                .map_err(|error| ProbeError::runtime("shared-prompt-dummy-decode", error))?;
+            context.synchronize();
+            context
+                .clear_kv_cache_seq(None, Some(input.prompt_tokens), None)
+                .map_err(|error| ProbeError::runtime("shared-prompt-dummy-remove", error))?;
+        }
+    }
+
+    // The C++ tool clears and reuses one preallocated batch for every
+    // generation step. Allocate once before timing and preserve that contract.
+    let mut generation_batch = LlamaBatch::new(
+        usize::try_from(input.parallel_sequences).expect("validated sequence count"),
+        1,
+    );
+    let generation_started = Instant::now();
+    decode_batched_generation(&mut context, &input, vocabulary_size, &mut generation_batch)?;
+    let generation_seconds = generation_started.elapsed().as_secs_f64();
+    if prompt_seconds <= 0.0 || generation_seconds <= 0.0 {
+        return Err(ProbeError::runtime(
+            "invalid-duration",
+            "batched benchmark measured a zero duration",
+        ));
+    }
+
+    let prompt_work = if input.shared_prompt {
+        input.prompt_tokens
+    } else {
+        input.prompt_tokens * input.parallel_sequences
+    };
+    let generation_work = input.generation_tokens_per_sequence * input.parallel_sequences;
+    let measured_tokens = prompt_work + generation_work;
+    let total_seconds = prompt_seconds + generation_seconds;
+    let tokens_per_second = f64::from(measured_tokens) / total_seconds;
+    let n_kv = input.expected_kv_tokens;
+    let value = json!({
+        "n_kv_max": context.n_ctx(),
+        "n_batch": context.n_batch(),
+        "n_ubatch": context.n_ubatch(),
+        "flash_attn": flash_attention_value,
+        "is_pp_shared": i32::from(input.shared_prompt),
+        "n_gpu_layers": batched_bench_gpu_layers,
+        "n_threads": context.n_threads(),
+        "n_threads_batch": context.n_threads_batch(),
+        "pp": input.prompt_tokens,
+        "tg": input.generation_tokens_per_sequence,
+        "pl": input.parallel_sequences,
+        "n_kv": n_kv,
+        "t_pp": prompt_seconds,
+        "speed_pp": f64::from(prompt_work) / prompt_seconds,
+        "t_tg": generation_seconds,
+        "speed_tg": f64::from(generation_work) / generation_seconds,
+        "t": total_seconds,
+        "speed": tokens_per_second,
+    });
+    let mut effective_configuration = value
+        .as_object()
+        .expect("batched benchmark value is an object")
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "n_kv_max"
+                    | "n_batch"
+                    | "n_ubatch"
+                    | "flash_attn"
+                    | "is_pp_shared"
+                    | "n_gpu_layers"
+                    | "n_threads"
+                    | "n_threads_batch"
+                    | "pp"
+                    | "tg"
+                    | "pl"
+                    | "n_kv"
+            )
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Map<_, _>>();
+    let output = Value::Object(effective_configuration.clone());
+    effective_configuration.insert("n_gpu_layers".to_owned(), normalized_gpu_layers);
+    effective_configuration.insert("kv_unified".to_owned(), json!(input.kv_unified));
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "output": output,
+        "measurements": [
+            {"name": "prompt_duration", "unit": "s", "samples": [prompt_seconds]},
+            {"name": "generation_duration", "unit": "s", "samples": [generation_seconds]},
+            {"name": "duration", "unit": "s", "samples": [total_seconds]},
+            {"name": "tokens_per_second", "unit": "tokens/s", "samples": [tokens_per_second]},
+        ],
+        "effectiveConfiguration": effective_configuration,
+        "devices": devices,
+        "producerVersion": concat!("icn-engine/", env!("CARGO_PKG_VERSION")),
+    }))
+}
+
+fn prepare_batched_prompt(
+    input: &LlamaBatchedBenchInput,
+    vocabulary_size: i32,
+) -> Result<Vec<LlamaBatch<'static>>, ProbeError> {
+    let capacity = usize::try_from(input.batch_tokens)
+        .map_err(|error| ProbeError::invalid("invalid-batch", error))?;
+    let prompt_work = input
+        .prompt_tokens
+        .checked_mul(if input.shared_prompt {
+            1
+        } else {
+            input.parallel_sequences
+        })
+        .expect("validated prompt work");
+    let chunk_count = prompt_work.div_ceil(input.batch_tokens);
+    let mut batches =
+        Vec::with_capacity(usize::try_from(chunk_count).expect("validated prompt chunk count"));
+    let mut batch = LlamaBatch::new(capacity, 1);
+    let prompt_sequences = if input.shared_prompt {
+        1
+    } else {
+        input.parallel_sequences
+    };
+    for sequence_id in 0..prompt_sequences {
+        for position in 0..input.prompt_tokens {
+            if usize::try_from(batch.n_tokens()).expect("batch token count") == capacity {
+                batches.push(batch);
+                batch = LlamaBatch::new(capacity, 1);
+            }
+            batch
+                .add(
+                    next_llama_bench_token(vocabulary_size),
+                    i32::try_from(position).expect("validated prompt position"),
+                    &[i32::try_from(sequence_id).expect("validated sequence")],
+                    position + 1 == input.prompt_tokens,
+                )
+                .map_err(|error| ProbeError::runtime("prompt-batch", error))?;
+        }
+    }
+    if batch.n_tokens() > 0 {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+fn decode_batched_generation(
+    context: &mut LlamaContext<'_>,
+    input: &LlamaBatchedBenchInput,
+    vocabulary_size: i32,
+    batch: &mut LlamaBatch<'_>,
+) -> Result<(), ProbeError> {
+    if input.separate_generation {
+        for sequence_id in 0..input.parallel_sequences {
+            for offset in 0..input.generation_tokens_per_sequence {
+                batch.clear();
+                batch
+                    .add(
+                        next_llama_bench_token(vocabulary_size),
+                        i32::try_from(input.prompt_tokens + offset)
+                            .expect("validated generation position"),
+                        &[i32::try_from(sequence_id).expect("validated sequence")],
+                        true,
+                    )
+                    .map_err(|error| ProbeError::runtime("generation-batch", error))?;
+                context
+                    .decode(batch)
+                    .map_err(|error| ProbeError::runtime("generation-decode", error))?;
+                context.synchronize();
+            }
+        }
+    } else {
+        for offset in 0..input.generation_tokens_per_sequence {
+            batch.clear();
+            for sequence_id in 0..input.parallel_sequences {
+                batch
+                    .add(
+                        next_llama_bench_token(vocabulary_size),
+                        i32::try_from(input.prompt_tokens + offset)
+                            .expect("validated generation position"),
+                        &[i32::try_from(sequence_id).expect("validated sequence")],
+                        true,
+                    )
+                    .map_err(|error| ProbeError::runtime("generation-batch", error))?;
+            }
+            context
+                .decode(batch)
+                .map_err(|error| ProbeError::runtime("generation-decode", error))?;
+            context.synchronize();
+        }
+    }
+    Ok(())
+}
+
 fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, ProbeError> {
     let input: LlamaBenchInput = decode_input(input)?;
     validate_llama_bench_input(operation, &input)?;
@@ -903,7 +1229,7 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
         .checked_add(input.generation_tokens)
         .and_then(|value| value.checked_add(input.context_depth))
         .expect("validated benchmark context sum fits in u32");
-    let config = ModelConfig {
+    let config = ResolvedExecutionPlan {
         model_path: input.model_path.clone(),
         context_size: requested_context,
         batch_size: input.batch_tokens,
@@ -912,6 +1238,7 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
         prefill_quantum: input.batch_tokens,
         execution,
         projector: None,
+        mtp: icn_contracts::MtpConfig::default(),
     };
 
     if !config.model_path.is_file() {
@@ -1078,7 +1405,7 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
         // fields such as modelPath and engineConfiguration.
         "effectiveConfiguration": effective_configuration,
         "devices": devices,
-        "producerVersion": concat!("icn-llamacpp/", env!("CARGO_PKG_VERSION")),
+        "producerVersion": concat!("icn-engine/", env!("CARGO_PKG_VERSION")),
     }))
 }
 
@@ -2519,7 +2846,7 @@ fn validate_context_request(input: &ContextRequest) -> Result<(), ProbeError> {
     if input.embeddings {
         return Err(ProbeError::invalid(
             "unsupported-embeddings",
-            "production ModelConfig does not expose embeddings; embeddings must be false",
+            "production ResolvedExecutionPlan does not expose embeddings; embeddings must be false",
         ));
     }
     Ok(())
@@ -3047,6 +3374,111 @@ fn default_logit_indices() -> Vec<i32> {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LlamaBatchedBenchInput {
+    #[serde(rename = "modelPath")]
+    model_path: PathBuf,
+    #[serde(default, rename = "model_id")]
+    _case_model_id: Option<String>,
+    #[serde(default, rename = "modelId")]
+    _runtime_model_id: Option<String>,
+    parallel_sequences: u32,
+    shared_prompt: bool,
+    prompt_tokens: u32,
+    generation_tokens_per_sequence: u32,
+    context_tokens: u32,
+    batch_tokens: u32,
+    micro_batch_tokens: u32,
+    kv_unified: bool,
+    expected_kv_tokens: u32,
+    separate_generation: bool,
+    repetitions: u32,
+    effective_engine_configuration: String,
+    #[serde(rename = "engineConfiguration")]
+    engine_configuration: LlamaBenchEngineConfiguration,
+    #[serde(default, rename = "fixturePaths")]
+    _fixture_paths: Map<String, Value>,
+}
+
+impl LlamaBatchedBenchInput {
+    fn validate(&self) -> Result<(), ProbeError> {
+        if self.effective_engine_configuration != "profile" {
+            return Err(ProbeError::invalid(
+                "invalid-engine-configuration",
+                "effective_engine_configuration must be 'profile'",
+            ));
+        }
+        if self.engine_configuration.backend.trim().is_empty() {
+            return Err(ProbeError::invalid(
+                "invalid-engine-configuration",
+                "engineConfiguration.backend must not be empty",
+            ));
+        }
+        nonzero_i32(self.engine_configuration.threads, "threads")?;
+        if self.engine_configuration.cpu_strict || self.engine_configuration.threadpool_poll != 50 {
+            return Err(ProbeError::invalid(
+                "unsupported-threadpool-policy",
+                "llama-batched-bench parity requires the upstream default CPU pool policy",
+            ));
+        }
+        if self.repetitions != 1 {
+            return Err(ProbeError::invalid(
+                "invalid-repetitions",
+                "repetitions must be exactly one; the parity runner owns process-level repetition",
+            ));
+        }
+        if self.parallel_sequences == 0 || self.parallel_sequences > i32::MAX.cast_unsigned() {
+            return Err(ProbeError::invalid(
+                "invalid-sequence-count",
+                "parallel_sequences must be in [1, i32::MAX]",
+            ));
+        }
+        if self.prompt_tokens == 0 || self.generation_tokens_per_sequence == 0 {
+            return Err(ProbeError::invalid(
+                "invalid-workload-shape",
+                "prompt and per-sequence generation lengths must be positive",
+            ));
+        }
+        if self.batch_tokens == 0
+            || self.batch_tokens > i32::MAX.cast_unsigned()
+            || self.micro_batch_tokens == 0
+            || self.micro_batch_tokens > self.batch_tokens
+        {
+            return Err(ProbeError::invalid(
+                "invalid-batch",
+                "batch_tokens must be in [1, i32::MAX] and micro_batch_tokens in [1, batch_tokens]",
+            ));
+        }
+        let prompt_work =
+            self.prompt_tokens
+                .checked_mul(if self.shared_prompt && self.kv_unified {
+                    1
+                } else {
+                    self.parallel_sequences
+                });
+        let generation_work = self
+            .generation_tokens_per_sequence
+            .checked_mul(self.parallel_sequences);
+        let expected = prompt_work.and_then(|prompt| {
+            generation_work.and_then(|generation| prompt.checked_add(generation))
+        });
+        if expected != Some(self.expected_kv_tokens) {
+            return Err(ProbeError::invalid(
+                "invalid-kv-work",
+                "expected_kv_tokens does not match the declared workload",
+            ));
+        }
+        if self.context_tokens < self.expected_kv_tokens {
+            return Err(ProbeError::invalid(
+                "invalid-context",
+                "context_tokens is smaller than the declared KV work",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LlamaBenchInput {
     #[serde(rename = "modelPath")]
     model_path: PathBuf,
@@ -3096,6 +3528,19 @@ impl LlamaBenchGpuLayers {
                 format!("unsupported gpuLayers policy: {value}"),
             )),
             Self::Count(value) => Ok((GpuLayers::Count(*value), json!(value))),
+        }
+    }
+
+    fn batched_bench_value(&self) -> Result<Value, ProbeError> {
+        match self {
+            // common_params serializes LLAMA_MODEL_DEFAULT (the value used by
+            // --n-gpu-layers all) as the upstream numeric sentinel -2.
+            Self::Name(value) if value == "all" => Ok(json!(-2)),
+            Self::Name(value) => Err(ProbeError::invalid(
+                "invalid-engine-configuration",
+                format!("unsupported gpuLayers policy: {value}"),
+            )),
+            Self::Count(value) => Ok(json!(value)),
         }
     }
 }

@@ -430,6 +430,10 @@ fn decode_batched_bench(
             .with_context(|| format!("batched benchmark row is missing {name}"))?;
         configuration.insert(name.to_owned(), value.clone());
     }
+    // Durations and rates are measurements, not semantic output. Keep the
+    // exact upstream work/configuration projection separate so performance
+    // validity does not require the two implementations to take equal time.
+    let semantic_output = Value::Object(configuration.clone());
     let gpu_layers = configuration
         .get("n_gpu_layers")
         .and_then(Value::as_i64)
@@ -465,7 +469,7 @@ fn decode_batched_bench(
             .context("batched benchmark case is missing kv_unified")?,
     );
     Ok((
-        (*selected).clone(),
+        semantic_output,
         vec![
             Measurement {
                 name: "prompt_duration".to_owned(),
@@ -1371,7 +1375,10 @@ mod tests {
     fn decodes_pinned_batched_bench_jsonl_shape_and_kv_work() {
         let case = load_case("performance/batched-bench/two-sequence-independent-prompts.json");
         let line = b"{\"n_kv_max\":160,\"n_batch\":64,\"n_ubatch\":64,\"flash_attn\":0,\"is_pp_shared\":0,\"n_gpu_layers\":-1,\"n_threads\":4,\"n_threads_batch\":4,\"pp\":64,\"tg\":16,\"pl\":2,\"n_kv\":160,\"t_pp\":0.1,\"t_tg\":0.2,\"t\":0.3,\"speed\":533.333333}\n";
-        let (_, measurements, configuration) = decode_batched_bench(line, &case).unwrap();
+        let (output, measurements, configuration) = decode_batched_bench(line, &case).unwrap();
+        assert_eq!(output["n_kv"], 160);
+        assert!(output.get("t").is_none());
+        assert!(output.get("speed").is_none());
         assert_eq!(configuration["n_kv"], 160);
         assert_eq!(configuration["kv_unified"], false);
         assert_eq!(configuration["n_gpu_layers"], "auto");

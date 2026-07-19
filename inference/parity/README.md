@@ -13,8 +13,8 @@ An upstream test passing qualifies the reference build. It does not establish IC
 
 There are two paired comparison boundaries:
 
-1. **Official tool ↔ production probe.** A pinned machine-readable llama.cpp tool is the reference and the matching `icn-llamacpp` operation is the candidate. P1–P4 use this boundary so their work and timing remain defined by `llama-bench`.
-2. **Native oracle ↔ production probe.** A thin C++ process calls the pinned public C API or common helper while the candidate calls the finalized safe Rust binding through production-owned `icn-llamacpp` code. Correctness differentials and custom P6–P8 microbenchmarks use this boundary.
+1. **Official tool ↔ production probe.** A pinned machine-readable llama.cpp tool is the reference and the matching `icn-engine` operation is the candidate. P1–P4 use this boundary so their work and timing remain defined by `llama-bench`.
+2. **Native oracle ↔ production probe.** A thin C++ process calls the pinned public C API or common helper while the candidate calls the finalized safe Rust binding through production-owned `icn-engine` code. Correctness differentials and custom P6–P8 microbenchmarks use this boundary.
 
 `upstream-test` and `upstream-qualification` are one-sided reference/build checks, not paired parity. P0 is intentionally one-sided.
 
@@ -33,7 +33,7 @@ Cases contain neutral inputs, never machine-local paths, C structs, Rust types, 
 
 The oracle and candidate probe use schema-v1 JSON Lines on stdin/stdout. Each non-empty request contains `schemaVersion`, `caseId`, `operation`, and an `input` object; unknown envelope fields and unsupported versions are rejected. Every request produces one response that echoes the case and operation and contains either evidence or a typed error.
 
-Input lines are capped at 16 MiB. The runner bounds execution time, stdout, and stderr; the candidate adapter contains panics as structured errors; diagnostics may not contaminate protocol stdout. The transport binary contains no primitive implementation—those operations live in `icn-llamacpp` and use the production safe bindings.
+Input lines are capped at 16 MiB. The runner bounds execution time, stdout, and stderr; the candidate adapter contains panics as structured errors; diagnostics may not contaminate protocol stdout. The transport binary contains no primitive implementation—those operations live in `icn-engine` and use the production safe bindings.
 
 Before running cases, the runner calls `protocol.describe`. The live candidate operation set must exactly equal the static capabilities in [`producers.toml`](producers.toml) plus `protocol.describe`. A stale capability in either direction fails preflight.
 

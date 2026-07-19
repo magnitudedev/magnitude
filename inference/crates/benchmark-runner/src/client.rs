@@ -99,7 +99,10 @@ impl EndpointClient {
 
     pub(crate) async fn reset_cache(&self) -> Result<bool, String> {
         match self.target.kind {
-            TargetKind::Icn => Ok(true),
+            // ICN intentionally has no public cache-administration endpoint. Workloads use
+            // per-sample cache namespaces, so report this honestly instead of pretending a
+            // reset occurred.
+            TargetKind::Icn => Ok(false),
             TargetKind::Generic => Ok(false),
             TargetKind::LlamaCpp => {
                 let props = self
@@ -396,6 +399,8 @@ fn accumulate_payload(
             predicted_n: number(raw_timings, "predicted_n"),
             predicted_ms: float(raw_timings, "predicted_ms"),
             predicted_per_second: float(raw_timings, "predicted_per_second"),
+            sampler_ms: float(raw_timings, "sampler_ms"),
+            parser_ms: float(raw_timings, "parser_ms"),
             draft_n: number(raw_timings, "draft_n"),
             draft_n_accepted: number(raw_timings, "draft_n_accepted"),
         });
