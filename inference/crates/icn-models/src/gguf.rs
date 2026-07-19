@@ -9,6 +9,7 @@ const MAGIC: [u8; 4] = *b"GGUF";
 const MAX_METADATA_ENTRIES: u64 = 1_000_000;
 const MAX_TENSORS: u64 = 10_000_000;
 const MAX_STRING_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STRING_ARRAY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DIMS: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,9 @@ pub struct GgufInspection {
     pub nextn_predict_layers: Option<u32>,
     pub tokenizer: Option<String>,
     pub chat_template: Option<String>,
+    pub tool_use_template: Option<String>,
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
     pub base_models: Vec<String>,
     pub modalities: Vec<String>,
     pub tensor_count: u64,
@@ -50,6 +54,7 @@ enum Value {
     U64(u64),
     I64(i64),
     String(String),
+    StringArray(Vec<String>),
     Other,
 }
 
@@ -133,6 +138,13 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     let quantization = u32_value(&metadata, "general.file_type").map(file_type_name);
     let parameter_count = u64_value(&metadata, "general.parameter_count")
         .or((derived_parameter_count > 0).then_some(derived_parameter_count));
+    let tokens = string_array_value(&metadata, "tokenizer.ggml.tokens");
+    let token_at = |key: &str| {
+        u32_value(&metadata, key)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| tokens.and_then(|tokens| tokens.get(index)))
+            .cloned()
+    };
 
     let mut fingerprint_material = Vec::new();
     fingerprint_material.extend_from_slice(&version.to_le_bytes());
@@ -156,6 +168,9 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
         nextn_predict_layers,
         tokenizer: string_value(&metadata, "tokenizer.ggml.model"),
         chat_template: string_value(&metadata, "tokenizer.chat_template"),
+        tool_use_template: string_value(&metadata, "tokenizer.chat_template.tool_use"),
+        bos_token: token_at("tokenizer.ggml.bos_token_id"),
+        eos_token: token_at("tokenizer.ggml.eos_token_id"),
         base_models,
         modalities,
         tensor_count,
@@ -166,6 +181,13 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
 fn string_value(values: &BTreeMap<String, Value>, key: &str) -> Option<String> {
     match values.get(key) {
         Some(Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn string_array_value<'a>(values: &'a BTreeMap<String, Value>, key: &str) -> Option<&'a [String]> {
+    match values.get(key) {
+        Some(Value::StringArray(values)) => Some(values),
         _ => None,
     }
 }
@@ -334,6 +356,25 @@ impl<R: Read + Seek> CheckedReader<R> {
                         "metadata array exceeds inspection bound",
                     ));
                 }
+                if element_type == 8 {
+                    let mut values = Vec::with_capacity(usize::try_from(count).map_err(|_| {
+                        GgufError::Invalid("metadata array length overflows usize")
+                    })?);
+                    let mut total = 0_u64;
+                    for _ in 0..count {
+                        let value = self.string()?;
+                        total = total
+                            .checked_add(value.len() as u64)
+                            .ok_or(GgufError::Invalid("metadata array size overflow"))?;
+                        if total > MAX_STRING_ARRAY_BYTES {
+                            return Err(GgufError::Invalid(
+                                "metadata string array exceeds inspection bound",
+                            ));
+                        }
+                        values.push(value);
+                    }
+                    return Ok(Value::StringArray(values));
+                }
                 for _ in 0..count {
                     let _ = self.value(element_type)?;
                 }
@@ -385,5 +426,51 @@ mod tests {
         let result = inspect(&path);
         std::fs::remove_file(path).unwrap();
         assert!(matches!(result, Err(GgufError::InvalidMagic)));
+    }
+
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    #[test]
+    fn extracts_effective_template_variants_and_token_strings() {
+        let path = std::env::temp_dir().join(format!(
+            "icn-gguf-template-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&5_u64.to_le_bytes());
+
+        push_string(&mut bytes, "tokenizer.chat_template");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_string(&mut bytes, "default-template");
+        push_string(&mut bytes, "tokenizer.chat_template.tool_use");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_string(&mut bytes, "tool-template");
+        push_string(&mut bytes, "tokenizer.ggml.tokens");
+        bytes.extend_from_slice(&9_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        push_string(&mut bytes, "<bos>");
+        push_string(&mut bytes, "<eos>");
+        push_string(&mut bytes, "tokenizer.ggml.bos_token_id");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        push_string(&mut bytes, "tokenizer.ggml.eos_token_id");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+
+        std::fs::write(&path, bytes).unwrap();
+        let result = inspect(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.chat_template.as_deref(), Some("default-template"));
+        assert_eq!(result.tool_use_template.as_deref(), Some("tool-template"));
+        assert_eq!(result.bos_token.as_deref(), Some("<bos>"));
+        assert_eq!(result.eos_token.as_deref(), Some("<eos>"));
     }
 }

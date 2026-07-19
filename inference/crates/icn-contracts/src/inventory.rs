@@ -195,6 +195,16 @@ pub enum ModelStatus {
     Available {
         ready_at: u64,
     },
+    InvalidArtifact {
+        detected_at: u64,
+        code: String,
+        message: String,
+    },
+    IncompatibleArtifact {
+        detected_at: u64,
+        code: String,
+        message: String,
+    },
     Loading {
         load_id: String,
         stage: LoadStage,
@@ -244,15 +254,11 @@ pub enum LoadStage {
 pub enum CapabilitySupport {
     Supported { parallel: Option<bool> },
     Unsupported,
-    Unknown { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReasoningCapability {
-    Unknown {
-        reason: String,
-    },
     Unsupported {
         evidence: CapabilityEvidence,
     },
@@ -374,14 +380,17 @@ pub struct TemplateAssessment {
     pub fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveTemplateInputs {
+    pub default_template: Option<String>,
+    pub tool_use_template: Option<String>,
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
+}
+
 /// Model-free native chat-template assessment injected into model discovery.
 pub trait TemplateAssessor: Send + Sync + 'static {
-    fn assess(
-        &self,
-        template: &str,
-        bos_token: Option<&str>,
-        eos_token: Option<&str>,
-    ) -> Result<TemplateAssessment, String>;
+    fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,9 +425,6 @@ pub enum HardwareAssessment {
     NotAssessed {
         reason: String,
     },
-    Assessing {
-        started_at: u64,
-    },
     Fits {
         profile: HardwareProfile,
         memory: HardwareMemory,
@@ -429,9 +435,6 @@ pub enum HardwareAssessment {
         memory: HardwareDeficit,
         limiting_resource: String,
         alternative: Option<HardwareProfile>,
-    },
-    Unknown {
-        reason: HardwareUnknownReason,
     },
 }
 
@@ -464,16 +467,6 @@ pub struct HardwareDeficit {
 pub enum HardwareRecommendation {
     Recommended,
     Constrained,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HardwareUnknownReason {
-    UnsupportedBackend,
-    EstimatorFailed,
-    InsufficientMetadata,
-    NoHardwareSnapshot,
-    UnsupportedExecutionPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,7 +506,6 @@ pub enum ModelOperation {
     Load,
     Unload,
     Delete,
-    Assess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,12 +632,18 @@ pub trait ModelInventory: Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<(), InventoryError>>;
 }
 
-/// Hardware-assessment boundary consumed by the HTTP API.
+/// Canonical inventory assessment implemented by the server composition root.
 ///
-/// The server composition root implements this with `icn-hardware` so the API and model inventory
-/// remain independent of llama.cpp.
-pub trait ModelHardwareAssessor: Send + Sync + 'static {
-    fn assess(&self, id: &ModelId) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>>;
+/// Keeping this boundary in contracts lets `icn-models` own reconciliation without depending on
+/// llama.cpp or `icn-hardware`. The cache key covers the canonical execution policy, native build,
+/// backend, and stable hardware topology. Assessment failures are operation failures, never model
+/// properties.
+pub trait InventoryHardwareAssessor: Send + Sync + 'static {
+    fn cache_key(&self) -> BoxFuture<'_, Result<String, InventoryError>>;
+    fn assess(
+        &self,
+        model: ResolvedModel,
+    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -672,6 +670,8 @@ pub enum InventoryError {
     Upstream(String),
     #[error("model integrity check failed: {0}")]
     Integrity(String),
+    #[error("model artifacts changed during inspection: {0}")]
+    ConcurrentMutation(String),
     #[error("internal inventory failure: {0}")]
     Internal(String),
 }

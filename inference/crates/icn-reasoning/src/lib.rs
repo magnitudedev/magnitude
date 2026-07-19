@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use getrandom::fill;
 use icn_contracts::{
-    AutomaticReasoningBudget, CapabilityEvidence, NativeReasoningControls,
+    AutomaticReasoningBudget, CapabilityEvidence, EffectiveTemplateInputs, NativeReasoningControls,
     NormalizedReasoningEffort, ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters,
     ReasoningEffortMapping, ReasoningProfile, ReasoningVisibility, TemplateAssessment,
     TemplateAssessor, TemplateCapabilities,
@@ -37,13 +37,8 @@ pub struct TemplateInspection {
 pub struct NativeTemplateAssessor;
 
 impl TemplateAssessor for NativeTemplateAssessor {
-    fn assess(
-        &self,
-        template: &str,
-        bos_token: Option<&str>,
-        eos_token: Option<&str>,
-    ) -> Result<TemplateAssessment, String> {
-        inspect_template(template, bos_token, eos_token)
+    fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
+        inspect_template_inputs(inputs)
             .map(|inspection| TemplateAssessment {
                 capabilities: inspection.capabilities,
                 reasoning: inspection.reasoning,
@@ -51,6 +46,19 @@ impl TemplateAssessor for NativeTemplateAssessor {
             })
             .map_err(|error| error.to_string())
     }
+}
+
+pub fn inspect_template_inputs(
+    inputs: &EffectiveTemplateInputs,
+) -> Result<TemplateInspection, InspectionError> {
+    let templates = CommonChatTemplates::from_metadata(
+        inputs.default_template.as_deref(),
+        inputs.tool_use_template.as_deref(),
+        inputs.bos_token.as_deref(),
+        inputs.eos_token.as_deref(),
+    )
+    .map_err(native_error)?;
+    inspect_templates(&templates)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,9 +75,12 @@ pub fn inspect_template(
     bos_token: Option<&str>,
     eos_token: Option<&str>,
 ) -> Result<TemplateInspection, InspectionError> {
-    let templates =
-        CommonChatTemplates::from_template(template, bos_token, eos_token).map_err(native_error)?;
-    inspect_templates(&templates)
+    inspect_template_inputs(&EffectiveTemplateInputs {
+        default_template: Some(template.to_owned()),
+        tool_use_template: None,
+        bos_token: bos_token.map(str::to_owned),
+        eos_token: eos_token.map(str::to_owned),
+    })
 }
 
 /// Inspect an already constructed native template handle.
@@ -77,7 +88,13 @@ pub fn inspect_templates(
     templates: &CommonChatTemplates,
 ) -> Result<TemplateInspection, InspectionError> {
     let source = templates.source(None).map_err(native_error)?;
-    let fingerprint = format!("sha256:{:x}", Sha256::digest(source.as_bytes()));
+    let tool_use_source = templates.source(Some("tool_use")).map_err(native_error)?;
+    let mut fingerprint_material = source.as_bytes().to_vec();
+    if !tool_use_source.is_empty() {
+        fingerprint_material.push(0);
+        fingerprint_material.extend_from_slice(tool_use_source.as_bytes());
+    }
+    let fingerprint = format!("sha256:{:x}", Sha256::digest(&fingerprint_material));
     let native = templates.capabilities().map_err(native_error)?;
     let capabilities = TemplateCapabilities {
         string_content: native.supports_string_content,

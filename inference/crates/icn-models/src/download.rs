@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::identity::{content_id, model_id};
-use crate::inventory::{ModelManager, hf_repo_dir, now};
+use crate::inventory::{ModelManager, build_model, hf_repo_dir, now};
 use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationComponent, OperationManifest};
 use crate::validation::validate_download_request;
 
@@ -505,26 +505,57 @@ impl ModelManager {
         let operation_path = operation_manifest_path(&self.config.root, &model_id);
         let _ = tokio::fs::remove_file(operation_path).await;
         drop(lock_file);
-        self.refresh().await.map_err(|error| DownloadError {
-            code: "publish_failed",
+        let primary = manifest
+            .components
+            .iter()
+            .filter(|component| {
+                matches!(
+                    component.role,
+                    icn_contracts::ComponentRole::Weights | icn_contracts::ComponentRole::Shard
+                )
+            })
+            .min_by_key(|component| component.shard_index.unwrap_or(0))
+            .map(|component| snapshot.join(&component.path))
+            .ok_or_else(|| DownloadError {
+                code: "publish_failed",
+                message: "published model has no runnable weight component".to_owned(),
+                retryable: false,
+                resumable: false,
+            })?;
+        let model = build_model(
+            manifest.model_id.clone(),
+            manifest.content_id.clone(),
+            manifest.created_at,
+            manifest.ready_at,
+            ModelSource::HuggingFace {
+                repository: manifest.repository.clone(),
+                requested_revision: manifest.requested_revision.clone(),
+                commit: manifest.commit.clone(),
+                metadata: None,
+            },
+            ModelLocation::MagnitudeCache {
+                total_bytes: manifest.components.iter().map(|item| item.size_bytes).sum(),
+                components: manifest.components.clone(),
+                integrity: Integrity::Verified {
+                    method: "manifest".to_owned(),
+                },
+            },
+            &primary,
+            true,
+            self.template_assessor.as_deref(),
+        )
+        .map_err(|error| DownloadError {
+            code: "inspection_failed",
             message: error.to_string(),
             retryable: true,
             resumable: true,
         })?;
         let ready = self
-            .models
-            .read()
-            .map_err(|_| DownloadError {
-                code: "internal",
-                message: "inventory lock poisoned".to_owned(),
-                retryable: false,
-                resumable: false,
-            })?
-            .get(&model_id)
-            .cloned()
-            .ok_or_else(|| DownloadError {
+            .complete_and_publish_model(model)
+            .await
+            .map_err(|error| DownloadError {
                 code: "publish_failed",
-                message: "published model was not discoverable".to_owned(),
+                message: error.to_string(),
                 retryable: true,
                 resumable: true,
             })?;

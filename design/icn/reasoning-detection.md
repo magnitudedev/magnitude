@@ -6,6 +6,10 @@ applies_to:
   - inference/crates/icn-api/**
   - inference/crates/icn-engine/**
   - inference/native/llama-cpp-rs/llama-cpp-2/src/common_chat.rs
+  - inference/native/llama-cpp-rs/llama-cpp-sys-2/wrapper_common_chat.cpp
+  - inference/native/llama-cpp-rs/llama-cpp-sys-2/wrapper_common_chat.h
+  - inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/common/chat.cpp
+  - inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/common/chat.h
 ---
 
 # ICN reasoning detection

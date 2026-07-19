@@ -20,6 +20,7 @@ icn-hardware.workspace = true
 icn-models.workspace = true
 icn-mtp.workspace = true
 icn-reasoning.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

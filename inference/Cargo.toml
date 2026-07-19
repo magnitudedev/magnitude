@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/benchmark-runner", "crates/icn-api", "crates/icn-contracts", "crates/icn-engine", "crates/icn-hardware", "crates/icn-models", "crates/icn-mtp", "crates/icn-parity", "crates/icn-parity-probe", "crates/icn-reasoning", "crates/icn-server"]
+members = ["crates/benchmark-runner", "crates/icn-api", "crates/icn-contracts", "crates/icn-engine", "crates/icn-hardware", "crates/icn-models", "crates/icn-mtp", "crates/icn-parity", "crates/icn-parity-probe", "crates/icn-reasoning", "crates/icn-server", "crates/icn-utils"]
 exclude = ["native/llama-cpp-rs"]
 resolver = "2"
 
@@ -29,6 +29,7 @@ icn-hardware = { path = "crates/icn-hardware", default-features = false }
 icn-models = { path = "crates/icn-models" }
 icn-mtp = { path = "crates/icn-mtp", default-features = false }
 icn-reasoning = { path = "crates/icn-reasoning" }
+icn-utils = { path = "crates/icn-utils" }
 llama-cpp-2 = { path = "native/llama-cpp-rs/llama-cpp-2", default-features = false, features = ["common"] }
 libc = "0.2.180"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
