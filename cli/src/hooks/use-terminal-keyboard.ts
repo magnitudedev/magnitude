@@ -21,7 +21,7 @@ import {
   usageOpenAtom,
   composerHasContentAtom,
 } from '@magnitudedev/client-common'
-import { showRecentChatsOverlayAtom } from '../state/cli-atoms'
+import { cloudModelsOpenAtom, modelSetupRouteAtom, showRecentChatsOverlayAtom } from '../state/cli-atoms'
 import { matchKeyToChord } from '../utils/chord'
 import type { ActionId } from '../types/ui-actions'
 
@@ -45,6 +45,8 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
   const setShowRecentChats = useAtomSet(showRecentChatsOverlayAtom)
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
+  const cloudModelsOpen = useAtomValue(cloudModelsOpenAtom)
+  const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
 
   const rootMode = useDisplayState((state) => getFork(state, null)?.mode ?? 'idle')
   const latestErrorCta = useDisplayState((state) => {
@@ -60,8 +62,9 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
     return null
   })
 
-  const overlayActive = showRecentChats || settingsOpen || usageOpen || expandedForkStack.length > 0
-  const canToggleRecentChats = !settingsOpen && !usageOpen && expandedForkStack.length === 0
+  const localModelSetupOpen = modelSetupRoute !== 'closed'
+  const overlayActive = showRecentChats || settingsOpen || usageOpen || cloudModelsOpen || localModelSetupOpen || expandedForkStack.length > 0
+  const canToggleRecentChats = !settingsOpen && !usageOpen && !cloudModelsOpen && !localModelSetupOpen && expandedForkStack.length === 0
 
   useKeyboard(
     useCallback((key: KeyEvent) => {
