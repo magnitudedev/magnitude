@@ -10,14 +10,14 @@ name = "icn-probe"
 path = "src/main.rs"
 
 [dependencies]
-icn-llamacpp = { workspace = true, features = ["parity-probe"] }
+icn-engine = { workspace = true, features = ["parity-probe"] }
 serde.workspace = true
 serde_json.workspace = true
 
 [features]
 default = ["cpu"]
 cpu = []
-metal = ["icn-llamacpp/metal"]
-cuda = ["icn-llamacpp/cuda"]
-vulkan = ["icn-llamacpp/vulkan"]
-mtmd = ["icn-llamacpp/mtmd"]
+metal = ["icn-engine/metal"]
+cuda = ["icn-engine/cuda"]
+vulkan = ["icn-engine/vulkan"]
+mtmd = ["icn-engine/mtmd"]

@@ -1,12 +1,12 @@
-# icn-fit
+# icn-hardware
 
-`icn-fit` runs the exact `common_get_device_memory_data` and `common_fit_params` implementation from
+The optional `icn-fit` diagnostic binary runs the exact `common_get_device_memory_data` and `common_fit_params` implementation from
 the llama.cpp revision nested in our bindings fork. It reads GGUF metadata and builds no-allocation
 graphs, but does not load model tensor data. This makes it suitable for admission checks before an
 ICN loads a model.
 
 ```sh
-cargo run --manifest-path inference/Cargo.toml -p icn-fit -- \
+cargo run --manifest-path inference/Cargo.toml -p icn-hardware --bin icn-fit -- \
   --model /absolute/path/to/model.gguf
 ```
 

@@ -27,6 +27,7 @@ capabilities = [
   "llama-bench.prompt-generation",
   "llama-bench.prompt-processing",
   "llama-bench.token-generation",
+  "llama-batched-bench.sequence-throughput",
   "model.metadata",
   "reasoning-budget.inspect",
   "sampler.apply",

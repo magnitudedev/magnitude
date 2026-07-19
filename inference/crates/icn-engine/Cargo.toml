@@ -1,5 +1,5 @@
 [package]
-name = "icn-llamacpp"
+name = "icn-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 encoding_rs.workspace = true
 getrandom.workspace = true
-icn-core.workspace = true
+icn-contracts.workspace = true
 llama-cpp-2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

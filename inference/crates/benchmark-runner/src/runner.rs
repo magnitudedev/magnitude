@@ -559,12 +559,14 @@ impl BenchmarkRunner {
                     format!("E4-{arm}-first-{repetition}"),
                     first_variant,
                     arm != "unrelated",
+                    &format!("{arm}-{repetition}"),
                 );
                 let second = cache_plan(
                     fixtures,
                     format!("E4-{arm}-second-{repetition}"),
                     second_variant,
                     arm != "unrelated",
+                    &format!("{arm}-{repetition}"),
                 );
                 let started = Instant::now();
                 let first = client.execute(first, None).await;
@@ -635,6 +637,7 @@ impl BenchmarkRunner {
                             fixtures,
                             format!("E5-{arm}-{repetition}-{index}"),
                             shared,
+                            repetition,
                             index,
                         )
                     })
@@ -898,13 +901,15 @@ fn cache_plan(
     id: String,
     variant: &str,
     shared: bool,
+    namespace: &str,
 ) -> ChatRequestPlan {
-    let prefix = shared.then_some("shared-prefix");
+    let prefix = shared.then(|| format!("shared-prefix-{namespace}"));
+    let variant = format!("{namespace}-{variant}");
     let prompt = carrier_prompt(
         fixtures,
         fixtures.prompt_long_tokens,
-        variant,
-        prefix,
+        &variant,
+        prefix.as_deref(),
         &fixtures.answer_short,
     );
     ChatRequestPlan {
@@ -924,19 +929,20 @@ fn fanout_plan(
     fixtures: &FixtureCatalog,
     id: String,
     shared: bool,
+    repetition: usize,
     index: usize,
 ) -> ChatRequestPlan {
     let variant = if shared {
-        format!("shared-tail-{index}")
+        format!("shared-tail-{repetition}-{index}")
     } else {
-        format!("independent-{index}")
+        format!("independent-{repetition}-{index}")
     };
-    let prefix = shared.then_some("fanout-shared-prefix");
+    let prefix = shared.then(|| format!("fanout-shared-prefix-{repetition}"));
     let prompt = carrier_prompt(
         fixtures,
         fixtures.prompt_long_tokens,
         &variant,
-        prefix,
+        prefix.as_deref(),
         &fixtures.answer_short,
     );
     ChatRequestPlan {
@@ -1264,6 +1270,8 @@ fn insert_request_metrics(
             ("prompt_tokens_per_second", timings.prompt_per_second),
             ("decode_ms", timings.predicted_ms),
             ("decode_tokens_per_second", timings.predicted_per_second),
+            ("sampler_ms", timings.sampler_ms),
+            ("parser_ms", timings.parser_ms),
         ] {
             if let Some(value) = value {
                 metrics.insert(format!("{prefix}.{name}"), value);

@@ -104,6 +104,14 @@ reuse outside E4/E5. Cache cases enable reuse deliberately. Tool responses use n
 because their natural semantic completion is part of the contract. These llama.cpp-compatible
 controls equalize execution work; they do not substitute for response validation.
 
+E4 and E5 include the arm and repetition in a cache namespace inside the prompt. The intended
+within-sample exact/partial/shared prefixes remain identical, while state from an earlier arm or
+repetition cannot satisfy a later request accidentally. This is required because llama.cpp's slot
+erase API clears resident slot state but does not clear its process-wide RAM prompt cache, and ICN
+does not expose a public cache-administration endpoint. Until Magnitude's planned global radix
+cache exists, scheduler/KV parity runs start llama-server with `--cache-ram 0`; both sides then
+compare resident sequence caching rather than a feature implemented by only one target.
+
 ## Measurements and validity
 
 The runner records client-observed response headers, first semantic output, every SSE event, stream

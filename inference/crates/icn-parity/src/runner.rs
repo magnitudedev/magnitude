@@ -2334,8 +2334,8 @@ async fn candidate_source_components(context: &RunContext<'_>) -> anyhow::Result
         ),
         (
             "icn-source",
-            "icn-llamacpp",
-            inference_root.join("crates/icn-llamacpp/src"),
+            "icn-engine",
+            inference_root.join("crates/icn-engine/src"),
             vec![".git", "target"],
         ),
     ] {

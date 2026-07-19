@@ -5,19 +5,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use icn_core::{
+use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
-    ChatTemplateRequest, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FinishReason,
-    FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
-    ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent, ModelModalities,
-    ModelProperties, PreparedChatInfo, ReasoningControl, ResponseFormat, SplitMode,
-    TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
+    ChatTemplateRequest, CompletionBackend, DownloadModelRequest, ExecutionConfig,
+    ExecutionConfigReport, FinishReason, FlashAttention, Generation, GenerationMetrics,
+    GenerationSnapshot, GpuLayers, GrammarTrigger, ImageInput, InferenceError, InferenceEvent,
+    InferenceStreamEvent, InventoryError, InventoryModel, ModelHardwareAssessor, ModelId,
+    ModelInventory, ModelModalities, ModelProperties, PreparedChatInfo, ReasoningControl,
+    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -28,6 +29,7 @@ use utoipa::openapi::path::Operation;
 use utoipa::openapi::{Components, OpenApi as OpenApiDocument, RefOr};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
+mod inventory_schema;
 mod media;
 
 const DEFAULT_MAX_TOKENS: u32 = 256;
@@ -52,15 +54,44 @@ const fn default_true() -> bool {
 #[derive(Clone)]
 pub struct AppState {
     backend: Arc<dyn CompletionBackend>,
+    model_aliases: Arc<BTreeSet<String>>,
+    inventory: Option<Arc<dyn ModelInventory>>,
+    hardware_assessor: Option<Arc<dyn ModelHardwareAssessor>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl AppState {
     pub fn new(backend: impl CompletionBackend) -> Self {
+        Self::from_shared_backend(Arc::new(backend))
+    }
+
+    /// Construct API state from a backend shared with another server-owned service.
+    pub fn from_shared_backend(backend: Arc<dyn CompletionBackend>) -> Self {
         Self {
-            backend: Arc::new(backend),
+            backend,
+            model_aliases: Arc::new(BTreeSet::new()),
+            inventory: None,
+            hardware_assessor: None,
             next_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Accept an additional OpenAI request model name for the loaded backend.
+    ///
+    /// The backend's stable model ID remains authoritative; aliases are routing names only.
+    pub fn with_model_alias(mut self, alias: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.model_aliases).insert(alias.into());
+        self
+    }
+
+    pub fn with_inventory(mut self, inventory: Arc<dyn ModelInventory>) -> Self {
+        self.inventory = Some(inventory);
+        self
+    }
+
+    pub fn with_hardware_assessor(mut self, assessor: Arc<dyn ModelHardwareAssessor>) -> Self {
+        self.hardware_assessor = Some(assessor);
+        self
     }
 }
 
@@ -68,6 +99,9 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/models/download", post(download_model))
+        .route("/v1/models/{model_id}", get(model).delete(delete_model))
+        .route("/v1/models/{model_id}/assess", post(assess_model))
         .route("/props", get(props))
         .route("/v1/props", get(props))
         .route("/apply-template", post(apply_template))
@@ -96,6 +130,199 @@ pub struct Model {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    supported_parameters: Vec<String>,
+    #[schema(value_type = inventory_schema::ModelStatusSchema)]
+    status: JsonValue,
+    #[schema(value_type = inventory_schema::ModelSourceSchema)]
+    source: JsonValue,
+    #[schema(value_type = inventory_schema::ModelLocationSchema)]
+    location: JsonValue,
+    #[schema(value_type = inventory_schema::InventoryPropertiesSchema)]
+    properties: JsonValue,
+    #[schema(value_type = inventory_schema::HardwareAssessmentSchema)]
+    hardware: JsonValue,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    operations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<u64>,
+}
+
+impl Model {
+    fn loaded_only(id: String) -> Self {
+        Self {
+            id,
+            object: "model",
+            owned_by: "magnitude",
+            created: None,
+            name: None,
+            content_id: None,
+            supported_parameters: Vec::new(),
+            status: JsonValue::Null,
+            source: JsonValue::Null,
+            location: JsonValue::Null,
+            properties: JsonValue::Null,
+            hardware: JsonValue::Null,
+            operations: Vec::new(),
+            updated_at: None,
+        }
+    }
+
+    fn inventory(model: InventoryModel) -> Result<Self, ApiError> {
+        Ok(Self {
+            id: model.id.0,
+            object: "model",
+            owned_by: "magnitude",
+            created: Some(model.created),
+            name: Some(model.name),
+            content_id: Some(model.content_id.0),
+            supported_parameters: model.supported_parameters,
+            status: json_value(model.status)?,
+            source: json_value(model.source)?,
+            location: json_value(model.location)?,
+            properties: json_value(model.properties)?,
+            hardware: json_value(model.hardware)?,
+            operations: model
+                .operations
+                .into_iter()
+                .map(|operation| serde_json::to_value(operation).expect("enum serializes"))
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect(),
+            updated_at: Some(model.updated_at),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteModelResponse {
+    id: String,
+    object: &'static str,
+    deleted: bool,
+    magnitude: JsonValue,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HuggingFaceDownloadSourceSchema {
+    HuggingFace {
+        repository: String,
+        revision: String,
+    },
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadComponentRoleSchema {
+    Weights,
+    Shard,
+    Projector,
+    Auxiliary,
+    Draft,
+    Mtp,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadComponentSchema {
+    path: String,
+    role: DownloadComponentRoleSchema,
+    shard_index: Option<u32>,
+    expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DownloadRelationshipSchema {
+    ProjectorFor { projector: String, model: String },
+    DraftFor { draft: String, model: String },
+    MtpFor { mtp: String, model: String },
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadModelRequestSchema {
+    source: HuggingFaceDownloadSourceSchema,
+    components: Vec<DownloadComponentSchema>,
+    relationships: Vec<DownloadRelationshipSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadStageSchema {
+    Queued,
+    Resolving,
+    CheckingSpace,
+    Downloading,
+    Verifying,
+    Publishing,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DownloadFileProgressSchema {
+    path: String,
+    completed_bytes: u64,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DownloadFailureSchema {
+    code: String,
+    message: String,
+    retryable: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelDownloadEventSchema {
+    Resolving {
+        operation_id: String,
+        repository: String,
+        revision: String,
+    },
+    CheckingSpace {
+        operation_id: String,
+        model_id: String,
+        required_bytes: u64,
+        available_bytes: u64,
+        completed_bytes: u64,
+        total_bytes: u64,
+    },
+    Progress {
+        operation_id: String,
+        model_id: String,
+        stage: DownloadStageSchema,
+        completed_bytes: u64,
+        total_bytes: u64,
+        file: DownloadFileProgressSchema,
+        bytes_per_second: Option<f64>,
+        resumed_from_bytes: u64,
+    },
+    Ready {
+        operation_id: String,
+        model: Box<Model>,
+    },
+    Failed {
+        operation_id: String,
+        model_id: Option<String>,
+        error: DownloadFailureSchema,
+        completed_bytes: u64,
+        total_bytes: u64,
+        resumable: bool,
+    },
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -595,6 +822,10 @@ pub struct Timings {
     pub predicted_ms: f64,
     pub predicted_per_token_ms: f64,
     pub predicted_per_second: f64,
+    /// Time spent inside llama.cpp's sampler for this request.
+    pub sampler_ms: f64,
+    /// Time spent incrementally parsing generated chat output for this request.
+    pub parser_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub draft_n: Option<u64>,
@@ -656,6 +887,64 @@ impl ApiError {
             error => Self::server(error.to_string()),
         }
     }
+
+    fn from_inventory(error: InventoryError) -> Self {
+        let (status, error_type, code) = match &error {
+            InventoryError::InvalidId(_) | InventoryError::InvalidRequest(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_request",
+            ),
+            InventoryError::NotFound(_) => (
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "model_not_found",
+            ),
+            InventoryError::NotReady(_) => (
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "model_not_ready",
+            ),
+            InventoryError::Busy(_) => {
+                (StatusCode::CONFLICT, "invalid_request_error", "model_busy")
+            }
+            InventoryError::Loaded(_) => (
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "model_loaded",
+            ),
+            InventoryError::DeletionUnsafe(_) => (
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "deletion_unsafe",
+            ),
+            InventoryError::Unsupported(_) => (
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "operation_unsupported",
+            ),
+            InventoryError::Integrity(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "integrity_failed",
+            ),
+            InventoryError::Io(_) | InventoryError::Upstream(_) | InventoryError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "inventory_error",
+            ),
+        };
+        Self {
+            status,
+            body: ErrorResponse {
+                error: ApiErrorBody {
+                    message: error.to_string(),
+                    r#type: error_type,
+                    code,
+                },
+            },
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -677,15 +966,171 @@ async fn health() -> Json<HealthResponse> {
 #[utoipa::path(get, path = "/v1/models", operation_id = "listModels", tag = "models", responses(
     (status = 200, description = "Loaded models", body = ModelList)
 ))]
-async fn models(State(state): State<AppState>) -> Json<ModelList> {
-    Json(ModelList {
+async fn models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiError> {
+    let data = match state.inventory.as_ref() {
+        Some(inventory) => inventory
+            .list()
+            .await
+            .map_err(ApiError::from_inventory)?
+            .into_iter()
+            .map(Model::inventory)
+            .collect::<Result<Vec<_>, _>>()?,
+        None => vec![Model::loaded_only(state.backend.model_id().to_owned())],
+    };
+    Ok(Json(ModelList {
         object: "list",
-        data: vec![Model {
-            id: state.backend.model_id().to_owned(),
+        data,
+    }))
+}
+
+#[utoipa::path(get, path = "/v1/models/{model_id}", operation_id = "getModel", tag = "models",
+    params(("model_id" = String, Path, description = "Stable inventory model ID")),
+    responses(
+        (status = 200, description = "Inventory model", body = Model),
+        (status = 404, description = "Model not found", body = ErrorResponse)
+    )
+)]
+async fn model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<Model>, ApiError> {
+    let inventory = require_inventory(&state)?;
+    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
+    let model = inventory.get(&id).await.map_err(ApiError::from_inventory)?;
+    Ok(Json(Model::inventory(model)?))
+}
+
+#[utoipa::path(post, path = "/v1/models/{model_id}/assess", operation_id = "assessModelHardware", tag = "models",
+    params(("model_id" = String, Path, description = "Stable inventory model ID")),
+    responses(
+        (status = 200, description = "Inventory model with refreshed hardware assessment", body = Model),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 409, description = "Model is not ready for assessment", body = ErrorResponse),
+        (status = 500, description = "Hardware assessor unavailable", body = ErrorResponse)
+    )
+)]
+async fn assess_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<Model>, ApiError> {
+    let inventory = require_inventory(&state)?;
+    let assessor = state
+        .hardware_assessor
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model hardware assessor is not configured"))?;
+    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
+    assessor
+        .assess(&id)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    let model = inventory.get(&id).await.map_err(ApiError::from_inventory)?;
+    Ok(Json(Model::inventory(model)?))
+}
+
+#[utoipa::path(post, path = "/v1/models/download", operation_id = "downloadModel", tag = "models",
+    request_body(content = DownloadModelRequestSchema, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Server-owned download progress", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Invalid download request", body = ErrorResponse),
+        (status = 500, description = "Download could not start", body = ErrorResponse)
+    )
+)]
+async fn download_model(
+    State(state): State<AppState>,
+    Json(request): Json<DownloadModelRequest>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let inventory = require_inventory(&state)?;
+    let stream = inventory
+        .download(request)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    let framed = tokio_stream::StreamExt::map(stream, |event| {
+        let data = download_event_json(event).unwrap_or_else(|error| {
+            serde_json::json!({
+                "type": "failed",
+                "error": {"code": "serialization_failed", "message": error.to_string(), "retryable": false},
+                "completed_bytes": 0,
+                "total_bytes": 0,
+                "resumable": true
+            })
+            .to_string()
+        });
+        Ok(Event::default().data(data))
+    });
+    Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
+}
+
+fn download_event_json(
+    event: icn_contracts::ModelDownloadEvent,
+) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(event)?;
+    if value.get("type").and_then(JsonValue::as_str) == Some("ready")
+        && let Some(model) = value.get_mut("model").and_then(JsonValue::as_object_mut)
+    {
+        model.insert("object".to_owned(), JsonValue::String("model".to_owned()));
+        model.insert(
+            "owned_by".to_owned(),
+            JsonValue::String("magnitude".to_owned()),
+        );
+    }
+    serde_json::to_string(&value)
+}
+
+#[utoipa::path(delete, path = "/v1/models/{model_id}", operation_id = "deleteModel", tag = "models",
+    params(
+        ("model_id" = String, Path, description = "Stable inventory model ID"),
+        ("dry_run" = Option<bool>, Query, description = "Return the deletion plan without mutation")
+    ),
+    responses(
+        (status = 200, description = "Deletion result", body = DeleteModelResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 409, description = "Model busy, loaded, or deletion unsafe", body = ErrorResponse)
+    )
+)]
+async fn delete_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    Query(query): Query<DeleteQuery>,
+) -> Result<Json<DeleteModelResponse>, ApiError> {
+    let inventory = require_inventory(&state)?;
+    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
+    if query.dry_run {
+        let plan = inventory
+            .plan_delete(&id)
+            .await
+            .map_err(ApiError::from_inventory)?;
+        return Ok(Json(DeleteModelResponse {
+            id: id.0,
             object: "model",
-            owned_by: "magnitude",
-        }],
-    })
+            deleted: false,
+            magnitude: json_value(plan)?,
+        }));
+    }
+    let deleted = inventory
+        .delete(&id)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    Ok(Json(DeleteModelResponse {
+        id: deleted.id.0,
+        object: "model",
+        deleted: deleted.deleted,
+        magnitude: json_value(serde_json::json!({
+            "freed_bytes": deleted.freed_bytes,
+            "retained_shared_bytes": deleted.retained_shared_bytes,
+            "plan": deleted.plan,
+        }))?,
+    }))
+}
+
+fn require_inventory(state: &AppState) -> Result<&Arc<dyn ModelInventory>, ApiError> {
+    state
+        .inventory
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model inventory is not configured"))
+}
+
+fn json_value(value: impl Serialize) -> Result<JsonValue, ApiError> {
+    serde_json::to_value(value).map_err(|error| ApiError::server(error.to_string()))
 }
 
 #[utoipa::path(get, path = "/v1/props", operation_id = "getModelProperties", tag = "models", responses(
@@ -712,7 +1157,7 @@ async fn apply_template(
     State(state): State<AppState>,
     Json(request): Json<ApplyTemplateRequest>,
 ) -> Result<Json<ApplyTemplateResponse>, ApiError> {
-    validate_model_selection(request.model.as_deref(), state.backend.model_id())?;
+    validate_model_selection(request.model.as_deref(), &state)?;
     let request = validate_apply_template_request(request)?;
     let backend = Arc::clone(&state.backend);
     let prepared = tokio::task::spawn_blocking(move || backend.apply_template(request))
@@ -733,7 +1178,7 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    validate_model_selection(request.model.as_deref(), state.backend.model_id())?;
+    validate_model_selection(request.model.as_deref(), &state)?;
     let (request, include_usage) = validate_request(request)?;
     let id = format!(
         "chatcmpl-icn-{}",
@@ -900,8 +1345,11 @@ fn timing_values(
         predicted_ms: metrics.decode_ms,
         predicted_per_token_ms: per_token_ms(generated_tokens, metrics.decode_ms),
         predicted_per_second: rate(generated_tokens, metrics.decode_ms),
-        draft_n: None,
-        draft_n_accepted: None,
+        sampler_ms: metrics.sampler_ms,
+        parser_ms: metrics.parser_ms,
+        draft_n: (metrics.draft_tokens > 0).then_some(metrics.draft_tokens as u64),
+        draft_n_accepted: (metrics.draft_tokens > 0)
+            .then_some(metrics.accepted_draft_tokens as u64),
     }
 }
 
@@ -992,12 +1440,17 @@ fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
     }
 }
 
-fn validate_model_selection(requested: Option<&str>, loaded: &str) -> Result<(), ApiError> {
+fn validate_model_selection(requested: Option<&str>, state: &AppState) -> Result<(), ApiError> {
     match requested {
         Some("") => Err(ApiError::invalid("model must not be empty")),
-        Some(requested) if requested != loaded => Err(ApiError::invalid(format!(
-            "model {requested} is not loaded by this inference node"
-        ))),
+        Some(requested)
+            if requested != state.backend.model_id()
+                && !state.model_aliases.contains(requested) =>
+        {
+            Err(ApiError::invalid(format!(
+                "model {requested} is not loaded by this inference node"
+            )))
+        }
         _ => Ok(()),
     }
 }
@@ -1534,11 +1987,37 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
 #[derive(OpenApi)]
 #[openapi(
     info(title = "Magnitude Inference Control Node", version = "0.1.0"),
-    paths(health, models, props, apply_template, chat_completions),
+    paths(
+        health,
+        models,
+        model,
+        assess_model,
+        download_model,
+        delete_model,
+        props,
+        apply_template,
+        chat_completions
+    ),
     components(schemas(
         HealthResponse,
         ModelList,
         Model,
+        inventory_schema::ModelStatusSchema,
+        inventory_schema::ModelSourceSchema,
+        inventory_schema::ModelLocationSchema,
+        inventory_schema::InventoryPropertiesSchema,
+        inventory_schema::HardwareAssessmentSchema,
+        DeleteQuery,
+        DeleteModelResponse,
+        HuggingFaceDownloadSourceSchema,
+        DownloadComponentRoleSchema,
+        DownloadComponentSchema,
+        DownloadRelationshipSchema,
+        DownloadModelRequestSchema,
+        DownloadStageSchema,
+        DownloadFileProgressSchema,
+        DownloadFailureSchema,
+        ModelDownloadEventSchema,
         PropsResponse,
         ExecutionConfigResponse,
         ExecutionSettingsResponse,
@@ -1666,6 +2145,29 @@ impl StreamContract for ChatCompletionStream {
     }
 }
 
+struct DownloadModelStream;
+
+impl StreamContract for DownloadModelStream {
+    type Event = ModelDownloadEventSchema;
+    const RESPONSE_STATUS: u16 = 200;
+
+    fn metadata() -> StreamMetadata {
+        StreamMetadata {
+            version: 1,
+            response_status: Self::RESPONSE_STATUS,
+            framing: StreamFraming::Sse,
+            data: StreamData {
+                encoding: "json",
+                schema: StreamSchemaRef {
+                    reference: format!("#/components/schemas/{}", Self::Event::name()),
+                },
+            },
+            termination: StreamTermination::Eof,
+            reconnect: StreamReconnect::None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenApiExportError {
     #[error("OpenAPI operation {0} was not generated")]
@@ -1690,6 +2192,11 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     attach_stream_contract::<ChatCompletionStream>(
         &mut document,
         "createChatCompletion",
+        "text/event-stream",
+    )?;
+    attach_stream_contract::<DownloadModelStream>(
+        &mut document,
+        "downloadModel",
         "text/event-stream",
     )?;
     Ok(document)
@@ -1814,6 +2321,9 @@ impl CompletionBackend for FakeBackend {
                 enable_thinking: true,
             },
             modalities: ModelModalities::default(),
+            mtp: icn_contracts::MtpRuntimeProperties::Disabled {
+                reason: "fake_backend".into(),
+            },
             execution: ExecutionConfigReport {
                 requested: ExecutionConfig::default(),
                 resolved: ExecutionConfig::default(),
@@ -2003,6 +2513,10 @@ mod tests {
                     decode_tokens_per_second: 6.0,
                     sampler_ms: 0.5,
                     parser_ms: 0.25,
+                    draft_tokens: 0,
+                    accepted_draft_tokens: 0,
+                    draft_ms: 0.0,
+                    verification_ms: 0.0,
                 },
             })
         }
@@ -2047,9 +2561,62 @@ mod tests {
             "predicted_ms",
             "predicted_per_token_ms",
             "predicted_per_second",
+            "sampler_ms",
+            "parser_ms",
         ] {
             assert!(schemas["Timings"]["properties"][field].is_object());
         }
+    }
+
+    #[test]
+    fn speculative_counts_are_exposed_only_when_drafting_ran() {
+        let ordinary = timing_values(0, 10, 2, &GenerationMetrics::default());
+        assert_eq!(ordinary.draft_n, None);
+        assert_eq!(ordinary.draft_n_accepted, None);
+
+        let speculative = timing_values(
+            0,
+            10,
+            4,
+            &GenerationMetrics {
+                draft_tokens: 3,
+                accepted_draft_tokens: 2,
+                ..GenerationMetrics::default()
+            },
+        );
+        assert_eq!(speculative.draft_n, Some(3));
+        assert_eq!(speculative.draft_n_accepted, Some(2));
+    }
+
+    #[test]
+    fn exported_inventory_contract_is_typed_and_streamed_to_eof() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        let operation = &value["paths"]["/v1/models/download"]["post"];
+        assert_eq!(operation[STREAM_EXTENSION]["framing"], "sse");
+        assert_eq!(operation[STREAM_EXTENSION]["termination"]["type"], "eof");
+        assert_eq!(
+            operation[STREAM_EXTENSION]["data"]["schema"]["$ref"],
+            "#/components/schemas/ModelDownloadEventSchema"
+        );
+        let schemas = &value["components"]["schemas"];
+        assert_eq!(
+            schemas["Model"]["properties"]["status"]["$ref"],
+            "#/components/schemas/ModelStatusSchema"
+        );
+        assert_eq!(
+            schemas["Model"]["properties"]["hardware"]["$ref"],
+            "#/components/schemas/HardwareAssessmentSchema"
+        );
+        assert_eq!(
+            value["paths"]["/v1/models/{model_id}/assess"]["post"]["operationId"],
+            "assessModelHardware"
+        );
+        let relationships = &schemas["DownloadRelationshipSchema"]["oneOf"]
+            .as_array()
+            .unwrap()[0];
+        assert!(relationships["properties"]["projector"].is_object());
+        assert!(relationships["properties"]["model"].is_object());
+        assert!(relationships["properties"].get("component_path").is_none());
     }
 
     #[tokio::test]
@@ -2112,6 +2679,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("not loaded"));
+    }
+
+    #[test]
+    fn accepts_the_loaded_model_id_and_configured_aliases() {
+        let state =
+            AppState::new(FakeBackend::new("test-model", "ok")).with_model_alias("friendly-name");
+
+        assert!(validate_model_selection(Some("test-model"), &state).is_ok());
+        assert!(validate_model_selection(Some("friendly-name"), &state).is_ok());
+        assert!(validate_model_selection(None, &state).is_ok());
+        assert!(validate_model_selection(Some("different-model"), &state).is_err());
     }
 
     #[test]
@@ -2446,6 +3024,7 @@ mod tests {
             timing_fields,
             BTreeSet::from([
                 "cache_n",
+                "parser_ms",
                 "predicted_ms",
                 "predicted_n",
                 "predicted_per_second",
@@ -2454,6 +3033,7 @@ mod tests {
                 "prompt_n",
                 "prompt_per_second",
                 "prompt_per_token_ms",
+                "sampler_ms",
             ])
         );
         assert_eq!(terminal["timings"]["cache_n"], 0);

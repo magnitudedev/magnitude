@@ -1,7 +1,7 @@
 //! Strict JSON Lines adapter for the production ICN primitive parity surface.
 //!
 //! The probe deliberately owns only transport concerns. Primitive semantics
-//! remain in `icn-llamacpp`, so the parity suite exercises the production
+//! remain in `icn-engine`, so the parity suite exercises the production
 //! binding path rather than a second implementation in this binary.
 
 use std::fmt;
@@ -122,7 +122,7 @@ fn response_for_line(line: &[u8]) -> Response {
     };
 
     match catch_unwind(AssertUnwindSafe(|| {
-        icn_llamacpp::parity_probe::execute(&request.operation, &request.input)
+        icn_engine::parity_probe::execute(&request.operation, &request.input)
     })) {
         Ok(Ok(evidence)) => Response {
             schema_version: PROTOCOL_VERSION,

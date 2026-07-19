@@ -1,0 +1,6 @@
+id = "cache-development"
+description = "Focused sequential prompt-cache diagnostic for engine development."
+cases = ["E4/exact", "E4/partial", "E4/unrelated"]
+repetitions = 1
+warmups = 0
+request_timeout_seconds = 600

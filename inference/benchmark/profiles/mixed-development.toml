@@ -1,0 +1,6 @@
+id = "mixed-development"
+description = "Focused concurrent prefill-and-decode scheduler diagnostic."
+cases = ["E3/*"]
+repetitions = 2
+warmups = 0
+request_timeout_seconds = 600

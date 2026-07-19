@@ -1,0 +1,6 @@
+id = "fanout-development"
+description = "Focused concurrent shared and independent prompt-cache diagnostic."
+cases = ["E5/shared", "E5/independent"]
+repetitions = 2
+warmups = 0
+request_timeout_seconds = 600

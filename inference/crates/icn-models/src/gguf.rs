@@ -1,0 +1,389 @@
+//! Bounded GGUF metadata inspection without loading tensor contents.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
+
+const MAGIC: [u8; 4] = *b"GGUF";
+const MAX_METADATA_ENTRIES: u64 = 1_000_000;
+const MAX_TENSORS: u64 = 10_000_000;
+const MAX_STRING_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DIMS: u32 = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GgufInspection {
+    pub version: u32,
+    pub architecture: Option<String>,
+    pub name: Option<String>,
+    pub quantization: Option<String>,
+    pub parameter_count: Option<u64>,
+    pub active_parameter_count: Option<u64>,
+    pub training_context_length: Option<u32>,
+    pub nextn_predict_layers: Option<u32>,
+    pub tokenizer: Option<String>,
+    pub chat_template: Option<String>,
+    pub base_models: Vec<String>,
+    pub modalities: Vec<String>,
+    pub tensor_count: u64,
+    pub fingerprint_material: Vec<u8>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GgufError {
+    #[error("failed to read GGUF: {0}")]
+    Io(#[from] io::Error),
+    #[error("file is not GGUF")]
+    InvalidMagic,
+    #[error("unsupported GGUF version {0}")]
+    UnsupportedVersion(u32),
+    #[error("GGUF header is structurally invalid: {0}")]
+    Invalid(&'static str),
+    #[error("GGUF metadata string is not UTF-8")]
+    Utf8(#[from] std::string::FromUtf8Error),
+}
+
+#[derive(Debug, Clone)]
+enum Value {
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    String(String),
+    Other,
+}
+
+pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut reader = CheckedReader::new(BufReader::new(file), file_len);
+
+    let mut magic = [0_u8; 4];
+    reader.read_exact(&mut magic)?;
+    if magic != MAGIC {
+        return Err(GgufError::InvalidMagic);
+    }
+    let version = reader.u32()?;
+    if !(2..=3).contains(&version) {
+        return Err(GgufError::UnsupportedVersion(version));
+    }
+    let tensor_count = reader.u64()?;
+    let metadata_count = reader.u64()?;
+    if tensor_count > MAX_TENSORS {
+        return Err(GgufError::Invalid("tensor count exceeds inspection bound"));
+    }
+    if metadata_count > MAX_METADATA_ENTRIES {
+        return Err(GgufError::Invalid(
+            "metadata count exceeds inspection bound",
+        ));
+    }
+
+    let mut metadata = BTreeMap::new();
+    for _ in 0..metadata_count {
+        let key = reader.string()?;
+        let value_type = reader.u32()?;
+        let value = reader.value(value_type)?;
+        metadata.insert(key, value);
+    }
+
+    let mut derived_parameter_count = 0_u64;
+    for _ in 0..tensor_count {
+        let _name = reader.string()?;
+        let dimensions = reader.u32()?;
+        if dimensions == 0 || dimensions > MAX_DIMS {
+            return Err(GgufError::Invalid("tensor dimension count is invalid"));
+        }
+        let mut elements = 1_u64;
+        for _ in 0..dimensions {
+            elements = elements
+                .checked_mul(reader.u64()?)
+                .ok_or(GgufError::Invalid("tensor element count overflow"))?;
+        }
+        derived_parameter_count = derived_parameter_count
+            .checked_add(elements)
+            .ok_or(GgufError::Invalid("model parameter count overflow"))?;
+        let _tensor_type = reader.u32()?;
+        let _offset = reader.u64()?;
+    }
+
+    let architecture = string_value(&metadata, "general.architecture");
+    let training_context_length = architecture
+        .as_ref()
+        .and_then(|architecture| u32_value(&metadata, &format!("{architecture}.context_length")))
+        .or_else(|| u32_value(&metadata, "llama.context_length"));
+    let nextn_predict_layers = architecture.as_ref().and_then(|architecture| {
+        u32_value(&metadata, &format!("{architecture}.nextn_predict_layers"))
+    });
+    // The expert activation ratio cannot be applied to the whole model: embeddings, attention,
+    // shared experts, and output tensors remain active. Publish no active count unless GGUF grows
+    // an authoritative aggregate field.
+    let active_parameter_count = u64_value(&metadata, "general.active_parameter_count");
+    let base_model_count = u32_value(&metadata, "general.base_model.count").unwrap_or(0);
+    let base_models = (0..base_model_count)
+        .filter_map(|index| string_value(&metadata, &format!("general.base_model.{index}.name")))
+        .collect();
+    let modalities = if metadata
+        .keys()
+        .any(|key| key.contains("vision") || key.contains("clip") || key.contains("projector"))
+    {
+        vec!["text".to_owned(), "image".to_owned()]
+    } else {
+        vec!["text".to_owned()]
+    };
+    let quantization = u32_value(&metadata, "general.file_type").map(file_type_name);
+    let parameter_count = u64_value(&metadata, "general.parameter_count")
+        .or((derived_parameter_count > 0).then_some(derived_parameter_count));
+
+    let mut fingerprint_material = Vec::new();
+    fingerprint_material.extend_from_slice(&version.to_le_bytes());
+    fingerprint_material.extend_from_slice(&tensor_count.to_le_bytes());
+    fingerprint_material.extend_from_slice(&metadata_count.to_le_bytes());
+    if let Some(value) = architecture.as_ref() {
+        fingerprint_material.extend_from_slice(value.as_bytes());
+    }
+    if let Some(value) = string_value(&metadata, "tokenizer.chat_template") {
+        fingerprint_material.extend_from_slice(value.as_bytes());
+    }
+
+    Ok(GgufInspection {
+        version,
+        architecture,
+        name: string_value(&metadata, "general.name"),
+        quantization,
+        parameter_count,
+        active_parameter_count,
+        training_context_length,
+        nextn_predict_layers,
+        tokenizer: string_value(&metadata, "tokenizer.ggml.model"),
+        chat_template: string_value(&metadata, "tokenizer.chat_template"),
+        base_models,
+        modalities,
+        tensor_count,
+        fingerprint_material,
+    })
+}
+
+fn string_value(values: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+    match values.get(key) {
+        Some(Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn u32_value(values: &BTreeMap<String, Value>, key: &str) -> Option<u32> {
+    match values.get(key) {
+        Some(Value::U32(value)) => Some(*value),
+        Some(Value::I32(value)) => u32::try_from(*value).ok(),
+        Some(Value::U64(value)) => u32::try_from(*value).ok(),
+        Some(Value::I64(value)) => u32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn u64_value(values: &BTreeMap<String, Value>, key: &str) -> Option<u64> {
+    match values.get(key) {
+        Some(Value::U32(value)) => Some(u64::from(*value)),
+        Some(Value::I32(value)) => u64::try_from(*value).ok(),
+        Some(Value::U64(value)) => Some(*value),
+        Some(Value::I64(value)) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn file_type_name(value: u32) -> String {
+    match value {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "IQ3_XXS",
+        22 => "IQ1_S",
+        23 => "IQ4_NL",
+        24 => "IQ3_S",
+        25 => "IQ2_S",
+        26 => "IQ4_XS",
+        27 => "IQ1_M",
+        28 => "BF16",
+        29 => "Q4_0_4_4",
+        30 => "Q4_0_4_8",
+        31 => "Q4_0_8_8",
+        32 => "TQ1_0",
+        33 => "TQ2_0",
+        34 => "MXFP4_MOE",
+        _ => return format!("file_type_{value}"),
+    }
+    .to_owned()
+}
+
+struct CheckedReader<R> {
+    inner: R,
+    position: u64,
+    length: u64,
+}
+
+impl<R: Read + Seek> CheckedReader<R> {
+    fn new(inner: R, length: u64) -> Self {
+        Self {
+            inner,
+            position: 0,
+            length,
+        }
+    }
+
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), GgufError> {
+        let amount =
+            u64::try_from(buffer.len()).map_err(|_| GgufError::Invalid("read length overflow"))?;
+        self.ensure_remaining(amount)?;
+        self.inner.read_exact(buffer)?;
+        self.position += amount;
+        Ok(())
+    }
+
+    fn u8(&mut self) -> Result<u8, GgufError> {
+        let mut bytes = [0; 1];
+        self.read_exact(&mut bytes)?;
+        Ok(bytes[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, GgufError> {
+        let mut bytes = [0; 2];
+        self.read_exact(&mut bytes)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn i16(&mut self) -> Result<i16, GgufError> {
+        let mut bytes = [0; 2];
+        self.read_exact(&mut bytes)?;
+        Ok(i16::from_le_bytes(bytes))
+    }
+
+    fn u32(&mut self) -> Result<u32, GgufError> {
+        let mut bytes = [0; 4];
+        self.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn i32(&mut self) -> Result<i32, GgufError> {
+        let mut bytes = [0; 4];
+        self.read_exact(&mut bytes)?;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, GgufError> {
+        let mut bytes = [0; 8];
+        self.read_exact(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn i64(&mut self) -> Result<i64, GgufError> {
+        let mut bytes = [0; 8];
+        self.read_exact(&mut bytes)?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    fn string(&mut self) -> Result<String, GgufError> {
+        let length = self.u64()?;
+        if length > MAX_STRING_BYTES {
+            return Err(GgufError::Invalid(
+                "metadata string exceeds inspection bound",
+            ));
+        }
+        let length = usize::try_from(length)
+            .map_err(|_| GgufError::Invalid("metadata string length overflows usize"))?;
+        let mut bytes = vec![0; length];
+        self.read_exact(&mut bytes)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    fn value(&mut self, value_type: u32) -> Result<Value, GgufError> {
+        match value_type {
+            0 => Ok(Value::U32(u32::from(self.u8()?))),
+            1 => Ok(Value::I32(i32::from(self.u8()? as i8))),
+            2 => Ok(Value::U32(u32::from(self.u16()?))),
+            3 => Ok(Value::I32(i32::from(self.i16()?))),
+            4 => Ok(Value::U32(self.u32()?)),
+            5 => Ok(Value::I32(self.i32()?)),
+            6 => {
+                self.skip(4)?;
+                Ok(Value::Other)
+            }
+            7 => {
+                let _ = self.u8()?;
+                Ok(Value::Other)
+            }
+            8 => Ok(Value::String(self.string()?)),
+            9 => {
+                let element_type = self.u32()?;
+                let count = self.u64()?;
+                if count > MAX_METADATA_ENTRIES {
+                    return Err(GgufError::Invalid(
+                        "metadata array exceeds inspection bound",
+                    ));
+                }
+                for _ in 0..count {
+                    let _ = self.value(element_type)?;
+                }
+                Ok(Value::Other)
+            }
+            10 => Ok(Value::U64(self.u64()?)),
+            11 => Ok(Value::I64(self.i64()?)),
+            12 => {
+                self.skip(8)?;
+                Ok(Value::Other)
+            }
+            _ => Err(GgufError::Invalid("unknown metadata value type")),
+        }
+    }
+
+    fn skip(&mut self, amount: u64) -> Result<(), GgufError> {
+        self.ensure_remaining(amount)?;
+        let amount =
+            i64::try_from(amount).map_err(|_| GgufError::Invalid("seek length overflows i64"))?;
+        self.inner.seek(SeekFrom::Current(amount))?;
+        self.position += amount as u64;
+        Ok(())
+    }
+
+    fn ensure_remaining(&self, amount: u64) -> Result<(), GgufError> {
+        if self
+            .position
+            .checked_add(amount)
+            .is_none_or(|end| end > self.length)
+        {
+            return Err(GgufError::Invalid("header extends beyond end of file"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_gguf_without_panicking() {
+        let path = std::env::temp_dir().join(format!(
+            "icn-gguf-invalid-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, b"not a gguf").unwrap();
+        let result = inspect(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(result, Err(GgufError::InvalidMagic)));
+    }
+}

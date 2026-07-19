@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SUITE_VERSION: &str = "3";
+pub const SUITE_VERSION: &str = "4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -148,6 +148,8 @@ pub struct TimingObservation {
     pub predicted_n: Option<u64>,
     pub predicted_ms: Option<f64>,
     pub predicted_per_second: Option<f64>,
+    pub sampler_ms: Option<f64>,
+    pub parser_ms: Option<f64>,
     pub draft_n: Option<u64>,
     pub draft_n_accepted: Option<u64>,
 }
