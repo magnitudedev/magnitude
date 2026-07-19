@@ -8,6 +8,7 @@ license.workspace = true
 encoding_rs.workspace = true
 getrandom.workspace = true
 icn-contracts.workspace = true
+icn-reasoning.workspace = true
 llama-cpp-2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

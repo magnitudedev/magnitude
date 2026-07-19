@@ -762,18 +762,15 @@ fn build_model(
             if matches!(tools, CapabilitySupport::Supported { .. }) {
                 supported_parameters.push("tools".to_owned());
             }
-            if matches!(reasoning, ReasoningCapability::Supported { .. }) {
-                supported_parameters.push("reasoning".to_owned());
-                if matches!(
-                    reasoning,
-                    ReasoningCapability::Supported {
-                        control: icn_contracts::ReasoningControlDomain::Effort { .. }
-                            | icn_contracts::ReasoningControlDomain::EffortAndBudget { .. },
-                        ..
-                    }
-                ) {
-                    supported_parameters.push("reasoning_effort".to_owned());
+            if matches!(
+                reasoning,
+                ReasoningCapability::Supported {
+                    control: icn_contracts::ReasoningControlDomain::Effort { .. }
+                        | icn_contracts::ReasoningControlDomain::EffortAndBudget { .. },
+                    ..
                 }
+            ) {
+                supported_parameters.push("reasoning_effort".to_owned());
             }
             let mut modalities = inspection.modalities;
             if location

@@ -1,3 +1,16 @@
+---
+applies_to:
+  - inference/crates/icn-engine/src/radix_cache.rs
+  - inference/crates/icn-engine/src/scheduler.rs
+  - inference/crates/icn-engine/src/lib.rs
+  - inference/crates/icn-contracts/src/lib.rs
+  - inference/crates/icn-server/src/main.rs
+  - inference/native/llama-cpp-rs/llama-cpp-2/src/context/kv_cache.rs
+  - inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/include/llama.h
+  - inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/src/llama-context.cpp
+  - inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/src/llama-kv-cache.cpp
+---
+
 # KV cache design
 
 Status: implemented, with the limitations called out below.

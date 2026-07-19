@@ -1,3 +1,14 @@
+---
+applies_to:
+  - inference/crates/icn-engine/**
+  - inference/crates/icn-mtp/**
+  - inference/crates/icn-contracts/src/lib.rs
+  - inference/crates/icn-contracts/src/output.rs
+  - inference/crates/icn-api/src/lib.rs
+  - inference/crates/icn-server/src/main.rs
+  - inference/native/llama-cpp-rs/llama-cpp-2/**
+---
+
 # Inference engine design
 
 The Magnitude inference engine is a persistent, per-model serving runtime built around a pinned llama.cpp fork. It converts typed chat requests into token work, continuously batches multiple sequences, streams semantic output, and retains reusable prompt state. The engine is deliberately opinionated: one thread owns native model state, while bounded channels isolate callers and transport backpressure from that state.

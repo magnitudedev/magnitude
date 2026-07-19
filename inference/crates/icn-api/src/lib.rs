@@ -343,8 +343,16 @@ pub struct PropsResponse {
     pub chat_template: String,
     pub template_fingerprint: String,
     pub template_capabilities: TemplateCapabilitiesResponse,
+    pub reasoning: ReasoningProfileResponse,
     pub training_context_tokens: u32,
     pub sliding_window_tokens: i32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningProfileResponse {
+    pub default_reasoning_effort: String,
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -679,23 +687,15 @@ pub struct AllowedToolRequest {
     pub function: FunctionNameRequest,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffortRequest {
-    None,
-    Low,
-    Medium,
-    High,
-}
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(transparent)]
+pub struct ReasoningEffortRequest(pub String);
 
 impl ReasoningEffortRequest {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
+    fn normalize(&self) -> Result<icn_contracts::NormalizedReasoningEffort, ApiError> {
+        icn_contracts::NormalizedReasoningEffort::parse(&self.0).ok_or_else(|| {
+            ApiError::invalid(format!("unsupported reasoning_effort spelling: {}", self.0))
+        })
     }
 }
 
@@ -1166,7 +1166,11 @@ async fn apply_template(
     Json(request): Json<ApplyTemplateRequest>,
 ) -> Result<Json<ApplyTemplateResponse>, ApiError> {
     validate_model_selection(request.model.as_deref(), &state)?;
-    let request = validate_apply_template_request(request)?;
+    let properties = state
+        .backend
+        .properties()
+        .map_err(ApiError::from_inference)?;
+    let request = validate_apply_template_request(request, &properties.reasoning)?;
     let backend = Arc::clone(&state.backend);
     let prepared = tokio::task::spawn_blocking(move || backend.apply_template(request))
         .await
@@ -1187,7 +1191,11 @@ async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     validate_model_selection(request.model.as_deref(), &state)?;
-    let (request, include_usage) = validate_request(request)?;
+    let properties = state
+        .backend
+        .properties()
+        .map_err(ApiError::from_inference)?;
+    let (request, include_usage) = validate_request(request, &properties.reasoning)?;
     let id = format!(
         "chatcmpl-icn-{}",
         state.next_id.fetch_add(1, Ordering::Relaxed)
@@ -1469,33 +1477,46 @@ fn validate_model_selection(requested: Option<&str>, state: &AppState) -> Result
 
 fn validate_apply_template_request(
     request: ApplyTemplateRequest,
+    reasoning_profile: &icn_contracts::ReasoningProfile,
 ) -> Result<ChatTemplateRequest, ApiError> {
-    let (request, _) = validate_request(ChatCompletionRequest {
-        model: request.model,
-        messages: request.messages,
-        max_tokens: None,
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        seed: None,
-        tools: request.tools,
-        tool_choice: request.tool_choice,
-        parallel_tool_calls: request.parallel_tool_calls,
-        reasoning_effort: None,
-        thinking_budget_tokens: None,
-        response_format: request.response_format,
-        chat_template_kwargs: request.chat_template_kwargs,
-        stop: None,
-        stream: true,
-        stream_options: None,
-        cache_prompt: true,
-        ignore_eos: false,
-        timings_per_token: false,
-    })?;
+    let (request, _) = validate_request(
+        ChatCompletionRequest {
+            model: request.model,
+            messages: request.messages,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            tools: request.tools,
+            tool_choice: request.tool_choice,
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: None,
+            thinking_budget_tokens: None,
+            response_format: request.response_format,
+            chat_template_kwargs: request.chat_template_kwargs,
+            stop: None,
+            stream: true,
+            stream_options: None,
+            cache_prompt: true,
+            ignore_eos: false,
+            timings_per_token: false,
+        },
+        reasoning_profile,
+    )?;
     Ok(request.template)
 }
 
 fn props_response(properties: ModelProperties) -> PropsResponse {
+    let reasoning = ReasoningProfileResponse {
+        default_reasoning_effort: properties.reasoning.default_effort.0.clone(),
+        reasoning_efforts: properties
+            .reasoning
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.0.clone())
+            .collect(),
+    };
     PropsResponse {
         build_info: format!("magnitude-icn {}", env!("CARGO_PKG_VERSION")),
         model_path: properties.model_path.display().to_string(),
@@ -1524,6 +1545,7 @@ fn props_response(properties: ModelProperties) -> PropsResponse {
             object_arguments: properties.capabilities.object_arguments,
             enable_thinking: properties.capabilities.enable_thinking,
         },
+        reasoning,
         training_context_tokens: properties.training_context_tokens,
         sliding_window_tokens: properties.sliding_window_tokens,
     }
@@ -1609,7 +1631,10 @@ fn apply_template_response(prepared: PreparedChatInfo) -> ApplyTemplateResponse 
     }
 }
 
-fn validate_request(request: ChatCompletionRequest) -> Result<(ChatRequest, bool), ApiError> {
+fn validate_request(
+    request: ChatCompletionRequest,
+    reasoning_profile: &icn_contracts::ReasoningProfile,
+) -> Result<(ChatRequest, bool), ApiError> {
     if !request.stream {
         return Err(ApiError::invalid(
             "ICN's MVP chat endpoint requires stream: true",
@@ -1662,6 +1687,7 @@ fn validate_request(request: ChatCompletionRequest) -> Result<(ChatRequest, bool
         request.reasoning_effort,
         request.thinking_budget_tokens,
         &mut template_args,
+        reasoning_profile,
     )?;
     let response_format = response_format(request.response_format)?;
     let stop = stops(request.stop)?;
@@ -1878,52 +1904,91 @@ fn reasoning_control(
     effort: Option<ReasoningEffortRequest>,
     budget_tokens: Option<u32>,
     template_args: &mut BTreeMap<String, JsonValue>,
+    profile: &icn_contracts::ReasoningProfile,
 ) -> Result<ReasoningControl, ApiError> {
-    if let Some(effort) = effort {
-        let value = JsonValue::String(effort.as_str().into());
-        if let Some(existing) = template_args.get("reasoning_effort") {
-            if existing != &value {
+    const OWNED_KEYS: &[&str] = &[
+        "enable_thinking",
+        "thinking",
+        "thinking_mode",
+        "reasoning_effort",
+        "thinking_budget",
+        "preserve_thinking",
+        "clear_thinking",
+        "drop_thinking",
+    ];
+    let raw_reasoning_controls = template_args
+        .keys()
+        .any(|key| OWNED_KEYS.contains(&key.as_str()));
+
+    let selected = match effort {
+        Some(effort) => {
+            if raw_reasoning_controls {
                 return Err(ApiError::invalid(
-                    "reasoning_effort conflicts with chat_template_kwargs.reasoning_effort",
+                    "reasoning_effort conflicts with reasoning controls in chat_template_kwargs",
                 ));
             }
-        } else {
-            template_args.insert("reasoning_effort".into(), value);
+            let normalized = effort.normalize()?;
+            profile.mapping(&normalized).ok_or_else(|| {
+                let supported = profile
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.effort.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ApiError::invalid(format!(
+                    "reasoning_effort {} is unsupported for this model; supported values: {supported}",
+                    normalized.as_str()
+                ))
+            })?
         }
-    }
-
-    let enable_thinking = match template_args.get("enable_thinking") {
-        Some(JsonValue::Bool(enabled)) => Some(*enabled),
-        Some(_) => {
-            return Err(ApiError::invalid(
-                "chat_template_kwargs.enable_thinking must be a boolean",
-            ));
+        None if raw_reasoning_controls => {
+            if budget_tokens.is_none() {
+                return Ok(ReasoningControl::ModelDefault);
+            }
+            let explicitly_disabled = matches!(
+                template_args
+                    .get("enable_thinking")
+                    .or_else(|| template_args.get("thinking")),
+                Some(JsonValue::Bool(false))
+            ) || matches!(
+                template_args
+                    .get("thinking_mode")
+                    .and_then(JsonValue::as_str),
+                Some("chat" | "disabled")
+            ) || template_args
+                .get("reasoning_effort")
+                .and_then(JsonValue::as_str)
+                .and_then(icn_contracts::NormalizedReasoningEffort::parse)
+                .is_some_and(|effort| effort.as_str() == "none");
+            if explicitly_disabled {
+                return Err(ApiError::invalid(
+                    "thinking_budget_tokens cannot be used when raw template controls disable reasoning",
+                ));
+            }
+            return Ok(ReasoningControl::Resolved {
+                effort: profile.default_effort.clone(),
+                controls: icn_contracts::NativeReasoningControls::default(),
+                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
+                explicit_budget_tokens: budget_tokens,
+                template_fingerprint: profile.template_fingerprint.clone(),
+            });
         }
-        None => None,
+        None => profile
+            .mapping(&profile.default_effort)
+            .expect("reasoning profile contains its default mapping"),
     };
-    let effort_enabled = effort.map(|effort| !matches!(effort, ReasoningEffortRequest::None));
-    if let (Some(from_template), Some(from_effort)) = (enable_thinking, effort_enabled)
-        && from_template != from_effort
-    {
+
+    if budget_tokens.is_some() && selected.effort.as_str() == "none" {
         return Err(ApiError::invalid(
-            "reasoning_effort conflicts with chat_template_kwargs.enable_thinking",
+            "thinking_budget_tokens cannot be used when reasoning is disabled (reasoning_effort none)",
         ));
     }
-    let enabled = enable_thinking.or(effort_enabled);
-    if budget_tokens.is_some() && enabled == Some(false) {
-        return Err(ApiError::invalid(
-            "thinking_budget_tokens cannot be used when reasoning is disabled",
-        ));
-    }
-    Ok(match (enabled, budget_tokens) {
-        (Some(false), None) => ReasoningControl::Disabled,
-        (_, Some(budget_tokens)) => ReasoningControl::Enabled {
-            budget_tokens: Some(budget_tokens),
-        },
-        (Some(true), None) => ReasoningControl::Enabled {
-            budget_tokens: None,
-        },
-        (None, None) => ReasoningControl::ModelDefault,
+    Ok(ReasoningControl::Resolved {
+        effort: selected.effort.clone(),
+        controls: selected.controls.clone(),
+        automatic_budget: selected.automatic_budget.clone(),
+        explicit_budget_tokens: budget_tokens,
+        template_fingerprint: profile.template_fingerprint.clone(),
     })
 }
 
@@ -2332,6 +2397,28 @@ impl CompletionBackend for FakeBackend {
                 object_arguments: true,
                 enable_thinking: true,
             },
+            reasoning: icn_contracts::ReasoningProfile {
+                default_effort: icn_contracts::NormalizedReasoningEffort("high".into()),
+                mappings: vec![
+                    icn_contracts::ReasoningEffortMapping {
+                        effort: icn_contracts::NormalizedReasoningEffort("none".into()),
+                        controls: icn_contracts::NativeReasoningControls {
+                            enable_thinking: Some(false),
+                            template_args: BTreeMap::new(),
+                        },
+                        automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
+                    },
+                    icn_contracts::ReasoningEffortMapping {
+                        effort: icn_contracts::NormalizedReasoningEffort("high".into()),
+                        controls: icn_contracts::NativeReasoningControls {
+                            enable_thinking: Some(true),
+                            template_args: BTreeMap::new(),
+                        },
+                        automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
+                    },
+                ],
+                template_fingerprint: "fake-fingerprint".into(),
+            },
             modalities: ModelModalities::default(),
             mtp: icn_contracts::MtpRuntimeProperties::Disabled {
                 reason: "fake_backend".into(),
@@ -2424,6 +2511,16 @@ mod tests {
         })
     }
 
+    fn validate_test_request(
+        request: ChatCompletionRequest,
+    ) -> Result<(ChatRequest, bool), ApiError> {
+        let profile = FakeBackend::new("test-model", "")
+            .properties()
+            .expect("fake properties")
+            .reasoning;
+        validate_request(request, &profile)
+    }
+
     fn stream_json(body: &str) -> Vec<Value> {
         body.lines()
             .filter_map(|line| line.strip_prefix("data: "))
@@ -2482,6 +2579,10 @@ mod tests {
     impl CompletionBackend for ScriptedBackend {
         fn model_id(&self) -> &str {
             "test-model"
+        }
+
+        fn properties(&self) -> Result<ModelProperties, InferenceError> {
+            FakeBackend::new("test-model", "").properties()
         }
 
         fn complete(
@@ -2760,7 +2861,7 @@ mod tests {
                     "schema": {"type": "object", "required": ["ok"]}
                 }
             },
-            "chat_template_kwargs": {"enable_thinking": true, "custom": 7},
+            "chat_template_kwargs": {"custom": 7},
             "stop": ["END", "STOP"],
             "max_completion_tokens": 99,
             "temperature": 0.25,
@@ -2773,7 +2874,7 @@ mod tests {
             "timings_per_token": true
         }));
 
-        let (request, include_usage) = validate_request(request).unwrap();
+        let (request, include_usage) = validate_test_request(request).unwrap();
         assert!(include_usage);
         assert_eq!(request.template.messages.len(), 4);
         assert_eq!(request.template.messages[0].role, ChatRole::System);
@@ -2806,15 +2907,21 @@ mod tests {
             }
         );
         assert!(!request.template.parallel_tool_calls);
-        assert_eq!(
-            request.template.reasoning,
-            ReasoningControl::Enabled {
-                budget_tokens: Some(64)
-            }
-        );
-        assert_eq!(
-            request.template.template_args.get("reasoning_effort"),
-            Some(&json!("high"))
+        assert!(matches!(
+            &request.template.reasoning,
+            ReasoningControl::Resolved {
+                effort,
+                controls,
+                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
+                explicit_budget_tokens: Some(64),
+                ..
+            } if effort.as_str() == "high" && controls.enable_thinking == Some(true)
+        ));
+        assert!(
+            !request
+                .template
+                .template_args
+                .contains_key("reasoning_effort")
         );
         assert_eq!(
             request.template.template_args.get("custom"),
@@ -2853,7 +2960,7 @@ mod tests {
             }]
         }]);
 
-        let error = validate_request(request_from_json(request)).unwrap_err();
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
         assert!(
             error
                 .body
@@ -2866,11 +2973,19 @@ mod tests {
     #[test]
     fn preserves_model_defaults_when_optional_controls_are_omitted() {
         let (request, include_usage) =
-            validate_request(request_from_json(minimal_request())).unwrap();
+            validate_test_request(request_from_json(minimal_request())).unwrap();
         assert!(!include_usage);
         assert_eq!(request.template.tool_choice, ToolChoice::Auto);
         assert!(request.template.parallel_tool_calls);
-        assert_eq!(request.template.reasoning, ReasoningControl::ModelDefault);
+        assert!(matches!(
+            request.template.reasoning,
+            ReasoningControl::Resolved {
+                ref effort,
+                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
+                explicit_budget_tokens: None,
+                ..
+            } if effort.as_str() == "high"
+        ));
         assert_eq!(request.template.response_format, ResponseFormat::Text);
         assert!(request.template.template_args.is_empty());
         assert!(request.stop.is_empty());
@@ -2890,13 +3005,13 @@ mod tests {
         ] {
             let mut request = minimal_request();
             request["timings_per_token"] = value;
-            let (request, _) = validate_request(request_from_json(request)).unwrap();
+            let (request, _) = validate_test_request(request_from_json(request)).unwrap();
             assert!(!request.timings_per_token);
         }
 
         let mut request = minimal_request();
         request["timings_per_token"] = json!(true);
-        let (request, _) = validate_request(request_from_json(request)).unwrap();
+        let (request, _) = validate_test_request(request_from_json(request)).unwrap();
         assert!(request.timings_per_token);
     }
 
@@ -2908,7 +3023,7 @@ mod tests {
             "grammar": "root ::= \"yes\" | \"no\""
         });
 
-        let (request, _) = validate_request(request_from_json(request)).unwrap();
+        let (request, _) = validate_test_request(request_from_json(request)).unwrap();
         assert_eq!(
             request.template.response_format,
             ResponseFormat::Grammar {
@@ -2922,8 +3037,25 @@ mod tests {
         let mut request = minimal_request();
         request["reasoning_effort"] = json!("none");
         request["thinking_budget_tokens"] = json!(10);
-        let error = validate_request(request_from_json(request)).unwrap_err();
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
         assert!(error.body.error.message.contains("reasoning is disabled"));
+
+        let mut request = minimal_request();
+        request["reasoning_effort"] = json!("high");
+        request["chat_template_kwargs"] = json!({"enable_thinking": true});
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
+        assert!(error.body.error.message.contains("conflicts"));
+
+        let mut request = minimal_request();
+        request["reasoning_effort"] = json!("medium");
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
+        assert!(
+            error
+                .body
+                .error
+                .message
+                .contains("supported values: none, high")
+        );
 
         let mut request = minimal_request();
         request["tools"] = json!([{"type": "function", "function": {
@@ -2932,7 +3064,7 @@ mod tests {
         request["tool_choice"] = json!({
             "type": "function", "function": {"name": "missing"}
         });
-        let error = validate_request(request_from_json(request)).unwrap_err();
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
         assert!(error.body.error.message.contains("undefined tool"));
 
         let mut request = minimal_request();
@@ -2940,12 +3072,12 @@ mod tests {
             "type": "json_schema",
             "json_schema": {"name": "bad", "schema": 42}
         });
-        let error = validate_request(request_from_json(request)).unwrap_err();
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
         assert!(error.body.error.message.contains("JSON Schema"));
 
         let mut request = minimal_request();
         request["response_format"] = json!({"type": "grammar", "grammar": ""});
-        let error = validate_request(request_from_json(request)).unwrap_err();
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
         assert!(
             error
                 .body
@@ -2956,8 +3088,24 @@ mod tests {
 
         let mut request = minimal_request();
         request["stop"] = json!(["END", "END"]);
-        let error = validate_request(request_from_json(request)).unwrap_err();
+        let error = validate_test_request(request_from_json(request)).unwrap_err();
         assert!(error.body.error.message.contains("duplicate stop"));
+    }
+
+    #[test]
+    fn normalizes_disabled_aliases_to_the_none_mapping() {
+        let mut request = minimal_request();
+        request["reasoning_effort"] = json!("off");
+        let (request, _) = validate_test_request(request_from_json(request)).unwrap();
+        assert!(matches!(
+            request.template.reasoning,
+            ReasoningControl::Resolved {
+                ref effort,
+                ref controls,
+                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
+                ..
+            } if effort.as_str() == "none" && controls.enable_thinking == Some(false)
+        ));
     }
 
     #[tokio::test]

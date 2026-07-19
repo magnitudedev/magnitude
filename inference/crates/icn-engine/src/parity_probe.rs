@@ -1704,7 +1704,7 @@ fn chat_template_render(input: &Map<String, Value>) -> Result<Value, ProbeError>
             tool_choice: parse_tool_choice(&input.tool_choice)?,
             parallel_tool_calls: Some(input.parallel_tool_calls),
             reasoning_format: parse_reasoning_format(&input.reasoning_format)?,
-            enable_thinking: input.enable_thinking,
+            enable_thinking: Some(input.enable_thinking),
             template_kwargs: input
                 .chat_template_kwargs
                 .into_iter()
@@ -2173,7 +2173,7 @@ fn chat_bench_prepare(
             tool_choice,
             parallel_tool_calls: Some(parallel_tool_calls),
             reasoning_format,
-            enable_thinking,
+            enable_thinking: Some(enable_thinking),
             template_kwargs,
             force_pure_content,
         })

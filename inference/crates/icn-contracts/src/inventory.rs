@@ -302,6 +302,63 @@ pub enum ReasoningDelimiters {
     Known { start: String, end: String },
 }
 
+/// Product-normalized reasoning selection. Native template spellings are kept in the compiled
+/// mapping rather than exposed through this identifier.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NormalizedReasoningEffort(pub String);
+
+impl NormalizedReasoningEffort {
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = match value {
+            "off" | "no_think" | "disabled" => "none",
+            "extra_high" | "extra-high" | "very_high" => "xhigh",
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "adaptive" => value,
+            _ => return None,
+        };
+        Some(Self(normalized.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutomaticReasoningBudget {
+    Disabled,
+    FixedTokens { tokens: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NativeReasoningControls {
+    /// `None` omits llama.cpp's dedicated control and preserves the authored template default.
+    pub enable_thinking: Option<bool>,
+    pub template_args: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningEffortMapping {
+    pub effort: NormalizedReasoningEffort,
+    pub controls: NativeReasoningControls,
+    pub automatic_budget: AutomaticReasoningBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningProfile {
+    pub default_effort: NormalizedReasoningEffort,
+    pub mappings: Vec<ReasoningEffortMapping>,
+    pub template_fingerprint: String,
+}
+
+impl ReasoningProfile {
+    pub fn mapping(&self, effort: &NormalizedReasoningEffort) -> Option<&ReasoningEffortMapping> {
+        self.mappings
+            .iter()
+            .find(|mapping| &mapping.effort == effort)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapabilityEvidence {
