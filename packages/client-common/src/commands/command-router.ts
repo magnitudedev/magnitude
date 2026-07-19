@@ -47,6 +47,8 @@ export interface CommandContext {
   openSettings: () => void
   /** Open the usage overlay */
   openUsage: () => void
+  /** Open the client-owned cloud model setup surface, when available. */
+  openCloud?: () => void
   /** Toggle autopilot mode */
   toggleAutopilot: () => void
 }
@@ -164,6 +166,11 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
 
     case 'usage':
       ctx.openUsage()
+      return true
+
+    case 'cloud':
+      if (!ctx.openCloud) return false
+      ctx.openCloud()
       return true
 
     case 'autopilot':

@@ -1,18 +1,22 @@
-import { describe, expect, mock, test } from 'bun:test'
+import { describe, expect, test, vi } from 'vitest'
 import { routeSlashCommand, type CommandContext } from '@magnitudedev/client-common'
+import { registerCliCommands } from './register'
+
+registerCliCommands()
 
 function createContext(overrides: Partial<CommandContext> = {}): CommandContext {
   return {
-    resetConversation: mock(() => {}),
-    showSystemMessage: mock(() => {}),
-    exitApp: mock(() => {}),
-    openRecentChats: mock(() => {}),
-    enterBashMode: mock(() => {}),
-    activateSkill: mock(() => {}),
-    initProject: mock(() => {}),
-    openSettings: mock(() => {}),
-    openUsage: mock(() => {}),
-    toggleAutopilot: mock(() => {}),
+    resetConversation: vi.fn(),
+    showSystemMessage: vi.fn(),
+    exitApp: vi.fn(),
+    openRecentChats: vi.fn(),
+    enterBashMode: vi.fn(),
+    activateSkill: vi.fn(),
+    initProject: vi.fn(),
+    openSettings: vi.fn(),
+    openUsage: vi.fn(),
+    openCloud: vi.fn(),
+    toggleAutopilot: vi.fn(),
     ...overrides,
   }
 }
@@ -29,6 +33,12 @@ describe('routeSlashCommand', () => {
     expect(routeSlashCommand('/usage', ctx)).toBe(true)
     expect(routeSlashCommand('/limits', ctx)).toBe(true)
     expect(ctx.openUsage).toHaveBeenCalledTimes(2)
+  })
+
+  test('opens standalone cloud setup from /cloud', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/cloud', ctx)).toBe(true)
+    expect(ctx.openCloud).toHaveBeenCalledTimes(1)
   })
 
   test('unknown command is not handled', () => {

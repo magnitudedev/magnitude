@@ -22,30 +22,24 @@ function useCopyFeedback() {
   return { copied, showCopied }
 }
 
-interface MagnitudeLoginScreenProps {
+interface CloudModelsConnectScreenProps {
   onSubmit: (key: string) => Promise<void> | void
   onExit: () => void
-  onBack?: () => void
-  onSkip?: () => Promise<void> | void
   busy?: boolean
   error?: string | null
 }
 
-export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
+export const CloudModelsConnectScreen = memo(function CloudModelsConnectScreen({
   onSubmit,
   onExit,
-  onBack,
-  onSkip,
   busy = false,
   error: serverError = null,
-}: MagnitudeLoginScreenProps) {
+}: CloudModelsConnectScreenProps) {
   const theme = useTheme()
   const [apiKey, setApiKey] = useState('')
   const [validationError, setValidationError] = useState<string | null>(null)
   const [continueHovered, setContinueHovered] = useState(false)
   const [copyHovered, setCopyHovered] = useState(false)
-  const [backHovered, setBackHovered] = useState(false)
-  const [skipHovered, setSkipHovered] = useState(false)
   const urlCopy = useCopyFeedback()
 
   const error = validationError ?? serverError
@@ -63,28 +57,13 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
     } catch {}
   }, [apiKey, busy, onSubmit])
 
-  const handleSkip = useCallback(() => {
-    if (!onSkip || busy) return
-    setValidationError(null)
-    try {
-      void Promise.resolve(onSkip()).catch(() => {})
-    } catch {}
-  }, [busy, onSkip])
-
   useKeyboard(useCallback((key: KeyEvent) => {
-    if (key.name === 'escape' && onSkip) {
+    if (key.name === 'escape') {
       key.preventDefault()
-      void handleSkip()
-      return
-    }
-    if (key.name === 'left' && onBack) {
-      key.preventDefault()
-      onBack()
+      onExit()
       return
     }
     if (key.ctrl && key.name === 'c') {
-      key.preventDefault()
-      onExit()
       return
     }
     if ((key.name === 'return' || key.name === 'enter') && !key.shift) {
@@ -92,7 +71,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
       handleSubmit()
       return
     }
-  }, [onBack, onExit, onSkip, handleSkip, handleSubmit]))
+  }, [onExit, handleSubmit]))
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
@@ -107,7 +86,7 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
       }}>
         <box style={{ flexDirection: 'column' }}>
           <text style={{ fg: theme.primary }}>
-            <span attributes={TextAttributes.BOLD}>CLOUD MODELS (OPTIONAL)</span>
+            <span attributes={TextAttributes.BOLD}>CLOUD MODELS</span>
           </text>
           <text style={{ fg: theme.foreground }}>
             <span attributes={TextAttributes.BOLD}>Connect hosted models with Magnitude Pro</span>
@@ -210,57 +189,13 @@ export const MagnitudeLoginScreen = memo(function MagnitudeLoginScreen({
         <box style={{ paddingTop: 2 }}>
           <text style={{ fg: theme.muted }}>
             <span attributes={TextAttributes.DIM}>
-              {onBack
-                ? 'Press ← to return to local model setup.'
-                : 'Prefer environment variables? Press Esc to exit, set MAGNITUDE_API_KEY, then relaunch.'}
+              Prefer environment variables? Press Esc to exit, set MAGNITUDE_API_KEY, then relaunch.
             </span>
           </text>
-        </box>
-
-        <box style={{ flexDirection: 'row', paddingTop: 1, flexShrink: 0 }}>
-          {onBack && (
-            <Button
-              onClick={onBack}
-              onMouseOver={() => setBackHovered(true)}
-              onMouseOut={() => setBackHovered(false)}
-            >
-              <box style={{
-                borderStyle: 'single',
-                borderColor: backHovered ? theme.primary : theme.border,
-                customBorderChars: BOX_CHARS,
-                paddingLeft: 1,
-                paddingRight: 1,
-              }}>
-                <text style={{ fg: backHovered ? theme.primary : theme.foreground }}>
-                  Back to local models (←)
-                </text>
-              </box>
-            </Button>
-          )}
-          {onBack && onSkip && <text>  </text>}
-          {onSkip && (
-            <Button
-              onClick={handleSkip}
-              onMouseOver={() => setSkipHovered(true)}
-              onMouseOut={() => setSkipHovered(false)}
-            >
-              <box style={{
-                borderStyle: 'single',
-                borderColor: skipHovered ? theme.primary : theme.border,
-                customBorderChars: BOX_CHARS,
-                paddingLeft: 1,
-                paddingRight: 1,
-              }}>
-                <text style={{ fg: skipHovered ? theme.primary : theme.foreground }}>
-                  Skip for now (Esc)
-                </text>
-              </box>
-            </Button>
-          )}
         </box>
       </box>
     </box>
   )
 })
 
-export type { MagnitudeLoginScreenProps }
+export type { CloudModelsConnectScreenProps }

@@ -26,7 +26,6 @@ import {
 interface LocalInferenceScreenProps {
   readonly management: boolean
   readonly onExit: () => void
-  readonly onBack: () => void
   readonly onSkip: () => void
   readonly onConfigured: () => void
 }
@@ -110,7 +109,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   state,
   local,
   management,
-  onBack,
   onSkip,
   onConfigured,
 }: LocalInferenceScreenProps & {
