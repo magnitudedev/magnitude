@@ -22,9 +22,12 @@ export const authSourceAtom = Atom.make<AuthSource>({ source: "none" })
  */
 export const showRecentChatsOverlayAtom = Atom.make(false)
 
-/** CLI model-setup route. Settings opens either provider screen as an overlay. */
-export type ModelSetupRoute = "closed" | "local" | "cloud"
+/** CLI local-model setup route. */
+export type ModelSetupRoute = "closed" | "local"
 export const modelSetupRouteAtom = Atom.make<ModelSetupRoute>("closed")
+
+/** Standalone Magnitude Cloud setup overlay, opened by /cloud. */
+export const cloudModelsOpenAtom = Atom.make(false)
 
 /**
  * Autopilot atoms — disabled but kept for potential future re-enablement.

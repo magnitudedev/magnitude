@@ -13,6 +13,7 @@ import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-
 import { getCatalogFailureNotice } from './catalog-failure-notice'
 import { describeLocalHardware } from '../local-inference/view-model'
 import { writeTextToClipboard } from '../../utils/clipboard'
+import { BOX_CHARS } from '../../utils/ui-constants'
 
 const MAGNITUDE_CLOUD_URL = 'https://app.magnitude.dev'
 const SETTINGS_SECTION_WIDTH = 72
@@ -32,7 +33,6 @@ interface SettingsOverlayProps {
   }>
   modelConfig?: UseModelConfigResult
   onManageLocalModels: () => void
-  onConfigureCloud: () => void
 }
 
 type Mode = 'view' | 'edit' | 'confirm-disconnect'
@@ -80,7 +80,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   slots,
   modelConfig,
   onManageLocalModels,
-  onConfigureCloud,
 }: SettingsOverlayProps) {
   const theme = useTheme()
   const localInferenceState = useLocalInferenceQuery()
@@ -142,7 +141,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const [confirmHovered, setConfirmHovered] = useState(false)
   const [refreshHovered, setRefreshHovered] = useState(false)
   const [localSetupHovered, setLocalSetupHovered] = useState(false)
-  const [cloudSetupHovered, setCloudSetupHovered] = useState(false)
   const [copyCloudLinkHovered, setCopyCloudLinkHovered] = useState(false)
   const [cloudLinkCopied, setCloudLinkCopied] = useState(false)
 
@@ -287,15 +285,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     const inferenceSourceAction = mode === 'view' ? getInferenceSourceAction(key.name) : null
     if (inferenceSourceAction) {
       key.preventDefault()
-      if (inferenceSourceAction === 'local') onManageLocalModels()
-      else onConfigureCloud()
+      onManageLocalModels()
       return
     }
     if (mode === 'edit' && (key.name === 'return' || key.name === 'enter') && !key.shift) {
       key.preventDefault()
       handleSave()
     }
-  }, [isVisible, dropdownTarget, dropdownItems, dropdownIndex, mode, onClose, onConfigureCloud, onManageLocalModels, cancelInline, handleSave, closeDropdown, selectDropdownItem]))
+  }, [isVisible, dropdownTarget, dropdownItems, dropdownIndex, mode, onClose, onManageLocalModels, cancelInline, handleSave, closeDropdown, selectDropdownItem]))
 
   if (!isVisible) return null
 
@@ -361,13 +358,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
       {/* Status / inline controls */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexShrink: 0, flexDirection: 'column' }}>
+        {auth.source === 'none' && (
+          <text style={{ fg: theme.muted }}>○ Not connected</text>
+        )}
+
         {mode === 'view' && auth.source === 'env' && (
           <>
             <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{'● Magnitude Cloud connected'}</text>
-            </box>
-            <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.muted }}>{`API key from ${auth.envVarName} `}</text>
+              <text style={{ fg: theme.success }}>{`● Connected via ${auth.envVarName} `}</text>
               {auth.key && (
                 <text style={{ fg: theme.foreground }}>
                   <span attributes={TextAttributes.DIM}>{`(${maskApiKey(auth.key)})`}</span>
@@ -383,7 +381,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         {mode === 'view' && auth.source === 'config' && (
           <box style={{ flexDirection: 'column' }}>
             <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{'● Magnitude Cloud connected '}</text>
+              <text style={{ fg: theme.success }}>{'● Connected via API key '}</text>
               {auth.maskedKey && (
                 <text style={{ fg: theme.foreground }}>
                   <span attributes={TextAttributes.DIM}>{`(${auth.maskedKey})`}</span>
@@ -404,8 +402,23 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
         {mode === 'view' && auth.source === 'none' && (
           <box style={{ flexDirection: 'column' }}>
-            <text style={{ fg: theme.muted }}>○ Magnitude Cloud not connected</text>
-            <text style={{ fg: theme.foreground }}>No Magnitude Cloud API key · No cloud model access</text>
+            <box style={{ paddingTop: 1 }}>
+              <Button
+                onClick={beginEdit}
+                onMouseOver={() => setUpdateHovered(true)}
+                onMouseOut={() => setUpdateHovered(false)}
+                style={{
+                  borderStyle: 'single',
+                  customBorderChars: BOX_CHARS,
+                  borderColor: updateHovered ? theme.primary : theme.border,
+                  paddingLeft: 1,
+                  paddingRight: 1,
+                  width: 15,
+                }}
+              >
+                <text style={{ fg: updateHovered ? theme.primary : theme.foreground }}>Add API Key</text>
+              </Button>
+            </box>
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
               <text style={{ fg: theme.muted }}>Get an API key → </text>
               <text style={{ fg: theme.primary }}>{MAGNITUDE_CLOUD_URL}</text>
@@ -420,11 +433,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                 </text>
               </Button>
             </box>
-            <box style={{ paddingTop: 1 }}>
-              <Button onClick={beginEdit} onMouseOver={() => setUpdateHovered(true)} onMouseOut={() => setUpdateHovered(false)}>
-                <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Connect Magnitude Cloud]'}</text>
-              </Button>
-            </box>
           </box>
         )}
 
@@ -433,19 +441,32 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             <box style={{ borderStyle: 'single', borderColor: displayedAuthError ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, flexShrink: 0, width: 80 }}>
               <SingleLineInput value={inputValue} onChange={(v) => { setInputValue(v); setError(null) }} placeholder="Paste Magnitude Cloud API key" focused={true} />
             </box>
-            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{displayedAuthError}</text></box>}
-            <box style={{ flexDirection: 'row', paddingTop: 1 }}>
+            <box style={{ flexDirection: 'row' }}>
               <Button onClick={handleSave} onMouseOver={() => setSaveHovered(true)} onMouseOut={() => setSaveHovered(false)}>
-                <text style={{ fg: saveHovered ? theme.primary : theme.foreground }}>{auth.saving ? '[Saving...]' : '[Save]'}</text>
+                <text style={{ fg: saveHovered ? theme.primary : theme.foreground }}>{auth.saving ? '[Saving...]' : '[Save (Enter)]'}</text>
               </Button>
               <text> </text>
               <Button onClick={cancelInline} onMouseOver={() => setCancelHovered(true)} onMouseOut={() => setCancelHovered(false)}>
-                <text style={{ fg: cancelHovered ? theme.foreground : theme.muted }}>{'[Cancel]'}</text>
+                <text style={{ fg: cancelHovered ? theme.foreground : theme.muted }}>{'[Cancel (Esc)]'}</text>
               </Button>
             </box>
-            <box style={{ paddingTop: 1 }}>
-              <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>Enter to save, Esc to cancel</span></text>
-            </box>
+            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{displayedAuthError}</text></box>}
+            {auth.source === 'none' && (
+              <box style={{ flexDirection: 'row', paddingTop: 1 }}>
+                <text style={{ fg: theme.muted }}>Get an API key → </text>
+                <text style={{ fg: theme.primary }}>{MAGNITUDE_CLOUD_URL}</text>
+                <text> </text>
+                <Button
+                  onClick={copyCloudLink}
+                  onMouseOver={() => setCopyCloudLinkHovered(true)}
+                  onMouseOut={() => setCopyCloudLinkHovered(false)}
+                >
+                  <text style={{ fg: cloudLinkCopied ? theme.success : copyCloudLinkHovered ? theme.foreground : theme.muted }}>
+                    {cloudLinkCopied ? '[Copied ✓]' : '[Copy link]'}
+                  </text>
+                </Button>
+              </box>
+            )}
           </box>
         )}
 
@@ -476,7 +497,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         <text style={{ fg: theme.foreground }}>
           <span attributes={TextAttributes.BOLD}>Inference sources</span>
         </text>
-        <text style={{ fg: theme.muted }}>Download or attach local models, or configure Magnitude Cloud fallback.</text>
+        <text style={{ fg: theme.muted }}>Download or manage local models.</text>
         <box style={{ flexDirection: 'row', paddingTop: 1 }}>
           <Button
             onClick={onManageLocalModels}
@@ -484,14 +505,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             onMouseOut={() => setLocalSetupHovered(false)}
           >
             <text style={{ fg: localSetupHovered ? theme.primary : theme.muted }}>{`[${INFERENCE_SOURCE_ACTIONS.local.label} · ${INFERENCE_SOURCE_ACTIONS.local.key.toUpperCase()}]`}</text>
-          </Button>
-          <text> </text>
-          <Button
-            onClick={onConfigureCloud}
-            onMouseOver={() => setCloudSetupHovered(true)}
-            onMouseOut={() => setCloudSetupHovered(false)}
-          >
-            <text style={{ fg: cloudSetupHovered ? theme.primary : theme.muted }}>{`[${INFERENCE_SOURCE_ACTIONS.cloud.label} · ${INFERENCE_SOURCE_ACTIONS.cloud.key.toUpperCase()}]`}</text>
           </Button>
         </box>
       </box>

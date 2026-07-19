@@ -46,11 +46,17 @@ const SLASH_COMMANDS: SlashCommandDefinition[] = [
 ]
 
 let skillCommands: SlashCommandDefinition[] = []
+let clientCommands: SlashCommandDefinition[] = []
 
 export function registerSkillCommands(skills: SlashCommandDefinition[]) {
   skillCommands = skills
 }
 
+/** Register commands owned by the active client surface. */
+export function registerClientCommands(commands: SlashCommandDefinition[]) {
+  clientCommands = commands
+}
+
 export function getAllCommands(): SlashCommandDefinition[] {
-  return [...SLASH_COMMANDS, ...skillCommands]
+  return [...SLASH_COMMANDS, ...clientCommands, ...skillCommands]
 }

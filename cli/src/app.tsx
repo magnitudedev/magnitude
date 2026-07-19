@@ -9,7 +9,7 @@
  */
 import { useCallback, useSyncExternalStore, type ReactNode } from 'react'
 import { TextAttributes } from '@opentui/core'
-import { Cause, Option } from 'effect'
+import { Option } from 'effect'
 import { useAtomValue, useAtomSet, useAtomInitialValues, Result } from '@effect-atom/atom-react'
 import {
   useOnboardingState,
@@ -56,6 +56,9 @@ import {
   PreparingModelSetupScreen,
 } from './features/model-setup'
 import { blockingModelSlotsFailure } from './features/model-setup/model-slots-gate'
+import { registerCliCommands } from './commands/register'
+
+registerCliCommands()
 
 export type { SessionStart }
 
@@ -152,16 +155,11 @@ function OnboardingGate(
   const onboardingRequired = onboarding.state.value.flows.model_setup.required
   const forcedSetupComplete = props.forceSetup && Result.isSuccess(onboarding.completeResult)
   if (onboardingRequired || (props.forceSetup && !forcedSetupComplete)) {
-    const completionError = Result.isFailure(onboarding.completeResult)
-      ? Cause.pretty(onboarding.completeResult.cause)
-      : null
     return (
       <ModelSetupScreen
         mode="onboarding"
         onExit={props.onExitApp}
         onComplete={() => onboarding.complete("model_setup")}
-        completing={Result.isWaiting(onboarding.completeResult)}
-        completionError={completionError}
       />
     )
   }

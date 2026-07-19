@@ -18,7 +18,7 @@ import {
   useTimelineStatus,
 } from '@magnitudedev/client-common'
 import { forkIdToKey, ROLE_TO_SLOT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
-import { showRecentChatsOverlayAtom, authSourceAtom, modelSetupRouteAtom, type ModelSetupRoute } from '../../state/cli-atoms'
+import { showRecentChatsOverlayAtom, authSourceAtom, cloudModelsOpenAtom, modelSetupRouteAtom } from '../../state/cli-atoms'
 import type { ActionId } from '../../types/ui-actions'
 import { deriveSettingsAuthInfo, type AuthInfo } from './auth-display'
 import { SettingsOverlay } from './settings'
@@ -26,17 +26,20 @@ import { UsageOverlay } from './usage'
 import { ForkDetailOverlay } from './fork-detail'
 import { RecentChatsOverlayContainer } from '../sessions/container'
 import { ModelSetupScreen } from '../model-setup'
+import { CloudModelsScreen } from '../cloud-models'
 
-export type ActiveOverlay = 'recent-chats' | 'model-setup' | 'settings' | 'usage' | 'fork' | 'none'
+export type ActiveOverlay = 'recent-chats' | 'model-setup' | 'cloud-models' | 'settings' | 'usage' | 'fork' | 'none'
 
 export function useActiveOverlay(): ActiveOverlay {
   const showRecentChats = useAtomValue(showRecentChatsOverlayAtom)
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
+  const cloudModelsOpen = useAtomValue(cloudModelsOpenAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
   const { expandedForkStack } = useDisplayViewController()
   return showRecentChats ? 'recent-chats'
     : modelSetupRoute !== 'closed' ? 'model-setup'
+    : cloudModelsOpen ? 'cloud-models'
     : settingsOpen ? 'settings'
     : usageOpen ? 'usage'
     : expandedForkStack.length > 0 ? 'fork'
@@ -44,16 +47,12 @@ export function useActiveOverlay(): ActiveOverlay {
 }
 
 function ModelSetupSettingsContainer({
-  route,
   onClose,
 }: {
-  readonly route: Exclude<ModelSetupRoute, 'closed'>
   readonly onClose: () => void
 }): ReactNode {
   return (
     <ModelSetupScreen
-      key={route}
-      initialStep={route}
       mode="management"
       onExit={onClose}
       onComplete={onClose}
@@ -71,6 +70,7 @@ export function AppOverlaysContainer({
   const setUsageOpen = useAtomSet(usageOpenAtom)
   const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
   const setModelSetupRoute = useAtomSet(modelSetupRouteAtom)
+  const setCloudModelsOpen = useAtomSet(cloudModelsOpenAtom)
   const controller = useDisplayViewController()
   const displayMode = controller.displayMode
   const selectedCwd = useAtomValue(selectedCwdAtom)
@@ -117,10 +117,13 @@ export function AppOverlaysContainer({
   if (active === 'model-setup' && modelSetupRoute !== 'closed') {
     return (
       <ModelSetupSettingsContainer
-        route={modelSetupRoute}
         onClose={() => setModelSetupRoute('closed')}
       />
     )
+  }
+
+  if (active === 'cloud-models') {
+    return <CloudModelsScreen onExit={() => setCloudModelsOpen(false)} />
   }
 
   if (active === 'settings') {
@@ -132,7 +135,6 @@ export function AppOverlaysContainer({
         slots={slots}
         modelConfig={modelConfig}
         onManageLocalModels={() => setModelSetupRoute('local')}
-        onConfigureCloud={() => setModelSetupRoute('cloud')}
       />
     )
   }

@@ -29,7 +29,7 @@ import {
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { ROLE_TO_SLOT } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
-import { showRecentChatsOverlayAtom } from '../../state/cli-atoms'
+import { cloudModelsOpenAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
 import { INIT_PROMPT } from '../../commands/init-prompt'
 import { Composer } from './composer'
@@ -51,6 +51,7 @@ export function ComposerContainer({
   const selectedCwd = useAtomValue(selectedCwdAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
   const setUsageOpen = useAtomSet(usageOpenAtom)
+  const setCloudModelsOpen = useAtomSet(cloudModelsOpenAtom)
   const setBashMode = useAtomSet(bashModeAtom)
   const setShowRecentChats = useAtomSet(showRecentChatsOverlayAtom)
   const { displayMode, expandedForkStack } = useDisplayViewController()
@@ -84,8 +85,9 @@ export function ComposerContainer({
     initProject: () => { void sendRef.current(INIT_PROMPT) },
     openSettings: () => setSettingsOpen(true),
     openUsage: () => setUsageOpen(true),
+    openCloud: () => setCloudModelsOpen(true),
     toggleAutopilot: () => { /* disabled */ },
-  }), [startNewSession, setShowRecentChats, setBashMode, setSettingsOpen, setUsageOpen, theme.error])
+  }), [startNewSession, setShowRecentChats, setBashMode, setSettingsOpen, setUsageOpen, setCloudModelsOpen, theme.error])
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
