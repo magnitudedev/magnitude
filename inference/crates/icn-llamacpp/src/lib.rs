@@ -114,6 +114,7 @@ struct ActiveRequest<'model> {
     multimodal_prompt: Option<MultimodalPrompt>,
     generation_limit: usize,
     generated_tokens: usize,
+    ignore_eos: bool,
     timings_per_token: bool,
     sampler: CommonSampler<'model>,
     utf8: Utf8Buffer,
@@ -1584,6 +1585,7 @@ impl<'model> ActiveRequest<'model> {
                 generation_limit: (request.max_tokens as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
                 generated_tokens: 0,
+                ignore_eos: request.ignore_eos,
                 timings_per_token: request.timings_per_token,
                 sampler,
                 utf8: Utf8Buffer::default(),
@@ -1619,7 +1621,7 @@ impl<'model> ActiveRequest<'model> {
         account_sample(&mut self.generated_tokens);
         self.record_sample(sampled_at);
         let starts_stream = self.generated_tokens == 1;
-        if is_eog {
+        if is_eog && !self.ignore_eos {
             let events = sampled_result_events(Vec::new(), starts_stream);
             let timings = (partial_timing_eligible(self.timings_per_token, false)
                 && !events.is_empty())
@@ -2047,6 +2049,10 @@ fn make_sampler<'model>(
         model,
         &CommonSamplerConfig {
             seed: Some(request.seed),
+            // Match llama.cpp server semantics: `ignore_eos` suppresses every
+            // end-of-generation token in the sampler, rather than allowing a
+            // special token to be selected and emitted as ordinary text.
+            ignore_eos: Some(request.ignore_eos),
             top_p: Some(request.top_p),
             temperature: Some(request.temperature),
             grammar,
@@ -2333,6 +2339,8 @@ mod tests {
             temperature: 0.0,
             top_p: 0.95,
             seed: 42,
+            cache_prompt: true,
+            ignore_eos: false,
             timings_per_token: false,
         }
     }

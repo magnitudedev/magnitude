@@ -1,0 +1,15 @@
+schema_version = 2
+id = "controlled"
+description = "Full paired qualification on a controlled host with preserved evidence."
+cases = ["E1/*", "E2/*", "E3/*", "E4/*", "E5/*", "E6/*", "E7/*"]
+repetitions = 10
+warmups = 2
+concurrency = [1, 2, 4, 8]
+closed_loop_multiplier = 4
+request_timeout_seconds = 1800
+paired = true
+controlled = true
+require_exclusive_device = true
+min_paired_repetitions = 10
+max_paired_repetitions = 30
+confidence_half_width_ratio = 0.05

@@ -1,0 +1,10 @@
+schema_version = 2
+id = "public"
+description = "Versioned full-suite self-benchmark profile for comparable public artifacts."
+cases = ["E1/*", "E2/*", "E3/*", "E4/*", "E5/*", "E6/*", "E7/*"]
+repetitions = 5
+warmups = 2
+concurrency = [1, 2, 4, 8]
+closed_loop_multiplier = 4
+request_timeout_seconds = 1800
+require_exclusive_device = true

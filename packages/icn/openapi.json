@@ -512,6 +512,14 @@
           "stream_options": {
             "$ref": "#/components/schemas/StreamOptions"
           },
+          "cache_prompt": {
+            "type": "boolean",
+            "default": true
+          },
+          "ignore_eos": {
+            "type": "boolean",
+            "default": false
+          },
           "timings_per_token": {
             "type": "boolean",
             "default": false

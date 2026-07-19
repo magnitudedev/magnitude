@@ -7,6 +7,8 @@ inference/dist/
 inference/.parity-models/
 # Parity evidence uses unique, immutable run directories and is never source.
 inference/results/parity/
+# Composite benchmark evidence is likewise generated and immutable.
+inference/results/benchmark/
 .turbo
 dist
 /bin

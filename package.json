@@ -49,6 +49,8 @@
     "icn:build:release": "cargo build --release --manifest-path inference/Cargo.toml -p icn-server",
     "icn:build:reference": "bun run --cwd inference build:reference",
     "icn:build:candidate": "bun run --cwd inference build:candidate --",
+    "icn:benchmark": "bun run --cwd inference benchmark --",
+    "icn:benchmark:validate": "bun run --cwd inference benchmark:validate",
     "icn:parity": "bun run --cwd inference parity --",
     "icn:parity:validate": "bun run --cwd inference parity:validate --",
     "icn:parity:list": "bun run --cwd inference parity:list --",
