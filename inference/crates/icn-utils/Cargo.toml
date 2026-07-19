@@ -1,0 +1,13 @@
+[package]
+name = "icn-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24.0"

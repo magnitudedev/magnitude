@@ -1421,6 +1421,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hf-hub",
  "icn-contracts",
+ "icn-utils",
  "libc",
  "reqwest 0.13.4",
  "serde",
@@ -1500,8 +1501,19 @@ dependencies = [
  "icn-models",
  "icn-mtp",
  "icn-reasoning",
+ "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "icn-utils"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -36,17 +36,38 @@ Non-ready records, such as an in-progress or interrupted download, may still app
 
 ## Authoritative reconciliation
 
-The list-models handler calls one shared operation, referred to here as `ensure_model_inventory`:
+The list-models handler performs one shared reconciliation operation with the following ordered
+phases:
 
-1. Read and schema-validate the durable inventory index.
-2. Enumerate configured model sources.
-3. Reconcile additions, removals, content changes, and component-grouping changes.
-4. Validate cached inspection and hardware evidence.
-5. Inspect only new or stale candidates.
-6. Atomically persist completed results.
-7. Return one complete snapshot.
+1. **Discover artifacts.** Enumerate the observed model directories, group related components, and
+   compute each candidate's stable identity from filesystem facts. Discovery does not open GGUF
+   metadata, inspect templates, or assess hardware.
+2. **Recover index entries.** Treat the durable index as an optional, disposable cache and decode
+   each candidate's cached model and evidence independently. An entry is reusable only when its
+   complete current shape is valid and its component, content, and filesystem identities match the
+   discovered files. Any missing or invalid field discards that entry without affecting unrelated
+   entries. A missing, unreadable, malformed, or wholly unrelated cache file is equivalent to an
+   empty cache and never fails reconciliation.
+3. **Partition the candidates.** Reuse complete, current inspection results immediately. Put every
+   candidate with no entry, a malformed entry, changed artifacts, or stale inspection evidence into
+   one enrichment set. Entries whose artifacts are no longer present are omitted from the new
+   snapshot.
+4. **Enrich only the stale set.** Inspect the stale candidates concurrently with a bounded worker
+   count. Each worker validates GGUF metadata, resolves the execution-equivalent effective template,
+   and derives the complete public model properties. Inspection produces either a complete available
+   model or a typed invalid/incompatible artifact record.
+5. **Validate hardware evidence.** Reuse hardware results only when their independent evidence key
+   matches the current canonical execution profile, native build, backend, and hardware topology.
+   Assess only available models with missing or stale hardware evidence. Native assessment is
+   serialized where required by process-global runtime state; other work remains concurrent.
+6. **Verify stability and publish.** Confirm that the discovered component identities still match
+   the files. If they changed during reconciliation, discard the attempt and retry under the bounded
+   mutation policy. Once every available model is complete, atomically persist and publish the new
+   inventory snapshot, then return it. Cache locking, serialization, or persistence failure does not
+   fail the completed result; the next list may recompute it.
 
-Concurrent list requests share the same in-flight ensure operation. They must not duplicate scans or native assessments.
+Concurrent list requests share the same in-flight reconciliation. They do not duplicate directory
+scans, metadata inspection, template probes, or native hardware assessment.
 
 Startup initializes storage, recovers interrupted operations, and may hydrate the durable index, but does not inspect every model. Download and acquisition completion directly records or invalidates the affected artifact. Deletion removes or invalidates the affected entry. Filesystem and runtime watchers only invalidate relevant cache entries. None of these paths launches inventory-wide enrichment.
 
@@ -102,7 +123,11 @@ The ordinary expectation is that every valid, stable model supported by the pinn
 
 Invalid and incompatible artifacts are expected to be rare and are not available models. Operational failures and ICN implementation defects are also not expected paths. They should be observable as errors and must not be cached as model facts.
 
-If product requirements later demand partial availability when one artifact is bad, that behavior should be implemented through an explicit top-level invalid/incompatible artifact record. It must not weaken the property invariant for models labeled `Available`.
+Invalid and incompatible artifacts discovered in configured sources are exposed as explicit top-level
+artifact records so local problems remain actionable. They carry a typed status and diagnostic, are
+never loadable, and never masquerade as available models with unknown properties. Managed artifacts
+may still offer deletion. Their presence does not weaken the property invariant for models labeled
+`Available` or prevent other stable models from being returned.
 
 ## Cache validity
 
@@ -110,10 +135,15 @@ A path existing in the cache is not evidence that its assessment remains valid. 
 
 - component membership, relationships, size, timestamps, or content identity;
 - effective chat template, tokenizer, BOS/EOS tokens, or named-template selection;
-- inventory schema or inspection algorithm version;
+- the complete validated shape of each cached model and evidence entry;
 - pinned llama.cpp version, native build, backend, or estimator fingerprint;
 - canonical execution profile or capacity-policy version;
 - hardware and device topology relevant to planning.
+
+The inventory cache has no schema, format, or inspection-algorithm version. Its current decoder
+recovers entries structurally and independently; data it cannot establish as a complete current
+entry is discarded and recomputed. The cache is never a migration boundary or durable source of
+truth.
 
 Reasoning and hardware evidence may use separate cache keys because their inputs differ. Completed results are written atomically only after all required work for the model succeeds. Interrupted or failed inspection must leave the previous valid entry intact only when its key is still valid; otherwise the model remains stale and the list request fails rather than returning it as current.
 
@@ -134,7 +164,11 @@ The implementation satisfies this design when:
 
 - daemon startup can complete without an inventory-wide scan or native assessment;
 - the first list after a cold start reconciles and fully assesses all available models;
-- a warm list performs reconciliation and reuses only valid cached evidence;
+- a warm list discovers artifacts without opening unchanged GGUF metadata and reuses only
+  independently valid inspection and hardware evidence;
+- missing, malformed, changed, and stale index entries form one bounded-parallel enrichment set;
+- one malformed index entry does not invalidate unrelated valid entries;
+- no cache-file read, parse, shape, lock, serialization, or write failure can fail model listing;
 - simultaneous lists share one ensure operation;
 - adding, changing, regrouping, or removing artifacts invalidates exactly the affected entries;
 - no successful response contains unresolved properties for an available model;

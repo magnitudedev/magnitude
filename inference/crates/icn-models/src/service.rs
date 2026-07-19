@@ -17,6 +17,7 @@ use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationManifest};
 impl ModelInventory for ModelManager {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>> {
         Box::pin(async move {
+            self.ensure_model_inventory().await?;
             let mut models = self
                 .models
                 .read()
@@ -109,7 +110,7 @@ impl ModelInventory for ModelManager {
                 let plan = plan_interrupted_delete(&self.config.root, &model)?;
                 let freed_bytes = delete_interrupted(&self.config.root, &model)?;
                 drop(lock);
-                self.refresh().await?;
+                self.remove_published_model(&id).await?;
                 return Ok(DeletedModel {
                     id: id.clone(),
                     deleted: true,
@@ -148,7 +149,7 @@ impl ModelInventory for ModelManager {
                 ModelLocation::Directory { .. } | ModelLocation::File { .. } => unreachable!(),
             };
             drop(lock);
-            self.refresh().await?;
+            self.remove_published_model(&id).await?;
             Ok(DeletedModel {
                 id: id.clone(),
                 deleted: true,
@@ -206,7 +207,7 @@ fn operations_for(model: &InventoryModel) -> Vec<icn_contracts::ModelOperation> 
     use icn_contracts::ModelOperation;
     match model.status {
         ModelStatus::Available { .. } | ModelStatus::LoadFailed { .. } => {
-            let mut operations = vec![ModelOperation::Load, ModelOperation::Assess];
+            let mut operations = vec![ModelOperation::Load];
             if matches!(
                 model.location,
                 ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. }
@@ -217,6 +218,16 @@ fn operations_for(model: &InventoryModel) -> Vec<icn_contracts::ModelOperation> 
         }
         ModelStatus::Loaded { .. } => vec![ModelOperation::Unload],
         ModelStatus::Interrupted { .. } => vec![ModelOperation::Delete],
+        ModelStatus::InvalidArtifact { .. } | ModelStatus::IncompatibleArtifact { .. } => {
+            if matches!(
+                model.location,
+                ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. }
+            ) {
+                vec![ModelOperation::Delete]
+            } else {
+                Vec::new()
+            }
+        }
         ModelStatus::Downloading { .. }
         | ModelStatus::Loading { .. }
         | ModelStatus::Unloading { .. } => Vec::new(),
@@ -429,7 +440,8 @@ fn status_rank(status: &ModelStatus) -> u8 {
         ModelStatus::Downloading { .. } => 2,
         ModelStatus::Interrupted { .. } => 3,
         ModelStatus::Available { .. } => 4,
-        ModelStatus::LoadFailed { .. } => 5,
+        ModelStatus::InvalidArtifact { .. } | ModelStatus::IncompatibleArtifact { .. } => 5,
+        ModelStatus::LoadFailed { .. } => 6,
     }
 }
 
@@ -441,11 +453,13 @@ fn ensure_deletable_status(model: &InventoryModel) -> Result<(), InventoryError>
         | ModelStatus::Unloading { .. } => Err(InventoryError::Loaded(model.id.0.clone())),
         ModelStatus::Interrupted { .. }
         | ModelStatus::Available { .. }
+        | ModelStatus::InvalidArtifact { .. }
+        | ModelStatus::IncompatibleArtifact { .. }
         | ModelStatus::LoadFailed { .. } => Ok(()),
     }
 }
 
-fn resolve_components(
+pub(crate) fn resolve_components(
     root: &Path,
     model: &InventoryModel,
 ) -> Result<Vec<ResolvedComponent>, InventoryError> {

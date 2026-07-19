@@ -16,9 +16,9 @@ use icn_contracts::{
     ChatTemplateRequest, CompletionBackend, DownloadModelRequest, ExecutionConfig,
     ExecutionConfigReport, FinishReason, FlashAttention, Generation, GenerationMetrics,
     GenerationSnapshot, GpuLayers, GrammarTrigger, ImageInput, InferenceError, InferenceEvent,
-    InferenceStreamEvent, InventoryError, InventoryModel, ModelHardwareAssessor, ModelId,
-    ModelInventory, ModelModalities, ModelProperties, PreparedChatInfo, ReasoningControl,
-    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
+    InferenceStreamEvent, InventoryError, InventoryModel, ModelId, ModelInventory, ModelModalities,
+    ModelProperties, PreparedChatInfo, ReasoningControl, ResponseFormat, SplitMode,
+    TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -56,7 +56,6 @@ pub struct AppState {
     backend: Arc<dyn CompletionBackend>,
     model_aliases: Arc<BTreeSet<String>>,
     inventory: Option<Arc<dyn ModelInventory>>,
-    hardware_assessor: Option<Arc<dyn ModelHardwareAssessor>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -71,7 +70,6 @@ impl AppState {
             backend,
             model_aliases: Arc::new(BTreeSet::new()),
             inventory: None,
-            hardware_assessor: None,
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -88,11 +86,6 @@ impl AppState {
         self.inventory = Some(inventory);
         self
     }
-
-    pub fn with_hardware_assessor(mut self, assessor: Arc<dyn ModelHardwareAssessor>) -> Self {
-        self.hardware_assessor = Some(assessor);
-        self
-    }
 }
 
 pub fn app(state: AppState) -> Router {
@@ -101,7 +94,6 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/models/download", post(download_model))
         .route("/v1/models/{model_id}", get(model).delete(delete_model))
-        .route("/v1/models/{model_id}/assess", post(assess_model))
         .route("/props", get(props))
         .route("/v1/props", get(props))
         .route("/apply-template", post(apply_template))
@@ -936,7 +928,10 @@ impl ApiError {
                 "invalid_request_error",
                 "integrity_failed",
             ),
-            InventoryError::Io(_) | InventoryError::Upstream(_) | InventoryError::Internal(_) => (
+            InventoryError::Io(_)
+            | InventoryError::Upstream(_)
+            | InventoryError::ConcurrentMutation(_)
+            | InventoryError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "inventory_error",
@@ -1004,33 +999,6 @@ async fn model(
 ) -> Result<Json<Model>, ApiError> {
     let inventory = require_inventory(&state)?;
     let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
-    let model = inventory.get(&id).await.map_err(ApiError::from_inventory)?;
-    Ok(Json(Model::inventory(model)?))
-}
-
-#[utoipa::path(post, path = "/v1/models/{model_id}/assess", operation_id = "assessModelHardware", tag = "models",
-    params(("model_id" = String, Path, description = "Stable inventory model ID")),
-    responses(
-        (status = 200, description = "Inventory model with refreshed hardware assessment", body = Model),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 409, description = "Model is not ready for assessment", body = ErrorResponse),
-        (status = 500, description = "Hardware assessor unavailable", body = ErrorResponse)
-    )
-)]
-async fn assess_model(
-    State(state): State<AppState>,
-    Path(model_id): Path<String>,
-) -> Result<Json<Model>, ApiError> {
-    let inventory = require_inventory(&state)?;
-    let assessor = state
-        .hardware_assessor
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model hardware assessor is not configured"))?;
-    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
-    assessor
-        .assess(&id)
-        .await
-        .map_err(ApiError::from_inventory)?;
     let model = inventory.get(&id).await.map_err(ApiError::from_inventory)?;
     Ok(Json(Model::inventory(model)?))
 }
@@ -2068,7 +2036,6 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         health,
         models,
         model,
-        assess_model,
         download_model,
         delete_model,
         props,
@@ -2725,10 +2692,7 @@ mod tests {
             schemas["Model"]["properties"]["hardware"]["$ref"],
             "#/components/schemas/HardwareAssessmentSchema"
         );
-        assert_eq!(
-            value["paths"]["/v1/models/{model_id}/assess"]["post"]["operationId"],
-            "assessModelHardware"
-        );
+        assert!(value["paths"].get("/v1/models/{model_id}/assess").is_none());
         let relationships = &schemas["DownloadRelationshipSchema"]["oneOf"]
             .as_array()
             .unwrap()[0];

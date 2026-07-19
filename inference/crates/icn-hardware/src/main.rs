@@ -131,7 +131,6 @@ impl From<FlashArg> for FitFlashAttention {
 
 #[derive(Serialize)]
 struct Output<'a> {
-    schema_version: u32,
     implementation: &'static str,
     estimator: &'static str,
     allocates_model_tensors: bool,
@@ -186,7 +185,6 @@ fn main() -> anyhow::Result<()> {
     };
     let report = icn_hardware::estimate(&request).context("model fit failed")?;
     let output = Output {
-        schema_version: 1,
         implementation: "magnitude-icn",
         estimator: "pinned_llama_cpp_common_fit",
         allocates_model_tensors: false,

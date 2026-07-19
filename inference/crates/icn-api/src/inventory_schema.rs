@@ -169,6 +169,16 @@ pub enum ModelStatusSchema {
     Available {
         ready_at: u64,
     },
+    InvalidArtifact {
+        detected_at: u64,
+        code: String,
+        message: String,
+    },
+    IncompatibleArtifact {
+        detected_at: u64,
+        code: String,
+        message: String,
+    },
     Loading {
         load_id: String,
         stage: LoadStageSchema,
@@ -197,7 +207,6 @@ pub enum ModelStatusSchema {
 pub enum CapabilitySupportSchema {
     Supported { parallel: Option<bool> },
     Unsupported,
-    Unknown { reason: String },
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -249,9 +258,6 @@ pub enum ReasoningControlDomainSchema {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReasoningCapabilitySchema {
-    Unknown {
-        reason: String,
-    },
     Unsupported {
         evidence: CapabilityEvidenceSchema,
     },
@@ -321,22 +327,10 @@ pub enum HardwareRecommendationSchema {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum HardwareUnknownReasonSchema {
-    UnsupportedBackend,
-    EstimatorFailed,
-    InsufficientMetadata,
-    NoHardwareSnapshot,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HardwareAssessmentSchema {
     NotAssessed {
         reason: String,
-    },
-    Assessing {
-        started_at: u64,
     },
     Fits {
         profile: HardwareProfileSchema,
@@ -348,8 +342,5 @@ pub enum HardwareAssessmentSchema {
         memory: HardwareDeficitSchema,
         limiting_resource: String,
         alternative: Option<HardwareProfileSchema>,
-    },
-    Unknown {
-        reason: HardwareUnknownReasonSchema,
     },
 }

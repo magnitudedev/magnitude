@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -9,9 +9,9 @@ use futures_util::future::BoxFuture;
 use icn_api::{AppState, FakeBackend, app};
 use icn_contracts::{
     CacheType, CompletionBackend, ComponentRole, ExecutionConfig, FlashAttention, GpuLayers,
-    HardwareAssessment, HardwareUnknownReason, InventoryError, LoadStage, ModelHardwareAssessor,
-    ModelId, ModelInventory, ModelStatus, ProjectorConfig, RadixCacheConfig, ResolvedExecutionPlan,
-    SplitMode,
+    HardwareAssessment, InventoryError, InventoryHardwareAssessor, LoadStage, ModelId,
+    ModelInventory, ModelStatus, ProjectorConfig, RadixCacheConfig, ResolvedExecutionPlan,
+    ResolvedModel, SplitMode,
 };
 use icn_engine::{LlamaCompletionBackend, resolve_execution_plan};
 use icn_hardware::{CapacityPolicy, assess as assess_hardware, assess_with_backend};
@@ -146,7 +146,7 @@ enum Command {
 #[derive(Debug, Clone)]
 struct TensorSplitArg(Vec<f32>);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct RuntimePlanDefaults {
     context_size: u32,
     batch_size: u32,
@@ -211,18 +211,36 @@ fn base_plan(
 }
 
 struct NativeHardwareAssessor {
-    inventory: Arc<ModelManager>,
     defaults: RuntimePlanDefaults,
-    native_executor: Option<Arc<LlamaCompletionBackend>>,
+    native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
     gate: tokio::sync::Mutex<()>,
 }
 
-impl ModelHardwareAssessor for NativeHardwareAssessor {
-    fn assess(&self, id: &ModelId) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
-        let id = id.clone();
+impl InventoryHardwareAssessor for NativeHardwareAssessor {
+    fn cache_key(&self) -> BoxFuture<'_, Result<String, InventoryError>> {
+        Box::pin(async move {
+            let defaults = serde_json::to_string(&self.defaults)
+                .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            let parallelism = std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1);
+            let topology = stable_hardware_topology();
+            Ok(format!(
+                "inventory-hardware-v1:{}:{}:{}:{parallelism}:{topology}:{defaults}",
+                build_identity::BINDINGS_REVISION,
+                build_identity::LLAMA_CPP_REVISION,
+                build_identity::enabled_backends().join(","),
+            ))
+        })
+    }
+
+    fn assess(
+        &self,
+        resolved: ResolvedModel,
+    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
         Box::pin(async move {
             let _guard = self.gate.lock().await;
-            let resolved = self.inventory.resolve_ready(&id).await?;
+            let id = resolved.model.id.clone();
             let primary = resolved
                 .components
                 .iter()
@@ -248,15 +266,13 @@ impl ModelHardwareAssessor for NativeHardwareAssessor {
                 })
                 .map(|component| component.path.clone())
                 .collect();
-            self.inventory.update_hardware(
-                &id,
-                HardwareAssessment::Assessing {
-                    started_at: unix_timestamp(),
-                },
-            )?;
-            let native_executor = self.native_executor.clone();
+            let native_executor = self
+                .native_executor
+                .read()
+                .map_err(|_| InventoryError::Internal("native executor lock poisoned".to_owned()))?
+                .clone();
             let defaults = self.defaults.clone();
-            let assessment = match tokio::task::spawn_blocking(move || match native_executor {
+            match tokio::task::spawn_blocking(move || match native_executor {
                 Some(executor) => executor
                     .run_exclusive_native(move |backend| {
                         let mut plan = base_plan(primary, projector, &defaults)?;
@@ -283,24 +299,60 @@ impl ModelHardwareAssessor for NativeHardwareAssessor {
             })
             .await
             {
-                Ok(Ok(assessment)) => assessment,
-                Ok(Err(error)) => {
-                    eprintln!("hardware assessment failed for {}: {error:#}", id.0);
-                    HardwareAssessment::Unknown {
-                        reason: HardwareUnknownReason::EstimatorFailed,
-                    }
-                }
-                Err(error) => {
-                    eprintln!("hardware assessment task failed for {}: {error}", id.0);
-                    HardwareAssessment::Unknown {
-                        reason: HardwareUnknownReason::EstimatorFailed,
-                    }
-                }
-            };
-            self.inventory.update_hardware(&id, assessment.clone())?;
-            Ok(assessment)
+                Ok(Ok(assessment)) => Ok(assessment),
+                Ok(Err(error)) => Err(InventoryError::Internal(format!(
+                    "hardware assessment failed for {}: {error:#}",
+                    id.0
+                ))),
+                Err(error) => Err(InventoryError::Internal(format!(
+                    "hardware assessment task failed for {}: {error}",
+                    id.0
+                ))),
+            }
         })
     }
+}
+
+fn stable_hardware_topology() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let mut values = Vec::new();
+        for key in ["hw.model", "hw.memsize"] {
+            if let Ok(output) = std::process::Command::new("sysctl")
+                .args(["-n", key])
+                .output()
+                && output.status.success()
+            {
+                values.push(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            }
+        }
+        if !values.is_empty() {
+            return values.join(":");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut values = Vec::new();
+        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+            if let Some(line) = contents.lines().find(|line| line.starts_with("MemTotal:")) {
+                values.push(line.to_owned());
+            }
+        }
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=uuid,name,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+            && output.status.success()
+        {
+            values.push(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        }
+        if !values.is_empty() {
+            return values.join(":");
+        }
+    }
+    "unknown".to_owned()
 }
 
 impl std::str::FromStr for TensorSplitArg {
@@ -441,6 +493,15 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("failed to initialize model inventory")?,
             );
+            let native_executor_slot = Arc::new(RwLock::new(None));
+            let inventory_hardware_assessor = Arc::new(NativeHardwareAssessor {
+                defaults: plan_defaults.clone(),
+                native_executor: Arc::clone(&native_executor_slot),
+                gate: tokio::sync::Mutex::new(()),
+            });
+            inventory
+                .set_hardware_assessor(inventory_hardware_assessor)
+                .context("failed to configure inventory hardware assessment")?;
             let (model, mmproj, mtp_model, model_alias, selected_inventory_id) = if let Some(
                 raw_id,
             ) = model_id
@@ -451,6 +512,10 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 let id = ModelId::parse(raw_id).context("invalid inventory model ID")?;
+                inventory
+                    .ensure_model_inventory()
+                    .await
+                    .context("failed to reconcile inventory for model selection")?;
                 let resolved = inventory
                     .resolve_ready(&id)
                     .await
@@ -523,19 +588,8 @@ async fn main() -> anyhow::Result<()> {
                         .context("failed to register the active model")?,
                 };
                 let requested_plan = resolved_plan(path, mmproj, mtp_model, &plan_defaults)?;
-                inventory
-                    .update_hardware(
-                        &inventory_id,
-                        icn_contracts::HardwareAssessment::Assessing {
-                            started_at: unix_timestamp(),
-                        },
-                    )
-                    .context("failed to project hardware assessment state")?;
                 let assessed = assess_hardware(&requested_plan, CapacityPolicy::default())
                     .context("failed to assess the resolved execution plan")?;
-                inventory
-                    .update_hardware(&inventory_id, assessed.assessment.clone())
-                    .context("failed to project hardware assessment")?;
                 if let icn_contracts::HardwareAssessment::DoesNotFit { memory, .. } =
                     &assessed.assessment
                 {
@@ -608,14 +662,10 @@ async fn main() -> anyhow::Result<()> {
                     Some(backend),
                 )
             };
-            let state = state
-                .with_inventory(inventory.clone())
-                .with_hardware_assessor(Arc::new(NativeHardwareAssessor {
-                    inventory,
-                    defaults: plan_defaults,
-                    native_executor,
-                    gate: tokio::sync::Mutex::new(()),
-                }));
+            *native_executor_slot
+                .write()
+                .map_err(|_| anyhow::anyhow!("native executor lock poisoned"))? = native_executor;
+            let state = state.with_inventory(inventory);
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .with_context(|| format!("failed to bind {bind}"))?;
