@@ -49,7 +49,6 @@ pub struct BenchmarkRunConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    pub schema_version: u32,
     pub id: String,
     pub description: String,
     pub cases: Vec<String>,
@@ -61,15 +60,11 @@ pub struct Profile {
     pub closed_loop_multiplier: usize,
     pub request_timeout_seconds: u64,
     #[serde(default)]
-    pub paired: bool,
-    #[serde(default)]
     pub controlled: bool,
     #[serde(default)]
     pub require_exclusive_device: bool,
     #[serde(default)]
-    pub min_paired_repetitions: usize,
-    #[serde(default)]
-    pub max_paired_repetitions: usize,
+    pub max_repetitions: usize,
     #[serde(default)]
     pub confidence_half_width_ratio: f64,
 }

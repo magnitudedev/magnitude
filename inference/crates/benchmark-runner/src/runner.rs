@@ -134,9 +134,9 @@ impl BenchmarkRunner {
         }
         let mut profile = load_profile(&config.root, &config.profile).await?;
         let (fixtures, fixtures_sha256) = load_fixtures(&config.root).await?;
-        if profile.paired && config.targets.len() != 2 {
+        if profile.controlled && config.targets.len() != 2 {
             return Err(BenchmarkError::InvalidConfig(
-                "a paired profile requires exactly two targets".into(),
+                "a controlled qualification requires exactly two targets".into(),
             ));
         }
         if profile.controlled
@@ -165,16 +165,21 @@ impl BenchmarkRunner {
             .cloned()
             .map(|target| EndpointClient::new(target, profile.request_timeout_seconds))
             .collect::<Result<Vec<_>, _>>()?;
-        let targets = if profile.paired {
+        let targets = if clients.len() == 2 {
             let mut accumulated = vec![None, None];
             let mut completed_repetitions = 0;
+            let first = usize::from(Sha256::digest(run_id.as_bytes())[0] & 1);
             let maximum = if profile.controlled {
-                profile.max_paired_repetitions
+                profile.max_repetitions
             } else {
                 profile.repetitions
             };
             for block in 0..maximum {
-                let order = if block % 2 == 0 { [0, 1] } else { [1, 0] };
+                let order = if block.is_multiple_of(2) {
+                    [first, 1 - first]
+                } else {
+                    [1 - first, first]
+                };
                 let mut block_profile = profile.clone();
                 block_profile.repetitions = 1;
                 block_profile.warmups = usize::from(block == 0) * profile.warmups;
@@ -192,7 +197,10 @@ impl BenchmarkRunner {
                     });
                 }
                 completed_repetitions = block + 1;
-                if profile.controlled && completed_repetitions >= profile.min_paired_repetitions {
+                if profile.controlled
+                    && completed_repetitions >= profile.repetitions
+                    && completed_repetitions % 2 == 0
+                {
                     let interim_targets = accumulated
                         .iter()
                         .filter_map(Clone::clone)

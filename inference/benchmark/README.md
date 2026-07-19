@@ -123,7 +123,8 @@ discovered and validated automatically. `cases` accepts exact selectors such as 
 experiment wildcards such as `E1/*`; the same selector mechanism applies across E1-E7. Adding,
 renaming, or removing a profile therefore changes only the profile file. The CLI requires an
 explicit `--profile` and has no compiled-in profile default. Parameters that apply only to E2 or to
-controlled pairing are omitted elsewhere and rejected if supplied where they have no effect.
+controlled adaptive stopping are omitted elsewhere and rejected if supplied where they have no
+effect. Pairing is not a profile choice: every two-target comparison is matched automatically.
 
 Validate the assets from `inference/`:
 
@@ -165,15 +166,17 @@ cargo run -p benchmark-runner -- compare \
 
 `smoke` and `development` are diagnostic. A controlled result is valid only when the recorded
 model, template, effective configuration, cache state, host, and completed token work support the
-claim. Controlled paired blocks alternate target order and continue from the profile minimum up to
-its maximum repetition count until all primary ratio intervals meet the precision target. Raw
+claim. Every comparison runs matched blocks, derives the initial target order from the run ID, and
+then alternates it to keep AB/BA exposure balanced. Controlled comparisons continue from the
+profile repetition count up to `max_repetitions` until all primary ratio intervals meet the
+precision target; stopping is checked only after a balanced AB/BA block. Raw
 request events and every repetition are retained in `run.json`. API keys are read from an
 environment variable and are never serialized into evidence.
 
 `variance-short` runs only E1-SS after three warmups and records 20 repetitions. It is intended to
-measure single-request noise without allowing the longer E1 arms to alter server state.
-`variance-short-paired` runs the same 20 repetitions against two live targets, alternating target
-order for every pair. Warmups run once per target before the first pair.
+measure single-request noise without allowing the longer E1 arms to alter server state. With
+`compare`, those repetitions are automatically matched across the two live targets and their order
+alternates. Warmups run once per target before the first block.
 
 Standalone one-target results can be joined later for regression or cross-host comparison:
 

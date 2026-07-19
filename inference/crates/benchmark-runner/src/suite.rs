@@ -93,12 +93,6 @@ async fn load_profiles(root: &Path) -> Result<Vec<Profile>, BenchmarkError> {
 }
 
 fn validate_profile(profile: &Profile) -> Result<(), BenchmarkError> {
-    if profile.schema_version != 2 {
-        return Err(BenchmarkError::Asset(format!(
-            "profile {} uses unsupported schema version {}",
-            profile.id, profile.schema_version
-        )));
-    }
     if profile.repetitions == 0 {
         return Err(BenchmarkError::Asset(format!(
             "profile {} requires positive repetitions",
@@ -160,9 +154,10 @@ fn validate_profile(profile: &Profile) -> Result<(), BenchmarkError> {
         )));
     }
     if profile.controlled
-        && (!profile.paired
-            || profile.min_paired_repetitions < 2
-            || profile.max_paired_repetitions < profile.min_paired_repetitions
+        && (profile.repetitions < 2
+            || !profile.repetitions.is_multiple_of(2)
+            || profile.max_repetitions < profile.repetitions
+            || !profile.max_repetitions.is_multiple_of(2)
             || !(0.0..1.0).contains(&profile.confidence_half_width_ratio))
     {
         return Err(BenchmarkError::Asset(format!(
@@ -170,23 +165,15 @@ fn validate_profile(profile: &Profile) -> Result<(), BenchmarkError> {
             profile.id
         )));
     }
-    if !profile.controlled
-        && (profile.min_paired_repetitions != 0 || profile.max_paired_repetitions != 0)
-    {
+    if !profile.controlled && profile.max_repetitions != 0 {
         return Err(BenchmarkError::Asset(format!(
             "profile {} configures controlled-run stability without enabling controlled mode",
             profile.id
         )));
     }
-    if profile.paired && !(0.0..1.0).contains(&profile.confidence_half_width_ratio) {
+    if !profile.controlled && profile.confidence_half_width_ratio != 0.0 {
         return Err(BenchmarkError::Asset(format!(
-            "profile {} requires a paired precision threshold between zero and one",
-            profile.id
-        )));
-    }
-    if !profile.paired && profile.confidence_half_width_ratio != 0.0 {
-        return Err(BenchmarkError::Asset(format!(
-            "profile {} configures paired precision without enabling paired mode",
+            "profile {} configures adaptive precision without enabling controlled mode",
             profile.id
         )));
     }
@@ -259,7 +246,7 @@ mod tests {
         tokio::fs::create_dir(&profiles).await.unwrap();
         let profile = |id: &str| {
             format!(
-                "schema_version = 2\nid = \"{id}\"\ndescription = \"test\"\ncases = [\"E1/ss\"]\nrepetitions = 2\nwarmups = 0\nrequest_timeout_seconds = 30\n"
+                "id = \"{id}\"\ndescription = \"test\"\ncases = [\"E1/ss\"]\nrepetitions = 2\nwarmups = 0\nrequest_timeout_seconds = 30\n"
             )
         };
 
