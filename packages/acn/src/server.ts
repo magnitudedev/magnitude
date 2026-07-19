@@ -3,7 +3,7 @@ import { FetchHttpClient, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
-import { Effect, Layer, Option, Redacted, Runtime } from "effect"
+import { Effect, Layer, Runtime } from "effect"
 import {
   StorageLive,
   MagnitudeStorage,
@@ -37,7 +37,6 @@ import {
   ModelConfigurationPropagationLive,
 } from "./local-inference"
 import { OnboardingLive } from "./onboarding"
-import { resolveLlamaCppAuth } from "./shared-client"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
@@ -189,27 +188,11 @@ const makeAcnServicesBase = (debug: boolean) => {
 const localInferencePlatformLayer = () => {
   const root = defaultGlobalStorageRoot()
   const paths = makeGlobalStoragePaths(root)
-  return Layer.unwrapEffect(Effect.gen(function* () {
-    const storage = yield* MagnitudeStorage
-    return LocalInferencePlatformLive({
-      root: `${root}/local-inference`,
-      indexPath: paths.localModelIndexFile,
-      configuredServerExecutable: Option.fromNullable(process.env.LLAMA_CPP_SERVER_PATH?.trim() || undefined),
-      external: resolveLlamaCppAuth(storage).pipe(
-        Effect.flatMap((auth) => auth
-          ? Effect.try({
-              try: () => [{
-                id: "llamacpp",
-                origin: new URL(auth.endpoint),
-                apiKey: auth.apiKey ? Option.some(Redacted.make(auth.apiKey)) : Option.none(),
-              }],
-              catch: () => [] as const,
-            })
-          : Effect.succeed([])),
-        Effect.catchAll(() => Effect.succeed([])),
-      ),
-    })
-  }))
+  return LocalInferencePlatformLive({
+    root: `${root}/local-inference`,
+    modelsRoot: `${root}/models`,
+    indexPath: paths.localModelIndexFile,
+  })
 }
 
 const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {

@@ -117,7 +117,7 @@ describe("llama.cpp command routing", () => {
       const fitParams = path.join(root, "llama-fit-params")
       const serverLog = path.join(root, "server.log")
       const fitLog = path.join(root, "fit.log")
-      yield* fs.writeFileString(server, `#!/bin/sh\nprintf '%s\\n' "$*" > '${serverLog}'\nprintf '[{"id":"MTL0"}]\\n'\n`)
+      yield* fs.writeFileString(server, `#!/bin/sh\nprintf '%s\\n' "$*" > '${serverLog}'\nprintf '[{"id":"MTL0","name":"Apple GPU","backend":"Metal","type":"IGPU","total_memory":51539607552,"free_memory":42949672960}]\\n'\n`)
       yield* fs.writeFileString(fitParams, `#!/bin/sh\nprintf '%s\\n' "$*" > '${fitLog}'\nprintf 'MTL0 100 200 300\\nHost 400 500 600\\n'\n`)
       yield* fs.chmod(server, 0o755)
       yield* fs.chmod(fitParams, 0o755)
@@ -146,7 +146,7 @@ describe("llama.cpp command routing", () => {
         mmap: true,
         mlock: false,
       })
-      yield* cli.listDevices
+      const devices = yield* cli.listDevices
       const modelFileId = ModelFileId.make("model")
       const sourceId = ModelFileSourceId.make("source")
       const projectorSizeBytes = 100 * MEBIBYTE
@@ -181,6 +181,7 @@ describe("llama.cpp command routing", () => {
         profile,
       })
       return {
+        devices,
         fit,
         serverArguments: yield* fs.readFileString(serverLog),
         fitArguments: yield* fs.readFileString(fitLog),
@@ -188,6 +189,15 @@ describe("llama.cpp command routing", () => {
     }).pipe(Effect.provide(BunContext.layer))))
 
     expect(result.fit._tag).toBe("Estimated")
+    expect(result.devices.devices[0]).toMatchObject({
+      id: "MTL0",
+      name: Option.some("Apple GPU"),
+      backend: Option.some("Metal"),
+      type: Option.some("IGPU"),
+      physicalId: Option.none(),
+      totalMemoryBytes: Option.some(51_539_607_552),
+      freeMemoryBytes: Option.some(42_949_672_960),
+    })
     if (result.fit._tag !== "Estimated") return
     expect(result.fit.plan.memory).toEqual({
       baseBytes: 2_100 * MEBIBYTE,

@@ -6,7 +6,6 @@ import { ModelDiscoveryOperationIdSchema, ModelFamilyIdSchema, ProviderIdSchema,
 import {
   makeDelegatingProviderClient,
   resolveEndpointProviderAuthFromStorage,
-  resolveLlamaCppAuth,
 } from "./shared-client"
 
 function storageWithAuth(initial?: ProviderAuth) {
@@ -50,18 +49,6 @@ describe("endpoint provider auth resolution", () => {
       type: "endpoint",
       endpoint: "http://127.0.0.1:9090",
     })
-  })
-
-  it("exposes an external llama.cpp server only when it is explicitly configured", async () => {
-    const missing = await Effect.runPromise(resolveLlamaCppAuth({
-      auth: { get: () => Effect.sync(() => undefined) },
-    }))
-    const configured = await Effect.runPromise(resolveLlamaCppAuth({
-      auth: { get: () => Effect.succeed({ type: "endpoint", endpoint: "http://127.0.0.1:9090" }) },
-    }))
-
-    expect(missing).toBeNull()
-    expect(configured).toEqual({ endpoint: "http://127.0.0.1:9090" })
   })
 })
 

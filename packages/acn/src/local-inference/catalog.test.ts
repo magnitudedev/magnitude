@@ -1,7 +1,24 @@
 import { describe, expect, test } from "vitest"
-import { LOCAL_MODEL_CATALOG, catalogFileUrl, catalogSourcePageUrl } from "./catalog"
+import { Option } from "effect"
+import {
+  LOCAL_MODEL_CATALOG,
+  catalogArtifactRequestFiles,
+  catalogFileUrl,
+  catalogSourcePageUrl,
+} from "./catalog"
 
 describe("local model catalog", () => {
+  test("publishes exactly one primary GGUF and orders every remaining shard", () => {
+    for (const entry of LOCAL_MODEL_CATALOG) {
+      const files = catalogArtifactRequestFiles(entry)
+      expect(files.filter((file) => file.role === "primary")).toHaveLength(1)
+      expect(files.filter((file) => file.role === "shard").map((file) =>
+        Option.getOrUndefined(file.shardIndex))).toEqual(
+        entry.files.slice(1).map((_, index) => index + 1),
+      )
+    }
+  })
+
   test("pins every shipping artifact to exact immutable metadata", () => {
     const ids = new Set<string>()
     for (const entry of LOCAL_MODEL_CATALOG) {
@@ -9,6 +26,25 @@ describe("local model catalog", () => {
       ids.add(entry.id)
       expect(entry.revision).toMatch(/^[0-9a-f]{40}$/)
       expect(entry.files.length).toBeGreaterThan(0)
+      expect(entry.runtime.ggufArchitecture).toBeTruthy()
+      expect(entry.runtime.parameterCount).toBeGreaterThan(0)
+      expect(entry.runtime.blockCount).toBeGreaterThan(0)
+      expect(entry.runtime.embeddingLength).toBeGreaterThan(0)
+      expect(entry.runtime.attentionHeadCount).toBeGreaterThan(0)
+      const attentionLayers = entry.runtime.attentionCache.reduce(
+        (total, group) => total + group.layerCount,
+        0,
+      )
+      expect(
+        attentionLayers + (entry.runtime.recurrentState?.layerCount ?? 0),
+        `${entry.id} runtime layers`,
+      ).toBe(entry.runtime.blockCount)
+      for (const group of entry.runtime.attentionCache) {
+        expect(group.keyHeads).toBeGreaterThan(0)
+        expect(group.keyLength).toBeGreaterThan(0)
+        expect(group.valueHeads).toBeGreaterThan(0)
+        expect(group.valueLength).toBeGreaterThan(0)
+      }
       expect(entry.license.id).toBeTruthy()
       expect(entry.quantization.fidelityLabel).not.toBe("Accuracy")
       expect(entry.quantization.fidelityLabel).toMatch(/^(Good|High|Very high|Near-original) fidelity /)

@@ -1,4 +1,6 @@
+import { Option } from "effect"
 import type { LocalModelCatalogEntry } from "./types"
+import { catalogRuntimeMetadata } from "./catalog-runtime-metadata"
 
 const APACHE_LICENSE = {
   id: "apache-2.0",
@@ -94,6 +96,7 @@ const artifact = (input: ArtifactInput): LocalModelCatalogEntry => ({
   repo: input.repo,
   revision: input.revision,
   quantTag: input.format,
+  runtime: catalogRuntimeMetadata(input.modelId),
   files: [{ path: input.file, sizeBytes: input.sizeBytes, sha256: input.sha256 }],
   quantization: {
     format: input.format,
@@ -310,6 +313,7 @@ const NEMOTRON_SUPER: LocalModelCatalogEntry = {
   repo: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
   revision: "036038fb30334a2d56a146c6f0d4871ab5edccbb",
   quantTag: "MXFP4_MOE",
+  runtime: catalogRuntimeMetadata("nemotron-3-super-120b-a12b"),
   files: [
     {
       path: "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00001-of-00003.gguf",
@@ -356,6 +360,7 @@ const QWEN_122B: LocalModelCatalogEntry = {
   repo: "unsloth/Qwen3.5-122B-A10B-GGUF",
   revision: "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
   quantTag: "UD-Q4_K_XL",
+  runtime: catalogRuntimeMetadata("qwen3.5-122b-a10b"),
   files: [
     {
       path: "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf",
@@ -401,6 +406,7 @@ const DEEPSEEK_V4_FLASH: LocalModelCatalogEntry = {
   repo: "unsloth/DeepSeek-V4-Flash-GGUF",
   revision: "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
   quantTag: "UD-Q8_K_XL",
+  runtime: catalogRuntimeMetadata("deepseek-v4-flash"),
   files: [
     {
       path: "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf",
@@ -457,6 +463,7 @@ const NEMOTRON_ULTRA: LocalModelCatalogEntry = {
   repo: "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
   revision: "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6",
   quantTag: "MXFP4_MOE",
+  runtime: catalogRuntimeMetadata("nemotron-3-ultra-550b-a55b"),
   files: catalogFiles([
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00001-of-00009.gguf", 7_872_128, "564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39"],
     ["MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00002-of-00009.gguf", 46_357_384_032, "49bb6d0075c1926583a88b2cb7fa0c07e24918ae2c0505c200a8f93cb618453d"],
@@ -497,6 +504,7 @@ const GLM_52: LocalModelCatalogEntry = {
   repo: "unsloth/GLM-5.2-GGUF",
   revision: "abc55e72527792c6e77069c99b4cb7de16fa9f23",
   quantTag: "UD-Q4_K_XL",
+  runtime: catalogRuntimeMetadata("glm-5.2"),
   files: catalogFiles([
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00001-of-00011.gguf", 9_423_744, "3256ac8c290273f0965ff39e93a8bcd07dc99bcd23e923bd4b7306ef39061038"],
     ["UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00002-of-00011.gguf", 49_433_942_336, "aaedfb89d314d6967a80005b93a9c460a494babc6c3e4f0138e21891e21572e1"],
@@ -542,6 +550,13 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
 ]
 
 export const LOCAL_MODEL_CATALOG_BY_ID = new Map(LOCAL_MODEL_CATALOG.map((entry) => [entry.id, entry]))
+
+export const catalogArtifactRequestFiles = (entry: LocalModelCatalogEntry) =>
+  entry.files.map((file, index) => ({
+    path: file.path,
+    role: index === 0 ? "primary" as const : "shard" as const,
+    shardIndex: index === 0 ? Option.none<number>() : Option.some(index),
+  }))
 
 const modelFileName = (value: string): string => value.replaceAll("\\", "/").split("/").at(-1) ?? value
 

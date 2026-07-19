@@ -8,15 +8,16 @@ import {
   type LocalInferenceUsageSelection,
   type LocalModelChoice,
 } from "@magnitudedev/protocol"
-import { HuggingFace, LlamaCpp, ModelFiles } from "@magnitudedev/local-inference"
+import { Hardware, HuggingFace, LlamaCpp, ModelFiles } from "@magnitudedev/local-inference"
 import type { DurableLocalModelBinding } from "@magnitudedev/storage"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
-import { LOCAL_MODEL_CATALOG } from "./catalog"
+import { LOCAL_MODEL_CATALOG, catalogArtifactRequestFiles } from "./catalog"
 import { LocalModelConfiguration, type ModelConfigurationError } from "./model-configuration"
 import { LocalInferencePlatform } from "./platform"
 import { LocalModelProviderSource, type LlamaLogicalRoute } from "./provider-source"
-import { configuredParallelSlots } from "./recommendations"
-import { recommendLocalModels } from "./recommendations"
+import { acceleratorCapacityBudget, systemCapacityBudget } from "./recommendations"
+import { recommendLocalModels, resolveConfiguration } from "./recommendations"
+import type { StableInferenceCapacity } from "./types"
 import { makeMirroredResource } from "../mirrored-resource"
 
 export interface LocalInferenceApi {
@@ -47,10 +48,141 @@ const mapFailure = (operation: string, cause: unknown) => localError(
   true,
 )
 
-const hostToWire = (
-  host: { readonly totalMemoryBytes: number; readonly availableMemoryBytes: number; readonly cpuModel: Option.Option<string>; readonly logicalCores: number },
+interface NormalizedDeviceDomain {
+  readonly id: string
+  readonly backend: string
+  readonly capacityBytes: number
+  readonly freeBytes: number | null
+  readonly sharesSystemMemory: boolean
+  readonly deviceNames: readonly string[]
+  readonly splitGroupId: string | null
+}
+
+const backendFromDevice = (device: LlamaCpp.LlamaDevice): string => Option.getOrElse(
+  device.backend,
+  () => {
+    const prefix = String(device.id).match(/^[A-Za-z_]+/)?.[0]?.toLowerCase()
+    if (prefix === "mtl" || prefix === "metal") return "Metal"
+    if (prefix === "cuda") return "CUDA"
+    if (prefix === "vulkan" || prefix === "vk") return "Vulkan"
+    if (prefix === "rocm" || prefix === "hip") return "ROCm"
+    if (prefix === "sycl") return "SYCL"
+    return prefix ?? "unknown"
+  },
+)
+
+const normalizedDeviceDomains = (
+  host: Hardware.HostHardwareSnapshot,
+  devices: readonly LlamaCpp.LlamaDevice[],
+): readonly NormalizedDeviceDomain[] => {
+  const backendPreference = (backend: string): number => {
+    switch (backend.toLowerCase()) {
+      case "metal": return 5
+      case "cuda": return 4
+      case "rocm": return 3
+      case "vulkan": return 2
+      case "sycl": return 1
+      default: return 0
+    }
+  }
+  // One physical accelerator can be exposed by multiple loaded llama.cpp
+  // backends (most commonly CUDA and Vulkan). Prefer one backend per matching
+  // device description so its memory is never counted twice. Multiple devices
+  // with the same description inside that backend remain distinct.
+  const preferredBackendByName = new Map<string, string>()
+  for (const device of devices) {
+    const name = Option.getOrElse(device.name, () => "").trim().toLowerCase()
+    if (!name) continue
+    const backend = backendFromDevice(device)
+    const current = preferredBackendByName.get(name)
+    if (!current || backendPreference(backend) > backendPreference(current)) {
+      preferredBackendByName.set(name, backend)
+    }
+  }
+  const visibleDevices = devices.filter((device) => {
+    const name = Option.getOrElse(device.name, () => "").trim().toLowerCase()
+    return !name || preferredBackendByName.get(name) === backendFromDevice(device)
+  })
+
+  const candidates = visibleDevices.flatMap((device) => Option.match(device.totalMemoryBytes, {
+    onNone: () => [],
+    onSome: (capacityBytes) => {
+      if (capacityBytes <= 0) return []
+      const backend = backendFromDevice(device)
+      const type = Option.getOrElse(device.type, () => "").toLowerCase()
+      if (type === "cpu" || backend.toLowerCase() === "cpu" || String(device.id).toLowerCase() === "host") return []
+      const appleMetal = host.platform === "darwin"
+        && host.nativeArchitecture === "arm64"
+        && backend.toLowerCase() === "metal"
+      const sharesSystemMemory = appleMetal || type === "igpu" || type.includes("integrated")
+      const physicalId = Option.getOrElse(device.physicalId, () => `${backend}:${String(device.id)}`)
+      return [{
+        id: sharesSystemMemory ? `unified:${physicalId}` : `physical:${physicalId}`,
+        backend,
+        capacityBytes: sharesSystemMemory
+          ? Math.min(host.totalMemoryBytes, capacityBytes)
+          : capacityBytes,
+        freeBytes: Option.getOrNull(device.freeMemoryBytes),
+        sharesSystemMemory,
+        deviceNames: [Option.getOrElse(device.name, () => String(device.id))],
+        splitGroupId: null,
+      }]
+    },
+  }))
+
+  const backendCounts = new Map<string, number>()
+  for (const candidate of candidates) {
+    if (candidate.sharesSystemMemory) continue
+    const key = candidate.backend.toLowerCase()
+    backendCounts.set(key, (backendCounts.get(key) ?? 0) + 1)
+  }
+
+  const domains = new Map<string, NormalizedDeviceDomain>()
+  for (const candidate of candidates) {
+    const existing = domains.get(candidate.id)
+    const splitGroupId = !candidate.sharesSystemMemory
+      && (backendCounts.get(candidate.backend.toLowerCase()) ?? 0) > 1
+      ? `llamacpp:${candidate.backend.toLowerCase()}`
+      : null
+    if (!existing) {
+      domains.set(candidate.id, { ...candidate, splitGroupId })
+      continue
+    }
+    domains.set(candidate.id, {
+      ...existing,
+      capacityBytes: Math.min(existing.capacityBytes, candidate.capacityBytes),
+      freeBytes: existing.freeBytes === null || candidate.freeBytes === null
+        ? existing.freeBytes ?? candidate.freeBytes
+        : Math.min(existing.freeBytes, candidate.freeBytes),
+      deviceNames: [...new Set([...existing.deviceNames, ...candidate.deviceNames])],
+      splitGroupId: existing.splitGroupId ?? splitGroupId,
+    })
+  }
+  return [...domains.values()]
+}
+
+export const detectedInferenceCapacity = (
+  host: Hardware.HostHardwareSnapshot,
+  devices: readonly LlamaCpp.LlamaDevice[],
+): StableInferenceCapacity => ({
+  systemMemoryBytes: host.totalMemoryBytes,
+  acceleratorDomains: normalizedDeviceDomains(host, devices).map((domain) => ({
+    memoryDomainId: domain.id,
+    capacityBytes: domain.sharesSystemMemory
+      ? Math.min(systemCapacityBudget(host.totalMemoryBytes), acceleratorCapacityBudget(domain.capacityBytes))
+      : acceleratorCapacityBudget(domain.capacityBytes),
+    sharesSystemMemory: domain.sharesSystemMemory,
+    preferredBackend: domain.backend,
+    ...(domain.splitGroupId ? { modelSplitGroupId: domain.splitGroupId } : {}),
+  })),
+})
+
+export const hostToWire = (
+  host: Hardware.HostHardwareSnapshot,
   devices: readonly LlamaCpp.LlamaDevice[],
 ): LocalInferenceHostProfile => ({
+  platform: host.platform,
+  architecture: host.nativeArchitecture,
   systemMemoryBytes: host.totalMemoryBytes,
   cpuModel: Option.getOrNull(host.cpuModel),
   logicalCores: host.logicalCores,
@@ -58,23 +190,26 @@ const hostToWire = (
     {
       id: "system",
       kind: "system",
-      stableCapacityBytes: Math.max(0, host.totalMemoryBytes - Math.max(8 * 1024 ** 3, host.totalMemoryBytes * 0.2)),
+      totalCapacityBytes: host.totalMemoryBytes,
+      stableCapacityBytes: systemCapacityBudget(host.totalMemoryBytes),
       currentFreeBytes: host.availableMemoryBytes,
       sharesSystemMemory: false,
+      backendNames: [],
       deviceNames: [],
       splitGroupId: null,
     },
-    ...devices.flatMap((device) => Option.match(device.totalMemoryBytes, {
-      onNone: () => [],
-      onSome: (total) => [{
-        id: String(device.id),
-        kind: "physical_device" as const,
-        stableCapacityBytes: Math.max(0, total - Math.max(1024 ** 3, total * 0.1)),
-        currentFreeBytes: Option.getOrNull(device.freeMemoryBytes),
-        sharesSystemMemory: false,
-        deviceNames: [Option.getOrElse(device.name, () => String(device.id))],
-        splitGroupId: null,
-      }],
+    ...normalizedDeviceDomains(host, devices).map((domain) => ({
+      id: domain.id,
+      kind: domain.sharesSystemMemory ? "unified_working_set" as const : "physical_device" as const,
+      totalCapacityBytes: domain.capacityBytes,
+      stableCapacityBytes: domain.sharesSystemMemory
+        ? Math.min(systemCapacityBudget(host.totalMemoryBytes), acceleratorCapacityBudget(domain.capacityBytes))
+        : acceleratorCapacityBudget(domain.capacityBytes),
+      currentFreeBytes: domain.freeBytes,
+      sharesSystemMemory: domain.sharesSystemMemory,
+      backendNames: [domain.backend],
+      deviceNames: domain.deviceNames,
+      splitGroupId: domain.splitGroupId,
     })),
   ],
 })
@@ -89,6 +224,15 @@ export const LocalInferenceLive: Layer.Layer<
   const configuration = yield* LocalModelConfiguration
   const lock = yield* Effect.makeSemaphore(1)
   const hostSnapshot = yield* platform.hardware.inspect.pipe(Effect.either)
+  const inspectDevices = platform.cli.pipe(
+    Effect.flatMap((cli) => cli.listDevices),
+    Effect.map((snapshot) => snapshot.devices),
+    Effect.catchAll((cause) => Effect.logWarning("Unable to inspect llama.cpp devices").pipe(
+      Effect.annotateLogs({ cause: String(cause) }),
+      Effect.as([] as readonly LlamaCpp.LlamaDevice[]),
+    )),
+  )
+  const deviceSnapshot = yield* Ref.make(yield* inspectDevices)
   const initialRegistry = yield* platform.instances.pipe(Effect.option)
   const activeRegistry = yield* Ref.make(initialRegistry)
   const configured = configuration.get.pipe(Effect.mapError(fromConfiguration))
@@ -106,14 +250,47 @@ export const LocalInferenceLive: Layer.Layer<
     Effect.mapError((cause) => mapFailure("refresh llama.cpp installations", cause)),
   )
 
-  const downloadModel = (configurationId: string) => Effect.gen(function* () {
-    const entry = LOCAL_MODEL_CATALOG.find((candidate) => candidate.id === configurationId)
-    if (!entry) return yield* localError("invalid_selection", "download local model", "The requested catalog model is unknown.")
+  const downloadModel = (configurationId: string) => lock.withPermits(1)(Effect.gen(function* () {
+    if (hostSnapshot._tag === "Left") {
+      return yield* localError(
+        "configuration_failed",
+        "download local model",
+        "Hardware capacity could not be detected for this model configuration.",
+        true,
+      )
+    }
+    const config = yield* configured
+    if (!config.usage) {
+      return yield* localError(
+        "invalid_selection",
+        "download local model",
+        "Choose local inference usage before downloading a recommended model.",
+      )
+    }
+    const selected = resolveConfiguration(
+      configurationId,
+      detectedInferenceCapacity(hostSnapshot.right, yield* Ref.get(deviceSnapshot)),
+      config.usage,
+    )
+    if (!selected) {
+      return yield* localError(
+        "invalid_selection",
+        "download local model",
+        "This recommendation no longer matches the detected hardware and usage settings.",
+      )
+    }
+    const entry = selected.entry
     if (entry.license.acknowledgementRequired) return yield* localError("license_required", "download local model", `License acknowledgement is required at ${entry.license.url}`)
+    yield* configuration.selectProfile({
+      configurationId: selected.configurationId,
+      catalogModelId: entry.id,
+      contextTokens: selected.contextTokens,
+      parallelSlots: selected.servingProfile.parallelSlots,
+    }).pipe(Effect.mapError(fromConfiguration))
     const artifact = yield* platform.hub.resolveArtifact({
       repository: HuggingFace.HuggingFaceRepositoryId.make(entry.repo),
       revision: HuggingFace.HuggingFaceRevision.make(entry.revision),
-      files: entry.files.map((file) => ({ path: file.path, role: "primary" as const, shardIndex: Option.none() })),
+      files: catalogArtifactRequestFiles(entry),
       relationships: [],
     }).pipe(Effect.mapError((cause) => mapFailure("resolve local model download", cause)))
     yield* platform.downloads.download(artifact).pipe(
@@ -121,7 +298,7 @@ export const LocalInferenceLive: Layer.Layer<
       Effect.mapError((cause) => mapFailure("download local model", cause)),
     )
     yield* platform.files.inspect("changed")
-  })
+  }))
 
   const matchCatalogEntry = (record: ModelFiles.ModelFileRecord | undefined) => record
     ? LOCAL_MODEL_CATALOG.find((entry) =>
@@ -145,6 +322,9 @@ export const LocalInferenceLive: Layer.Layer<
     if (!logical || !model || model.availability._tag === "Disabled") return yield* localError("invalid_selection", "activate local model", "The requested local model is unavailable.")
     const managed = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
     const external = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "External" }> => route._tag === "External")
+    const managedContextTokens = managed?.request?.profile.contextSize._tag === "Tokens"
+      ? managed.request.profile.contextSize.value
+      : model.contextWindow
     const binding: DurableLocalModelBinding = !managed && external
       ? {
           _tag: "External",
@@ -158,8 +338,8 @@ export const LocalInferenceLive: Layer.Layer<
           selectionId,
           artifactId: managed ? String(managed.record.id) : "",
           providerModelId: logical.providerModelId,
-          contextTokens: model.contextWindow,
-          parallelSlots: configuredParallelSlots(),
+          contextTokens: managedContextTokens,
+          parallelSlots: managed?.request?.profile.parallelSlots ?? 1,
         }
     yield* configuration.activateLocal(binding).pipe(Effect.mapError(fromConfiguration))
     yield* source.warm(logical.providerModelId).pipe(Effect.mapError((cause) => mapFailure("activate local model", cause)))
@@ -294,12 +474,15 @@ export const LocalInferenceLive: Layer.Layer<
         diagnostics: installationState.diagnostics.map((diagnostic) => ({ code: diagnostic._tag, message: diagnostic.reason })),
       },
       host: hostSnapshot._tag === "Right"
-        ? { _tag: "Available" as const, profile: hostToWire(hostSnapshot.right, []) }
+        ? { _tag: "Available" as const, profile: hostToWire(hostSnapshot.right, yield* Ref.get(deviceSnapshot)) }
         : { _tag: "Unavailable" as const, message: hostSnapshot.left.message },
       choices,
       operations,
       recommendations: config.usage && hostSnapshot._tag === "Right"
-        ? recommendLocalModels({ systemMemoryBytes: hostSnapshot.right.totalMemoryBytes, acceleratorDomains: [] }, config.usage)
+        ? recommendLocalModels(
+          detectedInferenceCapacity(hostSnapshot.right, yield* Ref.get(deviceSnapshot)),
+          config.usage,
+        )
         : [],
       warnings: [
         ...files.issues.map((issue) => ({ code: issue.code, message: issue.message })),
@@ -334,9 +517,12 @@ export const LocalInferenceLive: Layer.Layer<
       switch: true,
     }),
   )
+  const installationChanges = platform.installations.changes.pipe(
+    Stream.tap(() => inspectDevices.pipe(Effect.flatMap((devices) => Ref.set(deviceSnapshot, devices)))),
+  )
   const triggers = Stream.mergeAll([
     configuration.changes,
-    platform.installations.changes,
+    installationChanges,
     source.stateChanges,
     platform.files.changes.pipe(Stream.map(() => undefined)),
     registryChanges,

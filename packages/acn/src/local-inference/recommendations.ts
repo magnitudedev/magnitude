@@ -90,41 +90,60 @@ export const systemCapacityBudget = (totalBytes: number): number =>
 export const acceleratorCapacityBudget = (totalBytes: number): number =>
   Math.max(0, totalBytes - Math.max(GIB, totalBytes * 0.1))
 
+const F16_BYTES = 2
+
+export const estimateKvCacheBytes = (
+  entry: LocalModelCatalogEntry,
+  contextTokensPerSlot: number,
+  parallelSlots: number,
+): number => entry.runtime.attentionCache.reduce((total, group) => {
+  const retainedTokens = Math.min(contextTokensPerSlot, group.contextLimitTokens ?? contextTokensPerSlot)
+  const elementsPerToken = group.layerCount * (
+    group.keyHeads * group.keyLength
+    + group.valueHeads * group.valueLength
+  )
+  return total + elementsPerToken * F16_BYTES * retainedTokens * parallelSlots
+}, 0)
+
+export const estimateRecurrentStateBytes = (
+  entry: LocalModelCatalogEntry,
+  parallelSlots: number,
+): number => {
+  const recurrent = entry.runtime.recurrentState
+  if (!recurrent) return 0
+  const elementsPerLayer = recurrent.innerSize * (
+    recurrent.stateSize + Math.max(0, recurrent.convolutionWidth - 1)
+  )
+  return recurrent.layerCount * elementsPerLayer * recurrent.bytesPerElement * parallelSlots
+}
+
 /**
- * Conservative catalog estimate until measured llama.cpp profiles replace it.
- * It includes weights, compute/graph overhead, and context-scaled KV/runtime
- * overhead. The exact resolved artifact is still authoritatively fitted by
- * `LlamaCppHost.plan` immediately before activation.
+ * Artifact-specific stable-capacity estimate derived from pinned GGUF metadata.
+ * The exact resolved artifact is still authoritatively fitted by llama.cpp
+ * immediately before activation.
  */
 export const estimateRuntimeBytes = (
   entry: LocalModelCatalogEntry,
   contextTokensPerSlot: number,
   parallelSlots: number,
-): number => estimateRuntimeBytesForModel(
-  entry.files.reduce((total, file) => total + file.sizeBytes, 0),
-  contextTokensPerSlot,
-  parallelSlots,
-)
-
-export const estimateRuntimeBytesForModel = (
-  modelBytes: number,
-  contextTokensPerSlot: number,
-  parallelSlots: number,
 ): number => {
+  const modelBytes = entry.files.reduce((total, file) => total + file.sizeBytes, 0)
   const computeAndGraph = Math.max(768 * 1024 ** 2, modelBytes * 0.04)
-  const contextAt32K = Math.max(GIB, modelBytes * 0.06)
-  const totalContextTokens = contextTokensPerSlot * parallelSlots
-  const contextAndKv = contextAt32K * (totalContextTokens / BASELINE_CONTEXT_TOKENS)
-  return Math.ceil(modelBytes + computeAndGraph + contextAndKv)
+  const kvCache = estimateKvCacheBytes(entry, contextTokensPerSlot, parallelSlots)
+  const recurrentState = estimateRecurrentStateBytes(entry, parallelSlots)
+  return Math.ceil(modelBytes + computeAndGraph + kvCache + recurrentState)
 }
 
 export const estimateRuntimeOverheadPerSlot = (
-  modelBytes: number,
+  entry: LocalModelCatalogEntry,
   contextTokensPerSlot: number,
   parallelSlots: number,
 ): number => Math.max(
   0,
-  (estimateRuntimeBytesForModel(modelBytes, contextTokensPerSlot, parallelSlots) - modelBytes) / parallelSlots,
+  (
+    estimateRuntimeBytes(entry, contextTokensPerSlot, parallelSlots)
+    - entry.files.reduce((total, file) => total + file.sizeBytes, 0)
+  ) / parallelSlots,
 )
 
 const fitConfiguration = (
@@ -138,13 +157,13 @@ const fitConfiguration = (
   const systemBudget = systemCapacityBudget(capacity.systemMemoryBytes)
   const discreteDomains = capacity.acceleratorDomains
     .filter((domain) => domain.sharesSystemMemory === false)
-  const discreteBudgets = discreteDomains.map((domain) => acceleratorCapacityBudget(domain.capacityBytes))
+  const discreteBudgets = discreteDomains.map((domain) => domain.capacityBytes)
   const splitGroupBudgets = new Map<string, number>()
   for (const domain of discreteDomains) {
     if (!domain.modelSplitGroupId) continue
     splitGroupBudgets.set(
       domain.modelSplitGroupId,
-      (splitGroupBudgets.get(domain.modelSplitGroupId) ?? 0) + acceleratorCapacityBudget(domain.capacityBytes),
+      (splitGroupBudgets.get(domain.modelSplitGroupId) ?? 0) + domain.capacityBytes,
     )
   }
   const unifiedBudgets = capacity.acceleratorDomains
@@ -202,9 +221,16 @@ export const evaluateCatalog = (
 }
 
 const recommendedOrder = (a: EvaluatedLocalConfiguration, b: EvaluatedLocalConfiguration): number => {
+  const placementRank: Record<LocalInferenceFitClass, number> = {
+    full_accelerator: 3,
+    hybrid: 2,
+    cpu_or_unified: 1,
+    unknown: 0,
+  }
   // Model quality first across models. Within one model, preserve useful
   // context before spending remaining memory on a marginally larger quant.
   if (a.entry.modelQualityRank !== b.entry.modelQualityRank) return b.entry.modelQualityRank - a.entry.modelQualityRank
+  if (a.fitClass !== b.fitClass) return placementRank[b.fitClass] - placementRank[a.fitClass]
   if (a.contextTokens !== b.contextTokens) return b.contextTokens - a.contextTokens
   if (a.entry.quantization.fidelityRank !== b.entry.quantization.fidelityRank) {
     return b.entry.quantization.fidelityRank - a.entry.quantization.fidelityRank

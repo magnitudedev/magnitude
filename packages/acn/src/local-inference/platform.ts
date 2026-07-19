@@ -1,5 +1,4 @@
-import { delimiter } from "node:path"
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { homedir, platform } from "node:os"
 import { createServer } from "node:net"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
@@ -29,14 +28,7 @@ import {
 } from "@magnitudedev/local-inference"
 import { readStructuredFile, writeStructuredFileAtomic } from "@magnitudedev/storage"
 
-export interface ExternalLlamaConfiguration {
-  readonly id: string
-  readonly origin: URL
-  readonly apiKey: Option.Option<Redacted.Redacted<string>>
-}
-
 interface ActiveInstances {
-  readonly externalKey: string
   readonly scope: Scope.CloseableScope
   readonly registry: LlamaCpp.LlamaInstanceRegistryApi
 }
@@ -64,9 +56,8 @@ export class LocalInferencePlatform extends Context.Tag("LocalInferencePlatform"
 
 export interface LocalInferencePlatformOptions {
   readonly root: string
+  readonly modelsRoot: string
   readonly indexPath: string
-  readonly configuredServerExecutable: Option.Option<string>
-  readonly external: Effect.Effect<readonly ExternalLlamaConfiguration[]>
 }
 
 const freePort = (): Effect.Effect<number> => Effect.async<number>((resume) => {
@@ -93,8 +84,8 @@ export const LocalInferencePlatformLive = (
   const hardware = yield* Hardware.makeHostHardware()
   const host = yield* hardware.inspect.pipe(Effect.orDie)
   const store = {
-    cacheRoot: path.join(options.root, "huggingface", "cache"),
-    installationRoot: path.join(options.root, "huggingface", "installations"),
+    cacheRoot: options.modelsRoot,
+    installationRoot: path.join(options.modelsRoot, ".manifests"),
     sourceId: ModelFiles.ModelFileSourceId.make("huggingface-managed"),
   }
   const managedSource = yield* HuggingFace.makeHuggingFaceCacheSource({ store, label: Option.some("Magnitude models") })
@@ -160,9 +151,9 @@ export const LocalInferencePlatformLive = (
       ? host.nativeArchitecture === "arm64" ? Option.some(LlamaCpp.LlamaDistributionVariantId.make("linux-arm64-cpu")) : Option.some(LlamaCpp.LlamaDistributionVariantId.make("linux-x64-cpu"))
       : Option.none<LlamaCpp.LlamaDistributionVariantId>()
   const installations = yield* LlamaCpp.makeLlamaCppInstallationRegistry({
-    configuredServerExecutable: options.configuredServerExecutable,
+    configuredServerExecutable: Option.none(),
     managedRoot: path.join(options.root, "llamacpp", "distribution"),
-    searchPath: (process.env.PATH ?? "").split(delimiter).filter(Boolean),
+    searchPath: [],
     managedVariant,
     manifest: LlamaCpp.DEFAULT_LLAMA_DISTRIBUTION_MANIFEST,
     platform: platform(),
@@ -194,14 +185,8 @@ export const LocalInferencePlatformLive = (
   )
 
   const resolveActive = lock.withPermits(1)(Effect.gen(function* () {
-    const external = yield* options.external
-    const externalKey = external.map((item) => `${item.id}:${item.origin}:${Option.match(item.apiKey, {
-      onNone: () => "none",
-      onSome: (value) => createHash("sha256").update(Redacted.value(value)).digest("hex"),
-    })}`).join("\0")
     const current = yield* Ref.get(active)
-    if (Option.isSome(current) && current.value.externalKey === externalKey) return current.value
-    if (Option.isSome(current)) yield* Scope.close(current.value.scope, Exit.void)
+    if (Option.isSome(current)) return current.value
     const scope = yield* Scope.make()
     const port = yield* freePort()
     if (port <= 0) return yield* Effect.die("Unable to reserve a loopback port for llama.cpp")
@@ -213,19 +198,14 @@ export const LocalInferencePlatformLive = (
       port,
       apiKey: Redacted.make(randomUUID()),
       modelsMax: 1,
-      external: external.map((item) => ({
-        id: LlamaCpp.ExternalServerConfigId.make(item.id),
-        origin: item.origin,
-        authorization: item.apiKey,
-        label: Option.some(item.id),
-      })),
+      external: [],
     }).pipe(
       Effect.provideService(Scope.Scope, scope),
       Effect.provideService(FileSystem.FileSystem, fs),
       Effect.provideService(Path.Path, path),
       Effect.provideService(HttpClient.HttpClient, http),
     )
-    const next = { externalKey, scope, registry }
+    const next = { scope, registry }
     yield* Ref.set(active, Option.some(next))
     yield* PubSub.publish(instanceChanges, registry)
     return next
