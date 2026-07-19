@@ -2,15 +2,23 @@ import { memo, useCallback, useState, useMemo } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { Atom, Result, useAtomMount } from '@effect-atom/atom-react'
-import { Cause, Effect, Option } from 'effect'
+import { Effect, Option } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
-import { deriveLlamaCppInstallationManagementView, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
+import { reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
 import { ModelCatalogLifecycle, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
+import { describeLocalHardware } from '../local-inference/view-model'
+import { writeTextToClipboard } from '../../utils/clipboard'
+
+const MAGNITUDE_CLOUD_URL = 'https://app.magnitude.dev'
+const SETTINGS_SECTION_WIDTH = 72
+const SETTINGS_SECTION_LABEL_GAP = 2
+const settingsSectionRule = (label: string): string =>
+  '─'.repeat(Math.max(0, SETTINGS_SECTION_WIDTH - label.length - SETTINGS_SECTION_LABEL_GAP))
 
 interface SettingsOverlayProps {
   isVisible: boolean
@@ -49,7 +57,7 @@ const disabledReasonLabel = (reason: "insufficient_resources" | "provider_unavai
   insufficient_resources: 'not enough free memory',
   provider_unavailable: 'server unavailable',
   model_unavailable: 'model unavailable',
-  installation_unavailable: 'llama.cpp unavailable',
+  installation_unavailable: 'local inference unavailable',
   incompatible_runtime: 'incompatible runtime',
   invalid_configuration: 'invalid configuration',
 })[reason]
@@ -75,11 +83,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onConfigureCloud,
 }: SettingsOverlayProps) {
   const theme = useTheme()
-  const localInference = useLocalInferenceState()
-  const llamaView = Option.map(Result.value(localInference.state), deriveLlamaCppInstallationManagementView)
-  const localFailure = Result.isFailure(localInference.state)
-    ? Option.some(Cause.pretty(localInference.state.cause))
-    : localInference.mutationFailure
+  const localInferenceState = useLocalInferenceQuery()
+  const localInferenceSnapshot = Result.value(localInferenceState)
+  const host = Option.flatMap(localInferenceSnapshot, (state) =>
+    state.host._tag === 'Available' ? Option.some(state.host.profile) : Option.none()
+  )
+  const hardware = Option.map(host, describeLocalHardware)
   const [mode, setMode] = useState<Mode>('view')
   const [inputValue, setInputValue] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -134,6 +143,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const [refreshHovered, setRefreshHovered] = useState(false)
   const [localSetupHovered, setLocalSetupHovered] = useState(false)
   const [cloudSetupHovered, setCloudSetupHovered] = useState(false)
+  const [copyCloudLinkHovered, setCopyCloudLinkHovered] = useState(false)
+  const [cloudLinkCopied, setCloudLinkCopied] = useState(false)
 
   // Dropdown state
   const [dropdownTarget, setDropdownTarget] = useState<DropdownTarget>(null)
@@ -174,6 +185,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     setPendingAuthAction('clear')
     auth.clear()
   }, [auth])
+
+  const copyCloudLink = useCallback(() => {
+    void writeTextToClipboard(MAGNITUDE_CLOUD_URL).then((copied) => {
+      if (!copied) return
+      setCloudLinkCopied(true)
+      setTimeout(() => setCloudLinkCopied(false), 2_000)
+    })
+  }, [])
 
   const authCompletionAtom = useMemo(
     () => Atom.make(Effect.sync(() => {
@@ -292,15 +311,51 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         </text>
       </box>
 
+      {/* Detected hardware */}
+      <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
+        <box style={{ flexDirection: 'row', paddingBottom: 1, width: '100%', maxWidth: SETTINGS_SECTION_WIDTH }}>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>DETECTED HARDWARE</text>
+          <text style={{ fg: theme.border }}>  {settingsSectionRule('DETECTED HARDWARE')}</text>
+        </box>
+        {Option.match(hardware, {
+          onNone: () => (
+            <text style={{ fg: Result.isFailure(localInferenceState) ? theme.warning : theme.muted }}>
+              {Result.isFailure(localInferenceState) ? 'Hardware detection unavailable' : 'Detecting hardware…'}
+            </text>
+          ),
+          onSome: (detected) => (
+            <box style={{
+              paddingLeft: 1,
+              paddingRight: 1,
+              flexDirection: 'column',
+              width: '100%',
+              maxWidth: SETTINGS_SECTION_WIDTH,
+            }}>
+              <text style={{ fg: theme.foreground }}><span attributes={TextAttributes.BOLD}>{detected.system.name}</span></text>
+              {detected.system.details.map((detail) => <text key={detail} style={{ fg: theme.muted }}>{detail}</text>)}
+              {detected.accelerators.map((accelerator) => (
+                <box key={`${accelerator.name}:${accelerator.details}`} style={{ flexDirection: 'column', paddingTop: 1 }}>
+                  <text style={{ fg: theme.foreground }}>{accelerator.name}</text>
+                  <text style={{ fg: theme.muted }}>{accelerator.details}</text>
+                </box>
+              ))}
+              {detected.accelerators.length === 0 && Option.exists(host, (profile) => !profile.memoryDomains.some((domain) => domain.kind === 'unified_working_set')) && (
+                <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
+              )}
+            </box>
+          ),
+        })}
+      </box>
+
       {/* Divider */}
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
       </box>
 
-      {/* Magnitude section */}
+      {/* Magnitude Cloud section */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.foreground }}>
-          <span attributes={TextAttributes.BOLD}>Magnitude</span>
+          <span attributes={TextAttributes.BOLD}>Magnitude Cloud</span>
         </text>
       </box>
 
@@ -309,8 +364,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         {mode === 'view' && auth.source === 'env' && (
           <>
             <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{'● Connected '}</text>
-              <text style={{ fg: theme.muted }}>{`via ${auth.envVarName} `}</text>
+              <text style={{ fg: theme.success }}>{'● Magnitude Cloud connected'}</text>
+            </box>
+            <box style={{ flexDirection: 'row' }}>
+              <text style={{ fg: theme.muted }}>{`API key from ${auth.envVarName} `}</text>
               {auth.key && (
                 <text style={{ fg: theme.foreground }}>
                   <span attributes={TextAttributes.DIM}>{`(${maskApiKey(auth.key)})`}</span>
@@ -326,7 +383,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         {mode === 'view' && auth.source === 'config' && (
           <box style={{ flexDirection: 'column' }}>
             <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{'● Connected '}</text>
+              <text style={{ fg: theme.success }}>{'● Magnitude Cloud connected '}</text>
               {auth.maskedKey && (
                 <text style={{ fg: theme.foreground }}>
                   <span attributes={TextAttributes.DIM}>{`(${auth.maskedKey})`}</span>
@@ -335,7 +392,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             </box>
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
               <Button onClick={beginEdit} onMouseOver={() => setUpdateHovered(true)} onMouseOut={() => setUpdateHovered(false)}>
-                <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Update key]'}</text>
+                <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Update API key]'}</text>
               </Button>
               <text> </text>
               <Button onClick={beginDisconnect} onMouseOver={() => setDisconnectHovered(true)} onMouseOut={() => setDisconnectHovered(false)}>
@@ -346,19 +403,35 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         )}
 
         {mode === 'view' && auth.source === 'none' && (
-          <box style={{ flexDirection: 'row' }}>
-            <text style={{ fg: theme.muted }}>{'○ Not connected '}</text>
-            <text style={{ fg: theme.muted }}>{'· '}</text>
-            <Button onClick={beginEdit} onMouseOver={() => setUpdateHovered(true)} onMouseOut={() => setUpdateHovered(false)}>
-              <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Set API key]'}</text>
-            </Button>
+          <box style={{ flexDirection: 'column' }}>
+            <text style={{ fg: theme.muted }}>○ Magnitude Cloud not connected</text>
+            <text style={{ fg: theme.foreground }}>No Magnitude Cloud API key · No cloud model access</text>
+            <box style={{ flexDirection: 'row', paddingTop: 1 }}>
+              <text style={{ fg: theme.muted }}>Get an API key → </text>
+              <text style={{ fg: theme.primary }}>{MAGNITUDE_CLOUD_URL}</text>
+              <text> </text>
+              <Button
+                onClick={copyCloudLink}
+                onMouseOver={() => setCopyCloudLinkHovered(true)}
+                onMouseOut={() => setCopyCloudLinkHovered(false)}
+              >
+                <text style={{ fg: cloudLinkCopied ? theme.success : copyCloudLinkHovered ? theme.foreground : theme.muted }}>
+                  {cloudLinkCopied ? '[Copied ✓]' : '[Copy link]'}
+                </text>
+              </Button>
+            </box>
+            <box style={{ paddingTop: 1 }}>
+              <Button onClick={beginEdit} onMouseOver={() => setUpdateHovered(true)} onMouseOut={() => setUpdateHovered(false)}>
+                <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Connect Magnitude Cloud]'}</text>
+              </Button>
+            </box>
           </box>
         )}
 
         {mode === 'edit' && (
           <box style={{ flexDirection: 'column' }}>
             <box style={{ borderStyle: 'single', borderColor: displayedAuthError ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, flexShrink: 0, width: 80 }}>
-              <SingleLineInput value={inputValue} onChange={(v) => { setInputValue(v); setError(null) }} placeholder="Paste new API key" focused={true} />
+              <SingleLineInput value={inputValue} onChange={(v) => { setInputValue(v); setError(null) }} placeholder="Paste Magnitude Cloud API key" focused={true} />
             </box>
             {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{displayedAuthError}</text></box>}
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
@@ -378,7 +451,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
         {mode === 'confirm-disconnect' && (
           <box style={{ flexDirection: 'column' }}>
-            <text style={{ fg: theme.foreground }}>Disconnect this key? You will need to set another to reconnect.</text>
+            <text style={{ fg: theme.foreground }}>Disconnect Magnitude Cloud? Cloud models will no longer be available.</text>
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
               <Button onClick={handleConfirmDisconnect} onMouseOver={() => setConfirmHovered(true)} onMouseOut={() => setConfirmHovered(false)}>
                 <text style={{ fg: confirmHovered ? theme.error : theme.foreground }}>{auth.saving ? '[Disconnecting...]' : '[Yes, disconnect]'}</text>
@@ -397,53 +470,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
       </box>
-
-      {/* Inference source setup */}
-      {Option.isNone(llamaView) && (
-        <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
-          <text style={{ fg: Option.isSome(localFailure) ? theme.error : theme.muted }}>
-            {Option.getOrElse(localFailure, () => 'Inspecting llama.cpp installations…')}
-          </text>
-        </box>
-      )}
-      {Option.isSome(llamaView) && (
-        <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
-          <text style={{ fg: theme.foreground }}><span attributes={TextAttributes.BOLD}>llama.cpp</span></text>
-          <text style={{ fg: llamaView.value.status === 'ready' ? theme.success : theme.warning }}>
-            {llamaView.value.status === 'ready'
-              ? Option.match(llamaView.value.selected, {
-                  onNone: () => 'Ready',
-                  onSome: (installation) => `${installation.ownership === 'magnitude' ? 'Managed by Magnitude' : 'User installation'} · b${installation.build} · ${installation.executables.serverPath}`,
-                })
-              : llamaView.value.status === 'outdated'
-                ? Option.match(llamaView.value.representativeOutdated, { onNone: () => 'Outdated', onSome: (installation) => `Outdated b${installation.build} · requires b${llamaView.value.minimumBuild}` })
-                : 'Not installed for managed local inference'}
-          </text>
-          <text style={{ fg: theme.muted }}>Minimum b{llamaView.value.minimumBuild} · recommended b{llamaView.value.recommendedBuild}</text>
-          {llamaView.value.managedInstall.operation._tag === 'Running' && (
-            <text style={{ fg: theme.primary }}>{llamaView.value.managedInstall.operation.stage[0]?.toUpperCase()}{llamaView.value.managedInstall.operation.stage.slice(1)}…</text>
-          )}
-          {llamaView.value.managedInstall.operation._tag === 'Failed' && (
-            <text style={{ fg: theme.error }}>{llamaView.value.managedInstall.operation.message}</text>
-          )}
-          {llamaView.value.managedInstall.availability._tag === 'UnsupportedPlatform' && (
-            <text style={{ fg: theme.warning }}>{llamaView.value.managedInstall.availability.reason}</text>
-          )}
-          {Option.isSome(localFailure) && <text style={{ fg: theme.error }}>{localFailure.value}</text>}
-          <box style={{ flexDirection: 'row', paddingTop: 1 }}>
-            {llamaView.value.managedInstallRecommended && llamaView.value.managedInstall.availability._tag === 'Available' && llamaView.value.managedInstall.operation._tag !== 'Running' && (
-              <Button onClick={localInference.mutationBusy ? undefined : localInference.installLlamaCpp}><text style={{ fg: localInference.mutationBusy ? theme.muted : theme.primary }}>[Install b{llamaView.value.recommendedBuild}]</text></Button>
-            )}
-            <text> </text>
-            <Button onClick={localInference.mutationBusy ? undefined : localInference.refreshInstallations}><text style={{ fg: theme.muted }}>[Refresh detection]</text></Button>
-          </box>
-          {llamaView.value.installations.map((installation) => (
-            <text key={installation.id} style={{ fg: theme.muted }}>
-              {`${Option.exists(llamaView.value.selected, (selected) => selected.id === installation.id) ? '● ' : '  '}b${installation.build} · ${installation.ownership === 'magnitude' ? 'Magnitude' : 'User'}${Option.exists(llamaView.value.active, (active) => active.id === installation.id) ? ' · active' : ''} · ${installation.executables.serverPath} · ${installation.executables.fitParamsPath}`}
-            </text>
-          ))}
-        </box>
-      )}
 
       {/* Inference source setup */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>

@@ -246,4 +246,44 @@ describe("LocalModelConfiguration", () => {
       secondary: { providerId: "magnitude", providerModelId: "cloud-model" },
     })
   })
+
+  it("persists the exact recommended serving profile before installation", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const state = yield* Ref.make<MagnitudeConfig>({
+        localInference: { usage: { sessionConcurrency: "up_to_three" } },
+      })
+      const storage = {
+        getLocalInferenceConfig: () => Ref.get(state).pipe(
+          Effect.map((config) => config.localInference ?? null),
+        ),
+        getModelConfig: () => Ref.get(state).pipe(Effect.map((config) => config.models ?? null)),
+        updateModelConfig: () => Effect.void,
+        update: (f: (config: MagnitudeConfig) => MagnitudeConfig) => Ref.modify(
+          state,
+          (current) => {
+            const next = f(current)
+            return [next, next]
+          },
+        ),
+      }
+      const configuration = yield* makeLocalModelConfiguration(storage)
+      yield* configuration.selectProfile({
+        configurationId: "catalog@revision@sessions-up_to_three@p-3@ctx-100000",
+        catalogModelId: "catalog",
+        contextTokens: 100_000,
+        parallelSlots: 3,
+      })
+      return yield* Ref.get(state)
+    }))
+
+    expect(result.localInference).toEqual({
+      usage: { sessionConcurrency: "up_to_three" },
+      selectedProfile: {
+        configurationId: "catalog@revision@sessions-up_to_three@p-3@ctx-100000",
+        catalogModelId: "catalog",
+        contextTokens: 100_000,
+        parallelSlots: 3,
+      },
+    })
+  })
 })

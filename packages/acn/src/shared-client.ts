@@ -49,9 +49,6 @@ export const resolveEndpointProviderAuthFromStorage = (
   return defaultConfig ?? null
 })
 
-export const resolveLlamaCppAuth = (storage: EndpointProviderAuthStorage) =>
-  resolveEndpointProviderAuthFromStorage(storage, "llamacpp")
-
 interface ProviderClientEntry {
   readonly sessionId: string | null
   readonly ref: Ref.Ref<ProviderClientShape>

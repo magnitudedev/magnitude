@@ -17,6 +17,32 @@ export interface StableInferenceCapacity {
   readonly acceleratorDomains: readonly StableAcceleratorDomain[]
 }
 
+export interface LocalModelAttentionCacheGroup {
+  readonly layerCount: number
+  readonly keyHeads: number
+  readonly keyLength: number
+  readonly valueHeads: number
+  readonly valueLength: number
+  /** Sliding-attention groups retain at most this many tokens per slot. */
+  readonly contextLimitTokens?: number
+}
+
+export interface LocalModelRuntimeMetadata {
+  readonly ggufArchitecture: string
+  readonly parameterCount: number
+  readonly blockCount: number
+  readonly embeddingLength: number
+  readonly attentionHeadCount: number
+  readonly attentionCache: readonly LocalModelAttentionCacheGroup[]
+  readonly recurrentState?: {
+    readonly layerCount: number
+    readonly innerSize: number
+    readonly stateSize: number
+    readonly convolutionWidth: number
+    readonly bytesPerElement: number
+  }
+}
+
 export interface LocalModelCatalogEntry {
   readonly id: string
   readonly modelId: string
@@ -31,6 +57,7 @@ export interface LocalModelCatalogEntry {
   readonly repo: string
   readonly revision: string
   readonly quantTag: string
+  readonly runtime: LocalModelRuntimeMetadata
   readonly files: readonly {
     readonly path: string
     readonly sizeBytes: number

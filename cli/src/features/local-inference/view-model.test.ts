@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { ProviderModelIdSchema, type LocalInferenceState, type LocalModelRecommendation } from "@magnitudedev/sdk"
-import { buildLocalInferenceSelections, selectionCapacityWarning, selectionMetadata } from "./view-model"
+import {
+  buildLocalInferenceSelections,
+  describeLocalHardware,
+  selectionCapacityWarning,
+  selectionMetadata,
+} from "./view-model"
 
 const recommendation: LocalModelRecommendation = {
   configurationId: "configuration-1",
@@ -66,6 +71,93 @@ const baseState = {
 } satisfies Omit<LocalInferenceState, "choices" | "recommendations">
 
 describe("local inference selection view model", () => {
+  it("presents Apple Silicon as one unified-memory system", () => {
+    expect(describeLocalHardware({
+      platform: "darwin",
+      architecture: "arm64",
+      systemMemoryBytes: 64 * 1024 ** 3,
+      cpuModel: "Apple M4 Max",
+      logicalCores: 16,
+      memoryDomains: [{
+        id: "system",
+        kind: "system",
+        totalCapacityBytes: 64 * 1024 ** 3,
+        stableCapacityBytes: 51.2 * 1024 ** 3,
+        currentFreeBytes: null,
+        sharesSystemMemory: false,
+        backendNames: [],
+        deviceNames: [],
+        splitGroupId: null,
+      }, {
+        id: "metal",
+        kind: "unified_working_set",
+        totalCapacityBytes: 48 * 1024 ** 3,
+        stableCapacityBytes: 43.2 * 1024 ** 3,
+        currentFreeBytes: null,
+        sharesSystemMemory: true,
+        backendNames: ["Metal"],
+        deviceNames: ["Apple M4 Max"],
+        splitGroupId: null,
+      }],
+    })).toEqual({
+      system: {
+        name: "Apple M4 Max",
+        details: [
+          "macOS · Apple Silicon · 16 logical CPU cores",
+          "64.0 GiB unified memory · Metal GPU acceleration",
+        ],
+      },
+      accelerators: [],
+    })
+  })
+
+  it("presents every discrete GPU with its actual VRAM and backend", () => {
+    const gib = 1024 ** 3
+    expect(describeLocalHardware({
+      platform: "linux",
+      architecture: "x64",
+      systemMemoryBytes: 128 * gib,
+      cpuModel: "AMD Ryzen Threadripper",
+      logicalCores: 64,
+      memoryDomains: [{
+        id: "system",
+        kind: "system",
+        totalCapacityBytes: 128 * gib,
+        stableCapacityBytes: 102.4 * gib,
+        currentFreeBytes: null,
+        sharesSystemMemory: false,
+        backendNames: [],
+        deviceNames: [],
+        splitGroupId: null,
+      }, ...[0, 1].map((index) => ({
+        id: `cuda:${index}`,
+        kind: "physical_device" as const,
+        totalCapacityBytes: 24 * gib,
+        stableCapacityBytes: 21.6 * gib,
+        currentFreeBytes: null,
+        sharesSystemMemory: false,
+        backendNames: ["CUDA"],
+        deviceNames: [`NVIDIA GeForce RTX 4090 #${index + 1}`],
+        splitGroupId: "llamacpp:cuda",
+      }))],
+    })).toEqual({
+      system: {
+        name: "AMD Ryzen Threadripper",
+        details: [
+          "Linux · x86-64 · 64 logical CPU cores",
+          "128.0 GiB system memory",
+        ],
+      },
+      accelerators: [{
+        name: "NVIDIA GeForce RTX 4090 #1",
+        details: "24.0 GiB VRAM · CUDA GPU acceleration",
+      }, {
+        name: "NVIDIA GeForce RTX 4090 #2",
+        details: "24.0 GiB VRAM · CUDA GPU acceleration",
+      }],
+    })
+  })
+
   it("does not duplicate a downloaded recommendation", () => {
     const state: LocalInferenceState = {
       ...baseState,
