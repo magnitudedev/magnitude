@@ -24,12 +24,36 @@ pub struct ResolvedExecutionPlan {
     pub max_sequences: u32,
     /// Maximum prompt tokens allocated to one sequence in a round-robin pass.
     pub prefill_quantum: u32,
+    /// Automatic prefix-KV retention and lower-tier capacity. Device capacity remains the native
+    /// context allocation; these byte limits are strict additional maxima and allocate lazily.
+    pub radix_cache: RadixCacheConfig,
     /// Model loading, KV allocation, offload, and native worker-pool policy.
     pub execution: ExecutionConfig,
     /// Optional multimodal projector loaded into the same model executor.
     pub projector: Option<ProjectorConfig>,
     /// Fully resolved speculative-decoding configuration.
     pub mtp: MtpConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RadixCacheConfig {
+    pub enabled: bool,
+    pub page_tokens: NonZeroU32,
+    pub host_bytes: u64,
+    pub disk_bytes: u64,
+    pub disk_path: Option<PathBuf>,
+}
+
+impl Default for RadixCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            page_tokens: NonZeroU32::new(16).expect("16 is non-zero"),
+            host_bytes: 0,
+            disk_bytes: 0,
+            disk_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -315,6 +339,10 @@ pub struct GenerationMetrics {
     pub decode_tokens_per_second: f64,
     pub sampler_ms: f64,
     pub parser_ms: f64,
+    pub cache_device_tokens: usize,
+    pub cache_host_tokens: usize,
+    pub cache_disk_tokens: usize,
+    pub cache_promotion_ms: f64,
     pub draft_tokens: usize,
     pub accepted_draft_tokens: usize,
     pub draft_ms: f64,

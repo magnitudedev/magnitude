@@ -814,6 +814,14 @@ pub struct Usage {
 #[serde(deny_unknown_fields)]
 pub struct Timings {
     pub cache_n: u64,
+    /// Cached prompt tokens attached directly from native device pages.
+    pub cache_device_n: u64,
+    /// Cached prompt tokens promoted from the bounded host tier.
+    pub cache_host_n: u64,
+    /// Cached prompt tokens promoted from the bounded local-storage tier.
+    pub cache_disk_n: u64,
+    /// Native import plus host/disk read time for this request.
+    pub cache_promotion_ms: f64,
     pub prompt_n: u64,
     pub prompt_ms: f64,
     pub prompt_per_token_ms: f64,
@@ -1337,6 +1345,10 @@ fn timing_values(
     let prompt_n = prompt_tokens.saturating_sub(cached_prompt_tokens);
     Timings {
         cache_n: cached_prompt_tokens as u64,
+        cache_device_n: metrics.cache_device_tokens as u64,
+        cache_host_n: metrics.cache_host_tokens as u64,
+        cache_disk_n: metrics.cache_disk_tokens as u64,
+        cache_promotion_ms: metrics.cache_promotion_ms,
         prompt_n: prompt_n as u64,
         prompt_ms: metrics.prompt_ms,
         prompt_per_token_ms: per_token_ms(prompt_n, metrics.prompt_ms),
@@ -2517,6 +2529,7 @@ mod tests {
                     accepted_draft_tokens: 0,
                     draft_ms: 0.0,
                     verification_ms: 0.0,
+                    ..GenerationMetrics::default()
                 },
             })
         }
@@ -2553,6 +2566,10 @@ mod tests {
         );
         for field in [
             "cache_n",
+            "cache_device_n",
+            "cache_host_n",
+            "cache_disk_n",
+            "cache_promotion_ms",
             "prompt_n",
             "prompt_ms",
             "prompt_per_token_ms",
@@ -3023,7 +3040,11 @@ mod tests {
         assert_eq!(
             timing_fields,
             BTreeSet::from([
+                "cache_device_n",
+                "cache_disk_n",
+                "cache_host_n",
                 "cache_n",
+                "cache_promotion_ms",
                 "parser_ms",
                 "predicted_ms",
                 "predicted_n",
