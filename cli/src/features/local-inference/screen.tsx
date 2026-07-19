@@ -307,7 +307,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           </text>
         </box>
         {hardware ? (
-          <box style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: theme.border, paddingLeft: 1, paddingRight: 1, flexDirection: "column", width: "100%" }}>
+          <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: "column", width: "100%" }}>
             <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
             {hardware.system.details.map((detail) => (
               <text key={detail} style={{ fg: theme.muted }}>{detail}</text>
@@ -319,7 +319,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               </box>
             ))}
             {hardware.accelerators.length === 0 && !host?.memoryDomains.some((domain) => domain.kind === "unified_working_set") && (
-              <text style={{ fg: theme.muted }}>CPU inference · No GPU detected by llama.cpp</text>
+              <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
             )}
           </box>
         ) : (
