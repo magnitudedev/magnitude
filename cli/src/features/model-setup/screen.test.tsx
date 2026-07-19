@@ -120,12 +120,11 @@ vi.mock("../../hooks/use-theme", () => ({
   }),
 }))
 
-const { ModelSetupScreen, resolveModelSetupSurface } = await import("./screen")
+const { ModelSetupScreen } = await import("./screen")
 
 test("local management renders local inference even when it is entered independently", async () => {
   const view = await testRender(
     <ModelSetupScreen
-      initialStep="local"
       mode="management"
       onExit={() => {}}
     />,
@@ -140,17 +139,13 @@ test("local management renders local inference even when it is entered independe
   }
 })
 
-test("management preserves an explicitly selected cloud surface", () => {
-  expect(resolveModelSetupSurface("management", "cloud")).toBe("cloud-provider")
-})
-
 test("saved usage answers remain preselected without skipping the questions", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
   }
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="management" onExit={() => {}} />,
+    <ModelSetupScreen mode="management" onExit={() => {}} />,
     { width: 120, height: 30 },
   )
 
@@ -175,7 +170,7 @@ test("recommendation controls follow the model list instead of filling the termi
     usage: { sessionConcurrency: "one" },
   }
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
     { width: 120, height: 30 },
   )
 
@@ -232,8 +227,9 @@ test("clicking an already running model continues setup with that model", async 
       sizeBytes: 32_600_719_872,
     }],
   }
+  const onComplete = vi.fn()
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} onComplete={onComplete} />,
     { width: 120, height: 30 },
   )
 
@@ -247,9 +243,7 @@ test("clicking an already running model continues setup with that model", async 
     await act(async () => view.mockMouse.moveTo(runningModel.x, runningModel.y))
     await act(view.renderOnce)
     await act(async () => view.mockMouse.click(runningModel.x, runningModel.y))
-    await act(view.renderOnce)
-
-    expect(view.captureCharFrame()).toContain("CLOUD MODELS (OPTIONAL)")
+    expect(onComplete).toHaveBeenCalledTimes(1)
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -262,7 +256,7 @@ test("clicking a possible download starts that model download", async () => {
     recommendations: [recommendedModel],
   }
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
     { width: 120, height: 30 },
   )
 
@@ -328,7 +322,7 @@ test("recommendations show a human-readable detected hardware panel before model
     recommendations: [recommendedModel],
   }
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
     { width: 120, height: 35 },
   )
 
@@ -354,7 +348,7 @@ test("Right Arrow opens recommendations from the usage questions", async () => {
     usage: { sessionConcurrency: "one" },
   }
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} />,
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
     { width: 120, height: 30 },
   )
 
@@ -369,10 +363,10 @@ test("Right Arrow opens recommendations from the usage questions", async () => {
   }
 })
 
-test("local and cloud onboarding actions can be clicked with the mouse", async () => {
+test("skipping local onboarding completes without opening cloud setup", async () => {
   const onComplete = vi.fn()
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={() => {}} onComplete={onComplete} />,
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} onComplete={onComplete} />,
     { width: 120, height: 30 },
   )
 
@@ -382,29 +376,6 @@ test("local and cloud onboarding actions can be clicked with the mouse", async (
     await act(async () => view.mockMouse.moveTo(localSkip.x, localSkip.y))
     await act(view.renderOnce)
     await act(async () => view.mockMouse.click(localSkip.x, localSkip.y))
-    await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("CLOUD MODELS (OPTIONAL)")
-    expect(view.captureCharFrame()).toContain("Connect cloud models too large to run on this machine")
-    const cloudFrame = view.captureCharFrame()
-    expect(cloudFrame).toContain("Use Exa web search for external research")
-    expect(cloudFrame).not.toContain("Primary")
-    expect(cloudFrame).not.toContain("Secondary")
-    expect(cloudFrame).not.toContain("Ctrl+C close")
-    expect(cloudFrame.indexOf("Press ← to return")).toBeLessThan(cloudFrame.indexOf("Back to local models (←)"))
-    expect(cloudFrame.indexOf("Back to local models (←)")).toBeLessThan(cloudFrame.indexOf("Skip for now (Esc)"))
-
-    const cloudBack = textPosition(view.captureCharFrame(), "Back to local models (←)")
-    await act(async () => view.mockMouse.moveTo(cloudBack.x, cloudBack.y))
-    await act(view.renderOnce)
-    await act(async () => view.mockMouse.click(cloudBack.x, cloudBack.y))
-    await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("How many local coding sessions will you run at once?")
-
-    const localSkipAgain = textPosition(view.captureCharFrame(), "Skip for now (Esc)")
-    await act(async () => view.mockMouse.click(localSkipAgain.x, localSkipAgain.y))
-    await act(view.renderOnce)
-    const cloudSkip = textPosition(view.captureCharFrame(), "Skip for now (Esc)")
-    await act(async () => view.mockMouse.click(cloudSkip.x, cloudSkip.y))
     expect(onComplete).toHaveBeenCalledTimes(1)
   } finally {
     await act(async () => view.renderer.destroy())
@@ -414,7 +385,7 @@ test("local and cloud onboarding actions can be clicked with the mouse", async (
 test("Ctrl+C exits from local model setup", async () => {
   const onExit = vi.fn()
   const view = await testRender(
-    <ModelSetupScreen initialStep="local" mode="onboarding" onExit={onExit} />,
+    <ModelSetupScreen mode="onboarding" onExit={onExit} />,
     { width: 120, height: 30 },
   )
 

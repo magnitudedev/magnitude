@@ -5,14 +5,13 @@ import {
 } from './inference-source-actions'
 
 describe('settings inference source actions', () => {
-  test('exposes independent local and cloud management entry points', () => {
+  test('exposes local model management', () => {
     expect(INFERENCE_SOURCE_ACTIONS.local.label).toBe('Manage local models')
-    expect(INFERENCE_SOURCE_ACTIONS.cloud.label).toBe('Configure Cloud fallback')
   })
 
-  test('routes the documented shortcuts to their domains', () => {
+  test('routes the local shortcut and rejects unrelated keys', () => {
     expect(getInferenceSourceAction('l')).toBe('local')
-    expect(getInferenceSourceAction('c')).toBe('cloud')
+    expect(getInferenceSourceAction('c')).toBeNull()
     expect(getInferenceSourceAction('x')).toBeNull()
   })
 })
