@@ -343,12 +343,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           withHeartbeat(localInference.watchState),
         ),
 
-      ConfigureLocalInferenceUsage: (selection) =>
-        observeRpcDefects(
-          "ConfigureLocalInferenceUsage",
-          localInference.configureUsage(selection).pipe(Effect.as({})),
-        ),
-
       DownloadLocalModel: ({ configurationId }) =>
         observeRpcDefects(
           "DownloadLocalModel",

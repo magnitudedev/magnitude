@@ -1,5 +1,4 @@
 import { Context, Data, Effect, Layer, PubSub, Stream } from "effect"
-import type { LocalInferenceUsageSelection } from "@magnitudedev/protocol"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
@@ -20,7 +19,6 @@ export class ModelConfigurationError extends Data.TaggedError("ModelConfiguratio
 export interface LocalModelConfigurationApi {
   readonly get: Effect.Effect<LocalInferenceConfig, ModelConfigurationError>
   readonly getModels: Effect.Effect<MagnitudeConfig["models"], ModelConfigurationError>
-  readonly updateUsage: (usage: LocalInferenceUsageSelection) => Effect.Effect<void, ModelConfigurationError>
   readonly selectProfile: (profile: SelectedLocalModelProfile) => Effect.Effect<void, ModelConfigurationError>
   readonly updateSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, ModelConfigurationError>
   readonly recordUse: (slotId: SlotId, providerModelId: ProviderModelId) => Effect.Effect<void>
@@ -59,10 +57,6 @@ export const makeLocalModelConfiguration = (storage: Storage): Effect.Effect<Loc
         Effect.map((value) => value ?? {}),
         Effect.mapError((cause) => failure("read model configuration", cause)),
       ),
-      updateUsage: (usage) => mutate("update local inference usage", (current) => ({
-        ...current,
-        localInference: { ...current.localInference, usage },
-      })),
       selectProfile: (selectedProfile) => mutate("select local model profile", (current) => ({
         ...current,
         localInference: { ...current.localInference, selectedProfile },

@@ -4,23 +4,6 @@ import { MirroredSnapshotSchema } from "./mirrored-resource"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
-export const LocalSessionConcurrency = Schema.Literal("one", "up_to_three")
-export type LocalSessionConcurrency = Schema.Schema.Type<typeof LocalSessionConcurrency>
-
-export const LocalInferenceUsageSelection = Schema.Struct({
-  sessionConcurrency: LocalSessionConcurrency,
-})
-export type LocalInferenceUsageSelection = Schema.Schema.Type<typeof LocalInferenceUsageSelection>
-
-export const LocalInferenceServingProfile = Schema.Struct({
-  sessionConcurrency: LocalSessionConcurrency,
-  parallelSlots: PositiveInteger,
-  contextTokensPerSlot: PositiveInteger,
-  totalContextCapacityTokens: PositiveInteger,
-  slotAllocation: Schema.Literal("uniform"),
-  runtimeProfileId: Schema.String,
-})
-export type LocalInferenceServingProfile = Schema.Schema.Type<typeof LocalInferenceServingProfile>
 
 export const LocalInferenceFitClass = Schema.Literal("full_accelerator", "hybrid", "cpu_or_unified", "unknown")
 export type LocalInferenceFitClass = Schema.Schema.Type<typeof LocalInferenceFitClass>
@@ -109,7 +92,6 @@ export const LocalModelRecommendation = Schema.Struct({
     acknowledgementRequired: Schema.Boolean,
   }),
   contextTokens: PositiveInteger,
-  servingProfile: LocalInferenceServingProfile,
   modelMaximumContextTokens: PositiveInteger,
   estimatedRuntimeBytes: NonNegativeNumber,
   stableCapacityBudgetBytes: NonNegativeNumber,
@@ -121,7 +103,6 @@ export const LocalModelRecommendation = Schema.Struct({
 export type LocalModelRecommendation = Schema.Schema.Type<typeof LocalModelRecommendation>
 
 export const LocalInferenceRecommendationState = Schema.Union(
-  Schema.TaggedStruct("NotRequested", {}),
   Schema.TaggedStruct("Loading", {}),
   Schema.TaggedStruct("Ready", {
     recommendations: Schema.Array(LocalModelRecommendation),
@@ -144,7 +125,6 @@ const ChoiceFields = {
   residency: Schema.Literal("loaded", "sleeping", "unloaded", "loading", "failed"),
   quantization: Schema.optional(LocalInferenceQuantization),
   sizeBytes: Schema.optional(NonNegativeNumber),
-  servingProfile: Schema.optional(LocalInferenceServingProfile),
 }
 
 export const LocalModelChoice = Schema.Union(
@@ -194,7 +174,6 @@ export const LocalInferenceErrorCode = Schema.Literal(
 export type LocalInferenceErrorCode = Schema.Schema.Type<typeof LocalInferenceErrorCode>
 
 export const LocalInferenceState = Schema.Struct({
-  usage: Schema.NullOr(LocalInferenceUsageSelection),
   activeBinding: Schema.NullOr(ActiveLocalBindingSummary),
   host: LocalInferenceHostState,
   choices: Schema.Array(LocalModelChoice),

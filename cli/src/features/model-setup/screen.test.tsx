@@ -10,12 +10,11 @@ const localInferenceActions = vi.hoisted(() => ({
 }))
 
 const emptyLocalInferenceState = {
-  usage: null,
   activeBinding: null,
   host: { _tag: "Unavailable", message: "not needed" },
   choices: [],
   operations: [],
-  recommendationState: { _tag: "NotRequested" },
+  recommendationState: { _tag: "Loading" },
   warnings: [],
 } as const satisfies LocalInferenceState
 
@@ -45,16 +44,8 @@ const recommendedModel = {
   totalDownloadBytes: 10_000,
   sourcePageUrl: "https://example.invalid/recommended-model",
   license: { id: "test", url: "https://example.invalid/license", acknowledgementRequired: false },
-  contextTokens: 64_000,
-  servingProfile: {
-    sessionConcurrency: "one",
-    parallelSlots: 1,
-    contextTokensPerSlot: 64_000,
-    totalContextCapacityTokens: 64_000,
-    slotAllocation: "uniform",
-    runtimeProfileId: "test",
-  },
-  modelMaximumContextTokens: 64_000,
+  contextTokens: 100_000,
+  modelMaximumContextTokens: 200_000,
   estimatedRuntimeBytes: 12_000,
   stableCapacityBudgetBytes: 20_000,
   fitMarginBytes: 8_000,
@@ -93,7 +84,6 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
     mutationResults: [Result.initial()],
     mutationBusy: false,
     mutationFailure: Option.none(),
-    configureUsage: () => {},
     downloadModel: localInferenceActions.downloadModel,
     activateModel: () => {},
     deleteModel: () => {},
@@ -129,10 +119,9 @@ test("local management renders local inference even when it is entered independe
   }
 })
 
-test("saved usage answers remain preselected without skipping the questions", async () => {
+test("opens directly on hardware and model recommendations", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { sessionConcurrency: "one" },
     recommendationState: { _tag: "Ready", recommendations: [] },
   }
   const view = await testRender(
@@ -143,13 +132,11 @@ test("saved usage answers remain preselected without skipping the questions", as
   try {
     await act(view.renderOnce)
     const frame = view.captureCharFrame()
-    expect(frame).toContain("How many local coding sessions will you run at once?")
-    expect(frame).toContain("● One session")
-    expect(frame).not.toContain("┌")
-    expect(frame.indexOf("How many Magnitude sessions")).toBeLessThan(frame.indexOf("↑/↓ move"))
-    expect(frame.indexOf("↑/↓ move")).toBeLessThan(frame.indexOf("Skip for now"))
-    expect(frame.indexOf("Skip for now")).toBeLessThan(frame.indexOf("See recommendations"))
-    expect(frame.split("\n")[textPosition(frame, "↑/↓ move").y + 1]?.trim()).toBe("")
+    expect(frame).toContain("Choose what this machine should run")
+    expect(frame).toContain("HARDWARE DETECTION UNAVAILABLE")
+    expect(frame).toContain("No curated model currently fits")
+    expect(frame).not.toContain("How many local coding sessions")
+    expect(frame).not.toContain("See recommendations")
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -158,7 +145,6 @@ test("saved usage answers remain preselected without skipping the questions", as
 test("recommendation controls follow the model list instead of filling the terminal footer", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { sessionConcurrency: "one" },
     recommendationState: { _tag: "Ready", recommendations: [] },
   }
   const view = await testRender(
@@ -168,15 +154,10 @@ test("recommendation controls follow the model list instead of filling the termi
 
   try {
     await act(view.renderOnce)
-    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
-    await act(async () => view.mockMouse.moveTo(recommendations.x, recommendations.y))
-    await act(view.renderOnce)
-    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
-    await act(view.renderOnce)
     const frame = view.captureCharFrame()
     expect(frame.indexOf("No curated model")).toBeLessThan(frame.indexOf("↑/↓ choose"))
-    expect(frame.indexOf("↑/↓ choose")).toBeLessThan(frame.indexOf("Back (←)"))
-    expect(frame.indexOf("Back (←)")).toBeLessThan(frame.indexOf("Skip for now"))
+    expect(frame.indexOf("↑/↓ choose")).toBeLessThan(frame.indexOf("Skip for now"))
+    expect(frame).not.toContain("Back (←)")
     expect(frame.split("\n")[textPosition(frame, "↑/↓ choose").y + 1]?.replaceAll("█", "").trim()).toBe("")
   } finally {
     await act(async () => view.renderer.destroy())
@@ -186,7 +167,6 @@ test("recommendation controls follow the model list instead of filling the termi
 test("clicking an already running model continues setup with that model", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { sessionConcurrency: "one" },
     activeBinding: {
       selectionId: "running-model",
       providerModelId: ProviderModelIdSchema.make("running-provider-model"),
@@ -221,10 +201,6 @@ test("clicking an already running model continues setup with that model", async 
 
   try {
     await act(view.renderOnce)
-    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
-    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
-    await act(view.renderOnce)
-
     const runningModel = textPosition(view.captureCharFrame(), "Qwen3.6 35B-A3B")
     await act(async () => view.mockMouse.moveTo(runningModel.x, runningModel.y))
     await act(view.renderOnce)
@@ -238,7 +214,6 @@ test("clicking an already running model continues setup with that model", async 
 test("shows recommendation loading state without claiming that no model fits", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { sessionConcurrency: "one" },
     recommendationState: { _tag: "Loading" },
   }
   const view = await testRender(
@@ -248,10 +223,6 @@ test("shows recommendation loading state without claiming that no model fits", a
 
   try {
     await act(view.renderOnce)
-    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
-    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
-    await act(view.renderOnce)
-
     const frame = view.captureCharFrame()
     expect(frame).toContain("Calculating recommendations for this machine…")
     expect(frame).not.toContain("No curated model currently fits")
@@ -263,7 +234,6 @@ test("shows recommendation loading state without claiming that no model fits", a
 test("clicking a possible download starts that model download", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { sessionConcurrency: "one" },
     recommendationState: { _tag: "Ready", recommendations: [recommendedModel] },
   }
   const view = await testRender(
@@ -273,10 +243,6 @@ test("clicking a possible download starts that model download", async () => {
 
   try {
     await act(view.renderOnce)
-    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
-    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
-    await act(view.renderOnce)
-
     expect(view.captureCharFrame()).not.toContain("Install runtime")
     const model = textPosition(view.captureCharFrame(), recommendedModel.displayName)
     await act(async () => view.mockMouse.moveTo(model.x, model.y))
@@ -293,7 +259,6 @@ test("recommendations show a human-readable detected hardware panel before model
   const gib = 1024 ** 3
   localInferenceState = {
     ...emptyLocalInferenceState,
-    usage: { sessionConcurrency: "one" },
     host: {
       _tag: "Available",
       profile: {
@@ -324,9 +289,6 @@ test("recommendations show a human-readable detected hardware panel before model
 
   try {
     await act(view.renderOnce)
-    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
-    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
-    await act(view.renderOnce)
     const frame = view.captureCharFrame()
     expect(frame).toContain("HARDWARE DETECTED")
     expect(frame).toContain("Apple M4 Max")
@@ -338,11 +300,7 @@ test("recommendations show a human-readable detected hardware panel before model
   }
 })
 
-test("Right Arrow opens recommendations from the usage questions", async () => {
-  localInferenceState = {
-    ...emptyLocalInferenceState,
-    usage: { sessionConcurrency: "one" },
-  }
+test("does not render the obsolete session-concurrency question", async () => {
   const view = await testRender(
     <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
     { width: 120, height: 30 },
@@ -350,10 +308,10 @@ test("Right Arrow opens recommendations from the usage questions", async () => {
 
   try {
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("See recommendations (→)")
-    await act(async () => view.mockInput.pressArrow("right"))
-    await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("Choose what this machine should run")
+    const frame = view.captureCharFrame()
+    expect(frame).toContain("Choose what this machine should run")
+    expect(frame).not.toContain("session")
+    expect(frame).not.toContain("64K")
   } finally {
     await act(async () => view.renderer.destroy())
   }

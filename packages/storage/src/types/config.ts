@@ -63,21 +63,14 @@ export const OnboardingConfigSchema = Schema.Struct({
 })
 export type OnboardingConfig = Schema.Schema.Type<typeof OnboardingConfigSchema>
 
-export const LocalInferenceUsageSelectionSchema = Schema.Struct({
-  sessionConcurrency: Schema.Literal('one', 'up_to_three'),
-})
-export type LocalInferenceUsageSelection = Schema.Schema.Type<typeof LocalInferenceUsageSelectionSchema>
-
 export const SelectedLocalModelProfileSchema = Schema.Struct({
   configurationId: Schema.String,
   catalogModelId: Schema.String,
   contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
-  parallelSlots: Schema.Number.pipe(Schema.int(), Schema.positive()),
 })
 export type SelectedLocalModelProfile = Schema.Schema.Type<typeof SelectedLocalModelProfileSchema>
 
 export const LocalInferenceConfigSchema = Schema.Struct({
-  usage: Schema.optional(LocalInferenceUsageSelectionSchema),
   selectedProfile: Schema.optional(SelectedLocalModelProfileSchema),
 })
 export type LocalInferenceConfig = Schema.Schema.Type<typeof LocalInferenceConfigSchema>

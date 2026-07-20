@@ -1,7 +1,6 @@
 import { useCallback, useMemo } from "react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
-import type { LocalInferenceUsageSelection } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { useLocalInferenceResource } from "./use-reactive-rpc"
 
@@ -14,7 +13,6 @@ export function useLocalInferenceState() {
   const client = useAgentClient()
   const state = useLocalInferenceQuery()
 
-  const configureAtom = useMemo(() => client.mutation("ConfigureLocalInferenceUsage"), [client])
   const downloadAtom = useMemo(() => client.mutation("DownloadLocalModel"), [client])
   const activateAtom = useMemo(() => client.mutation("ActivateLocalModel"), [client])
   const deleteAtom = useMemo(() => client.mutation("DeleteLocalModel"), [client])
@@ -22,7 +20,6 @@ export function useLocalInferenceState() {
   const disableAtom = useMemo(() => client.mutation("DisableLocalInference"), [client])
 
   const mutationResults = [
-    useAtomValue(configureAtom),
     useAtomValue(downloadAtom),
     useAtomValue(activateAtom),
     useAtomValue(deleteAtom),
@@ -37,16 +34,12 @@ export function useLocalInferenceState() {
     Option.none<string>(),
   )
 
-  const configureMutation = useAtomSet(configureAtom)
   const downloadMutation = useAtomSet(downloadAtom)
   const activateMutation = useAtomSet(activateAtom)
   const deleteMutation = useAtomSet(deleteAtom)
   const restartMutation = useAtomSet(restartAtom)
   const disableMutation = useAtomSet(disableAtom)
 
-  const configureUsage = useCallback((selection: LocalInferenceUsageSelection): void => {
-    configureMutation({ payload: selection, reactivityKeys: ["localInference", "modelSlots"] })
-  }, [configureMutation])
   const downloadModel = useCallback((configurationId: string): void => {
     downloadMutation({ payload: { configurationId }, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })
   }, [downloadMutation])
@@ -68,7 +61,6 @@ export function useLocalInferenceState() {
     mutationResults,
     mutationBusy,
     mutationFailure,
-    configureUsage,
     downloadModel,
     activateModel,
     deleteModel,

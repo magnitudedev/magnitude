@@ -6,7 +6,6 @@ import {
   type LocalInferenceOperationSnapshot,
   type LocalInferenceRecommendationState,
   type LocalInferenceSnapshot,
-  type LocalInferenceUsageSelection,
   type LocalModelChoice,
   type LocalModelFitAssessment,
   type LocalModelRecommendation,
@@ -20,6 +19,10 @@ import { LocalInferenceChanges } from "./gateway"
 import { LocalModelConfiguration } from "./model-configuration"
 
 const PREVIEW_REQUEST_CONCURRENCY = 12
+const PROFILE_CONTEXTS = [200_000, 100_000] as const
+const PROFILE_PARALLEL_SEQUENCES = 1
+const MAX_RECOMMENDATIONS = 4
+const MATERIALLY_LIGHTER_RATIO = 0.8
 
 interface RecommendationResult {
   readonly recommendations: readonly LocalModelRecommendation[]
@@ -29,7 +32,6 @@ interface RecommendationResult {
 export interface LocalInferenceApi {
   readonly state: Effect.Effect<LocalInferenceSnapshot, LocalInferenceError>
   readonly watchState: Stream.Stream<MirroredResourceInvalidation, LocalInferenceError>
-  readonly configureUsage: (selection: LocalInferenceUsageSelection) => Effect.Effect<void, LocalInferenceError>
   readonly downloadModel: (configurationId: string) => Effect.Effect<void, LocalInferenceError>
   readonly activateModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
   readonly deleteModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
@@ -47,19 +49,15 @@ const localError = (code: LocalInferenceError["code"], operation: string, cause:
     retryable,
   })
 
-const parallelSequences = (usage: LocalInferenceUsageSelection): number =>
-  usage.sessionConcurrency === "one" ? 1 : 3
-
 const profileFor = (
   entry: LocalModelCatalogEntry,
-  usage: LocalInferenceUsageSelection,
   contextLength: number,
   policy: string,
 ) => ({
-  id: `${entry.id}:p${parallelSequences(usage)}:ctx${contextLength}`,
+  id: `${entry.id}:p${PROFILE_PARALLEL_SEQUENCES}:ctx${contextLength}`,
   policy,
   context_length: contextLength,
-  parallel_sequences: parallelSequences(usage),
+  parallel_sequences: PROFILE_PARALLEL_SEQUENCES,
 })
 
 const sourceFor = (entry: LocalModelCatalogEntry): Generated.ModelPreviewSourceSchema => ({
@@ -124,7 +122,6 @@ const recommendationFrom = (
   entry: LocalModelCatalogEntry,
   preview: Generated.ModelPreviewSchema,
   assessment: Generated.ModelPreviewAssessmentSchema,
-  badge: LocalModelRecommendation["badge"],
 ): LocalModelRecommendation | null => {
   if (assessment.assessment.type !== "fits") return null
   const properties = preview.properties.type === "inspected" ? preview.properties : undefined
@@ -139,7 +136,6 @@ const recommendationFrom = (
   const selectedProfile = preview.assessments.find((candidate) => candidate.profile_id === assessment.profile_id)
   if (!selectedProfile) return null
   const contextTokens = Number(assessment.profile_id.match(/:ctx(\d+)$/)?.[1] ?? trainingContext ?? 1)
-  const parallelSlots = Number(assessment.profile_id.match(/:p(\d+):/)?.[1] ?? 1)
   const fitClass = profile.acceleration.toLowerCase().includes("hybrid")
     ? "hybrid" as const
     : profile.acceleration.toLowerCase().includes("cpu")
@@ -148,7 +144,7 @@ const recommendationFrom = (
   return {
     configurationId: assessment.profile_id,
     catalogModelId: entry.id,
-    badge,
+    badge: "alternative",
     displayName: entry.displayName,
     family: entry.family,
     architecture: architectureName?.toLowerCase().includes("moe") ? "moe" : "dense",
@@ -174,22 +170,87 @@ const recommendationFrom = (
     sourcePageUrl: catalogSourcePageUrl(entry),
     license: entry.license,
     contextTokens,
-    servingProfile: {
-      sessionConcurrency: parallelSlots === 1 ? "one" : "up_to_three",
-      parallelSlots,
-      contextTokensPerSlot: contextTokens,
-      totalContextCapacityTokens: contextTokens * parallelSlots,
-      slotAllocation: "uniform",
-      runtimeProfileId: assessment.profile_id,
-    },
     modelMaximumContextTokens: trainingContext ?? contextTokens,
     estimatedRuntimeBytes: memory.required_bytes,
     stableCapacityBudgetBytes: memory.available_bytes,
     fitMarginBytes: memory.headroom_bytes,
     fitClass,
     constrainedContext: assessment.assessment.recommendation === "constrained",
-    explanation: `${entry.quantization.fidelityLabel}; ${profile.acceleration} placement at ${Math.round(contextTokens / 1_000)}K context across ${parallelSlots} local slot${parallelSlots === 1 ? "" : "s"}.`,
+    explanation: `${entry.quantization.fidelityLabel}; ${profile.acceleration} placement at ${Math.round(contextTokens / 1_000)}K context.`,
   }
+}
+
+export interface RankedRecommendationCandidate {
+  readonly value: LocalModelRecommendation
+  readonly modelId: string
+  readonly modelQualityRank: number
+  readonly fidelityRank: number
+}
+
+const compareConfiguration = (
+  left: RankedRecommendationCandidate,
+  right: RankedRecommendationCandidate,
+): number =>
+  right.fidelityRank - left.fidelityRank
+    || right.value.contextTokens - left.value.contextTokens
+    || right.value.fitMarginBytes - left.value.fitMarginBytes
+
+const compareProductRank = (
+  left: RankedRecommendationCandidate,
+  right: RankedRecommendationCandidate,
+): number =>
+  right.modelQualityRank - left.modelQualityRank
+    || right.fidelityRank - left.fidelityRank
+    || right.value.contextTokens - left.value.contextTokens
+    || right.value.fitMarginBytes - left.value.fitMarginBytes
+
+/**
+ * Builds a small set of meaningfully different choices instead of treating every
+ * context profile and quantization of one checkpoint as a separate recommendation.
+ */
+export const selectRecommendationPortfolio = (
+  candidates: readonly RankedRecommendationCandidate[],
+): readonly LocalModelRecommendation[] => {
+  const bestByModel = new Map<string, RankedRecommendationCandidate>()
+  for (const candidate of candidates) {
+    const current = bestByModel.get(candidate.modelId)
+    if (!current || compareConfiguration(candidate, current) < 0) {
+      bestByModel.set(candidate.modelId, candidate)
+    }
+  }
+
+  const ranked = [...bestByModel.values()].sort(compareProductRank)
+  const primary = ranked.shift()
+  if (!primary) return []
+
+  const selected: Array<{ candidate: RankedRecommendationCandidate; badge: LocalModelRecommendation["badge"] }> = [
+    { candidate: primary, badge: "recommended" },
+  ]
+  const remaining = new Map(ranked.map((candidate) => [candidate.modelId, candidate]))
+  const take = (
+    badge: LocalModelRecommendation["badge"],
+    predicate: (candidate: RankedRecommendationCandidate) => boolean,
+  ): void => {
+    const candidate = [...remaining.values()].find(predicate)
+    if (!candidate || selected.length >= MAX_RECOMMENDATIONS) return
+    remaining.delete(candidate.modelId)
+    selected.push({ candidate, badge })
+  }
+
+  take(
+    "lighter",
+    (candidate) => candidate.value.estimatedRuntimeBytes
+      <= primary.value.estimatedRuntimeBytes * MATERIALLY_LIGHTER_RATIO,
+  )
+  take("higher_fidelity", (candidate) => candidate.fidelityRank > primary.fidelityRank)
+  take("alternative", (candidate) => candidate.value.family !== primary.value.family)
+
+  for (const candidate of remaining.values()) {
+    if (selected.length >= MAX_RECOMMENDATIONS) break
+    selected.push({ candidate, badge: "alternative" })
+  }
+
+  return selected.map(({ candidate, badge }) => ({ ...candidate.value, badge }))
 }
 
 const operationStage = (event: Generated.ModelDownloadEventSchema | Generated.RuntimeModelEvent): LocalInferenceOperationSnapshot["stage"] => {
@@ -224,14 +285,14 @@ export const LocalInferenceLive: Layer.Layer<
     (current) => new Map(current).set(snapshot.operationId, snapshot),
   ).pipe(Effect.zipRight(changes.publish))
 
-  const previews = (usage: LocalInferenceUsageSelection, hardware: Generated.HardwareSnapshotSchema) => Effect.forEach(
+  const previews = (hardware: Generated.HardwareSnapshotSchema) => Effect.forEach(
     LOCAL_MODEL_CATALOG,
     (entry) => {
-      const contexts = [200_000, 100_000, 64_000].filter((context) => entry.supportedContextTokens.includes(context))
+      const contexts = PROFILE_CONTEXTS.filter((context) => entry.supportedContextTokens.includes(context))
       return client.models.previewModel({
         payload: {
           source: sourceFor(entry),
-          profiles: contexts.map((context) => profileFor(entry, usage, context, hardware.assessment_policy)),
+          profiles: contexts.map((context) => profileFor(entry, context, hardware.assessment_policy)),
         },
       }).pipe(
         Effect.map((preview) => ({ entry, preview })),
@@ -242,43 +303,41 @@ export const LocalInferenceLive: Layer.Layer<
   )
 
   const recommendations = (
-    usage: LocalInferenceUsageSelection | undefined,
     onLoading: Effect.Effect<void, LocalInferenceError> = Effect.void,
-  ) => usage
-    ? Effect.gen(function* () {
-        const hardware = yield* client.system.getHardware({})
-        const key = [
-          usage.sessionConcurrency,
-          hardware.native_build,
-          hardware.topology_fingerprint,
-          hardware.capacity_policy,
-          hardware.assessment_policy,
-        ].join(":")
-        const cached = (yield* Ref.get(recommendationCache)).get(key)
-        if (cached) return cached
-        yield* onLoading
-        const previewResults = yield* previews(usage, hardware)
-        const items = previewResults.flatMap((result) => result._tag === "Right" ? [result.right] : [])
-        const candidates = items.flatMap(({ entry, preview }) => preview.assessments.flatMap((assessment) => {
-          const value = recommendationFrom(entry, preview, assessment, "alternative")
-          return value ? [{ value, rank: entry.modelQualityRank * 1_000 + entry.quantization.fidelityRank }] : []
-        })).sort((left, right) => right.rank - left.rank || right.value.contextTokens - left.value.contextTokens)
-        const recommendations = candidates.slice(0, 4).map(({ value }, index) => ({
-          ...value,
-          badge: index === 0 ? "recommended" as const : index === 1 ? "lighter" as const : "alternative" as const,
-        }))
-        const result = {
-          recommendations,
-          failureCount: previewResults.length - items.length,
-        }
-        yield* Ref.update(recommendationCache, (current) => new Map(current).set(key, result))
-        return result
-      })
-    : Effect.succeed({ recommendations: [], failureCount: 0 } satisfies RecommendationResult)
+  ) => Effect.gen(function* () {
+    const hardware = yield* client.system.getHardware({})
+    const key = [
+      hardware.native_build,
+      hardware.topology_fingerprint,
+      hardware.capacity_policy,
+      hardware.assessment_policy,
+    ].join(":")
+    const cached = (yield* Ref.get(recommendationCache)).get(key)
+    if (cached) return cached
+    yield* onLoading
+    const previewResults = yield* previews(hardware)
+    const items = previewResults.flatMap((result) => result._tag === "Right" ? [result.right] : [])
+    const candidates = items.flatMap(({ entry, preview }) => preview.assessments.flatMap((assessment) => {
+      const value = recommendationFrom(entry, preview, assessment)
+      return value ? [{
+        value,
+        modelId: entry.modelId,
+        modelQualityRank: entry.modelQualityRank,
+        fidelityRank: entry.quantization.fidelityRank,
+      }] : []
+    }))
+    const recommendations = selectRecommendationPortfolio(candidates)
+    const result = {
+      recommendations,
+      failureCount: previewResults.length - items.length,
+    }
+    yield* Ref.update(recommendationCache, (current) => new Map(current).set(key, result))
+    return result
+  })
 
   const resolveCatalogSelection = (selectionId: string) => Effect.gen(function* () {
     const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
-    const recommendationList = yield* recommendations(config.usage).pipe(
+    const recommendationList = yield* recommendations().pipe(
       Effect.mapError((cause) => localError("icn_unavailable", "preview local model recommendations", cause)),
     )
     const recommendation = recommendationList.recommendations.find((item) => item.configurationId === selectionId || item.catalogModelId === selectionId)
@@ -303,12 +362,11 @@ export const LocalInferenceLive: Layer.Layer<
     recommendationState: LocalInferenceRecommendationState,
     recommendationFailureCount = 0,
   ) => Effect.gen(function* () {
-    const [hardware, inventory, runtime, config] = yield* Effect.all([
+    const [hardware, inventory, runtime] = yield* Effect.all([
       client.system.getHardware({}),
       client.models.listModels({}),
       client.runtime.getRuntimeState({}),
-      configuration.get,
-    ], { concurrency: 4 })
+    ], { concurrency: 3 })
     const activeId = runtime.status.type === "ready" ? runtime.status.model_id : undefined
     const choices: LocalModelChoice[] = inventory.data
       .filter((model) => isStoredArtifactStatus(model.status))
@@ -346,7 +404,6 @@ export const LocalInferenceLive: Layer.Layer<
         }
       })
     return {
-      usage: config.usage ?? null,
       activeBinding: runtime.status.type === "ready" ? {
         selectionId: runtime.status.model_id,
         providerModelId: ProviderModelIdSchema.make(runtime.status.model_id),
@@ -362,10 +419,7 @@ export const LocalInferenceLive: Layer.Layer<
     }
   }).pipe(Effect.mapError((cause) => localError("icn_unavailable", "read local inference state", cause)))
 
-  const initialConfig = yield* configuration.get.pipe(Effect.orDie)
-  const initialRecommendation: LocalInferenceRecommendationState = initialConfig.usage
-    ? { _tag: "Loading" }
-    : { _tag: "NotRequested" }
+  const initialRecommendation: LocalInferenceRecommendationState = { _tag: "Loading" }
   const resource = yield* makeMirroredResource(yield* stateValue(initialRecommendation).pipe(Effect.orDie))
   const publishState = (
     recommendationState: LocalInferenceRecommendationState,
@@ -375,21 +429,9 @@ export const LocalInferenceLive: Layer.Layer<
     Effect.asVoid,
   )
   const refresh = recommendationRefreshLock.withPermits(1)(Effect.gen(function* () {
-    const config = yield* configuration.get.pipe(
-      Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)),
-    )
-    if (!config.usage) {
-      yield* publishState({ _tag: "NotRequested" })
-      return
-    }
     const result = yield* recommendations(
-      config.usage,
       publishState({ _tag: "Loading" }),
     ).pipe(Effect.either)
-    const latestConfig = yield* configuration.get.pipe(
-      Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)),
-    )
-    if (latestConfig.usage?.sessionConcurrency !== config.usage.sessionConcurrency) return
     yield* (result._tag === "Right"
       ? publishState(
         { _tag: "Ready", recommendations: result.right.recommendations },
@@ -403,17 +445,8 @@ export const LocalInferenceLive: Layer.Layer<
   yield* changes.stream.pipe(Stream.runForEach(() => refresh), Effect.forkScoped)
   yield* refresh.pipe(Effect.forkScoped)
 
-  const configureUsage = (selection: LocalInferenceUsageSelection) => lock.withPermits(1)(
-    Ref.set(recommendationCache, new Map()).pipe(
-      Effect.zipRight(configuration.updateUsage(selection)),
-      Effect.mapError((cause) => localError("configuration_failed", "configure local inference usage", cause)),
-      Effect.zipRight(changes.publish),
-    ),
-  )
-
   const downloadModel = (configurationId: string) => lock.withPermits(1)(Effect.gen(function* () {
-    const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
-    const recommendationList = yield* recommendations(config.usage).pipe(
+    const recommendationList = yield* recommendations().pipe(
       Effect.mapError((cause) => localError("icn_unavailable", "preview local model recommendations", cause)),
     )
     const recommendation = recommendationList.recommendations.find((item) => item.configurationId === configurationId)
@@ -424,7 +457,6 @@ export const LocalInferenceLive: Layer.Layer<
       configurationId,
       catalogModelId: entry.id,
       contextTokens: recommendation.contextTokens,
-      parallelSlots: recommendation.servingProfile.parallelSlots,
     }).pipe(Effect.mapError((cause) => localError("configuration_failed", "save local model selection", cause)))
     const request: Generated.DownloadModelRequestSchema = {
       source: { type: "hugging_face", repository: entry.repo, revision: entry.revision },
@@ -464,13 +496,16 @@ export const LocalInferenceLive: Layer.Layer<
     const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
     const contextLength = config.selectedProfile?.contextTokens
       ?? (model.hardware.type === "fits" ? model.hardware.profile.context_length : 100_000)
-    const sequences = config.selectedProfile?.parallelSlots ?? parallelSequences(config.usage ?? { sessionConcurrency: "one" })
     const hardware = yield* client.system.getHardware({}).pipe(
       Effect.mapError((cause) => localError("icn_unavailable", "read ICN execution policy", cause)),
     )
     yield* client.runtime.loadRuntimeModel({ payload: {
       model_id: model.id,
-      profile: { policy: hardware.assessment_policy, context_length: contextLength, parallel_sequences: sequences },
+      profile: {
+        policy: hardware.assessment_policy,
+        context_length: contextLength,
+        parallel_sequences: PROFILE_PARALLEL_SEQUENCES,
+      },
     } }).pipe(Stream.runForEach((event) => setOperation({
       operationId: event.operation_id,
       providerModelId: ProviderModelIdSchema.make(event.type === "ready" ? model.id : event.model_id),
@@ -510,7 +545,6 @@ export const LocalInferenceLive: Layer.Layer<
   return LocalInference.of({
     state: resource.get,
     watchState: resource.changes,
-    configureUsage,
     downloadModel,
     activateModel,
     deleteModel,
