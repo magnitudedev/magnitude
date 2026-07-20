@@ -2,6 +2,7 @@ import * as Command from "@effect/platform/Command";
 import * as CommandExecutor from "@effect/platform/CommandExecutor";
 import * as FileSystem from "@effect/platform/FileSystem";
 import * as HttpClient from "@effect/platform/HttpClient";
+import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
 import * as Path from "@effect/platform/Path";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -32,7 +33,12 @@ const NonEmpty = Schema.String.pipe(Schema.minLength(1));
 
 export const IcnBinarySource = Schema.Union(
   Schema.TaggedStruct("Explicit", { path: NonEmpty }),
-  Schema.TaggedStruct("Companion", { manifestPath: NonEmpty }),
+  Schema.TaggedStruct("Release", {
+    version: NonEmpty,
+    platformKey: NonEmpty,
+    dataDir: NonEmpty,
+    releaseBaseUrl: NonEmpty,
+  }),
   Schema.TaggedStruct("DevelopmentSearch", {
     candidates: Schema.NonEmptyArray(NonEmpty),
   })
@@ -49,6 +55,9 @@ export class IcnBinaryResolutionConfig extends Schema.Class<IcnBinaryResolutionC
   requiredCapabilities: Schema.Array(NonEmpty),
   allowBuildMismatch: Schema.Boolean,
   probeTimeout: Schema.DurationFromSelf.pipe(
+    Schema.greaterThanDuration(Duration.zero)
+  ),
+  downloadTimeout: Schema.DurationFromSelf.pipe(
     Schema.greaterThanDuration(Duration.zero)
   ),
 }) {}
@@ -119,6 +128,8 @@ export const IcnLifecycleFailureReason = Schema.Literal(
   "target-mismatch",
   "missing-capability",
   "checksum-mismatch",
+  "download-failed",
+  "invalid-archive",
   "spawn-failed",
   "invalid-startup-record",
   "startup-timeout",
@@ -153,6 +164,7 @@ const lifecycleError = (
   });
 
 const ReleaseManifest = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
   binary: NonEmpty,
   sha256: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/)),
   apiVersion: PositiveInt,
@@ -160,16 +172,53 @@ const ReleaseManifest = Schema.Struct({
   target: NonEmpty,
 });
 
+const releaseTag = (version: string) => `@magnitudedev/cli@${version}`;
+
+export const icnReleaseAssetName = (platformKey: string) =>
+  `magnitude-icn-${platformKey}.tar.gz`;
+
+export const icnReleaseDownloadUrl = (
+  releaseBaseUrl: string,
+  version: string,
+  platformKey: string
+) =>
+  `${releaseBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(
+    releaseTag(version)
+  )}/${icnReleaseAssetName(platformKey)}`;
+
+const icnExecutableName = (platformKey: string) =>
+  platformKey.startsWith("windows-") ? "magnitude-icn.exe" : "magnitude-icn";
+
+const decodeReleaseManifest = (sourceText: string) =>
+  Schema.decodeUnknown(Schema.parseJson(ReleaseManifest))(sourceText).pipe(
+    Effect.mapError((cause) =>
+      lifecycleError(
+        "resolve",
+        "invalid-manifest",
+        "invalid ICN release manifest",
+        cause
+      )
+    )
+  );
+
 const resolveCandidate = (
   source: IcnBinarySource,
   fs: FileSystem.FileSystem,
-  path: Path.Path
+  path: Path.Path,
+  executor: CommandExecutor.CommandExecutor,
+  http: HttpClient.HttpClient,
+  downloadTimeout: Duration.Duration
 ) =>
   Effect.gen(function* () {
     if (source._tag === "Explicit")
       return {
         path: source.path,
         manifest: Option.none<typeof ReleaseManifest.Type>(),
+        install: Option.none<{
+          staging: string;
+          destination: string;
+          version: string;
+        }>(),
       };
     if (source._tag === "DevelopmentSearch") {
       for (const candidate of source.candidates) {
@@ -177,6 +226,11 @@ const resolveCandidate = (
           return {
             path: candidate,
             manifest: Option.none<typeof ReleaseManifest.Type>(),
+            install: Option.none<{
+              staging: string;
+              destination: string;
+              version: string;
+            }>(),
           };
       }
       return yield* lifecycleError(
@@ -185,35 +239,190 @@ const resolveCandidate = (
         `none of the configured ICN development candidates exist`
       );
     }
-    const sourceText = yield* fs
-      .readFileString(source.manifestPath)
-      .pipe(
+    const executable = icnExecutableName(source.platformKey);
+    const destination = path.join(
+      source.dataDir,
+      "bin",
+      "icn",
+      `${source.version}-${source.platformKey}`
+    );
+    const cachedBinary = path.join(destination, executable);
+    const cachedManifest = path.join(
+      destination,
+      "magnitude-icn-manifest.json"
+    );
+    const cachedVersion = path.join(destination, "magnitude-icn.version");
+    const cached = yield* Effect.all([
+      fs.exists(cachedBinary).pipe(Effect.orElseSucceed(() => false)),
+      fs.exists(cachedManifest).pipe(Effect.orElseSucceed(() => false)),
+      fs.exists(cachedVersion).pipe(Effect.orElseSucceed(() => false)),
+    ]).pipe(
+      Effect.map(([binary, manifest, version]) => binary && manifest && version)
+    );
+    if (cached) {
+      const version = yield* fs
+        .readFileString(cachedVersion)
+        .pipe(Effect.orElseSucceed(() => ""));
+      const manifest = yield* fs.readFileString(cachedManifest).pipe(
         Effect.mapError((cause) =>
           lifecycleError(
             "resolve",
             "invalid-manifest",
-            "unable to read the ICN release manifest",
+            "unable to read the cached ICN release manifest",
+            cause
+          )
+        ),
+        Effect.flatMap(decodeReleaseManifest)
+      );
+      if (version.trim() === source.version && manifest.binary === executable)
+        return {
+          path: cachedBinary,
+          manifest: Option.some(manifest),
+          install: Option.none<{
+            staging: string;
+            destination: string;
+            version: string;
+          }>(),
+        };
+    }
+
+    const nonce = (yield* Random.nextIntBetween(0, 0x1_0000_0000)).toString(16);
+    const downloads = path.join(source.dataDir, "downloads");
+    const staging = path.join(source.dataDir, "bin", `.icn-${nonce}`);
+    const archive = path.join(
+      downloads,
+      `${icnReleaseAssetName(source.platformKey)}.${nonce}.tmp`
+    );
+    const url = icnReleaseDownloadUrl(
+      source.releaseBaseUrl,
+      source.version,
+      source.platformKey
+    );
+    yield* fs
+      .makeDirectory(downloads, { recursive: true })
+      .pipe(
+        Effect.mapError((cause) =>
+          lifecycleError(
+            "resolve",
+            "download-failed",
+            "unable to create the ICN download directory",
             cause
           )
         )
       );
-    const manifest = yield* Schema.decodeUnknown(
-      Schema.parseJson(ReleaseManifest)
-    )(sourceText).pipe(
+    yield* fs
+      .makeDirectory(staging, { recursive: true })
+      .pipe(
+        Effect.mapError((cause) =>
+          lifecycleError(
+            "resolve",
+            "download-failed",
+            "unable to create the ICN staging directory",
+            cause
+          )
+        )
+      );
+    const response = yield* http.execute(HttpClientRequest.get(url)).pipe(
+      Effect.retry({
+        schedule: Schedule.exponential("1 second").pipe(
+          Schedule.intersect(Schedule.recurs(2))
+        ),
+      }),
+      Effect.timeoutFail({
+        duration: downloadTimeout,
+        onTimeout: () =>
+          lifecycleError(
+            "resolve",
+            "download-failed",
+            "ICN release download timed out"
+          ),
+      }),
       Effect.mapError((cause) =>
         cause instanceof IcnLifecycleError
           ? cause
           : lifecycleError(
               "resolve",
-              "invalid-manifest",
-              "invalid ICN release manifest",
+              "download-failed",
+              `unable to download ${url}`,
               cause
             )
       )
     );
+    if (response.status < 200 || response.status >= 300)
+      return yield* lifecycleError(
+        "resolve",
+        "download-failed",
+        `ICN release download returned HTTP ${response.status}`
+      );
+    const bytes = yield* response.arrayBuffer.pipe(
+      Effect.mapError((cause) =>
+        lifecycleError(
+          "resolve",
+          "download-failed",
+          "unable to read the ICN release archive",
+          cause
+        )
+      )
+    );
+    yield* fs
+      .writeFile(archive, new Uint8Array(bytes))
+      .pipe(
+        Effect.mapError((cause) =>
+          lifecycleError(
+            "resolve",
+            "download-failed",
+            "unable to stage the ICN release archive",
+            cause
+          )
+        )
+      );
+    const tarFlag = source.platformKey.startsWith("windows-") ? "-xf" : "-xzf";
+    const extracted = yield* Command.exitCode(
+      Command.make("tar", tarFlag, archive, "-C", staging)
+    ).pipe(
+      Effect.provideService(CommandExecutor.CommandExecutor, executor),
+      Effect.mapError((cause) =>
+        lifecycleError(
+          "resolve",
+          "invalid-archive",
+          "unable to extract the ICN release archive",
+          cause
+        )
+      ),
+      Effect.ensuring(
+        fs
+          .remove(archive, { force: true })
+          .pipe(Effect.catchAll(() => Effect.void))
+      )
+    );
+    if (extracted !== 0)
+      return yield* lifecycleError(
+        "resolve",
+        "invalid-archive",
+        `ICN release archive extraction failed with ${extracted}`
+      );
+    const manifestPath = path.join(staging, "magnitude-icn-manifest.json");
+    const manifest = yield* fs.readFileString(manifestPath).pipe(
+      Effect.mapError((cause) =>
+        lifecycleError(
+          "resolve",
+          "invalid-manifest",
+          "ICN release archive has no readable manifest",
+          cause
+        )
+      ),
+      Effect.flatMap(decodeReleaseManifest)
+    );
+    if (manifest.binary !== executable)
+      return yield* lifecycleError(
+        "verify",
+        "incompatible-build",
+        "ICN release manifest does not match the requested platform"
+      );
     return {
-      path: path.resolve(path.dirname(source.manifestPath), manifest.binary),
+      path: path.join(staging, manifest.binary),
       manifest: Option.some(manifest),
+      install: Option.some({ staging, destination, version: source.version }),
     };
   });
 
@@ -233,157 +442,281 @@ export const IcnBinaryResolverLive = Layer.effect(
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const executor = yield* CommandExecutor.CommandExecutor;
+    const http = yield* HttpClient.HttpClient;
     return IcnBinaryResolver.of({
       resolve: (config) =>
-        Effect.gen(function* () {
-          const candidate = yield* resolveCandidate(config.source, fs, path);
-          const exists = yield* fs
-            .exists(candidate.path)
-            .pipe(Effect.orElseSucceed(() => false));
-          if (!exists)
-            return yield* lifecycleError(
-              "resolve",
-              "not-found",
-              `ICN binary was not found at ${candidate.path}`
+        Effect.suspend(() => {
+          let stagingToClean: string | undefined;
+          return Effect.gen(function* () {
+            const candidate = yield* resolveCandidate(
+              config.source,
+              fs,
+              path,
+              executor,
+              http,
+              config.downloadTimeout
             );
-          const canonical = yield* fs
-            .realPath(candidate.path)
-            .pipe(
-              Effect.mapError((cause) =>
-                lifecycleError(
-                  "resolve",
-                  "not-found",
-                  `unable to resolve ${candidate.path}`,
-                  cause
-                )
-              )
-            );
-          const info = yield* fs
-            .stat(canonical)
-            .pipe(
-              Effect.mapError((cause) =>
-                lifecycleError(
-                  "resolve",
-                  "not-executable",
-                  "unable to inspect the ICN binary",
-                  cause
-                )
-              )
-            );
-          if (
-            info.type !== "File" ||
-            (!canonical.toLowerCase().endsWith(".exe") &&
-              (info.mode & 0o111) === 0)
-          )
-            return yield* lifecycleError(
-              "resolve",
-              "not-executable",
-              "the resolved ICN binary is not executable"
-            );
-          if (Option.isSome(candidate.manifest)) {
-            const bytes = yield* fs
-              .readFile(canonical)
+            if (Option.isSome(candidate.install))
+              stagingToClean = candidate.install.value.staging;
+            const exists = yield* fs
+              .exists(candidate.path)
+              .pipe(Effect.orElseSucceed(() => false));
+            if (!exists)
+              return yield* lifecycleError(
+                "resolve",
+                "not-found",
+                `ICN binary was not found at ${candidate.path}`
+              );
+            const canonical = yield* fs
+              .realPath(candidate.path)
               .pipe(
                 Effect.mapError((cause) =>
                   lifecycleError(
-                    "verify",
-                    "checksum-mismatch",
-                    "unable to hash the ICN binary",
+                    "resolve",
+                    "not-found",
+                    `unable to resolve ${candidate.path}`,
                     cause
                   )
                 )
               );
-            if (bytesToHex(sha256(bytes)) !== candidate.manifest.value.sha256)
+            const info = yield* fs
+              .stat(canonical)
+              .pipe(
+                Effect.mapError((cause) =>
+                  lifecycleError(
+                    "resolve",
+                    "not-executable",
+                    "unable to inspect the ICN binary",
+                    cause
+                  )
+                )
+              );
+            if (
+              info.type !== "File" ||
+              (!canonical.toLowerCase().endsWith(".exe") &&
+                (info.mode & 0o111) === 0)
+            )
+              return yield* lifecycleError(
+                "resolve",
+                "not-executable",
+                "the resolved ICN binary is not executable"
+              );
+            if (Option.isSome(candidate.manifest)) {
+              const bytes = yield* fs
+                .readFile(canonical)
+                .pipe(
+                  Effect.mapError((cause) =>
+                    lifecycleError(
+                      "verify",
+                      "checksum-mismatch",
+                      "unable to hash the ICN binary",
+                      cause
+                    )
+                  )
+                );
+              if (bytesToHex(sha256(bytes)) !== candidate.manifest.value.sha256)
+                return yield* lifecycleError(
+                  "verify",
+                  "checksum-mismatch",
+                  "ICN binary checksum does not match its release manifest"
+                );
+            }
+            const output = yield* Command.string(
+              Command.make(canonical, "version", "--json")
+            ).pipe(
+              Effect.provideService(CommandExecutor.CommandExecutor, executor),
+              Effect.timeoutFail({
+                duration: config.probeTimeout,
+                onTimeout: () =>
+                  lifecycleError(
+                    "verify",
+                    "probe-timeout",
+                    "ICN identity probe timed out"
+                  ),
+              }),
+              Effect.mapError((cause) =>
+                cause instanceof IcnLifecycleError
+                  ? cause
+                  : lifecycleError(
+                      "verify",
+                      "probe-failed",
+                      "ICN identity probe failed",
+                      cause
+                    )
+              )
+            );
+            const identity = yield* Schema.decodeUnknown(
+              Schema.parseJson(IcnBinaryIdentity)
+            )(output).pipe(
+              Effect.mapError((cause) =>
+                cause instanceof IcnLifecycleError
+                  ? cause
+                  : lifecycleError(
+                      "verify",
+                      "invalid-identity",
+                      "ICN identity did not match the protocol",
+                      cause
+                    )
+              )
+            );
+            if (identity.api_version !== config.supportedApiVersion)
               return yield* lifecycleError(
                 "verify",
-                "checksum-mismatch",
-                "ICN binary checksum does not match its release manifest"
+                "incompatible-api",
+                `ICN API ${identity.api_version} is incompatible with ${config.supportedApiVersion}`
               );
-          }
-          const output = yield* Command.string(
-            Command.make(canonical, "version", "--json")
-          ).pipe(
-            Effect.provideService(CommandExecutor.CommandExecutor, executor),
-            Effect.timeoutFail({
-              duration: config.probeTimeout,
-              onTimeout: () =>
-                lifecycleError(
-                  "verify",
-                  "probe-timeout",
-                  "ICN identity probe timed out"
-                ),
-            }),
-            Effect.mapError((cause) =>
-              cause instanceof IcnLifecycleError
-                ? cause
-                : lifecycleError(
-                    "verify",
-                    "probe-failed",
-                    "ICN identity probe failed",
-                    cause
+            if (
+              Option.isSome(candidate.manifest) &&
+              (identity.api_version !== candidate.manifest.value.apiVersion ||
+                identity.native_build !==
+                  candidate.manifest.value.nativeBuild ||
+                identity.target !== candidate.manifest.value.target)
+            )
+              return yield* lifecycleError(
+                "verify",
+                "incompatible-build",
+                "ICN binary identity does not match its companion manifest"
+              );
+            if (
+              Option.isSome(config.expectedNativeBuild) &&
+              identity.native_build !== config.expectedNativeBuild.value &&
+              !config.allowBuildMismatch
+            )
+              return yield* lifecycleError(
+                "verify",
+                "incompatible-build",
+                "ICN native build does not match the release"
+              );
+            if (
+              Option.isSome(config.expectedTarget) &&
+              identity.target !== config.expectedTarget.value
+            )
+              return yield* lifecycleError(
+                "verify",
+                "target-mismatch",
+                `ICN target ${identity.target} does not match ${config.expectedTarget.value}`
+              );
+            const missing = config.requiredCapabilities.find(
+              (capability) => !identity.capabilities.includes(capability)
+            );
+            if (missing !== undefined)
+              return yield* lifecycleError(
+                "verify",
+                "missing-capability",
+                `ICN binary does not provide required capability ${missing}`
+              );
+            let published = canonical;
+            if (Option.isSome(candidate.install)) {
+              const { staging, destination, version } = candidate.install.value;
+              yield* fs
+                .writeFileString(
+                  path.join(staging, "magnitude-icn.version"),
+                  version
+                )
+                .pipe(
+                  Effect.mapError((cause) =>
+                    lifecycleError(
+                      "resolve",
+                      "download-failed",
+                      "unable to write the ICN release cache marker",
+                      cause
+                    )
                   )
+                );
+              const destinationExists = yield* fs
+                .exists(destination)
+                .pipe(Effect.orElseSucceed(() => false));
+              if (destinationExists) {
+                yield* fs
+                  .remove(staging, { recursive: true, force: true })
+                  .pipe(
+                    Effect.mapError((cause) =>
+                      lifecycleError(
+                        "resolve",
+                        "download-failed",
+                        "unable to discard a redundant ICN staging directory",
+                        cause
+                      )
+                    )
+                  );
+              } else {
+                yield* fs
+                  .makeDirectory(path.dirname(destination), {
+                    recursive: true,
+                  })
+                  .pipe(
+                    Effect.mapError((cause) =>
+                      lifecycleError(
+                        "resolve",
+                        "download-failed",
+                        "unable to create the ICN cache directory",
+                        cause
+                      )
+                    )
+                  );
+                yield* fs.rename(staging, destination).pipe(
+                  Effect.catchAll((cause) =>
+                    fs.exists(destination).pipe(
+                      Effect.orElseSucceed(() => false),
+                      Effect.flatMap((wonByPeer) =>
+                        wonByPeer
+                          ? fs
+                              .remove(staging, {
+                                recursive: true,
+                                force: true,
+                              })
+                              .pipe(
+                                Effect.mapError((removeCause) =>
+                                  lifecycleError(
+                                    "resolve",
+                                    "download-failed",
+                                    "unable to discard a redundant ICN staging directory",
+                                    removeCause
+                                  )
+                                )
+                              )
+                          : Effect.fail(
+                              lifecycleError(
+                                "resolve",
+                                "download-failed",
+                                "unable to publish the verified ICN binary",
+                                cause
+                              )
+                            )
+                      )
+                    )
+                  )
+                );
+              }
+              stagingToClean = undefined;
+              published = yield* fs
+                .realPath(
+                  path.join(
+                    destination,
+                    candidate.manifest.pipe(Option.getOrThrow).binary
+                  )
+                )
+                .pipe(
+                  Effect.mapError((cause) =>
+                    lifecycleError(
+                      "resolve",
+                      "not-found",
+                      "unable to resolve the published ICN binary",
+                      cause
+                    )
+                  )
+                );
+            }
+            return { path: published, identity };
+          }).pipe(
+            Effect.onError(() =>
+              stagingToClean === undefined
+                ? Effect.void
+                : fs
+                    .remove(stagingToClean, { recursive: true, force: true })
+                    .pipe(Effect.catchAll(() => Effect.void))
             )
           );
-          const identity = yield* Schema.decodeUnknown(
-            Schema.parseJson(IcnBinaryIdentity)
-          )(output).pipe(
-            Effect.mapError((cause) =>
-              cause instanceof IcnLifecycleError
-                ? cause
-                : lifecycleError(
-                    "verify",
-                    "invalid-identity",
-                    "ICN identity did not match the protocol",
-                    cause
-                  )
-            )
-          );
-          if (identity.api_version !== config.supportedApiVersion)
-            return yield* lifecycleError(
-              "verify",
-              "incompatible-api",
-              `ICN API ${identity.api_version} is incompatible with ${config.supportedApiVersion}`
-            );
-          if (
-            Option.isSome(candidate.manifest) &&
-            (identity.api_version !== candidate.manifest.value.apiVersion ||
-              identity.native_build !== candidate.manifest.value.nativeBuild ||
-              identity.target !== candidate.manifest.value.target)
-          )
-            return yield* lifecycleError(
-              "verify",
-              "incompatible-build",
-              "ICN binary identity does not match its companion manifest"
-            );
-          if (
-            Option.isSome(config.expectedNativeBuild) &&
-            identity.native_build !== config.expectedNativeBuild.value &&
-            !config.allowBuildMismatch
-          )
-            return yield* lifecycleError(
-              "verify",
-              "incompatible-build",
-              "ICN native build does not match the release"
-            );
-          if (
-            Option.isSome(config.expectedTarget) &&
-            identity.target !== config.expectedTarget.value
-          )
-            return yield* lifecycleError(
-              "verify",
-              "target-mismatch",
-              `ICN target ${identity.target} does not match ${config.expectedTarget.value}`
-            );
-          const missing = config.requiredCapabilities.find(
-            (capability) => !identity.capabilities.includes(capability)
-          );
-          if (missing !== undefined)
-            return yield* lifecycleError(
-              "verify",
-              "missing-capability",
-              `ICN binary does not provide required capability ${missing}`
-            );
-          return { path: canonical, identity };
         }),
     });
   })

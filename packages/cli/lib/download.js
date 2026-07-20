@@ -1,27 +1,27 @@
-'use strict';
+"use strict";
 
-const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { execFileSync } = require('child_process');
+const http = require("http");
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { execFileSync } = require("child_process");
 
-const BINARY_DIR = path.join(os.homedir(), '.magnitude', 'bin');
-const REPO = 'magnitudedev/magnitude';
+const BINARY_DIR = path.join(os.homedir(), ".magnitude", "bin");
+const REPO = "magnitudedev/magnitude";
 
 const ASSETS = {
   cli: {
-    displayName: 'Magnitude',
-    executableBase: 'magnitude',
-    versionFile: 'magnitude.version',
-    assetPrefix: 'magnitude',
+    displayName: "Magnitude",
+    executableBase: "magnitude-cli",
+    versionFile: "magnitude-cli.version",
+    assetPrefix: "magnitude",
   },
   acn: {
-    displayName: 'Magnitude ACN',
-    executableBase: 'magnitude-acn',
-    versionFile: 'magnitude-acn.version',
-    assetPrefix: 'magnitude-acn',
+    displayName: "Magnitude ACN",
+    executableBase: "magnitude-acn",
+    versionFile: "magnitude-acn.version",
+    assetPrefix: "magnitude-acn",
   },
 };
 
@@ -30,22 +30,26 @@ function getPlatformKey() {
   const arch = process.arch;
 
   const map = {
-    'darwin-arm64': 'darwin-arm64',
-    'darwin-x64': 'darwin-x64',
-    'linux-x64': 'linux-x64',
-    'linux-arm64': 'linux-arm64',
-    'win32-x64': 'windows-x64',
+    "darwin-arm64": "darwin-arm64",
+    "darwin-x64": "darwin-x64",
+    "linux-x64": "linux-x64",
+    "linux-arm64": "linux-arm64",
+    "win32-x64": "windows-x64",
   };
 
   const key = `${platform}-${arch}`;
   if (!map[key]) {
-    throw new Error(`Unsupported platform: ${key}. Magnitude supports: ${Object.keys(map).join(', ')}`);
+    throw new Error(
+      `Unsupported platform: ${key}. Magnitude supports: ${Object.keys(
+        map
+      ).join(", ")}`
+    );
   }
   return map[key];
 }
 
 function executableName(kind) {
-  const ext = process.platform === 'win32' ? '.exe' : '';
+  const ext = process.platform === "win32" ? ".exe" : "";
   return `${ASSETS[kind].executableBase}${ext}`;
 }
 
@@ -59,7 +63,7 @@ function versionPath(kind) {
 
 function versionMatches(kind, version) {
   try {
-    const cached = fs.readFileSync(versionPath(kind), 'utf8').trim();
+    const cached = fs.readFileSync(versionPath(kind), "utf8").trim();
     return cached === version;
   } catch {
     return false;
@@ -71,7 +75,10 @@ function releaseTag(version) {
 }
 
 function releaseBaseUrl() {
-  return (process.env.MAGNITUDE_RELEASE_BASE_URL || `https://github.com/${REPO}/releases/download`).replace(/\/+$/, '');
+  return (
+    process.env.MAGNITUDE_RELEASE_BASE_URL ||
+    `https://github.com/${REPO}/releases/download`
+  ).replace(/\/+$/, "");
 }
 
 function assetName(kind, platformKey = getPlatformKey()) {
@@ -79,7 +86,9 @@ function assetName(kind, platformKey = getPlatformKey()) {
 }
 
 function assetUrl(kind, version, platformKey = getPlatformKey()) {
-  return `${releaseBaseUrl()}/${encodeURIComponent(releaseTag(version))}/${assetName(kind, platformKey)}`;
+  return `${releaseBaseUrl()}/${encodeURIComponent(
+    releaseTag(version)
+  )}/${assetName(kind, platformKey)}`;
 }
 
 function download(url, redirects = 0) {
@@ -90,12 +99,19 @@ function download(url, redirects = 0) {
     }
 
     const parsed = new URL(url);
-    const transport = parsed.protocol === 'http:' ? http : https;
+    const transport = parsed.protocol === "http:" ? http : https;
     const req = transport.get(parsed, (res) => {
-      if (res.statusCode === 302 || res.statusCode === 301 || res.statusCode === 307 || res.statusCode === 308) {
+      if (
+        res.statusCode === 302 ||
+        res.statusCode === 301 ||
+        res.statusCode === 307 ||
+        res.statusCode === 308
+      ) {
         const location = res.headers.location;
         if (!location) {
-          reject(new Error(`Download redirect missing Location header: ${url}`));
+          reject(
+            new Error(`Download redirect missing Location header: ${url}`)
+          );
           return;
         }
         const nextUrl = new URL(location, url).toString();
@@ -107,19 +123,24 @@ function download(url, redirects = 0) {
         return;
       }
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-      res.on('error', reject);
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
     });
-    req.on('error', reject);
+    req.on("error", reject);
   });
 }
 
 function smokeVersion(kind, binPath, version) {
-  const args = kind === 'cli' ? ['--version'] : ['version'];
-  const output = execFileSync(binPath, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const args = kind === "cli" ? ["--version"] : ["version"];
+  const output = execFileSync(binPath, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
   if (output !== version) {
-    throw new Error(`${ASSETS[kind].displayName} version mismatch: expected ${version}, got ${output}`);
+    throw new Error(
+      `${ASSETS[kind].displayName} version mismatch: expected ${version}, got ${output}`
+    );
   }
 }
 
@@ -130,30 +151,36 @@ async function downloadAndInstall(kind, version) {
 
   fs.mkdirSync(BINARY_DIR, { recursive: true });
 
-  console.log(`Downloading ${ASSETS[kind].displayName} v${version} for ${platformKey}...`);
+  console.log(
+    `Downloading ${ASSETS[kind].displayName} v${version} for ${platformKey}...`
+  );
 
   const data = await download(url);
   const tmpFile = path.join(BINARY_DIR, `${fileName}.tmp`);
   fs.writeFileSync(tmpFile, data);
 
   try {
-    const tarFlag = process.platform === 'win32' ? '-xf' : '-xzf';
-    execFileSync('tar', [tarFlag, tmpFile, '-C', BINARY_DIR], { stdio: 'ignore' });
+    const tarFlag = process.platform === "win32" ? "-xf" : "-xzf";
+    execFileSync("tar", [tarFlag, tmpFile, "-C", BINARY_DIR], {
+      stdio: "ignore",
+    });
 
     const binPath = executablePath(kind);
     if (!fs.existsSync(binPath)) {
       throw new Error(`Binary not found after extraction at ${binPath}`);
     }
 
-    if (process.platform !== 'win32') {
+    if (process.platform !== "win32") {
       fs.chmodSync(binPath, 0o755);
     }
 
     smokeVersion(kind, binPath, version);
-    fs.writeFileSync(versionPath(kind), version, 'utf8');
+    fs.writeFileSync(versionPath(kind), version, "utf8");
     return binPath;
   } finally {
-    try { fs.unlinkSync(tmpFile); } catch {}
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {}
   }
 }
 
@@ -168,13 +195,13 @@ async function ensureAsset(kind, version) {
 }
 
 async function ensureBinaries(version, options = {}) {
-  const binaryPath = await ensureAsset('cli', version);
+  const binaryPath = await ensureAsset("cli", version);
 
   let acnPath = null;
   let acnError = null;
   if (options.prefetchAcn !== false) {
     try {
-      acnPath = await ensureAsset('acn', version);
+      acnPath = await ensureAsset("acn", version);
     } catch (error) {
       acnError = error;
       if (options.requireAcn) throw error;

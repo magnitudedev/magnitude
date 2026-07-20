@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "build": "cargo build -p icn-server",
+    "build:binary": "bun run scripts/build-binary.ts",
     "build:release": "cargo build --release -p icn-server",
     "build:reference": "bun run scripts/build-reference.ts",
     "build:candidate": "bun run scripts/build-candidate.ts",
