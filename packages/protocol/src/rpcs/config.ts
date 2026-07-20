@@ -8,12 +8,11 @@ import {
   SlotId,
   SlotProfiles,
   SlotModelConfigSchema,
-  ModelCatalogSchema,
-  ModelSlotsSchema,
+  ModelCatalogStateSchema,
+  ModelSlotsStateSchema,
   ProviderAuthSchema,
 } from "../schemas/account"
-import { MirroredResourceInvalidationSchema } from "../schemas/mirrored-resource"
-import { StreamHeartbeat } from "../schemas/events"
+import { defineMirroredState } from "./mirrored-state"
 
 export const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
   payload: Schema.Struct({
@@ -60,17 +59,9 @@ export const ListPublicSlotProfiles = Rpc.make("ListPublicSlotProfiles", {
   error: SessionError
 })
 
-export const GetModelCatalog = Rpc.make("GetModelCatalog", {
-  payload: Schema.Struct({}),
-  success: ModelCatalogSchema,
-  error: SessionError,
-})
-
-export const WatchModelCatalog = Rpc.make("WatchModelCatalog", {
-  payload: Schema.Struct({}),
-  success: Schema.Union(MirroredResourceInvalidationSchema, StreamHeartbeat),
-  error: SessionError,
-  stream: true,
+export const ModelCatalogMirror = defineMirroredState("GetModelCatalog", {
+  stateSchema: ModelCatalogStateSchema,
+  errorSchema: SessionError,
 })
 
 export const RefreshModelCatalog = Rpc.make("RefreshModelCatalog", {
@@ -81,17 +72,9 @@ export const RefreshModelCatalog = Rpc.make("RefreshModelCatalog", {
   error: SessionError,
 })
 
-export const GetModelSlots = Rpc.make("GetModelSlots", {
-  payload: Schema.Struct({}),
-  success: ModelSlotsSchema,
-  error: SessionError,
-})
-
-export const WatchModelSlots = Rpc.make("WatchModelSlots", {
-  payload: Schema.Struct({}),
-  success: Schema.Union(MirroredResourceInvalidationSchema, StreamHeartbeat),
-  error: SessionError,
-  stream: true,
+export const ModelSlotsMirror = defineMirroredState("GetModelSlots", {
+  stateSchema: ModelSlotsStateSchema,
+  errorSchema: SessionError,
 })
 
 export const UpdateModelSlots = Rpc.make("UpdateModelSlots", {

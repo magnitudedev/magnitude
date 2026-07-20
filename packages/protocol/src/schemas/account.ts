@@ -8,7 +8,7 @@ import {
   VisionProperty,
 } from "@magnitudedev/ai/provider/model"
 import { FSM } from "@magnitudedev/utils"
-import { MirroredSnapshotSchema } from "./mirrored-resource"
+import { MirroredSnapshotSchema } from "./mirrored-state"
 
 const { defineFSM } = FSM
 

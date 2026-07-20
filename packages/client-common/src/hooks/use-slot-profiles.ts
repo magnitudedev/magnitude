@@ -1,16 +1,18 @@
 /**
  * Slot profiles hook — shared between web, desktop, and CLI.
  *
- * Reads the authoritative reactive model-slot resource.
+ * Reads the authoritative mirrored model-slot state.
  */
 import { useCallback, useMemo } from "react"
 import { Result, useAtomSet } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { useDisplayState } from "../state/display-state-store"
-import { isRoleId, ModelSlotsLifecycle, ROLE_TO_SLOT, type SlotId } from "@magnitudedev/sdk"
+import { isRoleId, ModelCatalogMirror, ModelSlotsLifecycle, ModelSlotsMirror, ROLE_TO_SLOT, type SlotId } from "@magnitudedev/sdk"
 import type { SlotProfile, SlotProfiles, SlotStates } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { useModelSlots } from "./use-reactive-rpc"
+import { useMirroredState } from "./use-mirrored-state"
+
+const useModelSlots = () => useMirroredState(ModelSlotsMirror)
 
 /**
  * Find the slot profile for a given slot ID.
@@ -70,7 +72,7 @@ export function useSlotProfiles(): UseSlotProfilesResult {
   const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
   const refresh = useAtomSet(refreshAtom)
   const retry = useCallback(() => {
-    refresh({ payload: { providerId: Option.none() }, reactivityKeys: ["modelCatalog", "modelSlots"] })
+    refresh({ payload: { providerId: Option.none() }, reactivityKeys: [ModelCatalogMirror.id, ModelSlotsMirror.id] })
   }, [refresh])
 
   const profiles = Option.flatMap(Result.value(result), ({ state }) => ModelSlotsLifecycle.match(state, {

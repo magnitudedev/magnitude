@@ -1,11 +1,17 @@
 import { useCallback, useMemo } from "react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
+import { createId } from "@magnitudedev/generate-id"
+import {
+  LocalInferenceMirror,
+  ModelCatalogMirror,
+  ModelSlotsMirror,
+} from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { useLocalInferenceResource } from "./use-reactive-rpc"
+import { useMirroredState } from "./use-mirrored-state"
 
 export function useLocalInferenceQuery() {
-  const snapshot = useLocalInferenceResource()
+  const snapshot = useMirroredState(LocalInferenceMirror)
   return Result.map(snapshot, ({ state }) => state)
 }
 
@@ -26,7 +32,13 @@ export function useLocalInferenceState() {
     useAtomValue(restartAtom),
     useAtomValue(disableAtom),
   ] as const
-  const mutationBusy = mutationResults.some(Result.isWaiting)
+  const pending = {
+    download: Result.isWaiting(mutationResults[0]),
+    activate: Result.isWaiting(mutationResults[1]),
+    delete: Result.isWaiting(mutationResults[2]),
+    restart: Result.isWaiting(mutationResults[3]),
+    disable: Result.isWaiting(mutationResults[4]),
+  } as const
   const mutationFailure = mutationResults.reduce(
     (failure, result) => Option.isSome(failure) || !Result.isFailure(result)
       ? failure
@@ -41,25 +53,31 @@ export function useLocalInferenceState() {
   const disableMutation = useAtomSet(disableAtom)
 
   const downloadModel = useCallback((configurationId: string): void => {
-    downloadMutation({ payload: { configurationId }, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })
+    downloadMutation({ payload: { configurationId, requestId: createId() }, reactivityKeys: [LocalInferenceMirror.id] })
   }, [downloadMutation])
   const activateModel = useCallback((selectionId: string): void => {
-    activateMutation({ payload: { selectionId }, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })
+    activateMutation({ payload: { selectionId, requestId: createId() }, reactivityKeys: [LocalInferenceMirror.id] })
   }, [activateMutation])
   const deleteModel = useCallback((selectionId: string): void => {
-    deleteMutation({ payload: { selectionId }, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })
+    deleteMutation({
+      payload: { selectionId },
+      reactivityKeys: [LocalInferenceMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
+    })
   }, [deleteMutation])
   const restart = useCallback((): void => {
-    restartMutation({ payload: {}, reactivityKeys: ["localInference", "modelCatalog"] })
+    restartMutation({ payload: { requestId: createId() }, reactivityKeys: [LocalInferenceMirror.id] })
   }, [restartMutation])
   const disable = useCallback((): void => {
-    disableMutation({ payload: {}, reactivityKeys: ["localInference", "modelCatalog", "modelSlots"] })
+    disableMutation({
+      payload: {},
+      reactivityKeys: [LocalInferenceMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
+    })
   }, [disableMutation])
 
   return {
     state,
     mutationResults,
-    mutationBusy,
+    pending,
     mutationFailure,
     downloadModel,
     activateModel,

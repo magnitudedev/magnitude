@@ -33,7 +33,6 @@ import {
   type ModelSummary,
   type ModelCatalog,
   type ModelSlots,
-  type MirroredResourceInvalidation,
   type ModelConfigResponse,
   type SlotModelConfig,
   type ProviderInfo,
@@ -54,12 +53,14 @@ import {
   SlotPending,
   SlotReady,
   SlotBlocked,
+  ModelCatalogMirror,
+  ModelSlotsMirror,
 } from "@magnitudedev/protocol"
 import { SessionStore } from "./session-store"
 import { LocalModelProviderSource } from "./local-inference/provider-source"
 import { LocalModelConfiguration } from "./local-inference/model-configuration"
 import { foldProviderCatalogOutcomes, type FoldedProviderCatalogs } from "./model-catalog-snapshot"
-import { makeMirroredResource } from "./mirrored-resource"
+import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 
 import {
   SLOT_IDS,
@@ -71,10 +72,8 @@ export interface AccountApi {
   readonly listProviderAuth: Effect.Effect<Readonly<Record<string, ProviderAuth>>, SessionError>
   readonly listPublicSlotProfiles: Effect.Effect<SlotProfiles | null, SessionError>
   readonly modelCatalog: Effect.Effect<ModelCatalog>
-  readonly watchModelCatalog: Stream.Stream<MirroredResourceInvalidation>
   readonly refreshModelCatalog: (providerId: Option.Option<ProviderId>) => Effect.Effect<void>
   readonly modelSlots: Effect.Effect<ModelSlots>
-  readonly watchModelSlots: Stream.Stream<MirroredResourceInvalidation>
   /** Replaying, coherent model configuration consumed by agent ambients. */
   readonly agentModelConfigurations: Stream.Stream<ConfigState>
   readonly updateModelSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, SessionError>
@@ -301,7 +300,7 @@ function compatibilityProfiles(states: SlotStates): SlotProfiles {
 // Layer
 // =============================================================================
 
-export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | ProviderClientRegistry | LocalModelProviderSource | LocalModelConfiguration> =
+export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | ProviderClientRegistry | LocalModelProviderSource | LocalModelConfiguration | MirroredStateChanges> =
   Layer.scoped(
     Account,
     Effect.gen(function* () {
@@ -314,8 +313,10 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       const scope = yield* Scope.Scope
       const snapshotLock = yield* Effect.makeSemaphore(1)
       const slotMutationLock = yield* Effect.makeSemaphore(1)
-      const catalogResource = yield* makeMirroredResource<ModelCatalogState>(new ModelCatalogLoading({}))
-      const slotResource = yield* makeMirroredResource<ModelSlotsState>(new ModelSlotsLoading({}))
+      const initialCatalog: ModelCatalogState = new ModelCatalogLoading({})
+      const initialSlots: ModelSlotsState = new ModelSlotsLoading({})
+      const catalogMirror = yield* makeMirroredState(ModelCatalogMirror, initialCatalog)
+      const slotMirror = yield* makeMirroredState(ModelSlotsMirror, initialSlots)
       const agentConfiguration = yield* SubscriptionRef.make<ConfigState>({
         revision: 0,
         bySlot: {
@@ -341,14 +342,14 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       }
 
       const markCatalogRefreshing = Effect.gen(function* () {
-        yield* catalogResource.update((state) => ModelCatalogLifecycle.match(state, {
+        yield* catalogMirror.update((state) => ModelCatalogLifecycle.match(state, {
           loading: (current) => current,
           ready: (current) => ModelCatalogLifecycle.transition(current, "refreshing", { failures: [] }),
           refreshing: (current) => current,
           degraded: (current) => ModelCatalogLifecycle.transition(current, "refreshing", {}),
           unavailable: (current) => ModelCatalogLifecycle.transition(current, "refreshing", { models: [] }),
         }))
-        yield* slotResource.update((state) => ModelSlotsLifecycle.match(state, {
+        yield* slotMirror.update((state) => ModelSlotsLifecycle.match(state, {
           loading: (current) => current,
           ready: (current) => ModelSlotsLifecycle.transition(current, "refreshing", { failures: [] }),
           refreshing: (current) => current,
@@ -358,7 +359,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       })
 
       const publishCatalog = (list: BuiltCatalogState, failures: readonly ProviderCatalogFailure[]) =>
-        catalogResource.update((state) => {
+        catalogMirror.update((state) => {
           if (failures.length === 0) {
             if (ModelCatalogLifecycle.is(state, "loading") || ModelCatalogLifecycle.is(state, "refreshing")) {
               return ModelCatalogLifecycle.transition(state, "ready", list)
@@ -379,7 +380,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         })
 
       const publishSlots = (list: BuiltSlotState, failures: readonly ModelSlotsFailure[]) =>
-        slotResource.update((state) => {
+        slotMirror.update((state) => {
           if (failures.length === 0) {
             if (ModelSlotsLifecycle.is(state, "loading") || ModelSlotsLifecycle.is(state, "refreshing")) {
               return ModelSlotsLifecycle.transition(state, "ready", { slots: list.slots, config: list.modelConfig })
@@ -419,7 +420,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         const failure = new ModelSlotConfigurationUnavailable({
           message: cause instanceof Error ? cause.message : String(cause),
         })
-        return slotResource.update((state) => {
+        return slotMirror.update((state) => {
           if (ModelSlotsLifecycle.is(state, "loading")) {
             return ModelSlotsLifecycle.transition(state, "unavailable", {
               config: { slots: {}, localSlotIntent: {} },
@@ -569,7 +570,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       ))))
 
       const rebuildSlotSnapshot = snapshotLock.withPermits(1)(Effect.gen(function* () {
-        yield* slotResource.update((state) => ModelSlotsLifecycle.match(state, {
+        yield* slotMirror.update((state) => ModelSlotsLifecycle.match(state, {
           loading: (current) => current,
           ready: (current) => ModelSlotsLifecycle.transition(current, "refreshing", { failures: [] }),
           refreshing: (current) => current,
@@ -580,7 +581,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         const list = yield* buildSlotState(models, storage, "build model slots").pipe(
           Effect.tapError(markSlotConfigurationFailed),
         )
-        const catalog = (yield* catalogResource.get).state
+        const catalog = (yield* catalogMirror.get).state
         const failures = ModelCatalogLifecycle.match(catalog, {
           loading: () => [] as readonly ProviderCatalogFailure[],
           ready: () => [] as readonly ProviderCatalogFailure[],
@@ -646,11 +647,9 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
             Effect.mapError(toAccountError("list public slot profiles")),
           ),
 
-        modelCatalog: catalogResource.get,
-        watchModelCatalog: catalogResource.changes,
+        modelCatalog: catalogMirror.get,
         refreshModelCatalog: (providerId) => refreshInBackground(true, providerId),
-        modelSlots: slotResource.get,
-        watchModelSlots: slotResource.changes,
+        modelSlots: slotMirror.get,
         agentModelConfigurations: agentConfiguration.changes.pipe(
           Stream.filter((state) => state.catalogLoaded),
         ),
@@ -679,7 +678,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           })) as typeof slots
           yield* modelConfiguration.updateSlots(normalized)
           yield* rebuildSlotSnapshot
-          const currentSlots = (yield* slotResource.get).state
+          const currentSlots = (yield* slotMirror.get).state
           yield* Effect.forkIn(ModelSlotsLifecycle.match(currentSlots, {
             loading: () => Effect.void,
             ready: (state) => discoverSelectedProperties(models, state.slots, true),

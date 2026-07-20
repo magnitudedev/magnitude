@@ -433,6 +433,14 @@ Downloaded ICN models and remote recommendations therefore display the same asse
 Every local model presented by the product is an ICN inventory model or ICN preview result; there is
 no external-server product route.
 
+Local inference is exposed as one coherent mirrored product projection. Downloads, activations, and
+runtime restarts acknowledge with an operation ID after acceptance and continue under ACN ownership.
+Their stage, byte progress where applicable, and terminal outcome are stored in the projection's
+operation collection. Clients observe that collection through the ordinary get/watch mirror and do
+not keep a page-local progress stream. Progress updates modify the existing projection directly;
+they must not recompute hardware, inventory, or recommendations. Terminal transitions reconcile the
+affected ICN inventory or runtime facts and publish the resulting state atomically.
+
 ## Cache validity
 
 Hardware fitting persists only through the

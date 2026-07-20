@@ -96,27 +96,41 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
   const selectedIndex = selectedInferenceIndex(selections, selectedId)
   const selected = selections[selectedIndex]
-  const busy = local.mutationBusy
   const error = local.mutationFailure
+  const activeOperations = state.operations.filter((operation) => operation.status === "running")
+  const visibleOperations = [
+    ...activeOperations,
+    ...state.operations.filter((operation) => operation.status === "failed").slice(-3),
+  ]
+  const selectedOperation = selected && activeOperations.find((operation) =>
+    operation.target._tag === "configuration"
+      ? operation.target.configurationId === selected.id
+      : operation.target._tag === "model" && operation.target.selectionId === selected.id,
+  )
+  const restartRunning = activeOperations.some((operation) => operation.kind === "restart")
 
   const activationCompletionAtom = useMemo(
     () => Atom.make(Effect.sync(() => {
       if (
         pendingActivationId
         && state.activeBinding?.selectionId === pendingActivationId
-        && !busy
       ) {
         setPendingActivationId(null)
         onConfigured()
       }
     })),
-    [busy, onConfigured, pendingActivationId, state.activeBinding?.selectionId],
+    [onConfigured, pendingActivationId, state.activeBinding?.selectionId],
   )
   useAtomMount(activationCompletionAtom)
 
   const confirmSelection = useCallback((selection: LocalInferenceSelection | undefined) => {
-    if (busy) return
     if (!selection) return
+    const hasActiveOperation = activeOperations.some((operation) =>
+      operation.target._tag === "configuration"
+        ? operation.target.configurationId === selection.id
+        : operation.target._tag === "model" && operation.target.selectionId === selection.id,
+    )
+    if (hasActiveOperation) return
     if (selection.kind === "running") {
       if (state.activeBinding?.providerModelId === selection.choice.providerModelId) {
         onConfigured()
@@ -138,7 +152,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     } else {
       local.downloadModel(selection.id)
     }
-  }, [busy, local, onConfigured, state.activeBinding, state.choices])
+  }, [activeOperations, local, onConfigured, state.activeBinding, state.choices])
 
   const confirmModel = useCallback(() => {
     confirmSelection(selected)
@@ -148,28 +162,28 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     if (key.ctrl && key.name === "c") return
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
-      if (!busy) setSelectedId(selections[Math.max(0, selectedIndex - 1)]?.id ?? null)
+      setSelectedId(selections[Math.max(0, selectedIndex - 1)]?.id ?? null)
       return
     }
     if (key.name === "down" || key.name === "j" || key.name === "tab") {
       key.preventDefault()
-      if (!busy) setSelectedId(selections[Math.min(Math.max(0, selections.length - 1), selectedIndex + 1)]?.id ?? null)
+      setSelectedId(selections[Math.min(Math.max(0, selections.length - 1), selectedIndex + 1)]?.id ?? null)
       return
     }
     if (key.name === "d") { key.preventDefault(); setDetails((value) => !value); return }
-    if (key.name === "r" && state.activeBinding && !busy) {
+    if (key.name === "r" && state.activeBinding && !restartRunning) {
       key.preventDefault(); local.restart(); return
     }
-    if (key.name === "u" && state.activeBinding && !busy) {
+    if (key.name === "u" && state.activeBinding && !local.pending.disable) {
       key.preventDefault(); local.disable(); return
     }
-    if (key.name === "delete" && selected?.kind === "stored" && !busy) {
+    if (key.name === "delete" && selected?.kind === "stored" && !selectedOperation && !local.pending.delete) {
       key.preventDefault(); local.deleteModel(selected.id); return
     }
-    if (key.name === "c" && state.activeBinding && !busy) { key.preventDefault(); onConfigured(); return }
+    if (key.name === "c" && state.activeBinding) { key.preventDefault(); onConfigured(); return }
     if (key.name === "return" || key.name === "enter") { key.preventDefault(); confirmModel(); return }
-    if (key.name === "escape") { key.preventDefault(); if (!busy) onSkip() }
-  }, [busy, confirmModel, local, onConfigured, onSkip, selected, selectedIndex, selections, state.activeBinding]))
+    if (key.name === "escape") { key.preventDefault(); onSkip() }
+  }, [confirmModel, local, onConfigured, onSkip, restartRunning, selected, selectedIndex, selectedOperation, selections, state.activeBinding]))
 
   const host = state.host._tag === "Available" ? state.host.profile : null
   const hardware = host ? describeLocalHardware(host) : null
@@ -228,6 +242,14 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           ? <text style={{ fg: theme.warning }}>No curated model currently fits this configuration.</text>
           : selections.map((selection, index) => {
             const capacityWarning = selectionCapacityWarning(selection)
+            const operation = activeOperations.find((candidate) =>
+              candidate.target._tag === "configuration"
+                ? candidate.target.configurationId === selection.id
+                : candidate.target._tag === "model" && candidate.target.selectionId === selection.id,
+            )
+            const operationProgress = operation?.progress && operation.progress.totalBytes > 0
+              ? ` · ${Math.round(operation.progress.completedBytes / operation.progress.totalBytes * 100)}%`
+              : ""
             const sectionLabel = index === firstRunningIndex ? "RUNNING NOW"
               : index === firstStoredIndex ? "DOWNLOADED"
               : index === firstRecommendationIndex ? (hasExistingModels ? "POSSIBLE DOWNLOADS" : "RECOMMENDED DOWNLOADS")
@@ -240,8 +262,8 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
             <Button
               id={`local-model-${index}`}
               onClick={() => confirmSelection(selection)}
-              onMouseOver={() => { if (!busy) setSelectedId(selection.id) }}
-              cursor={busy ? "default" : "pointer"}
+              onMouseOver={() => setSelectedId(selection.id)}
+              cursor={operation ? "default" : "pointer"}
               style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: index === selectedIndex ? theme.primary : theme.border, paddingLeft: 1, paddingRight: 1, marginBottom: 1, flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}
             >
               <text style={{ fg: index === selectedIndex ? theme.primary : theme.foreground }} attributes={TextAttributes.BOLD}>
@@ -250,6 +272,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               </text>
               <text style={{ fg: theme.muted }}>{selectionMetadata(selection)}</text>
               {selection.kind === "recommendation" && <text style={{ fg: theme.muted }}>{selection.recommendation.quantization.fidelityLabel}</text>}
+              {operation && <text style={{ fg: theme.primary }}>{operation.kind === "download" ? "Downloading" : "Activating"} · {operation.stage}{operationProgress}</text>}
               {capacityWarning && <text style={{ fg: theme.warning }}>{capacityWarning}</text>}
             </Button>
             </Fragment>
@@ -282,7 +305,19 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           </box>
         )}
       </box>
-      {busy && <text style={{ fg: theme.primary }}>Applying local model changes…</text>}
+      {visibleOperations.map((operation) => {
+        const progress = operation.progress && operation.progress.totalBytes > 0
+          ? ` · ${Math.round(operation.progress.completedBytes / operation.progress.totalBytes * 100)}% (${formatBytes(operation.progress.completedBytes)} / ${formatBytes(operation.progress.totalBytes)})`
+          : ""
+        const label = operation.kind === "download" ? "Downloading local model"
+          : operation.kind === "activate" ? "Activating local model"
+          : "Restarting local inference"
+        return (
+          <text key={operation.operationId} style={{ fg: operation.status === "failed" ? theme.error : theme.primary }}>
+            {label} · {operation.status === "failed" ? operation.failure?.message ?? "Failed" : operation.stage}{progress}
+          </text>
+        )
+      })}
       {Option.isSome(error) && <text style={{ fg: theme.error }}>{error.value}</text>}
       {state.warnings.map((warning) => <text key={warning.code} style={{ fg: theme.warning }}>{warning.message}</text>)}
       <text style={{ fg: theme.muted, marginTop: 1 }}>
@@ -293,7 +328,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       </text>
       <box style={{ paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: "row" }}>
         <Button
-          onClick={() => { if (!busy) onSkip() }}
+          onClick={onSkip}
           onMouseOver={() => setHoveredAction("models-skip")}
           onMouseOut={() => setHoveredAction((current) => current === "models-skip" ? null : current)}
         >

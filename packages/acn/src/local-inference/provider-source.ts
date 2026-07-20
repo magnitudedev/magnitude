@@ -15,16 +15,19 @@ import {
   acceptedHttpResponse,
   nativeChatCompletionsCodec,
   type BaseCallOptions,
+  type ChatCompletionsStreamChunk,
   type LocalModelInfo,
   type LocalProviderSource,
   type ProviderModelBindOptions,
+  type ProviderId,
   type ProviderModelId,
   type StreamFailure,
   type Prompt,
+  type ToolCallId,
   type ToolDefinition,
 } from "@magnitudedev/sdk"
 import { IcnApiClient, Generated } from "@magnitudedev/icn"
-import { LocalInferenceChanges } from "./gateway"
+import { LocalModelInventoryChanges } from "./inventory-changes"
 
 const PROVIDER_ID = LocalProviderId.make("local")
 const ZERO_PRICING = { input: 0, output: 0, cached_input: null } as const
@@ -109,7 +112,7 @@ const bindIcnModel = (
   providerModelId: ProviderModelId,
   bindOptions?: ProviderModelBindOptions,
 ) => Effect.succeed({
-  stream: (prompt: Prompt, tools: readonly ToolDefinition[], requestOptions?: BaseCallOptions & { generateToolCallId?: () => import("@magnitudedev/sdk").ToolCallId }) => {
+  stream: (prompt: Prompt, tools: readonly ToolDefinition[], requestOptions?: BaseCallOptions & { generateToolCallId?: () => ToolCallId }) => {
     const call = {
       provider: "local",
       model: providerModelId,
@@ -170,7 +173,7 @@ const bindIcnModel = (
       })))),
       Effect.map((payload) => {
         const chunks = client.chat.createChatCompletion({ payload }).pipe(
-          Stream.map((chunk) => Schema.encodeSync(Generated.ChatCompletionChunk)(chunk) as import("@magnitudedev/sdk").ChatCompletionsStreamChunk),
+          Stream.map((chunk) => Schema.encodeSync(Generated.ChatCompletionChunk)(chunk) as ChatCompletionsStreamChunk),
         )
         const decoded = nativeChatCompletionsCodec.decode(chunks, {
           tools,
@@ -198,7 +201,7 @@ export const LocalModelProviderSourceLive = Layer.effect(
   LocalModelProviderSource,
   Effect.gen(function* () {
     const client = yield* IcnApiClient
-    const changes = yield* LocalInferenceChanges
+    const changes = yield* LocalModelInventoryChanges
     const list = client.models.listModels({}).pipe(
       Effect.map(({ data }) => data.map(icnModelToProviderModel)),
       Effect.mapError((cause) => catalogError("Unable to list local models from ICN", cause)),
@@ -206,7 +209,7 @@ export const LocalModelProviderSourceLive = Layer.effect(
     const catalog = {
       list,
       refresh: list,
-      get: (providerId: import("@magnitudedev/sdk").ProviderId, providerModelId: ProviderModelId) =>
+      get: (providerId: ProviderId, providerModelId: ProviderModelId) =>
         providerId !== PROVIDER_ID
           ? Effect.fail(catalogError(`Unknown local provider ${providerId}`))
           : client.models.getModel({ path: { model_id: providerModelId } }).pipe(

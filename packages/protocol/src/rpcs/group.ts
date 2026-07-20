@@ -12,6 +12,7 @@ import * as Stream from "./stream"
 import * as LocalInference from "./local-inference"
 import * as Onboarding from "./onboarding"
 import { AcnRpcCommandActivity } from "./middleware"
+import { WatchMirroredStates } from "./mirrored-state"
 
 export const MagnitudeRpcs = RpcGroup.make(
   // Liveness — no activity tracking
@@ -36,12 +37,12 @@ export const MagnitudeRpcs = RpcGroup.make(
   Config.GetProviderAuth.middleware(AcnRpcCommandActivity),
   Config.ListProviderAuth.middleware(AcnRpcCommandActivity),
   Config.ListPublicSlotProfiles.middleware(AcnRpcCommandActivity),
-  Config.GetModelCatalog.middleware(AcnRpcCommandActivity),
+  Config.ModelCatalogMirror.getRpc.middleware(AcnRpcCommandActivity),
   Config.RefreshModelCatalog.middleware(AcnRpcCommandActivity),
-  Config.GetModelSlots.middleware(AcnRpcCommandActivity),
+  Config.ModelSlotsMirror.getRpc.middleware(AcnRpcCommandActivity),
   Config.UpdateModelSlots.middleware(AcnRpcCommandActivity),
   Config.GetCloudUsage.middleware(AcnRpcCommandActivity),
-  LocalInference.GetLocalInferenceState.middleware(AcnRpcCommandActivity),
+  LocalInference.LocalInferenceMirror.getRpc.middleware(AcnRpcCommandActivity),
   LocalInference.DownloadLocalModel.middleware(AcnRpcCommandActivity),
   LocalInference.ActivateLocalModel.middleware(AcnRpcCommandActivity),
   LocalInference.DeleteLocalModel.middleware(AcnRpcCommandActivity),
@@ -65,9 +66,7 @@ export const MagnitudeRpcs = RpcGroup.make(
   Stream.CloseDisplayView.middleware(AcnRpcCommandActivity),
 
   // Long-running subscriptions
-  LocalInference.WatchLocalInferenceState,
-  Config.WatchModelCatalog,
-  Config.WatchModelSlots,
+  WatchMirroredStates,
   Session.StreamActiveSessionStatuses,
   Events.StreamEvents,
 )

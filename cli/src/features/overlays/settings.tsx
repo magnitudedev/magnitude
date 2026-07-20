@@ -600,7 +600,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               <box style={{ flexDirection: 'row', paddingTop: 0, ...(isThisDropdownOpen ? { zIndex: 200 } : {}) }}>
                 {/* Model dropdown — relative wrapper, dropdown floats below with absolute */}
                 {(() => {
-                  const w = 36; const pad = 2; const border = 2; const arrow = '▾'
+                  const w = 72; const pad = 2; const border = 2; const arrow = '▾'
                   const maxLen = w - pad - border - arrow.length - 1
                   const trunc = loading ? 'Loading...' : modelLabel.length > maxLen ? modelLabel.slice(0, maxLen - 1) + '…' : modelLabel
                   const padded = trunc + ' '.repeat(Math.max(0, maxLen - trunc.length))

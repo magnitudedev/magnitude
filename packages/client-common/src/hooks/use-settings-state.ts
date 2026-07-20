@@ -7,7 +7,7 @@
 import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import { ProviderIdSchema } from "@magnitudedev/sdk"
+import { ModelCatalogMirror, ModelSlotsMirror, ProviderIdSchema } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 
 export interface ApiKeyState {
@@ -86,7 +86,7 @@ export function useSettingsState(): UseSettingsStateResult {
   function saveApiKey(key: string): void {
     updateProviderAuth({
       payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key } },
-      reactivityKeys: ["apiKey", "modelCatalog", "modelSlots"],
+      reactivityKeys: ["apiKey", ModelCatalogMirror.id, ModelSlotsMirror.id],
     })
   }
 
@@ -94,7 +94,7 @@ export function useSettingsState(): UseSettingsStateResult {
     // Clear by setting an empty key — the server can handle this
     updateProviderAuth({
       payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: "" } },
-      reactivityKeys: ["apiKey", "modelCatalog", "modelSlots"],
+      reactivityKeys: ["apiKey", ModelCatalogMirror.id, ModelSlotsMirror.id],
     })
   }
 
