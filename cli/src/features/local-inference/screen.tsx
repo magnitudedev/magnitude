@@ -321,7 +321,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                 <text style={{ fg: theme.muted }}>{accelerator.details}</text>
               </box>
             ))}
-            {hardware.accelerators.length === 0 && !host?.memoryDomains.some((domain) => domain.kind === "unified_working_set") && (
+            {hardware.accelerators.length === 0 && !host?.memoryDomains.some((domain) => domain.kind === "unified_memory") && (
               <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
             )}
           </box>

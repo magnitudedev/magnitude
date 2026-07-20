@@ -5,6 +5,7 @@ applies_to:
   - inference/crates/icn-contracts/src/inventory.rs
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
+  - inference/native/llama-cpp-rs/**
   - packages/acn/src/local-inference/**
   - packages/protocol/src/rpcs/local-inference.ts
   - packages/protocol/src/schemas/local-inference.ts
@@ -190,7 +191,7 @@ The response contains:
 - native build fingerprint and enabled backends;
 - the accepted model-assessment policy identity for preview requests;
 - runtime-visible logical devices with stable IDs where the backend supplies them, names, backend,
-  device kind, total memory, current free memory, and physical-memory-domain identity;
+  device kind, physical-memory-domain membership, and any backend-reported device limit;
 - normalized memory domains with total capacity, stable capacity, current free memory,
   host-memory-sharing semantics, and member devices;
 - the versioned capacity-policy identity used by fit assessment.
@@ -199,6 +200,19 @@ Logical devices and memory domains are distinct. A device is a native execution 
 domain is a physical capacity pool. Multiple backend views of one physical GPU and unified host/GPU
 memory must not be counted as independent capacity. If ICN cannot establish safe aliasing, it must
 use a conservative non-duplicating representation or fail discovery rather than overstate capacity.
+The pinned fit bridge therefore carries the backend registration name and exact backend-reported
+device identity into every per-device estimate; ICN uses exact identities, never display strings,
+to merge fit capacity across backend views. Host and integrated-GPU allocations are likewise
+charged to one host-sharing physical domain.
+
+On Apple Silicon, ICN reports one `unified_memory` physical domain whose capacity and current
+availability come from the OS system-memory observation. CPU and Metal are member devices of that
+same domain. Metal's `recommendedMaxWorkingSetSize` is not physical VRAM or total system memory; it
+is exposed as a `recommended_working_set` limit on the Metal device. Fit assessment charges all CPU
+and Metal allocations to the unified physical domain once, and independently requires Metal-owned
+allocations to fit within the Metal working-set limit. The API uses Rust's canonical `macos` and
+`aarch64` platform vocabulary; presentation layers may format those values but must not use a
+different vocabulary to decide topology.
 
 Current free memory is observational and volatile. Recommendation eligibility uses the versioned
 stable-capacity policy. The hardware response must make that distinction explicit.

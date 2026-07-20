@@ -26,7 +26,7 @@ pub enum ComponentRoleSchema {
 pub enum HardwareMemoryDomainKindSchema {
     System,
     PhysicalDevice,
-    UnifiedWorkingSet,
+    UnifiedMemory,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -40,12 +40,27 @@ pub enum HardwareDeviceKindSchema {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareDeviceMemoryLimitKindSchema {
+    RecommendedWorkingSet,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HardwareDeviceMemoryLimitSchema {
+    kind: HardwareDeviceMemoryLimitKindSchema,
+    total_bytes: u64,
+    stable_bytes: u64,
+    current_free_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HardwareDeviceSchema {
     id: String,
     backend: String,
     name: String,
     description: String,
     kind: HardwareDeviceKindSchema,
+    memory_limit: Option<HardwareDeviceMemoryLimitSchema>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -60,12 +75,19 @@ pub struct HardwareMemoryDomainSchema {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct HardwareSystemMemorySchema {
+    total_bytes: u64,
+    current_available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HardwareSnapshotSchema {
     captured_at: u64,
     platform: String,
     architecture: String,
     cpu_model: Option<String>,
     logical_cores: usize,
+    system_memory: HardwareSystemMemorySchema,
     native_build: String,
     enabled_backends: Vec<String>,
     assessment_policy: String,
@@ -410,6 +432,7 @@ pub struct HardwareMemorySchema {
     available_bytes: u64,
     headroom_bytes: u64,
     domains: Vec<HardwareMemoryDomainAssessmentSchema>,
+    device_constraints: Vec<HardwareDeviceMemoryAssessmentSchema>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -419,12 +442,26 @@ pub struct HardwareDeficitSchema {
     available_bytes: u64,
     deficit_bytes: u64,
     domains: Vec<HardwareMemoryDomainAssessmentSchema>,
+    device_constraints: Vec<HardwareDeviceMemoryAssessmentSchema>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareMemoryDomainAssessmentSchema {
     memory_domain: String,
+    model_bytes: u64,
+    context_bytes: u64,
+    compute_bytes: u64,
+    auxiliary_bytes: u64,
+    required_bytes: u64,
+    available_bytes: u64,
+    margin_bytes: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HardwareDeviceMemoryAssessmentSchema {
+    device: String,
+    kind: HardwareDeviceMemoryLimitKindSchema,
     model_bytes: u64,
     context_bytes: u64,
     compute_bytes: u64,

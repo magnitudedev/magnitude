@@ -24,6 +24,13 @@ also assumes host memory is unlimited whenever an accelerator is present. Device
 point-in-time reading, and integrated/unified-memory backends may report the same physical pool in
 more than one role.
 
+ICN normalizes those raw reports before exposing or evaluating them. In particular, Apple Silicon
+has one OS-sized unified physical-memory domain shared by CPU and Metal. Metal's backend-reported
+capacity is retained as a recommended working-set constraint, not added as a second pool. A fit
+must satisfy both the unified physical capacity and every applicable device constraint.
+Outside Apple platforms, exact backend device identities merge aliases of the same physical
+accelerator, and integrated-GPU allocations share the host-memory domain.
+
 `common_fit_params` returns only success/failure/error; its detailed fit failure text is emitted to
 the llama logger and is not a structured API. We intentionally do not scrape that text. Exceptions
 from the initial and fitted structured measurement calls are retained as diagnostics.
