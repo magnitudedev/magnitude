@@ -5,7 +5,7 @@ import { Effect, Layer } from "effect"
 import type { Scope } from "effect/Scope"
 import { MagnitudeRpcs } from "@magnitudedev/protocol"
 import {
-  makeJitDaemonResolver,
+  makeJitDaemonCoordinator,
   recoveringProtocolLayer as jitRecoveringProtocolLayer,
 } from "../jit-rpc"
 import type { AcnClient } from "../protocol"
@@ -36,22 +36,24 @@ const unavailableError = (cause: DaemonError): RpcClientError.RpcClientError =>
  * `/rpc` path, ACN resident-stream policy, and ACN infrastructure error
  * mapping. The recovery mechanics live in `jit-rpc`.
  */
-export const recoveringProtocolLayer = (
+export const makeRecoveringProtocolLayer = (
   options?: RecoveringClientOptions,
-): Layer.Layer<RpcClient.Protocol, never, DaemonSpawnerTag | HttpClient.HttpClient> =>
-  Layer.unwrapEffect(
-    Effect.gen(function* () {
-      const spawner = yield* DaemonSpawnerTag
-      const provider = toJitDaemonProvider(spawner, options?.spawnCommand)
-      const resolver = makeJitDaemonResolver(provider)
-      return jitRecoveringProtocolLayer({
-        resolver,
-        rpcPath: "/rpc",
-        streamPolicy: acnResidentStreamPolicy,
-        classifyInfraError: unavailableError,
-      })
-    }),
-  )
+): Effect.Effect<
+  Layer.Layer<RpcClient.Protocol, never, HttpClient.HttpClient>,
+  never,
+  DaemonSpawnerTag
+> => Effect.gen(function* () {
+    const spawner = yield* DaemonSpawnerTag
+    const coordinator = yield* makeJitDaemonCoordinator(
+      toJitDaemonProvider(spawner, options?.spawnCommand),
+    )
+    return jitRecoveringProtocolLayer({
+      coordinator,
+      rpcPath: "/rpc",
+      streamPolicy: acnResidentStreamPolicy,
+      classifyInfraError: unavailableError,
+    })
+  })
 
 /**
  * An `AcnClient` with the operation contract built in: fire commands and trust
@@ -61,10 +63,9 @@ export const recoveringProtocolLayer = (
 export const makeRecoveringAcnClient = (
   options?: RecoveringClientOptions,
 ): Effect.Effect<AcnClient, never, Scope | DaemonSpawnerTag> =>
-  RpcClient.make(MagnitudeRpcs).pipe(
-    Effect.provide(
-      recoveringProtocolLayer(options).pipe(
-        Layer.provide(FetchHttpClient.layer),
-      ),
-    ),
-  )
+  Effect.gen(function* () {
+    const protocol = yield* makeRecoveringProtocolLayer(options)
+    return yield* RpcClient.make(MagnitudeRpcs).pipe(
+      Effect.provide(protocol.pipe(Layer.provide(FetchHttpClient.layer))),
+    )
+  })

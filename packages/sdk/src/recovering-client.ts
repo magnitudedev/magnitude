@@ -1,6 +1,6 @@
 export {
   isEncodedHeartbeat,
   makeRecoveringAcnClient,
-  recoveringProtocolLayer,
+  makeRecoveringProtocolLayer,
   type RecoveringClientOptions,
 } from "./acn-jit/acn-recovering-client"

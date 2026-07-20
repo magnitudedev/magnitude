@@ -234,7 +234,9 @@ graceful-shutdown path. Repeated shutdown requests do not send overlapping signa
 Finalization is uninterruptible around signal delivery and child reaping, while both waits remain
 bounded. Cleanup errors are logged and classified; they never leave an unobserved child handle.
 
-An uncatchable parent crash cannot run Effect finalizers. The spawned child therefore also receives
+An uncatchable parent crash cannot run Effect finalizers. Normal signals and recoverable registry
+ownership loss must interrupt the ACN root Effect fiber and unwind its layers; they must not call
+`process.exit` before ICN cleanup completes. The spawned child therefore also receives
 parent identity and uses platform process containment where available plus a portable parent-liveness
 watchdog. It terminates itself when its owning ACN disappears. This is a backstop, not a mechanism
 for adopting or sharing children.

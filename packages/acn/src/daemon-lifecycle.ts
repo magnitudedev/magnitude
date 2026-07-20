@@ -114,26 +114,6 @@ export const DaemonLifecycleLive = (
 
       const timers: Array<ReturnType<typeof setInterval>> = [];
 
-      const shutdown = Effect.fn("acn.shutdown")(function* () {
-        yield* Effect.annotateCurrentSpan({ pid: process.pid });
-        yield* Effect.logInfo("ACN daemon shutting down gracefully");
-        // Leave the canonical registration in place. Its health probe will
-        // fail after exit, and the next owner atomically replaces it. Deleting
-        // here could race with and remove a successor's registration.
-        yield* agentRuntime.disposeAll();
-        return yield* Effect.sync(() => process.exit(0));
-      });
-
-      const shutdownHandler = () => {
-        Runtime.runPromise(runtime, shutdown()).catch((error) => {
-          console.error("Failed to shut down ACN daemon:", error);
-          process.exit(1);
-        });
-      };
-
-      process.on("SIGTERM", shutdownHandler);
-      process.on("SIGINT", shutdownHandler);
-
       const onTimerError =
         (label: string): ((error: unknown) => void) =>
         (error) => {
@@ -197,9 +177,9 @@ export const DaemonLifecycleLive = (
               observedPid: reg?.pid ?? null,
             })
           );
-          // Ownership loss is fail-closed. Exit immediately rather than allowing
-          // graceful cleanup to extend a split-brain window.
-          return yield* Effect.sync(() => process.exit(0));
+          // Ask BunRuntime to interrupt the root fiber. Layer finalizers then
+          // dispose sessions and synchronously close/reap this ACN's ICN.
+          return yield* Effect.sync(() => process.kill(process.pid, "SIGTERM"));
         }
       );
 
@@ -224,8 +204,6 @@ export const DaemonLifecycleLive = (
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           for (const timer of timers) clearInterval(timer);
-          process.off("SIGTERM", shutdownHandler);
-          process.off("SIGINT", shutdownHandler);
         })
       );
     })

@@ -1,24 +1,37 @@
-import { Effect, Option } from "effect"
+import { Effect, Option, Ref } from "effect"
 import type { JitDaemonEndpoint, JitDaemonProvider } from "./daemon-provider"
 
-export interface JitDaemonResolver<E> {
-  readonly resolve: Effect.Effect<JitDaemonEndpoint, E, never>
-  readonly invalidate: (endpoint: JitDaemonEndpoint) => Effect.Effect<void>
+export interface JitDaemonCoordinator<E> {
+  readonly ensure: Effect.Effect<JitDaemonLease, E, never>
+  readonly invalidate: (lease: JitDaemonLease) => Effect.Effect<void>
+  readonly current: Effect.Effect<Option.Option<JitDaemonEndpoint>>
 }
 
-export const makeJitDaemonResolver = <E>(
+export interface JitDaemonLease {
+  readonly endpoint: JitDaemonEndpoint
+  readonly generation: number
+}
+
+/**
+ * The coordinator is the process-local authority for one JIT daemon.
+ * It is intentionally stateful: every protocol consumer in an application
+ * process must share the same instance.
+ */
+export const makeJitDaemonCoordinator = <E>(
   provider: JitDaemonProvider<E>,
-): JitDaemonResolver<E> => {
-  let current: JitDaemonEndpoint | null = null
-  const semaphore = Effect.unsafeMakeSemaphore(1)
+): Effect.Effect<JitDaemonCoordinator<E>> => Effect.gen(function* () {
+  const current = yield* Ref.make<JitDaemonLease | null>(null)
+  const generation = yield* Ref.make(0)
+  const semaphore = yield* Effect.makeSemaphore(1)
 
-  const resolve: Effect.Effect<JitDaemonEndpoint, E, never> = semaphore.withPermits(1)(
-    Effect.suspend(() => {
-      if (current !== null) return Effect.succeed(current)
+  const ensure: Effect.Effect<JitDaemonLease, E, never> = semaphore.withPermits(1)(
+    Effect.gen(function* () {
+      const cached = yield* Ref.get(current)
+      if (cached !== null) return cached
 
-      return provider.discover().pipe(
+      const endpoint = yield* provider.discover().pipe(
         Effect.tap((found) =>
-          Effect.logDebug("jit-rpc resolve discover").pipe(
+          Effect.logDebug("jit-rpc ensure discover").pipe(
             Effect.annotateLogs({ discovered: Option.isSome(found) ? found.value.url : "none" }),
           ),
         ),
@@ -26,25 +39,41 @@ export const makeJitDaemonResolver = <E>(
           onNone: () =>
             provider.spawn().pipe(
               Effect.tap((endpoint) =>
-                Effect.logDebug("jit-rpc resolve spawned").pipe(
+                Effect.logDebug("jit-rpc ensure spawned").pipe(
                   Effect.annotateLogs({ url: endpoint.url }),
                 ),
               ),
             ),
           onSome: Effect.succeed,
         })),
-        Effect.tap((endpoint) => Effect.sync(() => { current = endpoint })),
       )
+      const nextGeneration = yield* Ref.updateAndGet(generation, (value) => value + 1)
+      const lease = { endpoint, generation: nextGeneration }
+      yield* Ref.set(current, lease)
+      return lease
     }),
   )
 
-  const invalidate = (endpoint: JitDaemonEndpoint): Effect.Effect<void> =>
-    Effect.gen(function* () {
+  const invalidate = (lease: JitDaemonLease): Effect.Effect<void> =>
+    semaphore.withPermits(1)(Effect.gen(function* () {
+      const cached = yield* Ref.get(current)
       yield* Effect.logDebug("jit-rpc invalidate endpoint").pipe(
-        Effect.annotateLogs({ url: endpoint.url, current: current?.url ?? null }),
+        Effect.annotateLogs({
+          url: lease.endpoint.url,
+          generation: lease.generation,
+          currentUrl: cached?.endpoint.url ?? null,
+          currentGeneration: cached?.generation ?? null,
+        }),
       )
-      if (current?.url === endpoint.url) current = null
-    })
+      if (cached?.generation === lease.generation) yield* Ref.set(current, null)
+    }))
 
-  return { resolve, invalidate }
-}
+  return {
+    ensure,
+    invalidate,
+    current: Ref.get(current).pipe(
+      Effect.map(Option.fromNullable),
+      Effect.map(Option.map((lease) => lease.endpoint)),
+    ),
+  }
+})

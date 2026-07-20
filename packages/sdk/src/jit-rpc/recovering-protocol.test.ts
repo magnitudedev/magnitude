@@ -5,7 +5,7 @@ import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { Effect, Exit, FiberId, Layer, Option, Schema, Stream } from "effect"
-import { makeJitDaemonResolver, type JitDaemonProvider } from "./index"
+import { makeJitDaemonCoordinator, type JitDaemonProvider } from "./index"
 import { recoveringProtocolLayer } from "./recovering-protocol"
 import { TransportExhausted } from "./errors"
 import { isCleanOrInterruptedExit, type ResidentStreamPolicy } from "./resident-streams"
@@ -137,11 +137,11 @@ const withClient = <A, E>(
   Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
-        const resolver = makeJitDaemonResolver(provider)
+        const coordinator = yield* makeJitDaemonCoordinator(provider)
         const client = yield* RpcClient.make(FakeRpcs).pipe(
           Effect.provide(
             recoveringProtocolLayer({
-              resolver,
+              coordinator,
               rpcPath: "/rpc",
               streamPolicy: fakeStreamPolicy,
               classifyInfraError,

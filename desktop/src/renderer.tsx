@@ -60,8 +60,8 @@ function renderDaemonError(message: string) {
   )
 }
 
-function renderApp() {
-  const platform = createDesktopPlatform(desktopApi)
+async function renderApp() {
+  const platform = await createDesktopPlatform(desktopApi)
   const agentClientTag = createAgentClient(platform.protocolLayer)
   root.render(
     <PlatformProvider platform={platform}>
@@ -82,7 +82,7 @@ window.addEventListener("beforeunload", () => {
 
 renderLoading()
 desktopApi.ready.then(() => {
-  renderApp()
+  return renderApp()
 }).catch((error: Error) => {
   renderDaemonError(error.message)
 })
