@@ -82,7 +82,13 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   useLocalInferenceState: () => ({
     state: Result.success(localInferenceState),
     mutationResults: [Result.initial()],
-    mutationBusy: false,
+    pending: {
+      download: false,
+      activate: false,
+      delete: false,
+      restart: false,
+      disable: false,
+    },
     mutationFailure: Option.none(),
     downloadModel: localInferenceActions.downloadModel,
     activateModel: () => {},
@@ -250,6 +256,42 @@ test("clicking a possible download starts that model download", async () => {
     await act(async () => view.mockMouse.click(model.x, model.y))
 
     expect(localInferenceActions.downloadModel).toHaveBeenCalledWith(recommendedModel.configurationId)
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("shows mirrored download progress without blocking navigation", async () => {
+  const onComplete = vi.fn()
+  localInferenceState = {
+    ...emptyLocalInferenceState,
+    recommendationState: { _tag: "Ready", recommendations: [recommendedModel] },
+    operations: [{
+      operationId: "operation-1",
+      requestId: "request-1",
+      kind: "download",
+      target: { _tag: "configuration", configurationId: recommendedModel.configurationId },
+      providerModelId: ProviderModelIdSchema.make("recommended-model-catalog"),
+      status: "running",
+      stage: "downloading",
+      progress: { completedBytes: 2_500, totalBytes: 10_000 },
+      startedAt: "2026-07-20T00:00:00.000Z",
+      updatedAt: "2026-07-20T00:00:01.000Z",
+    }],
+  }
+  const view = await testRender(
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} onComplete={onComplete} />,
+    { width: 120, height: 34 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain("Downloading · downloading · 25%")
+
+    const skip = textPosition(view.captureCharFrame(), "Skip for now (Esc)")
+    await act(async () => view.mockMouse.click(skip.x, skip.y))
+    await act(view.renderOnce)
+    expect(onComplete).toHaveBeenCalledOnce()
   } finally {
     await act(async () => view.renderer.destroy())
   }

@@ -29,7 +29,7 @@ import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import {
   LocalInferenceLive,
-  LocalInferenceChangesLive,
+  LocalModelInventoryChangesLive,
   LocalModelProviderSourceLive,
   LocalModelConfigurationLive,
 } from "./local-inference"
@@ -39,6 +39,7 @@ import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
 import { makeHealthResponse } from "./identity"
+import { MirroredStateChangesLive } from "./mirrored-state"
 
 export interface AcnServerOptions {
   readonly register?: boolean
@@ -169,7 +170,9 @@ const makeAcnServicesBase = (debug: boolean) => {
     Layer.provideMerge(storageLayer)
   )
 
-  const localServices = addLocalInferenceServices(storageServices)
+  const withActivity = Layer.provideMerge(AcnActivityTrackerLive, storageServices)
+  const withMirroredStateChanges = Layer.provideMerge(MirroredStateChangesLive, withActivity)
+  const localServices = addLocalInferenceServices(withMirroredStateChanges)
   const withSharedClient = Layer.provideMerge(SharedProviderClientLive, localServices)
   const withAccount = Layer.provideMerge(AccountLive, withSharedClient)
   const withFactory = Layer.provideMerge(
@@ -179,11 +182,11 @@ const makeAcnServicesBase = (debug: boolean) => {
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
   const withDestroyer = Layer.provideMerge(SessionDestroyerLive, withDrafts)
-  return Layer.provideMerge(AcnActivityTrackerLive, withDestroyer)
+  return withDestroyer
 }
 
 const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {
-  const withChanges = Layer.provideMerge(LocalInferenceChangesLive, base)
+  const withChanges = Layer.provideMerge(LocalModelInventoryChangesLive, base)
   const withIcn = Layer.provideMerge(AcnIcnLive, withChanges)
   const withConfiguration = Layer.provideMerge(LocalModelConfigurationLive, withIcn)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withConfiguration)

@@ -1,19 +1,19 @@
 /**
  * Model config hook — shared between web, desktop, and CLI.
  *
- * Composes the independent reactive model-catalog and model-slot resources.
+ * Composes the independent mirrored model-catalog and model-slot state.
  */
 import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { useAgentClient } from "../state/agent-client-context"
-import { ModelSlotsLifecycle, type SlotId } from "@magnitudedev/sdk"
-import { useModelCatalog, useModelSlots } from "./use-reactive-rpc"
+import { ModelCatalogMirror, ModelSlotsLifecycle, ModelSlotsMirror, type SlotId } from "@magnitudedev/sdk"
+import { useMirroredState } from "./use-mirrored-state"
 
 export function useModelConfig() {
   const client = useAgentClient()
-  const catalogResult = useModelCatalog()
-  const slotsResult = useModelSlots()
+  const catalogResult = useMirroredState(ModelCatalogMirror)
+  const slotsResult = useMirroredState(ModelSlotsMirror)
 
   const slotConfiguration = Option.flatMap(Result.value(slotsResult), ({ state }) => ModelSlotsLifecycle.match(state, {
     loading: () => Option.none(),
@@ -45,7 +45,7 @@ export function useModelConfig() {
             },
           },
         },
-        reactivityKeys: ["modelSlots"],
+        reactivityKeys: [ModelSlotsMirror.id],
       })
     },
     [updateConfig, slotConfiguration],
@@ -64,7 +64,7 @@ export function useModelConfig() {
             },
           },
         },
-        reactivityKeys: ["modelSlots"],
+        reactivityKeys: [ModelSlotsMirror.id],
       })
     },
     [updateConfig, slotConfiguration],
@@ -76,7 +76,7 @@ export function useModelConfig() {
         payload: {
           slots: {},
         },
-        reactivityKeys: ["modelSlots"],
+        reactivityKeys: [ModelSlotsMirror.id],
       })
     },
     [updateConfig],
@@ -86,7 +86,7 @@ export function useModelConfig() {
     () => (): void => {
       refreshMutation({
         payload: { providerId: Option.none() },
-        reactivityKeys: ["modelCatalog", "modelSlots"],
+        reactivityKeys: [ModelCatalogMirror.id, ModelSlotsMirror.id],
       })
     },
     [refreshMutation],

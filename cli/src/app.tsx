@@ -312,7 +312,7 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                 <text style={{ fg: theme.muted }}>
                   {[
                     loadedLocalModels.length > 0 ? `Local loaded: ${loadedLocalModels.map((model) => model.displayName).join(' · ')}` : null,
-                    ...loadingLocalModels.map((operation) => `Loading ${operation.providerModelId}: ${operation.stage}${operation.progress === undefined ? '' : ` ${Math.round(operation.progress * 100)}%`}`),
+                    ...loadingLocalModels.map((operation) => `${operation.kind === "download" ? "Downloading" : operation.kind === "activate" ? "Activating" : "Restarting"} ${operation.providerModelId}: ${operation.stage}${operation.progress === undefined || operation.progress.totalBytes === 0 ? '' : ` ${Math.round(operation.progress.completedBytes / operation.progress.totalBytes * 100)}%`}`),
                   ].filter(Boolean).join('  ·  ')}
                 </text>
               </box>

@@ -149,7 +149,7 @@ export const DaemonLifecycleLive = (
         };
 
       const idleCheck = Effect.fn("acn.idle-check")(function* () {
-        const hasActiveWork = yield* agentRuntime.hasActiveWork;
+        const hasActiveWork = (yield* agentRuntime.hasActiveWork) || (yield* activity.hasActiveWork);
         if (hasActiveWork) {
           yield* activity.touch("active-work");
           return;

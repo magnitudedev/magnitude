@@ -292,8 +292,9 @@ instance ID. A diagnostic tail is retained for failures without becoming an unbo
 log store.
 
 Health checks used for lifecycle do not count as ACN user activity. ICN model downloads, loads, and
-inference do count through the ACN operation that initiated them; ICN does not independently decide
-the ACN idle policy.
+inference do count through an ACN-owned active-work lease for their full lifetime, including after
+the initiating RPC has acknowledged. The idle checker considers both agent work and these leases;
+ICN does not independently decide the ACN idle policy.
 
 ## Conformance criteria
 

@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { ProviderModelAvailabilitySchema, ProviderModelIdSchema } from "@magnitudedev/ai/provider/model"
-import { MirroredSnapshotSchema } from "./mirrored-resource"
+import { MirroredSnapshotSchema } from "./mirrored-state"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
@@ -146,13 +146,42 @@ export const LocalInferenceOperationStage = Schema.Literal(
 )
 export type LocalInferenceOperationStage = Schema.Schema.Type<typeof LocalInferenceOperationStage>
 
+export const LocalInferenceOperationKind = Schema.Literal("download", "activate", "restart")
+export type LocalInferenceOperationKind = Schema.Schema.Type<typeof LocalInferenceOperationKind>
+
+export const LocalInferenceOperationTarget = Schema.Union(
+  Schema.TaggedStruct("configuration", { configurationId: Schema.String }),
+  Schema.TaggedStruct("model", { selectionId: Schema.String }),
+  Schema.TaggedStruct("runtime", {}),
+)
+export type LocalInferenceOperationTarget = Schema.Schema.Type<typeof LocalInferenceOperationTarget>
+
+export const LocalInferenceOperationProgress = Schema.Struct({
+  completedBytes: NonNegativeNumber,
+  totalBytes: NonNegativeNumber,
+})
+export type LocalInferenceOperationProgress = Schema.Schema.Type<typeof LocalInferenceOperationProgress>
+
+export const LocalInferenceOperationFailure = Schema.Struct({
+  code: Schema.String,
+  message: Schema.String,
+  retryable: Schema.Boolean,
+})
+export type LocalInferenceOperationFailure = Schema.Schema.Type<typeof LocalInferenceOperationFailure>
+
 export const LocalInferenceOperationSnapshot = Schema.Struct({
   operationId: Schema.String,
+  upstreamOperationId: Schema.optional(Schema.String),
+  requestId: Schema.String,
+  kind: LocalInferenceOperationKind,
+  target: LocalInferenceOperationTarget,
   providerModelId: ProviderModelIdSchema,
   status: Schema.Literal("running", "completed", "failed"),
   stage: LocalInferenceOperationStage,
-  progress: Schema.optional(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1))),
-  message: Schema.optional(Schema.String),
+  progress: Schema.optional(LocalInferenceOperationProgress),
+  failure: Schema.optional(LocalInferenceOperationFailure),
+  startedAt: Schema.String,
+  updatedAt: Schema.String,
 })
 export type LocalInferenceOperationSnapshot = Schema.Schema.Type<typeof LocalInferenceOperationSnapshot>
 

@@ -33,6 +33,7 @@ import type { AppEvent } from "@magnitudedev/agent";
 import { LocalInference } from "./local-inference";
 import { LocalModelProviderSource } from "./local-inference/provider-source";
 import { Onboarding } from "./onboarding";
+import { MirroredStateChanges } from "./mirrored-state";
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
@@ -44,6 +45,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const localInference = yield* LocalInference;
     const localModelSource = yield* LocalModelProviderSource;
     const onboarding = yield* Onboarding;
+    const mirroredStateChanges = yield* MirroredStateChanges;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -293,9 +295,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       GetModelCatalog: () =>
         observeRpcDefects("GetModelCatalog", account.modelCatalog),
 
-      WatchModelCatalog: () =>
-        observeRpcStreamDefects("WatchModelCatalog", withHeartbeat(account.watchModelCatalog)),
-
       RefreshModelCatalog: ({ providerId }) =>
         observeRpcDefects(
           "RefreshModelCatalog",
@@ -304,9 +303,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
       GetModelSlots: () =>
         observeRpcDefects("GetModelSlots", account.modelSlots),
-
-      WatchModelSlots: () =>
-        observeRpcStreamDefects("WatchModelSlots", withHeartbeat(account.watchModelSlots)),
 
       UpdateModelSlots: ({ slots }) =>
         observeRpcDefects(
@@ -337,22 +333,22 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localInference.state,
         ),
 
-      WatchLocalInferenceState: () =>
+      WatchMirroredStates: () =>
         observeRpcStreamDefects(
-          "WatchLocalInferenceState",
-          withHeartbeat(localInference.watchState),
+          "WatchMirroredStates",
+          withHeartbeat(mirroredStateChanges.stream),
         ),
 
-      DownloadLocalModel: ({ configurationId }) =>
+      DownloadLocalModel: ({ configurationId, requestId }) =>
         observeRpcDefects(
           "DownloadLocalModel",
-          localInference.downloadModel(configurationId).pipe(Effect.as({})),
+          localInference.downloadModel(configurationId, requestId),
         ),
 
-      ActivateLocalModel: ({ selectionId }) =>
+      ActivateLocalModel: ({ selectionId, requestId }) =>
         observeRpcDefects(
           "ActivateLocalModel",
-          localInference.activateModel(selectionId).pipe(Effect.as({})),
+          localInference.activateModel(selectionId, requestId),
         ),
 
       DeleteLocalModel: ({ selectionId }) =>
@@ -361,10 +357,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localInference.deleteModel(selectionId).pipe(Effect.as({})),
         ),
 
-      RestartLocalInference: () =>
+      RestartLocalInference: ({ requestId }) =>
         observeRpcDefects(
           "RestartLocalInference",
-          localInference.restart.pipe(Effect.as({})),
+          localInference.restart(requestId),
         ),
 
       DisableLocalInference: () =>

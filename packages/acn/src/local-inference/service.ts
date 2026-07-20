@@ -1,4 +1,5 @@
-import { Context, Effect, Layer, Option, Ref, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, Ref, Scope, Stream } from "effect"
+import { createId } from "@magnitudedev/generate-id"
 import { IcnApiClient, Generated } from "@magnitudedev/icn"
 import {
   LocalInferenceError,
@@ -9,20 +10,22 @@ import {
   type LocalModelChoice,
   type LocalModelFitAssessment,
   type LocalModelRecommendation,
-  type MirroredResourceInvalidation,
+  LocalInferenceMirror,
 } from "@magnitudedev/protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
-import { makeMirroredResource } from "../mirrored-resource"
+import { makeMirroredState, MirroredStateChanges } from "../mirrored-state"
 import { LOCAL_MODEL_CATALOG, catalogSourcePageUrl } from "./catalog"
 import type { LocalModelCatalogEntry } from "./types"
-import { LocalInferenceChanges } from "./gateway"
+import { LocalModelInventoryChanges } from "./inventory-changes"
 import { LocalModelConfiguration } from "./model-configuration"
+import { AcnActivityTracker } from "../activity-tracker"
 
 const PREVIEW_REQUEST_CONCURRENCY = 12
 const PROFILE_CONTEXTS = [200_000, 100_000] as const
 const PROFILE_PARALLEL_SEQUENCES = 1
 const MAX_RECOMMENDATIONS = 4
 const MATERIALLY_LIGHTER_RATIO = 0.8
+const TERMINAL_OPERATION_HISTORY = 24
 
 interface RecommendationResult {
   readonly recommendations: readonly LocalModelRecommendation[]
@@ -31,11 +34,10 @@ interface RecommendationResult {
 
 export interface LocalInferenceApi {
   readonly state: Effect.Effect<LocalInferenceSnapshot, LocalInferenceError>
-  readonly watchState: Stream.Stream<MirroredResourceInvalidation, LocalInferenceError>
-  readonly downloadModel: (configurationId: string) => Effect.Effect<void, LocalInferenceError>
-  readonly activateModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
+  readonly downloadModel: (configurationId: string, requestId: string) => Effect.Effect<{ readonly operationId: string }, LocalInferenceError>
+  readonly activateModel: (selectionId: string, requestId: string) => Effect.Effect<{ readonly operationId: string }, LocalInferenceError>
   readonly deleteModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
-  readonly restart: Effect.Effect<void, LocalInferenceError>
+  readonly restart: (requestId: string) => Effect.Effect<{ readonly operationId: string }, LocalInferenceError>
   readonly disable: Effect.Effect<void, LocalInferenceError>
 }
 
@@ -267,23 +269,27 @@ const operationStage = (event: Generated.ModelDownloadEventSchema | Generated.Ru
     : "queued"
 }
 
+const boundOperationHistory = (
+  operations: readonly LocalInferenceOperationSnapshot[],
+): readonly LocalInferenceOperationSnapshot[] => {
+  const active = operations.filter((operation) => operation.status === "running")
+  const terminal = operations.filter((operation) => operation.status !== "running").slice(-TERMINAL_OPERATION_HISTORY)
+  return [...terminal, ...active]
+}
+
 export const LocalInferenceLive: Layer.Layer<
   LocalInference,
   never,
-  IcnApiClient | LocalInferenceChanges | LocalModelConfiguration
+  IcnApiClient | LocalModelInventoryChanges | LocalModelConfiguration | AcnActivityTracker | MirroredStateChanges
 > = Layer.scoped(LocalInference, Effect.gen(function* () {
   const client = yield* IcnApiClient
-  const changes = yield* LocalInferenceChanges
+  const changes = yield* LocalModelInventoryChanges
   const configuration = yield* LocalModelConfiguration
-  const operations = yield* Ref.make<ReadonlyMap<string, LocalInferenceOperationSnapshot>>(new Map())
+  const activity = yield* AcnActivityTracker
+  const serviceScope = yield* Scope.Scope
   const recommendationCache = yield* Ref.make<ReadonlyMap<string, RecommendationResult>>(new Map())
   const lock = yield* Effect.makeSemaphore(1)
   const recommendationRefreshLock = yield* Effect.makeSemaphore(1)
-
-  const setOperation = (snapshot: LocalInferenceOperationSnapshot) => Ref.update(
-    operations,
-    (current) => new Map(current).set(snapshot.operationId, snapshot),
-  ).pipe(Effect.zipRight(changes.publish))
 
   const previews = (hardware: Generated.HardwareSnapshotSchema) => Effect.forEach(
     LOCAL_MODEL_CATALOG,
@@ -361,6 +367,7 @@ export const LocalInferenceLive: Layer.Layer<
   const stateValue = (
     recommendationState: LocalInferenceRecommendationState,
     recommendationFailureCount = 0,
+    currentOperations: readonly LocalInferenceOperationSnapshot[] = [],
   ) => Effect.gen(function* () {
     const [hardware, inventory, runtime] = yield* Effect.all([
       client.system.getHardware({}),
@@ -411,7 +418,7 @@ export const LocalInferenceLive: Layer.Layer<
       } : null,
       host: { _tag: "Available" as const, profile: hostToWire(hardware) },
       choices,
-      operations: [...(yield* Ref.get(operations)).values()],
+      operations: currentOperations,
       recommendationState,
       warnings: recommendationState._tag === "Ready" && recommendationFailureCount > 0
           ? [{ code: "preview_failed", message: "ICN could not assess the local model catalog. Try again when the inference service is available." }]
@@ -420,12 +427,20 @@ export const LocalInferenceLive: Layer.Layer<
   }).pipe(Effect.mapError((cause) => localError("icn_unavailable", "read local inference state", cause)))
 
   const initialRecommendation: LocalInferenceRecommendationState = { _tag: "Loading" }
-  const resource = yield* makeMirroredResource(yield* stateValue(initialRecommendation).pipe(Effect.orDie))
+  const mirror = yield* makeMirroredState(
+    LocalInferenceMirror,
+    yield* stateValue(initialRecommendation).pipe(Effect.orDie),
+  )
   const publishState = (
     recommendationState: LocalInferenceRecommendationState,
     recommendationFailureCount = 0,
-  ) => stateValue(recommendationState, recommendationFailureCount).pipe(
-    Effect.flatMap((next) => resource.setIfChanged(next, (left, right) => JSON.stringify(left) === JSON.stringify(right))),
+  ) => mirror.get.pipe(
+    Effect.flatMap((current) => stateValue(
+      recommendationState,
+      recommendationFailureCount,
+      current.state.operations,
+    )),
+    Effect.flatMap((next) => mirror.setIfChanged(next, (left, right) => JSON.stringify(left) === JSON.stringify(right))),
     Effect.asVoid,
   )
   const refresh = recommendationRefreshLock.withPermits(1)(Effect.gen(function* () {
@@ -442,14 +457,92 @@ export const LocalInferenceLive: Layer.Layer<
         message: "ICN could not assess the local model catalog. Try again when the inference service is available.",
       }))
   }).pipe(Effect.catchAll(() => Effect.void)))
-  yield* changes.stream.pipe(Stream.runForEach(() => refresh), Effect.forkScoped)
   yield* refresh.pipe(Effect.forkScoped)
 
-  const downloadModel = (configurationId: string) => lock.withPermits(1)(Effect.gen(function* () {
-    const recommendationList = yield* recommendations().pipe(
-      Effect.mapError((cause) => localError("icn_unavailable", "preview local model recommendations", cause)),
-    )
-    const recommendation = recommendationList.recommendations.find((item) => item.configurationId === configurationId)
+  const reconcileState = mirror.get.pipe(
+    Effect.flatMap((current) => stateValue(
+      current.state.recommendationState,
+      current.state.warnings.some((warning) => warning.code === "preview_failed") ? 1 : 0,
+      current.state.operations,
+    )),
+    Effect.flatMap((next) => mirror.setIfChanged(next, (left, right) => JSON.stringify(left) === JSON.stringify(right))),
+    Effect.asVoid,
+  )
+
+  const setOperation = (snapshot: LocalInferenceOperationSnapshot) => mirror.update((state) => {
+    const operations = state.operations.some((operation) => operation.operationId === snapshot.operationId)
+      ? state.operations.map((operation) => operation.operationId === snapshot.operationId ? snapshot : operation)
+      : [...state.operations, snapshot]
+    return { ...state, operations: boundOperationHistory(operations) }
+  }).pipe(Effect.asVoid)
+
+  const sameTarget = (
+    left: LocalInferenceOperationSnapshot["target"],
+    right: LocalInferenceOperationSnapshot["target"],
+  ): boolean => JSON.stringify(left) === JSON.stringify(right)
+
+  interface AcceptedOperation {
+    readonly operation: LocalInferenceOperationSnapshot
+    readonly accepted: boolean
+  }
+
+  const acceptOperation = (
+    requestId: string,
+    kind: LocalInferenceOperationSnapshot["kind"],
+    target: LocalInferenceOperationSnapshot["target"],
+    providerModelId: LocalInferenceOperationSnapshot["providerModelId"],
+  ) => mirror.modify<AcceptedOperation>((state) => {
+    const existing = state.operations.find((operation) => operation.requestId === requestId)
+      ?? state.operations.find((operation) => operation.status === "running" && operation.kind === kind && sameTarget(operation.target, target))
+    if (existing) return {
+      state,
+      result: { operation: existing, accepted: false as const },
+      changed: false,
+    }
+    const now = new Date().toISOString()
+    const operation: LocalInferenceOperationSnapshot = {
+      operationId: createId(),
+      requestId,
+      kind,
+      target,
+      providerModelId,
+      status: "running",
+      stage: "queued",
+      startedAt: now,
+      updatedAt: now,
+    }
+    return {
+      state: { ...state, operations: [...state.operations, operation] },
+      result: { operation, accepted: true as const },
+    }
+  }).pipe(Effect.map(({ result }) => result))
+
+  const runAccepted = (
+    accepted: Effect.Effect<{ readonly operation: LocalInferenceOperationSnapshot; readonly accepted: boolean }, LocalInferenceError>,
+    run: (operation: LocalInferenceOperationSnapshot) => Effect.Effect<void, LocalInferenceError>,
+  ) => Effect.gen(function* () {
+    const result = yield* accepted
+    if (result.accepted) {
+      yield* Effect.forkIn(activity.withActiveWork(`local-inference:${result.operation.kind}`, run(result.operation)).pipe(
+        Effect.catchAllCause((cause) => setOperation({
+          ...result.operation,
+          status: "failed",
+          failure: Option.match(Cause.failureOption(cause), {
+            onNone: () => ({ code: "unexpected_failure", message: Cause.pretty(cause).slice(0, 1_000), retryable: true }),
+            onSome: (error) => ({ code: error.code, message: error.message, retryable: error.retryable }),
+          }),
+          updatedAt: new Date().toISOString(),
+        })),
+      ), serviceScope)
+    }
+    return { operationId: result.operation.operationId }
+  })
+
+  const downloadModel = (configurationId: string, requestId: string) => Effect.gen(function* () {
+    const current = (yield* mirror.get).state
+    const recommendation = current.recommendationState._tag === "Ready"
+      ? current.recommendationState.recommendations.find((item) => item.configurationId === configurationId)
+      : undefined
     if (!recommendation) return yield* localError("invalid_selection", "download local model", "The selected recommendation is no longer available.", false)
     const entry = LOCAL_MODEL_CATALOG.find((candidate) => candidate.id === recommendation.catalogModelId)
     if (!entry) return yield* localError("invalid_selection", "download local model", "Unknown catalog model.", false)
@@ -458,63 +551,102 @@ export const LocalInferenceLive: Layer.Layer<
       catalogModelId: entry.id,
       contextTokens: recommendation.contextTokens,
     }).pipe(Effect.mapError((cause) => localError("configuration_failed", "save local model selection", cause)))
-    const request: Generated.DownloadModelRequestSchema = {
-      source: { type: "hugging_face", repository: entry.repo, revision: entry.revision },
-      components: recommendation.files.map((file, index) => ({
-        path: file.path,
-        role: file.role,
-        expected_sha256: file.sha256 ? Option.some(file.sha256) : Option.none(),
-        shard_index: index === 0 ? Option.none() : Option.some(index),
-      })),
-      relationships: [],
-    }
-    yield* client.models.downloadModel({ payload: request }).pipe(Stream.runForEach((event) => {
-      const modelId = event.type === "ready"
-        ? event.model.id
-        : event.type === "checking_space" || event.type === "progress"
-          ? event.model_id
-          : event.type === "failed"
-            ? Option.getOrNull(event.model_id) ?? entry.id
-            : entry.id
-      const total = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.total_bytes : 0
-      const completed = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.completed_bytes : 0
-      return setOperation({
-        operationId: event.operation_id,
-        providerModelId: ProviderModelIdSchema.make(modelId),
-        status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
-        stage: operationStage(event),
-        ...(total > 0 ? { progress: completed / total } : {}),
-        ...(event.type === "failed" ? { message: event.error.message } : {}),
-      })
-    }), Effect.mapError((cause) => localError("configuration_failed", "download local model", cause)))
-    yield* changes.publish
-  }))
-
-  const activateModel = (selectionId: string) => lock.withPermits(1)(Effect.gen(function* () {
-    const model = yield* resolveStoredModel(selectionId).pipe(Effect.mapError((cause) => localError("artifact_unavailable", "activate local model", cause)))
-    if (!model) return yield* localError("artifact_unavailable", "activate local model", "The selected model is not available in ICN.", false)
-    const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
-    const contextLength = config.selectedProfile?.contextTokens
-      ?? (model.hardware.type === "fits" ? model.hardware.profile.context_length : 100_000)
-    const hardware = yield* client.system.getHardware({}).pipe(
-      Effect.mapError((cause) => localError("icn_unavailable", "read ICN execution policy", cause)),
-    )
-    yield* client.runtime.loadRuntimeModel({ payload: {
-      model_id: model.id,
-      profile: {
-        policy: hardware.assessment_policy,
-        context_length: contextLength,
-        parallel_sequences: PROFILE_PARALLEL_SEQUENCES,
+    return yield* runAccepted(
+      acceptOperation(requestId, "download", { _tag: "configuration", configurationId }, ProviderModelIdSchema.make(entry.id)),
+      (operation) => {
+        const request: Generated.DownloadModelRequestSchema = {
+          source: { type: "hugging_face", repository: entry.repo, revision: entry.revision },
+          components: recommendation.files.map((file, index) => ({
+            path: file.path,
+            role: file.role,
+            expected_sha256: file.sha256 ? Option.some(file.sha256) : Option.none(),
+            shard_index: index === 0 ? Option.none() : Option.some(index),
+          })),
+          relationships: [],
+        }
+        return client.models.downloadModel({ payload: request }).pipe(
+          Stream.runForEach((event) => {
+            const modelId = event.type === "ready"
+              ? event.model.id
+              : event.type === "checking_space" || event.type === "progress"
+                ? event.model_id
+                : event.type === "failed"
+                  ? Option.getOrNull(event.model_id) ?? entry.id
+                  : entry.id
+            const total = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.total_bytes : 0
+            const completed = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.completed_bytes : 0
+            return setOperation({
+              ...operation,
+              upstreamOperationId: event.operation_id,
+              providerModelId: ProviderModelIdSchema.make(modelId),
+              status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
+              stage: operationStage(event),
+              ...(total > 0 ? { progress: { completedBytes: completed, totalBytes: total } } : {}),
+              ...(event.type === "failed" ? { failure: {
+                code: event.error.code,
+                message: event.error.message,
+                retryable: event.error.retryable,
+              } } : {}),
+              updatedAt: new Date().toISOString(),
+            })
+          }),
+          Effect.mapError((cause) => localError("configuration_failed", "download local model", cause)),
+          Effect.zipRight(reconcileState),
+          Effect.zipRight(changes.publish),
+        )
       },
-    } }).pipe(Stream.runForEach((event) => setOperation({
-      operationId: event.operation_id,
-      providerModelId: ProviderModelIdSchema.make(event.type === "ready" ? model.id : event.model_id),
-      status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
-      stage: operationStage(event),
-      ...(event.type === "failed" ? { message: event.message } : {}),
-    })), Effect.mapError((cause) => localError("runtime_start_failed", "activate local model", cause)))
-    yield* changes.publish
-  }))
+    )
+  })
+
+  const activateModel = (selectionId: string, requestId: string) => runAccepted(
+    acceptOperation(requestId, "activate", { _tag: "model", selectionId }, ProviderModelIdSchema.make(selectionId)),
+    (operation) => Effect.gen(function* () {
+      const model = yield* resolveStoredModel(selectionId).pipe(
+        Effect.mapError((cause) => localError("artifact_unavailable", "activate local model", cause)),
+      )
+      if (!model) {
+        return yield* localError(
+          "artifact_unavailable",
+          "activate local model",
+          "The selected model is not available in ICN.",
+          false,
+        )
+      }
+      const config = yield* configuration.get.pipe(
+        Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)),
+      )
+      const contextLength = config.selectedProfile?.contextTokens
+        ?? (model.hardware.type === "fits" ? model.hardware.profile.context_length : 100_000)
+      const hardware = yield* client.system.getHardware({}).pipe(
+        Effect.mapError((cause) => localError("icn_unavailable", "read ICN execution policy", cause)),
+      )
+      yield* client.runtime.loadRuntimeModel({ payload: {
+        model_id: model.id,
+        profile: {
+          policy: hardware.assessment_policy,
+          context_length: contextLength,
+          parallel_sequences: PROFILE_PARALLEL_SEQUENCES,
+        },
+      } }).pipe(
+        Stream.runForEach((event) => setOperation({
+          ...operation,
+          upstreamOperationId: event.operation_id,
+          providerModelId: ProviderModelIdSchema.make(event.type === "ready" ? model.id : event.model_id),
+          status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
+          stage: operationStage(event),
+          ...(event.type === "failed" ? { failure: {
+            code: event.code,
+            message: event.message,
+            retryable: event.retryable,
+          } } : {}),
+          updatedAt: new Date().toISOString(),
+        })),
+        Effect.mapError((cause) => localError("runtime_start_failed", "activate local model", cause)),
+      )
+      yield* reconcileState
+      yield* changes.publish
+    }),
+  )
 
   const deleteModel = (selectionId: string) => lock.withPermits(1)(Effect.gen(function* () {
     const model = yield* resolveStoredModel(selectionId).pipe(Effect.mapError((cause) => localError("artifact_unavailable", "delete local model", cause)))
@@ -522,29 +654,49 @@ export const LocalInferenceLive: Layer.Layer<
     yield* client.models.deleteModel({ path: { model_id: model.id }, urlParams: { dry_run: Option.none() } }).pipe(
       Effect.mapError((cause) => localError("artifact_active", "delete local model", cause)),
     )
+    yield* reconcileState
     yield* changes.publish
   }))
 
   const disable = lock.withPermits(1)(client.runtime.unloadRuntimeModel({}).pipe(
     Effect.mapError((cause) => localError("configuration_failed", "disable local inference", cause)),
+    Effect.zipRight(reconcileState),
     Effect.zipRight(changes.publish),
   ))
 
-  const restart = lock.withPermits(1)(Effect.gen(function* () {
-    const runtime = yield* client.runtime.getRuntimeState({}).pipe(Effect.mapError((cause) => localError("icn_unavailable", "read local runtime", cause)))
-    if (runtime.status.type !== "ready") return
-    const current = runtime.status
-    yield* client.runtime.unloadRuntimeModel({}).pipe(Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)))
-    yield* client.runtime.loadRuntimeModel({ payload: { model_id: current.model_id, profile: current.profile } }).pipe(
-      Stream.runDrain,
-      Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)),
-    )
-    yield* changes.publish
-  }))
+  const restart = (requestId: string) => runAccepted(
+    acceptOperation(requestId, "restart", { _tag: "runtime" }, ProviderModelIdSchema.make("local-runtime")),
+    (operation) => Effect.gen(function* () {
+      const runtime = yield* client.runtime.getRuntimeState({}).pipe(Effect.mapError((cause) => localError("icn_unavailable", "read local runtime", cause)))
+      if (runtime.status.type !== "ready") {
+        yield* setOperation({ ...operation, status: "completed", stage: "ready", updatedAt: new Date().toISOString() })
+        return
+      }
+      const current = runtime.status
+      yield* client.runtime.unloadRuntimeModel({}).pipe(Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)))
+      yield* client.runtime.loadRuntimeModel({ payload: { model_id: current.model_id, profile: current.profile } }).pipe(
+        Stream.runForEach((event) => setOperation({
+          ...operation,
+          upstreamOperationId: event.operation_id,
+          providerModelId: ProviderModelIdSchema.make(event.type === "ready" ? current.model_id : event.model_id),
+          status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
+          stage: operationStage(event),
+          ...(event.type === "failed" ? { failure: {
+            code: event.code,
+            message: event.message,
+            retryable: event.retryable,
+          } } : {}),
+          updatedAt: new Date().toISOString(),
+        })),
+        Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)),
+      )
+      yield* reconcileState
+      yield* changes.publish
+    }),
+  )
 
   return LocalInference.of({
-    state: resource.get,
-    watchState: resource.changes,
+    state: mirror.get,
     downloadModel,
     activateModel,
     deleteModel,

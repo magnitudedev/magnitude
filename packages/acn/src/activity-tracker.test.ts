@@ -36,4 +36,20 @@ describe("AcnActivityTracker", () => {
 
     expect(result.length).toBe(1)
   })
+
+  it("holds active work for the full scoped operation", async () => {
+    const program = Effect.gen(function* () {
+      const activity = yield* AcnActivityTracker
+      const latch = yield* Effect.makeLatch()
+      const fiber = yield* activity.withActiveWork("download", latch.await).pipe(Effect.fork)
+      yield* Effect.yieldNow()
+      const during = yield* activity.hasActiveWork
+      yield* latch.open
+      yield* Fiber.join(fiber)
+      const after = yield* activity.hasActiveWork
+      return { during, after }
+    }).pipe(Effect.provide(AcnActivityTrackerLive))
+
+    await expect(Effect.runPromise(program)).resolves.toEqual({ during: true, after: false })
+  })
 })

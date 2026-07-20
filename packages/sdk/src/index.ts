@@ -45,6 +45,9 @@ export {
   ProviderCatalogStale,
   ProviderCatalogUnavailable,
   ModelSlotConfigurationUnavailable,
+  ModelCatalogMirror,
+  ModelSlotsMirror,
+  LocalInferenceMirror,
 } from "@magnitudedev/protocol"
 
 export type {
