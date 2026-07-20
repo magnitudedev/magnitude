@@ -433,6 +433,141 @@
           }
         }
       }
+    },
+    "/v1/runtime": {
+      "get": {
+        "tags": [
+          "runtime"
+        ],
+        "operationId": "getRuntimeState",
+        "responses": {
+          "200": {
+            "description": "Active ICN model runtime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeStateResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime state unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runtime/model": {
+      "post": {
+        "tags": [
+          "runtime"
+        ],
+        "operationId": "loadRuntimeModel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoadRuntimeModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Runtime model load progress",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid runtime request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Runtime mutation conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/RuntimeModelEvent"
+            }
+          },
+          "framing": "sse",
+          "reconnect": {
+            "type": "none"
+          },
+          "responseStatus": 200,
+          "termination": {
+            "type": "eof"
+          },
+          "version": 1
+        }
+      },
+      "delete": {
+        "tags": [
+          "runtime"
+        ],
+        "operationId": "unloadRuntimeModel",
+        "responses": {
+          "200": {
+            "description": "Runtime after idempotent unload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeStateResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Runtime model is in use",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime unload failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2160,13 +2295,31 @@
         "type": "object",
         "required": [
           "status",
-          "version"
+          "ready",
+          "version",
+          "apiVersion",
+          "instanceId",
+          "nativeBuild"
         ],
         "properties": {
           "status": {
             "type": "string"
           },
+          "ready": {
+            "type": "boolean"
+          },
           "version": {
+            "type": "string"
+          },
+          "apiVersion": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "instanceId": {
+            "type": "string"
+          },
+          "nativeBuild": {
             "type": "string"
           }
         },
@@ -2454,6 +2607,22 @@
           },
           "strict": {
             "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "LoadRuntimeModelRequest": {
+        "type": "object",
+        "required": [
+          "model_id",
+          "profile"
+        ],
+        "properties": {
+          "model_id": {
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/RuntimeExecutionProfile"
           }
         },
         "additionalProperties": false
@@ -3859,6 +4028,225 @@
                 "type": "string",
                 "enum": [
                   "json_schema"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "RuntimeExecutionProfile": {
+        "type": "object",
+        "required": [
+          "policy",
+          "context_length",
+          "parallel_sequences"
+        ],
+        "properties": {
+          "policy": {
+            "type": "string"
+          },
+          "context_length": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "parallel_sequences": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "RuntimeLoadStage": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "resolving",
+          "assessing",
+          "unloading",
+          "loading",
+          "verifying"
+        ]
+      },
+      "RuntimeModelEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "model_id",
+              "stage",
+              "type"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "model_id": {
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/components/schemas/RuntimeLoadStage"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "progress"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "state",
+              "type"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "state": {
+                "$ref": "#/components/schemas/RuntimeStateResponse"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "model_id",
+              "code",
+              "message",
+              "retryable",
+              "type"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "model_id": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "RuntimeStateResponse": {
+        "type": "object",
+        "required": [
+          "generation",
+          "status"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/RuntimeStatus"
+          },
+          "operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "RuntimeStatus": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "empty"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "model_id",
+              "generation",
+              "profile",
+              "type"
+            ],
+            "properties": {
+              "model_id": {
+                "type": "string"
+              },
+              "generation": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "profile": {
+                "$ref": "#/components/schemas/RuntimeExecutionProfile"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "generation",
+              "code",
+              "message",
+              "type"
+            ],
+            "properties": {
+              "generation": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "failed"
                 ]
               }
             }

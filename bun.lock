@@ -255,6 +255,7 @@
       "dependencies": {
         "@effect/platform": "^0.96.0",
         "@magnitudedev/openapi-effect": "workspace:*",
+        "@noble/hashes": "^2.2.0",
         "effect": "3.21.2",
       },
       "devDependencies": {
@@ -272,7 +273,6 @@
         "@huggingface/hub": "2.13.3",
         "@huggingface/tasks": "0.21.24",
         "@magnitudedev/ai": "workspace:*",
-        "@magnitudedev/icn": "workspace:*",
         "effect": "3.21.2",
       },
       "devDependencies": {

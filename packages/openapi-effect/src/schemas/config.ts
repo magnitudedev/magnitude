@@ -11,6 +11,8 @@ export class OutputLayout extends Schema.Class<OutputLayout>(
     default: () => "operations.ts",
   }),
   api: Schema.optionalWith(Schema.String, { default: () => "api.ts" }),
+  client: Schema.optionalWith(Schema.String, { default: () => "client.ts" }),
+  index: Schema.optionalWith(Schema.String, { default: () => "index.ts" }),
   manifest: Schema.optionalWith(Schema.String, {
     default: () => "manifest.json",
   }),

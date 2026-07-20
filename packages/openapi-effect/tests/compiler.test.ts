@@ -27,10 +27,12 @@ describe("compileOpenApi", () => {
     expect(Option.isNone(decoded.servers)).toBe(true);
   });
 
-  it("decodes OpenAPI once and emits Schema, operation, HttpApi, and manifest modules", async () => {
+  it("decodes OpenAPI once and emits Schema, operation, HttpApi, client, index, and manifest modules", async () => {
     const result = await compile(document);
     const schemas = HashMap.get(result.files, "schemas.ts");
     const api = HashMap.get(result.files, "api.ts");
+    const client = HashMap.get(result.files, "client.ts");
+    const index = HashMap.get(result.files, "index.ts");
     const manifest = HashMap.get(result.files, "manifest.json");
 
     expect(schemas._tag).toBe("Some");
@@ -52,8 +54,17 @@ describe("compileOpenApi", () => {
     expect(
       api.pipe((value) => (value._tag === "Some" ? value.value : ""))
     ).toContain("S.NumberFromString");
+    expect(
+      client.pipe((value) => (value._tag === "Some" ? value.value : ""))
+    ).toContain("makeExampleApiClient");
+    expect(
+      index.pipe((value) => (value._tag === "Some" ? value.value : ""))
+    ).toContain('export * from "./client.js"');
     expect(manifest._tag).toBe("Some");
     expect(result.manifest.operations).toEqual(["getModel", "openModel"]);
+    const clientSource = client._tag === "Some" ? client.value : "";
+    for (const operation of result.manifest.operations)
+      expect(clientSource).toContain(`${operation}: make`);
   });
 
   it("emits configured NDJSON operations as descriptors, not HttpApi endpoints", async () => {
@@ -72,6 +83,10 @@ describe("compileOpenApi", () => {
     expect(operationSource).toContain("status: 400");
     expect(operationSource).toContain("Schemas.Problem");
     expect(apiSource).not.toContain('HttpApiEndpoint.post("generate"');
+    const client = HashMap.get(result.files, "client.ts");
+    expect(client._tag === "Some" ? client.value : "").toContain(
+      "makeStreamOperation(http, options, Operations.generateOperation)"
+    );
   });
 
   it("emits finite and long-lived SSE descriptors with explicit policies", async () => {
@@ -90,6 +105,10 @@ describe("compileOpenApi", () => {
     expect(operationSource).toContain("eventSchema: Schemas.LifecycleEvent");
     expect(apiSource).not.toContain('HttpApiEndpoint.post("chatCompletions"');
     expect(apiSource).not.toContain('HttpApiEndpoint.get("watchLifecycle"');
+    const client = HashMap.get(result.files, "client.ts");
+    const clientSource = client._tag === "Some" ? client.value : "";
+    expect(clientSource).toContain("Operations.chatCompletionsOperation");
+    expect(clientSource).toContain("Operations.watchLifecycleOperation");
   });
 
   it("rejects document-shape failures through a typed decode error", async () => {

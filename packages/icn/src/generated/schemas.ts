@@ -829,6 +829,10 @@ export type HardwareSnapshotSchema = S.Schema.Type<typeof HardwareSnapshotSchema
 export type HardwareSnapshotSchemaEncoded = S.Schema.Encoded<typeof HardwareSnapshotSchema>
 
 export const HealthResponse = S.Struct({
+  apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  instanceId: S.String,
+  nativeBuild: S.String,
+  ready: S.Boolean,
   status: S.String,
   version: S.String,
 })
@@ -949,6 +953,13 @@ export const JsonSchemaRequest = S.Struct({
 })
 export type JsonSchemaRequest = S.Schema.Type<typeof JsonSchemaRequest>
 export type JsonSchemaRequestEncoded = S.Schema.Encoded<typeof JsonSchemaRequest>
+
+export const LoadRuntimeModelRequest = S.Struct({
+  model_id: S.String,
+  profile: S.suspend((): S.Schema<RuntimeExecutionProfile, RuntimeExecutionProfileEncoded> => RuntimeExecutionProfile),
+})
+export type LoadRuntimeModelRequest = S.Schema.Type<typeof LoadRuntimeModelRequest>
+export type LoadRuntimeModelRequestEncoded = S.Schema.Encoded<typeof LoadRuntimeModelRequest>
 
 export const LoadStageSchema = S.Union(
   S.Literal("opening"),
@@ -1525,6 +1536,97 @@ export const ResponseFormatRequest = S.Union(
 )
 export type ResponseFormatRequest = S.Schema.Type<typeof ResponseFormatRequest>
 export type ResponseFormatRequestEncoded = S.Schema.Encoded<typeof ResponseFormatRequest>
+
+export const RuntimeExecutionProfile = S.Struct({
+  context_length: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  parallel_sequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  policy: S.String,
+})
+export type RuntimeExecutionProfile = S.Schema.Type<typeof RuntimeExecutionProfile>
+export type RuntimeExecutionProfileEncoded = S.Schema.Encoded<typeof RuntimeExecutionProfile>
+
+export const RuntimeLoadStage = S.Union(
+  S.Literal("queued"),
+  S.Literal("resolving"),
+  S.Literal("assessing"),
+  S.Literal("unloading"),
+  S.Literal("loading"),
+  S.Literal("verifying"),
+)
+export type RuntimeLoadStage = S.Schema.Type<typeof RuntimeLoadStage>
+export type RuntimeLoadStageEncoded = S.Schema.Encoded<typeof RuntimeLoadStage>
+
+export const RuntimeModelEvent = S.Union(
+  S.extend(
+    S.Struct({
+      model_id: S.String,
+      operation_id: S.String,
+      stage: S.suspend((): S.Schema<RuntimeLoadStage, RuntimeLoadStageEncoded> => RuntimeLoadStage),
+      type: S.Literal("progress"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      operation_id: S.String,
+      state: S.suspend((): S.Schema<RuntimeStateResponse, RuntimeStateResponseEncoded> => RuntimeStateResponse),
+      type: S.Literal("ready"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      code: S.String,
+      message: S.String,
+      model_id: S.String,
+      operation_id: S.String,
+      retryable: S.Boolean,
+      type: S.Literal("failed"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type RuntimeModelEvent = S.Schema.Type<typeof RuntimeModelEvent>
+export type RuntimeModelEventEncoded = S.Schema.Encoded<typeof RuntimeModelEvent>
+
+export const RuntimeStateResponse = S.Struct({
+  generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  operation_id: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  status: S.suspend((): S.Schema<RuntimeStatus, RuntimeStatusEncoded> => RuntimeStatus),
+})
+export type RuntimeStateResponse = S.Schema.Type<typeof RuntimeStateResponse>
+export type RuntimeStateResponseEncoded = S.Schema.Encoded<typeof RuntimeStateResponse>
+
+export const RuntimeStatus = S.Union(
+  S.extend(
+    S.Struct({
+      type: S.Literal("empty"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      model_id: S.String,
+      profile: S.suspend(
+        (): S.Schema<RuntimeExecutionProfile, RuntimeExecutionProfileEncoded> => RuntimeExecutionProfile,
+      ),
+      type: S.Literal("ready"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      code: S.String,
+      generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      message: S.String,
+      type: S.Literal("failed"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type RuntimeStatus = S.Schema.Type<typeof RuntimeStatus>
+export type RuntimeStatusEncoded = S.Schema.Encoded<typeof RuntimeStatus>
 
 export const SplitModeResponse = S.Union(S.Literal("none"), S.Literal("layer"), S.Literal("row"), S.Literal("tensor"))
 export type SplitModeResponse = S.Schema.Type<typeof SplitModeResponse>

@@ -10,6 +10,8 @@ export const config = new OpenApiEffectConfig({
     schemas: "schemas.ts",
     operations: "operations.ts",
     api: "api.ts",
+    client: "client.ts",
+    index: "index.ts",
     manifest: "manifest.json",
   }),
   transports: [new StreamTransport({ extension: "x-magnitude-stream" })],

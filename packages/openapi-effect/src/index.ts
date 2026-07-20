@@ -24,3 +24,24 @@ export {
   OpenApiSchemaObject,
 } from "./schemas/openapi.js";
 export type { OpenApiDocument as OpenApiDocumentType } from "./schemas/openapi.js";
+export {
+  GeneratedClientIncompleteStreamError,
+  GeneratedClientInputError,
+  GeneratedClientInvalidResponseError,
+  GeneratedClientRemoteError,
+  GeneratedClientTransportError,
+  makeGeneratedClientConnection,
+  makeHttpOperation,
+  makeStreamOperation,
+  type GeneratedClientError,
+  type GeneratedClientConnection,
+  type GeneratedClientOptions,
+  type HttpOperationDescriptor,
+  type HttpOperationError,
+  type HttpOperationInput,
+  type HttpOperationSuccess,
+  type StreamOperationDescriptor,
+  type StreamOperationError,
+  type StreamOperationEvent,
+  type StreamOperationInput,
+} from "./client-runtime.js";

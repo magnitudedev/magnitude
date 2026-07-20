@@ -1362,6 +1362,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "futures-util",
  "http-body-util",
  "icn-contracts",
  "serde",
@@ -1502,10 +1503,12 @@ dependencies = [
  "icn-models",
  "icn-mtp",
  "icn-reasoning",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
