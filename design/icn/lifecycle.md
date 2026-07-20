@@ -10,6 +10,7 @@ applies_to:
   - packages/acn/src/daemon-lifecycle.ts
   - packages/acn/src/local-inference/**
   - packages/acn/scripts/build-binary.ts
+  - inference/scripts/build-binary.ts
   - scripts/build-release-artifacts.ts
 ---
 
@@ -49,8 +50,8 @@ hand-written endpoint method, SSE parser, wire schema, or endpoint-specific erro
 
 The native ICN process owns hardware discovery, model acquisition and inventory, artifact
 inspection, model fitting, the pinned inference runtime, active-model state, and inference request
-execution. The native binary is shipped with ACN; it is not downloaded from Hugging Face and is not
-selected from a user llama.cpp installation.
+execution. The native binary is acquired by `@magnitudedev/icn` from the matching Magnitude release;
+it is not downloaded from Hugging Face and is not selected from a user llama.cpp installation.
 
 ACN owns the parent scope and product policy. It supplies ICN's storage roots and supported binary
 identity, translates product choices into generated ICN requests, and maps canonical ICN results to
@@ -118,12 +119,19 @@ paths into the typed configuration.
 
 ## Binary resolution and compatibility
 
-Production ACN artifacts contain a companion ICN binary for the same target and release. Resolution
-uses deterministic precedence:
+Production releases publish ICN as its own target-specific artifact. The ICN package owns release
+URL construction, bounded download, staging, extraction, manifest and checksum validation, binary
+identity verification, and atomic cache publication. This mirrors SDK ownership of ACN acquisition
+without coupling the two archives. Resolution uses deterministic precedence:
 
 1. an explicit path supplied for development or tests;
-2. the release manifest's companion path beside the running ACN; and
-3. a development-only PATH lookup when explicitly enabled.
+2. a verified cached binary for the requested Magnitude version and platform;
+3. the matching `magnitude-icn-<platform>.tar.gz` release artifact; and
+4. a development-only PATH lookup when explicitly enabled.
+
+The CLI, ACN, and ICN release archives are independent. The npm command remains `magnitude`, while
+the compiled CLI executable is named `magnitude-cli`. ACN does not contain or download ICN itself;
+it supplies typed release coordinates to the ICN lifecycle composition when integration is wired.
 
 An unresolved, non-executable, or incompatible binary is an ACN startup failure. There is no silent
 fallback to a different native runtime. Resolution canonicalizes the path and verifies the binary's
