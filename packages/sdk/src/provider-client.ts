@@ -21,10 +21,10 @@ import type { ModelCatalog } from "@magnitudedev/ai"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
   createMagnitudeProvider,
-  createLlamaCppProvider,
+  createLocalProvider,
   makeProviderRegistry,
   type MagnitudeProviderInstance,
-  type LlamaCppProviderSource,
+  type LocalProviderSource,
   type MagnitudeClientConfig,
   type MagnitudeCallOptions,
   type MagnitudeAdditionalOptions,
@@ -81,7 +81,7 @@ export type ProviderRegistryInfo = RegistryProviderInfo
 export type { ProviderCatalogOutcome } from "@magnitudedev/providers"
 
 export interface ProviderClientConfig extends MagnitudeClientConfig {
-  readonly llamacpp?: LlamaCppProviderSource
+  readonly local?: LocalProviderSource
 }
 
 export type {
@@ -91,8 +91,8 @@ export type {
   MagnitudeCallOptions,
   MagnitudeAdditionalOptions,
 } from "@magnitudedev/providers"
-export type { LlamaCppProviderSource, LlamaCppInferenceLease, LlamaCppModelInfo, LlamaServedModelId, LlamaServingRouteId } from "@magnitudedev/providers"
-export { LlamaCppAcquisitionError, LlamaCppModelInfoSchema, LlamaCppProviderId, LlamaServedModelIdSchema, LlamaServingRouteIdSchema } from "@magnitudedev/providers"
+export type { LocalProviderSource, LocalModelInfo } from "@magnitudedev/providers"
+export { LocalModelInfoSchema, LocalProviderId } from "@magnitudedev/providers"
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/protocol"
@@ -181,11 +181,11 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
   const magnitudeInstance: MagnitudeProviderInstance = createMagnitudeProvider(config)
   const sessionId = config?.sessionId ?? null
 
-  const llamacpp = config?.llamacpp ? createLlamaCppProvider(config.llamacpp) : null
+  const local = config?.local ? createLocalProvider(config.local) : null
 
   const registry = makeProviderRegistry({
     magnitude: magnitudeInstance,
-    discoverableProviders: llamacpp ? [llamacpp] : [],
+    discoverableProviders: local ? [local] : [],
   })
 
   return {

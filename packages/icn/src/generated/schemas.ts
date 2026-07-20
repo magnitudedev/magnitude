@@ -717,6 +717,22 @@ export const HardwareAssessmentSchema = S.Union(
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
+  S.extend(
+    S.Struct({
+      code: S.String,
+      message: S.String,
+      type: S.Literal("invalid_artifact"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      code: S.String,
+      message: S.String,
+      type: S.Literal("incompatible_artifact"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
 )
 export type HardwareAssessmentSchema = S.Schema.Type<typeof HardwareAssessmentSchema>
 export type HardwareAssessmentSchemaEncoded = S.Schema.Encoded<typeof HardwareAssessmentSchema>
@@ -724,6 +740,12 @@ export type HardwareAssessmentSchemaEncoded = S.Schema.Encoded<typeof HardwareAs
 export const HardwareDeficitSchema = S.Struct({
   available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   deficit_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  domains: S.Array(
+    S.suspend(
+      (): S.Schema<HardwareMemoryDomainAssessmentSchema, HardwareMemoryDomainAssessmentSchemaEncoded> =>
+        HardwareMemoryDomainAssessmentSchema,
+    ),
+  ),
   required_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type HardwareDeficitSchema = S.Schema.Type<typeof HardwareDeficitSchema>
@@ -753,6 +775,19 @@ export const HardwareDeviceSchema = S.extend(
 )
 export type HardwareDeviceSchema = S.Schema.Type<typeof HardwareDeviceSchema>
 export type HardwareDeviceSchemaEncoded = S.Schema.Encoded<typeof HardwareDeviceSchema>
+
+export const HardwareMemoryDomainAssessmentSchema = S.Struct({
+  auxiliary_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  compute_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  context_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  margin_bytes: S.Number.pipe(S.int()),
+  memory_domain: S.String,
+  model_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  required_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type HardwareMemoryDomainAssessmentSchema = S.Schema.Type<typeof HardwareMemoryDomainAssessmentSchema>
+export type HardwareMemoryDomainAssessmentSchemaEncoded = S.Schema.Encoded<typeof HardwareMemoryDomainAssessmentSchema>
 
 export const HardwareMemoryDomainKindSchema = S.Union(
   S.Literal("system"),
@@ -787,6 +822,12 @@ export type HardwareMemoryDomainSchemaEncoded = S.Schema.Encoded<typeof Hardware
 
 export const HardwareMemorySchema = S.Struct({
   available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  domains: S.Array(
+    S.suspend(
+      (): S.Schema<HardwareMemoryDomainAssessmentSchema, HardwareMemoryDomainAssessmentSchemaEncoded> =>
+        HardwareMemoryDomainAssessmentSchema,
+    ),
+  ),
   headroom_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   required_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
@@ -1657,11 +1698,7 @@ export type TemplateCapabilitiesResponse = S.Schema.Type<typeof TemplateCapabili
 export type TemplateCapabilitiesResponseEncoded = S.Schema.Encoded<typeof TemplateCapabilitiesResponse>
 
 export const Timings = S.Struct({
-  cache_device_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  cache_disk_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  cache_host_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   cache_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  cache_promotion_ms: S.Number,
   draft_n: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   draft_n_accepted: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   parser_ms: S.Number,

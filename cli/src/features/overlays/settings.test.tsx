@@ -16,15 +16,6 @@ const textPosition = (frame: string, needle: string) => {
 const localInferenceState = {
   usage: { sessionConcurrency: "one" },
   activeBinding: null,
-  llamaCpp: {
-    minimumBuild: 8868,
-    recommendedBuild: 10011,
-    installations: [],
-    selectedInstallationId: Option.none(),
-    activeManagedInstallationId: Option.none(),
-    managedInstall: { availability: { _tag: "Available", build: 10011 }, operation: { _tag: "Idle" } },
-    diagnostics: [],
-  },
   host: {
     _tag: "Available",
     profile: {
@@ -58,7 +49,7 @@ const localInferenceState = {
   },
   choices: [],
   operations: [],
-  recommendations: [],
+  recommendationState: { _tag: "Ready", recommendations: [] },
   warnings: [],
 } as const satisfies LocalInferenceState
 
@@ -115,7 +106,7 @@ test("settings starts with detected hardware followed by explicit Magnitude Clou
     expect(frame).toContain("Add API Key")
     expect(frame).toContain("https://app.magnitude.dev")
     expect(frame).toContain("[Copy link]")
-    expect(frame).not.toContain("llama.cpp")
+    expect(frame).not.toContain("Install runtime")
     expect(frame.indexOf("DETECTED HARDWARE")).toBeLessThan(frame.indexOf("Magnitude Cloud"))
 
     const addApiKey = textPosition(frame, "Add API Key")

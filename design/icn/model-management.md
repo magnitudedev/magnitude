@@ -71,6 +71,11 @@ scans, metadata inspection, template probes, or native hardware assessment.
 
 Startup initializes storage, recovers interrupted operations, and may hydrate the durable index, but does not inspect every model. Download and acquisition completion directly records or invalidates the affected artifact. Deletion removes or invalidates the affected entry. Filesystem and runtime watchers only invalidate relevant cache entries. None of these paths launches inventory-wide enrichment.
 
+The configured ICN model store is the product's authoritative model inventory. Its managed
+Hugging Face hub is contained within that store. Default configuration does not scan or adopt the
+host user's global Hugging Face cache, and ACN does not supply external cache or directory roots.
+Explicit read-only roots remain an ICN deployment input, not an ACN-side discovery mechanism.
+
 ## Reasoning discovery
 
 Reasoning discovery describes the mechanical controls exposed by the effective chat template and
@@ -79,7 +84,7 @@ behavior has the complete profile `none`, defaulting to `none`. Fixed reasoning 
 enabled profile. The detailed normalization and family examples are defined in
 [reasoning detection](./reasoning-detection.md).
 
-Inspection must use the same effective template inputs as model execution. A missing template in GGUF metadata does not imply an unknown result: the pinned llama.cpp fallback behavior must be applied. Actual BOS and EOS tokens and any applicable named template variant must also be resolved rather than omitted.
+Inspection must use the same effective template inputs as model execution. A missing template in GGUF metadata does not imply an unknown result: the pinned native backend's fallback behavior must be applied. Actual BOS and EOS tokens and any applicable named template variant must also be resolved rather than omitted.
 
 Probe errors must not be converted to the `none` profile. `none` is valid only after inspection
 successfully establishes absence of supported reasoning behavior. Likewise, a control that accepts
@@ -104,7 +109,7 @@ The profile fixes every execution input that can affect the result, including co
 
 Inventory assessment is advisory for the canonical profile. Loading a model still performs an exact safety assessment for the execution plan actually requested. The loader must not rely on a cached inventory assessment when those plans differ.
 
-Native hardware assessment is currently serialized where required by process-global llama.cpp state. Other metadata and template work may use bounded concurrency. Implementation limits on concurrency do not weaken the completeness requirement.
+Native hardware assessment is serialized where required by process-global native-backend state. Other metadata and template work may use bounded concurrency. Implementation limits on concurrency do not weaken the completeness requirement.
 
 ## Exact failure taxonomy
 
@@ -175,6 +180,14 @@ filesystem paths. Application services coalesce in-flight work by complete evide
 creating another persistence mechanism. `icn-utils` supplies no-fail file mechanics but knows
 nothing about model domains or evidence keys.
 
+Cache lookup precedes expensive source materialization. When the resolved-artifact index, artifact
+inspection, and every requested hardware assessment are independently valid, preview assembles its
+response from those indexes without opening header blobs, constructing sparse files, running GGUF
+or template inspection, querying the remote source, or invoking native planning. A source blob is
+required to recompute a missing derived fact; its later deletion does not invalidate an otherwise
+complete derived result whose evidence already includes the validated blob digest and immutable
+artifact identity.
+
 ```text
 authoritative local files ---------+
                                     |
@@ -206,7 +219,7 @@ A path existing in the cache is not evidence that its assessment remains valid. 
 - component membership, relationships, size, timestamps, or content identity;
 - effective chat template, tokenizer, BOS/EOS tokens, or named-template selection;
 - the complete validated shape of each cached model and evidence entry;
-- pinned llama.cpp version, native build, backend, or estimator fingerprint;
+- pinned native-backend revision, native build, backend, or estimator fingerprint;
 - canonical execution profile or capacity-policy version;
 - hardware and device topology relevant to planning.
 

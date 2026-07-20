@@ -19,6 +19,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tracing.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]

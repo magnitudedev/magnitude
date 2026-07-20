@@ -33,8 +33,8 @@ describe("config storage onboarding state", () => {
         ...current,
         models: {
           slots: {
-            primary: { providerId: "llamacpp", providerModelId: "model" },
-            secondary: { providerId: "llamacpp", providerModelId: "model" },
+            primary: { providerId: "local", providerModelId: "model" },
+            secondary: { providerId: "local", providerModelId: "model" },
           },
         },
         localInference: {
@@ -45,7 +45,7 @@ describe("config storage onboarding state", () => {
       return yield* config.load()
     }).pipe(Effect.provide(base)))
 
-    expect(result.models?.slots?.primary).toEqual({ providerId: "llamacpp", providerModelId: "model" })
+    expect(result.models?.slots?.primary).toEqual({ providerId: "local", providerModelId: "model" })
     expect(result.localInference?.usage).toEqual({
       sessionConcurrency: "up_to_three",
     })
@@ -60,7 +60,7 @@ describe("config storage onboarding state", () => {
     await Bun.write(paths.configFile, JSON.stringify({
       models: {
         slots: {
-          primary: { providerId: "llamacpp", providerModelId: "model" },
+          primary: { providerId: "local", providerModelId: "model" },
         },
       },
       onboarding: {
@@ -83,7 +83,7 @@ describe("config storage onboarding state", () => {
 
     expect(result.onboarding?.completions?.model_setup).toBeUndefined()
     expect(result.loaded.models?.slots?.primary).toEqual({
-      providerId: "llamacpp",
+      providerId: "local",
       providerModelId: "model",
     })
     expect(result.loaded.localInference?.usage).toEqual({
@@ -93,34 +93,6 @@ describe("config storage onboarding state", () => {
     const persisted = await Bun.file(paths.configFile).json()
     expect(persisted.onboarding?.completions?.model_setup).toBeUndefined()
     expect(persisted.futureDomain).toEqual({ enabled: true })
-  })
-
-  test("resets an invalid binding while preserving local usage", async () => {
-    const paths = makeGlobalStoragePaths(root)
-    await Bun.write(paths.configFile, JSON.stringify({
-      localInference: {
-        usage: { sessionConcurrency: "up_to_three" },
-        binding: {
-          _tag: "Managed",
-          selectionId: "selection",
-          artifactId: "artifact",
-          providerModelId: "provider-model",
-          contextTokens: -1,
-          parallelSlots: 3,
-        },
-      },
-    }))
-
-    const localInference = await Effect.runPromise(Effect.gen(function* () {
-      const config = yield* makeConfigStorage()
-      return yield* config.getLocalInferenceConfig()
-    }).pipe(Effect.provide(makeBase())))
-
-    expect(localInference?.usage).toEqual({
-      sessionConcurrency: "up_to_three",
-    })
-    expect(localInference?.binding).toBeUndefined()
-    expect((await Bun.file(paths.configFile).json()).localInference.binding).toBeUndefined()
   })
 
   test("recovers an invalid model-slot leaf without replacing sibling slots", async () => {
@@ -209,7 +181,7 @@ describe("config storage onboarding state", () => {
     await Effect.runPromise(Effect.gen(function* () {
       const config = yield* makeConfigStorage()
       yield* config.updateModelConfig({
-        primary: { providerId: "llamacpp", providerModelId: "model" },
+        primary: { providerId: "local", providerModelId: "model" },
       })
     }).pipe(Effect.provide(makeBase())))
 

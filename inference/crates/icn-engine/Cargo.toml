@@ -8,19 +8,21 @@ license.workspace = true
 encoding_rs.workspace = true
 getrandom.workspace = true
 icn-contracts.workspace = true
+icn-hardware.workspace = true
 icn-reasoning.workspace = true
 llama-cpp-2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tracing.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.180"
 
 [features]
 default = []
-cuda = ["llama-cpp-2/cuda"]
-metal = ["llama-cpp-2/metal"]
-mtmd = ["llama-cpp-2/mtmd"]
+cuda = ["llama-cpp-2/cuda", "icn-hardware/cuda"]
+metal = ["llama-cpp-2/metal", "icn-hardware/metal"]
+mtmd = ["llama-cpp-2/mtmd", "icn-hardware/mtmd"]
 parity-probe = []
-vulkan = ["llama-cpp-2/vulkan"]
+vulkan = ["llama-cpp-2/vulkan", "icn-hardware/vulkan"]

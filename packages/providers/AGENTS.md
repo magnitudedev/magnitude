@@ -12,7 +12,7 @@ Provider system spans three packages:
 `BaseCallOptions`: `maxTokens`, `toolChoice`, `reasoningEffort`, `generateToolCallId`. Provider-specific options are baked at `bindModel` time via `wrapAsBaseModel` — consumers only see `BoundModel<BaseCallOptions>`.
 
 Catalog eligibility is provider-specific. Hosted catalogs may exclude models
-they do not support. The llama.cpp provider consumes an ACN-owned catalog and
+they do not support. The local provider consumes an ACN-owned catalog and
 scoped acquisition source; it does not discover endpoints, files, or processes.
 Unavailable local models remain visible with a typed disabled reason.
 
@@ -32,7 +32,7 @@ Rules:
 
 Hosted providers generally use files under `packages/providers/src/<name>/`: `contract.ts`, `catalog.ts`, `models.ts`, `errors.ts`, `provider.ts`, `index.ts`. Local runtime providers may instead receive a product-owned `ModelCatalog` plus scoped acquisition closure.
 
-1. `contract.ts` — Effect Schema-derived serializable model info, option types, and error shapes. The llama.cpp model is route-independent; managed/external route facts stay behind its ACN-owned source.
+1. `contract.ts` — Effect Schema-derived serializable model info, option types, and error shapes. The local model is transport-independent; ICN runtime facts stay behind its ACN-owned source.
 2. `catalog.ts` — `ModelCatalog<TModel>`: fetch endpoint, classify with `classifyModelFamily`, filter unclassified, TTL cache. Use `makeFileBackedModelCatalog` for cross-process cache.
 3. `models.ts` — `NativeChatCompletions.model(...)` for OpenAI-compatible providers. `Option.define` for provider-specific options. `wrapAsBaseModel` to hide them.
 4. `errors.ts` — `classifyRejectedResponse` maps provider errors to `ProviderRejection` variants.

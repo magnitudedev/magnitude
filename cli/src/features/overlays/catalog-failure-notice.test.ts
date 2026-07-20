@@ -20,7 +20,7 @@ describe('getCatalogFailureNotice', () => {
   it('still reports other failures when optional cloud authentication is missing', () => {
     expect(getCatalogFailureNotice([
       failure('magnitude', 'Magnitude authentication is not configured'),
-      failure('llamacpp', 'Connection refused at http://127.0.0.1:8080'),
+      failure('local', 'Local inference unavailable'),
     ], false)).toEqual({
       message: 'Some model providers are currently unavailable.',
       tone: 'warning',
@@ -29,7 +29,7 @@ describe('getCatalogFailureNotice', () => {
 
   it('uses concise generic copy for a partially available catalog', () => {
     expect(getCatalogFailureNotice([
-      failure('llamacpp', 'Connection refused at http://127.0.0.1:8080'),
+      failure('local', 'Local inference unavailable'),
     ], false)).toEqual({
       message: 'Some model providers are currently unavailable.',
       tone: 'warning',
@@ -38,7 +38,7 @@ describe('getCatalogFailureNotice', () => {
 
   it('uses concise generic copy when the entire catalog is unavailable', () => {
     expect(getCatalogFailureNotice([
-      failure('llamacpp', 'Connection refused at http://127.0.0.1:8080'),
+      failure('local', 'Local inference unavailable'),
     ], true)).toEqual({
       message: 'No model providers are currently available.',
       tone: 'error',

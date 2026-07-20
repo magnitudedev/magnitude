@@ -12,19 +12,10 @@ const localInferenceActions = vi.hoisted(() => ({
 const emptyLocalInferenceState = {
   usage: null,
   activeBinding: null,
-  llamaCpp: {
-    minimumBuild: 8868,
-    recommendedBuild: 10011,
-    installations: [],
-    selectedInstallationId: Option.none(),
-    activeManagedInstallationId: Option.none(),
-    managedInstall: { availability: { _tag: "Available", build: 10011 }, operation: { _tag: "Idle" } },
-    diagnostics: [],
-  },
   host: { _tag: "Unavailable", message: "not needed" },
   choices: [],
   operations: [],
-  recommendations: [],
+  recommendationState: { _tag: "NotRequested" },
   warnings: [],
 } as const satisfies LocalInferenceState
 
@@ -47,9 +38,9 @@ const recommendedModel = {
   revision: "revision",
   files: [{
     path: "recommended-model.gguf",
+    role: "weights",
     sizeBytes: 10_000,
     sha256: "sha256",
-    downloadUrl: "https://example.invalid/recommended-model.gguf",
   }],
   totalDownloadBytes: 10_000,
   sourcePageUrl: "https://example.invalid/recommended-model",
@@ -103,7 +94,6 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
     mutationBusy: false,
     mutationFailure: Option.none(),
     configureUsage: () => {},
-    installLlamaCpp: () => {},
     downloadModel: localInferenceActions.downloadModel,
     activateModel: () => {},
     deleteModel: () => {},
@@ -143,6 +133,7 @@ test("saved usage answers remain preselected without skipping the questions", as
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
+    recommendationState: { _tag: "Ready", recommendations: [] },
   }
   const view = await testRender(
     <ModelSetupScreen mode="management" onExit={() => {}} />,
@@ -168,6 +159,7 @@ test("recommendation controls follow the model list instead of filling the termi
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
+    recommendationState: { _tag: "Ready", recommendations: [] },
   }
   const view = await testRender(
     <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
@@ -195,19 +187,13 @@ test("clicking an already running model continues setup with that model", async 
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
-    llamaCpp: {
-      ...emptyLocalInferenceState.llamaCpp,
-      installations: [{ id: "managed", executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" }, build: 10011, ownership: "magnitude", discoveries: [] }],
-      selectedInstallationId: Option.some("managed"),
-    },
     activeBinding: {
-      _tag: "External",
       selectionId: "running-model",
       providerModelId: ProviderModelIdSchema.make("running-provider-model"),
       contextTokens: 200_000,
     },
     choices: [{
-      _tag: "RunningExternal",
+      _tag: "Running",
       choiceId: "running-model",
       displayName: "Qwen3.6 35B-A3B",
       providerModelId: ProviderModelIdSchema.make("running-provider-model"),
@@ -249,11 +235,11 @@ test("clicking an already running model continues setup with that model", async 
   }
 })
 
-test("clicking a possible download starts that model download", async () => {
+test("shows recommendation loading state without claiming that no model fits", async () => {
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
-    recommendations: [recommendedModel],
+    recommendationState: { _tag: "Loading" },
   }
   const view = await testRender(
     <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
@@ -266,7 +252,32 @@ test("clicking a possible download starts that model download", async () => {
     await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
     await act(view.renderOnce)
 
-    expect(view.captureCharFrame()).not.toContain("Install llama.cpp")
+    const frame = view.captureCharFrame()
+    expect(frame).toContain("Calculating recommendations for this machine…")
+    expect(frame).not.toContain("No curated model currently fits")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("clicking a possible download starts that model download", async () => {
+  localInferenceState = {
+    ...emptyLocalInferenceState,
+    usage: { sessionConcurrency: "one" },
+    recommendationState: { _tag: "Ready", recommendations: [recommendedModel] },
+  }
+  const view = await testRender(
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
+    { width: 120, height: 30 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    const recommendations = textPosition(view.captureCharFrame(), "See recommendations")
+    await act(async () => view.mockMouse.click(recommendations.x, recommendations.y))
+    await act(view.renderOnce)
+
+    expect(view.captureCharFrame()).not.toContain("Install runtime")
     const model = textPosition(view.captureCharFrame(), recommendedModel.displayName)
     await act(async () => view.mockMouse.moveTo(model.x, model.y))
     await act(view.renderOnce)
@@ -283,11 +294,6 @@ test("recommendations show a human-readable detected hardware panel before model
   localInferenceState = {
     ...emptyLocalInferenceState,
     usage: { sessionConcurrency: "one" },
-    llamaCpp: {
-      ...emptyLocalInferenceState.llamaCpp,
-      installations: [{ id: "managed", executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" }, build: 10011, ownership: "magnitude", discoveries: [] }],
-      selectedInstallationId: Option.some("managed"),
-    },
     host: {
       _tag: "Available",
       profile: {
@@ -319,7 +325,7 @@ test("recommendations show a human-readable detected hardware panel before model
         }],
       },
     },
-    recommendations: [recommendedModel],
+    recommendationState: { _tag: "Ready", recommendations: [recommendedModel] },
   }
   const view = await testRender(
     <ModelSetupScreen mode="onboarding" onExit={() => {}} />,

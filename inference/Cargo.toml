@@ -32,6 +32,10 @@ icn-reasoning = { path = "crates/icn-reasoning" }
 icn-utils = { path = "crates/icn-utils" }
 llama-cpp-2 = { path = "native/llama-cpp-rs/llama-cpp-2", default-features = false, features = ["common"] }
 libc = "0.2.180"
+opentelemetry = { version = "0.32.0", features = ["logs", "trace"] }
+opentelemetry-appender-tracing = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-json", "logs", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "0.32.0", features = ["logs", "trace"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -41,5 +45,9 @@ toml = "0.9.8"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1.18"
 tower = "0.5.3"
+tower-http = { version = "0.6.11", features = ["trace"] }
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order"] }
 utoipa-axum = "0.2.0"

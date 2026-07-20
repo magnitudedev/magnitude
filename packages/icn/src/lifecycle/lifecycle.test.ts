@@ -37,7 +37,6 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     }),
     storage: new IcnStorageConfig({
       modelStore: Option.some("/data/models"),
-      legacyStore: Option.none(),
       modelSources: ["/read-only/models"],
       huggingFaceCaches: ["/read-only/hf"],
     }),

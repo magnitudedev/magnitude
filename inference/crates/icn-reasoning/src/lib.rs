@@ -1,4 +1,4 @@
-//! Model-free chat-template and reasoning capability inspection.
+//! Native chat-template and reasoning capability inspection.
 
 use std::collections::BTreeMap;
 
@@ -6,13 +6,15 @@ use getrandom::fill;
 use icn_contracts::{
     AutomaticReasoningBudget, CapabilityEvidence, EffectiveTemplateInputs, NativeReasoningControls,
     NormalizedReasoningEffort, ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters,
-    ReasoningEffortMapping, ReasoningProfile, ReasoningVisibility, TemplateAssessment,
-    TemplateAssessor, TemplateCapabilities,
+    ReasoningEffortMapping, ReasoningProfile, ReasoningVisibility, TemplateCapabilities,
 };
 use llama_cpp_2::common_chat::{
     ChatContent, ChatMessage, ChatPrepareOptions, ChatTemplateKwarg, ChatTool, ChatToolCall,
     ChatToolChoice, CommonChatTemplates,
 };
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::params::LlamaModelParams;
 use sha2::{Digest, Sha256};
 
 const EFFORT_DEFINITIONS: &[(&str, &[&str])] = &[
@@ -33,35 +35,14 @@ pub struct TemplateInspection {
     pub profile: ReasoningProfile,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NativeTemplateAssessor;
-
-impl TemplateAssessor for NativeTemplateAssessor {
-    fn cache_identity(&self) -> &str {
-        concat!("icn-native-template-assessor:", env!("CARGO_PKG_VERSION"))
-    }
-
-    fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
-        inspect_template_inputs(inputs)
-            .map(|inspection| TemplateAssessment {
-                capabilities: inspection.capabilities,
-                reasoning: inspection.reasoning,
-                fingerprint: inspection.template_fingerprint,
-            })
-            .map_err(|error| error.to_string())
-    }
-}
-
 pub fn inspect_template_inputs(
     inputs: &EffectiveTemplateInputs,
 ) -> Result<TemplateInspection, InspectionError> {
-    let templates = CommonChatTemplates::from_metadata(
-        inputs.default_template.as_deref(),
-        inputs.tool_use_template.as_deref(),
-        inputs.bos_token.as_deref(),
-        inputs.eos_token.as_deref(),
-    )
-    .map_err(native_error)?;
+    let backend = LlamaBackend::init().map_err(native_error)?;
+    let params = LlamaModelParams::default().with_no_alloc(true);
+    let model = LlamaModel::load_from_file(&backend, &inputs.model_path, &params)
+        .map_err(native_error)?;
+    let templates = CommonChatTemplates::from_model(&model).map_err(native_error)?;
     inspect_templates(&templates)
 }
 
@@ -79,12 +60,9 @@ pub fn inspect_template(
     bos_token: Option<&str>,
     eos_token: Option<&str>,
 ) -> Result<TemplateInspection, InspectionError> {
-    inspect_template_inputs(&EffectiveTemplateInputs {
-        default_template: Some(template.to_owned()),
-        tool_use_template: None,
-        bos_token: bos_token.map(str::to_owned),
-        eos_token: eos_token.map(str::to_owned),
-    })
+    let templates = CommonChatTemplates::from_template(template, bos_token, eos_token)
+        .map_err(native_error)?;
+    inspect_templates(&templates)
 }
 
 /// Inspect an already constructed native template handle.
@@ -699,7 +677,7 @@ mod tests {
     fn native_toggle_normalizes_to_none_and_high() {
         let result = inspect_template(TOGGLE, None, None).unwrap();
         assert_eq!(efforts(TOGGLE), ["none", "high"]);
-        assert_eq!(result.profile.default_effort.as_str(), "none");
+        assert_eq!(result.profile.default_effort.as_str(), "high");
         assert_eq!(
             result.profile.mappings[1].controls.enable_thinking,
             Some(true)

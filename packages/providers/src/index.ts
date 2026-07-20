@@ -39,24 +39,14 @@ export {
   ProviderRegistryLive,
 } from "./registry"
 export {
-  type LlamaCppProviderInstance,
-  type LlamaCppModelInfo,
-  LlamaCppModelInfoSchema,
-  LlamaCppProviderId,
-  type LlamaCppCallOptions,
-  type LlamaCppToolChoice,
-  type LlamaCppProviderSource,
-  type LlamaCppInferenceLease,
-  type LlamaServedModelId,
-  type LlamaServingRouteId,
-  LlamaServedModelIdSchema,
-  LlamaServingRouteIdSchema,
-  createLlamaCppProvider,
-  createLlamaCppCompatibleSpec,
-  classifyLlamaCppRejectedResponse,
-  LlamaCppAcquisitionError,
-  PROVIDER_ID as LLAMACPP_PROVIDER_ID,
-} from "./llamacpp"
+  type LocalProviderInstance,
+  type LocalModelInfo,
+  LocalModelInfoSchema,
+  LocalProviderId,
+  type LocalProviderSource,
+  createLocalProvider,
+  PROVIDER_ID as LOCAL_PROVIDER_ID,
+} from "./local"
 export {
   makeAggregatedCatalog,
   inspectProviderCatalogs,

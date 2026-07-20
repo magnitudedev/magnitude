@@ -111,7 +111,7 @@ export const ProviderClientRegistryLive: Layer.Layer<
   ProviderClientRegistry,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
-    const llamacpp = yield* LocalModelProviderSource
+    const local = yield* LocalModelProviderSource
     const modelConfiguration = yield* LocalModelConfiguration
     const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
     const lock = yield* Effect.makeSemaphore(1)
@@ -121,24 +121,24 @@ export const ProviderClientRegistryLive: Layer.Layer<
       const client = createProviderClient({
         ...(apiKey ? { apiKey } : {}),
         ...(sessionId ? { sessionId } : {}),
-        llamacpp,
+        local,
       })
       const withLiveLocalModels = (models: readonly import("@magnitudedev/ai").ProviderModel[]) =>
-        llamacpp.catalog.list.pipe(
-          Effect.map((local) => [...models.filter((model) => model.providerId !== "llamacpp"), ...local]),
+        local.catalog.list.pipe(
+          Effect.map((localModels) => [...models.filter((model) => model.providerId !== "local"), ...localModels]),
         )
       const catalog: ProviderClientShape["catalog"] = {
         list: client.catalog.list.pipe(Effect.flatMap(withLiveLocalModels)),
         refresh: client.catalog.refresh.pipe(Effect.flatMap(withLiveLocalModels)),
-        get: (providerId, providerModelId) => providerId === "llamacpp"
-          ? llamacpp.catalog.get(providerId, providerModelId)
+        get: (providerId, providerModelId) => providerId === "local"
+          ? local.catalog.get(providerId, providerModelId)
           : client.catalog.get(providerId, providerModelId),
       }
       const fileBacked: ProviderClientShape = {
         ...client,
         catalog,
         requestAttribution: (providerId, providerModelId, key) => ({
-          requestStarted: providerId === "llamacpp" && (key === "primary" || key === "secondary")
+          requestStarted: providerId === "local" && (key === "primary" || key === "secondary")
             ? modelConfiguration.recordUse(key, providerModelId).pipe(Effect.ignore)
             : Effect.void,
         }),

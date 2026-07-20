@@ -13,14 +13,14 @@ use llama_cpp_2::context::params::{
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::params::fit::{
-    FitDeviceEstimate, FitGpuLayers, FitMemoryEstimate, FitStatus,
+    FitDeviceEstimate, FitDeviceKind, FitMemoryEstimate, FitStatus,
 };
 use llama_cpp_2::model::params::fit::{FitReport, FitReportError};
 
 use icn_contracts::{
-    HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceKind, HardwareMemory,
-    HardwareMemoryDomain, HardwareMemoryDomainKind, HardwareProfile, HardwareRecommendation,
-    HardwareSnapshot, MtpConfig, MtpSource, ResolvedExecutionPlan,
+    ExecutionIntent, HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceKind,
+    HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment, HardwareMemoryDomainKind,
+    HardwareProfile, HardwareRecommendation, HardwareSnapshot, MtpConfig, MtpSource,
 };
 use llama_cpp_2::LlamaBackendDeviceType;
 use sha2::{Digest, Sha256};
@@ -92,6 +92,10 @@ pub struct FitOptions {
     pub recurrent_snapshots: u32,
     /// Maximum logits outputs allocated by the context.
     pub maximum_outputs: Option<NonZeroU32>,
+    /// Explicit generation thread count. `None` uses the pinned native common default.
+    pub threads: Option<NonZeroU32>,
+    /// Explicit prompt thread count. `None` reuses the resolved generation count.
+    pub threads_batch: Option<NonZeroU32>,
 }
 
 /// Native context role used by no-allocation planning.
@@ -129,6 +133,8 @@ impl Default for FitOptions {
             context_type: FitContextType::Target,
             recurrent_snapshots: 0,
             maximum_outputs: None,
+            threads: None,
+            threads_batch: None,
         }
     }
 }
@@ -171,7 +177,9 @@ pub struct CapacityPolicy {
 
 #[derive(Clone, Debug)]
 struct DiscoveredDevice {
+    native_index: usize,
     backend: String,
+    physical_id: Option<String>,
     name: String,
     description: String,
     kind: HardwareDeviceKind,
@@ -208,7 +216,9 @@ pub fn discover_hardware(
     let devices = llama_cpp_2::list_llama_ggml_backend_devices()
         .into_iter()
         .map(|device| DiscoveredDevice {
+            native_index: device.index,
             backend: device.backend,
+            physical_id: device.device_id,
             name: device.name,
             description: device.description,
             kind: match device.device_type {
@@ -253,10 +263,9 @@ fn hardware_snapshot_from_devices(
         {
             shared.push(device);
         } else {
-            let physical_key = format!(
-                "{}\0{}",
-                normalized_device_identity(&device),
-                device.total_bytes
+            let physical_key = device.physical_id.clone().map_or_else(
+                || format!("backend:{}:{}", device.backend, device.native_index),
+                |id| format!("physical:{id}"),
             );
             dedicated
                 .entry(physical_key)
@@ -304,9 +313,9 @@ fn hardware_snapshot_from_devices(
         });
     }
 
-    // A physical accelerator can be exposed by more than one backend. Equal normalized identity
-    // and capacity are strong alias evidence. Occurrence ordinals preserve two genuinely distinct,
-    // otherwise-identical cards reported by the same backend without double-counting aliases.
+    // A physical accelerator can be exposed by more than one backend. Merge views only when the
+    // backend reports the same exact physical identity. An id-less view remains backend-scoped;
+    // display strings and capacities are never treated as identity evidence.
     for (physical_key, backends) in dedicated {
         let occurrences = backends.values().map(Vec::len).max().unwrap_or(0);
         for ordinal in 0..occurrences {
@@ -390,33 +399,28 @@ fn hardware_snapshot_from_devices(
     }
 }
 
-fn normalized_device_identity(device: &DiscoveredDevice) -> String {
-    let description = device.description.trim();
-    let identity = if description.is_empty() {
-        device.name.trim()
-    } else {
-        description
-    };
-    identity.to_ascii_lowercase()
-}
-
 fn device_order(left: &DiscoveredDevice, right: &DiscoveredDevice) -> std::cmp::Ordering {
     (
-        normalized_device_identity(left),
+        left.physical_id.as_deref().unwrap_or(""),
         left.backend.to_ascii_lowercase(),
+        left.native_index,
         left.name.to_ascii_lowercase(),
     )
         .cmp(&(
-            normalized_device_identity(right),
+            right.physical_id.as_deref().unwrap_or(""),
             right.backend.to_ascii_lowercase(),
+            right.native_index,
             right.name.to_ascii_lowercase(),
         ))
 }
 
 fn public_device(device: DiscoveredDevice, ordinal: usize) -> HardwareDevice {
     let identity = format!(
-        "{}\0{}\0{}\0{ordinal}",
-        device.backend, device.name, device.description
+        "{}\0{}\0{}\0{}\0{ordinal}",
+        device.backend,
+        device.physical_id.as_deref().unwrap_or(""),
+        device.native_index,
+        device.name
     );
     HardwareDevice {
         id: format!("native-{:x}", Sha256::digest(identity.as_bytes())),
@@ -446,13 +450,21 @@ pub fn discover(
 /// The exact plan selected for loading plus its consumer-facing assessment.
 #[derive(Clone, Debug)]
 pub struct AssessedExecutionPlan {
-    pub plan: ResolvedExecutionPlan,
+    pub plan: ExecutionIntent,
     pub assessment: HardwareAssessment,
     pub text_report: FitReport,
     /// No-allocation report for the MTP context and optional companion model.
     pub mtp_report: Option<FitReport>,
     #[cfg(feature = "mtmd")]
     pub projector_memory: Vec<llama_cpp_2::mtmd::MtmdDeviceMemoryEstimate>,
+}
+
+/// Process-local backend plan. Its fitted native parameters are consumed directly by loading and
+/// are never serialized or persisted.
+pub struct BackendLoadPlan {
+    pub assessed: AssessedExecutionPlan,
+    pub native: NativeParameterPlan,
+    pub native_mtp: Option<NativeParameterPlan>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -466,23 +478,84 @@ pub enum AssessmentError {
     Projector(#[from] llama_cpp_2::mtmd::MtmdPreflightError),
     #[error("the native estimator omitted required memory measurements")]
     MissingMeasurements,
-    #[error(
-        "the native fitter selected tensor placement overrides that the execution plan cannot represent"
-    )]
-    UnrepresentableTensorPlacement,
+    #[error("artifact is incompatible with the pinned native backend: {code}: {message}")]
+    IncompatibleArtifact { code: String, message: String },
+    #[error("artifact is invalid: {code}: {message}")]
+    InvalidArtifact { code: String, message: String },
 }
 
-/// Assess and resolve exactly the configuration that the engine will load.
-///
-/// The preferred plan is evaluated from the native initial measurement against
-/// stable total capacity. If it does not fit, a native fitted fallback is used
-/// only when every selected placement is representable in the public plan.
-pub fn resolve_and_assess(
+/// Assess execution intent using the same native planning implementation used by loading.
+/// Preview retains only normalized evidence; it never projects native placement back into intent.
+pub fn assess_intent_with_backend(
     backend: &LlamaBackend,
-    requested: &ResolvedExecutionPlan,
+    requested: &ExecutionIntent,
     policy: CapacityPolicy,
 ) -> Result<AssessedExecutionPlan, AssessmentError> {
-    let text_report = estimate_with_backend(backend, &fit_request(requested, false)?)?;
+    Ok(plan_and_assess(backend, requested, policy)?.0)
+}
+
+/// Plan a load and retain the exact fitted native parameter object that produced its assessment.
+pub fn plan_load_with_backend(
+    backend: &LlamaBackend,
+    requested: &ExecutionIntent,
+    policy: CapacityPolicy,
+) -> Result<BackendLoadPlan, AssessmentError> {
+    let (assessed, native) = plan_and_assess(backend, requested, policy)?;
+    let native = match (native, &assessed.assessment) {
+        (Some(native), _) => native,
+        (None, HardwareAssessment::IncompatibleArtifact { code, message }) => {
+            return Err(AssessmentError::IncompatibleArtifact {
+                code: code.clone(),
+                message: message.clone(),
+            });
+        }
+        (None, HardwareAssessment::InvalidArtifact { code, message }) => {
+            return Err(AssessmentError::InvalidArtifact {
+                code: code.clone(),
+                message: message.clone(),
+            });
+        }
+        (None, _) => return Err(AssessmentError::MissingMeasurements),
+    };
+    let native_mtp = match requested.mtp {
+        MtpConfig::Disabled { .. } => None,
+        MtpConfig::Enabled { .. } => Some(
+            plan_fit_with_backend(backend, &fit_request(&assessed.plan, true)?, Some(&native))?
+                .native,
+        ),
+    };
+    Ok(BackendLoadPlan {
+        assessed,
+        native,
+        native_mtp,
+    })
+}
+
+fn plan_and_assess(
+    backend: &LlamaBackend,
+    requested: &ExecutionIntent,
+    policy: CapacityPolicy,
+) -> Result<(AssessedExecutionPlan, Option<NativeParameterPlan>), AssessmentError> {
+    let target_request = fit_request(requested, false)?;
+    let target_fit = plan_fit_with_backend(backend, &target_request, None)?;
+    let text_report = target_fit.report.clone();
+    if text_report.status == FitStatus::Error {
+        return Ok((
+            AssessedExecutionPlan {
+                plan: requested.clone(),
+                assessment: HardwareAssessment::IncompatibleArtifact {
+                    code: "native_backend_incompatible".to_owned(),
+                    message: "the pinned native backend cannot plan this valid artifact or execution intent"
+                        .to_owned(),
+                },
+                text_report,
+                mtp_report: None,
+                #[cfg(feature = "mtmd")]
+                projector_memory: Vec::new(),
+            },
+            None,
+        ));
+    }
     let mut mtp_report = estimate_mtp_report(backend, requested)?;
     let projector_memory = projector_memory(requested)?;
 
@@ -492,24 +565,26 @@ pub fn resolve_and_assess(
         mtp_report.as_ref().map(|report| report.devices.as_slice()),
         mtp_includes_model(requested),
         &projector_memory,
-        requested.radix_cache.host_bytes,
         policy,
     )?;
     if preferred.fits {
-        let plan = resolved_plan(requested, &text_report, Measurement::Initial)?;
-        return Ok(AssessedExecutionPlan {
-            assessment: fits_assessment(&plan, &preferred, HardwareRecommendation::Recommended),
-            plan,
-            text_report,
-            mtp_report,
-            #[cfg(feature = "mtmd")]
-            projector_memory,
-        });
+        let plan = assessed_intent(requested, &text_report, Measurement::Initial);
+        let native = native_parameter_plan(&target_request)?;
+        return Ok((
+            AssessedExecutionPlan {
+                assessment: fits_assessment(&plan, &preferred, HardwareRecommendation::Recommended),
+                plan,
+                text_report,
+                mtp_report,
+                #[cfg(feature = "mtmd")]
+                projector_memory,
+            },
+            Some(native),
+        ));
     }
 
     let fallback_plan = (text_report.status == FitStatus::Success)
-        .then(|| resolved_plan(requested, &text_report, Measurement::Fitted))
-        .transpose()?;
+        .then(|| assessed_intent(requested, &text_report, Measurement::Fitted));
     let fallback = fallback_plan
         .as_ref()
         .map(|plan| {
@@ -520,25 +595,24 @@ pub fn resolve_and_assess(
                 mtp_report.as_ref().map(|report| report.devices.as_slice()),
                 mtp_includes_model(plan),
                 &projector_memory,
-                plan.radix_cache.host_bytes,
                 policy,
             )
         })
         .transpose()?;
     if fallback.as_ref().is_some_and(|summary| summary.fits) {
-        if !text_report.tensor_placements.is_empty() {
-            return Err(AssessmentError::UnrepresentableTensorPlacement);
-        }
         let plan = fallback_plan.expect("a fallback summary has a plan");
         let summary = fallback.expect("checked above");
-        return Ok(AssessedExecutionPlan {
-            assessment: fits_assessment(&plan, &summary, HardwareRecommendation::Constrained),
-            plan,
-            text_report,
-            mtp_report,
-            #[cfg(feature = "mtmd")]
-            projector_memory,
-        });
+        return Ok((
+            AssessedExecutionPlan {
+                assessment: fits_assessment(&plan, &summary, HardwareRecommendation::Constrained),
+                plan,
+                text_report,
+                mtp_report,
+                #[cfg(feature = "mtmd")]
+                projector_memory,
+            },
+            Some(target_fit.native),
+        ));
     }
 
     let profile = hardware_profile(requested, &preferred);
@@ -550,24 +624,25 @@ pub fn resolve_and_assess(
             deficit_bytes: preferred
                 .required_bytes
                 .saturating_sub(preferred.available_bytes),
+            domains: preferred.domains.clone(),
         },
         limiting_resource: preferred.limiting_resource,
         alternative: None,
     };
-    Ok(AssessedExecutionPlan {
-        plan: requested.clone(),
-        assessment,
-        text_report,
-        mtp_report,
-        #[cfg(feature = "mtmd")]
-        projector_memory,
-    })
+    Ok((
+        AssessedExecutionPlan {
+            plan: requested.clone(),
+            assessment,
+            text_report,
+            mtp_report,
+            #[cfg(feature = "mtmd")]
+            projector_memory,
+        },
+        None,
+    ))
 }
 
-fn fit_request(
-    plan: &ResolvedExecutionPlan,
-    mtp_context: bool,
-) -> Result<FitRequest, AssessmentError> {
+fn fit_request(plan: &ExecutionIntent, mtp_context: bool) -> Result<FitRequest, AssessmentError> {
     let (model, cache_type_k, cache_type_v, context_type, recurrent_snapshots, maximum_outputs) =
         if mtp_context {
             let MtpConfig::Enabled {
@@ -636,13 +711,15 @@ fn fit_request(
             context_type,
             recurrent_snapshots,
             maximum_outputs,
+            threads: plan.execution.threads,
+            threads_batch: plan.execution.threads_batch,
         },
     })
 }
 
 fn estimate_mtp_report(
     backend: &LlamaBackend,
-    plan: &ResolvedExecutionPlan,
+    plan: &ExecutionIntent,
 ) -> Result<Option<FitReport>, AssessmentError> {
     match plan.mtp {
         MtpConfig::Disabled { .. } => Ok(None),
@@ -654,7 +731,7 @@ fn estimate_mtp_report(
     }
 }
 
-fn mtp_includes_model(plan: &ResolvedExecutionPlan) -> bool {
+fn mtp_includes_model(plan: &ExecutionIntent) -> bool {
     matches!(
         plan.mtp,
         MtpConfig::Enabled {
@@ -664,9 +741,9 @@ fn mtp_includes_model(plan: &ResolvedExecutionPlan) -> bool {
     )
 }
 
-/// Initialize the pinned backend and assess a resolved execution plan.
+/// Initialize the pinned backend and assess execution intent.
 pub fn assess(
-    requested: &ResolvedExecutionPlan,
+    requested: &ExecutionIntent,
     policy: CapacityPolicy,
 ) -> Result<AssessedExecutionPlan, AssessmentError> {
     let backend = LlamaBackend::init().map_err(EstimateError::Backend)?;
@@ -680,10 +757,99 @@ pub fn assess(
 /// diagnostic state.
 pub fn assess_with_backend(
     backend: &LlamaBackend,
-    requested: &ResolvedExecutionPlan,
+    requested: &ExecutionIntent,
     policy: CapacityPolicy,
 ) -> Result<AssessedExecutionPlan, AssessmentError> {
-    resolve_and_assess(backend, requested, policy)
+    assess_intent_with_backend(backend, requested, policy)
+}
+
+/// Assess several product profiles for one model. The requested no-allocation model is
+/// constructed once and llama.cpp constructs an exact context graph for every profile.
+/// Upstream fitting is invoked only for profiles whose requested plan does not fit and
+/// whose exact tensor storage could still fit across the available memory domains.
+pub fn assess_profiles_with_backend(
+    backend: &LlamaBackend,
+    requested: &[ExecutionIntent],
+    policy: CapacityPolicy,
+) -> Result<Vec<HardwareAssessment>, AssessmentError> {
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let requests = requested
+        .iter()
+        .map(|intent| fit_request(intent, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    if requests
+        .iter()
+        .any(|request| request.model != requests[0].model)
+    {
+        return Err(AssessmentError::MissingMeasurements);
+    }
+
+    let native = requests
+        .iter()
+        .map(native_parameter_plan)
+        .collect::<Result<Vec<_>, _>>()?;
+    let model_path = path_c_string(&requests[0].model)?;
+    let margins = expand_margins(
+        &requests[0].options.margins_bytes,
+        llama_cpp_2::max_devices(),
+    )?;
+    let contexts = native
+        .iter()
+        .map(|plan| plan.context_params.clone())
+        .collect::<Vec<_>>();
+    let reports = native[0]
+        .model_params
+        .as_ref()
+        .get_ref()
+        .measure_contexts(&model_path, &contexts, &margins)
+        .map_err(EstimateError::Fit)?;
+
+    requested
+        .iter()
+        .zip(reports)
+        .map(|(intent, report)| {
+            let projectors = projector_memory(intent)?;
+            let preferred = capacity_summary(
+                &report.devices,
+                Measurement::Initial,
+                None,
+                false,
+                &projectors,
+                policy,
+            )?;
+            if preferred.fits {
+                let plan = assessed_intent(intent, &report, Measurement::Initial);
+                return Ok(fits_assessment(
+                    &plan,
+                    &preferred,
+                    HardwareRecommendation::Recommended,
+                ));
+            }
+
+            // Every load must store every tensor exactly once in some physical memory
+            // domain. llama_model_size is the native model's exact tensor storage, so
+            // exceeding aggregate stable capacity is a proof of non-fit, not an estimate.
+            if report.model.tensor_bytes > preferred.available_bytes {
+                return Ok(HardwareAssessment::DoesNotFit {
+                    profile: hardware_profile(intent, &preferred),
+                    memory: HardwareDeficit {
+                        required_bytes: preferred.required_bytes,
+                        available_bytes: preferred.available_bytes,
+                        deficit_bytes: preferred
+                            .required_bytes
+                            .saturating_sub(preferred.available_bytes),
+                        domains: preferred.domains,
+                    },
+                    limiting_resource: preferred.limiting_resource,
+                    alternative: None,
+                });
+            }
+
+            Ok(assess_with_backend(backend, intent, policy)?.assessment)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -699,7 +865,7 @@ type ProjectorMemory = llama_cpp_2::mtmd::MtmdDeviceMemoryEstimate;
 #[derive(Clone, Debug)]
 struct ProjectorMemory;
 
-fn projector_memory(plan: &ResolvedExecutionPlan) -> Result<Vec<ProjectorMemory>, AssessmentError> {
+fn projector_memory(plan: &ExecutionIntent) -> Result<Vec<ProjectorMemory>, AssessmentError> {
     let Some(projector) = plan.projector.as_ref() else {
         return Ok(Vec::new());
     };
@@ -739,12 +905,19 @@ struct CapacitySummary {
     available_bytes: u64,
     limiting_resource: String,
     device: String,
+    domains: Vec<HardwareMemoryDomainAssessment>,
 }
 
 #[derive(Debug)]
 struct CapacityDomain {
+    native_index: usize,
+    kind: FitDeviceKind,
     name: String,
     total_bytes: u64,
+    model_bytes: u64,
+    context_bytes: u64,
+    compute_bytes: u64,
+    auxiliary_bytes: u64,
     required_bytes: u64,
 }
 
@@ -754,7 +927,6 @@ fn capacity_summary(
     mtp_devices: Option<&[FitDeviceEstimate]>,
     mtp_includes_model: bool,
     projectors: &[ProjectorMemory],
-    host_cache_bytes: u64,
     policy: CapacityPolicy,
 ) -> Result<CapacitySummary, AssessmentError> {
     // Every accelerator exposed by the supported macOS llama.cpp build shares the process's
@@ -766,7 +938,6 @@ fn capacity_summary(
         mtp_devices,
         mtp_includes_model,
         projectors,
-        host_cache_bytes,
         policy,
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
     )
@@ -779,7 +950,6 @@ fn capacity_summary_for_topology(
     mtp_devices: Option<&[FitDeviceEstimate]>,
     mtp_includes_model: bool,
     projectors: &[ProjectorMemory],
-    host_cache_bytes: u64,
     policy: CapacityPolicy,
     unified: bool,
 ) -> Result<CapacitySummary, AssessmentError> {
@@ -814,18 +984,16 @@ fn capacity_summary_for_topology(
     for projector in projectors {
         if unified {
             if let Some(domain) = domains.first_mut() {
+                domain.auxiliary_bytes = domain.auxiliary_bytes.saturating_add(projector.bytes);
                 domain.required_bytes = domain.required_bytes.saturating_add(projector.bytes);
             }
-        } else if let Some(domain_index) = projector
-            .device_index
-            .filter(|index| *index < domains.len())
-            .or_else(|| {
-                domains
-                    .iter()
-                    .position(|domain| domain.name == projector.device_name)
-            })
-        {
+        } else if let Some(domain_index) = projector.device_index.and_then(|index| {
+            domains
+                .iter()
+                .position(|domain| domain.native_index == index)
+        }) {
             let domain = &mut domains[domain_index];
+            domain.auxiliary_bytes = domain.auxiliary_bytes.saturating_add(projector.bytes);
             domain.required_bytes = domain.required_bytes.saturating_add(projector.bytes);
         } else {
             return Err(AssessmentError::MissingMeasurements);
@@ -833,18 +1001,6 @@ fn capacity_summary_for_topology(
     }
     if domains.is_empty() {
         return Err(AssessmentError::MissingMeasurements);
-    }
-    if host_cache_bytes > 0 {
-        let host_index = if unified {
-            0
-        } else {
-            domains
-                .iter()
-                .position(|domain| domain.name.to_ascii_lowercase().contains("cpu"))
-                .unwrap_or(0)
-        };
-        let host_domain = &mut domains[host_index];
-        host_domain.required_bytes = host_domain.required_bytes.saturating_add(host_cache_bytes);
     }
     let mut required_bytes = 0_u64;
     let mut available_bytes = 0_u64;
@@ -876,6 +1032,26 @@ fn capacity_summary_for_topology(
             .map(|domain| domain.name.as_str())
             .collect::<Vec<_>>()
             .join(" + "),
+        domains: domains
+            .into_iter()
+            .map(|domain| {
+                let available_bytes = domain
+                    .total_bytes
+                    .saturating_sub(policy.reserve_bytes_per_domain);
+                HardwareMemoryDomainAssessment {
+                    memory_domain: domain.name,
+                    model_bytes: domain.model_bytes,
+                    context_bytes: domain.context_bytes,
+                    compute_bytes: domain.compute_bytes,
+                    auxiliary_bytes: domain.auxiliary_bytes,
+                    required_bytes: domain.required_bytes,
+                    available_bytes,
+                    margin_bytes: (i128::from(available_bytes) - i128::from(domain.required_bytes))
+                        .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                        as i64,
+                }
+            })
+            .collect(),
     })
 }
 
@@ -886,22 +1062,30 @@ fn add_additional_device_estimate(
     unified: bool,
     include_model: bool,
 ) -> Result<(), AssessmentError> {
-    let bytes = estimate
-        .allocations
-        .context_bytes
-        .saturating_add(estimate.allocations.compute_bytes)
-        .saturating_add(if include_model {
-            estimate.allocations.model_bytes
-        } else {
-            0
-        });
     let domain = if unified {
         domains.first_mut()
     } else {
-        domains.iter_mut().find(|domain| domain.name == device.name)
+        domains
+            .iter_mut()
+            .find(|domain| domain.native_index == device.index && domain.kind == device.kind)
     }
     .ok_or(AssessmentError::MissingMeasurements)?;
-    domain.required_bytes = domain.required_bytes.saturating_add(bytes);
+    if include_model {
+        domain.model_bytes = domain
+            .model_bytes
+            .saturating_add(estimate.allocations.model_bytes);
+    }
+    domain.context_bytes = domain
+        .context_bytes
+        .saturating_add(estimate.allocations.context_bytes);
+    domain.compute_bytes = domain
+        .compute_bytes
+        .saturating_add(estimate.allocations.compute_bytes);
+    domain.required_bytes = domain
+        .model_bytes
+        .saturating_add(domain.context_bytes)
+        .saturating_add(domain.compute_bytes)
+        .saturating_add(domain.auxiliary_bytes);
     Ok(())
 }
 
@@ -916,49 +1100,64 @@ fn add_device_estimate(
     if unified {
         if let Some(domain) = domains.first_mut() {
             domain.total_bytes = domain.total_bytes.max(total_bytes);
+            domain.model_bytes = domain
+                .model_bytes
+                .saturating_add(estimate.allocations.model_bytes);
+            domain.context_bytes = domain
+                .context_bytes
+                .saturating_add(estimate.allocations.context_bytes);
+            domain.compute_bytes = domain
+                .compute_bytes
+                .saturating_add(estimate.allocations.compute_bytes);
             domain.required_bytes = domain
-                .required_bytes
-                .saturating_add(estimate.allocations.total_bytes);
+                .model_bytes
+                .saturating_add(domain.context_bytes)
+                .saturating_add(domain.compute_bytes)
+                .saturating_add(domain.auxiliary_bytes);
         } else {
             domains.push(CapacityDomain {
+                native_index: device.index,
+                kind: device.kind,
                 name: "metal_unified_memory".to_owned(),
                 total_bytes,
+                model_bytes: estimate.allocations.model_bytes,
+                context_bytes: estimate.allocations.context_bytes,
+                compute_bytes: estimate.allocations.compute_bytes,
+                auxiliary_bytes: 0,
                 required_bytes: estimate.allocations.total_bytes,
             });
         }
     } else {
         domains.push(CapacityDomain {
+            native_index: device.index,
+            kind: device.kind,
             name: device.name.clone(),
             total_bytes,
+            model_bytes: estimate.allocations.model_bytes,
+            context_bytes: estimate.allocations.context_bytes,
+            compute_bytes: estimate.allocations.compute_bytes,
+            auxiliary_bytes: 0,
             required_bytes: estimate.allocations.total_bytes,
         });
     }
     Ok(())
 }
 
-fn resolved_plan(
-    requested: &ResolvedExecutionPlan,
+fn assessed_intent(
+    requested: &ExecutionIntent,
     report: &FitReport,
     measurement: Measurement,
-) -> Result<ResolvedExecutionPlan, AssessmentError> {
+) -> ExecutionIntent {
     let configuration = match measurement {
         Measurement::Initial => report.requested,
         Measurement::Fitted => report.fitted,
     };
     let mut plan = requested.clone();
     plan.context_size = configuration.resolved_context_tokens;
-    plan.execution.gpu_layers = match configuration.gpu_layers {
-        FitGpuLayers::Count(value) => GpuLayers::Count(value),
-        FitGpuLayers::All => GpuLayers::All,
-        FitGpuLayers::Auto => GpuLayers::Count(configuration.resolved_gpu_layers),
-    };
-    if matches!(measurement, Measurement::Fitted) && !report.tensor_split.is_empty() {
-        plan.execution.tensor_split = Some(report.tensor_split.clone());
-    }
-    Ok(plan)
+    plan
 }
 
-fn hardware_profile(plan: &ResolvedExecutionPlan, summary: &CapacitySummary) -> HardwareProfile {
+fn hardware_profile(plan: &ExecutionIntent, summary: &CapacitySummary) -> HardwareProfile {
     HardwareProfile {
         context_length: plan.context_size,
         acceleration: if matches!(plan.execution.gpu_layers, GpuLayers::Count(0)) {
@@ -971,7 +1170,7 @@ fn hardware_profile(plan: &ResolvedExecutionPlan, summary: &CapacitySummary) -> 
 }
 
 fn fits_assessment(
-    plan: &ResolvedExecutionPlan,
+    plan: &ExecutionIntent,
     summary: &CapacitySummary,
     recommendation: HardwareRecommendation,
 ) -> HardwareAssessment {
@@ -983,6 +1182,7 @@ fn fits_assessment(
             headroom_bytes: summary
                 .available_bytes
                 .saturating_sub(summary.required_bytes),
+            domains: summary.domains.clone(),
         },
         recommendation,
     }
@@ -1012,7 +1212,7 @@ pub fn estimate_with_backend(
     backend: &LlamaBackend,
     request: &FitRequest,
 ) -> Result<FitReport, EstimateError> {
-    estimate_impl(backend, request, None)
+    Ok(plan_fit_with_backend(backend, request, None)?.report)
 }
 
 /// Estimate an MTP model/context linked to the exact target execution context.
@@ -1021,53 +1221,134 @@ pub fn estimate_linked_with_backend(
     request: &FitRequest,
     target: &FitRequest,
 ) -> Result<FitReport, EstimateError> {
-    estimate_impl(backend, request, Some(target))
+    let target = plan_fit_with_backend(backend, target, None)?;
+    Ok(plan_fit_with_backend(backend, request, Some(&target.native))?.report)
 }
 
-fn estimate_impl(
+pub struct NativeParameterPlan {
+    model: PathBuf,
+    model_params: std::pin::Pin<Box<LlamaModelParams>>,
+    context_params: LlamaContextParams,
+    threads: NonZeroU32,
+    threads_batch: NonZeroU32,
+}
+
+/// Exact native parameter objects used only for MTP capability preflight. Construction lives
+/// beside ordinary fit/load planning so speculative discovery cannot drift from runtime defaults.
+pub struct MtpPreflightParameters {
+    pub model_params: std::pin::Pin<Box<LlamaModelParams>>,
+    pub target_context: LlamaContextParams,
+    pub draft_context: LlamaContextParams,
+}
+
+struct NativeFitPlan {
+    native: NativeParameterPlan,
+    report: FitReport,
+}
+
+impl NativeParameterPlan {
+    pub fn into_parts(
+        self,
+    ) -> (
+        PathBuf,
+        std::pin::Pin<Box<LlamaModelParams>>,
+        LlamaContextParams,
+        NonZeroU32,
+        NonZeroU32,
+    ) {
+        (
+            self.model,
+            self.model_params,
+            self.context_params,
+            self.threads,
+            self.threads_batch,
+        )
+    }
+}
+
+pub fn mtp_preflight_parameters(
+    intent: &ExecutionIntent,
+    recurrent_snapshots: u32,
+) -> Result<MtpPreflightParameters, AssessmentError> {
+    let mut preflight = intent.clone();
+    preflight.mtp = MtpConfig::Enabled {
+        source: MtpSource::Bundled,
+        n_max: recurrent_snapshots,
+        n_min: 0,
+        p_min: 0.0,
+        cache_type_k: CacheType::F16,
+        cache_type_v: CacheType::F16,
+    };
+    let target = native_parameter_plan(&fit_request(&preflight, false)?)?;
+    let draft = native_parameter_plan(&fit_request(&preflight, true)?)?;
+    Ok(MtpPreflightParameters {
+        model_params: target.model_params,
+        target_context: target.context_params,
+        draft_context: draft.context_params,
+    })
+}
+
+/// Build native parameters from intent without fitting. Intended for native parity tooling; model
+/// serving must use [`plan_load_with_backend`] so fitted placement is retained.
+pub fn native_parameters_for_intent(
+    intent: &ExecutionIntent,
+) -> Result<NativeParameterPlan, AssessmentError> {
+    Ok(native_parameter_plan(&fit_request(intent, false)?)?)
+}
+
+fn native_parameter_plan(request: &FitRequest) -> Result<NativeParameterPlan, EstimateError> {
+    validate(request)?;
+    let (threads, threads_batch) = native_thread_counts(&request.options);
+    Ok(NativeParameterPlan {
+        model: request.model.clone(),
+        model_params: Box::pin(native_model_params(&request.options)?),
+        context_params: native_context_params(&request.options),
+        threads,
+        threads_batch,
+    })
+}
+
+fn plan_fit_with_backend(
     _backend: &LlamaBackend,
     request: &FitRequest,
-    linked_target: Option<&FitRequest>,
-) -> Result<FitReport, EstimateError> {
-    validate(request)?;
+    linked_target: Option<&NativeParameterPlan>,
+) -> Result<NativeFitPlan, EstimateError> {
+    let mut native = native_parameter_plan(request)?;
     let model_path = path_c_string(&request.model)?;
     let max_devices = llama_cpp_2::max_devices();
     let mut margins = expand_margins(&request.options.margins_bytes, max_devices)?;
 
-    let model_params = native_model_params(&request.options)?;
-    let mut model_params = std::pin::pin!(model_params);
-    let mut context_params = native_context_params(&request.options);
-
-    if let Some(target) = linked_target {
-        validate(target)?;
+    let report = if let Some(target) = linked_target {
         let target_path = path_c_string(&target.model)?;
-        let target_model_params = native_model_params(&target.options)?;
-        let target_context_params = native_context_params(&target.options);
-        return model_params
+        native
+            .model_params
             .as_mut()
             .fit_params_report_linked(
                 &model_path,
-                &mut context_params,
+                &mut native.context_params,
                 llama_cpp_2::model::params::fit::LinkedFitTarget {
                     model_path: &target_path,
-                    model_params: &target_model_params,
-                    context_params: &target_context_params,
+                    model_params: target.model_params.as_ref().get_ref(),
+                    context_params: &target.context_params,
                 },
                 &mut margins,
                 request.options.minimum_context_tokens,
             )
-            .map_err(EstimateError::Fit);
-    }
+            .map_err(EstimateError::Fit)?
+    } else {
+        native
+            .model_params
+            .as_mut()
+            .fit_params_report(
+                &model_path,
+                &mut native.context_params,
+                &mut margins,
+                request.options.minimum_context_tokens,
+            )
+            .map_err(EstimateError::Fit)?
+    };
 
-    model_params
-        .as_mut()
-        .fit_params_report(
-            &model_path,
-            &mut context_params,
-            &mut margins,
-            request.options.minimum_context_tokens,
-        )
-        .map_err(EstimateError::Fit)
+    Ok(NativeFitPlan { native, report })
 }
 
 fn native_model_params(options: &FitOptions) -> Result<LlamaModelParams, EstimateError> {
@@ -1094,6 +1375,7 @@ fn native_model_params(options: &FitOptions) -> Result<LlamaModelParams, Estimat
 }
 
 fn native_context_params(options: &FitOptions) -> LlamaContextParams {
+    let (threads, threads_batch) = native_thread_counts(options);
     LlamaContextParams::default()
         .with_n_ctx(options.context_tokens)
         .with_n_batch(options.batch_tokens)
@@ -1112,6 +1394,17 @@ fn native_context_params(options: &FitOptions) -> LlamaContextParams {
         })
         .with_n_rs_seq(options.recurrent_snapshots)
         .with_n_outputs_max(options.maximum_outputs)
+        .with_n_threads(threads.get().min(i32::MAX as u32) as i32)
+        .with_n_threads_batch(threads_batch.get().min(i32::MAX as u32) as i32)
+}
+
+fn native_thread_counts(options: &FitOptions) -> (NonZeroU32, NonZeroU32) {
+    let threads = options.threads.unwrap_or_else(|| {
+        NonZeroU32::new(llama_cpp_2::model::params::fit::default_math_threads())
+            .expect("native math-thread default is positive")
+    });
+    let threads_batch = options.threads_batch.unwrap_or(threads);
+    (threads, threads_batch)
 }
 
 fn validate(request: &FitRequest) -> Result<(), EstimateError> {
@@ -1203,7 +1496,9 @@ mod tests {
         free_bytes: u64,
     ) -> DiscoveredDevice {
         DiscoveredDevice {
+            native_index: 0,
             backend: backend.to_owned(),
+            physical_id: None,
             name: name.to_owned(),
             description: description.to_owned(),
             kind,
@@ -1215,14 +1510,17 @@ mod tests {
     #[test]
     fn hardware_snapshot_deduplicates_backend_aliases_without_merging_duplicate_cards() {
         let gpu = |backend: &str, name: &str| {
-            discovered_device(
+            let mut device = discovered_device(
                 backend,
                 name,
                 "Example GPU",
                 HardwareDeviceKind::Gpu,
                 16_000,
                 12_000,
-            )
+            );
+            device.native_index = name.bytes().last().unwrap_or(b'0').saturating_sub(b'0') as usize;
+            device.physical_id = Some(format!("0000:01:0{}.0", device.native_index));
+            device
         };
         let snapshot = hardware_snapshot_from_devices(
             vec![
@@ -1409,7 +1707,6 @@ mod tests {
             None,
             false,
             &[],
-            100,
             CapacityPolicy {
                 reserve_bytes_per_domain: 100,
             },
@@ -1417,7 +1714,7 @@ mod tests {
         .unwrap();
         assert!(summary.fits);
         assert_eq!(summary.available_bytes, 900);
-        assert_eq!(summary.required_bytes, 500);
+        assert_eq!(summary.required_bytes, 400);
     }
 
     #[test]
@@ -1451,7 +1748,6 @@ mod tests {
             None,
             false,
             &[],
-            0,
             CapacityPolicy {
                 reserve_bytes_per_domain: 4_000,
             },
@@ -1492,7 +1788,6 @@ mod tests {
             Some(&[mtp]),
             false,
             &[],
-            0,
             CapacityPolicy {
                 reserve_bytes_per_domain: 0,
             },

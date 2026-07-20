@@ -11,7 +11,6 @@ import { HttpClient } from "@effect/platform/HttpClient"
 import { Context, Effect, Layer } from "effect"
 import type { Scope } from "effect/Scope"
 import { MagnitudeRpcs } from "@magnitudedev/protocol"
-import { TracingLayer } from "./tracing"
 
 const { Protocol } = RpcClient
 
@@ -39,7 +38,6 @@ export const protocolLayer = (url: string) =>
   RpcClient.layerProtocolHttp({ url: `${url}/rpc` }).pipe(
     Layer.provide(RpcSerialization.layerNdjson),
     Layer.provide(FetchHttpClient.layer),
-    Layer.provide(TracingLayer),
   )
 
 /**

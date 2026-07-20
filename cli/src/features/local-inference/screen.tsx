@@ -5,6 +5,7 @@ import { Cause, Effect, Option } from "effect"
 import { Atom, Result as AtomResult, useAtomMount } from "@effect-atom/atom-react"
 import type {
   LocalInferenceState,
+  LocalModelRecommendation,
   LocalSessionConcurrency,
 } from "@magnitudedev/sdk"
 import { useLocalInferenceState } from "@magnitudedev/client-common"
@@ -44,7 +45,7 @@ export const moveLocalUsageFocus = (currentIndex: number, direction: -1 | 1): nu
 export const localModelSectionRule = (label: string): string =>
   "─".repeat(Math.max(0, LOCAL_MODEL_SECTION_WIDTH - label.length - SECTION_LABEL_GAP))
 
-const recommendationBadge = (badge: LocalInferenceState["recommendations"][number]["badge"]): string => {
+const recommendationBadge = (badge: LocalModelRecommendation["badge"]): string => {
   if (badge === "lighter") return "Smaller Model"
   if (badge === "higher_fidelity") return "Higher Fidelity Option"
   if (badge === "alternative") return "Alternative Option"
@@ -159,7 +160,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     if (selection.kind === "running") {
       if (state.activeBinding?.providerModelId === selection.choice.providerModelId) {
         onConfigured()
-      } else if (selection.choice._tag === "RunningExternal") {
+      } else {
         setPendingActivationId(selection.id)
         local.activateModel(selection.id)
       }
@@ -170,7 +171,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       local.activateModel(selection.id)
       return
     }
-    const stored = state.choices.some((choice) => choice.choiceId === selection.id && choice._tag === "StoredOwned")
+    const stored = state.choices.some((choice) => choice.choiceId === selection.id && choice._tag === "Stored")
     if (stored) {
       setPendingActivationId(selection.id)
       local.activateModel(selection.id)
@@ -211,13 +212,13 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       return
     }
     if (key.name === "d") { key.preventDefault(); setDetails((value) => !value); return }
-    if (key.name === "r" && state.activeBinding?._tag === "Managed" && !busy) {
+    if (key.name === "r" && state.activeBinding && !busy) {
       key.preventDefault(); local.restart(); return
     }
     if (key.name === "u" && state.activeBinding && !busy) {
       key.preventDefault(); local.disable(); return
     }
-    if (key.name === "delete" && selected?.kind === "stored" && selected.choice._tag === "StoredOwned" && !busy) {
+    if (key.name === "delete" && selected?.kind === "stored" && !busy) {
       key.preventDefault(); local.deleteModel(selected.id); return
     }
     if (key.name === "c" && state.activeBinding && !busy) { key.preventDefault(); onConfigured(); return }
@@ -228,18 +229,18 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 
   if (stage === "usage") {
     const focusTarget = LOCAL_USAGE_FOCUS_ORDER[usageRow]!
-    const running = state.choices.find((choice) => choice._tag === "RunningExternal" || choice._tag === "RunningManaged")
+    const running = state.choices.find((choice) => choice._tag === "Running")
     const runningMetadata = running
-      ? [running.displayName, running.quantization?.format, running.contextTokens === undefined ? "Context unavailable" : `${formatContext(running.contextTokens)} context`, running._tag === "RunningManaged" ? "Managed by Magnitude" : "Running outside Magnitude"].filter(Boolean).join(" · ")
+      ? [running.displayName, running.quantization?.format, running.contextTokens === undefined ? "Context unavailable" : `${formatContext(running.contextTokens)} context`, "Managed by Magnitude"].filter(Boolean).join(" · ")
       : null
     return (
       <box key="local-usage" style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
         <box style={{ flexDirection: "column", paddingTop: 1, flexShrink: 0, width: "100%", maxWidth: LOCAL_USAGE_SETUP_WIDTH }}>
           <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
-          <text style={{ fg: theme.foreground }}>Magnitude uses llama.cpp to run local models in the background.</text>
-          <text style={{ fg: theme.muted }}>Tell us how many local sessions to reserve, and we'll recommend Hugging Face models that fit.</text>
+          <text style={{ fg: theme.foreground }}>Magnitude runs local models in the background.</text>
+          <text style={{ fg: theme.muted }}>Tell us how many local sessions to reserve, and we'll recommend models that fit.</text>
           {running && <box style={{ flexDirection: "column", paddingTop: 1 }}>
-            <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>● llama.cpp server detected</text>
+            <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>● Local model ready</text>
             <text style={{ fg: theme.muted }}>  {runningMetadata}</text>
           </box>}
           <box style={{ flexDirection: "column", paddingTop: 1 }}>
@@ -282,6 +283,10 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const firstStoredIndex = selections.findIndex((selection) => selection.kind === "stored")
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
   const hasExistingModels = firstRunningIndex >= 0 || firstStoredIndex >= 0
+  const recommendationsLoading = state.recommendationState._tag === "Loading"
+  const recommendationsFailed = state.recommendationState._tag === "Failed"
+    ? state.recommendationState.message
+    : null
   return (
     <scrollbox
       key="local-models"
@@ -325,7 +330,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         )}
       </box>
       <box style={{ flexDirection: "column" }}>
-        {selections.length === 0
+        {state.recommendationState._tag === "Ready" && selections.length === 0
           ? <text style={{ fg: theme.warning }}>No curated model currently fits this configuration.</text>
           : selections.map((selection, index) => {
             const capacityWarning = selectionCapacityWarning(selection)
@@ -355,13 +360,23 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
             </Button>
             </Fragment>
           })}
+        {recommendationsLoading && (
+          <box style={{ flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}>
+            <box style={{ flexDirection: "row", paddingBottom: 1 }}>
+              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
+                {hasExistingModels ? "POSSIBLE DOWNLOADS" : "RECOMMENDED DOWNLOADS"}
+              </text>
+            </box>
+            <text style={{ fg: theme.primary }}>Calculating recommendations for this machine…</text>
+          </box>
+        )}
+        {recommendationsFailed && <text style={{ fg: theme.warning }}>{recommendationsFailed}</text>}
         {details && selected?.kind === "recommendation" && (
           <box style={{ flexDirection: "column", paddingLeft: 1 }}>
             <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Exact artifact</text>
             <text style={{ fg: theme.muted }}>{selected.recommendation.repo}@{selected.recommendation.revision}</text>
             {selected.recommendation.files.map((file) => <box key={file.path} style={{ flexDirection: "column" }}>
               <text style={{ fg: theme.muted }}>{file.path} · SHA-256 {file.sha256}</text>
-              <text style={{ fg: theme.primary }}>{file.downloadUrl}</text>
             </box>)}
             <text style={{ fg: theme.primary }}>{selected.recommendation.sourcePageUrl}</text>
             <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Quantization fidelity</text>

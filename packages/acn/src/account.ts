@@ -214,9 +214,9 @@ export function slotStatesFromModels(
     const userSlotConfig = userConfig?.slots?.[slotId]
     const intent = userConfig?.localSlotIntent?.[slotId]
     const eligibleModels = intent === "local"
-      ? routableModels.filter((model) => model.providerId === "llamacpp")
+      ? routableModels.filter((model) => model.providerId === "local")
       : intent === "cloud"
-        ? routableModels.filter((model) => model.providerId !== "llamacpp")
+        ? routableModels.filter((model) => model.providerId !== "local")
         : routableModels
     const hasOverride = userSlotConfig?.providerId !== undefined && userSlotConfig.providerModelId !== undefined
     const selected = hasOverride
@@ -545,7 +545,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
           Effect.either,
         )
         const current = yield* Ref.get(providerCatalogs)
-        const providerId = ProviderIdSchema.make("llamacpp")
+        const providerId = ProviderIdSchema.make("local")
         const byProvider = new Map(current.byProvider)
         const failuresByProvider = new Map(current.failuresByProvider)
         if (local._tag === "Right") {

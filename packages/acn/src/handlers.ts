@@ -349,18 +349,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localInference.configureUsage(selection).pipe(Effect.as({})),
         ),
 
-      InstallManagedLlamaCpp: () =>
-        observeRpcDefects(
-          "InstallManagedLlamaCpp",
-          localInference.installLlamaCpp.pipe(Effect.map((operationId) => ({ operationId }))),
-        ),
-
-      RefreshLocalInferenceInstallations: () =>
-        observeRpcDefects(
-          "RefreshLocalInferenceInstallations",
-          localInference.refreshInstallations.pipe(Effect.as({})),
-        ),
-
       DownloadLocalModel: ({ configurationId }) =>
         observeRpcDefects(
           "DownloadLocalModel",

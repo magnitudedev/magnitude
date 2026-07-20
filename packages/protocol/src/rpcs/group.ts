@@ -43,8 +43,6 @@ export const MagnitudeRpcs = RpcGroup.make(
   Config.GetCloudUsage.middleware(AcnRpcCommandActivity),
   LocalInference.GetLocalInferenceState.middleware(AcnRpcCommandActivity),
   LocalInference.ConfigureLocalInferenceUsage.middleware(AcnRpcCommandActivity),
-  LocalInference.InstallManagedLlamaCpp.middleware(AcnRpcCommandActivity),
-  LocalInference.RefreshLocalInferenceInstallations.middleware(AcnRpcCommandActivity),
   LocalInference.DownloadLocalModel.middleware(AcnRpcCommandActivity),
   LocalInference.ActivateLocalModel.middleware(AcnRpcCommandActivity),
   LocalInference.DeleteLocalModel.middleware(AcnRpcCommandActivity),

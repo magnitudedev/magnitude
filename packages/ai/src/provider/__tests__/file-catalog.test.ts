@@ -36,7 +36,7 @@ describe("file-backed model catalog", () => {
     const directory = await mkdtemp(join(tmpdir(), "magnitude-model-cache-"))
     const models = [
       model(ProviderIdSchema.make("magnitude"), "Hosted model"),
-      model(ProviderIdSchema.make("llamacpp"), "Local model"),
+      model(ProviderIdSchema.make("local"), "Local model"),
     ]
     const inner: ModelCatalog<ProviderModel> = {
       list: Effect.succeed(models),
@@ -54,7 +54,7 @@ describe("file-backed model catalog", () => {
     try {
       const catalog = makeFileBackedModelCatalog(inner, join(directory, "models.json"))
       const local = await Effect.runPromise(
-        catalog.get(ProviderIdSchema.make("llamacpp"), ProviderModelIdSchema.make("shared-model-id")).pipe(
+        catalog.get(ProviderIdSchema.make("local"), ProviderModelIdSchema.make("shared-model-id")).pipe(
           Effect.provide(FetchHttpClient.layer),
         ),
       )

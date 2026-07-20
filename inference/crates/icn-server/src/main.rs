@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+#[cfg(not(test))]
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -16,21 +18,21 @@ use icn_api::{
     RuntimeStatus, ServerIdentity, app,
 };
 use icn_contracts::{
-    CacheType, CompletionBackend, ComponentRole, ExecutionConfig, FlashAttention, GpuLayers,
-    HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
+    CacheType, CompletionBackend, ComponentRole, ExecutionConfig, ExecutionIntent, FlashAttention,
+    GpuLayers, HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
     InventoryHardwareAssessor, LoadStage, ModelHardwareAssessor, ModelId, ModelInventory,
-    ModelPreviewProfile, ModelStatus, ProjectorConfig, RadixCacheConfig, ResolvedExecutionPlan,
-    ResolvedModel, SplitMode,
+    ModelPreviewProfile, ModelStatus, ProjectorConfig, ResolvedModel, SplitMode,
+    TemplateAssessment, TemplateAssessor,
 };
-use icn_engine::{LlamaCompletionBackend, resolve_execution_plan};
-use icn_hardware::{
-    CapacityPolicy, assess as assess_hardware, assess_with_backend, discover, discover_hardware,
-};
+use icn_engine::LlamaCompletionBackend;
+use icn_hardware::{CapacityPolicy, assess as assess_hardware, discover, discover_hardware};
 use icn_models::{InventoryConfig, ModelManager, ModelPreviewService};
-use icn_reasoning::NativeTemplateAssessor;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::Instrument as _;
 
 mod build_identity;
+mod telemetry;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -93,9 +95,6 @@ enum Command {
         /// Magnitude-owned model inventory and Hugging Face cache root.
         #[arg(long, visible_alias = "models-dir")]
         model_store: Option<PathBuf>,
-        /// One-time read-only import source for the TypeScript v1 managed store.
-        #[arg(long)]
-        legacy_store: Option<PathBuf>,
         /// Additional read-only directories containing GGUF models.
         #[arg(long = "model-source")]
         model_sources: Vec<PathBuf>,
@@ -115,7 +114,7 @@ enum Command {
         /// GPU layers: `auto` runs pinned common/fit, `all` fully offloads, or use a count.
         #[arg(long, default_value = "auto")]
         gpu_layers: GpuLayers,
-        /// Disable model memory mapping (enabled by default, matching llama-server).
+        /// Disable model memory mapping (enabled by the native service profile).
         #[arg(long)]
         no_mmap: bool,
         /// Keep mapped model pages resident in RAM.
@@ -138,18 +137,6 @@ enum Command {
         swa_full: bool,
         #[arg(long)]
         kv_unified: bool,
-        /// Disable automatic radix-prefix KV reuse even when unified KV supports native pages.
-        #[arg(long)]
-        no_radix_cache: bool,
-        /// Strict lazy-allocation budget for serialized KV pages retained in system RAM.
-        #[arg(long, default_value_t = 0)]
-        radix_cache_host_bytes: u64,
-        /// Strict budget for serialized KV pages retained on local storage.
-        #[arg(long, default_value_t = 0)]
-        radix_cache_disk_bytes: u64,
-        /// Storage directory for the disk KV tier (required when its budget is non-zero).
-        #[arg(long)]
-        radix_cache_dir: Option<PathBuf>,
         #[arg(long)]
         threads: Option<NonZeroU32>,
         #[arg(long)]
@@ -162,19 +149,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(hide = true)]
+    PlanWorker,
+    #[command(hide = true)]
+    TemplateWorker,
 }
 
 #[derive(Debug, Clone)]
 struct TensorSplitArg(Vec<f32>);
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct RuntimePlanDefaults {
     context_size: u32,
     batch_size: u32,
     ubatch_size: u32,
     max_sequences: u32,
     prefill_quantum: u32,
-    radix_cache: RadixCacheConfig,
     execution: ExecutionConfig,
     projector_use_gpu: bool,
     projector_warmup: bool,
@@ -188,35 +178,28 @@ enum MtpSelection {
     Explicit(PathBuf),
 }
 
-fn resolved_plan(
-    model_path: PathBuf,
-    projector_path: Option<PathBuf>,
-    mtp_selection: MtpSelection,
-    defaults: &RuntimePlanDefaults,
-) -> anyhow::Result<ResolvedExecutionPlan> {
-    let mut plan = base_plan(model_path, projector_path, defaults)?;
+fn select_mtp(plan: &mut ExecutionIntent, mtp_selection: MtpSelection) -> anyhow::Result<()> {
     let candidates = match &mtp_selection {
         MtpSelection::Automatic(paths) => icn_mtp::CandidatePolicy::Automatic(paths),
         MtpSelection::Explicit(path) => icn_mtp::CandidatePolicy::Explicit(path),
     };
-    plan.mtp = icn_mtp::select_mtp(&plan, candidates)
+    plan.mtp = icn_mtp::select_mtp(plan, candidates)
         .context("failed to select a native MTP configuration")?;
-    resolve_execution_plan(plan).context("failed to resolve MTP execution defaults")
+    Ok(())
 }
 
-fn base_plan(
+fn execution_intent(
     model_path: PathBuf,
     projector_path: Option<PathBuf>,
     defaults: &RuntimePlanDefaults,
-) -> anyhow::Result<ResolvedExecutionPlan> {
-    resolve_execution_plan(ResolvedExecutionPlan {
+) -> anyhow::Result<ExecutionIntent> {
+    Ok(ExecutionIntent {
         model_path,
         context_size: defaults.context_size,
         batch_size: defaults.batch_size,
         ubatch_size: defaults.ubatch_size,
         max_sequences: defaults.max_sequences,
         prefill_quantum: defaults.prefill_quantum,
-        radix_cache: defaults.radix_cache.clone(),
         execution: defaults.execution.clone(),
         projector: projector_path.map(|path| {
             let mut projector = ProjectorConfig::new(path);
@@ -228,16 +211,77 @@ fn base_plan(
         }),
         mtp: icn_contracts::MtpConfig::default(),
     })
-    .context("failed to resolve execution defaults")
+}
+
+fn load_execution_intent(
+    model_path: PathBuf,
+    projector_path: Option<PathBuf>,
+    mtp_selection: MtpSelection,
+    defaults: &RuntimePlanDefaults,
+) -> anyhow::Result<ExecutionIntent> {
+    let mut intent = execution_intent(model_path, projector_path, defaults)?;
+    match assess_hardware(&intent, CapacityPolicy::default())?.assessment {
+        HardwareAssessment::InvalidArtifact { code, message } => {
+            anyhow::bail!("invalid artifact ({code}): {message}")
+        }
+        HardwareAssessment::IncompatibleArtifact { code, message } => {
+            anyhow::bail!("incompatible artifact ({code}): {message}")
+        }
+        HardwareAssessment::DoesNotFit { .. } | HardwareAssessment::NotAssessed { .. } => {
+            return Ok(intent);
+        }
+        HardwareAssessment::Fits { .. } => {}
+    }
+    select_mtp(&mut intent, mtp_selection)?;
+    Ok(intent)
 }
 
 struct NativeHardwareAssessor {
     defaults: RuntimePlanDefaults,
     native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
     gate: tokio::sync::Mutex<()>,
+    planning_slots: Arc<tokio::sync::Semaphore>,
 }
 
-const ASSESSMENT_PROFILE_RESOLVER: &str = "icn-runtime-plan-defaults";
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct PlanningWorkerRequest {
+    primary: PathBuf,
+    projector: Option<PathBuf>,
+    mtp: Vec<PathBuf>,
+    defaults: Vec<RuntimePlanDefaults>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct TemplateWorkerRequest {
+    model_path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct NativeTemplateAssessor;
+
+impl TemplateAssessor for NativeTemplateAssessor {
+    fn cache_identity(&self) -> &str {
+        concat!("icn-native-model-template:", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn assess(
+        &self,
+        inputs: &icn_contracts::EffectiveTemplateInputs,
+    ) -> Result<TemplateAssessment, String> {
+        run_isolated_template_inspection(TemplateWorkerRequest {
+            model_path: inputs.model_path.clone(),
+        })
+        .map_err(|error| format!("{error:#}"))
+    }
+}
+
+const ASSESSMENT_PROFILE_RESOLVER: &str = "icn-backend-plan-v1";
+#[cfg(not(test))]
+const PLANNING_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(not(test))]
+const MAX_PLANNING_WORKER_OUTPUT_BYTES: usize = 1024 * 1024;
+#[cfg(not(test))]
+const TEMPLATE_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl NativeHardwareAssessor {
     fn effective_defaults(&self, profile: Option<&ModelPreviewProfile>) -> RuntimePlanDefaults {
@@ -254,7 +298,18 @@ impl NativeHardwareAssessor {
         resolved: ResolvedModel,
         profile: Option<&icn_contracts::ModelPreviewProfile>,
     ) -> Result<HardwareAssessment, InventoryError> {
-        let _guard = self.gate.lock().await;
+        let profiles = profile.cloned().into_iter().collect();
+        let mut assessments = self.assess_resolved_profiles(resolved, profiles).await?;
+        assessments.pop().ok_or_else(|| {
+            InventoryError::Internal("native planner returned no assessment".to_owned())
+        })
+    }
+
+    async fn assess_resolved_profiles(
+        &self,
+        resolved: ResolvedModel,
+        profiles: Vec<ModelPreviewProfile>,
+    ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         let id = resolved.model.id.clone();
         let primary = resolved
             .components
@@ -279,36 +334,27 @@ impl NativeHardwareAssessor {
             .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
             .map(|component| component.path.clone())
             .collect();
-        let native_executor = self
-            .native_executor
-            .read()
-            .map_err(|_| InventoryError::Internal("native executor lock poisoned".to_owned()))?
-            .clone();
-        let defaults = self.effective_defaults(profile);
-        match tokio::task::spawn_blocking(move || match native_executor {
-            Some(executor) => executor
-                .run_exclusive_native(move |backend| {
-                    let mut plan = base_plan(primary, projector, &defaults)?;
-                    plan.mtp = icn_mtp::select_mtp_with_backend(
-                        backend,
-                        &plan,
-                        icn_mtp::CandidatePolicy::Automatic(&mtp),
-                    )
-                    .context("failed to select a native MTP configuration")?;
-                    let plan = resolve_execution_plan(plan)
-                        .context("failed to resolve MTP execution defaults")?;
-                    assess_with_backend(backend, &plan, CapacityPolicy::default())
-                        .map(|value| value.assessment)
-                        .map_err(anyhow::Error::from)
-                })
-                .map_err(|error| anyhow::anyhow!(error))?,
-            None => {
-                let plan =
-                    resolved_plan(primary, projector, MtpSelection::Automatic(mtp), &defaults)?;
-                assess_hardware(&plan, CapacityPolicy::default())
-                    .map(|value| value.assessment)
-                    .map_err(anyhow::Error::from)
-            }
+        let defaults = if profiles.is_empty() {
+            vec![self.effective_defaults(None)]
+        } else {
+            profiles
+                .iter()
+                .map(|profile| self.effective_defaults(Some(profile)))
+                .collect()
+        };
+        let request = PlanningWorkerRequest {
+            primary,
+            projector,
+            mtp,
+            defaults,
+        };
+        let permit = Arc::clone(&self.planning_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| InventoryError::Internal("native planner pool closed".to_owned()))?;
+        match spawn_blocking_traced(move || {
+            let _permit = permit;
+            run_isolated_planning(request)
         })
         .await
         {
@@ -344,6 +390,241 @@ impl NativeHardwareAssessor {
         ))
         .map_err(|error| InventoryError::Internal(error.to_string()))
     }
+}
+
+fn planner_concurrency() -> usize {
+    std::thread::available_parallelism().map_or(1, |cores| cores.get().clamp(1, 16))
+}
+
+fn assess_planning_request(
+    request: PlanningWorkerRequest,
+) -> anyhow::Result<Vec<HardwareAssessment>> {
+    let backend = llama_cpp_2::llama_backend::LlamaBackend::init()?;
+    let mut plans = request
+        .defaults
+        .into_iter()
+        .map(|defaults| {
+            execution_intent(
+                request.primary.clone(),
+                request.projector.clone(),
+                &defaults,
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let base =
+        icn_hardware::assess_profiles_with_backend(&backend, &plans, CapacityPolicy::default())?;
+    plans
+        .iter_mut()
+        .zip(base)
+        .map(|(plan, base)| {
+            if !matches!(base, HardwareAssessment::Fits { .. }) {
+                return Ok(base);
+            }
+            plan.mtp = icn_mtp::select_mtp_with_backend(
+                &backend,
+                &plan,
+                icn_mtp::CandidatePolicy::Automatic(&request.mtp),
+            )
+            .context("failed to select a native MTP configuration")?;
+            if matches!(plan.mtp, icn_contracts::MtpConfig::Disabled { .. }) {
+                return Ok(base);
+            }
+            Ok(
+                icn_hardware::assess_with_backend(&backend, &plan, CapacityPolicy::default())?
+                    .assessment,
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn run_isolated_planning(
+    request: PlanningWorkerRequest,
+) -> anyhow::Result<Vec<HardwareAssessment>> {
+    icn_engine::disable_native_diagnostics();
+    assess_planning_request(request)
+}
+
+#[cfg(not(test))]
+fn run_isolated_planning(
+    request: PlanningWorkerRequest,
+) -> anyhow::Result<Vec<HardwareAssessment>> {
+    use std::io::Write as _;
+
+    let executable = std::env::current_exe().context("failed to locate ICN planner executable")?;
+    let mut child = ProcessCommand::new(executable)
+        .arg("plan-worker")
+        .env("MAGNITUDE_OTEL", "0")
+        .env("RUST_LOG", "error")
+        .env_remove("MAGNITUDE_OTEL_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start isolated native planner")?;
+    serde_json::to_writer(
+        child
+            .stdin
+            .as_mut()
+            .context("isolated native planner stdin was unavailable")?,
+        &request,
+    )
+    .context("failed to encode isolated native planner request")?;
+    child
+        .stdin
+        .take()
+        .context("isolated native planner stdin was unavailable")?
+        .flush()
+        .context("failed to flush isolated native planner request")?;
+    let deadline = std::time::Instant::now() + PLANNING_WORKER_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .context("failed to observe isolated native planner")?
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("isolated native planner exceeded its time bound");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to await isolated native planner")?;
+    if output.stdout.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
+        || output.stderr.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
+    {
+        anyhow::bail!("isolated native planner exceeded its output bound");
+    }
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "isolated native planner exited with {}: {}",
+            output.status,
+            diagnostic.trim().chars().take(4_096).collect::<String>()
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("isolated native planner returned an invalid assessment")
+}
+
+fn run_planning_worker() -> anyhow::Result<()> {
+    let request = serde_json::from_reader(std::io::stdin().lock())
+        .context("failed to decode native planner request")?;
+    let assessment = assess_planning_request(request)?;
+    serde_json::to_writer(std::io::stdout().lock(), &assessment)
+        .context("failed to encode native planner result")?;
+    Ok(())
+}
+
+fn inspect_template_request(request: TemplateWorkerRequest) -> anyhow::Result<TemplateAssessment> {
+    icn_engine::disable_native_diagnostics();
+    let inspection = icn_reasoning::inspect_template_inputs(
+        &icn_contracts::EffectiveTemplateInputs {
+            model_path: request.model_path,
+        },
+    )?;
+    Ok(TemplateAssessment {
+        capabilities: inspection.capabilities,
+        reasoning: inspection.reasoning,
+        fingerprint: inspection.template_fingerprint,
+    })
+}
+
+#[cfg(test)]
+fn run_isolated_template_inspection(
+    request: TemplateWorkerRequest,
+) -> anyhow::Result<TemplateAssessment> {
+    inspect_template_request(request)
+}
+
+#[cfg(not(test))]
+fn run_isolated_template_inspection(
+    request: TemplateWorkerRequest,
+) -> anyhow::Result<TemplateAssessment> {
+    use std::io::Write as _;
+
+    let executable = std::env::current_exe().context("failed to locate ICN template worker")?;
+    let mut child = ProcessCommand::new(executable)
+        .arg("template-worker")
+        .env("MAGNITUDE_OTEL", "0")
+        .env("RUST_LOG", "error")
+        .env_remove("MAGNITUDE_OTEL_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start isolated native template worker")?;
+    serde_json::to_writer(
+        child
+            .stdin
+            .as_mut()
+            .context("template worker stdin was unavailable")?,
+        &request,
+    )
+    .context("failed to encode template worker request")?;
+    child
+        .stdin
+        .take()
+        .context("template worker stdin was unavailable")?
+        .flush()
+        .context("failed to flush template worker request")?;
+    let deadline = std::time::Instant::now() + TEMPLATE_WORKER_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .context("failed to observe isolated native template worker")?
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("isolated native template worker exceeded its time bound");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to await isolated native template worker")?;
+    if output.stdout.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
+        || output.stderr.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
+    {
+        anyhow::bail!("isolated native template worker exceeded its output bound");
+    }
+    if !output.status.success() {
+        anyhow::bail!(
+            "template worker exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(4_096)
+                .collect::<String>()
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("template worker returned an invalid assessment")
+}
+
+fn run_template_worker() -> anyhow::Result<()> {
+    let request = serde_json::from_reader(std::io::stdin().lock())
+        .context("failed to decode native template request")?;
+    let assessment = inspect_template_request(request)?;
+    serde_json::to_writer(std::io::stdout().lock(), &assessment)
+        .context("failed to encode native template assessment")?;
+    Ok(())
 }
 
 impl InventoryHardwareAssessor for NativeHardwareAssessor {
@@ -382,6 +663,14 @@ impl ModelHardwareAssessor for NativeHardwareAssessor {
     ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
         Box::pin(async move { self.assess_resolved(model, profile.as_ref()).await })
     }
+
+    fn assess_profiles(
+        &self,
+        model: ResolvedModel,
+        profiles: Vec<ModelPreviewProfile>,
+    ) -> BoxFuture<'_, Result<Vec<HardwareAssessment>, InventoryError>> {
+        Box::pin(async move { self.assess_resolved_profiles(model, profiles).await })
+    }
 }
 
 impl HardwareProvider for NativeHardwareAssessor {
@@ -393,16 +682,12 @@ impl HardwareProvider for NativeHardwareAssessor {
                 .read()
                 .map_err(|_| InventoryError::Internal("native executor lock poisoned".to_owned()))?
                 .clone();
-            let native_build = format!(
-                "bindings:{};llama_cpp:{}",
-                build_identity::BINDINGS_REVISION,
-                build_identity::LLAMA_CPP_REVISION
-            );
+            let native_build = build_identity::native_build();
             let enabled_backends = build_identity::enabled_backends()
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
-            tokio::task::spawn_blocking(move || match native_executor {
+            spawn_blocking_traced(move || match native_executor {
                 Some(executor) => executor
                     .run_exclusive_native(move |backend| {
                         Ok(discover_hardware(
@@ -479,6 +764,15 @@ impl NativeRuntimeController {
         runtime_lost: bool,
     ) {
         let message = message.into();
+        tracing::error!(
+            operation.id = %operation_id,
+            model.id = %model_id,
+            error.code = code,
+            error.message = %message,
+            error.retryable = retryable,
+            runtime.lost = runtime_lost,
+            "runtime model operation failed"
+        );
         if runtime_lost {
             let generation = self.backends.generation();
             *self.state.write().await = RuntimeStateResponse {
@@ -525,7 +819,7 @@ impl NativeRuntimeController {
         &self,
         model_id: &str,
         profile: &RuntimeExecutionProfile,
-    ) -> Result<(ResolvedModel, ResolvedExecutionPlan), InventoryError> {
+    ) -> Result<(ResolvedModel, ExecutionIntent), InventoryError> {
         let id = ModelId::parse(model_id.to_owned())?;
         self.inventory.ensure_model_inventory().await?;
         let resolved = self.inventory.resolve_ready(&id).await?;
@@ -553,8 +847,8 @@ impl NativeRuntimeController {
             .map(|component| component.path.clone())
             .collect();
         let defaults = self.profile_defaults(profile)?;
-        let plan = tokio::task::spawn_blocking(move || {
-            resolved_plan(primary, projector, MtpSelection::Automatic(mtp), &defaults)
+        let plan = spawn_blocking_traced(move || {
+            load_execution_intent(primary, projector, MtpSelection::Automatic(mtp), &defaults)
         })
         .await
         .map_err(|error| InventoryError::Internal(error.to_string()))?
@@ -564,6 +858,11 @@ impl NativeRuntimeController {
         Ok((resolved, plan))
     }
 
+    #[tracing::instrument(
+        name = "icn.runtime.load.operation",
+        skip_all,
+        fields(operation.id = %operation_id, model.id = %request.model_id)
+    )]
     async fn run_load(
         self,
         request: LoadRuntimeModelRequest,
@@ -662,8 +961,7 @@ impl NativeRuntimeController {
 
         let assessment_result = {
             let _assessment_guard = self.assessor.gate.lock().await;
-            tokio::task::spawn_blocking(move || assess_hardware(&plan, CapacityPolicy::default()))
-                .await
+            spawn_blocking_traced(move || assess_hardware(&plan, CapacityPolicy::default())).await
         };
         let assessed = match assessment_result {
             Ok(Ok(value)) => value,
@@ -723,6 +1021,10 @@ impl NativeRuntimeController {
             .await;
             return;
         }
+        let execution_backend = match &assessed.assessment {
+            HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
+            _ => "native".to_owned(),
+        };
 
         let _ = Self::emit(
             &sender,
@@ -772,7 +1074,7 @@ impl NativeRuntimeController {
         )
         .await;
         let model_id = request.model_id.clone();
-        let backend = match tokio::task::spawn_blocking(move || {
+        let backend = match spawn_blocking_traced(move || {
             LlamaCompletionBackend::load(model_id, assessed.plan)
         })
         .await
@@ -850,23 +1152,20 @@ impl NativeRuntimeController {
         if let Ok(mut slot) = self.native_executor.write() {
             *slot = Some(Arc::clone(&backend));
         }
-        let mut execution: std::collections::BTreeMap<_, _> =
+        let execution: std::collections::BTreeMap<_, _> =
             serde_json::to_value(&properties.execution.resolved)
                 .ok()
                 .and_then(|value| value.as_object().cloned())
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-        if let Ok(radix_cache) = serde_json::to_value(&self.defaults.radix_cache) {
-            execution.insert("radix_cache".to_owned(), radix_cache);
-        }
         let _ = self
             .inventory
             .update_status(
                 &resolved.model.id,
                 ModelStatus::Loaded {
                     loaded_at: unix_timestamp(),
-                    backend: "llama_cpp".to_owned(),
+                    backend: execution_backend,
                     context_length: properties.context_tokens,
                     execution,
                 },
@@ -890,6 +1189,7 @@ impl NativeRuntimeController {
             },
         )
         .await;
+        tracing::info!("runtime model ready");
     }
 }
 
@@ -905,7 +1205,11 @@ impl RuntimeController for NativeRuntimeController {
         );
         let runtime = self.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(runtime.run_load(request, operation_id, sender));
+        tokio::spawn(
+            runtime
+                .run_load(request, operation_id, sender)
+                .in_current_span(),
+        );
         ReceiverStream::new(receiver).boxed()
     }
 
@@ -980,6 +1284,10 @@ impl std::str::FromStr for TensorSplitArg {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _telemetry = telemetry::init()?;
+    // Native planner diagnostics are extremely verbose and can dominate metadata-only fitting.
+    // ICN emits bounded, structured operation telemetry at the service boundary instead.
+    icn_engine::disable_native_diagnostics();
     match Cli::parse().command {
         Command::Serve {
             bind,
@@ -997,7 +1305,6 @@ async fn main() -> anyhow::Result<()> {
             image_max_tokens,
             model_alias,
             model_store,
-            legacy_store: configured_legacy_store,
             model_sources,
             hf_caches,
             context_size,
@@ -1016,28 +1323,17 @@ async fn main() -> anyhow::Result<()> {
             no_op_offload,
             swa_full,
             kv_unified,
-            no_radix_cache,
-            radix_cache_host_bytes,
-            radix_cache_disk_bytes,
-            radix_cache_dir,
             threads,
             threads_batch,
             flash_attention,
         } => {
-            let (inventory_root, legacy_store) = match model_store {
-                Some(root) => (root, configured_legacy_store),
-                None => {
-                    let root = InventoryConfig::default_root()
-                        .context("failed to determine default model store")?;
-                    let legacy = root
-                        .parent()
-                        .map(|parent| parent.join("local-inference/huggingface"));
-                    (root, configured_legacy_store.or(legacy))
-                }
+            let inventory_root = match model_store {
+                Some(root) => root,
+                None => InventoryConfig::default_root()
+                    .context("failed to determine default model store")?,
             };
             let mut inventory_config = InventoryConfig::with_root(inventory_root)
                 .context("invalid model inventory configuration")?;
-            inventory_config.legacy_store = legacy_store;
             inventory_config.model_sources.extend(model_sources);
             inventory_config.hf_cache_dirs.extend(hf_caches);
             let plan_defaults = RuntimePlanDefaults {
@@ -1046,13 +1342,6 @@ async fn main() -> anyhow::Result<()> {
                 ubatch_size,
                 max_sequences,
                 prefill_quantum: prefill_quantum.unwrap_or(batch_size),
-                radix_cache: RadixCacheConfig {
-                    enabled: !no_radix_cache,
-                    page_tokens: NonZeroU32::new(16).expect("16 is non-zero"),
-                    host_bytes: radix_cache_host_bytes,
-                    disk_bytes: radix_cache_disk_bytes,
-                    disk_path: radix_cache_dir,
-                },
                 execution: ExecutionConfig {
                     gpu_layers,
                     use_mmap: !no_mmap,
@@ -1091,6 +1380,7 @@ async fn main() -> anyhow::Result<()> {
                 defaults: plan_defaults.clone(),
                 native_executor: Arc::clone(&native_executor_slot),
                 gate: tokio::sync::Mutex::new(()),
+                planning_slots: Arc::new(tokio::sync::Semaphore::new(planner_concurrency())),
             });
             inventory
                 .set_hardware_assessor(inventory_hardware_assessor.clone())
@@ -1210,18 +1500,23 @@ async fn main() -> anyhow::Result<()> {
                         .await
                         .context("failed to register the active model")?,
                 };
-                let requested_plan = resolved_plan(path, mmproj, mtp_model, &plan_defaults)?;
+                let requested_plan =
+                    load_execution_intent(path, mmproj, mtp_model, &plan_defaults)?;
                 let assessed = assess_hardware(&requested_plan, CapacityPolicy::default())
-                    .context("failed to assess the resolved execution plan")?;
+                    .context("failed to assess execution intent")?;
                 if let icn_contracts::HardwareAssessment::DoesNotFit { memory, .. } =
                     &assessed.assessment
                 {
                     anyhow::bail!(
-                        "resolved execution plan requires {} bytes but stable capacity is {} bytes",
+                        "execution intent requires {} bytes but stable capacity is {} bytes",
                         memory.required_bytes,
                         memory.available_bytes
                     );
                 }
+                let execution_backend = match &assessed.assessment {
+                    HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
+                    _ => "native".to_owned(),
+                };
                 let load_id = format!("load-{}", unix_timestamp());
                 inventory
                     .update_status(
@@ -1251,28 +1546,25 @@ async fn main() -> anyhow::Result<()> {
                                 },
                             )
                             .await;
-                        return Err(error).context("failed to load llama.cpp backend");
+                        return Err(error).context("failed to load native backend");
                     }
                 };
                 let properties = backend
                     .properties()
                     .context("failed to read loaded model properties")?;
-                let mut execution: std::collections::BTreeMap<_, _> =
+                let execution: std::collections::BTreeMap<_, _> =
                     serde_json::to_value(&properties.execution.resolved)
                         .ok()
                         .and_then(|value| value.as_object().cloned())
                         .unwrap_or_default()
                         .into_iter()
                         .collect();
-                if let Ok(radix_cache) = serde_json::to_value(&assessed.plan.radix_cache) {
-                    execution.insert("radix_cache".to_owned(), radix_cache);
-                }
                 inventory
                     .update_status(
                         &inventory_id,
                         ModelStatus::Loaded {
                             loaded_at: unix_timestamp(),
-                            backend: "llama_cpp".to_owned(),
+                            backend: execution_backend,
                             context_length: properties.context_tokens,
                             execution,
                         },
@@ -1312,11 +1604,7 @@ async fn main() -> anyhow::Result<()> {
                 plan_defaults,
                 initial_runtime,
             ));
-            let native_build = format!(
-                "bindings:{};llama_cpp:{}",
-                build_identity::BINDINGS_REVISION,
-                build_identity::LLAMA_CPP_REVISION
-            );
+            let native_build = build_identity::native_build();
             let identity = ServerIdentity {
                 instance_id: instance_id.clone(),
                 api_version: 1,
@@ -1350,9 +1638,20 @@ async fn main() -> anyhow::Result<()> {
                     "nativeBuild": native_build,
                 })
             );
-            axum::serve(listener, app(state))
+            tracing::info!(
+                service.name = telemetry::SERVICE_NAME,
+                server.address = %address,
+                "ICN server ready"
+            );
+            let app = app(state).layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(telemetry::http_request_span)
+                    .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
+            );
+            axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal(parent_pid))
                 .await?;
+            tracing::info!("ICN server stopped");
         }
         Command::Doctor => println!("ICN runtime and native backend loaded successfully"),
         Command::Version { json } => {
@@ -1362,6 +1661,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
         }
+        Command::PlanWorker => run_planning_worker()?,
+        Command::TemplateWorker => run_template_worker()?,
     }
     Ok(())
 }
@@ -1421,6 +1722,15 @@ fn unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+fn spawn_blocking_traced<F, R>(operation: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(operation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1432,7 +1742,6 @@ mod tests {
             ubatch_size: 64,
             max_sequences: 1,
             prefill_quantum: 128,
-            radix_cache: RadixCacheConfig::default(),
             execution: ExecutionConfig::default(),
             projector_use_gpu: true,
             projector_warmup: true,
@@ -1447,6 +1756,7 @@ mod tests {
             defaults: parity_test_defaults(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),
+            planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         let snapshot = HardwareSnapshot {
             captured_at: 1,
@@ -1536,6 +1846,7 @@ mod tests {
             defaults: parity_test_defaults(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),
+            planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         let profile = ModelPreviewProfile {
             id: "parity".to_owned(),
@@ -1635,10 +1946,6 @@ mod tests {
             no_op_offload,
             swa_full,
             kv_unified,
-            no_radix_cache,
-            radix_cache_host_bytes,
-            radix_cache_disk_bytes,
-            radix_cache_dir,
             threads,
             threads_batch,
             ..
@@ -1653,10 +1960,6 @@ mod tests {
         assert_eq!(cache_type_k, CacheType::F16);
         assert_eq!(cache_type_v, CacheType::F16);
         assert!(!no_kv_offload && !no_op_offload && !swa_full && !kv_unified);
-        assert!(!no_radix_cache);
-        assert_eq!(radix_cache_host_bytes, 0);
-        assert_eq!(radix_cache_disk_bytes, 0);
-        assert!(radix_cache_dir.is_none());
         assert!(threads.is_none() && threads_batch.is_none());
 
         let explicit = Cli::try_parse_from([
@@ -1677,12 +1980,6 @@ mod tests {
             "6",
             "--threads-batch",
             "8",
-            "--radix-cache-host-bytes",
-            "50000000000",
-            "--radix-cache-disk-bytes",
-            "100000000000",
-            "--radix-cache-dir",
-            "/tmp/icn-cache",
         ])
         .unwrap();
         let Command::Serve {
@@ -1694,9 +1991,6 @@ mod tests {
             cache_type_k,
             threads,
             threads_batch,
-            radix_cache_host_bytes,
-            radix_cache_disk_bytes,
-            radix_cache_dir,
             ..
         } = explicit.command
         else {
@@ -1709,9 +2003,6 @@ mod tests {
         assert_eq!(cache_type_k, CacheType::Q8_0);
         assert_eq!(threads, NonZeroU32::new(6));
         assert_eq!(threads_batch, NonZeroU32::new(8));
-        assert_eq!(radix_cache_host_bytes, 50_000_000_000);
-        assert_eq!(radix_cache_disk_bytes, 100_000_000_000);
-        assert_eq!(radix_cache_dir, Some(PathBuf::from("/tmp/icn-cache")));
     }
 
     #[test]
@@ -1760,15 +2051,12 @@ mod tests {
             "--fake",
             "--models-dir",
             "/tmp/models",
-            "--legacy-store",
-            "/tmp/legacy",
             "--hf-cache-dir",
             "/tmp/hf",
         ])
         .expect("documented inventory flag aliases should parse");
         let Command::Serve {
             model_store,
-            legacy_store,
             hf_caches,
             ..
         } = aliases.command
@@ -1776,21 +2064,15 @@ mod tests {
             panic!("expected serve command")
         };
         assert_eq!(model_store, Some(PathBuf::from("/tmp/models")));
-        assert_eq!(legacy_store, Some(PathBuf::from("/tmp/legacy")));
         assert_eq!(hf_caches, vec![PathBuf::from("/tmp/hf")]);
     }
 
     #[test]
     fn version_json_reports_native_and_build_provenance() {
         let value = build_identity::json();
-        assert_eq!(
-            value["bindings_revision"],
-            build_identity::BINDINGS_REVISION
-        );
-        assert_eq!(
-            value["llama_cpp_revision"],
-            build_identity::LLAMA_CPP_REVISION
-        );
+        assert_eq!(value["native_build"], build_identity::native_build());
+        assert!(value.get("bindings_revision").is_none());
+        assert!(value.get("native_backend_revision").is_none());
         assert_eq!(value["target"], build_identity::TARGET);
         assert_eq!(value["profile"], build_identity::PROFILE);
         assert!(

@@ -27,18 +27,6 @@ export const ConfigureLocalInferenceUsage = Rpc.make("ConfigureLocalInferenceUsa
   error: LocalInferenceError,
 })
 
-export const InstallManagedLlamaCpp = Rpc.make("InstallManagedLlamaCpp", {
-  payload: Schema.Struct({}),
-  success: Schema.Struct({ operationId: Schema.String }),
-  error: LocalInferenceError,
-})
-
-export const RefreshLocalInferenceInstallations = Rpc.make("RefreshLocalInferenceInstallations", {
-  payload: Schema.Struct({}),
-  success: Schema.Struct({}),
-  error: LocalInferenceError,
-})
-
 export const DownloadLocalModel = Rpc.make("DownloadLocalModel", {
   payload: Schema.Struct({ configurationId: Schema.String }),
   success: Schema.Struct({}),

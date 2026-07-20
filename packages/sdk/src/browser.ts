@@ -34,7 +34,34 @@ export {
   imageMediaTypeFromFilename,
   imageMediaTypeFromMime,
   isSupportedImageFilename,
+  ModelCatalogLifecycle,
+  ModelCatalogLoading,
+  ModelCatalogReady,
+  ModelCatalogRefreshing,
+  ModelCatalogDegraded,
+  ModelCatalogUnavailable,
+  ModelSlotsLifecycle,
+  ModelSlotsLoading,
+  ModelSlotsReady,
+  ModelSlotsRefreshing,
+  ModelSlotsDegraded,
+  ModelSlotsUnavailable,
+  SlotUnassigned,
+  SlotPending,
+  SlotReady,
+  SlotBlocked,
+  ProviderCatalogStale,
+  ProviderCatalogUnavailable,
+  ModelSlotConfigurationUnavailable,
 } from "@magnitudedev/protocol"
+
+export {
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  ReasoningProperty,
+  VisionProperty,
+} from "@magnitudedev/ai/provider/model"
 
 export type {
   AgentCommunicationMessage,

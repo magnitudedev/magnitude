@@ -17,7 +17,7 @@ const model = (
   reasoning: ModelSummary["properties"]["reasoning"],
   vision: ModelSummary["properties"]["vision"] = new VisionProperty.states.Deferred({}),
 ): ModelSummary => ({
-  providerId: ProviderIdSchema.make("llamacpp"),
+  providerId: ProviderIdSchema.make("local"),
   providerModelId: ProviderModelIdSchema.make("/models/test.gguf"),
   displayName: "Test model",
   contextWindow: 32_768,

@@ -50,7 +50,7 @@ ACN owns:
 - ranking successfully assessed candidates and projecting them into client RPC state.
 
 Clients own formatting and interaction only. Bun and client code must not independently inspect the
-OS, invoke llama.cpp device commands, classify unified memory, reserve device capacity, or estimate
+OS, invoke native-backend device commands, classify unified memory, reserve device capacity, or estimate
 model, KV, recurrent, graph, or compute memory.
 
 ## One assessment pipeline
@@ -144,8 +144,8 @@ remote header adapter ------+            v
 hardware discovery ------------------------------------------------> GET /v1/hardware
 ```
 
-The transport-neutral contracts define one canonical hardware snapshot, resolved execution
-profile, canonical component identity, and `HardwareAssessment`. The available and preview APIs may
+The transport-neutral contracts define one canonical hardware snapshot, execution intent,
+canonical component identity, and `HardwareAssessment`. The available and preview APIs may
 use different request and envelope types, but they do not define separate assessment shapes.
 
 The hardware discovery service owns backend initialization, logical-device enumeration, physical
@@ -259,15 +259,24 @@ The response contains:
 - the artifact, native-build, execution-policy, hardware-topology, and capacity-policy
   fingerprints supporting each result.
 
-Remote and downloaded models use the same `HardwareAssessment` contract. A complete assessment is
-either `Fits` or `DoesNotFit`. The structured result includes the resolved execution profile,
-placement, selected GPU layers and tensor split where applicable, and a per-memory-domain breakdown
-of model, context/KV, compute, auxiliary, required, capacity, and margin bytes.
+Remote and downloaded models use the same `HardwareAssessment` contract. A completed result is
+`Fits`, `DoesNotFit`, `InvalidArtifact`, or `IncompatibleArtifact`. Invalid and incompatible
+artifacts are domain results, not service failures. The structured fit result includes normalized
+context and concurrency facts plus a per-memory-domain breakdown of model, context/KV, compute,
+auxiliary, required, capacity, and margin bytes. It deliberately does not serialize tensor
+placement or any other executable native plan.
 
 The endpoint may accept a batch of candidate sources or gain a batch form without changing these
-semantics. Metadata acquisition for independent artifacts may be concurrent; native assessment is
-serialized wherever required by process-global llama.cpp state. Batch correlation and caching must
-avoid repeating header acquisition or native work for duplicate artifact/profile pairs.
+semantics. Metadata acquisition for independent artifacts may be concurrent. Native assessment is
+serialized within one native process wherever required by process-global state. Profile cache
+misses for one artifact are sent together to one private isolated planner process, bounded by the
+request's sixteen-profile limit. The planner constructs the no-allocation model once and asks
+llama.cpp to construct and measure every requested context graph against it. Independent artifacts
+may be planned concurrently up to the ICN host's available processor count. Planner processes use
+the same release-matched binary and canonical assessment implementation,
+never expose a second service endpoint, never publish cache entries, and never share mutable native
+state with the loaded inference executor. Batch correlation and caching avoid repeating header
+acquisition or native work for duplicate artifact/profile pairs.
 
 The preview handler calls the shared assessment pipeline with a remote-header acquisition adapter.
 Remote acquisition is responsible only for resolving immutable components and supplying their exact
@@ -281,6 +290,11 @@ GGUF places key/value metadata and the complete tensor directory before tensor p
 tensor directory describes each tensor's name, shape, data type, and offset. Those facts, together
 with the execution profile and native device capabilities, determine planner allocation and
 placement. Numerical weight values are not inputs to memory planning.
+
+When the source does not publish the exact aligned header length, bounded range discovery grows the
+locally accumulated prefix by requesting only the missing suffix. A larger probe must not reacquire
+bytes already validated by an earlier probe. Each response is independently checked against its
+exact requested range and the immutable artifact's logical size before it is appended.
 
 For every GGUF shard, ICN retains the exact byte prefix from offset zero through the aligned tensor
 data offset and records the original logical file size and content identity. The prefix may include
@@ -310,6 +324,22 @@ llama.cpp model construction, buffer-type selection, no-allocation graph constru
 and memory-breakdown behavior. Replacing the native planner with a parallel formula does not conform
 to this design.
 
+Multi-profile assessment may reuse an immutable no-allocation model construction while creating a
+separate native context for every profile. A requested plan that fits according to its exact native
+memory breakdown requires no placement search. If llama.cpp's exact model tensor-storage byte count
+alone exceeds the aggregate stable capacity of all non-overlapping physical memory domains, the
+model is conclusively `DoesNotFit`; changing placement cannot eliminate tensor storage. All other
+misses run the pinned upstream placement fitter and validate its resulting native allocation. The
+tensor-storage bound is architecture-independent native evidence, not a parameter-count estimate,
+active-expert approximation, or model-family rule.
+
+Assessment consumes the complete native memory breakdown produced by the constructed model and
+context. Every buffer type is assigned by its native owning device and physical memory domain;
+CPU-owned variants such as repacked expert tensors remain host or unified-memory requirements.
+Parameter counts, active-expert counts, architecture names, and tensor-name conventions are never
+substitutes for allocation bytes. An unknown non-empty native allocation domain fails assessment
+rather than being dropped or guessed.
+
 ## Component completeness
 
 Fit identity covers the complete execution component set. Every shard must contribute its GGUF
@@ -327,59 +357,51 @@ reserved memory when the underlying planner can do so. Unsupported component com
 ## Catalog integration
 
 The maintained catalog contains deliberate product facts and immutable artifact selectors. Humans
-choose the repository, commit, primary artifact, product grouping, quality rank, fidelity evidence,
-license decision, and any reviewed display override.
-
-A development-time generator derives artifact facts from the pinned Hugging Face revision:
-
-- complete shard/component paths, sizes, and content identities;
-- download and source URLs;
-- GGUF properties and header digests;
-- fit-header bundle identity when headers are published as catalog assets.
-
-Generated facts are checked in as a deterministic catalog lock or published as content-addressed
-catalog assets. Ordinary application startup and tests do not depend on mutable Hugging Face model
-metadata. Runtime header acquisition always verifies the pinned revision and expected component
-identity supplied by the generated catalog.
+choose the repository, commit, primary artifact selector, product grouping, quality rank, fidelity
+evidence, license decision, and any reviewed display override. ICN resolves the exact component
+set, sizes, content identities, GGUF properties, and header identities from that immutable source
+as part of preview. ACN does not duplicate those artifact-derived facts in a generated or
+hand-maintained table.
 
 ACN submits catalog artifact identities and usage-derived product profiles to the preview API. It
 excludes invalid, incompatible, and `DoesNotFit` candidates and applies only product ranking to the
 remaining results. It must not modify or reinterpret ICN memory arithmetic.
 
+Recommendation projection has an explicit lifecycle. With no usage selection it is `NotRequested`.
+Before an uncached preview calculation begins, ACN publishes `Loading`; after the calculation it
+publishes either `Ready` with the complete ranked recommendation set or `Failed` with a bounded
+user-facing explanation. An empty `Ready` result means that no curated candidate fit. Clients must
+not infer that outcome from an absent or empty recommendation list while calculation is in flight.
+Cached results may transition directly to `Ready` without an observable loading state.
+
 ### Catalog source versus generated artifact facts
 
 The hand-maintained catalog retains only deliberate product decisions: which model/artifact to
-offer, immutable repository revision, display and grouping policy, license review, quality rank,
-fidelity evidence, and supported product usage choices. A development-time generator resolves and
-checks in facts obtainable from the pinned artifact, including complete component membership,
-sizes, content identities, GGUF-derived properties, and header or header-bundle identities.
+offer, immutable repository revision and primary selector, display and grouping policy, license
+review, quality rank, fidelity evidence, and supported product usage choices.
 
-Runtime code must not contain a second hand-maintained table of GGUF architecture, tensor, KV,
-recurrent-state, or memory-estimator inputs. Runtime preview validates the generated immutable
-selectors and obtains the exact headers through ICN. Regenerating the catalog lock is an explicit
-development action; normal application startup does not query mutable repository metadata to fill
-missing catalog fields.
+Runtime code must not contain a second table of GGUF architecture, component membership, sizes,
+content identities, tensor, KV, recurrent-state, or memory-estimator inputs. Runtime preview sends
+the immutable selector to ICN, and ICN resolves and validates those facts from the pinned source.
 
-## Bun and client replacement boundary
+## Bun and client boundary
 
-After the ICN APIs are available, ACN obtains host/device facts from `GET /v1/hardware`, downloaded
+ACN obtains host/device facts from `GET /v1/hardware`, downloaded
 model facts from `GET /v1/models`, and remote candidate assessments from
 `POST /v1/models/preview`. ACN continues to translate usage selection into product profiles and rank
 successful candidates using curated quality and fidelity policy.
 
-The migration removes Bun-owned host inspection, llama.cpp device probing for product state,
-memory-domain normalization, stable-capacity arithmetic, hand-maintained runtime GGUF metadata,
-runtime-byte formulas, and direct fit-command assessment. These implementations must not remain as
-fallbacks because a fallback would create a second hardware authority. Until ACN has switched to
-the ICN endpoints, the old projection may remain isolated as transitional code, but one application
-state build must never combine ICN and Bun hardware or fit facts.
+ACN contains no host inspection, native-backend device probing, memory-domain normalization,
+stable-capacity arithmetic, hand-maintained runtime GGUF metadata, runtime-byte formulas, or direct
+fit-command assessment. Such implementations would create a second hardware authority and are not
+permitted as fallbacks.
 
 The ACN local-inference projection maps the canonical ICN results into the existing product state
 only where presentation requires it. It must preserve `Fits`, `DoesNotFit`, per-domain memory,
 resolved profile, and failure distinctions rather than converting them back into a Bun estimate.
 Downloaded ICN models and remote recommendations therefore display the same assessment semantics.
-Unmanaged external servers may remain explicitly unassessed because ICN does not own their
-artifacts or execution plan.
+Every local model presented by the product is an ICN inventory model or ICN preview result; there is
+no external-server product route.
 
 ## Cache validity
 
@@ -396,7 +418,7 @@ match the expected artifact facts.
 Fit results are cached by every input capable of changing the result, including:
 
 - complete component membership, identities, original sizes, and header digests;
-- pinned llama.cpp and ICN native-build fingerprint;
+- pinned native-backend revision and ICN native-build fingerprint;
 - enabled backend set and relevant backend capability fingerprint;
 - resolved execution profile and execution-policy version;
 - hardware topology and stable physical-capacity fingerprint;
@@ -474,8 +496,10 @@ The implementation conforms when:
   fit-result reinterpretation;
 - hardware displayed by clients originates exclusively from `GET /v1/hardware`;
 - ACN and clients contain no independent hardware normalization or fit arithmetic;
+- uncached recommendation calculation is represented as `Loading`, never as an empty completed result;
 - downloaded inventory and remote preview return the same hardware-assessment type;
 - complete headers from every shard are used, with exact original logical sizes;
+- every allocation in the native model/context breakdown is accounted to a physical memory domain;
 - remote preview and full local artifacts produce equal normalized reports for the same inputs;
 - parity coverage includes dense, MoE, recurrent/hybrid, sharded, projector, CPU-only, unified-memory,
   discrete-GPU, and supported multi-device profiles;
@@ -488,6 +512,6 @@ The implementation conforms when:
   assessment work to be repeated and never changes the resulting assessment;
 - `DoesNotFit`, invalid artifact, incompatible artifact, and operational failure remain distinct;
 - loading independently validates the exact execution plan it will allocate;
-- catalog runtime facts derivable from pinned artifacts are generated rather than maintained in a
-  parallel Bun metadata table;
+- catalog runtime facts derivable from pinned artifacts are resolved by ICN rather than maintained
+  in a parallel Bun metadata table;
 - regular builds and client operation do not require mutable Hugging Face metadata.

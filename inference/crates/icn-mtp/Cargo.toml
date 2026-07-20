@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 icn-contracts.workspace = true
+icn-hardware.workspace = true
 llama-cpp-2.workspace = true
 thiserror.workspace = true
 

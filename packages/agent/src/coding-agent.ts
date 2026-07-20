@@ -593,7 +593,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           if (!slotConfig || !slotConfig.isUserOverride) return
           // Local selection is reconciled against runtime/catalog state by ACN.
           // Never erase local intent and silently cross the cloud boundary.
-          if (slotConfig.providerId === 'llamacpp') return
+          if (slotConfig.providerId === 'local') return
 
           // Clear the stale override and refresh config
           yield* options.storage.config.updateModelConfig({ [slotId]: {} }).pipe(

@@ -6,9 +6,9 @@
  * No modal chrome — fills its parent container.
  */
 import { useState, useCallback, type ReactNode } from "react"
-import { Cause, Option } from "effect"
+import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { deriveLlamaCppInstallationManagementView, formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel } from "@magnitudedev/client-common"
+import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
 import type { CloudUsageResponse, UsagePeriod, SlotId, ReasoningEffort, LocalModelChoice } from "@magnitudedev/sdk"
 import { ModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS } from "@magnitudedev/sdk"
@@ -176,10 +176,6 @@ function SettingsTab({
   const [error, setError] = useState<string | null>(null)
   const localInference = useLocalInferenceState()
   const localSnapshot = Result.value(localInference.state)
-  const llamaView = Option.map(localSnapshot, deriveLlamaCppInstallationManagementView)
-  const localFailure = Result.isFailure(localInference.state)
-    ? Option.some(Cause.pretty(localInference.state.cause))
-    : localInference.mutationFailure
   const localChoices = Option.match(localSnapshot, {
     onNone: () => [] as const,
     onSome: ({ choices }) => choices,
@@ -224,58 +220,6 @@ function SettingsTab({
 
   return (
     <div className="settings-api-key-section">
-      {Option.isNone(llamaView) && (
-        <section style={{ marginBottom: 24, paddingBottom: 20, borderBottom: "1px solid var(--border-subtle)", fontSize: 13, color: Option.isSome(localFailure) ? "var(--accent-danger)" : "var(--fg-secondary)" }}>
-          {Option.getOrElse(localFailure, () => "Inspecting llama.cpp installations…")}
-        </section>
-      )}
-      {Option.isSome(llamaView) && (
-        <section style={{ marginBottom: 24, paddingBottom: 20, borderBottom: "1px solid var(--border-subtle)" }}>
-          <h3 style={{ fontFamily: "var(--font-sans)", fontSize: 15, fontWeight: 600, color: "var(--fg-primary)", marginBottom: 8 }}>llama.cpp</h3>
-          <div style={{ fontSize: 13, color: llamaView.value.status === "ready" ? "var(--accent-success)" : "var(--accent-warning)", marginBottom: 4 }}>
-            {llamaView.value.status === "ready"
-              ? Option.match(llamaView.value.selected, { onNone: () => "Ready", onSome: (installation) => `${installation.ownership === "magnitude" ? "Managed by Magnitude" : "User installation"} · b${installation.build}` })
-              : llamaView.value.status === "outdated"
-                ? Option.match(llamaView.value.representativeOutdated, { onNone: () => "Outdated", onSome: (installation) => `b${installation.build} is outdated` })
-                : "Not installed for managed local inference"}
-          </div>
-          <div style={{ fontSize: 12, color: "var(--fg-secondary)", marginBottom: 10 }}>
-            Minimum b{llamaView.value.minimumBuild} · recommended b{llamaView.value.recommendedBuild}
-          </div>
-          {llamaView.value.managedInstall.operation._tag === "Running" && (
-            <div style={{ fontSize: 12, color: "var(--accent-primary)", marginBottom: 8, textTransform: "capitalize" }}>{llamaView.value.managedInstall.operation.stage}…</div>
-          )}
-          {llamaView.value.managedInstall.operation._tag === "Failed" && (
-            <div style={{ fontSize: 12, color: "var(--accent-danger)", marginBottom: 8 }}>{llamaView.value.managedInstall.operation.message}</div>
-          )}
-          {llamaView.value.managedInstall.availability._tag === "UnsupportedPlatform" && (
-            <div style={{ fontSize: 12, color: "var(--accent-warning)", marginBottom: 8 }}>{llamaView.value.managedInstall.availability.reason}</div>
-          )}
-          {Option.isSome(localFailure) && (
-            <div style={{ fontSize: 12, color: "var(--accent-danger)", marginBottom: 8 }}>{localFailure.value}</div>
-          )}
-          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-            {llamaView.value.managedInstallRecommended && llamaView.value.managedInstall.availability._tag === "Available" && llamaView.value.managedInstall.operation._tag !== "Running" && (
-              <SettingsButton onClick={localInference.installLlamaCpp} disabled={localInference.mutationBusy}>Install b{llamaView.value.recommendedBuild}</SettingsButton>
-            )}
-            <SettingsButton onClick={localInference.refreshInstallations} disabled={localInference.mutationBusy}>Refresh detection</SettingsButton>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {llamaView.value.installations.map((installation) => (
-              <div key={installation.id} style={{ fontSize: 12, color: "var(--fg-secondary)", padding: "8px 10px", border: "1px solid var(--border-subtle)", borderRadius: 6 }}>
-                <div style={{ color: "var(--fg-primary)" }}>
-                  b{installation.build} · {installation.ownership === "magnitude" ? "Magnitude" : "User"}
-                  {Option.exists(llamaView.value.selected, (selected) => selected.id === installation.id) ? " · selected" : ""}
-                  {Option.exists(llamaView.value.active, (active) => active.id === installation.id) ? " · active" : ""}
-                </div>
-                <div style={{ overflowWrap: "anywhere" }}>Server: {installation.executables.serverPath}</div>
-                <div style={{ overflowWrap: "anywhere" }}>Fit analysis: {installation.executables.fitParamsPath}</div>
-                <div>{installation.discoveries.map((discovery) => discovery._tag === "Path" ? `PATH #${discovery.priority + 1}` : discovery._tag).join(" · ")}</div>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
       <h3
         style={{
           fontFamily: "var(--font-sans)",
@@ -738,9 +682,9 @@ function SlotCard({
     onSome: ({ slot }) => slot.selection.reasoningEffort,
   })
   const capacityRisk = Option.flatMap(selected, ({ model }) => {
-    if (model.providerId !== "llamacpp") return Option.none()
+    if (model.providerId !== "local") return Option.none()
     const choice = localChoices.find((candidate) => candidate.providerModelId === model.providerModelId)
-    if (choice?.fitAssessment._tag !== "Estimated" || choice.fitAssessment.result !== "capacity_risk") return Option.none()
+    if (choice?.fitAssessment._tag !== "Assessed" || choice.fitAssessment.result !== "does_not_fit") return Option.none()
     return Option.some(choice.fitAssessment)
   })
 
@@ -846,9 +790,9 @@ function SlotCard({
                 <option key={`${model.providerId}:${model.providerModelId}`} value={`${model.providerId}\0${model.providerModelId}`}>
                   {model.displayName} — {formatContextWindowCompact(model.contextWindow)} ctx
                   {model.pricing ? ` — ${formatPricing(model.pricing)}` : ""}
-                  {model.providerId === "llamacpp" && localChoices.some((choice) => choice.providerModelId === model.providerModelId
-                    && choice.fitAssessment._tag === "Estimated"
-                    && choice.fitAssessment.result === "capacity_risk") ? " — memory warning" : ""}
+                  {model.providerId === "local" && localChoices.some((choice) => choice.providerModelId === model.providerModelId
+                    && choice.fitAssessment._tag === "Assessed"
+                    && choice.fitAssessment.result === "does_not_fit") ? " — memory warning" : ""}
                 </option>
               ))
             ) : (
@@ -885,7 +829,7 @@ function SlotCard({
           </div>
           {Option.isSome(capacityRisk) && (
             <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-warning)" }}>
-              Estimated memory use is {formatMemoryGiB(capacityRisk.value.estimatedTotalBytes)}, above this machine&apos;s stable capacity. Loading may fail or affect system performance.
+              Estimated memory use is {formatMemoryGiB(capacityRisk.value.requiredTotalBytes)}, above this machine&apos;s stable capacity. Loading may fail or affect system performance.
             </div>
           )}
           {Option.isSome(selected) && (

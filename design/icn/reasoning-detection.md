@@ -19,8 +19,8 @@ ordered list of normalized reasoning-effort options. Each option has a model-spe
 recipe retained inside ICN. Callers see stable normalized names rather than model-specific Jinja
 arguments.
 
-This design governs the Rust inference implementation only. The Bun implementation is useful prior
-art and is close to the desired product behavior, but it is not changed or integrated by this work.
+This design governs the Rust inference implementation. There is no Bun reasoning-inspection
+implementation or fallback; ACN and clients consume the completed ICN result.
 
 ## Normalized behavior
 
@@ -52,8 +52,10 @@ templates distinguish high from max.
 Some templates expose a meaningful named state outside this scale. MiniMax M3's adaptive mode is
 the important current example. Such a state remains `adaptive`; it is not mislabeled as medium.
 
-The normalized default is the behavior produced when the template's reasoning controls are
-omitted. ICN does not replace the authored default with a preferred product setting.
+The normalized default is the behavior produced by pinned llama.cpp. Its common-chat input exposes
+`enable_thinking` as a boolean whose default is enabled, so a caller that does not choose an effort
+uses the enabled side of a supported toggle. ICN does not maintain a second parser for a template's
+authored Jinja fallback.
 
 ## Model-template formats
 
@@ -64,7 +66,8 @@ and test requirements, not runtime dispatch keys.
 ### Boolean thinking control
 
 Qwen 3.5 and Qwen 3.6 use `enable_thinking`. Kimi K2.5 and Kimi K2.6 use a similar boolean named
-`thinking`. Gemma 4 uses `enable_thinking` but defaults it in the opposite direction from Qwen.
+`thinking`. Gemma 4 also uses `enable_thinking`; all are rendered through the pinned common-chat
+input contract.
 
 | Example | Native behavior | Normalized options | Normalized default |
 | --- | --- | --- | --- |
@@ -72,7 +75,7 @@ Qwen 3.5 and Qwen 3.6 use `enable_thinking`. Kimi K2.5 and Kimi K2.6 use a simil
 | Qwen 3.6 | `enable_thinking` on or off | `none`, `high` | `high` |
 | Kimi K2.5 | `thinking` on or off | `none`, `high` | `high` |
 | Kimi K2.6 | `thinking` on or off | `none`, `high` | `high` |
-| Gemma 4 | `enable_thinking` on or off | `none`, `high` | `none` |
+| Gemma 4 | `enable_thinking` on or off | `none`, `high` | `high` |
 
 The private recipe for `high` uses the template's actual boolean key. ICN never assumes that
 normalized `high` should be passed as a native `reasoning_effort` string.
@@ -166,9 +169,10 @@ change the normalized effort list in this implementation.
 
 ## Detection architecture
 
-Detection runs against the same effective template inputs used for inference: resolved template
-source, fallback or named template choice, BOS token, EOS token, and pinned llama.cpp behavior. It
-does not load weights or create an inference context.
+Detection loads the actual model through llama.cpp in no-allocation mode and constructs common-chat
+templates from that model. This makes llama.cpp authoritative for metadata, vocabulary, template
+selection, BOS/EOS behavior, and rendering without loading tensor weights or creating an inference
+context. ICN does not copy those inputs into a parallel metadata representation.
 
 The process has two distinct responsibilities:
 
@@ -295,10 +299,10 @@ advertise a disabling option.
 
 ## Acceptance criteria
 
-- Qwen 3.5/3.6 boolean controls normalize to `none` and `high` with the authored default.
+- Qwen 3.5/3.6 boolean controls normalize to `none` and `high` with the pinned common-chat default.
 - Kimi K2.5/K2.6 nonstandard booleans normalize to `none` and `high`.
 - Kimi K2.7 Code and MiniMax M2 fixed reasoning normalize to `high` only.
-- Gemma 4 normalizes to `none` and `high` with `none` as its authored default.
+- Gemma 4 normalizes to `none` and `high` with the pinned common-chat default.
 - GLM-5.2 preserves distinct `none`, `high`, and `max` options.
 - DeepSeek V3/V4 modes map to the correct normalized options and private mode recipes.
 - MiniMax M3 preserves `adaptive` rather than relabeling it as an effort.

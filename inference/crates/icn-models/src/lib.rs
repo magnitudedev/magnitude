@@ -5,7 +5,6 @@ mod download;
 pub mod gguf;
 mod identity;
 mod inventory;
-mod legacy;
 mod manifest;
 mod preview;
 mod service;

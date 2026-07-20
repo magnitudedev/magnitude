@@ -48,7 +48,7 @@
         },
         "responses": {
           "200": {
-            "description": "Prepared llama.cpp chat prompt and constraints",
+            "description": "Prepared native chat prompt and constraints",
             "content": {
               "application/json": {
                 "schema": {
@@ -1696,7 +1696,7 @@
           },
           "resolved": {
             "$ref": "#/components/schemas/ExecutionSettingsResponse",
-            "description": "Concrete parameters passed to libllama after common/fit and thread selection."
+            "description": "Concrete parameters passed to the native backend after planning and thread selection."
           }
         },
         "additionalProperties": false
@@ -2054,6 +2054,50 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "type"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "invalid_artifact"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "type"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "incompatible_artifact"
+                ]
+              }
+            }
           }
         ]
       },
@@ -2062,7 +2106,8 @@
         "required": [
           "required_bytes",
           "available_bytes",
-          "deficit_bytes"
+          "deficit_bytes",
+          "domains"
         ],
         "properties": {
           "required_bytes": {
@@ -2079,6 +2124,12 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareMemoryDomainAssessmentSchema"
+            }
           }
         },
         "additionalProperties": false
@@ -2119,6 +2170,59 @@
             "$ref": "#/components/schemas/HardwareDeviceKindSchema"
           }
         }
+      },
+      "HardwareMemoryDomainAssessmentSchema": {
+        "type": "object",
+        "required": [
+          "memory_domain",
+          "model_bytes",
+          "context_bytes",
+          "compute_bytes",
+          "auxiliary_bytes",
+          "required_bytes",
+          "available_bytes",
+          "margin_bytes"
+        ],
+        "properties": {
+          "memory_domain": {
+            "type": "string"
+          },
+          "model_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "context_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "compute_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "auxiliary_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "required_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "available_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "margin_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "additionalProperties": false
       },
       "HardwareMemoryDomainKindSchema": {
         "type": "string",
@@ -2179,7 +2283,8 @@
         "required": [
           "required_bytes",
           "available_bytes",
-          "headroom_bytes"
+          "headroom_bytes",
+          "domains"
         ],
         "properties": {
           "required_bytes": {
@@ -2196,6 +2301,12 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareMemoryDomainAssessmentSchema"
+            }
           }
         },
         "additionalProperties": false
@@ -4332,10 +4443,6 @@
         "type": "object",
         "required": [
           "cache_n",
-          "cache_device_n",
-          "cache_host_n",
-          "cache_disk_n",
-          "cache_promotion_ms",
           "prompt_n",
           "prompt_ms",
           "prompt_per_token_ms",
@@ -4352,29 +4459,6 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
-          },
-          "cache_device_n": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Cached prompt tokens attached directly from native device pages.",
-            "minimum": 0
-          },
-          "cache_host_n": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Cached prompt tokens promoted from the bounded host tier.",
-            "minimum": 0
-          },
-          "cache_disk_n": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Cached prompt tokens promoted from the bounded local-storage tier.",
-            "minimum": 0
-          },
-          "cache_promotion_ms": {
-            "type": "number",
-            "format": "double",
-            "description": "Native import plus host/disk read time for this request."
           },
           "prompt_n": {
             "type": "integer",
@@ -4413,7 +4497,7 @@
           "sampler_ms": {
             "type": "number",
             "format": "double",
-            "description": "Time spent inside llama.cpp's sampler for this request."
+            "description": "Time spent inside the native sampler for this request."
           },
           "parser_ms": {
             "type": "number",
