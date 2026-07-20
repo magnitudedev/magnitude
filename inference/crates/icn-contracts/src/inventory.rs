@@ -463,6 +463,8 @@ pub struct HardwareMemory {
     pub available_bytes: u64,
     pub headroom_bytes: u64,
     pub domains: Vec<HardwareMemoryDomainAssessment>,
+    #[serde(default)]
+    pub device_constraints: Vec<HardwareDeviceMemoryAssessment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,12 +474,28 @@ pub struct HardwareDeficit {
     pub available_bytes: u64,
     pub deficit_bytes: u64,
     pub domains: Vec<HardwareMemoryDomainAssessment>,
+    #[serde(default)]
+    pub device_constraints: Vec<HardwareDeviceMemoryAssessment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareMemoryDomainAssessment {
     pub memory_domain: String,
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub compute_bytes: u64,
+    pub auxiliary_bytes: u64,
+    pub required_bytes: u64,
+    pub available_bytes: u64,
+    pub margin_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareDeviceMemoryAssessment {
+    pub device: String,
+    pub kind: HardwareDeviceMemoryLimitKind,
     pub model_bytes: u64,
     pub context_bytes: u64,
     pub compute_bytes: u64,
@@ -499,7 +517,7 @@ pub enum HardwareRecommendation {
 pub enum HardwareMemoryDomainKind {
     System,
     PhysicalDevice,
-    UnifiedWorkingSet,
+    UnifiedMemory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,6 +531,21 @@ pub enum HardwareDeviceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareDeviceMemoryLimitKind {
+    RecommendedWorkingSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareDeviceMemoryLimit {
+    pub kind: HardwareDeviceMemoryLimitKind,
+    pub total_bytes: u64,
+    pub stable_bytes: u64,
+    pub current_free_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareDevice {
     pub id: String,
@@ -520,6 +553,15 @@ pub struct HardwareDevice {
     pub name: String,
     pub description: String,
     pub kind: HardwareDeviceKind,
+    #[serde(default)]
+    pub memory_limit: Option<HardwareDeviceMemoryLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareSystemMemory {
+    pub total_bytes: u64,
+    pub current_available_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,6 +584,7 @@ pub struct HardwareSnapshot {
     pub architecture: String,
     pub cpu_model: Option<String>,
     pub logical_cores: usize,
+    pub system_memory: HardwareSystemMemory,
     pub native_build: String,
     pub enabled_backends: Vec<String>,
     pub assessment_policy: String,

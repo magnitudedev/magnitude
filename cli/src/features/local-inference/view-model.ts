@@ -68,15 +68,15 @@ export interface LocalHardwarePresentation {
 }
 
 const platformLabel = (platform: string): string => {
-  if (platform === "darwin") return "macOS"
+  if (platform === "darwin" || platform === "macos") return "macOS"
   if (platform === "linux") return "Linux"
   if (platform === "win32") return "Windows"
   return platform
 }
 
 const architectureLabel = (architecture: string): string => {
-  if (architecture === "arm64") return "ARM64"
-  if (architecture === "x64") return "x86-64"
+  if (architecture === "arm64" || architecture === "aarch64") return "ARM64"
+  if (architecture === "x64" || architecture === "x86_64") return "x86-64"
   return architecture
 }
 
@@ -92,38 +92,35 @@ export const describeLocalHardware = (
   host: LocalInferenceHostProfile,
 ): LocalHardwarePresentation => {
   const accelerators = host.memoryDomains.filter((domain) => domain.kind !== "system")
-  const unified = accelerators.filter((domain) => domain.kind === "unified_working_set")
+  const unified = accelerators.filter((domain) =>
+    domain.kind === "unified_memory" && domain.sharesSystemMemory
+  )
   const discrete = accelerators.filter((domain) => domain.kind === "physical_device")
-  const appleUnified = host.platform === "darwin"
-    && host.architecture === "arm64"
-    && unified.length > 0
+  const applePlatform = host.platform === "darwin" || host.platform === "macos"
+  const appleArchitecture = host.architecture === "arm64" || host.architecture === "aarch64"
+  const appleSilicon = applePlatform && appleArchitecture
+  const hasUnifiedMemory = unified.length > 0
   const systemName = host.cpuModel?.trim() || (
-    host.platform === "darwin" && host.architecture === "arm64"
+    appleSilicon
       ? "Apple Silicon"
       : "CPU"
   )
   const systemDetails = [
-    `${platformLabel(host.platform)} · ${host.platform === "darwin" && host.architecture === "arm64" ? "Apple Silicon" : architectureLabel(host.architecture)} · ${host.logicalCores} logical CPU core${host.logicalCores === 1 ? "" : "s"}`,
-    `${formatBytes(host.systemMemoryBytes)} ${appleUnified ? "unified" : "system"} memory${appleUnified ? ` · ${accelerationLabel(unified.flatMap((domain) => domain.backendNames))}` : ""}`,
+    `${platformLabel(host.platform)} · ${appleSilicon ? "Apple Silicon" : architectureLabel(host.architecture)} · ${host.logicalCores} logical CPU core${host.logicalCores === 1 ? "" : "s"}`,
+    `${formatBytes(host.systemMemoryBytes)} ${hasUnifiedMemory ? "unified" : "system"} memory${hasUnifiedMemory ? ` · ${accelerationLabel(unified.flatMap((domain) => domain.backendNames))}` : ""}`,
   ]
 
-  const visibleAccelerators = appleUnified ? discrete : accelerators
   return {
     system: { name: systemName, details: systemDetails },
-    accelerators: visibleAccelerators.map((domain) => {
+    accelerators: discrete.map((domain) => {
       const names = unique(domain.deviceNames)
       const backends = unique(domain.backendNames)
       const name = names.length > 0
         ? names.join(" + ")
-        : domain.kind === "unified_working_set"
-          ? "Integrated GPU"
-          : `${backends[0] ?? "Local"} GPU`
-      const memory = domain.kind === "unified_working_set"
-        ? `${formatBytes(domain.totalCapacityBytes)} shared memory`
-        : `${formatBytes(domain.totalCapacityBytes)} VRAM`
+        : `${backends[0] ?? "Local"} GPU`
       return {
         name,
-        details: `${memory} · ${accelerationLabel(backends)}`,
+        details: `${formatBytes(domain.totalCapacityBytes)} VRAM · ${accelerationLabel(backends)}`,
       }
     }),
   }

@@ -16,6 +16,7 @@ llama-cpp-2 = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sysinfo.workspace = true
 thiserror.workspace = true
 
 [features]

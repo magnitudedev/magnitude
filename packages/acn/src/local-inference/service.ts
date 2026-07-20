@@ -94,10 +94,13 @@ const fitAssessment = (assessment: Generated.HardwareAssessmentSchema): LocalMod
   }
 }
 
-const hostToWire = (hardware: Generated.HardwareSnapshotSchema): LocalInferenceHostProfile => ({
+const displayBackendName = (backend: string): string =>
+  backend.toUpperCase() === "MTL" ? "Metal" : backend
+
+export const hostToWire = (hardware: Generated.HardwareSnapshotSchema): LocalInferenceHostProfile => ({
   platform: hardware.platform,
   architecture: hardware.architecture,
-  systemMemoryBytes: hardware.memory_domains.find((domain) => domain.kind === "system")?.total_capacity_bytes ?? 0,
+  systemMemoryBytes: hardware.system_memory.total_bytes,
   cpuModel: Option.getOrNull(hardware.cpu_model),
   logicalCores: Math.max(1, hardware.logical_cores),
   memoryDomains: hardware.memory_domains.map((domain) => ({
@@ -107,8 +110,12 @@ const hostToWire = (hardware: Generated.HardwareSnapshotSchema): LocalInferenceH
     stableCapacityBytes: domain.stable_capacity_bytes,
     currentFreeBytes: Option.getOrNull(domain.current_free_bytes),
     sharesSystemMemory: domain.shares_system_memory,
-    backendNames: [...new Set(domain.devices.map((device) => device.backend))],
-    deviceNames: domain.devices.map((device) => device.name),
+    backendNames: [...new Set(domain.devices
+      .filter((device) => device.kind !== "cpu")
+      .map((device) => displayBackendName(device.backend)))],
+    deviceNames: domain.devices
+      .filter((device) => device.kind !== "cpu")
+      .map((device) => device.description),
     splitGroupId: null,
   })),
 })

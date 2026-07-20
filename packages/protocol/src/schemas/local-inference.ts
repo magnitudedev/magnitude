@@ -63,7 +63,7 @@ export const LocalInferenceHostProfile = Schema.Struct({
   logicalCores: PositiveInteger,
   memoryDomains: Schema.Array(Schema.Struct({
     id: Schema.String,
-    kind: Schema.Literal("system", "physical_device", "unified_working_set"),
+    kind: Schema.Literal("system", "physical_device", "unified_memory"),
     totalCapacityBytes: NonNegativeNumber,
     stableCapacityBytes: NonNegativeNumber,
     currentFreeBytes: Schema.NullOr(NonNegativeNumber),

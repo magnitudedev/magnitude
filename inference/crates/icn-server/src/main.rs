@@ -1764,6 +1764,10 @@ mod tests {
             architecture: "test".to_owned(),
             cpu_model: None,
             logical_cores: 1,
+            system_memory: icn_contracts::HardwareSystemMemory {
+                total_bytes: 1,
+                current_available_bytes: Some(1),
+            },
             native_build: "native".to_owned(),
             enabled_backends: vec!["cpu".to_owned()],
             assessment_policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),

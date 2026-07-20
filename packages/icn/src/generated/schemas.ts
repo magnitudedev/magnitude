@@ -740,6 +740,12 @@ export type HardwareAssessmentSchemaEncoded = S.Schema.Encoded<typeof HardwareAs
 export const HardwareDeficitSchema = S.Struct({
   available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   deficit_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  device_constraints: S.Array(
+    S.suspend(
+      (): S.Schema<HardwareDeviceMemoryAssessmentSchema, HardwareDeviceMemoryAssessmentSchemaEncoded> =>
+        HardwareDeviceMemoryAssessmentSchema,
+    ),
+  ),
   domains: S.Array(
     S.suspend(
       (): S.Schema<HardwareMemoryDomainAssessmentSchema, HardwareMemoryDomainAssessmentSchemaEncoded> =>
@@ -761,6 +767,48 @@ export const HardwareDeviceKindSchema = S.Union(
 export type HardwareDeviceKindSchema = S.Schema.Type<typeof HardwareDeviceKindSchema>
 export type HardwareDeviceKindSchemaEncoded = S.Schema.Encoded<typeof HardwareDeviceKindSchema>
 
+export const HardwareDeviceMemoryAssessmentSchema = S.extend(
+  S.Struct({
+    auxiliary_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    compute_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    context_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    device: S.String,
+    kind: S.suspend(
+      (): S.Schema<HardwareDeviceMemoryLimitKindSchema, HardwareDeviceMemoryLimitKindSchemaEncoded> =>
+        HardwareDeviceMemoryLimitKindSchema,
+    ),
+    margin_bytes: S.Number.pipe(S.int()),
+    model_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    required_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HardwareDeviceMemoryAssessmentSchema = S.Schema.Type<typeof HardwareDeviceMemoryAssessmentSchema>
+export type HardwareDeviceMemoryAssessmentSchemaEncoded = S.Schema.Encoded<typeof HardwareDeviceMemoryAssessmentSchema>
+
+export const HardwareDeviceMemoryLimitKindSchema = S.Literal("recommended_working_set")
+export type HardwareDeviceMemoryLimitKindSchema = S.Schema.Type<typeof HardwareDeviceMemoryLimitKindSchema>
+export type HardwareDeviceMemoryLimitKindSchemaEncoded = S.Schema.Encoded<typeof HardwareDeviceMemoryLimitKindSchema>
+
+export const HardwareDeviceMemoryLimitSchema = S.extend(
+  S.Struct({
+    current_free_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+      exact: true,
+      as: "Option",
+    }),
+    kind: S.suspend(
+      (): S.Schema<HardwareDeviceMemoryLimitKindSchema, HardwareDeviceMemoryLimitKindSchemaEncoded> =>
+        HardwareDeviceMemoryLimitKindSchema,
+    ),
+    stable_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HardwareDeviceMemoryLimitSchema = S.Schema.Type<typeof HardwareDeviceMemoryLimitSchema>
+export type HardwareDeviceMemoryLimitSchemaEncoded = S.Schema.Encoded<typeof HardwareDeviceMemoryLimitSchema>
+
 export const HardwareDeviceSchema = S.extend(
   S.Struct({
     backend: S.String,
@@ -768,6 +816,16 @@ export const HardwareDeviceSchema = S.extend(
     id: S.String,
     kind: S.suspend(
       (): S.Schema<HardwareDeviceKindSchema, HardwareDeviceKindSchemaEncoded> => HardwareDeviceKindSchema,
+    ),
+    memory_limit: S.optionalWith(
+      S.Union(
+        S.Null,
+        S.suspend(
+          (): S.Schema<HardwareDeviceMemoryLimitSchema, HardwareDeviceMemoryLimitSchemaEncoded> =>
+            HardwareDeviceMemoryLimitSchema,
+        ),
+      ),
+      { exact: true, as: "Option" },
     ),
     name: S.String,
   }),
@@ -792,7 +850,7 @@ export type HardwareMemoryDomainAssessmentSchemaEncoded = S.Schema.Encoded<typeo
 export const HardwareMemoryDomainKindSchema = S.Union(
   S.Literal("system"),
   S.Literal("physical_device"),
-  S.Literal("unified_working_set"),
+  S.Literal("unified_memory"),
 )
 export type HardwareMemoryDomainKindSchema = S.Schema.Type<typeof HardwareMemoryDomainKindSchema>
 export type HardwareMemoryDomainKindSchemaEncoded = S.Schema.Encoded<typeof HardwareMemoryDomainKindSchema>
@@ -822,6 +880,12 @@ export type HardwareMemoryDomainSchemaEncoded = S.Schema.Encoded<typeof Hardware
 
 export const HardwareMemorySchema = S.Struct({
   available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  device_constraints: S.Array(
+    S.suspend(
+      (): S.Schema<HardwareDeviceMemoryAssessmentSchema, HardwareDeviceMemoryAssessmentSchemaEncoded> =>
+        HardwareDeviceMemoryAssessmentSchema,
+    ),
+  ),
   domains: S.Array(
     S.suspend(
       (): S.Schema<HardwareMemoryDomainAssessmentSchema, HardwareMemoryDomainAssessmentSchemaEncoded> =>
@@ -862,12 +926,28 @@ export const HardwareSnapshotSchema = S.extend(
     ),
     native_build: S.String,
     platform: S.String,
+    system_memory: S.suspend(
+      (): S.Schema<HardwareSystemMemorySchema, HardwareSystemMemorySchemaEncoded> => HardwareSystemMemorySchema,
+    ),
     topology_fingerprint: S.String,
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )
 export type HardwareSnapshotSchema = S.Schema.Type<typeof HardwareSnapshotSchema>
 export type HardwareSnapshotSchemaEncoded = S.Schema.Encoded<typeof HardwareSnapshotSchema>
+
+export const HardwareSystemMemorySchema = S.extend(
+  S.Struct({
+    current_available_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+      exact: true,
+      as: "Option",
+    }),
+    total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HardwareSystemMemorySchema = S.Schema.Type<typeof HardwareSystemMemorySchema>
+export type HardwareSystemMemorySchemaEncoded = S.Schema.Encoded<typeof HardwareSystemMemorySchema>
 
 export const HealthResponse = S.Struct({
   apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),

@@ -19,11 +19,14 @@ use llama_cpp_2::model::params::fit::{FitReport, FitReportError};
 
 use icn_contracts::{
     ExecutionIntent, HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceKind,
+    HardwareDeviceMemoryAssessment, HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitKind,
     HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment, HardwareMemoryDomainKind,
-    HardwareProfile, HardwareRecommendation, HardwareSnapshot, MtpConfig, MtpSource,
+    HardwareProfile, HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory, MtpConfig,
+    MtpSource,
 };
 use llama_cpp_2::LlamaBackendDeviceType;
 use sha2::{Digest, Sha256};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 fn cache_type_into_native(cache_type: CacheType) -> KvCacheType {
     match cache_type {
@@ -194,6 +197,7 @@ struct HardwareEnvironment {
     platform: String,
     architecture: String,
     logical_cores: usize,
+    system_memory: HardwareSystemMemory,
 }
 
 impl Default for CapacityPolicy {
@@ -213,6 +217,14 @@ pub fn discover_hardware(
     enabled_backends: Vec<String>,
     assessment_policy: impl Into<String>,
 ) -> HardwareSnapshot {
+    let mut system = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    system.refresh_memory();
+    let mut system_memory = HardwareSystemMemory {
+        total_bytes: system.total_memory(),
+        current_available_bytes: Some(system.available_memory()),
+    };
     let devices = llama_cpp_2::list_llama_ggml_backend_devices()
         .into_iter()
         .map(|device| DiscoveredDevice {
@@ -231,7 +243,15 @@ pub fn discover_hardware(
             total_bytes: u64::try_from(device.memory_total).unwrap_or(u64::MAX),
             free_bytes: u64::try_from(device.memory_free).ok(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if system_memory.total_bytes == 0 {
+        system_memory.total_bytes = devices
+            .iter()
+            .filter(|device| device.kind == HardwareDeviceKind::Cpu)
+            .map(|device| device.total_bytes)
+            .max()
+            .unwrap_or(0);
+    }
     hardware_snapshot_from_devices(
         devices,
         policy,
@@ -242,6 +262,7 @@ pub fn discover_hardware(
             platform: std::env::consts::OS.to_owned(),
             architecture: std::env::consts::ARCH.to_owned(),
             logical_cores: std::thread::available_parallelism().map_or(1, |value| value.get()),
+            system_memory,
         },
     )
 }
@@ -283,13 +304,17 @@ fn hardware_snapshot_from_devices(
     }
 
     let mut domains = Vec::new();
-    if !shared.is_empty() {
-        let total = shared
+    if !shared.is_empty() || environment.system_memory.total_bytes > 0 {
+        let backend_total = shared
             .iter()
             .map(|device| device.total_bytes)
             .max()
             .unwrap_or(0);
-        let free = shared.iter().filter_map(|device| device.free_bytes).max();
+        let total = if environment.system_memory.total_bytes > 0 {
+            environment.system_memory.total_bytes
+        } else {
+            backend_total
+        };
         let unified = unified_platform
             || shared
                 .iter()
@@ -297,18 +322,18 @@ fn hardware_snapshot_from_devices(
         domains.push(HardwareMemoryDomain {
             id: "system".to_owned(),
             kind: if unified {
-                HardwareMemoryDomainKind::UnifiedWorkingSet
+                HardwareMemoryDomainKind::UnifiedMemory
             } else {
                 HardwareMemoryDomainKind::System
             },
             total_capacity_bytes: total,
             stable_capacity_bytes: total.saturating_sub(policy.reserve_bytes_per_domain),
-            current_free_bytes: free,
+            current_free_bytes: environment.system_memory.current_available_bytes,
             shares_system_memory: true,
             devices: shared
                 .into_iter()
                 .enumerate()
-                .map(|(ordinal, device)| public_device(device, ordinal))
+                .map(|(ordinal, device)| public_device(device, ordinal, unified_platform, policy))
                 .collect(),
         });
     }
@@ -328,6 +353,9 @@ fn hardware_snapshot_from_devices(
                 .map(|device| device.total_bytes)
                 .max()
                 .unwrap_or(0);
+            if total == 0 {
+                continue;
+            }
             let free = views.iter().filter_map(|device| device.free_bytes).max();
             let id_material = format!("{physical_key}\0{ordinal}");
             let id = format!("device-{:x}", Sha256::digest(id_material.as_bytes()));
@@ -340,7 +368,7 @@ fn hardware_snapshot_from_devices(
                 shares_system_memory: false,
                 devices: views
                     .into_iter()
-                    .map(|device| public_device(device, ordinal))
+                    .map(|device| public_device(device, ordinal, false, policy))
                     .collect(),
             });
         }
@@ -367,6 +395,10 @@ fn hardware_snapshot_from_devices(
                             &device.name,
                             &device.description,
                             &device.kind,
+                            device
+                                .memory_limit
+                                .as_ref()
+                                .map(|limit| (&limit.kind, limit.total_bytes, limit.stable_bytes)),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -387,6 +419,7 @@ fn hardware_snapshot_from_devices(
             .find(|device| device.kind == HardwareDeviceKind::Cpu)
             .map(|device| device.description.clone()),
         logical_cores: environment.logical_cores,
+        system_memory: environment.system_memory,
         native_build: environment.native_build,
         enabled_backends: environment.enabled_backends,
         assessment_policy: environment.assessment_policy,
@@ -414,7 +447,12 @@ fn device_order(left: &DiscoveredDevice, right: &DiscoveredDevice) -> std::cmp::
         ))
 }
 
-fn public_device(device: DiscoveredDevice, ordinal: usize) -> HardwareDevice {
+fn public_device(
+    device: DiscoveredDevice,
+    ordinal: usize,
+    apple_unified: bool,
+    policy: CapacityPolicy,
+) -> HardwareDevice {
     let identity = format!(
         "{}\0{}\0{}\0{}\0{ordinal}",
         device.backend,
@@ -422,12 +460,24 @@ fn public_device(device: DiscoveredDevice, ordinal: usize) -> HardwareDevice {
         device.native_index,
         device.name
     );
+    let memory_limit = (apple_unified
+        && device.kind != HardwareDeviceKind::Cpu
+        && device.total_bytes > 0)
+        .then(|| HardwareDeviceMemoryLimit {
+            kind: HardwareDeviceMemoryLimitKind::RecommendedWorkingSet,
+            total_bytes: device.total_bytes,
+            stable_bytes: device
+                .total_bytes
+                .saturating_sub(policy.reserve_bytes_per_domain),
+            current_free_bytes: device.free_bytes,
+        });
     HardwareDevice {
         id: format!("native-{:x}", Sha256::digest(identity.as_bytes())),
         backend: device.backend,
         name: device.name,
         description: device.description,
         kind: device.kind,
+        memory_limit,
     }
 }
 
@@ -621,10 +671,9 @@ fn plan_and_assess(
         memory: HardwareDeficit {
             required_bytes: preferred.required_bytes,
             available_bytes: preferred.available_bytes,
-            deficit_bytes: preferred
-                .required_bytes
-                .saturating_sub(preferred.available_bytes),
+            deficit_bytes: preferred.deficit_bytes,
             domains: preferred.domains.clone(),
+            device_constraints: preferred.device_constraints.clone(),
         },
         limiting_resource: preferred.limiting_resource,
         alternative: None,
@@ -837,10 +886,9 @@ pub fn assess_profiles_with_backend(
                     memory: HardwareDeficit {
                         required_bytes: preferred.required_bytes,
                         available_bytes: preferred.available_bytes,
-                        deficit_bytes: preferred
-                            .required_bytes
-                            .saturating_sub(preferred.available_bytes),
+                        deficit_bytes: preferred.deficit_bytes,
                         domains: preferred.domains,
+                        device_constraints: preferred.device_constraints,
                     },
                     limiting_resource: preferred.limiting_resource,
                     alternative: None,
@@ -903,16 +951,33 @@ struct CapacitySummary {
     fits: bool,
     required_bytes: u64,
     available_bytes: u64,
+    deficit_bytes: u64,
     limiting_resource: String,
     device: String,
     domains: Vec<HardwareMemoryDomainAssessment>,
+    device_constraints: Vec<HardwareDeviceMemoryAssessment>,
 }
 
 #[derive(Debug)]
 struct CapacityDomain {
-    native_index: usize,
+    native_indices: Vec<usize>,
+    physical_id: Option<String>,
+    shares_host_memory: bool,
     kind: FitDeviceKind,
     name: String,
+    total_bytes: u64,
+    model_bytes: u64,
+    context_bytes: u64,
+    compute_bytes: u64,
+    auxiliary_bytes: u64,
+    required_bytes: u64,
+}
+
+#[derive(Debug)]
+struct CapacityDeviceConstraint {
+    native_index: usize,
+    name: String,
+    kind: HardwareDeviceMemoryLimitKind,
     total_bytes: u64,
     model_bytes: u64,
     context_bytes: u64,
@@ -956,6 +1021,7 @@ fn capacity_summary_for_topology(
     #[cfg(not(feature = "mtmd"))]
     let _ = projectors;
     let mut domains = Vec::<CapacityDomain>::new();
+    let mut device_constraints = Vec::<CapacityDeviceConstraint>::new();
     for device in devices {
         let estimate = match measurement {
             Measurement::Initial => device.initial,
@@ -964,7 +1030,13 @@ fn capacity_summary_for_topology(
         let Some(estimate) = estimate else {
             continue;
         };
-        add_device_estimate(&mut domains, device, estimate, unified)?;
+        add_device_estimate(
+            &mut domains,
+            &mut device_constraints,
+            device,
+            estimate,
+            unified,
+        )?;
     }
     if let Some(mtp_devices) = mtp_devices {
         for device in mtp_devices {
@@ -973,6 +1045,7 @@ fn capacity_summary_for_topology(
             };
             add_additional_device_estimate(
                 &mut domains,
+                &mut device_constraints,
                 device,
                 estimate,
                 unified,
@@ -987,10 +1060,20 @@ fn capacity_summary_for_topology(
                 domain.auxiliary_bytes = domain.auxiliary_bytes.saturating_add(projector.bytes);
                 domain.required_bytes = domain.required_bytes.saturating_add(projector.bytes);
             }
+            if let Some(constraint) = projector.device_index.and_then(|index| {
+                device_constraints
+                    .iter_mut()
+                    .find(|constraint| constraint.native_index == index)
+            }) {
+                constraint.auxiliary_bytes =
+                    constraint.auxiliary_bytes.saturating_add(projector.bytes);
+                constraint.required_bytes =
+                    constraint.required_bytes.saturating_add(projector.bytes);
+            }
         } else if let Some(domain_index) = projector.device_index.and_then(|index| {
             domains
                 .iter()
-                .position(|domain| domain.native_index == index)
+                .position(|domain| domain.native_indices.contains(&index))
         }) {
             let domain = &mut domains[domain_index];
             domain.auxiliary_bytes = domain.auxiliary_bytes.saturating_add(projector.bytes);
@@ -1022,10 +1105,24 @@ fn capacity_summary_for_topology(
         required_bytes = required_bytes.saturating_add(domain.required_bytes);
         available_bytes = available_bytes.saturating_add(available);
     }
+    for constraint in &device_constraints {
+        let available = constraint
+            .total_bytes
+            .saturating_sub(policy.reserve_bytes_per_domain);
+        let deficit = constraint.required_bytes.saturating_sub(available);
+        if deficit > 0 {
+            fits = false;
+        }
+        if deficit > largest_deficit {
+            largest_deficit = deficit;
+            limiting_resource.clone_from(&constraint.name);
+        }
+    }
     Ok(CapacitySummary {
         fits,
         required_bytes,
         available_bytes,
+        deficit_bytes: largest_deficit,
         limiting_resource,
         device: domains
             .iter()
@@ -1052,11 +1149,34 @@ fn capacity_summary_for_topology(
                 }
             })
             .collect(),
+        device_constraints: device_constraints
+            .into_iter()
+            .map(|constraint| {
+                let available_bytes = constraint
+                    .total_bytes
+                    .saturating_sub(policy.reserve_bytes_per_domain);
+                HardwareDeviceMemoryAssessment {
+                    device: constraint.name,
+                    kind: constraint.kind,
+                    model_bytes: constraint.model_bytes,
+                    context_bytes: constraint.context_bytes,
+                    compute_bytes: constraint.compute_bytes,
+                    auxiliary_bytes: constraint.auxiliary_bytes,
+                    required_bytes: constraint.required_bytes,
+                    available_bytes,
+                    margin_bytes: (i128::from(available_bytes)
+                        - i128::from(constraint.required_bytes))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                        as i64,
+                }
+            })
+            .collect(),
     })
 }
 
 fn add_additional_device_estimate(
     domains: &mut [CapacityDomain],
+    device_constraints: &mut [CapacityDeviceConstraint],
     device: &FitDeviceEstimate,
     estimate: FitMemoryEstimate,
     unified: bool,
@@ -1065,9 +1185,10 @@ fn add_additional_device_estimate(
     let domain = if unified {
         domains.first_mut()
     } else {
-        domains
-            .iter_mut()
-            .find(|domain| domain.native_index == device.index && domain.kind == device.kind)
+        domains.iter_mut().find(|domain| {
+            (device.device_id.is_some() && domain.physical_id == device.device_id)
+                || (domain.native_indices.contains(&device.index) && domain.kind == device.kind)
+        })
     }
     .ok_or(AssessmentError::MissingMeasurements)?;
     if include_model {
@@ -1086,19 +1207,64 @@ fn add_additional_device_estimate(
         .saturating_add(domain.context_bytes)
         .saturating_add(domain.compute_bytes)
         .saturating_add(domain.auxiliary_bytes);
+    if unified
+        && let Some(constraint) = device_constraints
+            .iter_mut()
+            .find(|constraint| constraint.native_index == device.index)
+    {
+        if include_model {
+            constraint.model_bytes = constraint
+                .model_bytes
+                .saturating_add(estimate.allocations.model_bytes);
+        }
+        constraint.context_bytes = constraint
+            .context_bytes
+            .saturating_add(estimate.allocations.context_bytes);
+        constraint.compute_bytes = constraint
+            .compute_bytes
+            .saturating_add(estimate.allocations.compute_bytes);
+        constraint.required_bytes = constraint
+            .model_bytes
+            .saturating_add(constraint.context_bytes)
+            .saturating_add(constraint.compute_bytes)
+            .saturating_add(constraint.auxiliary_bytes);
+    }
     Ok(())
 }
 
 fn add_device_estimate(
     domains: &mut Vec<CapacityDomain>,
+    device_constraints: &mut Vec<CapacityDeviceConstraint>,
     device: &FitDeviceEstimate,
     estimate: FitMemoryEstimate,
     unified: bool,
 ) -> Result<(), AssessmentError> {
     let total_bytes =
         u64::try_from(estimate.total_bytes).map_err(|_| AssessmentError::MissingMeasurements)?;
-    if unified {
-        if let Some(domain) = domains.first_mut() {
+    let shares_host_memory = unified
+        || device.kind == FitDeviceKind::Host
+        || device.backend_device_type() == LlamaBackendDeviceType::IntegratedGpu;
+    if unified
+        && device.kind == FitDeviceKind::Accelerator
+        && (device.backend.eq_ignore_ascii_case("metal")
+            || device.backend.eq_ignore_ascii_case("mtl"))
+        && total_bytes > 0
+    {
+        device_constraints.push(CapacityDeviceConstraint {
+            native_index: device.index,
+            name: device.name.clone(),
+            kind: HardwareDeviceMemoryLimitKind::RecommendedWorkingSet,
+            total_bytes,
+            model_bytes: estimate.allocations.model_bytes,
+            context_bytes: estimate.allocations.context_bytes,
+            compute_bytes: estimate.allocations.compute_bytes,
+            auxiliary_bytes: 0,
+            required_bytes: estimate.allocations.total_bytes,
+        });
+    }
+    if shares_host_memory {
+        if let Some(domain) = domains.iter_mut().find(|domain| domain.shares_host_memory) {
+            domain.native_indices.push(device.index);
             domain.total_bytes = domain.total_bytes.max(total_bytes);
             domain.model_bytes = domain
                 .model_bytes
@@ -1116,9 +1282,16 @@ fn add_device_estimate(
                 .saturating_add(domain.auxiliary_bytes);
         } else {
             domains.push(CapacityDomain {
-                native_index: device.index,
+                native_indices: vec![device.index],
+                physical_id: None,
+                shares_host_memory: true,
                 kind: device.kind,
-                name: "metal_unified_memory".to_owned(),
+                name: if unified {
+                    "unified_memory"
+                } else {
+                    "system_memory"
+                }
+                .to_owned(),
                 total_bytes,
                 model_bytes: estimate.allocations.model_bytes,
                 context_bytes: estimate.allocations.context_bytes,
@@ -1127,9 +1300,32 @@ fn add_device_estimate(
                 required_bytes: estimate.allocations.total_bytes,
             });
         }
+    } else if let Some(domain) = device.device_id.as_ref().and_then(|physical_id| {
+        domains
+            .iter_mut()
+            .find(|domain| domain.physical_id.as_ref() == Some(physical_id))
+    }) {
+        domain.native_indices.push(device.index);
+        domain.total_bytes = domain.total_bytes.max(total_bytes);
+        domain.model_bytes = domain
+            .model_bytes
+            .saturating_add(estimate.allocations.model_bytes);
+        domain.context_bytes = domain
+            .context_bytes
+            .saturating_add(estimate.allocations.context_bytes);
+        domain.compute_bytes = domain
+            .compute_bytes
+            .saturating_add(estimate.allocations.compute_bytes);
+        domain.required_bytes = domain
+            .model_bytes
+            .saturating_add(domain.context_bytes)
+            .saturating_add(domain.compute_bytes)
+            .saturating_add(domain.auxiliary_bytes);
     } else {
         domains.push(CapacityDomain {
-            native_index: device.index,
+            native_indices: vec![device.index],
+            physical_id: device.device_id.clone(),
+            shares_host_memory: false,
             kind: device.kind,
             name: device.name.clone(),
             total_bytes,
@@ -1183,6 +1379,7 @@ fn fits_assessment(
                 .available_bytes
                 .saturating_sub(summary.required_bytes),
             domains: summary.domains.clone(),
+            device_constraints: summary.device_constraints.clone(),
         },
         recommendation,
     }
@@ -1547,6 +1744,10 @@ mod tests {
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
                 logical_cores: 8,
+                system_memory: HardwareSystemMemory {
+                    total_bytes: 64_000,
+                    current_available_bytes: Some(32_000),
+                },
             },
         );
         assert_eq!(snapshot.memory_domains.len(), 3);
@@ -1557,6 +1758,77 @@ mod tests {
             assert_eq!(domain.devices.len(), 2);
         }
         assert_eq!(snapshot.enabled_backends, vec!["cuda", "vulkan"]);
+    }
+
+    #[test]
+    fn idless_backend_views_are_not_merged_and_zero_capacity_domains_are_omitted() {
+        let snapshot = hardware_snapshot_from_devices(
+            vec![
+                discovered_device(
+                    "CPU",
+                    "CPU",
+                    "Example CPU",
+                    HardwareDeviceKind::Cpu,
+                    64_000,
+                    32_000,
+                ),
+                discovered_device(
+                    "CUDA",
+                    "CUDA0",
+                    "Example GPU",
+                    HardwareDeviceKind::Gpu,
+                    16_000,
+                    12_000,
+                ),
+                discovered_device(
+                    "Vulkan",
+                    "Vulkan0",
+                    "Example GPU",
+                    HardwareDeviceKind::Gpu,
+                    16_000,
+                    12_000,
+                ),
+                discovered_device(
+                    "BLAS",
+                    "BLAS",
+                    "Accelerate",
+                    HardwareDeviceKind::Accelerator,
+                    0,
+                    0,
+                ),
+            ],
+            CapacityPolicy {
+                reserve_bytes_per_domain: 1_000,
+            },
+            HardwareEnvironment {
+                native_build: "build".to_owned(),
+                enabled_backends: vec!["cpu".to_owned(), "cuda".to_owned(), "vulkan".to_owned()],
+                assessment_policy: "assessment".to_owned(),
+                platform: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                logical_cores: 8,
+                system_memory: HardwareSystemMemory {
+                    total_bytes: 64_000,
+                    current_available_bytes: Some(32_000),
+                },
+            },
+        );
+
+        assert_eq!(snapshot.memory_domains.len(), 3);
+        assert_eq!(
+            snapshot
+                .memory_domains
+                .iter()
+                .filter(|domain| domain.kind == HardwareMemoryDomainKind::PhysicalDevice)
+                .count(),
+            2
+        );
+        assert!(
+            snapshot
+                .memory_domains
+                .iter()
+                .all(|domain| { domain.devices.iter().all(|device| device.backend != "BLAS") })
+        );
     }
 
     #[test]
@@ -1589,6 +1861,10 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 logical_cores: 8,
+                system_memory: HardwareSystemMemory {
+                    total_bytes: 64_000,
+                    current_available_bytes: Some(40_000),
+                },
             },
         );
         let mut changed = devices.into_iter().rev().collect::<Vec<_>>();
@@ -1604,12 +1880,31 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 logical_cores: 8,
+                system_memory: HardwareSystemMemory {
+                    total_bytes: 64_000,
+                    current_available_bytes: Some(1),
+                },
             },
         );
         assert_eq!(first.topology_fingerprint, second.topology_fingerprint);
         assert_eq!(first.memory_domains.len(), 1);
         assert_eq!(first.memory_domains[0].total_capacity_bytes, 64_000);
         assert_eq!(first.memory_domains[0].devices.len(), 2);
+        let metal = first.memory_domains[0]
+            .devices
+            .iter()
+            .find(|device| device.backend == "Metal")
+            .expect("Metal device");
+        assert_eq!(
+            metal.memory_limit,
+            Some(HardwareDeviceMemoryLimit {
+                kind: HardwareDeviceMemoryLimitKind::RecommendedWorkingSet,
+                total_bytes: 48_000,
+                stable_bytes: 0,
+                current_free_bytes: Some(20_000),
+            })
+        );
+        assert_eq!(first.system_memory.total_bytes, 64_000);
         assert_ne!(
             first.memory_domains[0].current_free_bytes,
             second.memory_domains[0].current_free_bytes
@@ -1646,6 +1941,10 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "x86_64".to_owned(),
                 logical_cores: 8,
+                system_memory: HardwareSystemMemory {
+                    total_bytes: 64_000,
+                    current_available_bytes: Some(40_000),
+                },
             },
         );
         assert_eq!(snapshot.memory_domains.len(), 2);
@@ -1685,6 +1984,8 @@ mod tests {
             index: 0,
             kind: FitDeviceKind::Host,
             backend_type: 0,
+            backend: "CPU".to_owned(),
+            device_id: None,
             name: "cpu".to_owned(),
             description: "host".to_owned(),
             initial: Some(FitMemoryEstimate {
@@ -1718,11 +2019,111 @@ mod tests {
     }
 
     #[test]
+    fn fit_capacity_uses_exact_physical_identity_across_backend_views() {
+        let device = |index, backend: &str, required_bytes| FitDeviceEstimate {
+            index,
+            kind: FitDeviceKind::Accelerator,
+            backend_type: 0,
+            backend: backend.to_owned(),
+            device_id: Some("0000:01:00.0".to_owned()),
+            name: format!("{backend}0"),
+            description: "Example GPU".to_owned(),
+            initial: Some(FitMemoryEstimate {
+                total_bytes: 16_000,
+                free_bytes: 12_000,
+                allocations: FitAllocations {
+                    model_bytes: required_bytes,
+                    context_bytes: 0,
+                    compute_bytes: 0,
+                    total_bytes: required_bytes,
+                },
+                target: None,
+            }),
+            fitted: None,
+            margin_bytes: None,
+        };
+        let summary = capacity_summary_for_topology(
+            &[device(0, "CUDA", 4_000), device(1, "Vulkan", 3_000)],
+            Measurement::Initial,
+            None,
+            false,
+            &[],
+            CapacityPolicy {
+                reserve_bytes_per_domain: 1_000,
+            },
+            false,
+        )
+        .expect("capacity summary");
+
+        assert_eq!(summary.available_bytes, 15_000);
+        assert_eq!(summary.required_bytes, 7_000);
+        assert_eq!(summary.domains.len(), 1);
+    }
+
+    #[test]
+    fn integrated_gpu_and_host_share_one_fit_capacity_domain() {
+        let device = |index, kind, backend_type, name: &str, total_bytes, required_bytes| {
+            FitDeviceEstimate {
+                index,
+                kind,
+                backend_type,
+                backend: if kind == FitDeviceKind::Host {
+                    "CPU".to_owned()
+                } else {
+                    "Vulkan".to_owned()
+                },
+                device_id: None,
+                name: name.to_owned(),
+                description: name.to_owned(),
+                initial: Some(FitMemoryEstimate {
+                    total_bytes,
+                    free_bytes: total_bytes,
+                    allocations: FitAllocations {
+                        model_bytes: required_bytes,
+                        context_bytes: 0,
+                        compute_bytes: 0,
+                        total_bytes: required_bytes,
+                    },
+                    target: None,
+                }),
+                fitted: None,
+                margin_bytes: None,
+            }
+        };
+        let summary = capacity_summary_for_topology(
+            &[
+                device(0, FitDeviceKind::Accelerator, 2, "iGPU", 8_000, 4_000),
+                device(1, FitDeviceKind::Host, 0, "CPU", 32_000, 5_000),
+            ],
+            Measurement::Initial,
+            None,
+            false,
+            &[],
+            CapacityPolicy {
+                reserve_bytes_per_domain: 2_000,
+            },
+            false,
+        )
+        .expect("capacity summary");
+
+        assert_eq!(summary.available_bytes, 30_000);
+        assert_eq!(summary.required_bytes, 9_000);
+        assert_eq!(summary.domains.len(), 1);
+    }
+
+    #[test]
     fn unified_capacity_counts_physical_memory_once() {
         let device = |index, kind, name: &str, total_bytes, required_bytes| FitDeviceEstimate {
             index,
             kind,
             backend_type: 0,
+            backend: if kind == FitDeviceKind::Accelerator {
+                "Metal"
+            } else {
+                "CPU"
+            }
+            .to_owned(),
+            device_id: None,
             name: name.to_owned(),
             description: name.to_owned(),
             initial: Some(FitMemoryEstimate {
@@ -1756,6 +2157,61 @@ mod tests {
         .unwrap();
         assert_eq!(summary.available_bytes, 60_000);
         assert_eq!(summary.required_bytes, 25_000);
+        assert_eq!(summary.device_constraints.len(), 1);
+        assert_eq!(summary.device_constraints[0].available_bytes, 44_000);
+        assert_eq!(summary.device_constraints[0].required_bytes, 20_000);
+    }
+
+    #[test]
+    fn apple_metal_working_set_can_limit_an_otherwise_valid_unified_fit() {
+        let device = |index, kind, backend: &str, total_bytes, required_bytes| FitDeviceEstimate {
+            index,
+            kind,
+            backend_type: 0,
+            backend: backend.to_owned(),
+            device_id: None,
+            name: if kind == FitDeviceKind::Host {
+                "CPU".to_owned()
+            } else {
+                "MTL0".to_owned()
+            },
+            description: "Apple M4 Max".to_owned(),
+            initial: Some(FitMemoryEstimate {
+                total_bytes,
+                free_bytes: total_bytes,
+                allocations: FitAllocations {
+                    model_bytes: required_bytes,
+                    context_bytes: 0,
+                    compute_bytes: 0,
+                    total_bytes: required_bytes,
+                },
+                target: None,
+            }),
+            fitted: None,
+            margin_bytes: None,
+        };
+        let summary = capacity_summary_for_topology(
+            &[
+                device(0, FitDeviceKind::Accelerator, "MTL", 48_000, 47_000),
+                device(1, FitDeviceKind::Host, "CPU", 64_000, 1_000),
+            ],
+            Measurement::Initial,
+            None,
+            false,
+            &[],
+            CapacityPolicy {
+                reserve_bytes_per_domain: 2_000,
+            },
+            true,
+        )
+        .expect("capacity summary");
+
+        assert_eq!(summary.required_bytes, 48_000);
+        assert_eq!(summary.available_bytes, 62_000);
+        assert!(!summary.fits);
+        assert_eq!(summary.deficit_bytes, 1_000);
+        assert_eq!(summary.limiting_resource, "MTL0");
+        assert_eq!(summary.device_constraints[0].margin_bytes, -1_000);
     }
 
     #[test]
@@ -1764,6 +2220,8 @@ mod tests {
             index: 0,
             kind: FitDeviceKind::Host,
             backend_type: 0,
+            backend: "CPU".to_owned(),
+            device_id: None,
             name: "cpu".to_owned(),
             description: "host".to_owned(),
             initial: Some(FitMemoryEstimate {

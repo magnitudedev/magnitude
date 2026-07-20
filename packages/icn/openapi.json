@@ -2107,7 +2107,8 @@
           "required_bytes",
           "available_bytes",
           "deficit_bytes",
-          "domains"
+          "domains",
+          "device_constraints"
         ],
         "properties": {
           "required_bytes": {
@@ -2130,6 +2131,12 @@
             "items": {
               "$ref": "#/components/schemas/HardwareMemoryDomainAssessmentSchema"
             }
+          },
+          "device_constraints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareDeviceMemoryAssessmentSchema"
+            }
           }
         },
         "additionalProperties": false
@@ -2143,6 +2150,99 @@
           "accelerator",
           "unknown"
         ]
+      },
+      "HardwareDeviceMemoryAssessmentSchema": {
+        "type": "object",
+        "required": [
+          "device",
+          "kind",
+          "model_bytes",
+          "context_bytes",
+          "compute_bytes",
+          "auxiliary_bytes",
+          "required_bytes",
+          "available_bytes",
+          "margin_bytes"
+        ],
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/HardwareDeviceMemoryLimitKindSchema"
+          },
+          "model_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "context_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "compute_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "auxiliary_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "required_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "available_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "margin_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "HardwareDeviceMemoryLimitKindSchema": {
+        "type": "string",
+        "enum": [
+          "recommended_working_set"
+        ]
+      },
+      "HardwareDeviceMemoryLimitSchema": {
+        "type": "object",
+        "required": [
+          "kind",
+          "total_bytes",
+          "stable_bytes"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/HardwareDeviceMemoryLimitKindSchema"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "stable_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "current_free_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
       },
       "HardwareDeviceSchema": {
         "type": "object",
@@ -2168,6 +2268,16 @@
           },
           "kind": {
             "$ref": "#/components/schemas/HardwareDeviceKindSchema"
+          },
+          "memory_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HardwareDeviceMemoryLimitSchema"
+              }
+            ]
           }
         }
       },
@@ -2229,7 +2339,7 @@
         "enum": [
           "system",
           "physical_device",
-          "unified_working_set"
+          "unified_memory"
         ]
       },
       "HardwareMemoryDomainSchema": {
@@ -2284,7 +2394,8 @@
           "required_bytes",
           "available_bytes",
           "headroom_bytes",
-          "domains"
+          "domains",
+          "device_constraints"
         ],
         "properties": {
           "required_bytes": {
@@ -2306,6 +2417,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/HardwareMemoryDomainAssessmentSchema"
+            }
+          },
+          "device_constraints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareDeviceMemoryAssessmentSchema"
             }
           }
         },
@@ -2347,6 +2464,7 @@
           "platform",
           "architecture",
           "logical_cores",
+          "system_memory",
           "native_build",
           "enabled_backends",
           "assessment_policy",
@@ -2376,6 +2494,9 @@
             "type": "integer",
             "minimum": 0
           },
+          "system_memory": {
+            "$ref": "#/components/schemas/HardwareSystemMemorySchema"
+          },
           "native_build": {
             "type": "string"
           },
@@ -2399,6 +2520,27 @@
             "items": {
               "$ref": "#/components/schemas/HardwareMemoryDomainSchema"
             }
+          }
+        }
+      },
+      "HardwareSystemMemorySchema": {
+        "type": "object",
+        "required": [
+          "total_bytes"
+        ],
+        "properties": {
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "current_available_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

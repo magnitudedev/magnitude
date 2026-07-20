@@ -3044,6 +3044,10 @@ mod tests {
                     "architecture": "test64",
                     "cpu_model": "Test CPU",
                     "logical_cores": 8,
+                    "system_memory": {
+                        "total_bytes": 1024,
+                        "current_available_bytes": 512
+                    },
                     "native_build": "test-build",
                     "enabled_backends": ["cpu"],
                     "assessment_policy": "test-policy",
@@ -3061,7 +3065,8 @@ mod tests {
                             "backend": "cpu",
                             "name": "CPU",
                             "description": "Test CPU",
-                            "kind": "cpu"
+                            "kind": "cpu",
+                            "memory_limit": null
                         }]
                     }]
                 }))

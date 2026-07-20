@@ -58,26 +58,16 @@ const baseState = {
 describe("local inference selection view model", () => {
   it("presents Apple Silicon as one unified-memory system", () => {
     expect(describeLocalHardware({
-      platform: "darwin",
-      architecture: "arm64",
+      platform: "macos",
+      architecture: "aarch64",
       systemMemoryBytes: 64 * 1024 ** 3,
       cpuModel: "Apple M4 Max",
       logicalCores: 16,
       memoryDomains: [{
         id: "system",
-        kind: "system",
+        kind: "unified_memory",
         totalCapacityBytes: 64 * 1024 ** 3,
         stableCapacityBytes: 51.2 * 1024 ** 3,
-        currentFreeBytes: null,
-        sharesSystemMemory: false,
-        backendNames: [],
-        deviceNames: [],
-        splitGroupId: null,
-      }, {
-        id: "metal",
-        kind: "unified_working_set",
-        totalCapacityBytes: 48 * 1024 ** 3,
-        stableCapacityBytes: 43.2 * 1024 ** 3,
         currentFreeBytes: null,
         sharesSystemMemory: true,
         backendNames: ["Metal"],
@@ -90,6 +80,37 @@ describe("local inference selection view model", () => {
         details: [
           "macOS · Apple Silicon · 16 logical CPU cores",
           "64.0 GiB unified memory · Metal GPU acceleration",
+        ],
+      },
+      accelerators: [],
+    })
+  })
+
+  it("uses ICN unified-domain semantics without platform-specific topology inference", () => {
+    const gib = 1024 ** 3
+    expect(describeLocalHardware({
+      platform: "linux",
+      architecture: "x86_64",
+      systemMemoryBytes: 32 * gib,
+      cpuModel: "Example CPU",
+      logicalCores: 8,
+      memoryDomains: [{
+        id: "system",
+        kind: "unified_memory",
+        totalCapacityBytes: 32 * gib,
+        stableCapacityBytes: 30.5 * gib,
+        currentFreeBytes: null,
+        sharesSystemMemory: true,
+        backendNames: ["Vulkan"],
+        deviceNames: ["Integrated GPU"],
+        splitGroupId: null,
+      }],
+    })).toEqual({
+      system: {
+        name: "Example CPU",
+        details: [
+          "Linux · x86-64 · 8 logical CPU cores",
+          "32.0 GiB unified memory · Vulkan GPU acceleration",
         ],
       },
       accelerators: [],

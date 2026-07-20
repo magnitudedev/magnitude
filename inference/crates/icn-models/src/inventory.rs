@@ -1878,6 +1878,7 @@ mod tests {
                     },
                     memory: HardwareMemory {
                         domains: Vec::new(),
+                        device_constraints: Vec::new(),
                         required_bytes: 1,
                         available_bytes: 2,
                         headroom_bytes: 1,

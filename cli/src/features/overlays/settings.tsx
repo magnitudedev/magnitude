@@ -336,7 +336,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                   <text style={{ fg: theme.muted }}>{accelerator.details}</text>
                 </box>
               ))}
-              {detected.accelerators.length === 0 && Option.exists(host, (profile) => !profile.memoryDomains.some((domain) => domain.kind === 'unified_working_set')) && (
+              {detected.accelerators.length === 0 && Option.exists(host, (profile) => !profile.memoryDomains.some((domain) => domain.kind === 'unified_memory')) && (
                 <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
               )}
             </box>
