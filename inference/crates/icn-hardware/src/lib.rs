@@ -1,8 +1,10 @@
 //! Model-free memory fitting over the exact pinned llama.cpp `common/fit` path.
 
+use std::collections::BTreeMap;
 use std::ffi::{CString, NulError};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use icn_contracts::{CacheType, FlashAttention as FitFlashAttention, GpuLayers, SplitMode};
 use llama_cpp_2::context::params::{
@@ -16,9 +18,12 @@ use llama_cpp_2::model::params::fit::{
 use llama_cpp_2::model::params::fit::{FitReport, FitReportError};
 
 use icn_contracts::{
-    HardwareAssessment, HardwareDeficit, HardwareMemory, HardwareProfile, HardwareRecommendation,
-    MtpConfig, MtpSource, ResolvedExecutionPlan,
+    HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceKind, HardwareMemory,
+    HardwareMemoryDomain, HardwareMemoryDomainKind, HardwareProfile, HardwareRecommendation,
+    HardwareSnapshot, MtpConfig, MtpSource, ResolvedExecutionPlan,
 };
+use llama_cpp_2::LlamaBackendDeviceType;
+use sha2::{Digest, Sha256};
 
 fn cache_type_into_native(cache_type: CacheType) -> KvCacheType {
     match cache_type {
@@ -164,12 +169,278 @@ pub struct CapacityPolicy {
     pub reserve_bytes_per_domain: u64,
 }
 
+#[derive(Clone, Debug)]
+struct DiscoveredDevice {
+    backend: String,
+    name: String,
+    description: String,
+    kind: HardwareDeviceKind,
+    total_bytes: u64,
+    free_bytes: Option<u64>,
+}
+
+struct HardwareEnvironment {
+    native_build: String,
+    enabled_backends: Vec<String>,
+    assessment_policy: String,
+    platform: String,
+    architecture: String,
+    logical_cores: usize,
+}
+
 impl Default for CapacityPolicy {
     fn default() -> Self {
         Self {
             reserve_bytes_per_domain: 1536 * 1024 * 1024,
         }
     }
+}
+
+/// Discover the non-overlapping memory domains exposed by the pinned native runtime.
+#[must_use]
+pub fn discover_hardware(
+    _backend: &LlamaBackend,
+    policy: CapacityPolicy,
+    native_build: impl Into<String>,
+    enabled_backends: Vec<String>,
+    assessment_policy: impl Into<String>,
+) -> HardwareSnapshot {
+    let devices = llama_cpp_2::list_llama_ggml_backend_devices()
+        .into_iter()
+        .map(|device| DiscoveredDevice {
+            backend: device.backend,
+            name: device.name,
+            description: device.description,
+            kind: match device.device_type {
+                LlamaBackendDeviceType::Cpu => HardwareDeviceKind::Cpu,
+                LlamaBackendDeviceType::Gpu => HardwareDeviceKind::Gpu,
+                LlamaBackendDeviceType::IntegratedGpu => HardwareDeviceKind::IntegratedGpu,
+                LlamaBackendDeviceType::Accelerator => HardwareDeviceKind::Accelerator,
+                _ => HardwareDeviceKind::Unknown,
+            },
+            total_bytes: u64::try_from(device.memory_total).unwrap_or(u64::MAX),
+            free_bytes: u64::try_from(device.memory_free).ok(),
+        })
+        .collect();
+    hardware_snapshot_from_devices(
+        devices,
+        policy,
+        HardwareEnvironment {
+            native_build: native_build.into(),
+            enabled_backends,
+            assessment_policy: assessment_policy.into(),
+            platform: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+            logical_cores: std::thread::available_parallelism().map_or(1, |value| value.get()),
+        },
+    )
+}
+
+fn hardware_snapshot_from_devices(
+    devices: Vec<DiscoveredDevice>,
+    policy: CapacityPolicy,
+    mut environment: HardwareEnvironment,
+) -> HardwareSnapshot {
+    let unified_platform = environment.platform == "macos" && environment.architecture == "aarch64";
+    let mut shared = Vec::new();
+    let mut dedicated = BTreeMap::<String, BTreeMap<String, Vec<DiscoveredDevice>>>::new();
+    for device in devices {
+        if unified_platform
+            || matches!(
+                device.kind,
+                HardwareDeviceKind::Cpu | HardwareDeviceKind::IntegratedGpu
+            )
+        {
+            shared.push(device);
+        } else {
+            let physical_key = format!(
+                "{}\0{}",
+                normalized_device_identity(&device),
+                device.total_bytes
+            );
+            dedicated
+                .entry(physical_key)
+                .or_default()
+                .entry(device.backend.to_ascii_lowercase())
+                .or_default()
+                .push(device);
+        }
+    }
+    shared.sort_by(device_order);
+    for backends in dedicated.values_mut() {
+        for views in backends.values_mut() {
+            views.sort_by(device_order);
+        }
+    }
+
+    let mut domains = Vec::new();
+    if !shared.is_empty() {
+        let total = shared
+            .iter()
+            .map(|device| device.total_bytes)
+            .max()
+            .unwrap_or(0);
+        let free = shared.iter().filter_map(|device| device.free_bytes).max();
+        let unified = unified_platform
+            || shared
+                .iter()
+                .any(|device| device.kind == HardwareDeviceKind::IntegratedGpu);
+        domains.push(HardwareMemoryDomain {
+            id: "system".to_owned(),
+            kind: if unified {
+                HardwareMemoryDomainKind::UnifiedWorkingSet
+            } else {
+                HardwareMemoryDomainKind::System
+            },
+            total_capacity_bytes: total,
+            stable_capacity_bytes: total.saturating_sub(policy.reserve_bytes_per_domain),
+            current_free_bytes: free,
+            shares_system_memory: true,
+            devices: shared
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, device)| public_device(device, ordinal))
+                .collect(),
+        });
+    }
+
+    // A physical accelerator can be exposed by more than one backend. Equal normalized identity
+    // and capacity are strong alias evidence. Occurrence ordinals preserve two genuinely distinct,
+    // otherwise-identical cards reported by the same backend without double-counting aliases.
+    for (physical_key, backends) in dedicated {
+        let occurrences = backends.values().map(Vec::len).max().unwrap_or(0);
+        for ordinal in 0..occurrences {
+            let views = backends
+                .values()
+                .filter_map(|devices| devices.get(ordinal).cloned())
+                .collect::<Vec<_>>();
+            let total = views
+                .iter()
+                .map(|device| device.total_bytes)
+                .max()
+                .unwrap_or(0);
+            let free = views.iter().filter_map(|device| device.free_bytes).max();
+            let id_material = format!("{physical_key}\0{ordinal}");
+            let id = format!("device-{:x}", Sha256::digest(id_material.as_bytes()));
+            domains.push(HardwareMemoryDomain {
+                id,
+                kind: HardwareMemoryDomainKind::PhysicalDevice,
+                total_capacity_bytes: total,
+                stable_capacity_bytes: total.saturating_sub(policy.reserve_bytes_per_domain),
+                current_free_bytes: free,
+                shares_system_memory: false,
+                devices: views
+                    .into_iter()
+                    .map(|device| public_device(device, ordinal))
+                    .collect(),
+            });
+        }
+    }
+
+    environment.enabled_backends.sort();
+    environment.enabled_backends.dedup();
+
+    let topology_material = domains
+        .iter()
+        .map(|domain| {
+            (
+                &domain.id,
+                &domain.kind,
+                domain.total_capacity_bytes,
+                domain.stable_capacity_bytes,
+                domain.shares_system_memory,
+                domain
+                    .devices
+                    .iter()
+                    .map(|device| {
+                        (
+                            &device.backend,
+                            &device.name,
+                            &device.description,
+                            &device.kind,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let topology_material = serde_json::to_vec(&topology_material).unwrap_or_default();
+    let topology_fingerprint = format!("{:x}", Sha256::digest(topology_material));
+    HardwareSnapshot {
+        captured_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs()),
+        platform: environment.platform,
+        architecture: environment.architecture,
+        cpu_model: domains
+            .iter()
+            .flat_map(|domain| &domain.devices)
+            .find(|device| device.kind == HardwareDeviceKind::Cpu)
+            .map(|device| device.description.clone()),
+        logical_cores: environment.logical_cores,
+        native_build: environment.native_build,
+        enabled_backends: environment.enabled_backends,
+        assessment_policy: environment.assessment_policy,
+        capacity_policy: format!(
+            "native-fit-stable-total;memory-domains=platform-native;reserve-per-domain={}",
+            policy.reserve_bytes_per_domain
+        ),
+        topology_fingerprint,
+        memory_domains: domains,
+    }
+}
+
+fn normalized_device_identity(device: &DiscoveredDevice) -> String {
+    let description = device.description.trim();
+    let identity = if description.is_empty() {
+        device.name.trim()
+    } else {
+        description
+    };
+    identity.to_ascii_lowercase()
+}
+
+fn device_order(left: &DiscoveredDevice, right: &DiscoveredDevice) -> std::cmp::Ordering {
+    (
+        normalized_device_identity(left),
+        left.backend.to_ascii_lowercase(),
+        left.name.to_ascii_lowercase(),
+    )
+        .cmp(&(
+            normalized_device_identity(right),
+            right.backend.to_ascii_lowercase(),
+            right.name.to_ascii_lowercase(),
+        ))
+}
+
+fn public_device(device: DiscoveredDevice, ordinal: usize) -> HardwareDevice {
+    let identity = format!(
+        "{}\0{}\0{}\0{ordinal}",
+        device.backend, device.name, device.description
+    );
+    HardwareDevice {
+        id: format!("native-{:x}", Sha256::digest(identity.as_bytes())),
+        backend: device.backend,
+        name: device.name,
+        description: device.description,
+        kind: device.kind,
+    }
+}
+
+pub fn discover(
+    policy: CapacityPolicy,
+    native_build: impl Into<String>,
+    enabled_backends: Vec<String>,
+    assessment_policy: impl Into<String>,
+) -> Result<HardwareSnapshot, EstimateError> {
+    let backend = LlamaBackend::init().map_err(EstimateError::Backend)?;
+    Ok(discover_hardware(
+        &backend,
+        policy,
+        native_build,
+        enabled_backends,
+        assessment_policy,
+    ))
 }
 
 /// The exact plan selected for loading plus its consumer-facing assessment.
@@ -486,12 +757,34 @@ fn capacity_summary(
     host_cache_bytes: u64,
     policy: CapacityPolicy,
 ) -> Result<CapacitySummary, AssessmentError> {
+    // Every accelerator exposed by the supported macOS llama.cpp build shares the process's
+    // unified physical memory with the host. Native device display names such as `MTL0` are not a
+    // reliable backend discriminator and previously caused the same RAM to be counted twice.
+    capacity_summary_for_topology(
+        devices,
+        measurement,
+        mtp_devices,
+        mtp_includes_model,
+        projectors,
+        host_cache_bytes,
+        policy,
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capacity_summary_for_topology(
+    devices: &[FitDeviceEstimate],
+    measurement: Measurement,
+    mtp_devices: Option<&[FitDeviceEstimate]>,
+    mtp_includes_model: bool,
+    projectors: &[ProjectorMemory],
+    host_cache_bytes: u64,
+    policy: CapacityPolicy,
+    unified: bool,
+) -> Result<CapacitySummary, AssessmentError> {
     #[cfg(not(feature = "mtmd"))]
     let _ = projectors;
-    let unified = cfg!(target_os = "macos")
-        && devices
-            .iter()
-            .any(|device| device.name.to_ascii_lowercase().contains("metal"));
     let mut domains = Vec::<CapacityDomain>::new();
     for device in devices {
         let estimate = match measurement {
@@ -901,6 +1194,173 @@ mod tests {
     use super::*;
     use llama_cpp_2::model::params::fit::{FitAllocations, FitDeviceKind, FitMemoryEstimate};
 
+    fn discovered_device(
+        backend: &str,
+        name: &str,
+        description: &str,
+        kind: HardwareDeviceKind,
+        total_bytes: u64,
+        free_bytes: u64,
+    ) -> DiscoveredDevice {
+        DiscoveredDevice {
+            backend: backend.to_owned(),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            kind,
+            total_bytes,
+            free_bytes: Some(free_bytes),
+        }
+    }
+
+    #[test]
+    fn hardware_snapshot_deduplicates_backend_aliases_without_merging_duplicate_cards() {
+        let gpu = |backend: &str, name: &str| {
+            discovered_device(
+                backend,
+                name,
+                "Example GPU",
+                HardwareDeviceKind::Gpu,
+                16_000,
+                12_000,
+            )
+        };
+        let snapshot = hardware_snapshot_from_devices(
+            vec![
+                discovered_device(
+                    "CPU",
+                    "CPU",
+                    "Example CPU",
+                    HardwareDeviceKind::Cpu,
+                    64_000,
+                    32_000,
+                ),
+                gpu("CUDA", "CUDA0"),
+                gpu("CUDA", "CUDA1"),
+                gpu("Vulkan", "Vulkan0"),
+                gpu("Vulkan", "Vulkan1"),
+            ],
+            CapacityPolicy {
+                reserve_bytes_per_domain: 1_000,
+            },
+            HardwareEnvironment {
+                native_build: "build".to_owned(),
+                enabled_backends: vec!["vulkan".to_owned(), "cuda".to_owned()],
+                assessment_policy: "assessment".to_owned(),
+                platform: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                logical_cores: 8,
+            },
+        );
+        assert_eq!(snapshot.memory_domains.len(), 3);
+        assert_eq!(snapshot.memory_domains[0].id, "system");
+        for domain in &snapshot.memory_domains[1..] {
+            assert_eq!(domain.total_capacity_bytes, 16_000);
+            assert_eq!(domain.stable_capacity_bytes, 15_000);
+            assert_eq!(domain.devices.len(), 2);
+        }
+        assert_eq!(snapshot.enabled_backends, vec!["cuda", "vulkan"]);
+    }
+
+    #[test]
+    fn hardware_topology_is_stable_across_order_and_free_memory_changes() {
+        let devices = vec![
+            discovered_device(
+                "CPU",
+                "CPU",
+                "Example CPU",
+                HardwareDeviceKind::Cpu,
+                64_000,
+                40_000,
+            ),
+            discovered_device(
+                "Metal",
+                "MTL0",
+                "Example GPU",
+                HardwareDeviceKind::Gpu,
+                48_000,
+                20_000,
+            ),
+        ];
+        let first = hardware_snapshot_from_devices(
+            devices.clone(),
+            CapacityPolicy::default(),
+            HardwareEnvironment {
+                native_build: "build".to_owned(),
+                enabled_backends: vec!["metal".to_owned(), "cpu".to_owned()],
+                assessment_policy: "assessment".to_owned(),
+                platform: "macos".to_owned(),
+                architecture: "aarch64".to_owned(),
+                logical_cores: 8,
+            },
+        );
+        let mut changed = devices.into_iter().rev().collect::<Vec<_>>();
+        changed[0].free_bytes = Some(1);
+        changed[1].free_bytes = Some(2);
+        let second = hardware_snapshot_from_devices(
+            changed,
+            CapacityPolicy::default(),
+            HardwareEnvironment {
+                native_build: "build".to_owned(),
+                enabled_backends: vec!["cpu".to_owned(), "metal".to_owned()],
+                assessment_policy: "assessment".to_owned(),
+                platform: "macos".to_owned(),
+                architecture: "aarch64".to_owned(),
+                logical_cores: 8,
+            },
+        );
+        assert_eq!(first.topology_fingerprint, second.topology_fingerprint);
+        assert_eq!(first.memory_domains.len(), 1);
+        assert_eq!(first.memory_domains[0].total_capacity_bytes, 64_000);
+        assert_eq!(first.memory_domains[0].devices.len(), 2);
+        assert_ne!(
+            first.memory_domains[0].current_free_bytes,
+            second.memory_domains[0].current_free_bytes
+        );
+    }
+
+    #[test]
+    fn macos_unifies_devices_only_on_apple_silicon() {
+        let devices = vec![
+            discovered_device(
+                "CPU",
+                "CPU",
+                "Example CPU",
+                HardwareDeviceKind::Cpu,
+                64_000,
+                40_000,
+            ),
+            discovered_device(
+                "Metal",
+                "MTL0",
+                "Discrete GPU",
+                HardwareDeviceKind::Gpu,
+                16_000,
+                12_000,
+            ),
+        ];
+        let snapshot = hardware_snapshot_from_devices(
+            devices,
+            CapacityPolicy::default(),
+            HardwareEnvironment {
+                native_build: "build".to_owned(),
+                enabled_backends: vec!["cpu".to_owned(), "metal".to_owned()],
+                assessment_policy: "assessment".to_owned(),
+                platform: "macos".to_owned(),
+                architecture: "x86_64".to_owned(),
+                logical_cores: 8,
+            },
+        );
+        assert_eq!(snapshot.memory_domains.len(), 2);
+        assert_eq!(
+            snapshot.memory_domains[0].kind,
+            HardwareMemoryDomainKind::System
+        );
+        assert_eq!(
+            snapshot.memory_domains[1].kind,
+            HardwareMemoryDomainKind::PhysicalDevice
+        );
+    }
+
     #[test]
     fn one_margin_is_broadcast() {
         assert_eq!(expand_margins(&[512], 3).expect("margins"), vec![512; 3]);
@@ -958,6 +1418,48 @@ mod tests {
         assert!(summary.fits);
         assert_eq!(summary.available_bytes, 900);
         assert_eq!(summary.required_bytes, 500);
+    }
+
+    #[test]
+    fn unified_capacity_counts_physical_memory_once() {
+        let device = |index, kind, name: &str, total_bytes, required_bytes| FitDeviceEstimate {
+            index,
+            kind,
+            backend_type: 0,
+            name: name.to_owned(),
+            description: name.to_owned(),
+            initial: Some(FitMemoryEstimate {
+                total_bytes,
+                free_bytes: 1,
+                allocations: FitAllocations {
+                    model_bytes: required_bytes,
+                    context_bytes: 0,
+                    compute_bytes: 0,
+                    total_bytes: required_bytes,
+                },
+                target: None,
+            }),
+            fitted: None,
+            margin_bytes: None,
+        };
+        let summary = capacity_summary_for_topology(
+            &[
+                device(0, FitDeviceKind::Accelerator, "MTL0", 48_000, 20_000),
+                device(1, FitDeviceKind::Host, "CPU", 64_000, 5_000),
+            ],
+            Measurement::Initial,
+            None,
+            false,
+            &[],
+            0,
+            CapacityPolicy {
+                reserve_bytes_per_domain: 4_000,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.available_bytes, 60_000);
+        assert_eq!(summary.required_bytes, 25_000);
     }
 
     #[test]

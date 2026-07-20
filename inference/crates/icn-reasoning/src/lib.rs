@@ -37,6 +37,10 @@ pub struct TemplateInspection {
 pub struct NativeTemplateAssessor;
 
 impl TemplateAssessor for NativeTemplateAssessor {
+    fn cache_identity(&self) -> &str {
+        concat!("icn-native-template-assessor:", env!("CARGO_PKG_VERSION"))
+    }
+
     fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
         inspect_template_inputs(inputs)
             .map(|inspection| TemplateAssessment {

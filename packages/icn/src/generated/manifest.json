@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "f78377a56a3adcf6b7e5ed146157f17ba46402658ed2fe92d8382b5ae1f81966",
+  "protocolHash": "eed0a19ccc57c2c3717040e569b31b63de2ef74675789cfd1fa086d2e9500cb3",
   "configHash": "ff673308712b33818f3f8d3476dbc7079e8f635a9ba4c347929f164771c3760b",
   "files": [
     "api.ts",
@@ -12,8 +12,13 @@
   "operations": [
     "applyChatTemplate",
     "createChatCompletion",
+    "deleteModel",
+    "downloadModel",
+    "getHardware",
+    "getModel",
     "getModelProperties",
     "health",
-    "listModels"
+    "listModels",
+    "previewModel"
   ]
 }

@@ -33,6 +33,57 @@ export const createChatCompletionOperation = {
   ],
 } as const
 
+export const deleteModelOperation = {
+  operationId: "deleteModel",
+  transport: "http",
+  method: "DELETE",
+  path: "/v1/models/{model_id}",
+  group: "models",
+} as const
+
+export const downloadModelOperation = {
+  operationId: "downloadModel",
+  transport: "sse",
+  method: "POST",
+  path: "/v1/models/download",
+  group: "models",
+  mediaType: "text/event-stream",
+  responseStatus: 200,
+  eventSchema: Schemas.ModelDownloadEventSchema,
+  termination: { type: "eof" },
+  reconnect: { type: "none" },
+  payload: S.suspend(
+    (): S.Schema<Schemas.DownloadModelRequestSchema, Schemas.DownloadModelRequestSchemaEncoded> =>
+      Schemas.DownloadModelRequestSchema,
+  ),
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    },
+  ],
+} as const
+
+export const getHardwareOperation = {
+  operationId: "getHardware",
+  transport: "http",
+  method: "GET",
+  path: "/v1/hardware",
+  group: "system",
+} as const
+
+export const getModelOperation = {
+  operationId: "getModel",
+  transport: "http",
+  method: "GET",
+  path: "/v1/models/{model_id}",
+  group: "models",
+} as const
+
 export const getModelPropertiesOperation = {
   operationId: "getModelProperties",
   transport: "http",
@@ -54,5 +105,13 @@ export const listModelsOperation = {
   transport: "http",
   method: "GET",
   path: "/v1/models",
+  group: "models",
+} as const
+
+export const previewModelOperation = {
+  operationId: "previewModel",
+  transport: "http",
+  method: "POST",
+  path: "/v1/models/preview",
   group: "models",
 } as const

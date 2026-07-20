@@ -9,13 +9,16 @@ use futures_util::future::BoxFuture;
 use icn_api::{AppState, FakeBackend, app};
 use icn_contracts::{
     CacheType, CompletionBackend, ComponentRole, ExecutionConfig, FlashAttention, GpuLayers,
-    HardwareAssessment, InventoryError, InventoryHardwareAssessor, LoadStage, ModelId,
-    ModelInventory, ModelStatus, ProjectorConfig, RadixCacheConfig, ResolvedExecutionPlan,
+    HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
+    InventoryHardwareAssessor, LoadStage, ModelHardwareAssessor, ModelId, ModelInventory,
+    ModelPreviewProfile, ModelStatus, ProjectorConfig, RadixCacheConfig, ResolvedExecutionPlan,
     ResolvedModel, SplitMode,
 };
 use icn_engine::{LlamaCompletionBackend, resolve_execution_plan};
-use icn_hardware::{CapacityPolicy, assess as assess_hardware, assess_with_backend};
-use icn_models::{InventoryConfig, ModelManager};
+use icn_hardware::{
+    CapacityPolicy, assess as assess_hardware, assess_with_backend, discover, discover_hardware,
+};
+use icn_models::{InventoryConfig, ModelManager, ModelPreviewService};
 use icn_reasoning::NativeTemplateAssessor;
 
 mod build_identity;
@@ -216,21 +219,120 @@ struct NativeHardwareAssessor {
     gate: tokio::sync::Mutex<()>,
 }
 
+const ASSESSMENT_PROFILE_RESOLVER: &str = "icn-runtime-plan-defaults";
+
+impl NativeHardwareAssessor {
+    fn effective_defaults(&self, profile: Option<&ModelPreviewProfile>) -> RuntimePlanDefaults {
+        let mut defaults = self.defaults.clone();
+        if let Some(profile) = profile {
+            defaults.context_size = profile.context_length;
+            defaults.max_sequences = profile.parallel_sequences;
+        }
+        defaults
+    }
+
+    async fn assess_resolved(
+        &self,
+        resolved: ResolvedModel,
+        profile: Option<&icn_contracts::ModelPreviewProfile>,
+    ) -> Result<HardwareAssessment, InventoryError> {
+        let _guard = self.gate.lock().await;
+        let id = resolved.model.id.clone();
+        let primary = resolved
+            .components
+            .iter()
+            .filter(|component| {
+                matches!(
+                    component.role,
+                    ComponentRole::Weights | ComponentRole::Shard
+                )
+            })
+            .min_by_key(|component| component.shard_index.unwrap_or(0))
+            .map(|component| component.path.clone())
+            .ok_or_else(|| InventoryError::NotReady("model has no runnable weights".into()))?;
+        let projector = resolved
+            .components
+            .iter()
+            .find(|component| component.role == ComponentRole::Projector)
+            .map(|component| component.path.clone());
+        let mtp: Vec<PathBuf> = resolved
+            .components
+            .iter()
+            .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
+            .map(|component| component.path.clone())
+            .collect();
+        let native_executor = self
+            .native_executor
+            .read()
+            .map_err(|_| InventoryError::Internal("native executor lock poisoned".to_owned()))?
+            .clone();
+        let defaults = self.effective_defaults(profile);
+        match tokio::task::spawn_blocking(move || match native_executor {
+            Some(executor) => executor
+                .run_exclusive_native(move |backend| {
+                    let mut plan = base_plan(primary, projector, &defaults)?;
+                    plan.mtp = icn_mtp::select_mtp_with_backend(
+                        backend,
+                        &plan,
+                        icn_mtp::CandidatePolicy::Automatic(&mtp),
+                    )
+                    .context("failed to select a native MTP configuration")?;
+                    let plan = resolve_execution_plan(plan)
+                        .context("failed to resolve MTP execution defaults")?;
+                    assess_with_backend(backend, &plan, CapacityPolicy::default())
+                        .map(|value| value.assessment)
+                        .map_err(anyhow::Error::from)
+                })
+                .map_err(|error| anyhow::anyhow!(error))?,
+            None => {
+                let plan =
+                    resolved_plan(primary, projector, MtpSelection::Automatic(mtp), &defaults)?;
+                assess_hardware(&plan, CapacityPolicy::default())
+                    .map(|value| value.assessment)
+                    .map_err(anyhow::Error::from)
+            }
+        })
+        .await
+        {
+            Ok(Ok(assessment)) => Ok(assessment),
+            Ok(Err(error)) => Err(InventoryError::Internal(format!(
+                "hardware assessment failed for {}: {error:#}",
+                id.0
+            ))),
+            Err(error) => Err(InventoryError::Internal(format!(
+                "hardware assessment task failed for {}: {error}",
+                id.0
+            ))),
+        }
+    }
+
+    fn assessment_cache_key(
+        &self,
+        profile: Option<&ModelPreviewProfile>,
+        snapshot: &HardwareSnapshot,
+    ) -> Result<String, InventoryError> {
+        if profile.is_some_and(|profile| profile.policy != ASSESSMENT_PROFILE_RESOLVER) {
+            return Err(InventoryError::InvalidRequest(format!(
+                "unsupported model assessment policy; expected {ASSESSMENT_PROFILE_RESOLVER}"
+            )));
+        }
+        serde_json::to_string(&(
+            ASSESSMENT_PROFILE_RESOLVER,
+            &snapshot.native_build,
+            &snapshot.enabled_backends,
+            &snapshot.topology_fingerprint,
+            &snapshot.capacity_policy,
+            self.effective_defaults(profile),
+        ))
+        .map_err(|error| InventoryError::Internal(error.to_string()))
+    }
+}
+
 impl InventoryHardwareAssessor for NativeHardwareAssessor {
     fn cache_key(&self) -> BoxFuture<'_, Result<String, InventoryError>> {
         Box::pin(async move {
-            let defaults = serde_json::to_string(&self.defaults)
-                .map_err(|error| InventoryError::Internal(error.to_string()))?;
-            let parallelism = std::thread::available_parallelism()
-                .map(|value| value.get())
-                .unwrap_or(1);
-            let topology = stable_hardware_topology();
-            Ok(format!(
-                "inventory-hardware-v1:{}:{}:{}:{parallelism}:{topology}:{defaults}",
-                build_identity::BINDINGS_REVISION,
-                build_identity::LLAMA_CPP_REVISION,
-                build_identity::enabled_backends().join(","),
-            ))
+            let snapshot = HardwareProvider::snapshot(self).await?;
+            ModelHardwareAssessor::cache_key(self, None, &snapshot)
         })
     }
 
@@ -238,121 +340,74 @@ impl InventoryHardwareAssessor for NativeHardwareAssessor {
         &self,
         resolved: ResolvedModel,
     ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
+        Box::pin(self.assess_resolved(resolved, None))
+    }
+}
+
+impl ModelHardwareAssessor for NativeHardwareAssessor {
+    fn policy_identity(&self) -> &str {
+        ASSESSMENT_PROFILE_RESOLVER
+    }
+
+    fn cache_key(
+        &self,
+        profile: Option<&ModelPreviewProfile>,
+        snapshot: &HardwareSnapshot,
+    ) -> Result<String, InventoryError> {
+        self.assessment_cache_key(profile, snapshot)
+    }
+
+    fn assess_profile(
+        &self,
+        model: ResolvedModel,
+        profile: Option<ModelPreviewProfile>,
+    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
+        Box::pin(async move { self.assess_resolved(model, profile.as_ref()).await })
+    }
+}
+
+impl HardwareProvider for NativeHardwareAssessor {
+    fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>> {
         Box::pin(async move {
             let _guard = self.gate.lock().await;
-            let id = resolved.model.id.clone();
-            let primary = resolved
-                .components
-                .iter()
-                .filter(|component| {
-                    matches!(
-                        component.role,
-                        ComponentRole::Weights | ComponentRole::Shard
-                    )
-                })
-                .min_by_key(|component| component.shard_index.unwrap_or(0))
-                .map(|component| component.path.clone())
-                .ok_or_else(|| InventoryError::NotReady("model has no runnable weights".into()))?;
-            let projector = resolved
-                .components
-                .iter()
-                .find(|component| component.role == ComponentRole::Projector)
-                .map(|component| component.path.clone());
-            let mtp: Vec<PathBuf> = resolved
-                .components
-                .iter()
-                .filter(|component| {
-                    matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft)
-                })
-                .map(|component| component.path.clone())
-                .collect();
             let native_executor = self
                 .native_executor
                 .read()
                 .map_err(|_| InventoryError::Internal("native executor lock poisoned".to_owned()))?
                 .clone();
-            let defaults = self.defaults.clone();
-            match tokio::task::spawn_blocking(move || match native_executor {
+            let native_build = format!(
+                "bindings:{};llama_cpp:{}",
+                build_identity::BINDINGS_REVISION,
+                build_identity::LLAMA_CPP_REVISION
+            );
+            let enabled_backends = build_identity::enabled_backends()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            tokio::task::spawn_blocking(move || match native_executor {
                 Some(executor) => executor
                     .run_exclusive_native(move |backend| {
-                        let mut plan = base_plan(primary, projector, &defaults)?;
-                        plan.mtp = icn_mtp::select_mtp_with_backend(
+                        Ok(discover_hardware(
                             backend,
-                            &plan,
-                            icn_mtp::CandidatePolicy::Automatic(&mtp),
-                        )
-                        .context("failed to select a native MTP configuration")?;
-                        let plan = resolve_execution_plan(plan)
-                            .context("failed to resolve MTP execution defaults")?;
-                        assess_with_backend(backend, &plan, CapacityPolicy::default())
-                            .map(|value| value.assessment)
-                            .map_err(anyhow::Error::from)
+                            CapacityPolicy::default(),
+                            native_build,
+                            enabled_backends,
+                            ASSESSMENT_PROFILE_RESOLVER,
+                        ))
                     })
-                    .map_err(|error| anyhow::anyhow!(error))?,
-                None => {
-                    let plan =
-                        resolved_plan(primary, projector, MtpSelection::Automatic(mtp), &defaults)?;
-                    assess_hardware(&plan, CapacityPolicy::default())
-                        .map(|value| value.assessment)
-                        .map_err(anyhow::Error::from)
-                }
+                    .map_err(|error| InventoryError::Internal(error.to_string()))?,
+                None => discover(
+                    CapacityPolicy::default(),
+                    native_build,
+                    enabled_backends,
+                    ASSESSMENT_PROFILE_RESOLVER,
+                )
+                .map_err(|error| InventoryError::Internal(error.to_string())),
             })
             .await
-            {
-                Ok(Ok(assessment)) => Ok(assessment),
-                Ok(Err(error)) => Err(InventoryError::Internal(format!(
-                    "hardware assessment failed for {}: {error:#}",
-                    id.0
-                ))),
-                Err(error) => Err(InventoryError::Internal(format!(
-                    "hardware assessment task failed for {}: {error}",
-                    id.0
-                ))),
-            }
+            .map_err(|error| InventoryError::Internal(error.to_string()))?
         })
     }
-}
-
-fn stable_hardware_topology() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        let mut values = Vec::new();
-        for key in ["hw.model", "hw.memsize"] {
-            if let Ok(output) = std::process::Command::new("sysctl")
-                .args(["-n", key])
-                .output()
-                && output.status.success()
-            {
-                values.push(String::from_utf8_lossy(&output.stdout).trim().to_owned());
-            }
-        }
-        if !values.is_empty() {
-            return values.join(":");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut values = Vec::new();
-        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-            if let Some(line) = contents.lines().find(|line| line.starts_with("MemTotal:")) {
-                values.push(line.to_owned());
-            }
-        }
-        if let Ok(output) = std::process::Command::new("nvidia-smi")
-            .args([
-                "--query-gpu=uuid,name,memory.total,driver_version",
-                "--format=csv,noheader,nounits",
-            ])
-            .output()
-            && output.status.success()
-        {
-            values.push(String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        }
-        if !values.is_empty() {
-            return values.join(":");
-        }
-    }
-    "unknown".to_owned()
 }
 
 impl std::str::FromStr for TensorSplitArg {
@@ -500,8 +555,12 @@ async fn main() -> anyhow::Result<()> {
                 gate: tokio::sync::Mutex::new(()),
             });
             inventory
-                .set_hardware_assessor(inventory_hardware_assessor)
+                .set_hardware_assessor(inventory_hardware_assessor.clone())
                 .context("failed to configure inventory hardware assessment")?;
+            let previewer = Arc::new(ModelPreviewService::new(
+                inventory.clone(),
+                inventory_hardware_assessor.clone(),
+            ));
             let (model, mmproj, mtp_model, model_alias, selected_inventory_id) = if let Some(
                 raw_id,
             ) = model_id
@@ -665,7 +724,10 @@ async fn main() -> anyhow::Result<()> {
             *native_executor_slot
                 .write()
                 .map_err(|_| anyhow::anyhow!("native executor lock poisoned"))? = native_executor;
-            let state = state.with_inventory(inventory);
+            let state = state
+                .with_inventory(inventory)
+                .with_hardware(inventory_hardware_assessor)
+                .with_previewer(previewer);
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .with_context(|| format!("failed to bind {bind}"))?;
@@ -700,6 +762,201 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parity_test_defaults() -> RuntimePlanDefaults {
+        RuntimePlanDefaults {
+            context_size: 128,
+            batch_size: 128,
+            ubatch_size: 64,
+            max_sequences: 1,
+            prefill_quantum: 128,
+            radix_cache: RadixCacheConfig::default(),
+            execution: ExecutionConfig::default(),
+            projector_use_gpu: true,
+            projector_warmup: true,
+            image_min_tokens: None,
+            image_max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn available_and_preview_cache_keys_share_resolved_profile_identity() {
+        let assessor = NativeHardwareAssessor {
+            defaults: parity_test_defaults(),
+            native_executor: Arc::new(RwLock::new(None)),
+            gate: tokio::sync::Mutex::new(()),
+        };
+        let snapshot = HardwareSnapshot {
+            captured_at: 1,
+            platform: "test".to_owned(),
+            architecture: "test".to_owned(),
+            cpu_model: None,
+            logical_cores: 1,
+            native_build: "native".to_owned(),
+            enabled_backends: vec!["cpu".to_owned()],
+            assessment_policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
+            capacity_policy: "capacity".to_owned(),
+            topology_fingerprint: "topology".to_owned(),
+            memory_domains: Vec::new(),
+        };
+        let equivalent_preview = ModelPreviewProfile {
+            id: "caller-correlation-does-not-affect-fit".to_owned(),
+            policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
+            context_length: 128,
+            parallel_sequences: 1,
+        };
+        assert_eq!(
+            assessor.assessment_cache_key(None, &snapshot).unwrap(),
+            assessor
+                .assessment_cache_key(Some(&equivalent_preview), &snapshot)
+                .unwrap()
+        );
+        assert_ne!(
+            assessor.assessment_cache_key(None, &snapshot).unwrap(),
+            assessor
+                .assessment_cache_key(
+                    Some(&ModelPreviewProfile {
+                        context_length: 4096,
+                        ..equivalent_preview.clone()
+                    }),
+                    &snapshot,
+                )
+                .unwrap()
+        );
+        assert!(
+            assessor
+                .assessment_cache_key(
+                    Some(&ModelPreviewProfile {
+                        policy: "unknown-policy".to_owned(),
+                        ..equivalent_preview
+                    }),
+                    &snapshot,
+                )
+                .is_err()
+        );
+    }
+
+    fn sparse_header_copy(source: &std::path::Path, destination: &std::path::Path) {
+        use std::io::{Read, Write};
+
+        let inspection = icn_models::gguf::inspect(source).expect("inspect complete fixture");
+        let header_bytes = usize::try_from(inspection.header_bytes).expect("header fits usize");
+        let mut input = std::fs::File::open(source).expect("open complete fixture");
+        let mut header = vec![0_u8; header_bytes];
+        input.read_exact(&mut header).expect("read complete header");
+        let mut output = std::fs::File::create(destination).expect("create sparse preview");
+        output.write_all(&header).expect("write preview header");
+        output
+            .set_len(input.metadata().expect("fixture metadata").len())
+            .expect("preserve preview logical length");
+    }
+
+    /// This exercises the exact native assessor used by both inventory and preview models. The
+    /// verified parity fixtures are optional in ordinary source checkouts, but CI/dev environments
+    /// that stage them exercise both a tiny dense model and a production-scale MoE model.
+    #[tokio::test]
+    async fn available_and_sparse_preview_artifacts_have_identical_fit_assessments() {
+        let inference_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixtures = [
+            inference_root.join("target/parity-models/tinyllamas/stories15M-q4_0.gguf"),
+            inference_root
+                .join("target/parity-models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+        ];
+        let fixtures = fixtures
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        if fixtures.is_empty() {
+            return;
+        }
+
+        let assessor = Arc::new(NativeHardwareAssessor {
+            defaults: parity_test_defaults(),
+            native_executor: Arc::new(RwLock::new(None)),
+            gate: tokio::sync::Mutex::new(()),
+        });
+        let profile = ModelPreviewProfile {
+            id: "parity".to_owned(),
+            policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
+            context_length: 128,
+            parallel_sequences: 1,
+        };
+
+        for fixture in fixtures {
+            let store = tempfile::tempdir().expect("temporary model store");
+            let mut config = InventoryConfig::with_root(store.path().join("inventory"))
+                .expect("inventory config");
+            config.model_sources = vec![fixture.parent().expect("fixture parent").to_path_buf()];
+            config.hf_cache_dirs.clear();
+            let manager = ModelManager::open_with_template_assessor(
+                config,
+                Some(Arc::new(NativeTemplateAssessor)),
+            )
+            .await
+            .expect("open inventory");
+            manager
+                .set_hardware_assessor(assessor.clone())
+                .expect("configure inventory assessor");
+            manager
+                .ensure_model_inventory()
+                .await
+                .expect("inspect available fixture");
+            let model = manager
+                .list()
+                .await
+                .expect("list inventory")
+                .into_iter()
+                .find(|model| {
+                    model
+                        .location
+                        .components()
+                        .iter()
+                        .any(|component| component.path.file_name() == fixture.file_name())
+                })
+                .expect("fixture inventory model");
+            let inventory_assessment = model.hardware.clone();
+            let available = manager
+                .resolve_ready(&model.id)
+                .await
+                .expect("resolve available fixture");
+
+            let sparse_root = store.path().join("sparse-preview");
+            std::fs::create_dir_all(&sparse_root).expect("create sparse preview directory");
+            let mut preview = available.clone();
+            for component in &mut preview.components {
+                let destination =
+                    sparse_root.join(component.path.file_name().expect("component file name"));
+                sparse_header_copy(&component.path, &destination);
+                component.path = destination;
+            }
+
+            let default_preview_assessment = assessor
+                .assess_resolved(preview.clone(), None)
+                .await
+                .expect("assess sparse preview with inventory defaults");
+            assert_eq!(
+                default_preview_assessment,
+                inventory_assessment,
+                "the inventory and preview paths diverged for {}",
+                fixture.display()
+            );
+
+            let available_assessment = assessor
+                .assess_resolved(available, Some(&profile))
+                .await
+                .expect("assess available fixture");
+            let preview_assessment = assessor
+                .assess_resolved(preview, Some(&profile))
+                .await
+                .expect("assess sparse preview fixture");
+            assert_eq!(
+                preview_assessment,
+                available_assessment,
+                "preview and available fitting diverged for {}",
+                fixture.display()
+            );
+        }
+    }
 
     #[test]
     fn execution_cli_defaults_and_explicit_values_are_typed() {

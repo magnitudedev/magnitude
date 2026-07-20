@@ -30,6 +30,7 @@ pub struct GgufInspection {
     pub base_models: Vec<String>,
     pub modalities: Vec<String>,
     pub tensor_count: u64,
+    pub header_bytes: u64,
     pub fingerprint_material: Vec<u8>,
 }
 
@@ -111,6 +112,19 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
         let _offset = reader.u64()?;
     }
 
+    let alignment = u64::from(u32_value(&metadata, "general.alignment").unwrap_or(32));
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(GgufError::Invalid("GGUF alignment is invalid"));
+    }
+    let header_bytes = reader
+        .position
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or(GgufError::Invalid("GGUF header alignment overflow"))?;
+    if header_bytes > file_len {
+        return Err(GgufError::Invalid("GGUF header extends beyond end of file"));
+    }
+
     let architecture = string_value(&metadata, "general.architecture");
     let training_context_length = architecture
         .as_ref()
@@ -174,6 +188,7 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
         base_models,
         modalities,
         tensor_count,
+        header_bytes,
         fingerprint_material,
     })
 }
@@ -464,6 +479,9 @@ mod tests {
         push_string(&mut bytes, "tokenizer.ggml.eos_token_id");
         bytes.extend_from_slice(&4_u32.to_le_bytes());
         bytes.extend_from_slice(&1_u32.to_le_bytes());
+
+        let aligned = bytes.len().next_multiple_of(32);
+        bytes.resize(aligned, 0);
 
         std::fs::write(&path, bytes).unwrap();
         let result = inspect(&path).unwrap();
