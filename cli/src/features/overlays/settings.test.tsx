@@ -14,7 +14,6 @@ const textPosition = (frame: string, needle: string) => {
 }
 
 const localInferenceState = {
-  usage: { sessionConcurrency: "one" },
   activeBinding: null,
   host: {
     _tag: "Available",

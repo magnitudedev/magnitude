@@ -6,7 +6,6 @@ import { Atom, Result as AtomResult, useAtomMount } from "@effect-atom/atom-reac
 import type {
   LocalInferenceState,
   LocalModelRecommendation,
-  LocalSessionConcurrency,
 } from "@magnitudedev/sdk"
 import { useLocalInferenceState } from "@magnitudedev/client-common"
 import { Button } from "../../components/button"
@@ -32,16 +31,9 @@ interface LocalInferenceScreenProps {
 }
 
 export const LOCAL_MODEL_SECTION_WIDTH = 72
-export const LOCAL_USAGE_SETUP_WIDTH = 88
 const SECTION_LABEL_GAP = 2
 
-export type LocalUsageFocusTarget = "one" | "up_to_three" | "continue"
-type LocalSetupHoveredAction = "usage-skip" | "usage-recommendations" | "models-back" | "models-skip"
-export const LOCAL_USAGE_FOCUS_ORDER: readonly LocalUsageFocusTarget[] = [
-  "one", "up_to_three", "continue",
-]
-export const moveLocalUsageFocus = (currentIndex: number, direction: -1 | 1): number =>
-  Math.max(0, Math.min(LOCAL_USAGE_FOCUS_ORDER.length - 1, currentIndex + direction))
+type LocalSetupHoveredAction = "models-skip"
 export const localModelSectionRule = (label: string): string =>
   "─".repeat(Math.max(0, LOCAL_MODEL_SECTION_WIDTH - label.length - SECTION_LABEL_GAP))
 
@@ -51,25 +43,6 @@ const recommendationBadge = (badge: LocalModelRecommendation["badge"]): string =
   if (badge === "alternative") return "Alternative Option"
   return "Recommended"
 }
-
-const LocalUsageOption = memo(function LocalUsageOption({ focused, selected, title, description }: {
-  readonly focused: boolean
-  readonly selected: boolean
-  readonly title: string
-  readonly description: string
-}) {
-  const theme = useTheme()
-  return (
-    <box style={{ flexDirection: "column", flexShrink: 0 }}>
-      <box style={{ flexDirection: "row" }}>
-        <text style={{ fg: focused ? theme.primary : theme.muted }}>{focused ? "›" : " "}</text>
-        <text style={{ fg: selected ? theme.primary : theme.muted }}>{selected ? " ● " : " ○ "}</text>
-        <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{title}</text>
-      </box>
-      <text style={{ fg: theme.muted }}>    {description}</text>
-    </box>
-  )
-})
 
 type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
 
@@ -109,7 +82,6 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(
 const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   state,
   local,
-  management,
   onSkip,
   onConfigured,
 }: LocalInferenceScreenProps & {
@@ -117,10 +89,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   readonly local: LocalInferenceController
 }) {
   const theme = useTheme()
-  const [requestedStage, setRequestedStage] = useState<"usage" | "models">("usage")
-  const [concurrencyOverride, setConcurrencyOverride] = useState<LocalSessionConcurrency | null>(null)
-  const concurrency = concurrencyOverride ?? state.usage?.sessionConcurrency ?? "one"
-  const [usageRow, setUsageRow] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [details, setDetails] = useState(false)
   const [hoveredAction, setHoveredAction] = useState<LocalSetupHoveredAction | null>(null)
@@ -130,8 +98,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const selected = selections[selectedIndex]
   const busy = local.mutationBusy
   const error = local.mutationFailure
-  const usageReady = state.usage?.sessionConcurrency === concurrency
-  const stage = requestedStage === "models" && usageReady ? "models" : "usage"
 
   const activationCompletionAtom = useMemo(
     () => Atom.make(Effect.sync(() => {
@@ -147,12 +113,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     [busy, onConfigured, pendingActivationId, state.activeBinding?.selectionId],
   )
   useAtomMount(activationCompletionAtom)
-
-  const continueFromUsage = useCallback(() => {
-    if (busy) return
-    local.configureUsage({ sessionConcurrency: concurrency })
-    setRequestedStage("models")
-  }, [busy, concurrency, local])
 
   const confirmSelection = useCallback((selection: LocalInferenceSelection | undefined) => {
     if (busy) return
@@ -186,21 +146,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c") return
-    if (stage === "usage") {
-      if (key.name === "right") { key.preventDefault(); continueFromUsage(); return }
-      if (key.name === "up" || key.name === "k") { key.preventDefault(); setUsageRow((row) => moveLocalUsageFocus(row, -1)); return }
-      if (key.name === "down" || key.name === "j" || key.name === "tab") { key.preventDefault(); setUsageRow((row) => moveLocalUsageFocus(row, 1)); return }
-      if (key.name === "space" || key.name === "return" || key.name === "enter") {
-        key.preventDefault()
-        const target = LOCAL_USAGE_FOCUS_ORDER[usageRow]
-        if (target === "one" || target === "up_to_three") setConcurrencyOverride(target)
-        else continueFromUsage()
-        return
-      }
-      if (key.name === "escape") { key.preventDefault(); onSkip() }
-      return
-    }
-
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
       if (!busy) setSelectedId(selections[Math.max(0, selectedIndex - 1)]?.id ?? null)
@@ -223,59 +168,8 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     }
     if (key.name === "c" && state.activeBinding && !busy) { key.preventDefault(); onConfigured(); return }
     if (key.name === "return" || key.name === "enter") { key.preventDefault(); confirmModel(); return }
-    if (key.name === "left" || key.name === "backspace") { key.preventDefault(); if (!busy) setRequestedStage("usage"); return }
     if (key.name === "escape") { key.preventDefault(); if (!busy) onSkip() }
-  }, [busy, confirmModel, continueFromUsage, local, onConfigured, onSkip, selected, selectedIndex, selections, stage, state.activeBinding, usageRow]))
-
-  if (stage === "usage") {
-    const focusTarget = LOCAL_USAGE_FOCUS_ORDER[usageRow]!
-    const running = state.choices.find((choice) => choice._tag === "Running")
-    const runningMetadata = running
-      ? [running.displayName, running.quantization?.format, running.contextTokens === undefined ? "Context unavailable" : `${formatContext(running.contextTokens)} context`, "Managed by Magnitude"].filter(Boolean).join(" · ")
-      : null
-    return (
-      <box key="local-usage" style={{ flexDirection: "column", height: "100%", paddingLeft: 2, paddingRight: 2 }}>
-        <box style={{ flexDirection: "column", paddingTop: 1, flexShrink: 0, width: "100%", maxWidth: LOCAL_USAGE_SETUP_WIDTH }}>
-          <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
-          <text style={{ fg: theme.foreground }}>Magnitude runs local models in the background.</text>
-          <text style={{ fg: theme.muted }}>Tell us how many local sessions to reserve, and we'll recommend models that fit.</text>
-          {running && <box style={{ flexDirection: "column", paddingTop: 1 }}>
-            <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>● Local model ready</text>
-            <text style={{ fg: theme.muted }}>  {runningMetadata}</text>
-          </box>}
-          <box style={{ flexDirection: "column", paddingTop: 1 }}>
-            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>How many local coding sessions will you run at once?</text>
-            <LocalUsageOption focused={focusTarget === "one"} selected={concurrency === "one"} title="One session" description="Reserve one local context window." />
-            <LocalUsageOption focused={focusTarget === "up_to_three"} selected={concurrency === "up_to_three"} title="Multiple sessions" description="Reserve up to three local context windows. This may result in a smaller recommended local model." />
-          </box>
-          {busy && <text style={{ fg: theme.primary }}>Finding models for this setup…</text>}
-          {Option.isSome(error) && <text style={{ fg: theme.error }}>{error.value}</text>}
-          <text style={{ fg: theme.muted, marginTop: 1 }}>↑/↓ move · Enter select</text>
-          <box style={{ flexDirection: "row", paddingTop: 1 }}>
-            <Button
-              onClick={() => { if (!busy) onSkip() }}
-              onMouseOver={() => setHoveredAction("usage-skip")}
-              onMouseOut={() => setHoveredAction((current) => current === "usage-skip" ? null : current)}
-            >
-              <box style={{ borderStyle: "single", borderColor: hoveredAction === "usage-skip" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
-                <text style={{ fg: hoveredAction === "usage-skip" ? theme.primary : theme.foreground }}>Skip for now (Esc)</text>
-              </box>
-            </Button>
-            <text>  </text>
-            <Button
-              onClick={continueFromUsage}
-              onMouseOver={() => setHoveredAction("usage-recommendations")}
-              onMouseOut={() => setHoveredAction((current) => current === "usage-recommendations" ? null : current)}
-            >
-              <box style={{ borderStyle: "single", borderColor: focusTarget === "continue" || hoveredAction === "usage-recommendations" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
-                <text style={{ fg: focusTarget === "continue" || hoveredAction === "usage-recommendations" ? theme.primary : theme.foreground }}>See recommendations (→)</text>
-              </box>
-            </Button>
-          </box>
-        </box>
-      </box>
-    )
-  }
+  }, [busy, confirmModel, local, onConfigured, onSkip, selected, selectedIndex, selections, state.activeBinding]))
 
   const host = state.host._tag === "Available" ? state.host.profile : null
   const hardware = host ? describeLocalHardware(host) : null
@@ -383,7 +277,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
             <text style={{ fg: theme.muted }}>{selected.recommendation.quantization.fidelityEvidence}</text>
             <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Fit</text>
             <text style={{ fg: theme.muted }}>
-              Estimated {formatBytes(selected.recommendation.estimatedRuntimeBytes)} runtime with {selected.recommendation.servingProfile.parallelSlots} × {formatContext(selected.recommendation.contextTokens)} context windows; {formatBytes(selected.recommendation.fitMarginBytes)} stable headroom. Model maximum {formatContext(selected.recommendation.modelMaximumContextTokens)} per window.
+              Estimated {formatBytes(selected.recommendation.estimatedRuntimeBytes)} runtime at {formatContext(selected.recommendation.contextTokens)} context; {formatBytes(selected.recommendation.fitMarginBytes)} stable headroom. Model maximum {formatContext(selected.recommendation.modelMaximumContextTokens)}.
             </text>
           </box>
         )}
@@ -398,16 +292,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           : " · Enter use"}
       </text>
       <box style={{ paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: "row" }}>
-        <Button
-          onClick={() => { if (!busy) setRequestedStage("usage") }}
-          onMouseOver={() => setHoveredAction("models-back")}
-          onMouseOut={() => setHoveredAction((current) => current === "models-back" ? null : current)}
-        >
-          <box style={{ borderStyle: "single", borderColor: hoveredAction === "models-back" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
-            <text style={{ fg: hoveredAction === "models-back" ? theme.primary : theme.foreground }}>Back (←)</text>
-          </box>
-        </Button>
-        <text>  </text>
         <Button
           onClick={() => { if (!busy) onSkip() }}
           onMouseOver={() => setHoveredAction("models-skip")}

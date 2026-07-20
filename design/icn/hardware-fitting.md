@@ -47,7 +47,7 @@ ACN owns:
 
 - the curated set of recommended artifact identities;
 - product quality and quantization-fidelity policy;
-- user usage choices and the product profiles to evaluate;
+- the fixed product profiles to evaluate;
 - ranking successfully assessed candidates and projecting them into client RPC state.
 
 Clients own formatting and interaction only. Bun and client code must not independently inspect the
@@ -377,22 +377,38 @@ set, sizes, content identities, GGUF properties, and header identities from that
 as part of preview. ACN does not duplicate those artifact-derived facts in a generated or
 hand-maintained table.
 
-ACN submits catalog artifact identities and usage-derived product profiles to the preview API. It
+ACN submits catalog artifact identities and fixed product profiles to the preview API. It
 excludes invalid, incompatible, and `DoesNotFit` candidates and applies only product ranking to the
 remaining results. It must not modify or reinterpret ICN memory arithmetic.
 
-Recommendation projection has an explicit lifecycle. With no usage selection it is `NotRequested`.
-Before an uncached preview calculation begins, ACN publishes `Loading`; after the calculation it
+Recommendation projection has an explicit lifecycle. Before an uncached preview calculation begins,
+ACN publishes `Loading`; after the calculation it
 publishes either `Ready` with the complete ranked recommendation set or `Failed` with a bounded
 user-facing explanation. An empty `Ready` result means that no curated candidate fit. Clients must
 not infer that outcome from an absent or empty recommendation list while calculation is in flight.
 Cached results may transition directly to `Ready` without an observable loading state.
 
+### Recommendation portfolio policy
+
+Recommendation fitting evaluates one resident native sequence. Magnitude's inference engine owns
+session multiplexing and KV-cache swapping, so user session count is not a recommendation input and
+clients do not ask for it. The supported product context profiles are 200K and 100K tokens. ACN
+prefers 200K for a chosen artifact and falls back to 100K when the larger profile does not fit; 64K
+is not a recommendation profile.
+
+Context profiles and quantizations are fit alternatives, not separate products. ACN first keeps the
+best fitting context for each artifact, then keeps one configuration per base-model checkpoint. It
+prefers the highest-fidelity fitting quantization and, within that quantization, the 200K profile.
+The displayed portfolio contains distinct base models only. Badges describe an actual relationship
+to the primary recommendation: a smaller option must have materially lower runtime memory, a
+higher-fidelity option must have a higher curated fidelity rank, and an alternative should prefer a
+different model family. List position alone never determines those labels.
+
 ### Catalog source versus generated artifact facts
 
 The hand-maintained catalog retains only deliberate product decisions: which model/artifact to
 offer, immutable repository revision and primary selector, display and grouping policy, license
-review, quality rank, fidelity evidence, and supported product usage choices.
+review, quality rank, fidelity evidence, and supported product context profiles.
 
 Runtime code must not contain a second table of GGUF architecture, component membership, sizes,
 content identities, tensor, KV, recurrent-state, or memory-estimator inputs. Runtime preview sends
@@ -402,8 +418,8 @@ the immutable selector to ICN, and ICN resolves and validates those facts from t
 
 ACN obtains host/device facts from `GET /v1/hardware`, downloaded
 model facts from `GET /v1/models`, and remote candidate assessments from
-`POST /v1/models/preview`. ACN continues to translate usage selection into product profiles and rank
-successful candidates using curated quality and fidelity policy.
+`POST /v1/models/preview`. ACN continues to submit the fixed product profiles and rank successful
+candidates using curated quality, fidelity, and portfolio-diversity policy.
 
 ACN contains no host inspection, native-backend device probing, memory-domain normalization,
 stable-capacity arithmetic, hand-maintained runtime GGUF metadata, runtime-byte formulas, or direct
@@ -511,6 +527,9 @@ The implementation conforms when:
 - hardware displayed by clients originates exclusively from `GET /v1/hardware`;
 - ACN and clients contain no independent hardware normalization or fit arithmetic;
 - uncached recommendation calculation is represented as `Loading`, never as an empty completed result;
+- recommendation profiles use one resident sequence and only the 200K and 100K context tiers;
+- each displayed recommendation represents a distinct base model, with badges derived from actual
+  size, fidelity, or family differences rather than candidate position;
 - downloaded inventory and remote preview return the same hardware-assessment type;
 - complete headers from every shard are used, with exact original logical sizes;
 - every allocation in the native model/context breakdown is accounted to a physical memory domain;

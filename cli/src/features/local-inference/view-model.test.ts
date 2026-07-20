@@ -30,14 +30,6 @@ const recommendation: LocalModelRecommendation = {
   sourcePageUrl: "https://example.invalid/model",
   license: { id: "test", url: "https://example.invalid/license", acknowledgementRequired: false },
   contextTokens: 32_768,
-  servingProfile: {
-    sessionConcurrency: "one",
-    parallelSlots: 1,
-    contextTokensPerSlot: 32_768,
-    totalContextCapacityTokens: 32_768,
-    slotAllocation: "uniform",
-    runtimeProfileId: "test",
-  },
   modelMaximumContextTokens: 32_768,
   estimatedRuntimeBytes: 5_000,
   stableCapacityBudgetBytes: 10_000,
@@ -48,7 +40,6 @@ const recommendation: LocalModelRecommendation = {
 }
 
 const baseState = {
-  usage: { sessionConcurrency: "one" },
   activeBinding: null,
   host: { _tag: "Unavailable", message: "not needed" },
   operations: [],

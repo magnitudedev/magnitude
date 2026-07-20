@@ -38,7 +38,11 @@ describe("config storage onboarding state", () => {
           },
         },
         localInference: {
-          usage: { sessionConcurrency: "up_to_three" },
+          selectedProfile: {
+            configurationId: "configuration",
+            catalogModelId: "catalog-model",
+            contextTokens: 100_000,
+          },
         },
       }))
       yield* config.completeOnboardingFlow("model_setup", 2, "2026-07-14T22:00:00.000Z")
@@ -46,8 +50,10 @@ describe("config storage onboarding state", () => {
     }).pipe(Effect.provide(base)))
 
     expect(result.models?.slots?.primary).toEqual({ providerId: "local", providerModelId: "model" })
-    expect(result.localInference?.usage).toEqual({
-      sessionConcurrency: "up_to_three",
+    expect(result.localInference?.selectedProfile).toEqual({
+      configurationId: "configuration",
+      catalogModelId: "catalog-model",
+      contextTokens: 100_000,
     })
     expect(result.onboarding?.completions?.model_setup).toEqual({
       version: 2,
@@ -86,8 +92,9 @@ describe("config storage onboarding state", () => {
       providerId: "local",
       providerModelId: "model",
     })
-    expect(result.loaded.localInference?.usage).toEqual({
-      sessionConcurrency: "one",
+    // Unknown legacy fields remain round-trippable even though runtime code no longer reads them.
+    expect(result.loaded.localInference).toEqual({
+      usage: { sessionConcurrency: "one" },
     })
 
     const persisted = await Bun.file(paths.configFile).json()

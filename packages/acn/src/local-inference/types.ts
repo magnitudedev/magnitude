@@ -1,6 +1,8 @@
 /** Curated product/source policy. Artifact facts are supplied by ICN preview. */
 export interface LocalModelCatalogEntry {
   readonly id: string
+  /** Stable model identity shared by every quantization of the same checkpoint. */
+  readonly modelId: string
   readonly family: string
   readonly displayName: string
   readonly repo: string
