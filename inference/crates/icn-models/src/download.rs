@@ -542,6 +542,7 @@ impl ModelManager {
             },
             &primary,
             true,
+            &self.cache,
             self.template_assessor.as_deref(),
         )
         .map_err(|error| DownloadError {

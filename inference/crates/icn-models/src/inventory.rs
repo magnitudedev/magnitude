@@ -12,9 +12,10 @@ use icn_contracts::{
     LocalDeclaration, ModelComponent, ModelId, ModelLocation, ModelOperation, ModelSource,
     ModelStatus, ReasoningCapability, TemplateAssessor,
 };
-use icn_utils::file_cache::{read_object, recover_map, write_json_atomic};
+use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
 
+use crate::cache::{ModelCache, ModelIndexKind};
 use crate::download::blob_key;
 use crate::gguf;
 use crate::identity::{content_id, fingerprint, model_id};
@@ -22,13 +23,18 @@ use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationManifest};
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
-const MAX_INVENTORY_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CacheEvidence {
     content_id: String,
     observation_key: String,
-    hardware_key: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedModelInspection {
+    name: String,
+    properties: InventoryProperties,
+    supported_parameters: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -95,6 +101,7 @@ pub struct ModelManager {
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) template_assessor: Option<Arc<dyn TemplateAssessor>>,
     hardware_assessor: Arc<RwLock<Option<Arc<dyn InventoryHardwareAssessor>>>>,
+    pub(crate) cache: ModelCache,
     cache_evidence: Arc<RwLock<BTreeMap<ModelId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
@@ -110,6 +117,7 @@ impl Clone for ModelManager {
             download_slots: Arc::clone(&self.download_slots),
             template_assessor: self.template_assessor.clone(),
             hardware_assessor: Arc::clone(&self.hardware_assessor),
+            cache: self.cache.clone(),
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
@@ -146,7 +154,8 @@ impl ModelManager {
             .cache_dir(config.root.join("hub"))
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let (models, cache_evidence) = load_inventory_index(&config.root);
+        let cache = ModelCache::new(&config.root);
+        let (models, cache_evidence) = load_inventory_index(&cache);
         let manager = Self {
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
@@ -155,6 +164,7 @@ impl ModelManager {
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             template_assessor,
             hardware_assessor: Arc::new(RwLock::new(None)),
+            cache,
             cache_evidence: Arc::new(RwLock::new(cache_evidence)),
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),
@@ -187,10 +197,16 @@ impl ModelManager {
         let mut attempt = 0_u8;
         let (discovered, next_evidence) = loop {
             let config = self.config.clone();
+            let cache = self.cache.clone();
             let template_assessor = self.template_assessor.clone();
             let scan_live_models = live_models.clone();
             let scan_result = tokio::task::spawn_blocking(move || {
-                scan(&config, template_assessor.as_deref(), &scan_live_models)
+                scan(
+                    &config,
+                    &cache,
+                    template_assessor.as_deref(),
+                    &scan_live_models,
+                )
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
@@ -221,7 +237,7 @@ impl ModelManager {
                 if !is_cacheable_model(model)? {
                     continue;
                 }
-                let mut evidence = CacheEvidence {
+                let evidence = CacheEvidence {
                     content_id: model.content_id.0.clone(),
                     observation_key: scan_result
                         .observations
@@ -233,20 +249,14 @@ impl ModelManager {
                                 model.id.0
                             ))
                         })?,
-                    hardware_key: String::new(),
                 };
                 if matches!(model.properties, InventoryProperties::Inspected { .. }) {
-                    evidence.hardware_key.clone_from(&hardware_key);
-                    let reusable = scan_result.cached_evidence.get(&model.id) == Some(&evidence);
-                    if reusable
-                        && let Some(cached) = scan_result.cached_models.get(&model.id)
-                        && matches!(
-                            cached.hardware,
-                            HardwareAssessment::Fits { .. } | HardwareAssessment::DoesNotFit { .. }
-                        )
-                    {
-                        model.hardware = cached.hardware.clone();
-                    }
+                    model.hardware = self
+                        .cache
+                        .read_hardware_assessment(&model.content_id, &hardware_key)
+                        .unwrap_or(HardwareAssessment::NotAssessed {
+                            reason: "cache_miss".to_owned(),
+                        });
                     if !matches!(
                         model.hardware,
                         HardwareAssessment::Fits { .. } | HardwareAssessment::DoesNotFit { .. }
@@ -258,11 +268,17 @@ impl ModelManager {
                                 model,
                             )?,
                         };
-                        model.hardware = assessor
+                        let assessment = assessor
                             .as_ref()
                             .expect("inspected models require an assessor")
                             .assess(resolved)
                             .await?;
+                        self.cache.write_hardware_assessment(
+                            &model.content_id,
+                            &hardware_key,
+                            &assessment,
+                        );
+                        model.hardware = assessment;
                     }
                 }
                 next_evidence.insert(model.id.clone(), evidence);
@@ -284,7 +300,7 @@ impl ModelManager {
             }
         };
 
-        persist_inventory_index(&self.config.root, &discovered, &next_evidence);
+        persist_inventory_index(&self.cache, &discovered, &next_evidence);
         *self
             .models
             .write()
@@ -361,6 +377,7 @@ impl ModelManager {
             },
             &canonical,
             false,
+            &self.cache,
             self.template_assessor.as_deref(),
         )?;
         if let Some(name) = display_name {
@@ -375,12 +392,11 @@ impl ModelManager {
         mut model: InventoryModel,
     ) -> Result<InventoryModel, InventoryError> {
         let _guard = self.ensure_gate.lock().await;
-        let mut evidence = is_cacheable_model(&model)?
+        let evidence = is_cacheable_model(&model)?
             .then(|| {
                 Ok::<_, InventoryError>(CacheEvidence {
                     content_id: model.content_id.0.clone(),
                     observation_key: model_observation_key(&self.config.root, &model)?,
-                    hardware_key: String::new(),
                 })
             })
             .transpose()?;
@@ -402,11 +418,10 @@ impl ModelManager {
                 model: model.clone(),
                 components: crate::service::resolve_components(&self.config.root, &model)?,
             };
-            model.hardware = assessor.assess(resolved).await?;
-            evidence
-                .as_mut()
-                .expect("available models have inspection evidence")
-                .hardware_key = hardware_key;
+            let assessment = assessor.assess(resolved).await?;
+            self.cache
+                .write_hardware_assessment(&model.content_id, &hardware_key, &assessment);
+            model.hardware = assessment;
         }
         let mut models = self
             .models
@@ -424,7 +439,7 @@ impl ModelManager {
         } else {
             cache.remove(&model.id);
         }
-        persist_inventory_index(&self.config.root, &models, &cache);
+        persist_inventory_index(&self.cache, &models, &cache);
         *self
             .models
             .write()
@@ -452,7 +467,7 @@ impl ModelManager {
             .clone();
         models.remove(id);
         cache.remove(id);
-        persist_inventory_index(&self.config.root, &models, &cache);
+        persist_inventory_index(&self.cache, &models, &cache);
         *self
             .models
             .write()
@@ -528,9 +543,8 @@ fn inventory_snapshot_is_current(
         })
 }
 
-fn load_inventory_index(root: &Path) -> HydratedInventory {
-    let path = root.join("inventory-index.json");
-    let Some(mut index) = read_object(&path, MAX_INVENTORY_CACHE_BYTES) else {
+fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
+    let Some(mut index) = cache.read_inventory() else {
         return (BTreeMap::new(), BTreeMap::new());
     };
     let raw_models = recover_map::<InventoryModel>(index.remove("models"), MAX_SCAN_ENTRIES);
@@ -570,19 +584,14 @@ fn load_inventory_index(root: &Path) -> HydratedInventory {
 }
 
 fn persist_inventory_index(
-    root: &Path,
+    cache: &ModelCache,
     models: &BTreeMap<ModelId, InventoryModel>,
     evidence: &BTreeMap<ModelId, CacheEvidence>,
 ) {
-    write_json_atomic(
-        &root.join("inventory-index.json"),
-        &root.join("locks/inventory-index.lock"),
-        &InventoryCache {
-            models: models.clone(),
-            evidence: evidence.clone(),
-        },
-        MAX_INVENTORY_CACHE_BYTES,
-    );
+    cache.write_inventory(&InventoryCache {
+        models: models.clone(),
+        evidence: evidence.clone(),
+    });
 }
 
 fn model_primary_path(root: &Path, model: &InventoryModel) -> Option<PathBuf> {
@@ -664,12 +673,11 @@ async fn create_layout(root: &Path) -> Result<(), InventoryError> {
 struct InventoryScan {
     models: BTreeMap<ModelId, InventoryModel>,
     observations: BTreeMap<ModelId, String>,
-    cached_models: BTreeMap<ModelId, InventoryModel>,
-    cached_evidence: BTreeMap<ModelId, CacheEvidence>,
 }
 
 fn scan(
     config: &InventoryConfig,
+    cache: &ModelCache,
     assessor: Option<&dyn TemplateAssessor>,
     live_models: &BTreeMap<ModelId, InventoryModel>,
 ) -> Result<InventoryScan, InventoryError> {
@@ -726,7 +734,7 @@ fn scan(
     }
     scan_interrupted(config, &mut discovered)?;
 
-    let (mut cached_models, cached_evidence) = load_inventory_index(&config.root);
+    let (mut cached_models, cached_evidence) = load_inventory_index(&ModelCache::new(&config.root));
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
     // that independently survived durable schema validation.
     for (id, durable) in &mut cached_models {
@@ -779,7 +787,7 @@ fn scan(
         let enriched = std::thread::scope(|scope| {
             candidates
                 .iter()
-                .map(|candidate| scope.spawn(move || enrich_candidate(candidate, assessor)))
+                .map(|candidate| scope.spawn(move || enrich_candidate(candidate, cache, assessor)))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|handle| {
@@ -796,8 +804,6 @@ fn scan(
     Ok(InventoryScan {
         models,
         observations,
-        cached_models,
-        cached_evidence,
     })
 }
 
@@ -1187,6 +1193,7 @@ fn reuse_inspection(
 
 fn enrich_candidate(
     candidate: &ArtifactCandidate,
+    cache: &ModelCache,
     assessor: Option<&dyn TemplateAssessor>,
 ) -> Result<InventoryModel, InventoryError> {
     build_model(
@@ -1198,6 +1205,7 @@ fn enrich_candidate(
         candidate.location.clone(),
         &candidate.primary,
         candidate.deletable,
+        cache,
         assessor,
     )
 }
@@ -1214,116 +1222,135 @@ pub(crate) fn build_model(
     location: ModelLocation,
     primary: &Path,
     deletable: bool,
+    cache: &ModelCache,
     assessor: Option<&dyn TemplateAssessor>,
 ) -> Result<InventoryModel, InventoryError> {
-    let inspection = gguf::inspect(primary);
-    let (name, status, properties, supported_parameters) = match inspection {
-        Ok(inspection) => {
-            let evidence = fingerprint(&inspection.fingerprint_material);
-            let template = assessor.map(|assessor| {
-                assessor.assess(&EffectiveTemplateInputs {
+    let assessor = assessor.ok_or_else(|| {
+        InventoryError::Internal("the model inventory has no template assessor".to_owned())
+    })?;
+    let primary_name = primary
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("local model");
+    let has_projector = location
+        .components()
+        .iter()
+        .any(|component| component.role == ComponentRole::Projector);
+    let inspection_evidence = serde_json::to_string(&(
+        &content_id.0,
+        assessor.cache_identity(),
+        primary_name,
+        has_projector,
+    ))
+    .map_err(|error| InventoryError::Internal(error.to_string()))?;
+    let cached_inspection = cache.read_index::<CachedModelInspection>(
+        ModelIndexKind::ArtifactInspection,
+        &inspection_evidence,
+    );
+    let inspected = match cached_inspection {
+        Some(inspection) => inspection,
+        None => match gguf::inspect(primary) {
+            Ok(inspection) => {
+                let evidence = fingerprint(&inspection.fingerprint_material);
+                let template = assessor.assess(&EffectiveTemplateInputs {
                     default_template: inspection.chat_template.clone(),
                     tool_use_template: inspection.tool_use_template.clone(),
                     bos_token: inspection.bos_token.clone(),
                     eos_token: inspection.eos_token.clone(),
-                })
-            });
-            let (tools, reasoning, template_evidence) = match template {
-                Some(Ok(assessment)) => (
-                    if assessment.capabilities.tools || assessment.capabilities.tool_calls {
-                        CapabilitySupport::Supported {
-                            parallel: Some(assessment.capabilities.parallel_tool_calls),
-                        }
-                    } else {
-                        CapabilitySupport::Unsupported
-                    },
-                    assessment.reasoning,
-                    Some(assessment.fingerprint),
-                ),
-                Some(Err(error)) => {
-                    return Err(InventoryError::Internal(format!(
-                        "template inspection failed for {}: {error}",
-                        primary.display()
-                    )));
+                });
+                let (tools, reasoning, template_evidence) = match template {
+                    Ok(assessment) => (
+                        if assessment.capabilities.tools || assessment.capabilities.tool_calls {
+                            CapabilitySupport::Supported {
+                                parallel: Some(assessment.capabilities.parallel_tool_calls),
+                            }
+                        } else {
+                            CapabilitySupport::Unsupported
+                        },
+                        assessment.reasoning,
+                        Some(assessment.fingerprint),
+                    ),
+                    Err(error) => {
+                        return Err(InventoryError::Internal(format!(
+                            "template inspection failed for {}: {error}",
+                            primary.display()
+                        )));
+                    }
+                };
+                let name = inspection.name.clone().unwrap_or_else(|| {
+                    primary
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("local model")
+                        .to_owned()
+                });
+                let mut supported_parameters = Vec::new();
+                if matches!(tools, CapabilitySupport::Supported { .. }) {
+                    supported_parameters.push("tools".to_owned());
                 }
-                None => {
-                    return Err(InventoryError::Internal(
-                        "the model inventory has no template assessor".to_owned(),
-                    ));
-                }
-            };
-            let name = inspection.name.clone().unwrap_or_else(|| {
-                primary
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("local model")
-                    .to_owned()
-            });
-            let mut supported_parameters = Vec::new();
-            if matches!(tools, CapabilitySupport::Supported { .. }) {
-                supported_parameters.push("tools".to_owned());
-            }
-            if matches!(
-                reasoning,
-                ReasoningCapability::Supported {
-                    control: icn_contracts::ReasoningControlDomain::Effort { .. }
-                        | icn_contracts::ReasoningControlDomain::EffortAndBudget { .. },
-                    ..
-                }
-            ) {
-                supported_parameters.push("reasoning_effort".to_owned());
-            }
-            let mut modalities = inspection.modalities;
-            if location
-                .components()
-                .iter()
-                .any(|component| component.role == ComponentRole::Projector)
-                && !modalities.iter().any(|modality| modality == "image")
-            {
-                modalities.push("image".to_owned());
-            }
-            (
-                name,
-                ModelStatus::Available { ready_at },
-                InventoryProperties::Inspected {
-                    architecture: inspection.architecture,
-                    quantization: inspection.quantization,
-                    parameter_count: inspection.parameter_count,
-                    active_parameter_count: inspection.active_parameter_count,
-                    training_context_length: inspection.training_context_length,
-                    tokenizer: inspection.tokenizer,
-                    modalities,
-                    base_models: inspection.base_models,
-                    tools,
-                    structured_output: CapabilitySupport::Supported { parallel: None },
+                if matches!(
                     reasoning,
-                    evidence_fingerprint: template_evidence.map_or(evidence.clone(), |template| {
-                        format!("{evidence}+{template}")
-                    }),
-                },
-                supported_parameters,
-            )
-        }
-        Err(error) => {
-            let incompatible = matches!(error, gguf::GgufError::UnsupportedVersion(_));
-            return Ok(unavailable_model(
-                id,
-                content_id,
-                created,
-                ready_at,
-                source,
-                location,
-                primary,
-                deletable,
-                if incompatible {
-                    "unsupported_gguf_version"
-                } else {
-                    "invalid_gguf"
-                },
-                error.to_string(),
-                incompatible,
-            ));
-        }
+                    ReasoningCapability::Supported {
+                        control: icn_contracts::ReasoningControlDomain::Effort { .. }
+                            | icn_contracts::ReasoningControlDomain::EffortAndBudget { .. },
+                        ..
+                    }
+                ) {
+                    supported_parameters.push("reasoning_effort".to_owned());
+                }
+                let mut modalities = inspection.modalities;
+                if has_projector && !modalities.iter().any(|modality| modality == "image") {
+                    modalities.push("image".to_owned());
+                }
+                let inspected = CachedModelInspection {
+                    name,
+                    properties: InventoryProperties::Inspected {
+                        architecture: inspection.architecture,
+                        quantization: inspection.quantization,
+                        parameter_count: inspection.parameter_count,
+                        active_parameter_count: inspection.active_parameter_count,
+                        training_context_length: inspection.training_context_length,
+                        tokenizer: inspection.tokenizer,
+                        modalities,
+                        base_models: inspection.base_models,
+                        tools,
+                        structured_output: CapabilitySupport::Supported { parallel: None },
+                        reasoning,
+                        evidence_fingerprint: template_evidence
+                            .map_or(evidence.clone(), |template| {
+                                format!("{evidence}+{template}")
+                            }),
+                    },
+                    supported_parameters,
+                };
+                cache.write_index(
+                    ModelIndexKind::ArtifactInspection,
+                    &inspection_evidence,
+                    &inspected,
+                );
+                inspected
+            }
+            Err(error) => {
+                let incompatible = matches!(error, gguf::GgufError::UnsupportedVersion(_));
+                return Ok(unavailable_model(
+                    id,
+                    content_id,
+                    created,
+                    ready_at,
+                    source,
+                    location,
+                    primary,
+                    deletable,
+                    if incompatible {
+                        "unsupported_gguf_version"
+                    } else {
+                        "invalid_gguf"
+                    },
+                    error.to_string(),
+                    incompatible,
+                ));
+            }
+        },
     };
     let mut operations = vec![ModelOperation::Load];
     if deletable {
@@ -1333,12 +1360,12 @@ pub(crate) fn build_model(
         id,
         content_id,
         created,
-        name,
-        supported_parameters,
-        status,
+        name: inspected.name,
+        supported_parameters: inspected.supported_parameters,
+        status: ModelStatus::Available { ready_at },
         source,
         location,
-        properties,
+        properties: inspected.properties,
         hardware: HardwareAssessment::NotAssessed {
             reason: "not_requested".to_owned(),
         },
@@ -1770,6 +1797,10 @@ mod tests {
     }
 
     impl TemplateAssessor for CompleteTemplateAssessor {
+        fn cache_identity(&self) -> &str {
+            "complete-template-assessor:test"
+        }
+
         fn assess(&self, _inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
@@ -1842,6 +1873,7 @@ mod tests {
         bytes.extend_from_slice(&3_u32.to_le_bytes());
         bytes.extend_from_slice(&0_u64.to_le_bytes());
         bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.resize(32, 0);
         fs::write(path, bytes).unwrap();
     }
 
@@ -1897,7 +1929,8 @@ mod tests {
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
         let persisted: serde_json::Value =
-            serde_json::from_slice(&fs::read(store.join("inventory-index.json")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(store.join("cache/indexes/inventory.json")).unwrap())
+                .unwrap();
         assert!(persisted.get("version").is_none());
 
         let reopened =
@@ -1965,7 +1998,7 @@ mod tests {
         assert_eq!(manager.list().await.unwrap().len(), 2);
         assert!(template.max_active.load(AtomicOrdering::SeqCst) > 1);
 
-        let index_path = store.join("inventory-index.json");
+        let index_path = store.join("cache/indexes/inventory.json");
         let mut index: serde_json::Value =
             serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
         let models = index
@@ -1982,9 +2015,17 @@ mod tests {
                 .unwrap();
         reopened.set_hardware_assessor(hardware.clone()).unwrap();
         assert_eq!(reopened.list().await.unwrap().len(), 2);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
 
+        let inspection_dir = store.join("cache/indexes/inspections/artifacts");
+        let one_inspection = fs::read_dir(&inspection_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(one_inspection, b"not json").unwrap();
         fs::write(&index_path, b"not json").unwrap();
         let corrupted =
             ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
@@ -1992,8 +2033,8 @@ mod tests {
                 .unwrap();
         corrupted.set_hardware_assessor(hardware.clone()).unwrap();
         assert_eq!(corrupted.list().await.unwrap().len(), 2);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 5);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 5);
+        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
 
         fs::remove_file(&index_path).unwrap();
         fs::create_dir(&index_path).unwrap();
@@ -2002,7 +2043,7 @@ mod tests {
             .unwrap();
         uncached.set_hardware_assessor(hardware.clone()).unwrap();
         assert_eq!(uncached.list().await.unwrap().len(), 2);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 7);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 7);
+        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
     }
 }

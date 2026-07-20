@@ -15,8 +15,9 @@ use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
     ChatTemplateRequest, CompletionBackend, DownloadModelRequest, ExecutionConfig,
     ExecutionConfigReport, FinishReason, FlashAttention, Generation, GenerationMetrics,
-    GenerationSnapshot, GpuLayers, GrammarTrigger, ImageInput, InferenceError, InferenceEvent,
-    InferenceStreamEvent, InventoryError, InventoryModel, ModelId, ModelInventory, ModelModalities,
+    GenerationSnapshot, GpuLayers, GrammarTrigger, HardwareProvider, HardwareSnapshot, ImageInput,
+    InferenceError, InferenceEvent, InferenceStreamEvent, InventoryError, InventoryModel, ModelId,
+    ModelInventory, ModelModalities, ModelPreview, ModelPreviewRequest, ModelPreviewer,
     ModelProperties, PreparedChatInfo, ReasoningControl, ResponseFormat, SplitMode,
     TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
 };
@@ -56,6 +57,8 @@ pub struct AppState {
     backend: Arc<dyn CompletionBackend>,
     model_aliases: Arc<BTreeSet<String>>,
     inventory: Option<Arc<dyn ModelInventory>>,
+    hardware: Option<Arc<dyn HardwareProvider>>,
+    previewer: Option<Arc<dyn ModelPreviewer>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -70,6 +73,8 @@ impl AppState {
             backend,
             model_aliases: Arc::new(BTreeSet::new()),
             inventory: None,
+            hardware: None,
+            previewer: None,
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -86,12 +91,24 @@ impl AppState {
         self.inventory = Some(inventory);
         self
     }
+
+    pub fn with_hardware(mut self, hardware: Arc<dyn HardwareProvider>) -> Self {
+        self.hardware = Some(hardware);
+        self
+    }
+
+    pub fn with_previewer(mut self, previewer: Arc<dyn ModelPreviewer>) -> Self {
+        self.previewer = Some(previewer);
+        self
+    }
 }
 
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/hardware", get(hardware))
         .route("/v1/models", get(models))
+        .route("/v1/models/preview", post(preview_model))
         .route("/v1/models/download", post(download_model))
         .route("/v1/models/{model_id}", get(model).delete(delete_model))
         .route("/props", get(props))
@@ -966,6 +983,22 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+#[utoipa::path(get, path = "/v1/hardware", operation_id = "getHardware", tag = "system", responses(
+    (status = 200, description = "Hardware visible to the pinned ICN runtime", body = inventory_schema::HardwareSnapshotSchema),
+    (status = 500, description = "Hardware discovery failed", body = ErrorResponse)
+))]
+async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot>, ApiError> {
+    let provider = state
+        .hardware
+        .as_ref()
+        .ok_or_else(|| ApiError::server("hardware discovery is not configured"))?;
+    provider
+        .snapshot()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
 #[utoipa::path(get, path = "/v1/models", operation_id = "listModels", tag = "models", responses(
     (status = 200, description = "Loaded models", body = ModelList)
 ))]
@@ -984,6 +1017,29 @@ async fn models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiErr
         object: "list",
         data,
     }))
+}
+
+#[utoipa::path(post, path = "/v1/models/preview", operation_id = "previewModel", tag = "models",
+    request_body(content = inventory_schema::ModelPreviewRequestSchema, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Metadata-only model assessment", body = inventory_schema::ModelPreviewSchema),
+        (status = 400, description = "Invalid immutable artifact or profile", body = ErrorResponse),
+        (status = 500, description = "Preview acquisition or assessment failed", body = ErrorResponse)
+    )
+)]
+async fn preview_model(
+    State(state): State<AppState>,
+    Json(request): Json<ModelPreviewRequest>,
+) -> Result<Json<ModelPreview>, ApiError> {
+    let previewer = state
+        .previewer
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model preview is not configured"))?;
+    previewer
+        .preview(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(get, path = "/v1/models/{model_id}", operation_id = "getModel", tag = "models",
@@ -2034,7 +2090,9 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
     info(title = "Magnitude Inference Control Node", version = "0.1.0"),
     paths(
         health,
+        hardware,
         models,
+        preview_model,
         model,
         download_model,
         delete_model,
@@ -2044,6 +2102,9 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
     ),
     components(schemas(
         HealthResponse,
+        inventory_schema::HardwareSnapshotSchema,
+        inventory_schema::ModelPreviewRequestSchema,
+        inventory_schema::ModelPreviewSchema,
         ModelList,
         Model,
         inventory_schema::ModelStatusSchema,
@@ -2465,6 +2526,143 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use tower::ServiceExt;
+
+    struct StubHardware;
+
+    impl HardwareProvider for StubHardware {
+        fn snapshot(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<HardwareSnapshot, InventoryError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                serde_json::from_value(json!({
+                    "captured_at": 10,
+                    "platform": "test",
+                    "architecture": "test64",
+                    "cpu_model": "Test CPU",
+                    "logical_cores": 8,
+                    "native_build": "test-build",
+                    "enabled_backends": ["cpu"],
+                    "assessment_policy": "test-policy",
+                    "capacity_policy": "test-policy",
+                    "topology_fingerprint": "topology",
+                    "memory_domains": [{
+                        "id": "system",
+                        "kind": "system",
+                        "total_capacity_bytes": 1024,
+                        "stable_capacity_bytes": 768,
+                        "current_free_bytes": 512,
+                        "shares_system_memory": true,
+                        "devices": [{
+                            "id": "cpu",
+                            "backend": "cpu",
+                            "name": "CPU",
+                            "description": "Test CPU",
+                            "kind": "cpu"
+                        }]
+                    }]
+                }))
+                .map_err(|error| InventoryError::Internal(error.to_string()))
+            })
+        }
+    }
+
+    struct StubPreviewer;
+
+    impl ModelPreviewer for StubPreviewer {
+        fn preview(
+            &self,
+            request: ModelPreviewRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ModelPreview, InventoryError>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                let profile = request
+                    .profiles
+                    .first()
+                    .ok_or_else(|| InventoryError::InvalidRequest("missing profile".to_owned()))?;
+                serde_json::from_value(json!({
+                    "repository": request.source.repository,
+                    "commit": request.source.revision,
+                    "components": [{
+                        "path": request.source.primary_gguf,
+                        "role": "weights",
+                        "size_bytes": 123,
+                        "content": {"type": "sha256", "value": "abc"},
+                        "shard_index": null,
+                        "relationship": null
+                    }],
+                    "properties": {"type": "pending"},
+                    "assessments": [{
+                        "profile_id": profile.id,
+                        "artifact_fingerprint": "artifact",
+                        "execution_policy": profile.policy,
+                        "hardware_topology": "topology",
+                        "assessment": {"type": "not_assessed", "reason": "stub"}
+                    }]
+                }))
+                .map_err(|error| InventoryError::Internal(error.to_string()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hardware_endpoint_returns_the_provider_snapshot() {
+        let response =
+            app(AppState::new(FakeBackend::new("test-model", ""))
+                .with_hardware(Arc::new(StubHardware)))
+            .oneshot(Request::get("/v1/hardware").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["topology_fingerprint"], "topology");
+        assert_eq!(body["memory_domains"][0]["stable_capacity_bytes"], 768);
+    }
+
+    #[tokio::test]
+    async fn preview_endpoint_uses_the_typed_previewer_contract() {
+        let commit = "a".repeat(40);
+        let response = app(AppState::new(FakeBackend::new("test-model", ""))
+            .with_previewer(Arc::new(StubPreviewer)))
+        .oneshot(
+            Request::post("/v1/models/preview")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "source": {
+                            "repository": "owner/repository",
+                            "revision": commit,
+                            "primary_gguf": "model.gguf",
+                            "additional_components": []
+                        },
+                        "profiles": [{
+                            "id": "interactive",
+                            "policy": "test-policy",
+                            "context_length": 4096,
+                            "parallel_sequences": 1
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["repository"], "owner/repository");
+        assert_eq!(body["assessments"][0]["profile_id"], "interactive");
+    }
 
     fn request_from_json(value: Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("request must decode")

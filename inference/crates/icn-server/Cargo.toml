@@ -30,3 +30,6 @@ cuda = ["icn-engine/cuda", "icn-hardware/cuda", "icn-mtp/cuda"]
 metal = ["icn-engine/metal", "icn-hardware/metal", "icn-mtp/metal"]
 mtmd = ["icn-engine/mtmd", "icn-hardware/mtmd"]
 vulkan = ["icn-engine/vulkan", "icn-hardware/vulkan", "icn-mtp/vulkan"]
+
+[dev-dependencies]
+tempfile = "3.24.0"

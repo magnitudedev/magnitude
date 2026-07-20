@@ -28,6 +28,48 @@ export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/v1/
     { status: 500 },
   )
 
+export const deleteModel = HttpApiEndpoint.del("deleteModel", "/v1/models/:model_id")
+  .setPath(S.Struct({ model_id: S.String }))
+  .setUrlParams(S.Struct({ dry_run: S.optionalWith(S.BooleanFromString, { exact: true, as: "Option" }) }))
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.DeleteModelResponse, Schemas.DeleteModelResponseEncoded> => Schemas.DeleteModelResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+
+export const getHardware = HttpApiEndpoint.get("getHardware", "/v1/hardware")
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.HardwareSnapshotSchema, Schemas.HardwareSnapshotSchemaEncoded> =>
+        Schemas.HardwareSnapshotSchema,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const getModel = HttpApiEndpoint.get("getModel", "/v1/models/:model_id")
+  .setPath(S.Struct({ model_id: S.String }))
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.Model, Schemas.ModelEncoded> => Schemas.Model),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+
 export const getModelProperties = HttpApiEndpoint.get("getModelProperties", "/v1/props")
   .addSuccess(
     S.suspend((): S.Schema<Schemas.PropsResponse, Schemas.PropsResponseEncoded> => Schemas.PropsResponse),
@@ -48,10 +90,37 @@ export const listModels = HttpApiEndpoint.get("listModels", "/v1/models").addSuc
   { status: 200 },
 )
 
+export const previewModel = HttpApiEndpoint.post("previewModel", "/v1/models/preview")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.ModelPreviewRequestSchema, Schemas.ModelPreviewRequestSchemaEncoded> =>
+        Schemas.ModelPreviewRequestSchema,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.ModelPreviewSchema, Schemas.ModelPreviewSchemaEncoded> => Schemas.ModelPreviewSchema,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const ChatGroup = HttpApiGroup.make("chat").add(applyChatTemplate)
 
-export const ModelsGroup = HttpApiGroup.make("models").add(getModelProperties).add(listModels)
+export const ModelsGroup = HttpApiGroup.make("models")
+  .add(deleteModel)
+  .add(getModel)
+  .add(getModelProperties)
+  .add(listModels)
+  .add(previewModel)
 
-export const SystemGroup = HttpApiGroup.make("system").add(health)
+export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
 export const IcnApi = HttpApi.make("IcnApi").add(ChatGroup).add(ModelsGroup).add(SystemGroup)

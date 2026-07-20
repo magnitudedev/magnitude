@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fs2::FileExt;
@@ -13,8 +13,8 @@ use serde_json::{Map, Value};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Reads a bounded JSON object. Every filesystem, size, and decoding failure is a cache miss.
-pub fn read_object(path: &Path, maximum_bytes: usize) -> Option<Map<String, Value>> {
+/// Reads a bounded regular file. Every filesystem and size failure is a cache miss.
+pub fn read_bytes(path: &Path, maximum_bytes: usize) -> Option<Vec<u8>> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.file_type().is_file() || metadata.len() > maximum_bytes as u64 {
         return None;
@@ -27,10 +27,28 @@ pub fn read_object(path: &Path, maximum_bytes: usize) -> Option<Map<String, Valu
     if bytes.len() > maximum_bytes {
         return None;
     }
-    match serde_json::from_slice(&bytes).ok()? {
+    Some(bytes)
+}
+
+/// Reads and decodes one bounded JSON recovery unit.
+pub fn read_json<T: DeserializeOwned>(path: &Path, maximum_bytes: usize) -> Option<T> {
+    serde_json::from_slice(&read_bytes(path, maximum_bytes)?).ok()
+}
+
+/// Reads a bounded JSON object. Every filesystem, size, and decoding failure is a cache miss.
+pub fn read_object(path: &Path, maximum_bytes: usize) -> Option<Map<String, Value>> {
+    match read_json::<Value>(path, maximum_bytes)? {
         Value::Object(object) => Some(object),
         _ => None,
     }
+}
+
+/// Removes and decodes one independently recoverable object section.
+pub fn recover_section<T: DeserializeOwned>(
+    object: &mut Map<String, Value>,
+    key: &str,
+) -> Option<T> {
+    serde_json::from_value(object.remove(key)?).ok()
 }
 
 /// Decodes independently meaningful map entries and discards only entries that do not decode.
@@ -67,6 +85,43 @@ pub fn write_json_atomic<T: Serialize>(
     value: &T,
     maximum_bytes: usize,
 ) {
+    let Some(bytes) = serde_json::to_vec_pretty(value)
+        .ok()
+        .filter(|bytes| bytes.len() <= maximum_bytes)
+    else {
+        return;
+    };
+    write_bytes_atomic(path, lock_path, &bytes, maximum_bytes);
+}
+
+/// Publishes bounded bytes as a complete replacement. Failure is intentionally invisible.
+pub fn write_bytes_atomic(path: &Path, lock_path: &Path, bytes: &[u8], maximum_bytes: usize) {
+    if bytes.len() > maximum_bytes {
+        return;
+    }
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return;
+    };
+    let Some(lock_parent) = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return;
+    };
+    if create_private_directories(parent).is_err()
+        || create_private_directories(lock_parent).is_err()
+    {
+        return;
+    }
+    match fs::symlink_metadata(lock_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
     let Ok(lock) = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -79,24 +134,31 @@ pub fn write_json_atomic<T: Serialize>(
     if lock.try_lock_exclusive().is_err() {
         return;
     }
-    let Some(bytes) = serde_json::to_vec_pretty(value)
-        .ok()
-        .filter(|bytes| bytes.len() <= maximum_bytes)
-    else {
-        let _ = lock.unlock();
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        let _ = lock.unlock();
-        return;
-    };
     let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(".cache-tmp-{}-{sequence}", std::process::id()));
-    let persisted = write_private_file(&temporary, &bytes) && fs::rename(&temporary, path).is_ok();
+    let temporary = temporary_path(parent, path, sequence);
+    let persisted = write_private_file(&temporary, bytes) && fs::rename(&temporary, path).is_ok();
     if !persisted {
         let _ = fs::remove_file(&temporary);
     }
     let _ = lock.unlock();
+}
+
+fn temporary_path(parent: &Path, path: &Path, sequence: u64) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()))
+}
+
+fn create_private_directories(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> bool {
@@ -122,6 +184,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cache.json");
         assert!(read_object(&path, 1024).is_none());
+
+        fs::write(&path, br#"{"value": 7}"#).unwrap();
+        assert_eq!(
+            read_json::<serde_json::Value>(&path, 1024).unwrap()["value"],
+            7
+        );
+        assert_eq!(read_bytes(&path, 1024).unwrap(), br#"{"value": 7}"#);
+
+        let mut object = serde_json::json!({"valid": 2, "invalid": "no"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(recover_section::<u64>(&mut object, "valid"), Some(2));
+        assert_eq!(recover_section::<u64>(&mut object, "invalid"), None);
         fs::write(&path, b"not json").unwrap();
         assert!(read_object(&path, 1024).is_none());
         fs::write(&path, b"[]").unwrap();
@@ -150,10 +226,22 @@ mod tests {
     #[test]
     fn atomic_write_is_recoverable_and_failures_are_invisible() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("cache.json");
-        let lock = directory.path().join("cache.lock");
+        let path = directory.path().join("nested/cache.json");
+        let lock = directory.path().join("locks/cache.lock");
         write_json_atomic(&path, &lock, &serde_json::json!({"value": 1}), 1024);
         assert_eq!(read_object(&path, 1024).unwrap()["value"], 1);
+
+        let blob = directory.path().join("blobs/value");
+        write_bytes_atomic(&blob, &lock, b"cached bytes", 1024);
+        assert_eq!(read_bytes(&blob, 1024).unwrap(), b"cached bytes");
+
+        write_bytes_atomic(&blob, &lock, b"too large", 2);
+        assert_eq!(read_bytes(&blob, 1024).unwrap(), b"cached bytes");
+
+        fs::remove_file(&lock).unwrap();
+        fs::create_dir(&lock).unwrap();
+        write_bytes_atomic(&blob, &lock, b"must not publish", 1024);
+        assert_eq!(read_bytes(&blob, 1024).unwrap(), b"cached bytes");
 
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();

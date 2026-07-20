@@ -116,8 +116,62 @@ The same hardware service supplies `GET /v1/hardware`, downloaded-model reconcil
 preview, and load-time safety assessment. No endpoint may maintain its own device enumeration,
 backend preference, memory-domain aliasing, or capacity snapshot implementation.
 
+## Required internal decomposition
+
+The implementation is divided into transport-independent services with one-way dependencies:
+
+```text
+native runtime/build identity
+          |
+          +----> hardware discovery + memory-domain normalization
+          |                         |
+          |                         v
+local artifact adapter ----+   shared assessment service <---- execution-profile resolver
+                            |            ^
+                            v            |
+                  canonical artifact ----+
+                            ^            |
+remote header adapter ------+            v
+                                model-derived cache
+                                         |
+                    +--------------------+--------------------+
+                    v                                         v
+          inventory/list application service          preview application service
+                    |                                         |
+                    v                                         v
+             GET /v1/models                         POST /v1/models/preview
+
+hardware discovery ------------------------------------------------> GET /v1/hardware
+```
+
+The transport-neutral contracts define one canonical hardware snapshot, resolved execution
+profile, canonical component identity, and `HardwareAssessment`. The available and preview APIs may
+use different request and envelope types, but they do not define separate assessment shapes.
+
+The hardware discovery service owns backend initialization, logical-device enumeration, physical
+memory-domain aliasing, stable capacity, volatile free-memory observation, and topology
+fingerprinting. Its result is reused within an operation and may be refreshed according to one
+service-owned policy. API state, inventory assessment, preview, and loading receive this service by
+dependency injection rather than constructing their own snapshots.
+
+The canonical artifact resolver owns component roles and relationships, exact identities, logical
+sizes, and metadata sources. Local and remote adapters implement acquisition only. The shared
+assessment service owns property inspection, execution-profile resolution, native planning,
+capacity evaluation, typed adjustments, normalized reporting, and assessment-key construction.
+Native calls share one serialization gate wherever the pinned runtime has process-global state.
+
+The [model-management cache](./model-management.md#model-derived-cache) owns acquired header blobs
+and the computed artifact, inspection, and assessment indexes. Hardware fitting defines its typed
+evidence and validation rules but does not create a fit-specific cache service or construct
+filesystem paths. Inventory may embed a completed assessment in its disposable snapshot, while
+preview and available paths reuse the same assessment index.
+
+The HTTP handlers perform request decoding, call the relevant application service, and translate
+typed domain failures. They do not initialize native backends, fetch model metadata, construct
+sparse artifacts, resolve profiles, or perform cache operations directly.
+
 The available path persists completed inspection and assessment in inventory under the inventory
-cache rules. The preview path durably caches the candidate assessment through the shared fit cache
+cache rules. The preview path durably caches the candidate assessment through the shared model cache
 and returns it without publishing the candidate into local inventory or making it available for
 loading. “Preview” describes model availability, not cache lifetime. Download publication converts
 the artifact into the available path, which may reuse the shared cached assessment only when every
@@ -134,6 +188,7 @@ The response contains:
 - platform, native architecture, CPU identity, logical cores, total system memory, and current
   available system memory;
 - native build fingerprint and enabled backends;
+- the accepted model-assessment policy identity for preview requests;
 - runtime-visible logical devices with stable IDs where the backend supplies them, names, backend,
   device kind, total memory, current free memory, and physical-memory-domain identity;
 - normalized memory domains with total capacity, stable capacity, current free memory,
@@ -181,16 +236,20 @@ A Hugging Face source contains at least:
 repository
 immutable commit revision
 primary GGUF path
+zero or more explicitly selected projector, draft, or MTP GGUF paths and roles
 ```
 
-ICN resolves every shard and associated required component at that revision. A future
+ICN resolves every shard of the primary GGUF and every explicitly selected execution companion at
+that revision. Companion relationships are derived by ICN rather than accepted as unchecked caller
+metadata. A future
 content-addressed fit-descriptor source may identify a Magnitude-published header bundle by URL,
 size, and digest. Arbitrary caller-controlled fetch URLs are not accepted.
 
-Each requested profile has a caller correlation ID and a versioned product-policy identity plus the
-high-level variable inputs, such as context length and parallel sequence count. ICN resolves those
-inputs through the same execution-policy implementation used for loading. Callers do not assemble
-unchecked native flags.
+Each requested profile has a caller correlation ID, the ICN-published semantic policy identity, and
+the high-level variable inputs, such as context length and parallel sequence count. ICN rejects an
+unknown policy identity and resolves accepted inputs through the same execution-policy
+implementation used for loading. Callers do not assemble unchecked native flags. The returned
+execution-policy identity is supplied by the assessor, not echoed from unchecked caller data.
 
 The response contains:
 
@@ -223,9 +282,13 @@ tensor directory describes each tensor's name, shape, data type, and offset. Tho
 with the execution profile and native device capabilities, determine planner allocation and
 placement. Numerical weight values are not inputs to memory planning.
 
-For every GGUF shard, ICN acquires the exact byte prefix from offset zero through the aligned tensor
+For every GGUF shard, ICN retains the exact byte prefix from offset zero through the aligned tensor
 data offset and records the original logical file size and content identity. The prefix may include
-large tokenizer arrays and must not be replaced by a small hand-selected metadata subset.
+large tokenizer arrays and must not be replaced by a small hand-selected metadata subset. A remote
+source that does not publish the header length may require bounded, increasing prefix probes; the
+terminal HTTP range can extend beyond the discovered boundary, but bytes after the aligned header
+are discarded and never cached or materialized. Preview acquisition never downloads the complete
+weights file merely to discover that boundary.
 
 To reuse the ordinary pinned llama.cpp file loader, ICN may materialize a temporary sparse artifact:
 
@@ -239,8 +302,8 @@ To reuse the ordinary pinned llama.cpp file loader, ICN may materialize a tempor
 
 The logical length is required because llama.cpp validates that declared tensor ranges fall within
 the file even in no-allocation mode. The fit path must disable tensor allocation, mmap, and mlock and
-must not read tensor payload ranges. Sparse preview artifacts must be isolated and marked so they can
-never be passed to an ordinary model load.
+must not read tensor payload from the sparse artifact. Sparse preview artifacts must be isolated and
+marked so they can never be passed to an ordinary model load.
 
 A future native metadata-source abstraction may replace sparse files, but it must preserve the same
 llama.cpp model construction, buffer-type selection, no-allocation graph construction, placement,
@@ -283,46 +346,48 @@ ACN submits catalog artifact identities and usage-derived product profiles to th
 excludes invalid, incompatible, and `DoesNotFit` candidates and applies only product ranking to the
 remaining results. It must not modify or reinterpret ICN memory arithmetic.
 
+### Catalog source versus generated artifact facts
+
+The hand-maintained catalog retains only deliberate product decisions: which model/artifact to
+offer, immutable repository revision, display and grouping policy, license review, quality rank,
+fidelity evidence, and supported product usage choices. A development-time generator resolves and
+checks in facts obtainable from the pinned artifact, including complete component membership,
+sizes, content identities, GGUF-derived properties, and header or header-bundle identities.
+
+Runtime code must not contain a second hand-maintained table of GGUF architecture, tensor, KV,
+recurrent-state, or memory-estimator inputs. Runtime preview validates the generated immutable
+selectors and obtains the exact headers through ICN. Regenerating the catalog lock is an explicit
+development action; normal application startup does not query mutable repository metadata to fill
+missing catalog fields.
+
+## Bun and client replacement boundary
+
+After the ICN APIs are available, ACN obtains host/device facts from `GET /v1/hardware`, downloaded
+model facts from `GET /v1/models`, and remote candidate assessments from
+`POST /v1/models/preview`. ACN continues to translate usage selection into product profiles and rank
+successful candidates using curated quality and fidelity policy.
+
+The migration removes Bun-owned host inspection, llama.cpp device probing for product state,
+memory-domain normalization, stable-capacity arithmetic, hand-maintained runtime GGUF metadata,
+runtime-byte formulas, and direct fit-command assessment. These implementations must not remain as
+fallbacks because a fallback would create a second hardware authority. Until ACN has switched to
+the ICN endpoints, the old projection may remain isolated as transitional code, but one application
+state build must never combine ICN and Bun hardware or fit facts.
+
+The ACN local-inference projection maps the canonical ICN results into the existing product state
+only where presentation requires it. It must preserve `Fits`, `DoesNotFit`, per-domain memory,
+resolved profile, and failure distinctions rather than converting them back into a Bun estimate.
+Downloaded ICN models and remote recommendations therefore display the same assessment semantics.
+Unmanaged external servers may remain explicitly unassessed because ICN does not own their
+artifacts or execution plan.
+
 ## Cache validity
 
-### Cache storage and lifecycle
-
-The shared fit cache lives below ICN's configured model-store root, alongside but separate from the
-durable inventory. With the default model-store location its logical layout is:
-
-```text
-~/.magnitude/models/
-  inventory-index.json
-  hub/
-  fit-cache/
-    headers/
-      <header-content-digest>
-    artifacts/
-      <resolved-artifact-key>.json
-    assessments/
-      <assessment-key>.json
-```
-
-The exact on-disk encoding may change, but the ownership and separation are required:
-
-- ICN owns the cache under the configured model-store root;
-- ACN and clients never read or write it directly;
-- preview candidates do not become inventory records merely because they are cached;
-- downloaded inventory evidence and preview requests consult the same assessment cache service;
-- deleting `fit-cache/` is safe and causes reassessment, not model or inventory loss.
-
-`headers/` is a content-addressed store for exact remote GGUF prefixes or published fit-header
-bundles. `artifacts/` records the validated mapping from immutable source components to header
-digests and original logical sizes. `assessments/` stores normalized completed planner results.
-
-Fit-cache files follow the shared
-[file-based cache and recovery contract](../misc/file-based-caching.md): they carry no file-format
-schema version, tolerate corruption as granular cache misses, and never fail assessment solely due
-to cache I/O. Writes are atomic and use restrictive filesystem permissions. The cache supports
-bounded size or age-based garbage collection without consulting product catalog policy.
-An in-flight map coalesces concurrent requests for the same key; it is an execution optimization,
-not a second cache or source of truth. Operational failures and incomplete assessments are never
-persisted.
+Hardware fitting persists only through the
+[model-management cache](./model-management.md#model-derived-cache). Exact remote GGUF prefixes or
+published header bundles are source blobs. Resolved artifacts, GGUF inspections, and completed
+hardware assessments are computed indexes. Preview status, inventory membership, and endpoint
+identity never define a separate cache category.
 
 Header acquisition is cached by immutable source identity, component path, original size, content
 identity, and header digest. A cached prefix is valid only when its bytes and declared tensor ranges
@@ -414,9 +479,15 @@ The implementation conforms when:
 - remote preview and full local artifacts produce equal normalized reports for the same inputs;
 - parity coverage includes dense, MoE, recurrent/hybrid, sharded, projector, CPU-only, unified-memory,
   discrete-GPU, and supported multi-device profiles;
-- instrumentation verifies that metadata-only fitting never reads tensor payload ranges;
+- instrumentation verifies that metadata-only fitting retains and materializes only the exact GGUF
+  header prefix and never performs a complete weights download;
 - changing any artifact, runtime, hardware, profile, component, or policy input invalidates the
   relevant cached result;
+- deleting, corrupting, or making the model-derived cache unwritable causes only affected
+  acquisition, inspection, or
+  assessment work to be repeated and never changes the resulting assessment;
 - `DoesNotFit`, invalid artifact, incompatible artifact, and operational failure remain distinct;
 - loading independently validates the exact execution plan it will allocate;
+- catalog runtime facts derivable from pinned artifacts are generated rather than maintained in a
+  parallel Bun metadata table;
 - regular builds and client operation do not require mutable Hugging Face metadata.

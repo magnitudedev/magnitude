@@ -130,8 +130,8 @@ Cache recovery must satisfy all of the following:
   fail the operation that wanted to use the cache;
 - regeneration may proceed without first repairing or deleting the bad file;
 - a successful later write may heal the file atomically, but healing is not required for correctness;
-- diagnostics are bounded, omit cached payload contents and secrets, and do not become user-facing
-  errors;
+- any diagnostics that are emitted are bounded, omit cached payload contents and secrets, and do
+  not become user-facing errors; disposable caches are not required to allocate a recovery report;
 - repeated callers may coalesce regeneration in memory, but an in-flight map is not durable state.
 
 Readers cannot assume that writers are cooperative or that a lock was honored. Writers encode the
@@ -178,17 +178,36 @@ unrecoverable decode results become scoped misses or defaults. Configuration ada
 richer recovery report, preservation, and catastrophic-error behavior. A cache must not use a
 single all-or-nothing decode when its schema contains independent entries.
 
-The Rust side must provide an equivalent shared facility rather than open-coding `serde_json` reads
-in each subsystem. It must support bounded reads, root fallback, independent section decoding,
-per-entry map and array salvage, safe field defaults, unknown-field tolerance, recovery diagnostics,
-and atomic best-effort publication. `serde(default)` alone is insufficient because it handles
-absence but not a present value of the wrong type; collection entries and independently recoverable
-fields must be decoded at their recovery boundaries. Cache-facing Rust APIs return `Option`, a
-default, or an explicit hit/partial-hit/miss type without exposing an I/O or decode error channel.
+The Rust side uses Serde and `serde_json`, with the common file mechanics and small recovery
+combinators owned by `icn-utils`. The shared layer provides bounded no-fail reads, object/root
+fallback, independent map and array entry decoding, best-effort directory creation, bounded binary
+and JSON publication, restrictive temporary files, and same-directory atomic replacement. Cache
+callers receive `Option`, an empty/default value, or a hit/miss type without an I/O or decode error
+channel.
+
+The schema owner explicitly chooses each recovery boundary. Ordinary Serde decoding is used for a
+unit that should be kept or discarded as a whole. `#[serde(default)]` supplies absent values.
+`serde_with` adapters such as `DefaultOnError`, `VecSkipError`, and `MapSkipError` may be used when
+defaulting an invalid field or skipping an invalid collection member is exactly the desired domain
+behavior. An explicit `serde_json::Value` boundary remains preferable when identity validation,
+cross-field invariants, unknown-field preservation, or custom recovery decisions are required.
+
+`serde_with` is a convenience, not a required layer in every cache and not an abstraction to wrap or
+reimplement in `icn-utils`. The Rust design deliberately excludes a runtime schema algebra, a
+generic recursive schema walker, and automatic mutation-and-retry of arbitrary decode-error paths.
+New recovery helpers are added to `icn-utils` only after the same mechanically correct pattern is
+needed by more than one consumer or is required to keep file I/O no-fail.
+
+Disposable-cache reads may silently return misses. A bounded recovery report is optional and is
+introduced only where it materially improves operational diagnosis. Durable configuration retains
+the richer behavior: when recovery changes user-authored data it records affected paths, preserves
+unknown fields, and preserves the original before a root reset.
 
 ## Conformance tests
 
-Every file-backed cache/index implementation is tested with:
+The shared file utility is tested with the applicable filesystem and representation cases below;
+individual cache/index consumers test their own recovery units and evidence invalidation without
+repeating the entire utility matrix:
 
 - missing and empty files;
 - random, truncated, and invalidly encoded bytes;
@@ -203,9 +222,9 @@ Every file-backed cache/index implementation is tested with:
 - write, rename, cleanup, and lock failure.
 
 Tests assert that valid siblings survive, only affected work is regenerated, cache failures do not
-enter the caller's error channel, and failed writes do not change the operation result. Parsers should
-also receive fuzz or property-based coverage proving that arbitrary bytes cannot panic or escape the
-cache boundary as an error.
+enter the caller's error channel, and failed writes do not change the operation result. Fuzz or
+property-based coverage is appropriate for shared parsers that do more than bounded
+`serde_json::Value` decoding; it is not required for every thin cache consumer.
 
 Durable-configuration tests use the same corruption matrix and additionally assert minimal
 defaulting, preservation of unknown fields, preservation of original bytes before a root reset, and

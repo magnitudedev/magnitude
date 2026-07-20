@@ -22,6 +22,105 @@ pub enum ComponentRoleSchema {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareMemoryDomainKindSchema {
+    System,
+    PhysicalDevice,
+    UnifiedWorkingSet,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareDeviceKindSchema {
+    Cpu,
+    Gpu,
+    IntegratedGpu,
+    Accelerator,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HardwareDeviceSchema {
+    id: String,
+    backend: String,
+    name: String,
+    description: String,
+    kind: HardwareDeviceKindSchema,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HardwareMemoryDomainSchema {
+    id: String,
+    kind: HardwareMemoryDomainKindSchema,
+    total_capacity_bytes: u64,
+    stable_capacity_bytes: u64,
+    current_free_bytes: Option<u64>,
+    shares_system_memory: bool,
+    devices: Vec<HardwareDeviceSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HardwareSnapshotSchema {
+    captured_at: u64,
+    platform: String,
+    architecture: String,
+    cpu_model: Option<String>,
+    logical_cores: usize,
+    native_build: String,
+    enabled_backends: Vec<String>,
+    assessment_policy: String,
+    capacity_policy: String,
+    topology_fingerprint: String,
+    memory_domains: Vec<HardwareMemoryDomainSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelPreviewSourceSchema {
+    repository: String,
+    revision: String,
+    primary_gguf: String,
+    additional_components: Vec<ModelPreviewComponentSourceSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelPreviewComponentSourceSchema {
+    path: String,
+    role: ComponentRoleSchema,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelPreviewProfileSchema {
+    id: String,
+    policy: String,
+    context_length: u32,
+    parallel_sequences: u32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelPreviewRequestSchema {
+    source: ModelPreviewSourceSchema,
+    profiles: Vec<ModelPreviewProfileSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelPreviewAssessmentSchema {
+    profile_id: String,
+    artifact_fingerprint: String,
+    execution_policy: String,
+    hardware_topology: String,
+    assessment: HardwareAssessmentSchema,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelPreviewSchema {
+    repository: String,
+    commit: String,
+    components: Vec<ModelComponentSchema>,
+    properties: InventoryPropertiesSchema,
+    assessments: Vec<ModelPreviewAssessmentSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentIdentitySchema {
     Sha256 { value: String },
@@ -56,6 +155,7 @@ pub struct ModelComponentSchema {
     size_bytes: u64,
     content: ContentIdentitySchema,
     shard_index: Option<u32>,
+    #[schema(nullable = false)]
     relationship: Option<ComponentRelationshipSchema>,
 }
 

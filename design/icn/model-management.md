@@ -129,7 +129,77 @@ never loadable, and never masquerade as available models with unknown properties
 may still offer deletion. Their presence does not weaken the property invariant for models labeled
 `Available` or prevent other stable models from being returned.
 
-## Cache validity
+## Model-derived cache
+
+ICN model management owns one cache for all recomputable facts derived from local or remote model
+artifacts. Inventory, artifact resolution, metadata inspection, reasoning detection, and hardware
+assessment are domains within this cache, not independent cache systems. ACN and clients never
+read, write, or construct paths inside it.
+
+The cache lives below the configured model-store root and has two top-level data forms:
+
+```text
+~/.magnitude/models/
+  hub/                              authoritative downloaded artifacts
+  cache/                            safely disposable as a whole
+    blobs/                          faithful cached source bytes
+      gguf-headers/
+        <content-digest>
+    indexes/                        computed structured projections
+      inventory.json
+      artifacts/
+        <artifact-key>.json
+      inspections/
+        artifacts/
+          <inspection-key>.json
+      assessments/
+        hardware/
+          <assessment-key>.json
+```
+
+Blobs are exact byte sequences acquired from an authoritative source and retained to avoid
+acquiring them again. GGUF header prefixes are blobs. They are addressed by content identity and
+validated for expected length, digest, and domain-specific structure before use.
+
+Indexes are computed structured projections regenerated from authoritative artifacts, validated
+blobs, runtime state, hardware state, or other current inputs. The inventory, resolved artifacts,
+artifact inspections (including template and reasoning results), and hardware assessments are
+indexes. Each index key covers every input capable of changing its result. Invalid or incomplete
+entries are misses at the smallest independently recomputable unit.
+
+The distinction controls identity, validation, and garbage collection, but not failure behavior.
+Both use the shared [file-based cache and recovery contract](../misc/file-based-caching.md). One
+model-cache service owns root resolution, domain paths, and bounded reads and writes. Domain
+components supply typed keys, values, validation, and recomputation; they do not assemble
+filesystem paths. Application services coalesce in-flight work by complete evidence key without
+creating another persistence mechanism. `icn-utils` supplies no-fail file mechanics but knows
+nothing about model domains or evidence keys.
+
+```text
+authoritative local files ---------+
+                                    |
+immutable remote sources -> blobs -+-> artifact index -> inspection indexes
+                                                        |              |
+runtime/template policy --------------------------------+              |
+                                                                       v
+hardware + execution profile ---------------------------> hardware assessment index
+                                                                       |
+                                                                       v
+                                                           inventory index projection
+```
+
+The inventory is a materialized listing projection, not a second authority for embedded reasoning
+or hardware facts. It may embed current domain results for efficient listing, but those values come
+from the same inspectors and assessors and carry the same evidence identities as their independently
+reusable indexes. Preview caching does not add a remote candidate to inventory. Once downloaded,
+the available path reuses the same indexes only when every evidence key matches.
+
+New model-derived data extends `cache/blobs/` or `cache/indexes/` with a domain-specific namespace.
+It does not create a sibling cache root, endpoint-owned cache, or feature-specific filesystem path.
+Deleting `cache/` is always safe and repeats acquisition, discovery, inspection, and assessment; it
+never deletes downloaded models or user-authored data.
+
+### Cache validity and recovery
 
 A path existing in the cache is not evidence that its assessment remains valid. Reconciliation invalidates results when any relevant input changes, including:
 
@@ -145,7 +215,17 @@ recovers entries structurally and independently; data it cannot establish as a c
 entry is discarded and recomputed. The cache is never a migration boundary or durable source of
 truth.
 
-Reasoning and hardware evidence may use separate cache keys because their inputs differ. Completed results are written atomically only after all required work for the model succeeds. Interrupted or failed inspection must leave the previous valid entry intact only when its key is still valid; otherwise the model remains stale and the list request fails rather than returning it as current.
+Reasoning and hardware indexes use separate domain evidence keys because their inputs differ, while
+sharing the same cache owner and mechanics. Completed results are written atomically only after all
+required work for the model succeeds. Interrupted or failed inspection must leave the previous
+valid entry intact only when its key is still valid; otherwise the model remains stale and the list
+request fails rather than returning it as current.
+
+Garbage collection may apply independent age or size bounds to blob and index namespaces without
+changing correctness. Cache reachability is an optimization, never correctness state. Obsolete
+cache locations are ignored and regenerated rather than migrated or treated as competing sources
+of truth. Operational failures and partial computations are never persisted; stable negative domain
+results such as `DoesNotFit` may be cached because they are complete results for their evidence key.
 
 ## Contract consequences
 
@@ -169,6 +249,12 @@ The implementation satisfies this design when:
 - missing, malformed, changed, and stale index entries form one bounded-parallel enrichment set;
 - one malformed index entry does not invalidate unrelated valid entries;
 - no cache-file read, parse, shape, lock, serialization, or write failure can fail model listing;
+- all ICN model-derived persistence is under the one model-management cache root and is classified
+  as either a source blob or a computed index;
+- domain code does not construct cache paths or create feature-specific cache services;
+- preview and available flows reuse identical typed results exactly when their evidence keys match;
+- deleting or making the complete cache unwritable does not change computed results or fail an
+  otherwise successful operation;
 - simultaneous lists share one ensure operation;
 - adding, changing, regrouping, or removing artifacts invalidates exactly the affected entries;
 - no successful response contains unresolved properties for an available model;

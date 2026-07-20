@@ -76,6 +76,7 @@ pub struct ModelComponent {
     pub size_bytes: u64,
     pub content: ContentIdentity,
     pub shard_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship: Option<ComponentRelationship>,
 }
 
@@ -390,6 +391,10 @@ pub struct EffectiveTemplateInputs {
 
 /// Model-free native chat-template assessment injected into model discovery.
 pub trait TemplateAssessor: Send + Sync + 'static {
+    /// Stable identity for every implementation and native-policy input that can change an
+    /// assessment. This is cache evidence, not a persisted schema version.
+    fn cache_identity(&self) -> &str;
+
     fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String>;
 }
 
@@ -467,6 +472,114 @@ pub struct HardwareDeficit {
 pub enum HardwareRecommendation {
     Recommended,
     Constrained,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareMemoryDomainKind {
+    System,
+    PhysicalDevice,
+    UnifiedWorkingSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareDeviceKind {
+    Cpu,
+    Gpu,
+    IntegratedGpu,
+    Accelerator,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareDevice {
+    pub id: String,
+    pub backend: String,
+    pub name: String,
+    pub description: String,
+    pub kind: HardwareDeviceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareMemoryDomain {
+    pub id: String,
+    pub kind: HardwareMemoryDomainKind,
+    pub total_capacity_bytes: u64,
+    pub stable_capacity_bytes: u64,
+    pub current_free_bytes: Option<u64>,
+    pub shares_system_memory: bool,
+    pub devices: Vec<HardwareDevice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareSnapshot {
+    pub captured_at: u64,
+    pub platform: String,
+    pub architecture: String,
+    pub cpu_model: Option<String>,
+    pub logical_cores: usize,
+    pub native_build: String,
+    pub enabled_backends: Vec<String>,
+    pub assessment_policy: String,
+    pub capacity_policy: String,
+    pub topology_fingerprint: String,
+    pub memory_domains: Vec<HardwareMemoryDomain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreviewSource {
+    pub repository: String,
+    pub revision: String,
+    pub primary_gguf: PathBuf,
+    pub additional_components: Vec<ModelPreviewComponentSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreviewComponentSource {
+    pub path: PathBuf,
+    pub role: ComponentRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreviewProfile {
+    pub id: String,
+    pub policy: String,
+    pub context_length: u32,
+    pub parallel_sequences: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreviewRequest {
+    pub source: ModelPreviewSource,
+    pub profiles: Vec<ModelPreviewProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreviewAssessment {
+    pub profile_id: String,
+    pub artifact_fingerprint: String,
+    pub execution_policy: String,
+    pub hardware_topology: String,
+    pub assessment: HardwareAssessment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreview {
+    pub repository: String,
+    pub commit: String,
+    pub components: Vec<ModelComponent>,
+    pub properties: InventoryProperties,
+    pub assessments: Vec<ModelPreviewAssessment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,6 +757,33 @@ pub trait InventoryHardwareAssessor: Send + Sync + 'static {
         &self,
         model: ResolvedModel,
     ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>>;
+}
+
+pub trait HardwareProvider: Send + Sync + 'static {
+    fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>>;
+}
+
+/// Canonical profile-aware model assessment used by inventory and remote preview.
+pub trait ModelHardwareAssessor: HardwareProvider {
+    fn policy_identity(&self) -> &str;
+
+    fn cache_key(
+        &self,
+        profile: Option<&ModelPreviewProfile>,
+        snapshot: &HardwareSnapshot,
+    ) -> Result<String, InventoryError>;
+    fn assess_profile(
+        &self,
+        model: ResolvedModel,
+        profile: Option<ModelPreviewProfile>,
+    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>>;
+}
+
+pub trait ModelPreviewer: Send + Sync + 'static {
+    fn preview(
+        &self,
+        request: ModelPreviewRequest,
+    ) -> BoxFuture<'_, Result<ModelPreview, InventoryError>>;
 }
 
 #[derive(Debug, thiserror::Error)]
