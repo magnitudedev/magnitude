@@ -13,11 +13,11 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", pin_path.display()));
     let bindings_revision = table_value(&pin, "llama_cpp_rs", "revision")
         .unwrap_or_else(|| panic!("missing llama_cpp_rs.revision in {}", pin_path.display()));
-    let llama_cpp_revision = table_value(&pin, "llama_cpp", "revision")
+    let native_backend_revision = table_value(&pin, "llama_cpp", "revision")
         .unwrap_or_else(|| panic!("missing llama_cpp.revision in {}", pin_path.display()));
 
     emit("ICN_BINDINGS_REVISION", &bindings_revision);
-    emit("ICN_LLAMA_CPP_REVISION", &llama_cpp_revision);
+    emit("ICN_NATIVE_BACKEND_REVISION", &native_backend_revision);
     emit(
         "ICN_BUILD_TARGET",
         &env::var("TARGET").expect("TARGET must be set"),

@@ -31,10 +31,10 @@ struct CacheEvidence {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct CachedModelInspection {
-    name: String,
-    properties: InventoryProperties,
-    supported_parameters: Vec<String>,
+pub(crate) struct CachedModelInspection {
+    pub(crate) name: String,
+    pub(crate) properties: InventoryProperties,
+    pub(crate) supported_parameters: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -51,8 +51,6 @@ type HydratedInventory = (
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
     pub root: PathBuf,
-    /// Optional v1 TypeScript-owned Hugging Face store imported once at startup.
-    pub legacy_store: Option<PathBuf>,
     pub hf_cache_dirs: Vec<PathBuf>,
     pub model_sources: Vec<PathBuf>,
     pub max_concurrent_downloads: usize,
@@ -75,16 +73,9 @@ impl InventoryConfig {
                 "model store root must be absolute".to_owned(),
             ));
         }
-        let client =
-            HFClient::new().map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let external_hf_cache = std::env::var_os("HF_HUB_CACHE")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HF_HOME").map(|home| PathBuf::from(home).join("hub")))
-            .unwrap_or_else(|| client.cache_dir().to_path_buf());
         Ok(Self {
             root,
-            legacy_store: None,
-            hf_cache_dirs: vec![external_hf_cache],
+            hf_cache_dirs: Vec::new(),
             model_sources: Vec::new(),
             max_concurrent_downloads: 2,
             disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
@@ -136,14 +127,6 @@ impl ModelManager {
     ) -> Result<Self, InventoryError> {
         validate_config(&config)?;
         create_layout(&config.root).await?;
-        if let Some(legacy_store) = config.legacy_store.clone() {
-            let destination = config.root.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::legacy::import_v1_store(&legacy_store, &destination)
-            })
-            .await
-            .map_err(|error| InventoryError::Internal(error.to_string()))??;
-        }
         let reconciliation_root = config.root.clone();
         tokio::task::spawn_blocking(move || {
             crate::service::reconcile_tombstones(&reconciliation_root)
@@ -180,6 +163,24 @@ impl ModelManager {
             InventoryError::Internal("hardware assessor lock poisoned".to_owned())
         })? = Some(assessor);
         Ok(())
+    }
+
+    pub(crate) fn cached_model_inspection(
+        &self,
+        content_id: &icn_contracts::ContentId,
+        primary_name: &str,
+        has_projector: bool,
+    ) -> Option<CachedModelInspection> {
+        let assessor = self.template_assessor.as_deref()?;
+        let evidence = model_inspection_evidence(
+            content_id,
+            assessor.cache_identity(),
+            primary_name,
+            has_projector,
+        )
+        .ok()?;
+        self.cache
+            .read_index(ModelIndexKind::ArtifactInspection, &evidence)
     }
 
     pub async fn ensure_model_inventory(&self) -> Result<(), InventoryError> {
@@ -636,7 +637,6 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
         .hf_cache_dirs
         .iter()
         .chain(config.model_sources.iter())
-        .chain(config.legacy_store.iter())
     {
         if !root.is_absolute() {
             return Err(InventoryError::InvalidRequest(format!(
@@ -1236,13 +1236,12 @@ pub(crate) fn build_model(
         .components()
         .iter()
         .any(|component| component.role == ComponentRole::Projector);
-    let inspection_evidence = serde_json::to_string(&(
-        &content_id.0,
+    let inspection_evidence = model_inspection_evidence(
+        &content_id,
         assessor.cache_identity(),
         primary_name,
         has_projector,
-    ))
-    .map_err(|error| InventoryError::Internal(error.to_string()))?;
+    )?;
     let cached_inspection = cache.read_index::<CachedModelInspection>(
         ModelIndexKind::ArtifactInspection,
         &inspection_evidence,
@@ -1253,10 +1252,7 @@ pub(crate) fn build_model(
             Ok(inspection) => {
                 let evidence = fingerprint(&inspection.fingerprint_material);
                 let template = assessor.assess(&EffectiveTemplateInputs {
-                    default_template: inspection.chat_template.clone(),
-                    tool_use_template: inspection.tool_use_template.clone(),
-                    bos_token: inspection.bos_token.clone(),
-                    eos_token: inspection.eos_token.clone(),
+                    model_path: primary.to_path_buf(),
                 });
                 let (tools, reasoning, template_evidence) = match template {
                     Ok(assessment) => (
@@ -1372,6 +1368,21 @@ pub(crate) fn build_model(
         operations,
         updated_at: ready_at,
     })
+}
+
+fn model_inspection_evidence(
+    content_id: &icn_contracts::ContentId,
+    assessor_identity: &str,
+    primary_name: &str,
+    has_projector: bool,
+) -> Result<String, InventoryError> {
+    serde_json::to_string(&(
+        &content_id.0,
+        assessor_identity,
+        primary_name,
+        has_projector,
+    ))
+    .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1788,6 +1799,15 @@ mod tests {
         ReasoningVisibility, ResolvedModel, TemplateAssessment, TemplateCapabilities,
     };
 
+    #[test]
+    fn configured_store_does_not_adopt_host_hugging_face_caches() {
+        let root = std::env::temp_dir().join("icn-owned-model-store");
+        let config = InventoryConfig::with_root(root).expect("absolute model store");
+
+        assert!(config.hf_cache_dirs.is_empty());
+        assert!(config.model_sources.is_empty());
+    }
+
     #[derive(Default)]
     struct CompleteTemplateAssessor {
         calls: AtomicUsize,
@@ -1857,6 +1877,7 @@ mod tests {
                         device: "test".to_owned(),
                     },
                     memory: HardwareMemory {
+                        domains: Vec::new(),
                         required_bytes: 1,
                         available_bytes: 2,
                         headroom_bytes: 1,

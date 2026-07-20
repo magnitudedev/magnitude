@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 use icn_contracts::output::{StopBuffer, Utf8Buffer};
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatRequest, ChatTemplateRequest,
-    CompletionBackend, ExecutionConfig, ExecutionConfigReport, FinishReason, FlashAttention,
-    Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger, ImageInput,
-    InferenceError, InferenceEvent, InferenceStreamEvent, ModelModalities, ModelProperties,
-    PreparedChatInfo, ProjectorConfig, ReasoningControl, ResolvedExecutionPlan, ResponseFormat,
+    CompletionBackend, ExecutionConfig, ExecutionConfigReport, ExecutionIntent, FinishReason,
+    FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
+    ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent, ModelModalities,
+    ModelProperties, PreparedChatInfo, ProjectorConfig, ReasoningControl, ResponseFormat,
     SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
@@ -32,18 +32,23 @@ use llama_cpp_2::common_sampling::{
     CommonSamplerConfig, ReasoningBudgetLimit,
 };
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::params::LlamaContextType;
-use llama_cpp_2::context::params::{FlashAttentionPolicy, KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams, LlamaSplitMode};
+use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::mtp::{MtpOperations, MtpParams, MtpSession};
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
 
-mod radix_cache;
 mod scheduler;
+
+/// Suppress the native backend's process-global diagnostic callback.
+///
+/// ICN emits bounded structured diagnostics around native operations; the backend's verbose model
+/// planning dump is neither bounded nor suitable for service telemetry.
+pub fn disable_native_diagnostics() {
+    llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default().with_logs_enabled(false));
+}
 
 #[cfg(feature = "parity-probe")]
 #[doc(hidden)]
@@ -62,8 +67,7 @@ mod multimodal {
 
 use multimodal::{MultimodalPrompt, MultimodalRuntime};
 use scheduler::{
-    BatchPlanner, BatchWork, PromptCheckpoint, RadixAttach, SequenceCache, SequencePool,
-    WorkCandidate, WorkKind,
+    BatchPlanner, BatchWork, PromptCheckpoint, SequenceCache, SequencePool, WorkCandidate, WorkKind,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -77,7 +81,6 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 // reach the command queue before beginning that first blocking decode. This mirrors the natural
 // task coalescing in llama-server's update loop without delaying an already-active sequence.
 const IDLE_ADMISSION_COALESCE_INTERVAL: Duration = Duration::from_millis(1);
-const RADIX_FANOUT_MIN_TOKENS: usize = 64;
 
 type ExclusiveNativeTask = Box<dyn FnOnce(&LlamaBackend) + Send + 'static>;
 
@@ -87,10 +90,12 @@ enum ExecutorCommand {
         events: SyncSender<ExecutorItem>,
         cancelled: Arc<AtomicBool>,
         queued_at: Instant,
+        span: tracing::Span,
     },
     ApplyTemplate {
         request: ChatTemplateRequest,
         response: SyncSender<Result<PreparedChatInfo, InferenceError>>,
+        span: tracing::Span,
     },
     RunExclusiveNative {
         task: ExclusiveNativeTask,
@@ -109,6 +114,7 @@ struct QueuedCompletion {
     events: SyncSender<ExecutorItem>,
     cancelled: Arc<AtomicBool>,
     queued_at: Instant,
+    span: tracing::Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +128,7 @@ enum RequestPhase {
 struct ActiveRequest<'model> {
     sequence_id: Option<i32>,
     events: SyncSender<ExecutorItem>,
+    span: tracing::Span,
     cancelled: Arc<AtomicBool>,
     outbound: VecDeque<ExecutorItem>,
     phase: RequestPhase,
@@ -132,8 +139,6 @@ struct ActiveRequest<'model> {
     prompt_offset: usize,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
-    radix_attach: RadixAttach,
-    radix_published_tokens: usize,
     prompt_checkpoints: Vec<PromptCheckpoint>,
     pending_checkpoint_prefixes: VecDeque<usize>,
     next_position: i32,
@@ -188,12 +193,19 @@ pub struct LlamaCompletionBackend {
 
 impl LlamaCompletionBackend {
     /// Load a model and initialize its persistent context before returning.
+    #[tracing::instrument(
+        name = "icn.model.load",
+        skip_all,
+        fields(model.id = tracing::field::Empty),
+        err
+    )]
     pub fn load(
         model_id: impl Into<String>,
-        config: ResolvedExecutionPlan,
+        config: ExecutionIntent,
     ) -> Result<Self, InferenceError> {
         validate_model_config(&config)?;
         let model_id = model_id.into();
+        tracing::Span::current().record("model.id", model_id.as_str());
         let (commands, command_receiver) = sync_channel(COMMAND_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = sync_channel(1);
         let executor = thread::Builder::new()
@@ -230,8 +242,11 @@ impl LlamaCompletionBackend {
         F: FnOnce(&LlamaBackend) -> T + Send + 'static,
     {
         let (response, receiver) = sync_channel(1);
+        let span = tracing::Span::current();
         let task = Box::new(move |backend: &LlamaBackend| {
-            let _ = response.send(operation(backend));
+            span.in_scope(|| {
+                let _ = response.send(operation(backend));
+            });
         });
         self.commands
             .try_send(ExecutorCommand::RunExclusiveNative { task })
@@ -241,17 +256,6 @@ impl LlamaCompletionBackend {
             })?;
         receiver.recv().map_err(|_| InferenceError::ExecutorStopped)
     }
-}
-
-/// Resolve platform-dependent worker-pool defaults once, before hardware
-/// assessment and loading consume the plan.
-pub fn resolve_execution_plan(
-    mut plan: ResolvedExecutionPlan,
-) -> Result<ResolvedExecutionPlan, InferenceError> {
-    let (threads, threads_batch) = resolved_thread_counts_with_defaults(&plan.execution)?;
-    plan.execution.threads = NonZeroU32::new(threads.get().cast_unsigned());
-    plan.execution.threads_batch = NonZeroU32::new(threads_batch.get().cast_unsigned());
-    Ok(plan)
 }
 
 impl CompletionBackend for LlamaCompletionBackend {
@@ -269,7 +273,11 @@ impl CompletionBackend for LlamaCompletionBackend {
     ) -> Result<PreparedChatInfo, InferenceError> {
         let (response, receiver) = sync_channel(1);
         self.commands
-            .try_send(ExecutorCommand::ApplyTemplate { request, response })
+            .try_send(ExecutorCommand::ApplyTemplate {
+                request,
+                response,
+                span: tracing::Span::current(),
+            })
             .map_err(|error| match error {
                 TrySendError::Full(_) => InferenceError::Overloaded,
                 TrySendError::Disconnected(_) => InferenceError::ExecutorStopped,
@@ -279,6 +287,12 @@ impl CompletionBackend for LlamaCompletionBackend {
             .map_err(|_| InferenceError::ExecutorStopped)?
     }
 
+    #[tracing::instrument(
+        name = "icn.inference.complete",
+        skip_all,
+        fields(model.id = %self.model_id),
+        err
+    )]
     fn complete(
         &self,
         request: ChatRequest,
@@ -291,6 +305,7 @@ impl CompletionBackend for LlamaCompletionBackend {
             events,
             cancelled: Arc::clone(&cancelled),
             queued_at: Instant::now(),
+            span: tracing::Span::current(),
         }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Err(InferenceError::Overloaded),
@@ -325,7 +340,7 @@ impl Drop for LlamaCompletionBackend {
 }
 
 fn executor_main(
-    config: ResolvedExecutionPlan,
+    requested: ExecutionIntent,
     commands: Receiver<ExecutorCommand>,
     ready: SyncSender<Result<ModelProperties, InferenceError>>,
 ) {
@@ -336,39 +351,49 @@ fn executor_main(
             return;
         }
     };
-    let (threads, threads_batch) = match resolved_thread_counts(&config.execution) {
-        Ok(counts) => counts,
+    let planned = match icn_hardware::plan_load_with_backend(
+        &backend,
+        &requested,
+        icn_hardware::CapacityPolicy::default(),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = ready.send(Err(backend_error(error)));
+            return;
+        }
+    };
+    let config = planned.assessed.plan;
+    let native_mtp = planned.native_mtp.map(|plan| plan.into_parts());
+    let (model_path, model_params, context_params, threads, threads_batch) =
+        planned.native.into_parts();
+    let threads = match nonzero_i32(threads, "threads") {
+        Ok(value) => value,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
-    let context_params = native_context_params(&config, threads, threads_batch);
-    let model_params = match native_model_params(&config.execution) {
-        Ok(params) => params,
+    let threads_batch = match nonzero_i32(threads_batch, "threads_batch") {
+        Ok(value) => value,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
-    let model_params = std::pin::pin!(model_params);
     let resolved_execution = resolved_execution_config(
         &config.execution,
         model_params.as_ref().get_ref(),
         threads,
         threads_batch,
     );
-    let model = match LlamaModel::load_from_file(
-        &backend,
-        &config.model_path,
-        model_params.as_ref().get_ref(),
-    ) {
-        Ok(model) => model,
-        Err(error) => {
-            let _ = ready.send(Err(backend_error(error)));
-            return;
-        }
-    };
+    let model =
+        match LlamaModel::load_from_file(&backend, &model_path, model_params.as_ref().get_ref()) {
+            Ok(model) => model,
+            Err(error) => {
+                let _ = ready.send(Err(backend_error(error)));
+                return;
+            }
+        };
     let chat_templates = match CommonChatTemplates::from_model(&model) {
         Ok(templates) => templates,
         Err(error) => {
@@ -384,13 +409,19 @@ fn executor_main(
         }
     };
     let mut context = Some(context);
-    let draft_model = match &config.mtp {
-        icn_contracts::MtpConfig::Enabled {
-            source: icn_contracts::MtpSource::Separate { model_path },
-            ..
-        } => {
-            match LlamaModel::load_from_file(&backend, model_path, model_params.as_ref().get_ref())
-            {
+    let draft_model = match (&config.mtp, native_mtp.as_ref()) {
+        (
+            icn_contracts::MtpConfig::Enabled {
+                source: icn_contracts::MtpSource::Separate { model_path },
+                ..
+            },
+            Some((_, draft_model_params, _, _, _)),
+        ) => {
+            match LlamaModel::load_from_file(
+                &backend,
+                model_path,
+                draft_model_params.as_ref().get_ref(),
+            ) {
                 Ok(model) => Some(model),
                 Err(error) => {
                     let _ = ready.send(Err(backend_error(error)));
@@ -398,37 +429,29 @@ fn executor_main(
                 }
             }
         }
-        _ => None,
-    };
-    if let icn_contracts::MtpConfig::Enabled { source, .. } = &config.mtp {
-        let inspected = draft_model.as_ref().unwrap_or(&model).mtp_info();
-        let expected = match source {
-            icn_contracts::MtpSource::Bundled => llama_cpp_2::mtp::MtpModelKind::Bundled,
-            icn_contracts::MtpSource::Separate { .. } => llama_cpp_2::mtp::MtpModelKind::Draft,
-        };
-        if inspected.map(|info| info.kind) != Some(expected) {
-            let _ = ready.send(Err(InferenceError::InvalidConfig(format!(
-                "loaded MTP artifact role changed after preflight: expected {expected:?}, got {inspected:?}"
-            ))));
+        (icn_contracts::MtpConfig::Enabled { .. }, None) => {
+            let _ = ready.send(Err(InferenceError::InvalidConfig(
+                "native planner omitted the enabled MTP plan".to_owned(),
+            )));
             return;
         }
-    }
+        _ => None,
+    };
     let mut mtp = match &config.mtp {
         icn_contracts::MtpConfig::Disabled { .. } => None,
         icn_contracts::MtpConfig::Enabled {
             n_max,
             n_min,
             p_min,
-            cache_type_k,
-            cache_type_v,
             ..
         } => {
-            let draft_context_params = native_context_params(&config, threads, threads_batch)
-                .with_context_type(LlamaContextType::Mtp)
-                .with_type_k(native_cache_type(*cache_type_k))
-                .with_type_v(native_cache_type(*cache_type_v))
-                .with_n_rs_seq(0)
-                .with_n_outputs_max(NonZeroU32::new(config.max_sequences));
+            let Some((_, _, draft_context_params, _, _)) = native_mtp.as_ref() else {
+                let _ = ready.send(Err(InferenceError::InvalidConfig(
+                    "native planner omitted the enabled MTP context".to_owned(),
+                )));
+                return;
+            };
+            let draft_context_params = draft_context_params.clone();
             let draft_model = draft_model.as_ref().unwrap_or(&model);
             match MtpSession::new_linked(
                 context.take().expect("target context is constructed once"),
@@ -588,199 +611,10 @@ fn executor_main(
     }
 }
 
-fn resolved_thread_counts(
-    execution: &ExecutionConfig,
-) -> Result<(NonZeroI32, NonZeroI32), InferenceError> {
-    let main = execution.threads.ok_or_else(|| {
-        InferenceError::InvalidConfig("execution plan is missing resolved threads".to_owned())
-    })?;
-    let batch = execution.threads_batch.ok_or_else(|| {
-        InferenceError::InvalidConfig("execution plan is missing resolved threads_batch".to_owned())
-    })?;
-    Ok((
-        nonzero_i32(main, "threads")?,
-        nonzero_i32(batch, "threads_batch")?,
-    ))
-}
-
-fn resolved_thread_counts_with_defaults(
-    execution: &ExecutionConfig,
-) -> Result<(NonZeroI32, NonZeroI32), InferenceError> {
-    let main = execution.threads.map_or_else(
-        || Ok(available_math_threads()),
-        |value| nonzero_i32(value, "threads"),
-    )?;
-    let batch = execution
-        .threads_batch
-        .map_or(Ok(main), |value| nonzero_i32(value, "threads_batch"))?;
-    Ok((main, batch))
-}
-
-fn available_math_threads() -> NonZeroI32 {
-    let logical = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
-    let selected =
-        platform_physical_core_count().unwrap_or_else(|| fallback_math_thread_count(logical));
-    let selected = selected.clamp(1, i32::MAX as usize) as i32;
-    NonZeroI32::new(selected).expect("the resolved math-thread count is always positive")
-}
-
-/// Mirrors llama.cpp common's portable fallback while respecting the logical CPUs Rust reports as
-/// available to this process. A failed logical-CPU query uses llama.cpp's four-thread fallback.
-fn fallback_math_thread_count(logical: usize) -> usize {
-    match logical {
-        0 => 4,
-        1..=4 => logical,
-        _ => logical / 2,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn platform_physical_core_count() -> Option<usize> {
-    macos_physical_core_count_with(macos_positive_i32_sysctl)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_physical_core_count_with(
-    mut read_sysctl: impl FnMut(&std::ffi::CStr) -> Option<usize>,
-) -> Option<usize> {
-    read_sysctl(c"hw.perflevel0.physicalcpu").or_else(|| read_sysctl(c"hw.physicalcpu"))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_positive_i32_sysctl(name: &std::ffi::CStr) -> Option<usize> {
-    let mut value: i32 = 0;
-    let mut length = std::mem::size_of_val(&value);
-    // SAFETY: `name` is NUL terminated; `value` and `length` point to writable objects of the
-    // advertised size; and both the replacement pointer and replacement length are null/zero for
-    // this read-only query.
-    let status = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            (&raw mut value).cast(),
-            &raw mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (status == 0 && value > 0).then_some(value as usize)
-}
-
-#[cfg(target_os = "linux")]
-fn platform_physical_core_count() -> Option<usize> {
-    linux_physical_core_count_with(|cpu| {
-        std::fs::read_to_string(format!(
-            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings"
-        ))
-        .ok()
-    })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn platform_physical_core_count() -> Option<usize> {
-    None
-}
-
-/// Count the unique Linux thread-sibling masks, stopping at the first unavailable CPU exactly as
-/// pinned llama.cpp common does. On hybrid x86 Linux, upstream may instead temporarily change the
-/// caller's CPU affinity and probe each core with CPUID. ICN deliberately does not reproduce that
-/// potentially disruptive native behavior, so this safe path returns the ordinary physical-core
-/// count.
-#[cfg(any(target_os = "linux", test))]
-fn linux_physical_core_count_with(
-    mut read_siblings: impl FnMut(u32) -> Option<String>,
-) -> Option<usize> {
-    let mut sibling_sets = std::collections::HashSet::new();
-    for cpu in 0..u32::MAX {
-        let Some(contents) = read_siblings(cpu) else {
-            break;
-        };
-        if let Some(first_line) = contents.split_terminator('\n').next() {
-            sibling_sets.insert(first_line.to_owned());
-        }
-    }
-    (!sibling_sets.is_empty()).then_some(sibling_sets.len())
-}
-
 fn nonzero_i32(value: NonZeroU32, field: &str) -> Result<NonZeroI32, InferenceError> {
     let value = i32::try_from(value.get())
         .map_err(|_| InferenceError::InvalidConfig(format!("{field} must not exceed i32::MAX")))?;
     Ok(NonZeroI32::new(value).expect("a converted NonZeroU32 remains non-zero"))
-}
-
-fn native_model_params(execution: &ExecutionConfig) -> Result<LlamaModelParams, InferenceError> {
-    let params = LlamaModelParams::default()
-        .with_gpu_layers(match execution.gpu_layers {
-            GpuLayers::Auto => LlamaGpuLayers::Auto,
-            GpuLayers::All => LlamaGpuLayers::All,
-            GpuLayers::Count(value) => LlamaGpuLayers::Count(value),
-        })
-        .with_use_mmap(execution.use_mmap)
-        .with_use_mlock(execution.use_mlock)
-        .with_split_mode(match execution.split_mode {
-            SplitMode::None => LlamaSplitMode::None,
-            SplitMode::Layer => LlamaSplitMode::Layer,
-            SplitMode::Row => LlamaSplitMode::Row,
-            SplitMode::Tensor => LlamaSplitMode::Tensor,
-        });
-    match &execution.tensor_split {
-        Some(weights) => params.with_tensor_split(weights).map_err(backend_error),
-        None => Ok(params),
-    }
-}
-
-fn native_context_params(
-    config: &ResolvedExecutionPlan,
-    threads: NonZeroI32,
-    threads_batch: NonZeroI32,
-) -> LlamaContextParams {
-    let execution = &config.execution;
-    let mut params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(config.context_size))
-        .with_n_batch(config.batch_size)
-        .with_n_ubatch(config.ubatch_size)
-        .with_n_seq_max(config.max_sequences)
-        // Match llama-server's server_n_outputs_max(): ordinary generation emits at most one
-        // logit row per sequence. Leaving this at zero makes llama.cpp reserve n_batch rows,
-        // which is dramatically more output work for large vocabularies.
-        .with_n_outputs_max(NonZeroU32::new(config.max_sequences.min(config.batch_size)))
-        .with_n_threads(threads.get())
-        .with_n_threads_batch(threads_batch.get())
-        .with_type_k(native_cache_type(execution.cache_type_k))
-        .with_type_v(native_cache_type(execution.cache_type_v))
-        .with_offload_kqv(execution.offload_kqv)
-        .with_op_offload(execution.operation_offload)
-        .with_swa_full(execution.swa_full)
-        .with_kv_unified(execution.kv_unified)
-        .with_flash_attention(match execution.flash_attention {
-            FlashAttention::Auto => FlashAttentionPolicy::Auto,
-            FlashAttention::Disabled => FlashAttentionPolicy::Disabled,
-            FlashAttention::Enabled => FlashAttentionPolicy::Enabled,
-        });
-    if let icn_contracts::MtpConfig::Enabled { n_max, .. } = config.mtp {
-        // Recurrent architectures cannot remove an arbitrary speculative suffix from their
-        // state. llama.cpp keeps one rollback snapshot per possible draft token instead.
-        params = params.with_n_rs_seq(n_max);
-        let outputs = config
-            .max_sequences
-            .saturating_mul(n_max.saturating_add(1))
-            .min(config.batch_size);
-        params = params.with_n_outputs_max(NonZeroU32::new(outputs));
-    }
-    params
-}
-
-fn native_cache_type(cache_type: CacheType) -> KvCacheType {
-    match cache_type {
-        CacheType::F32 => KvCacheType::F32,
-        CacheType::F16 => KvCacheType::F16,
-        CacheType::Bf16 => KvCacheType::BF16,
-        CacheType::Q8_0 => KvCacheType::Q8_0,
-        CacheType::Q4_0 => KvCacheType::Q4_0,
-        CacheType::Q4_1 => KvCacheType::Q4_1,
-        CacheType::Iq4Nl => KvCacheType::IQ4_NL,
-        CacheType::Q5_0 => KvCacheType::Q5_0,
-        CacheType::Q5_1 => KvCacheType::Q5_1,
-    }
 }
 
 fn resolved_execution_config(
@@ -809,7 +643,7 @@ fn trimmed_tensor_split(weights: &[f32]) -> Option<Vec<f32>> {
 #[allow(clippy::too_many_arguments)]
 fn run_initialized_executor<'model>(
     backend: &LlamaBackend,
-    config: &ResolvedExecutionPlan,
+    config: &ExecutionIntent,
     resolved_execution: ExecutionConfig,
     model: &'model LlamaModel,
     chat_templates: &CommonChatTemplates,
@@ -862,7 +696,7 @@ fn run_initialized_executor<'model>(
 #[allow(clippy::too_many_arguments)]
 fn run_scheduler<'model>(
     backend: &LlamaBackend,
-    config: &ResolvedExecutionPlan,
+    config: &ExecutionIntent,
     model: &'model LlamaModel,
     chat_templates: &CommonChatTemplates,
     context: &mut LlamaContext<'model>,
@@ -872,13 +706,6 @@ fn run_scheduler<'model>(
     commands: &Receiver<ExecutorCommand>,
 ) {
     let mut sequence_pool = SequencePool::new(config.max_sequences);
-    if config.radix_cache.enabled
-        && mtp.is_none()
-        && draft_context.is_none()
-        && context.kv_pages_supported()
-    {
-        sequence_pool.enable_radix(&config.radix_cache);
-    }
     let mut planner = BatchPlanner::new(config.prefill_quantum as usize);
     let mut decode_buffer = LlamaBatch::new(context.n_batch() as usize, 1);
     let mut queued = VecDeque::<QueuedCompletion>::new();
@@ -982,7 +809,6 @@ fn run_scheduler<'model>(
                 draft_context.as_deref_mut(),
                 mtp.as_deref_mut(),
                 multimodal,
-                &mut sequence_pool,
                 &mut planner,
                 &mut decode_buffer,
                 &mut active,
@@ -1087,7 +913,10 @@ fn handle_command(
             events,
             cancelled,
             queued_at,
+            span,
         } => {
+            let entered_span = span.clone();
+            let _entered = entered_span.enter();
             if *shutting_down {
                 let _ = events.try_send(ExecutorItem::Failed(InferenceError::ExecutorStopped));
             } else if queued.len() + active_count >= max_tracked {
@@ -1098,10 +927,16 @@ fn handle_command(
                     events,
                     cancelled,
                     queued_at,
+                    span,
                 });
             }
         }
-        ExecutorCommand::ApplyTemplate { request, response } => {
+        ExecutorCommand::ApplyTemplate {
+            request,
+            response,
+            span,
+        } => {
+            let _entered = span.enter();
             let result = if *shutting_down {
                 Err(InferenceError::ExecutorStopped)
             } else {
@@ -1132,80 +967,20 @@ fn admit_requests<'model>(
     active: &mut Vec<ActiveRequest<'model>>,
 ) {
     while !queued.is_empty() {
-        let radix_prompt = sequence_pool
-            .radix_enabled()
-            .then(|| {
-                queued.front().and_then(|queued| {
-                    request_images(&queued.request.template)
-                        .is_empty()
-                        .then(|| {
-                            prepare_chat(
-                                chat_templates,
-                                &queued.request.template,
-                                multimodal.map(multimodal_marker),
-                            )
-                            .and_then(|prepared| plain_prompt(model, &prepared))
-                            .map(|prompt| prompt.text_tokens)
-                            .ok()
-                        })
-                        .flatten()
+        let matching_prompt = queued.front().and_then(|queued| {
+            (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
+                .then(|| {
+                    prepare_chat(
+                        chat_templates,
+                        &queued.request.template,
+                        multimodal.map(multimodal_marker),
+                    )
+                    .and_then(|prepared| plain_prompt(model, &prepared))
+                    .map(|prompt| prompt.text_tokens)
+                    .ok()
                 })
-            })
-            .flatten();
-        let matching_prompt = (!sequence_pool.radix_enabled())
-            .then(|| queued.front())
-            .flatten()
-            .and_then(|queued| {
-                (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
-                    .then(|| {
-                        prepare_chat(
-                            chat_templates,
-                            &queued.request.template,
-                            multimodal.map(multimodal_marker),
-                        )
-                        .and_then(|prepared| plain_prompt(model, &prepared))
-                        .map(|prompt| prompt.text_tokens)
-                        .ok()
-                    })
-                    .flatten()
-            });
-        if let Some(prompt) = radix_prompt.as_deref() {
-            let context_capacity = context.n_ctx_seq() as usize;
-            if let Err(error) = validate_prompt_capacity(prompt.len(), context_capacity) {
-                let queued_request = queued
-                    .pop_front()
-                    .expect("radix prompt came from the front of the queue");
-                let error = if queued_request.cancelled.load(Ordering::Acquire) {
-                    InferenceError::Cancelled
-                } else {
-                    error
-                };
-                let _ = queued_request.events.try_send(ExecutorItem::Failed(error));
-                continue;
-            }
-            let (cached, device_cached) = sequence_pool.cached_radix_prefix(&prompt);
-            let materializing_shared_prefix = active.iter().any(|request| {
-                common_token_prefix(&request.prompt, &prompt) >= RADIX_FANOUT_MIN_TOKENS
-                    && common_token_prefix(&request.prompt, &prompt) > cached
-            });
-            if materializing_shared_prefix {
-                break;
-            }
-            // Account for prompt cells promised to already-admitted requests but not yet decoded.
-            // The unified pool cannot overcommit these the way independent per-sequence streams
-            // can. Cold radix leaves are evicted first; if active paths still consume the budget,
-            // keep this request queued instead of admitting a batch that native decode must fail.
-            let reserved = active
-                .iter()
-                .map(|request| request.prompt.len().saturating_sub(request.prompt_offset))
-                .sum::<usize>();
-            // Lower-tier pages avoid model evaluation but still require native cells when
-            // promoted. Reserve those cells just like uncached prompt tokens.
-            let required = reserved.saturating_add(prompt.len().saturating_sub(device_cached));
-            if !sequence_pool.ensure_free_radix_cells(context, required) {
-                break;
-            }
-        }
+                .flatten()
+        });
         let sequence_id = match matching_prompt.as_deref() {
             Some(prompt) => sequence_pool.acquire_matching(prompt),
             None => sequence_pool.acquire(),
@@ -1223,9 +998,7 @@ fn admit_requests<'model>(
             sequence_pool.release(sequence_id);
             continue;
         }
-        let cached = (!sequence_pool.radix_enabled())
-            .then(|| sequence_pool.take_cache(sequence_id))
-            .flatten();
+        let cached = sequence_pool.take_cache(sequence_id);
         match ActiveRequest::admit(
             model,
             chat_templates,
@@ -1238,30 +1011,6 @@ fn admit_requests<'model>(
             cached.as_ref(),
         ) {
             Ok(mut request) => {
-                if sequence_pool.radix_enabled() {
-                    match sequence_pool.attach_radix_prefix(context, sequence_id, &request.prompt) {
-                        Ok(attached) => {
-                            request.prompt_offset = attached.cached_tokens;
-                            request.cached_prompt_tokens = attached.cached_tokens;
-                            request.radix_attach = attached;
-                            request.prompt_checkpoints.clear();
-                            request.pending_checkpoint_prefixes.clear();
-                            active.push(request);
-                        }
-                        Err(error) => {
-                            let _ = request
-                                .events
-                                .try_send(ExecutorItem::Failed(backend_error(error)));
-                            if clear_sequence(context, mtp.as_deref_mut(), sequence_id).is_ok() {
-                                sequence_pool.retain_radix_prefix(context, sequence_id, &[], 0);
-                                sequence_pool.release(sequence_id);
-                            } else {
-                                sequence_pool.quarantine(sequence_id);
-                            }
-                        }
-                    }
-                    continue;
-                }
                 let requested_start = request.prompt_offset;
                 let partial = clear_sequence_range(
                     context,
@@ -1334,24 +1083,12 @@ fn sample_ready_requests<'model>(
         let RequestPhase::ReadyToSample { batch_index } = request.phase else {
             continue;
         };
+        let current_span = request.span.clone();
+        let _entered = current_span.enter();
         if request.cancelled.load(Ordering::Acquire) {
             cancel_request(request);
             release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
             continue;
-        }
-        if request.cacheable
-            && sequence_pool.radix_enabled()
-            && request.radix_published_tokens < request.prompt_offset
-        {
-            let sequence_id = request.sequence_id.expect("ready request owns a sequence");
-            if sequence_pool.publish_active_radix_prefix(
-                context,
-                sequence_id,
-                &request.cache_history,
-                request.prompt_offset,
-            ) {
-                request.radix_published_tokens = request.prompt_offset;
-            }
         }
         if !request.mtp_started
             && request.multimodal_prompt.is_none()
@@ -1388,7 +1125,6 @@ fn decode_batch<'model>(
     mut draft_context: Option<&mut LlamaContext<'model>>,
     mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
-    sequence_pool: &mut SequencePool,
     planner: &mut BatchPlanner,
     batch: &mut LlamaBatch<'_>,
     active: &mut [ActiveRequest<'model>],
@@ -1539,20 +1275,6 @@ fn decode_batch<'model>(
     if plan.is_empty() {
         return Ok(false);
     }
-    let required_cells = plan
-        .iter()
-        .map(|work| match work {
-            BatchWork::Decode { .. } => 1,
-            BatchWork::Prefill { tokens, .. } => *tokens,
-        })
-        .sum::<usize>()
-        .saturating_add(draft_extra_tokens);
-    if !sequence_pool.ensure_free_radix_cells(context, required_cells) {
-        return Err(InferenceError::Backend(format!(
-            "radix KV cache could not free {required_cells} cells for the next batch"
-        )));
-    }
-
     batch.clear();
     let mut logits = Vec::<(i32, i32)>::new();
     let batch_started = Instant::now();
@@ -1899,29 +1621,6 @@ fn release_sequence(
     let Some(sequence_id) = request.sequence_id.take() else {
         return;
     };
-    if sequence_pool.radix_enabled() {
-        let resident_tokens = if matches!(request.phase, RequestPhase::Prefill) {
-            request.prompt_offset
-        } else {
-            request.cache_history.len()
-        };
-        sequence_pool.retain_radix_prefix(
-            context,
-            sequence_id,
-            &request.cache_history,
-            request.cacheable.then_some(resident_tokens).unwrap_or(0),
-        );
-        match clear_sequence(context, mtp, sequence_id) {
-            Ok(()) => sequence_pool.release(sequence_id),
-            Err(error) => {
-                sequence_pool.quarantine(sequence_id);
-                request.phase = RequestPhase::Terminal;
-                request.outbound.clear();
-                request.outbound.push_back(ExecutorItem::Failed(error));
-            }
-        }
-        return;
-    }
     if request.cache_prompt && request.cacheable {
         sequence_pool.release_cached(
             sequence_id,
@@ -2033,7 +1732,7 @@ fn clone_inference_error(error: &InferenceError) -> InferenceError {
     }
 }
 
-fn validate_model_config(config: &ResolvedExecutionPlan) -> Result<(), InferenceError> {
+fn validate_model_config(config: &ExecutionIntent) -> Result<(), InferenceError> {
     if !config.model_path.is_file() {
         return Err(InferenceError::InvalidConfig(format!(
             "GGUF model does not exist: {}",
@@ -2065,19 +1764,6 @@ fn validate_model_config(config: &ResolvedExecutionPlan) -> Result<(), Inference
             "context_size must provide at least one token per sequence".into(),
         ));
     }
-    if config.radix_cache.page_tokens.get() > config.context_size {
-        return Err(InferenceError::InvalidConfig(format!(
-            "radix cache page_tokens ({}) cannot exceed context_size ({})",
-            config.radix_cache.page_tokens, config.context_size
-        )));
-    }
-    if (config.radix_cache.host_bytes > 0 || config.radix_cache.disk_bytes > 0)
-        && (!config.radix_cache.enabled || !config.execution.kv_unified)
-    {
-        return Err(InferenceError::InvalidConfig(
-            "lower radix KV tiers require radix caching and unified KV (`--kv-unified`)".into(),
-        ));
-    }
     if config.prefill_quantum == 0 || config.prefill_quantum > config.batch_size {
         return Err(InferenceError::InvalidConfig(
             "prefill_quantum must be greater than zero and no larger than batch_size".into(),
@@ -2087,12 +1773,6 @@ fn validate_model_config(config: &ResolvedExecutionPlan) -> Result<(), Inference
         return Err(InferenceError::InvalidConfig(
             "an explicit GPU-layer count must not exceed i32::MAX; use 'all' for full offload"
                 .into(),
-        ));
-    }
-    if config.execution.gpu_layers == GpuLayers::Auto {
-        return Err(InferenceError::InvalidConfig(
-            "the engine requires a resolved GPU-layer plan; run icn-hardware assessment before loading"
-                .to_owned(),
         ));
     }
     if config.execution.split_mode == SplitMode::None && config.execution.tensor_split.is_some() {
@@ -2111,12 +1791,6 @@ fn validate_model_config(config: &ResolvedExecutionPlan) -> Result<(), Inference
     {
         return Err(InferenceError::InvalidConfig(
             "thread counts must not exceed i32::MAX".into(),
-        ));
-    }
-    if config.execution.threads.is_none() || config.execution.threads_batch.is_none() {
-        return Err(InferenceError::InvalidConfig(
-            "the engine requires resolved thread counts; call resolve_execution_plan first"
-                .to_owned(),
         ));
     }
     if config.execution.flash_attention == FlashAttention::Disabled
@@ -2142,7 +1816,7 @@ fn validate_model_config(config: &ResolvedExecutionPlan) -> Result<(), Inference
 
 #[cfg(not(feature = "mtmd"))]
 fn validate_projector_config(
-    _config: &ResolvedExecutionPlan,
+    _config: &ExecutionIntent,
     _projector: &ProjectorConfig,
 ) -> Result<(), InferenceError> {
     Err(InferenceError::InvalidConfig(
@@ -2153,7 +1827,7 @@ fn validate_projector_config(
 
 #[cfg(feature = "mtmd")]
 fn validate_projector_config(
-    config: &ResolvedExecutionPlan,
+    config: &ExecutionIntent,
     projector: &ProjectorConfig,
 ) -> Result<(), InferenceError> {
     if !projector.path.is_file() {
@@ -2226,7 +1900,7 @@ fn warm_up(
 }
 
 fn model_properties(
-    config: &ResolvedExecutionPlan,
+    config: &ExecutionIntent,
     resolved_execution: ExecutionConfig,
     model: &LlamaModel,
     context: &LlamaContext<'_>,
@@ -2326,7 +2000,7 @@ fn prepared_chat_info(
 }
 
 fn fingerprint(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
 
 fn request_images(request: &ChatTemplateRequest) -> Vec<ImageInput> {
@@ -2450,7 +2124,10 @@ impl<'model> ActiveRequest<'model> {
             events,
             cancelled,
             queued_at,
+            span,
         } = queued;
+        let entered_span = span.clone();
+        let _entered = entered_span.enter();
         let result = (|| {
             validate_request(&request)?;
             let admitted_at = Instant::now();
@@ -2522,6 +2199,7 @@ impl<'model> ActiveRequest<'model> {
             Ok(Self {
                 sequence_id: Some(sequence_id),
                 events: events.clone(),
+                span,
                 cancelled,
                 outbound: VecDeque::new(),
                 phase: RequestPhase::Prefill,
@@ -2530,8 +2208,6 @@ impl<'model> ActiveRequest<'model> {
                 prompt_offset: cached_prompt_tokens,
                 prompt_tokens,
                 cached_prompt_tokens,
-                radix_attach: RadixAttach::default(),
-                radix_published_tokens: cached_prompt_tokens,
                 prompt_checkpoints,
                 pending_checkpoint_prefixes: pending_checkpoint_prefixes.into(),
                 next_position: tokenized.next_position,
@@ -2704,10 +2380,6 @@ impl<'model> ActiveRequest<'model> {
                 decode_tokens_per_second: rate(self.generated_tokens, decode_ms),
                 sampler_ms: self.sampler.performance().sample_milliseconds,
                 parser_ms: self.semantic.parser_ms(),
-                cache_device_tokens: self.radix_attach.device_tokens,
-                cache_host_tokens: self.radix_attach.host_tokens,
-                cache_disk_tokens: self.radix_attach.disk_tokens,
-                cache_promotion_ms: self.radix_attach.promotion_ms,
                 draft_tokens: self.draft_tokens,
                 accepted_draft_tokens: self.accepted_draft_tokens,
                 draft_ms: self.draft_ms,
@@ -3381,10 +3053,10 @@ mod tests {
     }
 
     #[test]
-    fn model_default_omits_enable_thinking() {
+    fn model_default_uses_llama_cpp_thinking_default() {
         let templates = CommonChatTemplates::from_template(AUTHORED_DISABLED, None, None).unwrap();
         let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        assert!(!prepared.prompt().contains("<think>"));
+        assert!(prepared.prompt().contains("<think>"));
     }
 
     #[test]
@@ -3461,16 +3133,15 @@ mod tests {
         );
     }
 
-    fn model_config_with_projector(max_sequences: u32) -> ResolvedExecutionPlan {
+    fn model_config_with_projector(max_sequences: u32) -> ExecutionIntent {
         let executable = std::env::current_exe().unwrap();
-        ResolvedExecutionPlan {
+        ExecutionIntent {
             model_path: executable.clone(),
             context_size: 128,
             batch_size: 32,
             ubatch_size: 32,
             max_sequences,
             prefill_quantum: 16,
-            radix_cache: Default::default(),
             execution: ExecutionConfig {
                 gpu_layers: GpuLayers::Count(0),
                 threads: NonZeroU32::new(1),
@@ -3482,136 +3153,15 @@ mod tests {
         }
     }
 
-    fn model_config() -> ResolvedExecutionPlan {
+    fn model_config() -> ExecutionIntent {
         let mut config = model_config_with_projector(1);
         config.projector = None;
         config
     }
 
     #[test]
-    fn portable_math_thread_fallback_matches_llama_common_policy() {
-        assert_eq!(fallback_math_thread_count(0), 4);
-        assert_eq!(fallback_math_thread_count(1), 1);
-        assert_eq!(fallback_math_thread_count(2), 2);
-        assert_eq!(fallback_math_thread_count(4), 4);
-        assert_eq!(fallback_math_thread_count(5), 2);
-        assert_eq!(fallback_math_thread_count(8), 4);
-        assert_eq!(fallback_math_thread_count(17), 8);
-    }
-
-    #[test]
-    fn macos_physical_core_count_prefers_performance_cores() {
-        let mut requested = Vec::new();
-        let count = macos_physical_core_count_with(|name| {
-            requested.push(name.to_owned());
-            (name == c"hw.perflevel0.physicalcpu").then_some(12)
-        });
-        assert_eq!(count, Some(12));
-        assert_eq!(requested, [c"hw.perflevel0.physicalcpu".to_owned()]);
-    }
-
-    #[test]
-    fn macos_physical_core_count_falls_back_to_all_physical_cores() {
-        let mut requested = Vec::new();
-        let count = macos_physical_core_count_with(|name| {
-            requested.push(name.to_owned());
-            (name == c"hw.physicalcpu").then_some(8)
-        });
-        assert_eq!(count, Some(8));
-        assert_eq!(
-            requested,
-            [
-                c"hw.perflevel0.physicalcpu".to_owned(),
-                c"hw.physicalcpu".to_owned()
-            ]
-        );
-    }
-
-    #[test]
-    fn linux_physical_core_count_deduplicates_thread_sibling_masks() {
-        let files = [
-            "00000000,00000003\n",
-            "00000000,00000003\n",
-            "00000000,0000000c\n",
-            "00000000,0000000c\n",
-        ];
-        let count = linux_physical_core_count_with(|cpu| {
-            files.get(cpu as usize).map(|contents| (*contents).into())
-        });
-        assert_eq!(count, Some(2));
-    }
-
-    #[test]
-    fn linux_physical_core_count_stops_at_the_first_missing_cpu() {
-        let count = linux_physical_core_count_with(|cpu| match cpu {
-            0 => Some("00000003\n".into()),
-            2 => Some("0000000c\n".into()),
-            _ => None,
-        });
-        assert_eq!(count, Some(1));
-    }
-
-    #[test]
-    fn linux_physical_core_count_rejects_an_empty_topology() {
-        assert_eq!(linux_physical_core_count_with(|_| None), None);
-        assert_eq!(
-            linux_physical_core_count_with(|cpu| (cpu == 0).then(String::new)),
-            None
-        );
-    }
-
-    #[test]
-    fn native_execution_params_preserve_server_defaults_and_sentinels() {
-        let mut config = model_config();
-        config.execution = ExecutionConfig::default();
-        let threads = NonZeroI32::new(3).unwrap();
-        let threads_batch = NonZeroI32::new(5).unwrap();
-        let context = native_context_params(&config, threads, threads_batch);
-        assert_eq!(context.type_k(), KvCacheType::F16);
-        assert_eq!(context.type_v(), KvCacheType::F16);
-        assert!(context.offload_kqv());
-        assert!(context.op_offload());
-        assert!(!context.swa_full());
-        assert!(!context.kv_unified());
-        assert_eq!(context.n_threads(), 3);
-        assert_eq!(context.n_threads_batch(), 5);
-        assert_eq!(context.n_outputs_max(), NonZeroU32::new(1));
-
-        let mut parallel = model_config_with_projector(4);
-        parallel.projector = None;
-        let parallel_context = native_context_params(&parallel, threads, threads_batch);
-        assert_eq!(parallel_context.n_outputs_max(), NonZeroU32::new(4));
-        parallel.mtp = icn_contracts::MtpConfig::Enabled {
-            source: icn_contracts::MtpSource::Bundled,
-            n_max: 5,
-            n_min: 1,
-            p_min: 0.1,
-            cache_type_k: CacheType::F16,
-            cache_type_v: CacheType::F16,
-        };
-        let speculative_context = native_context_params(&parallel, threads, threads_batch);
-        assert_eq!(speculative_context.n_outputs_max(), NonZeroU32::new(24));
-
-        config.execution.gpu_layers = GpuLayers::All;
-        let all = native_model_params(&config.execution).unwrap();
-        assert_eq!(all.gpu_layers(), LlamaGpuLayers::All);
-        config.execution.gpu_layers = GpuLayers::Count(7);
-        let exact = native_model_params(&config.execution).unwrap();
-        assert_eq!(exact.gpu_layers(), LlamaGpuLayers::Count(7));
-    }
-
-    #[test]
     fn execution_validation_rejects_ambiguous_or_native_invalid_combinations() {
         let mut config = model_config();
-        config.execution.gpu_layers = GpuLayers::Auto;
-        config.execution.tensor_split = Some(vec![1.0]);
-        assert!(
-            validate_model_config(&config)
-                .unwrap_err()
-                .to_string()
-                .contains("requires a resolved GPU-layer plan")
-        );
-
         config.execution.gpu_layers = GpuLayers::All;
         config.execution.tensor_split = None;
         config.execution.cache_type_v = CacheType::Q4_0;

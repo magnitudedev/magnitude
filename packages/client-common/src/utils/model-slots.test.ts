@@ -17,7 +17,7 @@ import { selectedSlotModel } from "./model-slots"
 const defaultEffort = ReasoningEffortSchema.make("high")
 
 const model = (id: string): ModelSummary => ({
-  providerId: ProviderIdSchema.make("llamacpp"),
+  providerId: ProviderIdSchema.make("local"),
   providerModelId: ProviderModelIdSchema.make(id),
   displayName: id,
   contextWindow: 32_768,

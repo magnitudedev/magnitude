@@ -44,7 +44,7 @@ export class LocalInferenceError extends Schema.TaggedError<LocalInferenceError>
   "LocalInferenceError",
   {
     code: Schema.Literal(
-      "llama_cpp_missing",
+      "icn_unavailable",
       "unsupported_platform",
       "invalid_selection",
       "artifact_unavailable",
@@ -53,11 +53,9 @@ export class LocalInferenceError extends Schema.TaggedError<LocalInferenceError>
       "integrity_failed",
       "operation_conflict",
       "operation_not_found",
-      "artifact_not_owned",
       "artifact_active",
       "context_mismatch",
-      "server_start_failed",
-      "external_server_unavailable",
+      "runtime_start_failed",
       "configuration_failed",
       "runtime_probe_failed",
       "cancelled",

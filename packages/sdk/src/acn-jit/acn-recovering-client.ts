@@ -9,7 +9,6 @@ import {
   recoveringProtocolLayer as jitRecoveringProtocolLayer,
 } from "../jit-rpc"
 import type { AcnClient } from "../protocol"
-import { TracingLayer } from "../tracing"
 import { DaemonSpawnerTag, toJitDaemonProvider } from "./daemon-spawner"
 import type { DaemonError } from "./errors"
 import { acnResidentStreamPolicy, isEncodedHeartbeat } from "./acn-stream-policy"
@@ -65,7 +64,7 @@ export const makeRecoveringAcnClient = (
   RpcClient.make(MagnitudeRpcs).pipe(
     Effect.provide(
       recoveringProtocolLayer(options).pipe(
-        Layer.provide(Layer.mergeAll(FetchHttpClient.layer, TracingLayer)),
+        Layer.provide(FetchHttpClient.layer),
       ),
     ),
   )

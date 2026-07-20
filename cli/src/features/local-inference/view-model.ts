@@ -15,14 +15,17 @@ export const buildLocalInferenceSelections = (
   const choices = state.choices
     .filter((choice) => choice.availability._tag === "Available")
     .map((choice): LocalInferenceSelection => ({
-      kind: choice._tag === "RunningExternal" || choice._tag === "RunningManaged" ? "running" : "stored",
+      kind: choice._tag === "Running" ? "running" : "stored",
       id: choice.choiceId,
       choice,
     }))
   const choiceIds = new Set(choices.map((choice) => choice.id))
+  const recommendations = state.recommendationState._tag === "Ready"
+    ? state.recommendationState.recommendations
+    : []
   return [
     ...choices,
-    ...state.recommendations
+    ...recommendations
       .filter((recommendation) => !choiceIds.has(recommendation.configurationId))
       .map((recommendation): LocalInferenceSelection => ({
         kind: "recommendation",
@@ -149,10 +152,10 @@ export const selectionMetadata = (selection: LocalInferenceSelection): string =>
 export const selectionCapacityWarning = (selection: LocalInferenceSelection): string | null => {
   if (selection.kind === "recommendation") return null
   const fit = selection.choice.fitAssessment
-  if (fit._tag !== "Estimated" || fit.result !== "capacity_risk") return null
+  if (fit._tag !== "Assessed" || fit.result !== "does_not_fit") return null
   const constrained = fit.domains.filter(({ marginBytes }) => marginBytes < 0)
   const capacity = constrained.reduce((total, domain) => total + domain.stableCapacityBytes, 0)
   return capacity > 0
-    ? `Memory warning: estimated ${formatBytes(fit.estimatedTotalBytes)}; constrained hardware capacity ${formatBytes(capacity)}. Loading may fail or affect system performance.`
-    : `Memory warning: estimated ${formatBytes(fit.estimatedTotalBytes)} may exceed this machine's stable capacity.`
+    ? `Memory warning: estimated ${formatBytes(fit.requiredTotalBytes)}; constrained hardware capacity ${formatBytes(capacity)}. Loading may fail or affect system performance.`
+    : `Memory warning: estimated ${formatBytes(fit.requiredTotalBytes)} may exceed this machine's stable capacity.`
 }

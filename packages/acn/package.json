@@ -9,9 +9,7 @@
     "dev": "bun run ../version/scripts/generate-version.ts --dev && bun run src/binary.ts serve --register --debug",
     "dev:run": "bun run src/binary.ts serve --register --debug",
     "build:binary": "bun run scripts/build-binary.ts",
-    "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit",
-    "validate:local-model-catalog": "bun run scripts/validate-local-model-catalog.ts",
-    "validate:llamacpp-runtime": "bun run scripts/validate-llamacpp-runtime.ts"
+    "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit"
   },
   "dependencies": {
     "@effect/cli": "^0.75.2",
@@ -21,7 +19,7 @@
     "@effect/rpc": "0.75.1",
     "@magnitudedev/agent": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
-    "@magnitudedev/local-inference": "workspace:*",
+    "@magnitudedev/icn": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
 
     "@magnitudedev/protocol": "workspace:*",

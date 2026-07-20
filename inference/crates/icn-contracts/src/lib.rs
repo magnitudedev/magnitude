@@ -9,51 +9,29 @@ pub mod output;
 
 pub use inventory::*;
 
-/// Fully resolved model, component, context, and execution configuration.
+/// Serializable execution intent supplied to the native backend planner.
 ///
-/// Hardware assessment and the engine must consume this same value. Neither
-/// layer is permitted to apply independent execution defaults.
+/// This value deliberately contains policy and requested limits only. It is not an executable
+/// plan: native defaults, compatibility decisions, tensor placement, and final allocation
+/// parameters belong to a process-local backend plan and must never be reconstructed from this
+/// representation.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ResolvedExecutionPlan {
+pub struct ExecutionIntent {
     pub model_path: PathBuf,
     /// Total context capacity shared by all concurrently resident sequences.
     pub context_size: u32,
     pub batch_size: u32,
     pub ubatch_size: u32,
-    /// Maximum number of independently owned llama.cpp sequence IDs.
+    /// Maximum number of independently owned native sequence IDs.
     pub max_sequences: u32,
     /// Maximum prompt tokens allocated to one sequence in a round-robin pass.
     pub prefill_quantum: u32,
-    /// Automatic prefix-KV retention and lower-tier capacity. Device capacity remains the native
-    /// context allocation; these byte limits are strict additional maxima and allocate lazily.
-    pub radix_cache: RadixCacheConfig,
     /// Model loading, KV allocation, offload, and native worker-pool policy.
     pub execution: ExecutionConfig,
     /// Optional multimodal projector loaded into the same model executor.
     pub projector: Option<ProjectorConfig>,
-    /// Fully resolved speculative-decoding configuration.
+    /// Requested speculative-decoding configuration selected through native preflight.
     pub mtp: MtpConfig,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RadixCacheConfig {
-    pub enabled: bool,
-    pub page_tokens: NonZeroU32,
-    pub host_bytes: u64,
-    pub disk_bytes: u64,
-    pub disk_path: Option<PathBuf>,
-}
-
-impl Default for RadixCacheConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            page_tokens: NonZeroU32::new(16).expect("16 is non-zero"),
-            host_bytes: 0,
-            disk_bytes: 0,
-            disk_path: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -102,17 +80,17 @@ pub enum MtpRuntimeProperties {
     },
 }
 
-/// llama.cpp execution settings whose values affect loading or context allocation.
+/// Native execution settings whose values affect loading or context allocation.
 ///
-/// Defaults intentionally match the pinned `llama-server` configuration rather than bare
-/// `llama_context_default_params` where those differ (notably `swa_full`).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+/// Defaults intentionally match the pinned native service profile rather than bare context
+/// defaults where those differ (notably `swa_full`).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExecutionConfig {
     pub gpu_layers: GpuLayers,
     pub use_mmap: bool,
     pub use_mlock: bool,
     pub split_mode: SplitMode,
-    /// Explicit per-device proportions. `None` lets llama.cpp select placement.
+    /// Explicit per-device proportions. `None` lets the native backend select placement.
     pub tensor_split: Option<Vec<f32>>,
     pub cache_type_k: CacheType,
     pub cache_type_v: CacheType,
@@ -120,15 +98,7 @@ pub struct ExecutionConfig {
     pub operation_offload: bool,
     pub swa_full: bool,
     pub kv_unified: bool,
-    /// `None` selects ICN's safe mirror of pinned llama.cpp common's math-thread default.
-    ///
-    /// On macOS this prefers the performance-level physical-core count and then the total physical
-    /// core count. On ordinary Linux it counts unique `thread_siblings` masks. Other platforms (or
-    /// unavailable topology data) use all available logical CPUs up to four, otherwise half. The
-    /// pinned x86 Linux hybrid-CPU special case temporarily changes the calling thread's affinity
-    /// and uses CPUID to exclude efficiency cores. ICN cannot reproduce that exactly without this
-    /// potentially disruptive native behavior, so set this field explicitly when exact
-    /// hybrid-host parity is required.
+    /// `None` delegates selection to the pinned native backend.
     pub threads: Option<NonZeroU32>,
     /// `None` reuses the generation pool for prompt processing.
     pub threads_batch: Option<NonZeroU32>,
@@ -158,20 +128,20 @@ impl Default for ExecutionConfig {
 
 /// A requested execution configuration and the concrete native parameters selected at startup.
 ///
-/// `resolved` describes parameters passed to libllama, not measured physical tensor placement.
+/// `resolved` describes parameters passed to the native backend, not measured physical tensor placement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionConfigReport {
     pub requested: ExecutionConfig,
     pub resolved: ExecutionConfig,
 }
 
-/// llama.cpp GPU-layer selection semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// Native GPU-layer selection semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GpuLayers {
     /// Run pinned `common/fit` before loading and use its selected layer count and placement.
     Auto,
-    /// Ask libllama to offload every supported layer.
+    /// Ask the native backend to offload every supported layer.
     All,
     /// Offload at most the explicit number of layers.
     Count(u32),
@@ -194,8 +164,8 @@ impl std::str::FromStr for GpuLayers {
     }
 }
 
-/// Model distribution strategy accepted by the pinned llama.cpp server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// Model distribution strategy accepted by the pinned native backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitMode {
     None,
@@ -218,9 +188,9 @@ impl std::str::FromStr for SplitMode {
     }
 }
 
-/// KV-cache data types accepted by the pinned llama.cpp server CLI.
+/// KV-cache data types accepted by the pinned native backend.
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheType {
     F32,
@@ -280,7 +250,7 @@ impl ProjectorConfig {
 }
 
 /// Resource limits applied before native media preprocessing allocates decoded pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ImageInputLimits {
     pub max_images: NonZeroU32,
     /// Maximum compressed bytes accepted for one image after data-URL decoding.
@@ -305,7 +275,7 @@ impl Default for ImageInputLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlashAttention {
     Auto,
@@ -339,10 +309,6 @@ pub struct GenerationMetrics {
     pub decode_tokens_per_second: f64,
     pub sampler_ms: f64,
     pub parser_ms: f64,
-    pub cache_device_tokens: usize,
-    pub cache_host_tokens: usize,
-    pub cache_disk_tokens: usize,
-    pub cache_promotion_ms: f64,
     pub draft_tokens: usize,
     pub accepted_draft_tokens: usize,
     pub draft_ms: f64,
@@ -435,7 +401,7 @@ impl fmt::Debug for ImageInput {
 /// The encoded shape of a chat message's content.
 ///
 /// Keeping string content distinct from typed parts matters because Jinja templates can advertise
-/// support for one representation but not the other, and llama.cpp adapts them differently.
+/// support for one representation but not the other, and the native backend adapts them differently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatContent {
     Text(String),
@@ -578,7 +544,7 @@ pub enum GrammarTrigger {
     PatternFull(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TemplateCapabilities {
     pub string_content: bool,
     pub typed_content: bool,
@@ -635,7 +601,7 @@ pub struct ModelModalities {
 pub enum InferenceEvent {
     /// Begins the assistant stream for the first sampled-token result.
     ///
-    /// Keeping this in the sampled result group lets transports reproduce llama.cpp's timing
+    /// Keeping this in the sampled result group lets transports reproduce native timing
     /// placement when the first token produces no semantic parser delta.
     StreamStart,
     ContentDelta {
@@ -719,7 +685,7 @@ mod execution_config_tests {
     use super::*;
 
     #[test]
-    fn defaults_match_pinned_llama_server_execution_defaults() {
+    fn defaults_match_pinned_native_service_execution_defaults() {
         let config = ExecutionConfig::default();
         assert_eq!(config.gpu_layers, GpuLayers::Auto);
         assert!(config.use_mmap);

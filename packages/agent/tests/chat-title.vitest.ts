@@ -147,7 +147,7 @@ function makeTitleModel(title: string | null, options?: { failAfterOutput?: bool
     },
     modelSource: { slotId: 'primary' },
     modelId: 'local-primary',
-    providerId: 'llamacpp',
+    providerId: 'local',
     profile: {
       contextWindow: 128_000,
       maxOutputTokens: 4096,

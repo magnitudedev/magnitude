@@ -1,150 +1,52 @@
-import { describe, expect, test } from "vitest"
-import { Option, Schema } from "effect"
+import { describe, expect, it } from "vitest"
+import { Schema } from "effect"
 import {
-  ActiveLocalBindingSummary,
-  LocalInferenceErrorCode,
-  LocalInferenceHostProfile,
-  LocalInferenceLlamaCppState,
-  LocalModelChoice,
-  LocalInferenceServingProfile,
-  LocalInferenceState,
-  LocalInferenceSnapshotSchema,
-  LocalInferenceUsageSelection,
+  LocalInferenceRecommendationState,
+  LocalModelFitAssessmentSchema,
 } from "./local-inference"
 
-describe("local inference protocol schemas", () => {
-  const llamaCpp = {
-    minimumBuild: 8868,
-    recommendedBuild: 10011,
-    installations: [],
-    selectedInstallationId: Option.none<string>(),
-    activeManagedInstallationId: Option.none<string>(),
-    managedInstall: {
-      availability: { _tag: "Available" as const, build: 10011 },
-      operation: { _tag: "Idle" as const },
-    },
-    diagnostics: [],
-  }
-  test("keeps stable capacity distinct from point-in-time free memory", () => {
-    const decoded = Schema.decodeUnknownSync(LocalInferenceHostProfile)({
-      platform: "linux",
-      architecture: "x64",
-      systemMemoryBytes: 64 * 1024 ** 3,
-      cpuModel: "test cpu",
-      logicalCores: 12,
-      memoryDomains: [{
-        id: "gpu:0",
-        kind: "physical_device",
-        totalCapacityBytes: 24 * 1024 ** 3,
-        stableCapacityBytes: 24 * 1024 ** 3,
-        currentFreeBytes: 1,
-        sharesSystemMemory: false,
-        backendNames: ["CUDA"],
-        deviceNames: ["test gpu"],
-        splitGroupId: null,
+describe("LocalModelFitAssessmentSchema", () => {
+  it("preserves the authoritative ICN fit result and per-domain requirements", () => {
+    const assessment = Schema.decodeUnknownSync(LocalModelFitAssessmentSchema)({
+      _tag: "Assessed",
+      requiredTotalBytes: 24,
+      domains: [{
+        memoryDomainId: "unified",
+        requiredBytes: 24,
+        stableCapacityBytes: 20,
+        marginBytes: -4,
       }],
+      result: "does_not_fit",
     })
-    expect(decoded.memoryDomains[0]?.stableCapacityBytes).toBe(24 * 1024 ** 3)
-    expect(decoded.memoryDomains[0]?.currentFreeBytes).toBe(1)
+
+    expect(assessment).toEqual({
+      _tag: "Assessed",
+      requiredTotalBytes: 24,
+      domains: [{
+        memoryDomainId: "unified",
+        requiredBytes: 24,
+        stableCapacityBytes: 20,
+        marginBytes: -4,
+      }],
+      result: "does_not_fit",
+    })
   })
 
-  test("accepts only the supported usage choices", () => {
-    expect(Schema.decodeUnknownSync(LocalInferenceUsageSelection)({
-      sessionConcurrency: "up_to_three",
-    })).toEqual({
-      sessionConcurrency: "up_to_three",
-    })
-    expect(() => Schema.decodeUnknownSync(LocalInferenceUsageSelection)({
-      sessionConcurrency: "unlimited",
+  it("rejects non-ICN assessment variants", () => {
+    expect(() => Schema.decodeUnknownSync(LocalModelFitAssessmentSchema)({
+      _tag: "Unknown",
+      domains: [],
+      result: "unknown",
     })).toThrow()
   })
 
-  test("requires positive uniform serving-profile dimensions", () => {
-    const profile = {
-      sessionConcurrency: "up_to_three",
-      parallelSlots: 3,
-      contextTokensPerSlot: 100_000,
-      totalContextCapacityTokens: 300_000,
-      slotAllocation: "uniform",
-      runtimeProfileId: "profile",
-    }
-    expect(Schema.decodeUnknownSync(LocalInferenceServingProfile)(profile)).toEqual(profile)
-    expect(() => Schema.decodeUnknownSync(LocalInferenceServingProfile)({
-      ...profile,
-      parallelSlots: 0,
-    })).toThrow()
-  })
-
-  test("local inference state cannot contain onboarding state", () => {
-    const state = {
-      usage: null,
-      activeBinding: null,
-      llamaCpp,
-      host: { _tag: "Unavailable" as const, message: "llama.cpp missing" },
-      choices: [],
-      operations: [],
+  it("distinguishes recommendation loading from a completed empty result", () => {
+    expect(Schema.decodeUnknownSync(LocalInferenceRecommendationState)({
+      _tag: "Loading",
+    })).toEqual({ _tag: "Loading" })
+    expect(Schema.decodeUnknownSync(LocalInferenceRecommendationState)({
+      _tag: "Ready",
       recommendations: [],
-      warnings: [],
-    }
-    const encodedState = Schema.encodeSync(LocalInferenceState)(state)
-    expect(Schema.decodeUnknownSync(LocalInferenceState)(encodedState)).toEqual(state)
-
-    const snapshot = { revision: 3, state }
-    const encodedSnapshot = Schema.encodeSync(LocalInferenceSnapshotSchema)(snapshot)
-    expect(Schema.decodeUnknownSync(LocalInferenceSnapshotSchema)(encodedSnapshot)).toEqual(snapshot)
-  })
-
-  test("round-trips every tagged choice, binding, and llama.cpp state", () => {
-    const choiceFields = {
-      choiceId: "opaque-choice",
-      displayName: "Model",
-      providerModelId: "model",
-      contextTokens: 8192,
-      fitClass: "unknown",
-      availability: { _tag: "Available" },
-      fitAssessment: { _tag: "NotAssessed" },
-      explanation: "test",
-      residency: "loaded",
-    }
-    for (const _tag of ["RunningExternal", "RunningManaged", "StoredOwned", "StoredExternal"] as const) {
-      const choice = { _tag, ...choiceFields }
-      expect(Schema.decodeUnknownSync(LocalModelChoice)(choice)).toEqual(choice)
-    }
-
-    for (const binding of [
-      { _tag: "Managed", selectionId: "managed", providerModelId: "model", contextTokens: 8192 },
-      { _tag: "External", selectionId: "external", providerModelId: "model", contextTokens: 8192 },
-    ] as const) {
-      expect(Schema.decodeUnknownSync(ActiveLocalBindingSummary)(binding)).toEqual(binding)
-    }
-
-    const encoded = Schema.encodeSync(LocalInferenceLlamaCppState)(llamaCpp)
-    const transported = JSON.parse(JSON.stringify(encoded))
-    expect(transported).not.toHaveProperty("selectedInstallationId")
-    expect(transported).not.toHaveProperty("activeManagedInstallationId")
-    expect(Schema.decodeUnknownSync(LocalInferenceLlamaCppState)(transported)).toEqual(llamaCpp)
-  })
-
-  test("accepts every error code in the closed wire vocabulary", () => {
-    const codes = [
-      "llama_cpp_missing",
-      "unsupported_platform",
-      "invalid_selection",
-      "artifact_unavailable",
-      "license_required",
-      "insufficient_disk_space",
-      "integrity_failed",
-      "artifact_not_owned",
-      "artifact_active",
-      "context_mismatch",
-      "server_start_failed",
-      "external_server_unavailable",
-      "configuration_failed",
-      "runtime_probe_failed",
-      "cancelled",
-    ] as const
-    for (const code of codes) {
-      expect(Schema.decodeUnknownSync(LocalInferenceErrorCode)(code)).toBe(code)
-    }
+    })).toEqual({ _tag: "Ready", recommendations: [] })
   })
 })

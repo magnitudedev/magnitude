@@ -1,31 +1,35 @@
-import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Ref, Stream } from "effect"
+import { IcnApiClient, Generated } from "@magnitudedev/icn"
 import {
   LocalInferenceError,
-  type MirroredResourceInvalidation,
   type LocalInferenceHostProfile,
+  type LocalInferenceOperationSnapshot,
+  type LocalInferenceRecommendationState,
   type LocalInferenceSnapshot,
-  LocalInferenceState,
   type LocalInferenceUsageSelection,
   type LocalModelChoice,
+  type LocalModelFitAssessment,
+  type LocalModelRecommendation,
+  type MirroredResourceInvalidation,
 } from "@magnitudedev/protocol"
-import { Hardware, HuggingFace, LlamaCpp, ModelFiles } from "@magnitudedev/local-inference"
-import type { DurableLocalModelBinding } from "@magnitudedev/storage"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
-import { LOCAL_MODEL_CATALOG, catalogArtifactRequestFiles } from "./catalog"
-import { LocalModelConfiguration, type ModelConfigurationError } from "./model-configuration"
-import { LocalInferencePlatform } from "./platform"
-import { LocalModelProviderSource, type LlamaLogicalRoute } from "./provider-source"
-import { acceleratorCapacityBudget, systemCapacityBudget } from "./recommendations"
-import { recommendLocalModels, resolveConfiguration } from "./recommendations"
-import type { StableInferenceCapacity } from "./types"
 import { makeMirroredResource } from "../mirrored-resource"
+import { LOCAL_MODEL_CATALOG, catalogSourcePageUrl } from "./catalog"
+import type { LocalModelCatalogEntry } from "./types"
+import { LocalInferenceChanges } from "./gateway"
+import { LocalModelConfiguration } from "./model-configuration"
+
+const PREVIEW_REQUEST_CONCURRENCY = 12
+
+interface RecommendationResult {
+  readonly recommendations: readonly LocalModelRecommendation[]
+  readonly failureCount: number
+}
 
 export interface LocalInferenceApi {
   readonly state: Effect.Effect<LocalInferenceSnapshot, LocalInferenceError>
   readonly watchState: Stream.Stream<MirroredResourceInvalidation, LocalInferenceError>
   readonly configureUsage: (selection: LocalInferenceUsageSelection) => Effect.Effect<void, LocalInferenceError>
-  readonly installLlamaCpp: Effect.Effect<string, LocalInferenceError>
-  readonly refreshInstallations: Effect.Effect<void, LocalInferenceError>
   readonly downloadModel: (configurationId: string) => Effect.Effect<void, LocalInferenceError>
   readonly activateModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
   readonly deleteModel: (selectionId: string) => Effect.Effect<void, LocalInferenceError>
@@ -35,514 +39,471 @@ export interface LocalInferenceApi {
 
 export class LocalInference extends Context.Tag("LocalInference")<LocalInference, LocalInferenceApi>() {}
 
-const localError = (code: LocalInferenceError["code"], operation: string, message: string, retryable = false) =>
-  new LocalInferenceError({ code, operation, message, retryable })
-const fromConfiguration = (error: ModelConfigurationError) =>
-  localError("configuration_failed", error.operation, error.reason, true)
-const storedProviderModelId = (value: string) =>
-  Schema.is(ProviderModelIdSchema)(value) ? value : undefined
-const mapFailure = (operation: string, cause: unknown) => localError(
-  "configuration_failed",
-  operation,
-  cause instanceof Error ? cause.message : String(cause),
-  true,
-)
-
-interface NormalizedDeviceDomain {
-  readonly id: string
-  readonly backend: string
-  readonly capacityBytes: number
-  readonly freeBytes: number | null
-  readonly sharesSystemMemory: boolean
-  readonly deviceNames: readonly string[]
-  readonly splitGroupId: string | null
-}
-
-const backendFromDevice = (device: LlamaCpp.LlamaDevice): string => Option.getOrElse(
-  device.backend,
-  () => {
-    const prefix = String(device.id).match(/^[A-Za-z_]+/)?.[0]?.toLowerCase()
-    if (prefix === "mtl" || prefix === "metal") return "Metal"
-    if (prefix === "cuda") return "CUDA"
-    if (prefix === "vulkan" || prefix === "vk") return "Vulkan"
-    if (prefix === "rocm" || prefix === "hip") return "ROCm"
-    if (prefix === "sycl") return "SYCL"
-    return prefix ?? "unknown"
-  },
-)
-
-const normalizedDeviceDomains = (
-  host: Hardware.HostHardwareSnapshot,
-  devices: readonly LlamaCpp.LlamaDevice[],
-): readonly NormalizedDeviceDomain[] => {
-  const backendPreference = (backend: string): number => {
-    switch (backend.toLowerCase()) {
-      case "metal": return 5
-      case "cuda": return 4
-      case "rocm": return 3
-      case "vulkan": return 2
-      case "sycl": return 1
-      default: return 0
-    }
-  }
-  // One physical accelerator can be exposed by multiple loaded llama.cpp
-  // backends (most commonly CUDA and Vulkan). Prefer one backend per matching
-  // device description so its memory is never counted twice. Multiple devices
-  // with the same description inside that backend remain distinct.
-  const preferredBackendByName = new Map<string, string>()
-  for (const device of devices) {
-    const name = Option.getOrElse(device.name, () => "").trim().toLowerCase()
-    if (!name) continue
-    const backend = backendFromDevice(device)
-    const current = preferredBackendByName.get(name)
-    if (!current || backendPreference(backend) > backendPreference(current)) {
-      preferredBackendByName.set(name, backend)
-    }
-  }
-  const visibleDevices = devices.filter((device) => {
-    const name = Option.getOrElse(device.name, () => "").trim().toLowerCase()
-    return !name || preferredBackendByName.get(name) === backendFromDevice(device)
+const localError = (code: LocalInferenceError["code"], operation: string, cause: unknown, retryable = true) =>
+  new LocalInferenceError({
+    code,
+    operation,
+    message: cause instanceof Error ? cause.message : String(cause),
+    retryable,
   })
 
-  const candidates = visibleDevices.flatMap((device) => Option.match(device.totalMemoryBytes, {
-    onNone: () => [],
-    onSome: (capacityBytes) => {
-      if (capacityBytes <= 0) return []
-      const backend = backendFromDevice(device)
-      const type = Option.getOrElse(device.type, () => "").toLowerCase()
-      if (type === "cpu" || backend.toLowerCase() === "cpu" || String(device.id).toLowerCase() === "host") return []
-      const appleMetal = host.platform === "darwin"
-        && host.nativeArchitecture === "arm64"
-        && backend.toLowerCase() === "metal"
-      const sharesSystemMemory = appleMetal || type === "igpu" || type.includes("integrated")
-      const physicalId = Option.getOrElse(device.physicalId, () => `${backend}:${String(device.id)}`)
-      return [{
-        id: sharesSystemMemory ? `unified:${physicalId}` : `physical:${physicalId}`,
-        backend,
-        capacityBytes: sharesSystemMemory
-          ? Math.min(host.totalMemoryBytes, capacityBytes)
-          : capacityBytes,
-        freeBytes: Option.getOrNull(device.freeMemoryBytes),
-        sharesSystemMemory,
-        deviceNames: [Option.getOrElse(device.name, () => String(device.id))],
-        splitGroupId: null,
-      }]
-    },
-  }))
+const parallelSequences = (usage: LocalInferenceUsageSelection): number =>
+  usage.sessionConcurrency === "one" ? 1 : 3
 
-  const backendCounts = new Map<string, number>()
-  for (const candidate of candidates) {
-    if (candidate.sharesSystemMemory) continue
-    const key = candidate.backend.toLowerCase()
-    backendCounts.set(key, (backendCounts.get(key) ?? 0) + 1)
-  }
+const profileFor = (
+  entry: LocalModelCatalogEntry,
+  usage: LocalInferenceUsageSelection,
+  contextLength: number,
+  policy: string,
+) => ({
+  id: `${entry.id}:p${parallelSequences(usage)}:ctx${contextLength}`,
+  policy,
+  context_length: contextLength,
+  parallel_sequences: parallelSequences(usage),
+})
 
-  const domains = new Map<string, NormalizedDeviceDomain>()
-  for (const candidate of candidates) {
-    const existing = domains.get(candidate.id)
-    const splitGroupId = !candidate.sharesSystemMemory
-      && (backendCounts.get(candidate.backend.toLowerCase()) ?? 0) > 1
-      ? `llamacpp:${candidate.backend.toLowerCase()}`
-      : null
-    if (!existing) {
-      domains.set(candidate.id, { ...candidate, splitGroupId })
-      continue
-    }
-    domains.set(candidate.id, {
-      ...existing,
-      capacityBytes: Math.min(existing.capacityBytes, candidate.capacityBytes),
-      freeBytes: existing.freeBytes === null || candidate.freeBytes === null
-        ? existing.freeBytes ?? candidate.freeBytes
-        : Math.min(existing.freeBytes, candidate.freeBytes),
-      deviceNames: [...new Set([...existing.deviceNames, ...candidate.deviceNames])],
-      splitGroupId: existing.splitGroupId ?? splitGroupId,
-    })
+const sourceFor = (entry: LocalModelCatalogEntry): Generated.ModelPreviewSourceSchema => ({
+  repository: entry.repo,
+  revision: entry.revision,
+  primary_gguf: entry.primaryGguf,
+  additional_components: entry.additionalComponents,
+})
+
+const isStoredArtifactStatus = (status: Generated.ModelStatusSchema): boolean =>
+  status.type === "available"
+    || status.type === "loading"
+    || status.type === "loaded"
+    || status.type === "unloading"
+    || status.type === "load_failed"
+
+const fitAssessment = (assessment: Generated.HardwareAssessmentSchema): LocalModelFitAssessment => {
+  if (assessment.type !== "fits" && assessment.type !== "does_not_fit") {
+    return { _tag: "NotAssessed" }
   }
-  return [...domains.values()]
+  const memory = assessment.memory
+  return {
+    _tag: "Assessed",
+    requiredTotalBytes: memory.required_bytes,
+    domains: memory.domains.map((domain) => ({
+      memoryDomainId: domain.memory_domain,
+      requiredBytes: domain.required_bytes,
+      stableCapacityBytes: domain.available_bytes,
+      marginBytes: domain.margin_bytes,
+    })),
+    result: assessment.type === "fits" ? "fits" : "does_not_fit",
+  }
 }
 
-export const detectedInferenceCapacity = (
-  host: Hardware.HostHardwareSnapshot,
-  devices: readonly LlamaCpp.LlamaDevice[],
-): StableInferenceCapacity => ({
-  systemMemoryBytes: host.totalMemoryBytes,
-  acceleratorDomains: normalizedDeviceDomains(host, devices).map((domain) => ({
-    memoryDomainId: domain.id,
-    capacityBytes: domain.sharesSystemMemory
-      ? Math.min(systemCapacityBudget(host.totalMemoryBytes), acceleratorCapacityBudget(domain.capacityBytes))
-      : acceleratorCapacityBudget(domain.capacityBytes),
-    sharesSystemMemory: domain.sharesSystemMemory,
-    preferredBackend: domain.backend,
-    ...(domain.splitGroupId ? { modelSplitGroupId: domain.splitGroupId } : {}),
+const hostToWire = (hardware: Generated.HardwareSnapshotSchema): LocalInferenceHostProfile => ({
+  platform: hardware.platform,
+  architecture: hardware.architecture,
+  systemMemoryBytes: hardware.memory_domains.find((domain) => domain.kind === "system")?.total_capacity_bytes ?? 0,
+  cpuModel: Option.getOrNull(hardware.cpu_model),
+  logicalCores: Math.max(1, hardware.logical_cores),
+  memoryDomains: hardware.memory_domains.map((domain) => ({
+    id: domain.id,
+    kind: domain.kind,
+    totalCapacityBytes: domain.total_capacity_bytes,
+    stableCapacityBytes: domain.stable_capacity_bytes,
+    currentFreeBytes: Option.getOrNull(domain.current_free_bytes),
+    sharesSystemMemory: domain.shares_system_memory,
+    backendNames: [...new Set(domain.devices.map((device) => device.backend))],
+    deviceNames: domain.devices.map((device) => device.name),
+    splitGroupId: null,
   })),
 })
 
-export const hostToWire = (
-  host: Hardware.HostHardwareSnapshot,
-  devices: readonly LlamaCpp.LlamaDevice[],
-): LocalInferenceHostProfile => ({
-  platform: host.platform,
-  architecture: host.nativeArchitecture,
-  systemMemoryBytes: host.totalMemoryBytes,
-  cpuModel: Option.getOrNull(host.cpuModel),
-  logicalCores: host.logicalCores,
-  memoryDomains: [
-    {
-      id: "system",
-      kind: "system",
-      totalCapacityBytes: host.totalMemoryBytes,
-      stableCapacityBytes: systemCapacityBudget(host.totalMemoryBytes),
-      currentFreeBytes: host.availableMemoryBytes,
-      sharesSystemMemory: false,
-      backendNames: [],
-      deviceNames: [],
-      splitGroupId: null,
+const recommendationFrom = (
+  entry: LocalModelCatalogEntry,
+  preview: Generated.ModelPreviewSchema,
+  assessment: Generated.ModelPreviewAssessmentSchema,
+  badge: LocalModelRecommendation["badge"],
+): LocalModelRecommendation | null => {
+  if (assessment.assessment.type !== "fits") return null
+  const properties = preview.properties.type === "inspected" ? preview.properties : undefined
+  const profile = assessment.assessment.profile
+  const memory = assessment.assessment.memory
+  const totalDownloadBytes = preview.components.reduce((total, component) => total + component.size_bytes, 0)
+  const quantization = properties ? Option.getOrUndefined(properties.quantization) : undefined
+  const architectureName = properties ? Option.getOrUndefined(properties.architecture) : undefined
+  const trainingContext = properties ? Option.getOrUndefined(properties.training_context_length) : undefined
+  const totalParameters = properties ? Option.getOrNull(properties.parameter_count) : null
+  const activeParameters = properties ? Option.getOrNull(properties.active_parameter_count) : null
+  const selectedProfile = preview.assessments.find((candidate) => candidate.profile_id === assessment.profile_id)
+  if (!selectedProfile) return null
+  const contextTokens = Number(assessment.profile_id.match(/:ctx(\d+)$/)?.[1] ?? trainingContext ?? 1)
+  const parallelSlots = Number(assessment.profile_id.match(/:p(\d+):/)?.[1] ?? 1)
+  const fitClass = profile.acceleration.toLowerCase().includes("hybrid")
+    ? "hybrid" as const
+    : profile.acceleration.toLowerCase().includes("cpu")
+      ? "cpu_or_unified" as const
+      : "full_accelerator" as const
+  return {
+    configurationId: assessment.profile_id,
+    catalogModelId: entry.id,
+    badge,
+    displayName: entry.displayName,
+    family: entry.family,
+    architecture: architectureName?.toLowerCase().includes("moe") ? "moe" : "dense",
+    ...(totalParameters === null ? {} : { totalParametersBillions: totalParameters / 1_000_000_000 }),
+    ...(activeParameters === null ? {} : { activeParametersBillions: activeParameters / 1_000_000_000 }),
+    quantization: {
+      format: quantization ?? entry.quantTag,
+      quantAwareCheckpoint: entry.quantization.quantAwareCheckpoint,
+      fidelityLabel: entry.quantization.fidelityLabel,
+      fidelityEvidence: entry.quantization.fidelityEvidence,
+      fidelitySourceUrl: entry.quantization.fidelitySourceUrl,
     },
-    ...normalizedDeviceDomains(host, devices).map((domain) => ({
-      id: domain.id,
-      kind: domain.sharesSystemMemory ? "unified_working_set" as const : "physical_device" as const,
-      totalCapacityBytes: domain.capacityBytes,
-      stableCapacityBytes: domain.sharesSystemMemory
-        ? Math.min(systemCapacityBudget(host.totalMemoryBytes), acceleratorCapacityBudget(domain.capacityBytes))
-        : acceleratorCapacityBudget(domain.capacityBytes),
-      currentFreeBytes: domain.freeBytes,
-      sharesSystemMemory: domain.sharesSystemMemory,
-      backendNames: [domain.backend],
-      deviceNames: domain.deviceNames,
-      splitGroupId: domain.splitGroupId,
+    quantTag: quantization ?? entry.quantTag,
+    repo: preview.repository,
+    revision: preview.commit,
+    files: preview.components.map((component) => ({
+      path: component.path,
+      role: component.role,
+      sizeBytes: component.size_bytes,
+      sha256: component.content.type === "sha256" ? component.content.value : "",
     })),
-  ],
-})
+    totalDownloadBytes,
+    sourcePageUrl: catalogSourcePageUrl(entry),
+    license: entry.license,
+    contextTokens,
+    servingProfile: {
+      sessionConcurrency: parallelSlots === 1 ? "one" : "up_to_three",
+      parallelSlots,
+      contextTokensPerSlot: contextTokens,
+      totalContextCapacityTokens: contextTokens * parallelSlots,
+      slotAllocation: "uniform",
+      runtimeProfileId: assessment.profile_id,
+    },
+    modelMaximumContextTokens: trainingContext ?? contextTokens,
+    estimatedRuntimeBytes: memory.required_bytes,
+    stableCapacityBudgetBytes: memory.available_bytes,
+    fitMarginBytes: memory.headroom_bytes,
+    fitClass,
+    constrainedContext: assessment.assessment.recommendation === "constrained",
+    explanation: `${entry.quantization.fidelityLabel}; ${profile.acceleration} placement at ${Math.round(contextTokens / 1_000)}K context across ${parallelSlots} local slot${parallelSlots === 1 ? "" : "s"}.`,
+  }
+}
+
+const operationStage = (event: Generated.ModelDownloadEventSchema | Generated.RuntimeModelEvent): LocalInferenceOperationSnapshot["stage"] => {
+  if (event.type === "resolving") return "resolving"
+  if (event.type === "checking_space") return "checking_space"
+  if (event.type === "ready") return "ready"
+  if (event.type === "failed") return "verifying"
+  return event.stage === "publishing" ? "publishing"
+    : event.stage === "downloading" ? "downloading"
+    : event.stage === "assessing" ? "assessing"
+    : event.stage === "unloading" ? "unloading"
+    : event.stage === "loading" ? "loading"
+    : event.stage === "verifying" ? "verifying"
+    : "queued"
+}
 
 export const LocalInferenceLive: Layer.Layer<
   LocalInference,
   never,
-  LocalInferencePlatform | LocalModelProviderSource | LocalModelConfiguration
+  IcnApiClient | LocalInferenceChanges | LocalModelConfiguration
 > = Layer.scoped(LocalInference, Effect.gen(function* () {
-  const platform = yield* LocalInferencePlatform
-  const source = yield* LocalModelProviderSource
+  const client = yield* IcnApiClient
+  const changes = yield* LocalInferenceChanges
   const configuration = yield* LocalModelConfiguration
+  const operations = yield* Ref.make<ReadonlyMap<string, LocalInferenceOperationSnapshot>>(new Map())
+  const recommendationCache = yield* Ref.make<ReadonlyMap<string, RecommendationResult>>(new Map())
   const lock = yield* Effect.makeSemaphore(1)
-  const hostSnapshot = yield* platform.hardware.inspect.pipe(Effect.either)
-  const inspectDevices = platform.cli.pipe(
-    Effect.flatMap((cli) => cli.listDevices),
-    Effect.map((snapshot) => snapshot.devices),
-    Effect.catchAll((cause) => Effect.logWarning("Unable to inspect llama.cpp devices").pipe(
-      Effect.annotateLogs({ cause: String(cause) }),
-      Effect.as([] as readonly LlamaCpp.LlamaDevice[]),
-    )),
+  const recommendationRefreshLock = yield* Effect.makeSemaphore(1)
+
+  const setOperation = (snapshot: LocalInferenceOperationSnapshot) => Ref.update(
+    operations,
+    (current) => new Map(current).set(snapshot.operationId, snapshot),
+  ).pipe(Effect.zipRight(changes.publish))
+
+  const previews = (usage: LocalInferenceUsageSelection, hardware: Generated.HardwareSnapshotSchema) => Effect.forEach(
+    LOCAL_MODEL_CATALOG,
+    (entry) => {
+      const contexts = [200_000, 100_000, 64_000].filter((context) => entry.supportedContextTokens.includes(context))
+      return client.models.previewModel({
+        payload: {
+          source: sourceFor(entry),
+          profiles: contexts.map((context) => profileFor(entry, usage, context, hardware.assessment_policy)),
+        },
+      }).pipe(
+        Effect.map((preview) => ({ entry, preview })),
+        Effect.either,
+      )
+    },
+    { concurrency: PREVIEW_REQUEST_CONCURRENCY },
   )
-  const deviceSnapshot = yield* Ref.make(yield* inspectDevices)
-  const initialRegistry = yield* platform.instances.pipe(Effect.option)
-  const activeRegistry = yield* Ref.make(initialRegistry)
-  const configured = configuration.get.pipe(Effect.mapError(fromConfiguration))
+
+  const recommendations = (
+    usage: LocalInferenceUsageSelection | undefined,
+    onLoading: Effect.Effect<void, LocalInferenceError> = Effect.void,
+  ) => usage
+    ? Effect.gen(function* () {
+        const hardware = yield* client.system.getHardware({})
+        const key = [
+          usage.sessionConcurrency,
+          hardware.native_build,
+          hardware.topology_fingerprint,
+          hardware.capacity_policy,
+          hardware.assessment_policy,
+        ].join(":")
+        const cached = (yield* Ref.get(recommendationCache)).get(key)
+        if (cached) return cached
+        yield* onLoading
+        const previewResults = yield* previews(usage, hardware)
+        const items = previewResults.flatMap((result) => result._tag === "Right" ? [result.right] : [])
+        const candidates = items.flatMap(({ entry, preview }) => preview.assessments.flatMap((assessment) => {
+          const value = recommendationFrom(entry, preview, assessment, "alternative")
+          return value ? [{ value, rank: entry.modelQualityRank * 1_000 + entry.quantization.fidelityRank }] : []
+        })).sort((left, right) => right.rank - left.rank || right.value.contextTokens - left.value.contextTokens)
+        const recommendations = candidates.slice(0, 4).map(({ value }, index) => ({
+          ...value,
+          badge: index === 0 ? "recommended" as const : index === 1 ? "lighter" as const : "alternative" as const,
+        }))
+        const result = {
+          recommendations,
+          failureCount: previewResults.length - items.length,
+        }
+        yield* Ref.update(recommendationCache, (current) => new Map(current).set(key, result))
+        return result
+      })
+    : Effect.succeed({ recommendations: [], failureCount: 0 } satisfies RecommendationResult)
+
+  const resolveCatalogSelection = (selectionId: string) => Effect.gen(function* () {
+    const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
+    const recommendationList = yield* recommendations(config.usage).pipe(
+      Effect.mapError((cause) => localError("icn_unavailable", "preview local model recommendations", cause)),
+    )
+    const recommendation = recommendationList.recommendations.find((item) => item.configurationId === selectionId || item.catalogModelId === selectionId)
+    const catalogId = recommendation?.catalogModelId ?? config.selectedProfile?.catalogModelId
+    return catalogId ? LOCAL_MODEL_CATALOG.find((entry) => entry.id === catalogId) : undefined
+  })
+
+  const resolveStoredModel = (selectionId: string) => Effect.gen(function* () {
+    const models = (yield* client.models.listModels({})).data
+    const direct = models.find((model) => model.id === selectionId)
+    if (direct) return direct
+    const entry = yield* resolveCatalogSelection(selectionId)
+    if (!entry) return undefined
+    return models.find((model) => {
+      if (model.source.type !== "hugging_face" || model.source.repository !== entry.repo) return false
+      const components = model.location.type === "file" ? [model.location.component] : model.location.components
+      return components.some((component) => component.path === entry.primaryGguf)
+    })
+  })
+
+  const stateValue = (
+    recommendationState: LocalInferenceRecommendationState,
+    recommendationFailureCount = 0,
+  ) => Effect.gen(function* () {
+    const [hardware, inventory, runtime, config] = yield* Effect.all([
+      client.system.getHardware({}),
+      client.models.listModels({}),
+      client.runtime.getRuntimeState({}),
+      configuration.get,
+    ], { concurrency: 4 })
+    const activeId = runtime.status.type === "ready" ? runtime.status.model_id : undefined
+    const choices: LocalModelChoice[] = inventory.data
+      .filter((model) => isStoredArtifactStatus(model.status))
+      .map((model) => {
+        const contextTokens = activeId === model.id && runtime.status.type === "ready"
+          ? runtime.status.profile.context_length
+          : model.hardware.type === "fits"
+            ? model.hardware.profile.context_length
+            : undefined
+        const properties = model.properties.type === "inspected" ? model.properties : undefined
+        const quantization = properties ? Option.getOrUndefined(properties.quantization) : undefined
+        return {
+          _tag: activeId === model.id ? "Running" as const : "Stored" as const,
+          choiceId: model.id,
+          displayName: Option.getOrUndefined(model.name) ?? model.id,
+          providerModelId: ProviderModelIdSchema.make(model.id),
+          ...(contextTokens ? { contextTokens } : {}),
+          fitClass: model.hardware.type === "fits"
+            ? model.hardware.profile.acceleration.toLowerCase().includes("hybrid") ? "hybrid" as const : "full_accelerator" as const
+            : "unknown" as const,
+          availability: { _tag: "Available" as const },
+          fitAssessment: fitAssessment(model.hardware),
+          explanation: model.hardware.type === "fits" ? `${model.hardware.profile.acceleration} placement` : "Stored local model",
+          residency: activeId === model.id ? "loaded" as const : "unloaded" as const,
+          ...(quantization ? { quantization: {
+            format: quantization,
+            quantAwareCheckpoint: false,
+            fidelityLabel: "Inspected artifact",
+            fidelityEvidence: "Artifact properties inspected by ICN.",
+            fidelitySourceUrl: "",
+          } } : {}),
+          ...(model.location.type === "magnitude_cache" || model.location.type === "hugging_face_cache" || model.location.type === "directory"
+            ? { sizeBytes: model.location.total_bytes }
+            : { sizeBytes: model.location.component.size_bytes }),
+        }
+      })
+    return {
+      usage: config.usage ?? null,
+      activeBinding: runtime.status.type === "ready" ? {
+        selectionId: runtime.status.model_id,
+        providerModelId: ProviderModelIdSchema.make(runtime.status.model_id),
+        contextTokens: runtime.status.profile.context_length,
+      } : null,
+      host: { _tag: "Available" as const, profile: hostToWire(hardware) },
+      choices,
+      operations: [...(yield* Ref.get(operations)).values()],
+      recommendationState,
+      warnings: recommendationState._tag === "Ready" && recommendationFailureCount > 0
+          ? [{ code: "preview_failed", message: "ICN could not assess the local model catalog. Try again when the inference service is available." }]
+          : [],
+    }
+  }).pipe(Effect.mapError((cause) => localError("icn_unavailable", "read local inference state", cause)))
+
+  const initialConfig = yield* configuration.get.pipe(Effect.orDie)
+  const initialRecommendation: LocalInferenceRecommendationState = initialConfig.usage
+    ? { _tag: "Loading" }
+    : { _tag: "NotRequested" }
+  const resource = yield* makeMirroredResource(yield* stateValue(initialRecommendation).pipe(Effect.orDie))
+  const publishState = (
+    recommendationState: LocalInferenceRecommendationState,
+    recommendationFailureCount = 0,
+  ) => stateValue(recommendationState, recommendationFailureCount).pipe(
+    Effect.flatMap((next) => resource.setIfChanged(next, (left, right) => JSON.stringify(left) === JSON.stringify(right))),
+    Effect.asVoid,
+  )
+  const refresh = recommendationRefreshLock.withPermits(1)(Effect.gen(function* () {
+    const config = yield* configuration.get.pipe(
+      Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)),
+    )
+    if (!config.usage) {
+      yield* publishState({ _tag: "NotRequested" })
+      return
+    }
+    const result = yield* recommendations(
+      config.usage,
+      publishState({ _tag: "Loading" }),
+    ).pipe(Effect.either)
+    const latestConfig = yield* configuration.get.pipe(
+      Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)),
+    )
+    if (latestConfig.usage?.sessionConcurrency !== config.usage.sessionConcurrency) return
+    yield* (result._tag === "Right"
+      ? publishState(
+        { _tag: "Ready", recommendations: result.right.recommendations },
+        result.right.failureCount,
+      )
+      : publishState({
+        _tag: "Failed",
+        message: "ICN could not assess the local model catalog. Try again when the inference service is available.",
+      }))
+  }).pipe(Effect.catchAll(() => Effect.void)))
+  yield* changes.stream.pipe(Stream.runForEach(() => refresh), Effect.forkScoped)
+  yield* refresh.pipe(Effect.forkScoped)
 
   const configureUsage = (selection: LocalInferenceUsageSelection) => lock.withPermits(1)(
-    configuration.updateUsage(selection).pipe(Effect.mapError(fromConfiguration)),
-  )
-
-  const installLlamaCpp = platform.installations.installManaged.pipe(
-    Effect.map(String),
-    Effect.mapError((cause) => mapFailure("install managed llama.cpp", cause)),
-  )
-  const refreshInstallations = platform.installations.refresh.pipe(
-    Effect.zipRight(platform.instances.pipe(Effect.asVoid)),
-    Effect.mapError((cause) => mapFailure("refresh llama.cpp installations", cause)),
+    Ref.set(recommendationCache, new Map()).pipe(
+      Effect.zipRight(configuration.updateUsage(selection)),
+      Effect.mapError((cause) => localError("configuration_failed", "configure local inference usage", cause)),
+      Effect.zipRight(changes.publish),
+    ),
   )
 
   const downloadModel = (configurationId: string) => lock.withPermits(1)(Effect.gen(function* () {
-    if (hostSnapshot._tag === "Left") {
-      return yield* localError(
-        "configuration_failed",
-        "download local model",
-        "Hardware capacity could not be detected for this model configuration.",
-        true,
-      )
-    }
-    const config = yield* configured
-    if (!config.usage) {
-      return yield* localError(
-        "invalid_selection",
-        "download local model",
-        "Choose local inference usage before downloading a recommended model.",
-      )
-    }
-    const selected = resolveConfiguration(
-      configurationId,
-      detectedInferenceCapacity(hostSnapshot.right, yield* Ref.get(deviceSnapshot)),
-      config.usage,
+    const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
+    const recommendationList = yield* recommendations(config.usage).pipe(
+      Effect.mapError((cause) => localError("icn_unavailable", "preview local model recommendations", cause)),
     )
-    if (!selected) {
-      return yield* localError(
-        "invalid_selection",
-        "download local model",
-        "This recommendation no longer matches the detected hardware and usage settings.",
-      )
-    }
-    const entry = selected.entry
-    if (entry.license.acknowledgementRequired) return yield* localError("license_required", "download local model", `License acknowledgement is required at ${entry.license.url}`)
+    const recommendation = recommendationList.recommendations.find((item) => item.configurationId === configurationId)
+    if (!recommendation) return yield* localError("invalid_selection", "download local model", "The selected recommendation is no longer available.", false)
+    const entry = LOCAL_MODEL_CATALOG.find((candidate) => candidate.id === recommendation.catalogModelId)
+    if (!entry) return yield* localError("invalid_selection", "download local model", "Unknown catalog model.", false)
     yield* configuration.selectProfile({
-      configurationId: selected.configurationId,
+      configurationId,
       catalogModelId: entry.id,
-      contextTokens: selected.contextTokens,
-      parallelSlots: selected.servingProfile.parallelSlots,
-    }).pipe(Effect.mapError(fromConfiguration))
-    const artifact = yield* platform.hub.resolveArtifact({
-      repository: HuggingFace.HuggingFaceRepositoryId.make(entry.repo),
-      revision: HuggingFace.HuggingFaceRevision.make(entry.revision),
-      files: catalogArtifactRequestFiles(entry),
+      contextTokens: recommendation.contextTokens,
+      parallelSlots: recommendation.servingProfile.parallelSlots,
+    }).pipe(Effect.mapError((cause) => localError("configuration_failed", "save local model selection", cause)))
+    const request: Generated.DownloadModelRequestSchema = {
+      source: { type: "hugging_face", repository: entry.repo, revision: entry.revision },
+      components: recommendation.files.map((file, index) => ({
+        path: file.path,
+        role: file.role,
+        expected_sha256: file.sha256 ? Option.some(file.sha256) : Option.none(),
+        shard_index: index === 0 ? Option.none() : Option.some(index),
+      })),
       relationships: [],
-    }).pipe(Effect.mapError((cause) => mapFailure("resolve local model download", cause)))
-    yield* platform.downloads.download(artifact).pipe(
-      Stream.runDrain,
-      Effect.mapError((cause) => mapFailure("download local model", cause)),
-    )
-    yield* platform.files.inspect("changed")
+    }
+    yield* client.models.downloadModel({ payload: request }).pipe(Stream.runForEach((event) => {
+      const modelId = event.type === "ready"
+        ? event.model.id
+        : event.type === "checking_space" || event.type === "progress"
+          ? event.model_id
+          : event.type === "failed"
+            ? Option.getOrNull(event.model_id) ?? entry.id
+            : entry.id
+      const total = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.total_bytes : 0
+      const completed = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.completed_bytes : 0
+      return setOperation({
+        operationId: event.operation_id,
+        providerModelId: ProviderModelIdSchema.make(modelId),
+        status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
+        stage: operationStage(event),
+        ...(total > 0 ? { progress: completed / total } : {}),
+        ...(event.type === "failed" ? { message: event.error.message } : {}),
+      })
+    }), Effect.mapError((cause) => localError("configuration_failed", "download local model", cause)))
+    yield* changes.publish
   }))
 
-  const matchCatalogEntry = (record: ModelFiles.ModelFileRecord | undefined) => record
-    ? LOCAL_MODEL_CATALOG.find((entry) =>
-        entry.files.reduce((total, file) => total + file.sizeBytes, 0) === record.sizeBytes
-        && Option.contains(record.metadata.quantization, entry.quantization.format),
-      )
-    : undefined
-
-  const resolveSelectedModel = (selectionId: string) => Effect.gen(function* () {
-    const logical = yield* source.logicalModels
-    for (const record of logical.values()) {
-      const managed = record.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
-      if (record.providerModelId === selectionId || matchCatalogEntry(managed?.record)?.id === selectionId) return record
-    }
-    return undefined
-  })
-
   const activateModel = (selectionId: string) => lock.withPermits(1)(Effect.gen(function* () {
-    const logical = yield* resolveSelectedModel(selectionId)
-    const model = logical?.providerModel
-    if (!logical || !model || model.availability._tag === "Disabled") return yield* localError("invalid_selection", "activate local model", "The requested local model is unavailable.")
-    const managed = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
-    const external = logical.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "External" }> => route._tag === "External")
-    const managedContextTokens = managed?.request?.profile.contextSize._tag === "Tokens"
-      ? managed.request.profile.contextSize.value
-      : model.contextWindow
-    const binding: DurableLocalModelBinding = !managed && external
-      ? {
-          _tag: "External",
-          selectionId,
-          endpointConfigId: String(external.request.instanceId),
-          providerModelId: logical.providerModelId,
-          contextTokens: model.contextWindow,
-        }
-      : {
-          _tag: "Managed",
-          selectionId,
-          artifactId: managed ? String(managed.record.id) : "",
-          providerModelId: logical.providerModelId,
-          contextTokens: managedContextTokens,
-          parallelSlots: managed?.request?.profile.parallelSlots ?? 1,
-        }
-    yield* configuration.activateLocal(binding).pipe(Effect.mapError(fromConfiguration))
-    yield* source.warm(logical.providerModelId).pipe(Effect.mapError((cause) => mapFailure("activate local model", cause)))
+    const model = yield* resolveStoredModel(selectionId).pipe(Effect.mapError((cause) => localError("artifact_unavailable", "activate local model", cause)))
+    if (!model) return yield* localError("artifact_unavailable", "activate local model", "The selected model is not available in ICN.", false)
+    const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
+    const contextLength = config.selectedProfile?.contextTokens
+      ?? (model.hardware.type === "fits" ? model.hardware.profile.context_length : 100_000)
+    const sequences = config.selectedProfile?.parallelSlots ?? parallelSequences(config.usage ?? { sessionConcurrency: "one" })
+    const hardware = yield* client.system.getHardware({}).pipe(
+      Effect.mapError((cause) => localError("icn_unavailable", "read ICN execution policy", cause)),
+    )
+    yield* client.runtime.loadRuntimeModel({ payload: {
+      model_id: model.id,
+      profile: { policy: hardware.assessment_policy, context_length: contextLength, parallel_sequences: sequences },
+    } }).pipe(Stream.runForEach((event) => setOperation({
+      operationId: event.operation_id,
+      providerModelId: ProviderModelIdSchema.make(event.type === "ready" ? model.id : event.model_id),
+      status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
+      stage: operationStage(event),
+      ...(event.type === "failed" ? { message: event.message } : {}),
+    })), Effect.mapError((cause) => localError("runtime_start_failed", "activate local model", cause)))
+    yield* changes.publish
   }))
 
   const deleteModel = (selectionId: string) => lock.withPermits(1)(Effect.gen(function* () {
-    const config = yield* configured
-    if (config.binding?.providerModelId === selectionId) return yield* localError("artifact_active", "delete local model", "Disable the active local model before deleting it.")
-    const model = yield* resolveSelectedModel(selectionId)
-    const managed = model?.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
-    if (!managed) return yield* localError("invalid_selection", "delete local model", "The requested stored model is unknown.")
-    const id = managed.record.id
-    const record = yield* platform.files.get(id).pipe(Effect.mapError((cause) => mapFailure("inspect local model", cause)))
-    if (!record.operations.delete) return yield* localError("artifact_not_owned", "delete local model", "Only Magnitude-owned model artifacts can be deleted.")
-    yield* platform.files.remove(id).pipe(Effect.mapError((cause) => mapFailure("delete local model", cause)))
+    const model = yield* resolveStoredModel(selectionId).pipe(Effect.mapError((cause) => localError("artifact_unavailable", "delete local model", cause)))
+    if (!model) return yield* localError("artifact_unavailable", "delete local model", "The selected model is not available in ICN.", false)
+    yield* client.models.deleteModel({ path: { model_id: model.id }, urlParams: { dry_run: Option.none() } }).pipe(
+      Effect.mapError((cause) => localError("artifact_active", "delete local model", cause)),
+    )
+    yield* changes.publish
   }))
+
+  const disable = lock.withPermits(1)(client.runtime.unloadRuntimeModel({}).pipe(
+    Effect.mapError((cause) => localError("configuration_failed", "disable local inference", cause)),
+    Effect.zipRight(changes.publish),
+  ))
 
   const restart = lock.withPermits(1)(Effect.gen(function* () {
-    const config = yield* configured
-    if (!config.binding || config.binding._tag !== "Managed") return yield* localError("invalid_selection", "restart local model", "There is no managed local model to restart.")
-    const providerModelId = storedProviderModelId(config.binding.providerModelId)
-    if (!providerModelId) return yield* localError("invalid_selection", "restart local model", "The configured local model ID is invalid.")
-    yield* source.stopManaged.pipe(Effect.mapError((cause) => mapFailure("restart local model", cause)))
-    yield* source.warm(providerModelId).pipe(Effect.mapError((cause) => mapFailure("restart local model", cause)))
+    const runtime = yield* client.runtime.getRuntimeState({}).pipe(Effect.mapError((cause) => localError("icn_unavailable", "read local runtime", cause)))
+    if (runtime.status.type !== "ready") return
+    const current = runtime.status
+    yield* client.runtime.unloadRuntimeModel({}).pipe(Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)))
+    yield* client.runtime.loadRuntimeModel({ payload: { model_id: current.model_id, profile: current.profile } }).pipe(
+      Stream.runDrain,
+      Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)),
+    )
+    yield* changes.publish
   }))
-
-  const disable = lock.withPermits(1)(Effect.gen(function* () {
-    yield* configuration.disableLocal.pipe(Effect.mapError(fromConfiguration))
-    yield* source.stopManaged.pipe(Effect.mapError((cause) => mapFailure("disable local inference", cause)))
-  }))
-
-  const buildState = Effect.gen(function* () {
-    const [config, installationState, logicalModels, files, operations, instanceSnapshot] = yield* Effect.all([
-      configured,
-      platform.installations.snapshot,
-      source.logicalModels,
-      platform.files.inspect("cached"),
-      source.operations,
-      Ref.get(activeRegistry).pipe(Effect.flatMap(Option.match({
-        onNone: () => Effect.succeed({
-          instances: [],
-          failures: [],
-          capturedAt: new Date(),
-          activeManagedInstallationId: Option.none(),
-        } satisfies LlamaCpp.LlamaInstanceSnapshot),
-        onSome: (registry) => registry.snapshot,
-      }))),
-    ], { concurrency: 4 })
-    const choices: LocalModelChoice[] = [...logicalModels.values()].map((logical) => {
-      const model = logical.providerModel
-      const managed = logical?.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "Managed" }> => route._tag === "Managed")
-      const external = logical?.routes.find((route): route is Extract<LlamaLogicalRoute, { readonly _tag: "External" }> => route._tag === "External")
-      const record = managed?.record
-      const curated = matchCatalogEntry(record)
-      const runningExternal = logical?.routes.some((route) => route._tag === "External" && route.healthy && (route.observation.status === "loaded" || route.observation.status === "sleeping")) ?? false
-      const runningManaged = logical?.routes.some((route) => route._tag === "Managed" && route.loaded) ?? false
-      const residency = runningExternal || runningManaged ? "loaded" as const : "unloaded" as const
-      const availability = model?.availability ?? { _tag: "Disabled" as const, reason: "model_unavailable" as const }
-      const fitAssessment = managed && !runningManaged
-        ? Option.match(managed.fitAssessment, {
-          onNone: () => ({ _tag: "NotAssessed" as const }),
-          onSome: (assessment) => ({ _tag: "Estimated" as const, ...assessment }),
-        })
-        : { _tag: "NotAssessed" as const }
-      const common = {
-        choiceId: curated?.id ?? logical.providerModelId,
-        displayName: logical.information.displayName,
-        providerModelId: logical.providerModelId,
-        ...(model ? { contextTokens: model.contextWindow } : {}),
-        fitClass: "unknown" as const,
-        availability,
-        fitAssessment,
-        explanation: !model
-          ? "Metadata required for safe inference is unavailable."
-          : availability._tag === "Disabled"
-            ? `Unavailable: ${availability.reason}`
-            : fitAssessment._tag === "Estimated" && fitAssessment.result === "capacity_risk"
-              ? "Estimated memory exceeds stable capacity; loading may fail or affect system performance."
-              : "Runnable with the selected llama.cpp installation.",
-        residency,
-        ...(record ? { sizeBytes: record.sizeBytes } : {}),
-      }
-      if (runningExternal && !runningManaged) return { _tag: "RunningExternal" as const, ...common }
-      if (runningManaged) return { _tag: "RunningManaged" as const, ...common }
-      return record?.ownership === "magnitude"
-        ? { _tag: "StoredOwned" as const, ...common }
-        : { _tag: "StoredExternal" as const, ...common }
-    })
-    const activeProviderModelId = config.binding ? storedProviderModelId(config.binding.providerModelId) : undefined
-    const installOperation = installationState.managedInstall.operation
-    const clientInstallOperation = installOperation._tag === "Running"
-      ? {
-          ...installOperation,
-          operationId: String(installOperation.operationId),
-          stage: installOperation.stage === "Resolving"
-            ? "preparing" as const
-            : installOperation.stage === "Downloading"
-              ? "downloading" as const
-              : "installing" as const,
-        }
-      : installOperation._tag === "Failed"
-        ? { ...installOperation, operationId: String(installOperation.operationId) }
-        : installOperation
-    return {
-      usage: config.usage ?? null,
-      activeBinding: config.binding && activeProviderModelId
-        ? config.binding._tag === "Managed"
-          ? { _tag: "Managed" as const, selectionId: config.binding.selectionId, providerModelId: activeProviderModelId, contextTokens: config.binding.contextTokens }
-          : { _tag: "External" as const, selectionId: config.binding.selectionId, providerModelId: activeProviderModelId, contextTokens: config.binding.contextTokens }
-        : null,
-      llamaCpp: {
-        minimumBuild: installationState.minimumBuild,
-        recommendedBuild: installationState.recommendedBuild,
-        installations: installationState.installations.map((installation) => ({
-          id: String(installation.id),
-          build: installation.build,
-          ownership: installation.ownership,
-          executables: {
-            serverPath: installation.executables.server.path,
-            fitParamsPath: installation.executables.fitParams.path,
-          },
-          discoveries: installation.discoveries,
-        })),
-        selectedInstallationId: Option.map(installationState.selectedInstallationId, String),
-        activeManagedInstallationId: Option.map(instanceSnapshot.activeManagedInstallationId, String),
-        managedInstall: {
-          availability: installationState.managedInstall.availability._tag === "Available"
-            ? { _tag: "Available" as const, build: installationState.managedInstall.availability.build }
-            : installationState.managedInstall.availability,
-          operation: clientInstallOperation,
-        },
-        diagnostics: installationState.diagnostics.map((diagnostic) => ({ code: diagnostic._tag, message: diagnostic.reason })),
-      },
-      host: hostSnapshot._tag === "Right"
-        ? { _tag: "Available" as const, profile: hostToWire(hostSnapshot.right, yield* Ref.get(deviceSnapshot)) }
-        : { _tag: "Unavailable" as const, message: hostSnapshot.left.message },
-      choices,
-      operations,
-      recommendations: config.usage && hostSnapshot._tag === "Right"
-        ? recommendLocalModels(
-          detectedInferenceCapacity(hostSnapshot.right, yield* Ref.get(deviceSnapshot)),
-          config.usage,
-        )
-        : [],
-      warnings: [
-        ...files.issues.map((issue) => ({ code: issue.code, message: issue.message })),
-        ...instanceSnapshot.instances.flatMap((instance) => instance.diagnostics.map((diagnostic) => ({
-          code: diagnostic.code,
-          message: diagnostic.message,
-        }))),
-        ...instanceSnapshot.failures.map((failure) => ({
-          code: `runtime_${failure.reason}`,
-          message: `Unable to observe llama.cpp instance ${failure.instanceId}: ${failure.reason}`,
-        })),
-      ],
-    } satisfies LocalInferenceState
-  })
-
-  const initialState = yield* buildState.pipe(Effect.orDie)
-  const stateResource = yield* makeMirroredResource(initialState)
-  const publishState = buildState.pipe(
-    Effect.flatMap((next) => stateResource.setIfChanged(next, Schema.equivalence(LocalInferenceState))),
-    Effect.asVoid,
-  )
-  const registryChanges = Stream.concat(
-    Option.match(initialRegistry, {
-      onNone: () => Stream.empty,
-      onSome: Stream.make,
-    }),
-    platform.instanceChanges,
-  ).pipe(
-    Stream.tap((registry) => Ref.set(activeRegistry, Option.some(registry))),
-    Stream.flatMap((registry) => Stream.concat(Stream.make(undefined), registry.changes), {
-      concurrency: 1,
-      switch: true,
-    }),
-  )
-  const installationChanges = platform.installations.changes.pipe(
-    Stream.tap(() => inspectDevices.pipe(Effect.flatMap((devices) => Ref.set(deviceSnapshot, devices)))),
-  )
-  const triggers = Stream.mergeAll([
-    configuration.changes,
-    installationChanges,
-    source.stateChanges,
-    platform.files.changes.pipe(Stream.map(() => undefined)),
-    registryChanges,
-  ], { concurrency: "unbounded" })
-  yield* triggers.pipe(
-    Stream.debounce("50 millis"),
-    Stream.runForEach(() => publishState.pipe(
-      Effect.catchAll((cause) => Effect.logWarning("Local inference state projection failed").pipe(
-        Effect.annotateLogs({ cause: String(cause) }),
-      )),
-    )),
-    Effect.forkScoped,
-  )
 
   return LocalInference.of({
-    state: stateResource.get,
-    watchState: stateResource.changes,
+    state: resource.get,
+    watchState: resource.changes,
     configureUsage,
-    installLlamaCpp: installLlamaCpp.pipe(Effect.tap(() => publishState)),
-    refreshInstallations: refreshInstallations.pipe(Effect.tap(() => publishState)),
     downloadModel,
     activateModel,
     deleteModel,

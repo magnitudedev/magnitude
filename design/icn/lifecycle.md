@@ -5,6 +5,7 @@ applies_to:
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
   - packages/acn/src/server.ts
+  - packages/acn/src/icn-layer.ts
   - packages/acn/src/serve.ts
   - packages/acn/src/binary.ts
   - packages/acn/src/daemon-lifecycle.ts
@@ -26,6 +27,12 @@ ICN is not a separately discovered daemon. Clients never connect to it directly,
 adopt an ICN started by another process. A model is not a process: the one child starts without a
 loaded model and loads, replaces, or unloads its active model through ICN's runtime API.
 
+The service process may own bounded, private, short-lived native planner workers for isolated
+metadata-only fitting. These workers are an internal implementation detail of that one ICN service:
+they use the same verified executable, communicate only with their parent over private standard
+I/O, expose no listener or public lifecycle, allocate no model tensors, and terminate with the
+request or parent. ACN still owns and observes exactly one ICN service child.
+
 The hardware, fitting, and inventory meanings exposed through this boundary are defined by
 [hardware fitting](./hardware-fitting.md) and [model management](./model-management.md). This
 document defines ownership, process lifetime, transport, and the Bun-facing package contract.
@@ -45,13 +52,13 @@ The ICN package owns:
 
 The package does not own product catalog curation, recommendation ranking, durable user selection,
 ACN RPC state, or provider routing. It does not inspect hardware, GGUF files, Hugging Face state, or
-llama.cpp installations in Bun. It contains no fallback implementation of an ICN operation and no
+native runtime installations in Bun. It contains no fallback implementation of an ICN operation and no
 hand-written endpoint method, SSE parser, wire schema, or endpoint-specific error mapper.
 
 The native ICN process owns hardware discovery, model acquisition and inventory, artifact
 inspection, model fitting, the pinned inference runtime, active-model state, and inference request
 execution. The native binary is acquired by `@magnitudedev/icn` from the matching Magnitude release;
-it is not downloaded from Hugging Face and is not selected from a user llama.cpp installation.
+it is not downloaded from a model repository and is not selected from a user-installed runtime.
 
 ACN owns the parent scope and product policy. It supplies ICN's storage roots and supported binary
 identity, translates product choices into generated ICN requests, and maps canonical ICN results to
@@ -106,6 +113,11 @@ binding, model-store and cache roots, optional read-only import/source roots, st
 deadlines, output bounds, authentication/instance identity, and compatible API/build identity.
 It must be validated before spawning.
 
+The configured model store is authoritative. ICN's managed Hugging Face hub lives beneath that
+store, and ICN does not implicitly discover or adopt a host user's global Hugging Face cache.
+External caches or directories participate only when they are supplied explicitly as read-only
+import/source roots. ACN supplies no such roots for the product-managed ICN.
+
 Context length, sequence count, batching, GPU placement, KV policy, reasoning controls, projector,
 draft, and MTP selection belong to preview or runtime load requests. Model path, model ID, model
 alias, and execution flags are not singleton startup options. This separation lets one ICN live for
@@ -130,8 +142,9 @@ without coupling the two archives. Resolution uses deterministic precedence:
 4. a development-only PATH lookup when explicitly enabled.
 
 The CLI, ACN, and ICN release archives are independent. The npm command remains `magnitude`, while
-the compiled CLI executable is named `magnitude-cli`. ACN does not contain or download ICN itself;
-it supplies typed release coordinates to the ICN lifecycle composition when integration is wired.
+the compiled CLI executable is named `magnitude-cli`. ACN does not embed ICN; at startup it supplies
+typed release coordinates to the ICN lifecycle, which verifies a cached binary or downloads and
+atomically publishes the matching release artifact before ACN readiness can succeed.
 
 An unresolved, non-executable, or incompatible binary is an ACN startup failure. There is no silent
 fallback to a different native runtime. Resolution canonicalizes the path and verifies the binary's
@@ -244,9 +257,8 @@ backend. Unload is idempotent, refuses while protected inference leases remain u
 was explicitly requested, and returns only after native resources are released. Chat requests bind
 to the active runtime generation they began with and cannot silently continue on a replacement.
 
-These operations replace Bun-owned llama.cpp installation and instance registries. ICN's pinned
-runtime is part of the ICN build, so there is no separate install/refresh/select lifecycle for
-llama.cpp in ACN.
+ICN's pinned runtime is part of the ICN build, so ACN has no separate native-runtime install,
+discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
 
 ## Failure semantics
 
@@ -295,6 +307,10 @@ The lifecycle conforms when:
 - `@magnitudedev/icn` contains no hand-written endpoint facade or streaming transport logic;
 - no Bun implementation duplicates hardware, model inspection, fitting, downloading, inventory, or
   pinned-runtime management;
+- the public local provider ID is exactly `local`, and its bound model streams through the generated
+  ICN chat client rather than an endpoint URL adapter;
+- product model-download, activation, deletion, hardware, and fit operations reach ICN only through
+  the generated client, with no alternate model-repository or host-inspection path in ACN;
 - interrupting a consumer stream closes its response without terminating ICN;
 - an unexpected child exit causes the owning ACN to fail closed without an in-process restart;
 - normal ACN shutdown drains higher-level work, gracefully terminates ICN, escalates on deadline,

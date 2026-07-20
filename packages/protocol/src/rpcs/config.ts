@@ -1,6 +1,6 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
-import { ProviderIdSchema } from "@magnitudedev/ai"
+import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
 import { SessionError } from "../errors"
 import {
   CloudUsageResponse,

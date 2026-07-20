@@ -11,4 +11,4 @@ release = "0.1.151"
 [llama_cpp]
 checkout_path = "native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp"
 repository = "https://github.com/ggml-org/llama.cpp"
-revision = "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66"
+revision = "178a6c44937154dc4c4eff0d166f4a044c4fceba"

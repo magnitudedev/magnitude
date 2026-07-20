@@ -409,6 +409,7 @@ pub struct HardwareMemorySchema {
     required_bytes: u64,
     available_bytes: u64,
     headroom_bytes: u64,
+    domains: Vec<HardwareMemoryDomainAssessmentSchema>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -417,6 +418,20 @@ pub struct HardwareDeficitSchema {
     required_bytes: u64,
     available_bytes: u64,
     deficit_bytes: u64,
+    domains: Vec<HardwareMemoryDomainAssessmentSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareMemoryDomainAssessmentSchema {
+    memory_domain: String,
+    model_bytes: u64,
+    context_bytes: u64,
+    compute_bytes: u64,
+    auxiliary_bytes: u64,
+    required_bytes: u64,
+    available_bytes: u64,
+    margin_bytes: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -442,5 +457,13 @@ pub enum HardwareAssessmentSchema {
         memory: HardwareDeficitSchema,
         limiting_resource: String,
         alternative: Option<HardwareProfileSchema>,
+    },
+    InvalidArtifact {
+        code: String,
+        message: String,
+    },
+    IncompatibleArtifact {
+        code: String,
+        message: String,
     },
 }

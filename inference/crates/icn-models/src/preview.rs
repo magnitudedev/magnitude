@@ -3,12 +3,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HardwareProvider, Integrity,
     InventoryError, ModelComponent, ModelHardwareAssessor, ModelId, ModelLocation, ModelPreview,
-    ModelPreviewAssessment, ModelPreviewRequest, ModelPreviewSource, ModelPreviewer, ModelSource,
-    ResolvedComponent, ResolvedModel,
+    ModelPreviewAssessment, ModelPreviewProfile, ModelPreviewRequest, ModelPreviewSource,
+    ModelPreviewer, ModelSource, ResolvedComponent, ResolvedModel,
 };
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ const INITIAL_HEADER_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 128 * 1024 * 1024;
 const MAX_HUB_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HUB_SIBLINGS: usize = 100_000;
+const PREVIEW_HARDWARE_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 const MAX_MODEL_COMPONENTS: u32 = 256;
 const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_PREVIEW_CONTEXT_TOKENS: u32 = 16 * 1024 * 1024;
@@ -31,6 +33,7 @@ pub struct ModelPreviewService {
     models: Arc<ModelManager>,
     assessor: Arc<dyn ModelHardwareAssessor>,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    hardware_snapshot: tokio::sync::Mutex<Option<(Instant, icn_contracts::HardwareSnapshot)>>,
 }
 
 impl ModelPreviewService {
@@ -40,7 +43,77 @@ impl ModelPreviewService {
             models,
             assessor,
             work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
+            hardware_snapshot: tokio::sync::Mutex::new(None),
         }
+    }
+
+    async fn hardware_snapshot(&self) -> Result<icn_contracts::HardwareSnapshot, InventoryError> {
+        let mut cached = self.hardware_snapshot.lock().await;
+        if let Some((captured, snapshot)) = cached.as_ref()
+            && captured.elapsed() <= PREVIEW_HARDWARE_SNAPSHOT_TTL
+        {
+            return Ok(snapshot.clone());
+        }
+        let snapshot = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
+        *cached = Some((Instant::now(), snapshot.clone()));
+        Ok(snapshot)
+    }
+
+    fn cached_preview(
+        &self,
+        artifact: &CachedArtifact,
+        profiles: &[ModelPreviewProfile],
+        snapshot: &icn_contracts::HardwareSnapshot,
+    ) -> Result<Option<ModelPreview>, InventoryError> {
+        let components = artifact
+            .components
+            .iter()
+            .map(|component| component.component.clone())
+            .collect::<Vec<_>>();
+        let content_id = content_id(&components);
+        let primary_name = artifact
+            .primary_gguf
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("remote model");
+        let has_projector = components
+            .iter()
+            .any(|component| component.role == ComponentRole::Projector);
+        let Some(inspection) =
+            self.models
+                .cached_model_inspection(&content_id, primary_name, has_projector)
+        else {
+            return Ok(None);
+        };
+        let source_fingerprint = format!(
+            "{}:{}:{}",
+            artifact.repository, artifact.commit, content_id.0
+        );
+        let mut assessments = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            let hardware_key = self.assessor.cache_key(Some(profile), snapshot)?;
+            let Some(assessment) = self
+                .models
+                .cache
+                .read_hardware_assessment(&content_id, &hardware_key)
+            else {
+                return Ok(None);
+            };
+            assessments.push(ModelPreviewAssessment {
+                profile_id: profile.id.clone(),
+                artifact_fingerprint: source_fingerprint.clone(),
+                execution_policy: self.assessor.policy_identity().to_owned(),
+                hardware_topology: snapshot.topology_fingerprint.clone(),
+                assessment,
+            });
+        }
+        Ok(Some(ModelPreview {
+            repository: artifact.repository.clone(),
+            commit: artifact.commit.clone(),
+            components,
+            properties: inspection.properties,
+            assessments,
+        }))
     }
 
     async fn work_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -53,6 +126,98 @@ impl ModelPreviewService {
         gates.insert(key.to_owned(), Arc::downgrade(&gate));
         gate
     }
+
+    async fn assessments_for_profiles(
+        &self,
+        prepared: &PreparedPreview,
+        profiles: Vec<ModelPreviewProfile>,
+        snapshot: &icn_contracts::HardwareSnapshot,
+    ) -> Result<Vec<ModelPreviewAssessment>, InventoryError> {
+        let content_id = &prepared.model.model.content_id;
+        let mut entries = profiles
+            .into_iter()
+            .map(|profile| {
+                let hardware_key = self.assessor.cache_key(Some(&profile), snapshot)?;
+                let assessment = self
+                    .models
+                    .cache
+                    .read_hardware_assessment(content_id, &hardware_key);
+                Ok((profile, hardware_key, assessment))
+            })
+            .collect::<Result<Vec<_>, InventoryError>>()?;
+
+        let mut missing_keys = entries
+            .iter()
+            .filter(|(_, _, assessment)| assessment.is_none())
+            .map(|(_, hardware_key, _)| hardware_key.clone())
+            .collect::<Vec<_>>();
+        missing_keys.sort_unstable();
+        missing_keys.dedup();
+        let mut gates = Vec::with_capacity(missing_keys.len());
+        for hardware_key in missing_keys {
+            gates.push(self.work_gate(&format!(
+                "assessment:{}:{hardware_key}",
+                content_id.0
+            )).await);
+        }
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in &gates {
+            guards.push(gate.lock().await);
+        }
+
+        let mut missing_indices = Vec::new();
+        for (index, (_, hardware_key, assessment)) in entries.iter_mut().enumerate() {
+            if assessment.is_none() {
+                *assessment = self
+                    .models
+                    .cache
+                    .read_hardware_assessment(content_id, hardware_key);
+            }
+            if assessment.is_none() {
+                missing_indices.push(index);
+            }
+        }
+        if !missing_indices.is_empty() {
+            let missing_profiles = missing_indices
+                .iter()
+                .map(|index| entries[*index].0.clone())
+                .collect();
+            let measured = self
+                .assessor
+                .assess_profiles(prepared.model.clone(), missing_profiles)
+                .await?;
+            if measured.len() != missing_indices.len() {
+                return Err(InventoryError::Internal(
+                    "native planner returned the wrong number of profile assessments".to_owned(),
+                ));
+            }
+            for (index, assessment) in missing_indices.into_iter().zip(measured) {
+                self.models.cache.write_hardware_assessment(
+                    content_id,
+                    &entries[index].1,
+                    &assessment,
+                );
+                entries[index].2 = Some(assessment);
+            }
+        }
+
+        entries
+            .into_iter()
+            .map(|(profile, _, assessment)| {
+                Ok(ModelPreviewAssessment {
+                    profile_id: profile.id,
+                    artifact_fingerprint: prepared.artifact_fingerprint.clone(),
+                    execution_policy: self.assessor.policy_identity().to_owned(),
+                    hardware_topology: snapshot.topology_fingerprint.clone(),
+                    assessment: assessment.ok_or_else(|| {
+                        InventoryError::Internal(
+                            "profile assessment was neither cached nor measured".to_owned(),
+                        )
+                    })?,
+                })
+            })
+            .collect()
+    }
 }
 
 impl ModelPreviewer for ModelPreviewService {
@@ -64,56 +229,27 @@ impl ModelPreviewer for ModelPreviewService {
             validate_preview_request(&request)?;
             let source_key = serde_json::to_string(&request.source)
                 .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            let snapshot = self.hardware_snapshot().await?;
+            if let Some(artifact) = self.models.cached_preview_artifact(&request.source)
+                && let Some(preview) =
+                    self.cached_preview(&artifact, &request.profiles, &snapshot)?
+            {
+                return Ok(preview);
+            }
             let artifact_gate = self.work_gate(&format!("artifact:{source_key}")).await;
             let prepared = {
                 let _guard = artifact_gate.lock().await;
+                if let Some(artifact) = self.models.cached_preview_artifact(&request.source)
+                    && let Some(preview) =
+                        self.cached_preview(&artifact, &request.profiles, &snapshot)?
+                {
+                    return Ok(preview);
+                }
                 self.models.prepare_preview(&request.source).await?
             };
-            let snapshot = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
-            let mut assessments = Vec::with_capacity(request.profiles.len());
-            for profile in &request.profiles {
-                let hardware_key = self.assessor.cache_key(Some(profile), &snapshot)?;
-                let content_id = &prepared.model.model.content_id;
-                let assessment = match self
-                    .models
-                    .cache
-                    .read_hardware_assessment(content_id, &hardware_key)
-                {
-                    Some(assessment) => assessment,
-                    None => {
-                        let gate = self
-                            .work_gate(&format!("assessment:{}:{hardware_key}", content_id.0))
-                            .await;
-                        let _guard = gate.lock().await;
-                        match self
-                            .models
-                            .cache
-                            .read_hardware_assessment(content_id, &hardware_key)
-                        {
-                            Some(assessment) => assessment,
-                            None => {
-                                let assessment = self
-                                    .assessor
-                                    .assess_profile(prepared.model.clone(), Some(profile.clone()))
-                                    .await?;
-                                self.models.cache.write_hardware_assessment(
-                                    content_id,
-                                    &hardware_key,
-                                    &assessment,
-                                );
-                                assessment
-                            }
-                        }
-                    }
-                };
-                assessments.push(ModelPreviewAssessment {
-                    profile_id: profile.id.clone(),
-                    artifact_fingerprint: prepared.artifact_fingerprint.clone(),
-                    execution_policy: self.assessor.policy_identity().to_owned(),
-                    hardware_topology: snapshot.topology_fingerprint.clone(),
-                    assessment,
-                });
-            }
+            let assessments = self
+                .assessments_for_profiles(&prepared, request.profiles, &snapshot)
+                .await?;
             Ok(ModelPreview {
                 repository: prepared.repository,
                 commit: prepared.commit,
@@ -165,7 +301,7 @@ pub struct PreparedPreview {
     _workspace: ModelCacheWorkspace,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedArtifact {
     repository: String,
     commit: String,
@@ -173,7 +309,7 @@ struct CachedArtifact {
     components: Vec<CachedComponent>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedComponent {
     component: ModelComponent,
     header_digest: String,
@@ -211,6 +347,13 @@ struct SelectedComponent<'a> {
 }
 
 impl ModelManager {
+    fn cached_preview_artifact(&self, source: &ModelPreviewSource) -> Option<CachedArtifact> {
+        let evidence = serde_json::to_string(source).ok()?;
+        self.cache
+            .read_index::<CachedArtifact>(ModelIndexKind::Artifact, &evidence)
+            .filter(|artifact| artifact_matches_source(artifact, source))
+    }
+
     pub async fn prepare_preview(
         &self,
         source: &ModelPreviewSource,
@@ -218,17 +361,13 @@ impl ModelManager {
         validate_source(source)?;
         let evidence = serde_json::to_string(source)
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
-        let cached = self
-            .cache
-            .read_index::<CachedArtifact>(ModelIndexKind::Artifact, &evidence)
-            .filter(|artifact| artifact_matches_source(artifact, source))
-            .filter(|artifact| {
-                artifact.components.iter().all(|component| {
-                    self.cache
-                        .read_blob(ModelBlobKind::GgufHeader, &component.header_digest)
-                        .is_some()
-                })
-            });
+        let cached = self.cached_preview_artifact(source).filter(|artifact| {
+            artifact.components.iter().all(|component| {
+                self.cache
+                    .read_blob(ModelBlobKind::GgufHeader, &component.header_digest)
+                    .is_some()
+            })
+        });
         let artifact = match cached {
             Some(artifact) => artifact,
             None => {
@@ -248,14 +387,8 @@ impl ModelManager {
         let http = reqwest::Client::builder()
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let url = format!(
-            "{}/api/models/{}",
-            self.client.endpoint(),
-            source.repository
-        );
-        let mut request = http
-            .get(url)
-            .query(&[("revision", source.revision.as_str()), ("blobs", "true")]);
+        let url = hub_metadata_url(self.client.endpoint(), &source.repository, &source.revision)?;
+        let mut request = http.get(url).query(&[("blobs", "true")]);
         if let Some(token) = hub_token() {
             request = request.bearer_auth(token);
         }
@@ -418,6 +551,26 @@ impl ModelManager {
             _workspace: workspace,
         })
     }
+}
+
+fn hub_metadata_url(
+    endpoint: &str,
+    repository: &str,
+    revision: &str,
+) -> Result<reqwest::Url, InventoryError> {
+    let mut url = reqwest::Url::parse(endpoint)
+        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?;
+        segments.pop_if_empty().push("api").push("models");
+        for segment in repository.split('/') {
+            segments.push(segment);
+        }
+        segments.push("revision").push(revision);
+    }
+    Ok(url)
 }
 
 fn validate_source(source: &ModelPreviewSource) -> Result<(), InventoryError> {
@@ -743,12 +896,16 @@ async fn fetch_header(
         }
     }
 
-    let mut requested =
+    let mut target_length =
         INITIAL_HEADER_BYTES.min(usize::try_from(logical_size).unwrap_or(usize::MAX));
+    let mut bytes = Vec::with_capacity(target_length);
     loop {
-        let mut request = http
-            .get(url.clone())
-            .header(RANGE, format!("bytes=0-{}", requested.saturating_sub(1)));
+        let range_start = bytes.len();
+        let range_length = target_length.saturating_sub(range_start);
+        let mut request = http.get(url.clone()).header(
+            RANGE,
+            format!("bytes={range_start}-{}", target_length.saturating_sub(1)),
+        );
         if let Some(token) = hub_token() {
             request = request.bearer_auth(token);
         }
@@ -762,37 +919,50 @@ async fn fetch_header(
                 response.status()
             )));
         }
-        let expected = u64::try_from(requested)
+        let expected_start = u64::try_from(range_start)
             .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
-        let complete_response = expected == logical_size && response.status().as_u16() == 200;
+        let expected_length = u64::try_from(range_length)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        let expected_end = u64::try_from(target_length)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        let complete_response = expected_start == 0
+            && expected_end == logical_size
+            && response.status().as_u16() == 200;
         let valid_partial = response.status().as_u16() == 206
             && response
                 .headers()
                 .get(CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| valid_content_range(value, expected, logical_size));
+                .is_some_and(|value| {
+                    valid_content_range(value, expected_start, expected_end, logical_size)
+                });
         if !complete_response && !valid_partial {
             return Err(InventoryError::Upstream(
                 "GGUF source did not honor the exact bounded range request".to_owned(),
             ));
         }
-        if response.content_length() != Some(expected) {
+        if response.content_length() != Some(expected_length) {
             return Err(InventoryError::Upstream(
                 "GGUF header response length did not match its content range".to_owned(),
             ));
         }
-        let mut bytes = Vec::with_capacity(requested);
+        let previous_length = bytes.len();
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|error| InventoryError::Upstream(error.to_string()))?
         {
-            if bytes.len().saturating_add(chunk.len()) > requested {
+            if bytes.len().saturating_add(chunk.len()) > target_length {
                 return Err(InventoryError::Upstream(
                     "GGUF header response exceeded its requested range".to_owned(),
                 ));
             }
             bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len().saturating_sub(previous_length) != range_length {
+            return Err(InventoryError::Upstream(
+                "GGUF header response ended before its requested range".to_owned(),
+            ));
         }
         let temporary = tempfile::NamedTempFile::new()
             .map_err(|error| InventoryError::Io(error.to_string()))?;
@@ -812,10 +982,10 @@ async fn fetch_header(
                 return Ok(bytes);
             }
             Err(_)
-                if requested < MAX_HEADER_BYTES
-                    && u64::try_from(requested).is_ok_and(|value| value < logical_size) =>
+                if target_length < MAX_HEADER_BYTES
+                    && u64::try_from(target_length).is_ok_and(|value| value < logical_size) =>
             {
-                requested = requested
+                target_length = target_length
                     .saturating_mul(2)
                     .min(MAX_HEADER_BYTES)
                     .min(usize::try_from(logical_size).unwrap_or(usize::MAX));
@@ -825,7 +995,12 @@ async fn fetch_header(
     }
 }
 
-fn valid_content_range(value: &str, expected_bytes: u64, logical_size: u64) -> bool {
+fn valid_content_range(
+    value: &str,
+    expected_start: u64,
+    expected_end: u64,
+    logical_size: u64,
+) -> bool {
     let Some(value) = value.strip_prefix("bytes ") else {
         return false;
     };
@@ -835,8 +1010,8 @@ fn valid_content_range(value: &str, expected_bytes: u64, logical_size: u64) -> b
     let Some((start, end)) = range.split_once('-') else {
         return false;
     };
-    start == "0"
-        && end.parse::<u64>().ok() == expected_bytes.checked_sub(1)
+    start.parse::<u64>().ok() == Some(expected_start)
+        && end.parse::<u64>().ok() == expected_end.checked_sub(1)
         && total.parse::<u64>().ok() == Some(logical_size)
 }
 
@@ -953,6 +1128,7 @@ mod tests {
                         device: "system".to_owned(),
                     },
                     memory: icn_contracts::HardwareMemory {
+                        domains: Vec::new(),
                         required_bytes: 1,
                         available_bytes: 2,
                         headroom_bytes: 1,
@@ -994,6 +1170,17 @@ mod tests {
                 ..valid
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_lookup_addresses_the_immutable_revision() {
+        let revision = "a".repeat(40);
+        let url =
+            hub_metadata_url("https://huggingface.co/", "owner/repository", &revision).unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!("https://huggingface.co/api/models/owner/repository/revision/{revision}")
         );
     }
 
@@ -1183,10 +1370,16 @@ mod tests {
 
     #[test]
     fn content_range_must_cover_the_exact_prefix_and_logical_file() {
-        assert!(valid_content_range("bytes 0-1023/4096", 1024, 4096));
-        assert!(!valid_content_range("bytes 1-1024/4096", 1024, 4096));
-        assert!(!valid_content_range("bytes 0-1024/4096", 1024, 4096));
-        assert!(!valid_content_range("bytes 0-1023/8192", 1024, 4096));
+        assert!(valid_content_range("bytes 0-1023/4096", 0, 1024, 4096));
+        assert!(valid_content_range(
+            "bytes 1024-2047/4096",
+            1024,
+            2048,
+            4096
+        ));
+        assert!(!valid_content_range("bytes 1-1024/4096", 0, 1024, 4096));
+        assert!(!valid_content_range("bytes 0-1024/4096", 0, 1024, 4096));
+        assert!(!valid_content_range("bytes 0-1023/8192", 0, 1024, 4096));
     }
 
     #[tokio::test]
@@ -1204,6 +1397,7 @@ mod tests {
                 device: "system".to_owned(),
             },
             memory: icn_contracts::HardwareMemory {
+                domains: Vec::new(),
                 required_bytes: 10,
                 available_bytes: 20,
                 headroom_bytes: 10,
@@ -1245,9 +1439,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_identical_previews_coalesce_native_assessment() {
         let temporary = tempfile::tempdir().unwrap();
-        let mut config =
-            crate::inventory::InventoryConfig::with_root(temporary.path().join("model-store"))
-                .unwrap();
+        let store = temporary.path().join("model-store");
+        let mut config = crate::inventory::InventoryConfig::with_root(store.clone()).unwrap();
         config.hf_cache_dirs.clear();
         let manager = Arc::new(
             ModelManager::open_with_template_assessor(config, Some(Arc::new(TestTemplateAssessor)))
@@ -1313,6 +1506,7 @@ mod tests {
         );
         assert_eq!(first.unwrap(), second.unwrap());
         assert_eq!(assessor.0.load(Ordering::SeqCst), 1);
+        fs::remove_dir_all(store.join("cache/blobs")).unwrap();
         service.preview(request).await.unwrap();
         assert_eq!(assessor.0.load(Ordering::SeqCst), 1);
     }

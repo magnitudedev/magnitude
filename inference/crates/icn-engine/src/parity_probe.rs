@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use icn_contracts::{ExecutionConfig, FlashAttention, GpuLayers, ResolvedExecutionPlan};
+use icn_contracts::{ExecutionConfig, ExecutionIntent, FlashAttention, GpuLayers};
 use llama_cpp_2::common_chat::{
     ChatContent, ChatContinuation, ChatFormat, ChatGrammarTrigger, ChatMessage, ChatParserOptions,
     ChatPrepareOptions, ChatReasoningFormat, ChatSemanticDelta, ChatTemplateKwarg, ChatTool,
@@ -164,19 +164,20 @@ fn configuration_inspect(input: &Map<String, Value>) -> Result<Value, ProbeError
         threads_batch: NonZeroU32::new(input.context.batch_threads),
         ..ExecutionConfig::default()
     };
-    let config = ResolvedExecutionPlan {
+    let config = ExecutionIntent {
         model_path: input.model_path.clone(),
         context_size: input.context.context_tokens,
         batch_size: input.context.batch_tokens,
         ubatch_size: input.context.micro_batch_tokens,
         max_sequences: input.context.sequences,
         prefill_quantum: input.context.batch_tokens,
-        radix_cache: Default::default(),
         execution,
         projector: None,
         mtp: icn_contracts::MtpConfig::default(),
     };
-    let params = super::native_context_params(&config, threads, batch_threads);
+    let (_, _, params, _, _) = icn_hardware::native_parameters_for_intent(&config)
+        .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?
+        .into_parts();
     let context = loaded
         .model
         .new_context(&loaded.backend, params)
@@ -908,14 +909,13 @@ fn llama_batched_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
         kv_unified: input.kv_unified,
         ..ExecutionConfig::default()
     };
-    let config = ResolvedExecutionPlan {
+    let config = ExecutionIntent {
         model_path: input.model_path.clone(),
         context_size: input.context_tokens,
         batch_size: input.batch_tokens,
         ubatch_size: input.micro_batch_tokens,
         max_sequences: input.parallel_sequences,
         prefill_quantum: input.batch_tokens,
-        radix_cache: Default::default(),
         execution,
         projector: None,
         mtp: icn_contracts::MtpConfig::default(),
@@ -932,15 +932,20 @@ fn llama_batched_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
 
     let backend =
         LlamaBackend::init().map_err(|error| ProbeError::runtime("backend-initialize", error))?;
-    let model_params = super::native_model_params(&config.execution)
-        .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?;
-    let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
-        .map_err(|error| ProbeError::runtime("model-load", error))?;
+    let (_, model_params, context_params, _, _) =
+        icn_hardware::native_parameters_for_intent(&config)
+            .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?
+            .into_parts();
+    let model = LlamaModel::load_from_file(
+        &backend,
+        &config.model_path,
+        model_params.as_ref().get_ref(),
+    )
+    .map_err(|error| ProbeError::runtime("model-load", error))?;
     // The official batched-bench leaves n_outputs_max at zero (n_batch) and uses the context's
     // default CPU backend pool. Preserve both details here; production server construction is
     // compared separately by the endpoint benchmark.
-    let context_params =
-        super::native_context_params(&config, threads, threads).with_n_outputs_max(None);
+    let context_params = context_params.with_n_outputs_max(None);
     let mut context = model
         .new_context(&backend, context_params)
         .map_err(|error| ProbeError::runtime("context-create", error))?;
@@ -1231,14 +1236,13 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
         .checked_add(input.generation_tokens)
         .and_then(|value| value.checked_add(input.context_depth))
         .expect("validated benchmark context sum fits in u32");
-    let config = ResolvedExecutionPlan {
+    let config = ExecutionIntent {
         model_path: input.model_path.clone(),
         context_size: requested_context,
         batch_size: input.batch_tokens,
         ubatch_size: input.micro_batch_tokens,
         max_sequences: 1,
         prefill_quantum: input.batch_tokens,
-        radix_cache: Default::default(),
         execution,
         projector: None,
         mtp: icn_contracts::MtpConfig::default(),
@@ -1255,11 +1259,16 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
     }
     let backend =
         LlamaBackend::init().map_err(|error| ProbeError::runtime("backend-initialize", error))?;
-    let model_params = super::native_model_params(&config.execution)
-        .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?;
-    let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
-        .map_err(|error| ProbeError::runtime("model-load", error))?;
-    let context_params = super::native_context_params(&config, threads, threads);
+    let (_, model_params, context_params, _, _) =
+        icn_hardware::native_parameters_for_intent(&config)
+            .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?
+            .into_parts();
+    let model = LlamaModel::load_from_file(
+        &backend,
+        &config.model_path,
+        model_params.as_ref().get_ref(),
+    )
+    .map_err(|error| ProbeError::runtime("model-load", error))?;
     let mut context = model
         .new_context(&backend, context_params)
         .map_err(|error| ProbeError::runtime("context-create", error))?;
@@ -1739,12 +1748,6 @@ fn chat_template_render(input: &Map<String, Value>) -> Result<Value, ProbeError>
             }
         })
         .collect::<Vec<_>>();
-    let spans = prepared
-        .message_spans()
-        .iter()
-        .map(|span| json!({"role": span.role, "position": span.position, "length": span.length}))
-        .collect::<Vec<_>>();
-
     Ok(json!({
         "source": templates
             .source(None)
@@ -1772,7 +1775,6 @@ fn chat_template_render(input: &Map<String, Value>) -> Result<Value, ProbeError>
         "preservedTokens": prepared.preserved_tokens(),
         "additionalStops": prepared.additional_stops(),
         "parser": prepared.parser_definition(),
-        "messageSpans": spans,
     }))
 }
 
@@ -2070,7 +2072,6 @@ fn chat_template_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
         ));
     }
     let grammar_triggers = project_chat_grammar_triggers(&semantic);
-    let message_spans = project_chat_message_spans(&semantic);
     let output = json!({
         "format": chat_format_name(summary.format),
         "prompt": semantic.prompt(),
@@ -2080,7 +2081,6 @@ fn chat_template_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
         "grammarTriggers": grammar_triggers,
         "preservedTokens": semantic.preserved_tokens(),
         "additionalStops": semantic.additional_stops(),
-        "messageSpans": message_spans,
         "promptBytes": summary.prompt_bytes,
         "grammarBytes": summary.grammar_bytes,
         "generationPromptBytes": summary.generation_prompt_bytes,
@@ -2088,7 +2088,6 @@ fn chat_template_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
         "preservedTokenCount": summary.preserved_token_count,
         "stopCount": summary.stop_count,
         "parserBytes": summary.parser_bytes,
-        "spanCount": summary.span_count,
         "executedWarmupIterations": executed_warmup_iterations,
         "executedMeasurementIterations": executed_measurement_iterations,
         "semanticChecksum": semantic_checksum,
@@ -2190,7 +2189,6 @@ fn summarize_chat_preparation(prepared: &PreparedChat) -> ChatPreparationSummary
         preserved_token_count: prepared.preserved_tokens().len(),
         stop_count: prepared.additional_stops().len(),
         parser_bytes: prepared.parser_definition().len(),
-        span_count: prepared.message_spans().len(),
     }
 }
 
@@ -2212,14 +2210,6 @@ fn project_chat_grammar_triggers(prepared: &PreparedChat) -> Vec<Value> {
                 json!({"type": "pattern-full", "value": value, "token": -1})
             }
         })
-        .collect()
-}
-
-fn project_chat_message_spans(prepared: &PreparedChat) -> Vec<Value> {
-    prepared
-        .message_spans()
-        .iter()
-        .map(|span| json!({"role": span.role, "position": span.position, "length": span.length}))
         .collect()
 }
 
@@ -2258,7 +2248,6 @@ struct ChatPreparationSummary {
     preserved_token_count: usize,
     stop_count: usize,
     parser_bytes: usize,
-    span_count: usize,
 }
 
 fn chat_summary_checksum(summary: ChatPreparationSummary) -> u64 {
@@ -2276,7 +2265,6 @@ fn chat_summary_checksum(summary: ChatPreparationSummary) -> u64 {
         summary.preserved_token_count,
         summary.stop_count,
         summary.parser_bytes,
-        summary.span_count,
     ] {
         value = value.wrapping_mul(SEMANTIC_CHECKSUM_PRIME) ^ component as u64;
     }
@@ -2849,7 +2837,7 @@ fn validate_context_request(input: &ContextRequest) -> Result<(), ProbeError> {
     if input.embeddings {
         return Err(ProbeError::invalid(
             "unsupported-embeddings",
-            "production ResolvedExecutionPlan does not expose embeddings; embeddings must be false",
+            "production ExecutionIntent does not expose embeddings; embeddings must be false",
         ));
     }
     Ok(())
@@ -4030,7 +4018,6 @@ mod tests {
         assert_eq!(evidence["output"]["promptBytes"], 206);
         assert_eq!(evidence["output"]["generationPromptBytes"], 22);
         assert_eq!(evidence["output"]["parserBytes"], 351);
-        assert_eq!(evidence["output"]["spanCount"], 4);
         assert_eq!(evidence["output"]["executedWarmupIterations"], 2);
         assert_eq!(evidence["output"]["executedMeasurementIterations"], 3);
         assert_eq!(
@@ -4046,10 +4033,6 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Say hello to 世界.")
-        );
-        assert_eq!(
-            evidence["output"]["messageSpans"].as_array().unwrap().len(),
-            4
         );
     }
 

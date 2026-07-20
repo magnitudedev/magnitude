@@ -339,7 +339,7 @@ pub enum AutomaticReasoningBudget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NativeReasoningControls {
-    /// `None` omits llama.cpp's dedicated control and preserves the authored template default.
+    /// `None` omits the native backend's dedicated control and preserves the authored template default.
     pub enable_thinking: Option<bool>,
     pub template_args: BTreeMap<String, serde_json::Value>,
 }
@@ -374,7 +374,7 @@ pub enum CapabilityEvidence {
     DeclaredMetadata { source: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateAssessment {
     pub capabilities: crate::TemplateCapabilities,
     pub reasoning: ReasoningCapability,
@@ -383,13 +383,10 @@ pub struct TemplateAssessment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveTemplateInputs {
-    pub default_template: Option<String>,
-    pub tool_use_template: Option<String>,
-    pub bos_token: Option<String>,
-    pub eos_token: Option<String>,
+    pub model_path: std::path::PathBuf,
 }
 
-/// Model-free native chat-template assessment injected into model discovery.
+/// Native chat-template assessment injected into model discovery.
 pub trait TemplateAssessor: Send + Sync + 'static {
     /// Stable identity for every implementation and native-policy input that can change an
     /// assessment. This is cache evidence, not a persisted schema version.
@@ -441,6 +438,14 @@ pub enum HardwareAssessment {
         limiting_resource: String,
         alternative: Option<HardwareProfile>,
     },
+    InvalidArtifact {
+        code: String,
+        message: String,
+    },
+    IncompatibleArtifact {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +462,7 @@ pub struct HardwareMemory {
     pub required_bytes: u64,
     pub available_bytes: u64,
     pub headroom_bytes: u64,
+    pub domains: Vec<HardwareMemoryDomainAssessment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +471,20 @@ pub struct HardwareDeficit {
     pub required_bytes: u64,
     pub available_bytes: u64,
     pub deficit_bytes: u64,
+    pub domains: Vec<HardwareMemoryDomainAssessment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareMemoryDomainAssessment {
+    pub memory_domain: String,
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub compute_bytes: u64,
+    pub auxiliary_bytes: u64,
+    pub required_bytes: u64,
+    pub available_bytes: u64,
+    pub margin_bytes: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,7 +768,7 @@ pub trait ModelInventory: Send + Sync + 'static {
 /// Canonical inventory assessment implemented by the server composition root.
 ///
 /// Keeping this boundary in contracts lets `icn-models` own reconciliation without depending on
-/// llama.cpp or `icn-hardware`. The cache key covers the canonical execution policy, native build,
+/// the native planner or `icn-hardware`. The cache key covers the canonical execution policy, native build,
 /// backend, and stable hardware topology. Assessment failures are operation failures, never model
 /// properties.
 pub trait InventoryHardwareAssessor: Send + Sync + 'static {
@@ -777,6 +797,22 @@ pub trait ModelHardwareAssessor: HardwareProvider {
         model: ResolvedModel,
         profile: Option<ModelPreviewProfile>,
     ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>>;
+
+    fn assess_profiles(
+        &self,
+        model: ResolvedModel,
+        profiles: Vec<ModelPreviewProfile>,
+    ) -> BoxFuture<'_, Result<Vec<HardwareAssessment>, InventoryError>> {
+        Box::pin(async move {
+            let mut assessments = Vec::with_capacity(profiles.len());
+            for profile in profiles {
+                assessments.push(
+                    self.assess_profile(model.clone(), Some(profile)).await?,
+                );
+            }
+            Ok(assessments)
+        })
+    }
 }
 
 pub trait ModelPreviewer: Send + Sync + 'static {

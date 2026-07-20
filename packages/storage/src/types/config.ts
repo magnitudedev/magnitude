@@ -44,9 +44,6 @@ export const ModelConfigSchema = Schema.Struct({
   localSlotIntent: Schema.optional(
     Schema.partial(Schema.Record({ key: SlotIdSchema, value: Schema.Literal('local', 'cloud') }))
   ),
-  localModelRecency: Schema.optional(
-    Schema.partial(Schema.Record({ key: SlotIdSchema, value: Schema.Array(Schema.String) }))
-  ),
 })
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 
@@ -71,23 +68,6 @@ export const LocalInferenceUsageSelectionSchema = Schema.Struct({
 })
 export type LocalInferenceUsageSelection = Schema.Schema.Type<typeof LocalInferenceUsageSelectionSchema>
 
-export const DurableLocalModelBindingSchema = Schema.Union(
-  Schema.TaggedStruct('Managed', {
-    selectionId: Schema.String,
-    artifactId: Schema.String,
-    providerModelId: Schema.String,
-    contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
-    parallelSlots: Schema.Number.pipe(Schema.int(), Schema.positive()),
-  }),
-  Schema.TaggedStruct('External', {
-    selectionId: Schema.String,
-    endpointConfigId: Schema.String,
-    providerModelId: Schema.String,
-    contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
-  }),
-)
-export type DurableLocalModelBinding = Schema.Schema.Type<typeof DurableLocalModelBindingSchema>
-
 export const SelectedLocalModelProfileSchema = Schema.Struct({
   configurationId: Schema.String,
   catalogModelId: Schema.String,
@@ -99,7 +79,6 @@ export type SelectedLocalModelProfile = Schema.Schema.Type<typeof SelectedLocalM
 export const LocalInferenceConfigSchema = Schema.Struct({
   usage: Schema.optional(LocalInferenceUsageSelectionSchema),
   selectedProfile: Schema.optional(SelectedLocalModelProfileSchema),
-  binding: Schema.optional(DurableLocalModelBindingSchema),
 })
 export type LocalInferenceConfig = Schema.Schema.Type<typeof LocalInferenceConfigSchema>
 

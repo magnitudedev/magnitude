@@ -10,7 +10,7 @@ import {
 } from "@magnitudedev/sdk"
 import { slotStatesFromModels } from "./account"
 
-const providerId = ProviderIdSchema.make("llamacpp")
+const providerId = ProviderIdSchema.make("local")
 const providerModelId = ProviderModelIdSchema.make("/models/test.gguf")
 const defaultEffort = ReasoningEffortSchema.make("high")
 const highEffort = ReasoningEffortSchema.make("max")

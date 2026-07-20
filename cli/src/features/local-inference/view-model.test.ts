@@ -25,7 +25,7 @@ const recommendation: LocalModelRecommendation = {
   quantTag: "Q4_K_M",
   repo: "example/model",
   revision: "revision",
-  files: [{ path: "model.gguf", sizeBytes: 4_000, sha256: "sha256", downloadUrl: "https://example.invalid/model.gguf" }],
+  files: [{ path: "model.gguf", role: "weights", sizeBytes: 4_000, sha256: "sha256" }],
   totalDownloadBytes: 4_000,
   sourcePageUrl: "https://example.invalid/model",
   license: { id: "test", url: "https://example.invalid/license", acknowledgementRequired: false },
@@ -50,25 +50,10 @@ const recommendation: LocalModelRecommendation = {
 const baseState = {
   usage: { sessionConcurrency: "one" },
   activeBinding: null,
-  llamaCpp: {
-    minimumBuild: 8868,
-    recommendedBuild: 10011,
-    installations: [{
-      id: "managed",
-      executables: { serverPath: "/managed/llama-server", fitParamsPath: "/managed/llama-fit-params" },
-      build: 10011,
-      ownership: "magnitude",
-      discoveries: [{ _tag: "Managed", markerPath: "/managed/current.json", release: "test" }],
-    }],
-    selectedInstallationId: Option.some("managed"),
-    activeManagedInstallationId: Option.none(),
-    managedInstall: { availability: { _tag: "Available", build: 10011 }, operation: { _tag: "Idle" } },
-    diagnostics: [],
-  },
   host: { _tag: "Unavailable", message: "not needed" },
   operations: [],
   warnings: [],
-} satisfies Omit<LocalInferenceState, "choices" | "recommendations">
+} satisfies Omit<LocalInferenceState, "choices" | "recommendationState">
 
 describe("local inference selection view model", () => {
   it("presents Apple Silicon as one unified-memory system", () => {
@@ -138,7 +123,7 @@ describe("local inference selection view model", () => {
         sharesSystemMemory: false,
         backendNames: ["CUDA"],
         deviceNames: [`NVIDIA GeForce RTX 4090 #${index + 1}`],
-        splitGroupId: "llamacpp:cuda",
+        splitGroupId: "cuda:group",
       }))],
     })).toEqual({
       system: {
@@ -162,7 +147,7 @@ describe("local inference selection view model", () => {
     const state: LocalInferenceState = {
       ...baseState,
       choices: [{
-        _tag: "StoredOwned",
+        _tag: "Stored",
         choiceId: recommendation.configurationId,
         displayName: recommendation.displayName,
         providerModelId: ProviderModelIdSchema.make("local-model"),
@@ -173,7 +158,7 @@ describe("local inference selection view model", () => {
         explanation: "Stored and ready.",
         residency: "unloaded",
       }],
-      recommendations: [recommendation],
+      recommendationState: { _tag: "Ready", recommendations: [recommendation] },
     }
 
     expect(buildLocalInferenceSelections(state)).toEqual([expect.objectContaining({
@@ -186,7 +171,7 @@ describe("local inference selection view model", () => {
     const state: LocalInferenceState = {
       ...baseState,
       choices: [{
-        _tag: "RunningExternal",
+        _tag: "Running",
         choiceId: "external-choice",
         displayName: "External model",
         providerModelId: ProviderModelIdSchema.make("external-model"),
@@ -205,7 +190,7 @@ describe("local inference selection view model", () => {
         },
         sizeBytes: 32_600_719_872,
       }],
-      recommendations: [],
+      recommendationState: { _tag: "Ready", recommendations: [] },
     }
 
     const selections = buildLocalInferenceSelections(state)
@@ -220,7 +205,7 @@ describe("local inference selection view model", () => {
     const state: LocalInferenceState = {
       ...baseState,
       choices: [{
-        _tag: "StoredOwned",
+        _tag: "Stored",
         choiceId: "large-model",
         displayName: "Large model",
         providerModelId: ProviderModelIdSchema.make("large-model"),
@@ -228,15 +213,15 @@ describe("local inference selection view model", () => {
         fitClass: "cpu_or_unified",
         availability: { _tag: "Available" },
         fitAssessment: {
-          _tag: "Estimated",
-          estimatedTotalBytes: 24 * 1024 ** 3,
-          domains: [{ memoryDomainId: "system", estimatedBytes: 24 * 1024 ** 3, stableCapacityBytes: 20 * 1024 ** 3, marginBytes: -4 * 1024 ** 3 }],
-          result: "capacity_risk",
+          _tag: "Assessed",
+          requiredTotalBytes: 24 * 1024 ** 3,
+          domains: [{ memoryDomainId: "system", requiredBytes: 24 * 1024 ** 3, stableCapacityBytes: 20 * 1024 ** 3, marginBytes: -4 * 1024 ** 3 }],
+          result: "does_not_fit",
         },
         explanation: "Loading may fail.",
         residency: "unloaded",
       }],
-      recommendations: [],
+      recommendationState: { _tag: "Ready", recommendations: [] },
     }
 
     const selections = buildLocalInferenceSelections(state)
@@ -248,7 +233,7 @@ describe("local inference selection view model", () => {
     const state: LocalInferenceState = {
       ...baseState,
       choices: [{
-        _tag: "StoredOwned",
+        _tag: "Stored",
         choiceId: "unavailable",
         displayName: "Unavailable model",
         providerModelId: ProviderModelIdSchema.make("unavailable"),
@@ -258,7 +243,7 @@ describe("local inference selection view model", () => {
         explanation: "No installation.",
         residency: "unloaded",
       }],
-      recommendations: [],
+      recommendationState: { _tag: "Ready", recommendations: [] },
     }
 
     expect(buildLocalInferenceSelections(state)).toEqual([])

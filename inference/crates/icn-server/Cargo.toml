@@ -21,10 +21,20 @@ icn-models.workspace = true
 icn-mtp.workspace = true
 icn-reasoning.workspace = true
 libc.workspace = true
+llama-cpp-2.workspace = true
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 default = ["mtmd"]

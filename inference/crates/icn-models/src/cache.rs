@@ -226,7 +226,10 @@ fn hardware_assessment_evidence(content_id: &ContentId, hardware_evidence: &str)
 fn is_terminal_assessment(assessment: &HardwareAssessment) -> bool {
     matches!(
         assessment,
-        HardwareAssessment::Fits { .. } | HardwareAssessment::DoesNotFit { .. }
+        HardwareAssessment::Fits { .. }
+            | HardwareAssessment::DoesNotFit { .. }
+            | HardwareAssessment::InvalidArtifact { .. }
+            | HardwareAssessment::IncompatibleArtifact { .. }
     )
 }
 
@@ -275,7 +278,8 @@ mod tests {
             "memory": {
                 "required_bytes": 1,
                 "available_bytes": 2,
-                "headroom_bytes": 1
+                "headroom_bytes": 1,
+                "domains": []
             },
             "recommendation": "recommended"
         }))

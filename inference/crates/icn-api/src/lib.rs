@@ -669,7 +669,7 @@ pub struct ReasoningProfileResponse {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfigResponse {
     pub requested: ExecutionSettingsResponse,
-    /// Concrete parameters passed to libllama after common/fit and thread selection.
+    /// Concrete parameters passed to the native backend after planning and thread selection.
     pub resolved: ExecutionSettingsResponse,
 }
 
@@ -1124,14 +1124,6 @@ pub struct Usage {
 #[serde(deny_unknown_fields)]
 pub struct Timings {
     pub cache_n: u64,
-    /// Cached prompt tokens attached directly from native device pages.
-    pub cache_device_n: u64,
-    /// Cached prompt tokens promoted from the bounded host tier.
-    pub cache_host_n: u64,
-    /// Cached prompt tokens promoted from the bounded local-storage tier.
-    pub cache_disk_n: u64,
-    /// Native import plus host/disk read time for this request.
-    pub cache_promotion_ms: f64,
     pub prompt_n: u64,
     pub prompt_ms: f64,
     pub prompt_per_token_ms: f64,
@@ -1140,7 +1132,7 @@ pub struct Timings {
     pub predicted_ms: f64,
     pub predicted_per_token_ms: f64,
     pub predicted_per_second: f64,
-    /// Time spent inside llama.cpp's sampler for this request.
+    /// Time spent inside the native sampler for this request.
     pub sampler_ms: f64,
     /// Time spent incrementally parsing generated chat output for this request.
     pub parser_ms: f64,
@@ -1305,6 +1297,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     (status = 200, description = "Active ICN model runtime", body = RuntimeStateResponse),
     (status = 500, description = "Runtime state unavailable", body = ErrorResponse)
 ))]
+#[tracing::instrument(name = "icn.runtime.state", skip_all, err(Debug))]
 async fn runtime_state(
     State(state): State<AppState>,
 ) -> Result<Json<RuntimeStateResponse>, ApiError> {
@@ -1326,6 +1319,12 @@ async fn runtime_state(
         (status = 400, description = "Invalid runtime request", body = ErrorResponse),
         (status = 409, description = "Runtime mutation conflict", body = ErrorResponse)
     )
+)]
+#[tracing::instrument(
+    name = "icn.runtime.load",
+    skip_all,
+    fields(model.id = %request.model_id),
+    err(Debug)
 )]
 async fn load_runtime_model(
     State(state): State<AppState>,
@@ -1366,6 +1365,7 @@ async fn load_runtime_model(
     (status = 409, description = "Runtime model is in use", body = ErrorResponse),
     (status = 500, description = "Runtime unload failed", body = ErrorResponse)
 ))]
+#[tracing::instrument(name = "icn.runtime.unload", skip_all, err(Debug))]
 async fn unload_runtime_model(
     State(state): State<AppState>,
 ) -> Result<Json<RuntimeStateResponse>, ApiError> {
@@ -1384,6 +1384,7 @@ async fn unload_runtime_model(
     (status = 200, description = "Hardware visible to the pinned ICN runtime", body = inventory_schema::HardwareSnapshotSchema),
     (status = 500, description = "Hardware discovery failed", body = ErrorResponse)
 ))]
+#[tracing::instrument(name = "icn.hardware.snapshot", skip_all, err(Debug))]
 async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot>, ApiError> {
     let provider = state
         .hardware
@@ -1399,6 +1400,7 @@ async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot
 #[utoipa::path(get, path = "/v1/models", operation_id = "listModels", tag = "models", responses(
     (status = 200, description = "Loaded models", body = ModelList)
 ))]
+#[tracing::instrument(name = "icn.models.list", skip_all, err(Debug))]
 async fn models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiError> {
     let data = match state.inventory.as_ref() {
         Some(inventory) => inventory
@@ -1428,6 +1430,7 @@ async fn models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiErr
         (status = 500, description = "Preview acquisition or assessment failed", body = ErrorResponse)
     )
 )]
+#[tracing::instrument(name = "icn.models.preview", skip_all, err(Debug))]
 async fn preview_model(
     State(state): State<AppState>,
     Json(request): Json<ModelPreviewRequest>,
@@ -1450,6 +1453,12 @@ async fn preview_model(
         (status = 404, description = "Model not found", body = ErrorResponse)
     )
 )]
+#[tracing::instrument(
+    name = "icn.models.get",
+    skip_all,
+    fields(model.id = %model_id),
+    err(Debug)
+)]
 async fn model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
@@ -1468,6 +1477,7 @@ async fn model(
         (status = 500, description = "Download could not start", body = ErrorResponse)
     )
 )]
+#[tracing::instrument(name = "icn.models.download", skip_all, err(Debug))]
 async fn download_model(
     State(state): State<AppState>,
     Json(request): Json<DownloadModelRequest>,
@@ -1520,6 +1530,12 @@ fn download_event_json(
         (status = 409, description = "Model busy, loaded, or deletion unsafe", body = ErrorResponse)
     )
 )]
+#[tracing::instrument(
+    name = "icn.models.delete",
+    skip_all,
+    fields(model.id = %model_id, delete.dry_run = query.dry_run),
+    err(Debug)
+)]
 async fn delete_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
@@ -1570,8 +1586,15 @@ fn json_value(value: impl Serialize) -> Result<JsonValue, ApiError> {
     (status = 200, description = "Loaded model and active template properties", body = PropsResponse),
     (status = 500, description = "Properties unavailable", body = ErrorResponse)
 ))]
+#[tracing::instrument(
+    name = "icn.model.properties",
+    skip_all,
+    fields(model.id = tracing::field::Empty),
+    err(Debug)
+)]
 async fn props(State(state): State<AppState>) -> Result<Json<PropsResponse>, ApiError> {
     let lease = require_backend(&state)?;
+    tracing::Span::current().record("model.id", lease.model_id());
     let properties = lease
         .backend()
         .properties()
@@ -1582,26 +1605,36 @@ async fn props(State(state): State<AppState>) -> Result<Json<PropsResponse>, Api
 #[utoipa::path(post, path = "/v1/apply-template", operation_id = "applyChatTemplate", tag = "chat",
     request_body = ApplyTemplateRequest,
     responses(
-        (status = 200, description = "Prepared llama.cpp chat prompt and constraints", body = ApplyTemplateResponse),
+        (status = 200, description = "Prepared native chat prompt and constraints", body = ApplyTemplateResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 500, description = "Template preparation failed", body = ErrorResponse)
     )
+)]
+#[tracing::instrument(
+    name = "icn.apply_template",
+    skip_all,
+    fields(model.id = tracing::field::Empty),
+    err(Debug)
 )]
 async fn apply_template(
     State(state): State<AppState>,
     Json(request): Json<ApplyTemplateRequest>,
 ) -> Result<Json<ApplyTemplateResponse>, ApiError> {
     let lease = require_backend(&state)?;
+    tracing::Span::current().record("model.id", lease.model_id());
     validate_model_selection(request.model.as_deref(), &lease)?;
     let properties = lease
         .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
     let request = validate_apply_template_request(request, &properties.reasoning)?;
-    let prepared = tokio::task::spawn_blocking(move || lease.backend().apply_template(request))
-        .await
-        .map_err(|error| ApiError::server(format!("template task failed: {error}")))?
-        .map_err(ApiError::from_inference)?;
+    let span = tracing::Span::current();
+    let prepared = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| lease.backend().apply_template(request))
+    })
+    .await
+    .map_err(|error| ApiError::server(format!("template task failed: {error}")))?
+    .map_err(ApiError::from_inference)?;
     Ok(Json(apply_template_response(prepared)))
 }
 
@@ -1611,6 +1644,12 @@ async fn apply_template(
         (status = 200, description = "OpenAI-compatible server-sent events", body = String, content_type = "text/event-stream"),
         (status = 400, description = "Invalid request", body = ErrorResponse)
     )
+)]
+#[tracing::instrument(
+    name = "icn.chat_completions",
+    skip_all,
+    fields(completion.id = tracing::field::Empty, model.id = tracing::field::Empty),
+    err(Debug)
 )]
 async fn chat_completions(
     State(state): State<AppState>,
@@ -1629,62 +1668,82 @@ async fn chat_completions(
     );
     let created = unix_timestamp();
     let model = lease.model_id().to_owned();
+    let current_span = tracing::Span::current();
+    current_span.record("completion.id", id.as_str());
+    current_span.record("model.id", model.as_str());
     let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
 
+    let span = current_span;
     tokio::task::spawn_blocking(move || {
-        let mut callback = |event: InferenceStreamEvent| {
-            let InferenceStreamEvent {
-                delta: event,
-                timings,
-            } = event;
-            let delta = inference_event_delta(event)?;
-            let timings = timings.map(|snapshot| snapshot_timings(&snapshot));
-            if emit_chunk(
-                &sender,
-                &choice_chunk(&id, created, &model, delta, None, timings),
-            ) {
-                Ok(())
-            } else {
-                Err(InferenceError::Callback(
-                    "stream consumer disconnected".into(),
-                ))
-            }
-        };
-        let generation = match lease.backend().complete(request, &mut callback) {
-            Ok(generation) => generation,
-            Err(error) => {
+        span.in_scope(|| {
+            let mut callback = |event: InferenceStreamEvent| {
+                let InferenceStreamEvent {
+                    delta: event,
+                    timings,
+                } = event;
+                let delta = inference_event_delta(event)?;
+                let timings = timings.map(|snapshot| snapshot_timings(&snapshot));
                 if emit_chunk(
                     &sender,
-                    &error_chunk(&id, created, &model, inference_error_body(&error)),
+                    &choice_chunk(&id, created, &model, delta, None, timings),
                 ) {
-                    emit_done(&sender);
+                    Ok(())
+                } else {
+                    Err(InferenceError::Callback(
+                        "stream consumer disconnected".into(),
+                    ))
                 }
+            };
+            let generation = match lease.backend().complete(request, &mut callback) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    tracing::error!(error = %error, "chat completion failed");
+                    if emit_chunk(
+                        &sender,
+                        &error_chunk(&id, created, &model, inference_error_body(&error)),
+                    ) {
+                        emit_done(&sender);
+                    }
+                    return;
+                }
+            };
+            let reason = match generation.finish_reason {
+                FinishReason::Stop => "stop",
+                FinishReason::Length => "length",
+                FinishReason::ToolCalls => "tool_calls",
+            };
+            tracing::info!(
+                completion.id = %id,
+                model.id = %model,
+                finish.reason = reason,
+                input.tokens = generation.prompt_tokens,
+                output.tokens = generation.generated_tokens,
+                queue.ms = generation.metrics.queue_ms,
+                prompt.ms = generation.metrics.prompt_ms,
+                decode.ms = generation.metrics.decode_ms,
+                "chat completion finished"
+            );
+            let terminal_timings = (!include_usage).then(|| generation_timings(&generation));
+            if !emit_chunk(
+                &sender,
+                &choice_chunk(
+                    &id,
+                    created,
+                    &model,
+                    ChunkDelta::default(),
+                    Some(reason.into()),
+                    terminal_timings,
+                ),
+            ) {
                 return;
             }
-        };
-        let reason = match generation.finish_reason {
-            FinishReason::Stop => "stop",
-            FinishReason::Length => "length",
-            FinishReason::ToolCalls => "tool_calls",
-        };
-        let terminal_timings = (!include_usage).then(|| generation_timings(&generation));
-        if !emit_chunk(
-            &sender,
-            &choice_chunk(
-                &id,
-                created,
-                &model,
-                ChunkDelta::default(),
-                Some(reason.into()),
-                terminal_timings,
-            ),
-        ) {
-            return;
-        }
-        if include_usage && !emit_chunk(&sender, &usage_chunk(&id, created, &model, &generation)) {
-            return;
-        }
-        emit_done(&sender);
+            if include_usage
+                && !emit_chunk(&sender, &usage_chunk(&id, created, &model, &generation))
+            {
+                return;
+            }
+            emit_done(&sender);
+        });
     });
     Ok(Sse::new(ReceiverStream::new(receiver))
         .keep_alive(KeepAlive::default())
@@ -1779,10 +1838,6 @@ fn timing_values(
     let prompt_n = prompt_tokens.saturating_sub(cached_prompt_tokens);
     Timings {
         cache_n: cached_prompt_tokens as u64,
-        cache_device_n: metrics.cache_device_tokens as u64,
-        cache_host_n: metrics.cache_host_tokens as u64,
-        cache_disk_n: metrics.cache_disk_tokens as u64,
-        cache_promotion_ms: metrics.cache_promotion_ms,
         prompt_n: prompt_n as u64,
         prompt_ms: metrics.prompt_ms,
         prompt_per_token_ms: per_token_ms(prompt_n, metrics.prompt_ms),
@@ -3275,10 +3330,6 @@ mod tests {
         );
         for field in [
             "cache_n",
-            "cache_device_n",
-            "cache_host_n",
-            "cache_disk_n",
-            "cache_promotion_ms",
             "prompt_n",
             "prompt_ms",
             "prompt_per_token_ms",
@@ -3658,7 +3709,7 @@ mod tests {
     }
 
     #[test]
-    fn timing_control_matches_llama_cpp_tolerant_boolean_semantics() {
+    fn timing_control_accepts_tolerant_boolean_semantics() {
         for value in [
             JsonValue::Null,
             json!(false),
@@ -3796,7 +3847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_llama_compatible_cumulative_timings_on_group_terminal_deltas() {
+    async fn streams_cumulative_native_timings_on_group_terminal_deltas() {
         let backend = ScriptedBackend {
             events: vec![
                 stream_event(InferenceEvent::ReasoningDelta {
@@ -3851,11 +3902,7 @@ mod tests {
         assert_eq!(
             timing_fields,
             BTreeSet::from([
-                "cache_device_n",
-                "cache_disk_n",
-                "cache_host_n",
                 "cache_n",
-                "cache_promotion_ms",
                 "parser_ms",
                 "predicted_ms",
                 "predicted_n",

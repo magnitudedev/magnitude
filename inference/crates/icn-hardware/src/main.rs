@@ -11,7 +11,7 @@ use serde::Serialize;
 #[derive(Debug, Parser)]
 #[command(
     name = "icn-fit",
-    about = "Estimate and fit a GGUF using pinned llama.cpp common/fit without loading model tensors"
+    about = "Estimate and fit a GGUF using the pinned native planner without loading model tensors"
 )]
 struct Args {
     /// GGUF model file to inspect.
@@ -38,10 +38,10 @@ struct Args {
     /// GPU layers, or `auto` for common/fit selection.
     #[arg(long, default_value = "auto")]
     gpu_layers: GpuLayersArg,
-    /// K-cache type (same values accepted by the pinned llama.cpp CLI).
+    /// K-cache type accepted by the pinned native backend.
     #[arg(long, default_value = "f16")]
     cache_type_k: CacheType,
-    /// V-cache type (same values accepted by the pinned llama.cpp CLI).
+    /// V-cache type accepted by the pinned native backend.
     #[arg(long, default_value = "f16")]
     cache_type_v: CacheType,
     /// Flash Attention planning policy.
@@ -178,6 +178,8 @@ fn main() -> anyhow::Result<()> {
         context_type: FitContextType::Target,
         recurrent_snapshots: 0,
         maximum_outputs: None,
+        threads: None,
+        threads_batch: None,
     };
     let request = FitRequest {
         model: args.model,
@@ -186,7 +188,7 @@ fn main() -> anyhow::Result<()> {
     let report = icn_hardware::estimate(&request).context("model fit failed")?;
     let output = Output {
         implementation: "magnitude-icn",
-        estimator: "pinned_llama_cpp_common_fit",
+        estimator: "pinned_native_fit",
         allocates_model_tensors: false,
         model: &request.model,
         options: &request.options,
@@ -201,7 +203,7 @@ fn main() -> anyhow::Result<()> {
     if report.is_success() {
         Ok(())
     } else {
-        anyhow::bail!("llama.cpp common/fit returned {:?}", report.status)
+        anyhow::bail!("native fit assessment returned {:?}", report.status)
     }
 }
 

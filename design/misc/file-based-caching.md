@@ -3,12 +3,10 @@ applies_to:
   - packages/storage/src/config/**
   - packages/storage/src/io/structured-file.ts
   - packages/storage/src/sessions/storage.ts
-  - packages/local-inference/src/local-model-index.ts
   - packages/acn/src/local-inference/**
   - packages/ai/src/provider/file-catalog.ts
   - inference/crates/icn-models/**
   - inference/crates/icn-hardware/**
-  - inference/crates/icn-engine/src/radix_cache.rs
   - inference/crates/icn-utils/**
 ---
 

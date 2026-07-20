@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub(crate) const BINDINGS_REVISION: &str = env!("ICN_BINDINGS_REVISION");
-pub(crate) const LLAMA_CPP_REVISION: &str = env!("ICN_LLAMA_CPP_REVISION");
+pub(crate) const NATIVE_BACKEND_REVISION: &str = env!("ICN_NATIVE_BACKEND_REVISION");
 pub(crate) const TARGET: &str = env!("ICN_BUILD_TARGET");
 pub(crate) const PROFILE: &str = env!("ICN_BUILD_PROFILE");
 pub(crate) const RUSTC_VERSION: &str = env!("ICN_RUSTC_VERSION");
@@ -23,10 +24,7 @@ pub(crate) fn enabled_backends() -> Vec<&'static str> {
 }
 
 pub(crate) fn json() -> Value {
-    let native_build = format!(
-        "bindings:{};llama_cpp:{}",
-        BINDINGS_REVISION, LLAMA_CPP_REVISION
-    );
+    let native_build = native_build();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "api_version": 1,
@@ -39,13 +37,19 @@ pub(crate) fn json() -> Value {
             "runtime_model_control",
             "chat_streaming"
         ],
-        "bindings_revision": BINDINGS_REVISION,
-        "llama_cpp_revision": LLAMA_CPP_REVISION,
         "target": TARGET,
         "profile": PROFILE,
         "rustc": RUSTC_VERSION,
         "backends": enabled_backends(),
     })
+}
+
+pub(crate) fn native_build() -> String {
+    let mut digest = Sha256::new();
+    digest.update(BINDINGS_REVISION.as_bytes());
+    digest.update([0]);
+    digest.update(NATIVE_BACKEND_REVISION.as_bytes());
+    format!("native_{:x}", digest.finalize())
 }
 
 #[cfg(test)]
@@ -55,12 +59,11 @@ mod tests {
     #[test]
     fn build_identity_contains_full_pins_and_cpu_backend() {
         assert_eq!(BINDINGS_REVISION.len(), 40);
-        assert_eq!(LLAMA_CPP_REVISION.len(), 40);
+        assert_eq!(NATIVE_BACKEND_REVISION.len(), 40);
         assert!(enabled_backends().contains(&"cpu"));
 
         let identity = json();
-        assert_eq!(identity["bindings_revision"], BINDINGS_REVISION);
-        assert_eq!(identity["llama_cpp_revision"], LLAMA_CPP_REVISION);
+        assert_eq!(identity["native_build"], native_build());
         assert!(
             identity["target"]
                 .as_str()

@@ -10,8 +10,6 @@ import {
   GlobalStorageLive,
   ProjectStorageLiveFromCwd,
   VersionLive,
-  defaultGlobalStorageRoot,
-  makeGlobalStoragePaths,
 } from "@magnitudedev/storage"
 import { MagnitudeRpcs } from "@magnitudedev/protocol"
 import { HandlersLive } from "./handlers"
@@ -31,11 +29,11 @@ import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import {
   LocalInferenceLive,
-  LocalInferencePlatformLive,
+  LocalInferenceChangesLive,
   LocalModelProviderSourceLive,
   LocalModelConfigurationLive,
-  ModelConfigurationPropagationLive,
 } from "./local-inference"
+import { AcnIcnLive } from "./icn-layer"
 import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
@@ -179,25 +177,15 @@ const makeAcnServicesBase = (debug: boolean) => {
     withAccount,
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
-  const withPropagation = Layer.provideMerge(ModelConfigurationPropagationLive, withRuntime)
-  const withDrafts = Layer.provideMerge(SessionDraftsLive, withPropagation)
+  const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
   const withDestroyer = Layer.provideMerge(SessionDestroyerLive, withDrafts)
   return Layer.provideMerge(AcnActivityTrackerLive, withDestroyer)
 }
 
-const localInferencePlatformLayer = () => {
-  const root = defaultGlobalStorageRoot()
-  const paths = makeGlobalStoragePaths(root)
-  return LocalInferencePlatformLive({
-    root: `${root}/local-inference`,
-    modelsRoot: `${root}/models`,
-    indexPath: paths.localModelIndexFile,
-  })
-}
-
 const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {
-  const withPackage = Layer.provideMerge(localInferencePlatformLayer(), base)
-  const withConfiguration = Layer.provideMerge(LocalModelConfigurationLive, withPackage)
+  const withChanges = Layer.provideMerge(LocalInferenceChangesLive, base)
+  const withIcn = Layer.provideMerge(AcnIcnLive, withChanges)
+  const withConfiguration = Layer.provideMerge(LocalModelConfigurationLive, withIcn)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withConfiguration)
   const withBackend = Layer.provideMerge(LocalModelProviderSourceLive, withOnboarding)
   const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withBackend)

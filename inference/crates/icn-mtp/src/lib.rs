@@ -1,21 +1,13 @@
 //! Native MTP discovery, compatibility validation, and automatic selection policy.
 //!
-//! This crate owns ICN's MTP policy. Architecture-specific capability remains in the pinned
-//! llama.cpp implementation, and all native access goes through safe `llama-cpp-2` APIs.
+//! This crate owns ICN's MTP policy. Construction of the linked contexts and native speculative
+//! controller is the capability test, and all native access goes through safe `llama-cpp-2` APIs.
 
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use icn_contracts::{
-    CacheType, ExecutionConfig, FlashAttention, GpuLayers, MtpConfig, MtpSource,
-    ResolvedExecutionPlan, SplitMode,
-};
-use llama_cpp_2::context::params::{FlashAttentionPolicy, KvCacheType, LlamaContextParams};
+use icn_contracts::{CacheType, ExecutionIntent, MtpConfig, MtpSource};
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams, LlamaSplitMode};
-use llama_cpp_2::mtp::{
-    MtpModelKind, MtpPreflightError, MtpPreflightParams, inspect_mtp_model, preflight_mtp,
-};
+use llama_cpp_2::mtp::{MtpPreflightError, MtpPreflightParams, preflight_mtp};
 
 /// Pinned llama.cpp's default speculative policy. Capability selection is exact; these values are
 /// runtime tuning policy and can be calibrated independently.
@@ -38,14 +30,6 @@ pub enum SelectionError {
     Backend(String),
     #[error("invalid native execution parameters: {0}")]
     InvalidExecution(String),
-    #[error("failed to inspect MTP artifact {path}: {source}")]
-    Inspection {
-        path: PathBuf,
-        #[source]
-        source: MtpPreflightError,
-    },
-    #[error("target artifact is an MTP draft and cannot be served as the target model")]
-    DraftUsedAsTarget,
     #[error("bundled MTP failed native compatibility preflight: {0}")]
     BundledPreflight(#[source] MtpPreflightError),
     #[error("selected MTP artifact is incompatible: {0}")]
@@ -59,10 +43,10 @@ pub enum SelectionError {
 /// Selection is intentionally small and deterministic:
 ///
 /// 1. Use executable MTP bundled in the target when native preflight succeeds.
-/// 2. Otherwise use the only separate candidate that native linked-context preflight accepts.
+/// 2. Otherwise use the only separate candidate that native execution preflight accepts.
 /// 3. Disable MTP when none work, and reject ambiguity rather than guessing.
 pub fn select_mtp(
-    plan: &ResolvedExecutionPlan,
+    plan: &ExecutionIntent,
     candidates: CandidatePolicy<'_>,
 ) -> Result<MtpConfig, SelectionError> {
     let backend =
@@ -77,66 +61,42 @@ pub fn select_mtp(
 /// preflight; selection itself still loads no model tensors.
 pub fn select_mtp_with_backend(
     _backend: &LlamaBackend,
-    plan: &ResolvedExecutionPlan,
+    plan: &ExecutionIntent,
     candidates: CandidatePolicy<'_>,
 ) -> Result<MtpConfig, SelectionError> {
-    let model_params = native_model_params(&plan.execution)?;
-    let target_context = native_context_params(plan, &plan.execution, DEFAULT_N_MAX);
-    let target_info = inspect_mtp_model(&plan.model_path, &model_params).map_err(|source| {
-        SelectionError::Inspection {
-            path: plan.model_path.clone(),
-            source,
-        }
-    })?;
-
-    match target_info.map(|info| info.kind) {
-        Some(MtpModelKind::Bundled) => {
-            preflight_mtp(
-                &plan.model_path,
-                None,
-                &MtpPreflightParams {
-                    target_model: &model_params,
-                    target_context: &target_context,
-                    draft_model: None,
-                    draft_context: None,
-                },
-            )
-            .map_err(SelectionError::BundledPreflight)?;
-            return Ok(enabled(MtpSource::Bundled));
-        }
-        Some(MtpModelKind::Draft) => return Err(SelectionError::DraftUsedAsTarget),
-        None => {}
+    let native = icn_hardware::mtp_preflight_parameters(plan, DEFAULT_N_MAX)
+        .map_err(|error| SelectionError::InvalidExecution(error.to_string()))?;
+    let model_params = native.model_params.as_ref().get_ref();
+    let bundled = preflight_mtp(
+        &plan.model_path,
+        None,
+        &MtpPreflightParams {
+            target_model: model_params,
+            target_context: &native.target_context,
+            draft_model: None,
+            draft_context: None,
+        },
+    );
+    match bundled {
+        Ok(_) => return Ok(enabled(MtpSource::Bundled)),
+        Err(MtpPreflightError::ContextUnsupported) => {}
+        Err(error) => return Err(SelectionError::BundledPreflight(error)),
     }
 
     let paths: Vec<&Path> = match candidates {
         CandidatePolicy::Automatic(paths) => paths.iter().map(PathBuf::as_path).collect(),
         CandidatePolicy::Explicit(path) => vec![path],
     };
-    let draft_context = native_context_params(plan, &plan.execution, 0);
     let mut compatible = Vec::new();
     for path in paths {
-        let info = inspect_mtp_model(path, &model_params).map_err(|source| {
-            SelectionError::Inspection {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-        if !matches!(info.map(|info| info.kind), Some(MtpModelKind::Draft)) {
-            if matches!(candidates, CandidatePolicy::Explicit(_)) {
-                return Err(SelectionError::ExplicitCandidate(
-                    MtpPreflightError::DraftNotSupported,
-                ));
-            }
-            continue;
-        }
         let result = preflight_mtp(
             &plan.model_path,
             Some(path),
             &MtpPreflightParams {
-                target_model: &model_params,
-                target_context: &target_context,
-                draft_model: Some(&model_params),
-                draft_context: Some(&draft_context),
+                target_model: model_params,
+                target_context: &native.target_context,
+                draft_model: Some(model_params),
+                draft_context: Some(&native.draft_context),
             },
         );
         match result {
@@ -144,18 +104,8 @@ pub fn select_mtp_with_backend(
             Err(error) if matches!(candidates, CandidatePolicy::Explicit(_)) => {
                 return Err(SelectionError::ExplicitCandidate(error));
             }
-            Err(
-                MtpPreflightError::VocabularyMismatch
-                | MtpPreflightError::EmbeddingMismatch
-                | MtpPreflightError::ContextUnsupported
-                | MtpPreflightError::DraftNotSupported,
-            ) => {}
-            Err(error) => {
-                return Err(SelectionError::Inspection {
-                    path: path.to_path_buf(),
-                    source: error,
-                });
-            }
+            Err(MtpPreflightError::ContextUnsupported) => {}
+            Err(error) => return Err(SelectionError::ExplicitCandidate(error)),
         }
     }
 
@@ -182,85 +132,6 @@ fn enabled(source: MtpSource) -> MtpConfig {
         p_min: DEFAULT_P_MIN,
         cache_type_k: CacheType::F16,
         cache_type_v: CacheType::F16,
-    }
-}
-
-fn native_model_params(execution: &ExecutionConfig) -> Result<LlamaModelParams, SelectionError> {
-    let params = LlamaModelParams::default()
-        .with_gpu_layers(match execution.gpu_layers {
-            GpuLayers::Auto => LlamaGpuLayers::Auto,
-            GpuLayers::All => LlamaGpuLayers::All,
-            GpuLayers::Count(value) => LlamaGpuLayers::Count(value),
-        })
-        .with_use_mmap(execution.use_mmap)
-        .with_use_mlock(execution.use_mlock)
-        .with_split_mode(match execution.split_mode {
-            SplitMode::None => LlamaSplitMode::None,
-            SplitMode::Layer => LlamaSplitMode::Layer,
-            SplitMode::Row => LlamaSplitMode::Row,
-            SplitMode::Tensor => LlamaSplitMode::Tensor,
-        });
-    match &execution.tensor_split {
-        Some(weights) => params
-            .with_tensor_split(weights)
-            .map_err(|error| SelectionError::InvalidExecution(error.to_string())),
-        None => Ok(params),
-    }
-}
-
-fn native_context_params(
-    plan: &ResolvedExecutionPlan,
-    execution: &ExecutionConfig,
-    recurrent_snapshots: u32,
-) -> LlamaContextParams {
-    let threads = execution
-        .threads
-        .map(NonZeroU32::get)
-        .unwrap_or_else(default_threads);
-    let threads_batch = execution.threads_batch.map_or(threads, NonZeroU32::get);
-    let outputs = plan
-        .max_sequences
-        .saturating_mul(recurrent_snapshots.saturating_add(1))
-        .min(plan.batch_size);
-    LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(plan.context_size))
-        .with_n_batch(plan.batch_size)
-        .with_n_ubatch(plan.ubatch_size)
-        .with_n_seq_max(plan.max_sequences)
-        .with_n_outputs_max(NonZeroU32::new(outputs))
-        .with_n_threads(threads.min(i32::MAX as u32) as i32)
-        .with_n_threads_batch(threads_batch.min(i32::MAX as u32) as i32)
-        .with_type_k(native_cache_type(execution.cache_type_k))
-        .with_type_v(native_cache_type(execution.cache_type_v))
-        .with_offload_kqv(execution.offload_kqv)
-        .with_op_offload(execution.operation_offload)
-        .with_swa_full(execution.swa_full)
-        .with_kv_unified(execution.kv_unified)
-        .with_n_rs_seq(recurrent_snapshots)
-        .with_flash_attention(match execution.flash_attention {
-            FlashAttention::Auto => FlashAttentionPolicy::Auto,
-            FlashAttention::Disabled => FlashAttentionPolicy::Disabled,
-            FlashAttention::Enabled => FlashAttentionPolicy::Enabled,
-        })
-}
-
-fn default_threads() -> u32 {
-    std::thread::available_parallelism()
-        .map(|value| u32::try_from(value.get()).unwrap_or(u32::MAX))
-        .unwrap_or(1)
-}
-
-fn native_cache_type(cache_type: CacheType) -> KvCacheType {
-    match cache_type {
-        CacheType::F32 => KvCacheType::F32,
-        CacheType::F16 => KvCacheType::F16,
-        CacheType::Bf16 => KvCacheType::BF16,
-        CacheType::Q8_0 => KvCacheType::Q8_0,
-        CacheType::Q4_0 => KvCacheType::Q4_0,
-        CacheType::Q4_1 => KvCacheType::Q4_1,
-        CacheType::Iq4Nl => KvCacheType::IQ4_NL,
-        CacheType::Q5_0 => KvCacheType::Q5_0,
-        CacheType::Q5_1 => KvCacheType::Q5_1,
     }
 }
 
