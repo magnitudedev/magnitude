@@ -7,11 +7,10 @@
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { RpcClient } from "@effect/rpc"
 import {
   DaemonSpawnerTag,
   makeLocalDaemonSpawner,
-  recoveringProtocolLayer,
+  makeRecoveringProtocolLayer,
   type DaemonSpawner,
   type SpawnProcess,
 } from "@magnitudedev/sdk"
@@ -86,7 +85,7 @@ export interface TerminalPlatformOptions {
   readonly effectLoggingLayer?: Layer.Layer<never, never, never>
 }
 
-export function createTerminalPlatform(options: TerminalPlatformOptions = {}): Platform {
+export async function createTerminalPlatform(options: TerminalPlatformOptions = {}): Promise<Platform> {
   const effectLoggingLayer = options.effectLoggingLayer
     ?? makeCliEffectLoggingLayer({ debug: options.debug === true })
   const withSpawnCommand = (spawner: DaemonSpawner): DaemonSpawner =>
@@ -97,8 +96,7 @@ export function createTerminalPlatform(options: TerminalPlatformOptions = {}): P
         }
       : spawner
 
-  const spawnerLayer = Layer.effect(
-    DaemonSpawnerTag,
+  const spawner = await Effect.runPromise(
     makeLocalDaemonSpawner(bunSpawn, {
       ...(options.debug ? { debug: true } : {}),
     }).pipe(
@@ -106,9 +104,10 @@ export function createTerminalPlatform(options: TerminalPlatformOptions = {}): P
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
     ),
   )
-
-  const protocolLayer = recoveringProtocolLayer().pipe(
-    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, spawnerLayer, effectLoggingLayer)),
+  const protocolLayer = (await Effect.runPromise(
+    makeRecoveringProtocolLayer().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
+  )).pipe(
+    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)),
   )
 
   return {

@@ -3,7 +3,7 @@ import type { FromClientEncoded } from "@effect/rpc/RpcMessage"
 import * as HttpBody from "@effect/platform/HttpBody"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { Array as Arr, Chunk, Effect, Either, Layer, Stream } from "effect"
-import type { JitDaemonResolver } from "./daemon-resolver"
+import type { JitDaemonCoordinator } from "./daemon-resolver"
 import type { ResidentStreamPolicy } from "./resident-streams"
 import {
   type JitRpcTransportError,
@@ -23,7 +23,7 @@ import { isChunkMessage, isFromServerEncoded, isTerminalMessage } from "./transp
 const { Protocol } = RpcClient
 
 export interface RecoveringProtocolOptions<InfraError> {
-  readonly resolver: JitDaemonResolver<InfraError>
+  readonly coordinator: JitDaemonCoordinator<InfraError>
   readonly rpcPath: string
   readonly streamPolicy: ResidentStreamPolicy
   readonly classifyInfraError: (error: InfraError) => RpcClientError.RpcClientError
@@ -115,9 +115,10 @@ export const makeRecoveringProtocol = <InfraError>(
 
           return Effect.gen(function* () {
             while (!done) {
-              const endpoint = yield* options.resolver.resolve.pipe(
+              const lease = yield* options.coordinator.ensure.pipe(
                 Effect.mapError(options.classifyInfraError),
               )
+              const endpoint = lease.endpoint
               progressed = false
               yield* Effect.logDebug("jit-rpc attempt").pipe(
                 Effect.annotateLogs({ tag: request.tag, id: request.id, url: endpoint.url }),
@@ -140,7 +141,7 @@ export const makeRecoveringProtocol = <InfraError>(
                   error: failure._tag,
                 }),
               )
-              yield* options.resolver.invalidate(endpoint)
+              yield* options.coordinator.invalidate(lease)
               if (done) return
 
               failuresWithoutProgress = progressed ? 1 : failuresWithoutProgress + 1

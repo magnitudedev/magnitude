@@ -7,7 +7,7 @@ export { makeLocalDaemonSpawner, type SpawnProcess, type LocalSpawnerOptions } f
 export { makeRemoteDaemonSpawner } from "./remote-spawner"
 export {
   makeRecoveringAcnClient,
-  recoveringProtocolLayer,
+  makeRecoveringProtocolLayer,
   type RecoveringClientOptions,
 } from "./recovering-client"
 

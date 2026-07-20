@@ -2,7 +2,7 @@
  * Dev server — the single server for `bun web`.
  *
  * One process, one port. This server:
- * 1. Ensures a daemon on startup (via makeLocalDaemonSpawner + Bun.spawn)
+ * 1. Lazily ensures a daemon on first RPC demand
  * 2. Serves the web app via Vite's middleware
  * 3. Handles /discover + /spawn (daemon lifecycle)
  * 4. Proxies /rpc, /health, /logs to the daemon
@@ -38,10 +38,17 @@ const bunSpawn: SpawnProcess = (command) => {
 
 const rt = Runtime.defaultRuntime
 
-async function getSpawner() {
+async function createSpawner() {
   return Runtime.runPromise(rt)(makeLocalDaemonSpawner(bunSpawn).pipe(
     Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer)),
   ))
+}
+
+let spawnerPromise: ReturnType<typeof createSpawner> | null = null
+
+async function getSpawner() {
+  spawnerPromise ??= createSpawner()
+  return spawnerPromise
 }
 
 // ─── Daemon URL ───────────────────────────────────────────────────────
@@ -63,23 +70,6 @@ async function spawnDaemon(command: string[] | undefined): Promise<string> {
 
 const acnSourcePath = resolve(import.meta.dir, "..", "..", "packages", "acn", "src", "binary.ts")
 const defaultSpawnCommand = ["bun", acnSourcePath, "serve", "--register"]
-
-// ─── Ensure daemon on startup ─────────────────────────────────────────
-
-console.log("[dev] Ensuring ACN daemon...")
-daemonUrl = (await discoverDaemonUrl()) ?? ""
-if (!daemonUrl) {
-  try {
-    daemonUrl = await spawnDaemon(defaultSpawnCommand)
-  } catch (err) {
-    console.error("[dev] Failed to spawn daemon:", String(err))
-  }
-}
-if (daemonUrl) {
-  console.log(`[dev] Daemon at ${daemonUrl}`)
-} else {
-  console.warn("[dev] No daemon available — /spawn will start one on demand")
-}
 
 // ─── HTTP server with Vite middleware ─────────────────────────────────
 

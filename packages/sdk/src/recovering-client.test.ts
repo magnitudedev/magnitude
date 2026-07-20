@@ -7,7 +7,7 @@ import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { MagnitudeRpcs, SessionNotFound } from "@magnitudedev/protocol"
 import { DaemonSpawnerTag, type DaemonSpawner } from "./daemon-spawner"
-import { recoveringProtocolLayer } from "./recovering-client"
+import { makeRecoveringProtocolLayer } from "./recovering-client"
 import { DaemonSpawnFailed } from "./errors"
 import type { AcnClient } from "./protocol"
 
@@ -103,10 +103,12 @@ const withClient = <A, E>(
   Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
+        const protocolLayer = yield* makeRecoveringProtocolLayer().pipe(
+          Effect.provideService(DaemonSpawnerTag, spawner),
+        )
         const client = yield* RpcClient.make(MagnitudeRpcs).pipe(
           Effect.provide(
-            recoveringProtocolLayer().pipe(
-              Layer.provide(Layer.succeed(DaemonSpawnerTag, spawner)),
+            protocolLayer.pipe(
               Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
             )
           )
@@ -151,6 +153,31 @@ const collectPaths = (acn: AcnClient) =>
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("recovering client — operation contract", () => {
+  it("shares one lazy resolver across independent builds of one protocol layer", async () => {
+    const { spawner, discoverCalls, spawnCalls } = makeFakeSpawner({
+      discover: [Option.some("http://daemon-1")],
+    })
+    const { client: http } = makeFakeHttp([
+      { kind: "lines", make: (id) => [exitMessage("CheckFileExists", id, Exit.succeed(true))] },
+    ])
+    const protocolLayer = (await Effect.runPromise(
+      makeRecoveringProtocolLayer().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
+    )).pipe(
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
+    )
+    const call = Effect.scoped(
+      RpcClient.make(MagnitudeRpcs).pipe(
+        Effect.provide(protocolLayer),
+        Effect.flatMap((acn) => acn.CheckFileExists({ cwd: "/project", path: "/x" })),
+      ),
+    )
+
+    expect(await Effect.runPromise(call)).toBe(true)
+    expect(await Effect.runPromise(call)).toBe(true)
+    expect(discoverCalls()).toBe(1)
+    expect(spawnCalls()).toBe(0)
+  })
+
   it("dispatches optimistically against a discovered daemon (no spawn)", async () => {
     const { spawner, spawnCalls } = makeFakeSpawner({ discover: [Option.some("http://daemon-1")] })
     const { client, calls } = makeFakeHttp([

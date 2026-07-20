@@ -53,7 +53,7 @@ type RuntimeStartClaim =
   | { readonly _tag: "joiner"; readonly deferred: RuntimeStartDeferred }
 
 export const AgentRuntimeLive: Layer.Layer<AgentRuntime, never, AgentFactory | SessionStore | SessionRuntimeOptionsStore> =
-  Layer.effect(
+  Layer.scoped(
     AgentRuntime,
     Effect.gen(function* () {
       const factory = yield* AgentFactory
@@ -271,6 +271,12 @@ export const AgentRuntimeLive: Layer.Layer<AgentRuntime, never, AgentFactory | S
         }
       })
 
+      const disposeAll = Effect.fn("acn.agent-runtime.dispose-all")(function* () {
+        const ids = [...(yield* Ref.get(entries)).keys()]
+        yield* Effect.forEach(ids, dispose, { discard: true })
+      })
+      yield* Effect.addFinalizer(() => disposeAll())
+
       return {
         getLive,
         getAllEntries: Effect.fn("acn.agent-runtime.get-all-entries")(function* () {
@@ -283,10 +289,7 @@ export const AgentRuntimeLive: Layer.Layer<AgentRuntime, never, AgentFactory | S
         retainEntry,
         releaseEntry,
         evictIdleSessions,
-        disposeAll: Effect.fn("acn.agent-runtime.dispose-all")(function* () {
-          const ids = [...(yield* Ref.get(entries)).keys()]
-          yield* Effect.forEach(ids, dispose, { discard: true })
-        }),
+        disposeAll,
         hasActiveWork: Effect.gen(function* () {
           const liveEntries = [...(yield* Ref.get(entries)).values()]
           for (const entry of liveEntries) {

@@ -8,7 +8,7 @@
 export { DaemonSpawnerTag } from "./daemon-spawner"
 export type { DaemonSpawner } from "./daemon-spawner"
 export { makeRemoteDaemonSpawner } from "./remote-spawner"
-export { recoveringProtocolLayer, makeRecoveringAcnClient } from "./recovering-client"
+export { makeRecoveringProtocolLayer, makeRecoveringAcnClient } from "./recovering-client"
 export type { RecoveringClientOptions } from "./recovering-client"
 export {
   NoDaemon,

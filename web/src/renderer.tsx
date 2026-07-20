@@ -28,7 +28,7 @@ injectCssVars()
 const root = createRoot(document.getElementById("root")!)
 
 async function main() {
-  const platform = createBrowserPlatform("")
+  const platform = await createBrowserPlatform("")
   const agentClientTag = createAgentClient(platform.protocolLayer)
 
   root.render(
