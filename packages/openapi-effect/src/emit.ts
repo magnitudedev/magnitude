@@ -549,7 +549,7 @@ const emitOperations = (
   ir: ProtocolIr,
   config: OpenApiEffectConfig
 ): string => {
-  const needsSchemas = [...ir.operations].some(Operation.$is("Stream"));
+  const needsSchemas = ir.operations.length > 0;
   const schemaImport = needsSchemas
     ? `import * as HttpApiSchema from "@effect/platform/HttpApiSchema"
 import * as S from "effect/Schema"
@@ -560,12 +560,78 @@ import * as Schemas from ${quote(
   const descriptors = [...ir.operations]
     .map((operation) =>
       Operation.$match(operation, {
-        Http: (value) =>
-          `export const ${value.name}Operation = { operationId: ${quote(
-            value.operationId
-          )}, transport: "http", method: ${quote(value.method)}, path: ${quote(
-            value.path
-          )}, group: ${quote(value.group)} } as const`,
+        Http: (value) => {
+          const pathParameters = value.parameters.filter(
+            ({ location }) => location === "Path"
+          );
+          const queryParameters = value.parameters.filter(
+            ({ location }) => location === "Query"
+          );
+          const headerParameters = value.parameters.filter(
+            ({ location }) => location === "Header"
+          );
+          const responses = (success: boolean) =>
+            value.responses
+              .filter((response) => response.success === success)
+              .map(
+                (response) =>
+                  `{ status: ${response.status}, schema: ${responseSchema(
+                    response,
+                    ir.components
+                  )}${Option.match(response.mediaType, {
+                    onNone: () => "",
+                    onSome: (mediaType) => `, mediaType: ${quote(mediaType)}`,
+                  })} }`
+              )
+              .join(", ");
+          const fields = [
+            `operationId: ${quote(value.operationId)}`,
+            `transport: "http"`,
+            `method: ${quote(value.method)}`,
+            `path: ${quote(value.path)}`,
+            `group: ${quote(value.group)}`,
+            `successes: [${responses(true)}]`,
+            `errors: [${responses(false)}]`,
+            ...(pathParameters.length > 0
+              ? [
+                  `pathParameters: ${emitParameterStruct(
+                    pathParameters,
+                    ir.components
+                  )}`,
+                ]
+              : []),
+            ...(queryParameters.length > 0
+              ? [
+                  `queryParameters: ${emitParameterStruct(
+                    queryParameters,
+                    ir.components
+                  )}`,
+                ]
+              : []),
+            ...(headerParameters.length > 0
+              ? [
+                  `headers: ${emitParameterStruct(
+                    headerParameters,
+                    ir.components
+                  )}`,
+                ]
+              : []),
+            ...(Option.isSome(value.body)
+              ? [
+                  `payload: ${bodySchema(
+                    value.body.value.mediaType,
+                    value.body.value.schema,
+                    ir.components
+                  )}`,
+                  `payloadMediaType: ${quote(value.body.value.mediaType)}`,
+                  `payloadRequired: ${value.body.value.required}`,
+                ]
+              : []),
+          ];
+          return `export const ${value.name}Operation = { ${fields.join(
+            ", "
+          )} } as const`;
+        },
         Stream: (value) => {
           const pathParameters = value.parameters.filter(
             ({ location }) => location === "Path"
@@ -637,9 +703,9 @@ import * as Schemas from ${quote(
                   body.schema,
                   ir.components
                 );
-                return `payload: ${
-                  body.required ? schema : `S.OptionFromUndefinedOr(${schema})`
-                }`;
+                return `payload: ${schema}, payloadMediaType: ${quote(
+                  body.mediaType
+                )}, payloadRequired: ${body.required}`;
               })
             ),
             `errors: [${value.errors
@@ -648,7 +714,10 @@ import * as Schemas from ${quote(
                   `{ status: ${response.status}, schema: ${responseSchema(
                     response,
                     ir.components
-                  )} }`
+                  )}${Option.match(response.mediaType, {
+                    onNone: () => "",
+                    onSome: (mediaType) => `, mediaType: ${quote(mediaType)}`,
+                  })} }`
               )
               .join(", ")}]`,
           ];
@@ -662,6 +731,80 @@ import * as Schemas from ${quote(
   return `${generatedHeader}${schemaImport}${descriptors}\n`;
 };
 
+const emitClient = (ir: ProtocolIr, config: OpenApiEffectConfig): string => {
+  const apiName = pascalIdentifier(config.apiName);
+  const clientName = `${apiName}Client`;
+  const makeName = `make${clientName}`;
+  const groups = [
+    ...new Set([...ir.operations].map(({ groupName }) => groupName)),
+  ].sort();
+  const groupFields = groups
+    .map((groupName) => {
+      const ordinary = [...ir.operations].filter(
+        (operation) =>
+          Operation.$is("Http")(operation) && operation.groupName === groupName
+      );
+      const streams = [...ir.operations].filter(
+        (operation) =>
+          Operation.$is("Stream")(operation) &&
+          operation.groupName === groupName
+      );
+      const entries = [
+        ...ordinary.map(
+          ({ name }) =>
+            `${JSON.stringify(
+              name
+            )}: makeHttpOperation(http, options, Operations.${name}Operation)`
+        ),
+        ...streams.map(
+          ({ name }) =>
+            `${JSON.stringify(
+              name
+            )}: makeStreamOperation(http, options, Operations.${name}Operation)`
+        ),
+      ];
+      return `${JSON.stringify(groupName)}: { ${entries.join(", ")} }`;
+    })
+    .join(",\n");
+  return `${generatedHeader}import * as HttpClient from "@effect/platform/HttpClient"
+import { Context, Effect, Layer } from "effect"
+import { makeHttpOperation, makeStreamOperation, type GeneratedClientOptions } from "@magnitudedev/openapi-effect/client-runtime"
+import * as Operations from ${quote(
+    moduleImport(config.output.client, config.output.operations)
+  )}
+
+export const ${makeName} = (options: GeneratedClientOptions) =>
+  Effect.gen(function* () {
+    const http = yield* HttpClient.HttpClient
+    return {
+      ${groupFields}
+    }
+  })
+
+export type ${clientName} = Effect.Effect.Success<ReturnType<typeof ${makeName}>>
+export const ${clientName} = Context.GenericTag<${clientName}>(${quote(
+    `@generated/${clientName}`
+  )})
+export const ${clientName}Live = (options: GeneratedClientOptions) =>
+  Layer.effect(${clientName}, ${makeName}(options))
+`;
+};
+
+const emitIndex = (config: OpenApiEffectConfig): string => {
+  const targets = [
+    config.output.schemas,
+    config.output.operations,
+    config.output.api,
+    config.output.client,
+  ];
+  return `${generatedHeader}${targets
+    .map(
+      (target) =>
+        `export * from ${quote(moduleImport(config.output.index, target))}`
+    )
+    .join("\n")}\n`;
+};
+
 export const emitProject = (
   ir: ProtocolIr,
   config: OpenApiEffectConfig
@@ -670,6 +813,8 @@ export const emitProject = (
     [config.output.schemas, emitSchemas(ir)],
     [config.output.operations, emitOperations(ir, config)],
     [config.output.api, emitApi(ir, config, config.output.schemas)],
+    [config.output.client, emitClient(ir, config)],
+    [config.output.index, emitIndex(config)],
   ] as const;
   return Effect.try({
     try: () =>

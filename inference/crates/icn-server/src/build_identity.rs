@@ -23,8 +23,22 @@ pub(crate) fn enabled_backends() -> Vec<&'static str> {
 }
 
 pub(crate) fn json() -> Value {
+    let native_build = format!(
+        "bindings:{};llama_cpp:{}",
+        BINDINGS_REVISION, LLAMA_CPP_REVISION
+    );
     json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "api_version": 1,
+        "native_build": native_build,
+        "capabilities": [
+            "hardware",
+            "model_inventory",
+            "model_preview",
+            "model_download",
+            "runtime_model_control",
+            "chat_streaming"
+        ],
         "bindings_revision": BINDINGS_REVISION,
         "llama_cpp_revision": LLAMA_CPP_REVISION,
         "target": TARGET,

@@ -22,14 +22,14 @@ async function sha256(path: string): Promise<string> {
   return Buffer.from(hash).toString('hex')
 }
 
-async function verifyTarball(path: string, expectedEntry: string): Promise<void> {
+async function verifyTarball(path: string, expectedEntries: ReadonlyArray<string>): Promise<void> {
   const listing = (await $`tar -tzf ${path}`.text())
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
-  if (listing.length !== 1 || listing[0] !== expectedEntry) {
+  if (JSON.stringify(listing.sort()) !== JSON.stringify([...expectedEntries].sort())) {
     throw new Error(
-      `[release] ${basename(path)} contains ${JSON.stringify(listing)}, expected ${expectedEntry}`
+      `[release] ${basename(path)} contains ${JSON.stringify(listing)}, expected ${JSON.stringify(expectedEntries)}`
     )
   }
 }
@@ -61,8 +61,12 @@ export async function buildReleaseArtifacts(
   const acnTarball = await buildAcnBinary(target, outDir)
   const cliTarball = await buildCliBinary(target, outDir)
 
-  await verifyTarball(acnTarball, 'magnitude-acn' + info.executableExt)
-  await verifyTarball(cliTarball, 'magnitude' + info.executableExt)
+  await verifyTarball(acnTarball, [
+    'magnitude-acn' + info.executableExt,
+    'magnitude-icn' + info.executableExt,
+    'magnitude-icn-manifest.json',
+  ])
+  await verifyTarball(cliTarball, ['magnitude' + info.executableExt])
 
   const artifacts = [
     await manifestEntry(cliTarball, 'cli', info),

@@ -8,7 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./generated": "./src/generated/index.ts",
-    "./stream": "./src/stream.ts"
+    "./lifecycle": "./src/lifecycle/index.ts"
   },
   "scripts": {
     "generate": "bun run scripts/generate.ts",
@@ -19,6 +19,7 @@
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@magnitudedev/openapi-effect": "workspace:*",
+    "@noble/hashes": "^2.2.0",
     "effect": "3.21.2"
   },
   "devDependencies": {

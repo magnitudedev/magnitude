@@ -2,15 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{future::BoxFuture, stream::BoxStream};
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
     ChatTemplateRequest, CompletionBackend, DownloadModelRequest, ExecutionConfig,
@@ -54,12 +57,161 @@ const fn default_true() -> bool {
 
 #[derive(Clone)]
 pub struct AppState {
-    backend: Arc<dyn CompletionBackend>,
-    model_aliases: Arc<BTreeSet<String>>,
+    backends: BackendRegistry,
     inventory: Option<Arc<dyn ModelInventory>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
     previewer: Option<Arc<dyn ModelPreviewer>>,
+    runtime: Option<Arc<dyn RuntimeController>>,
+    identity: ServerIdentity,
+    authorization: Option<Arc<str>>,
     next_id: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerIdentity {
+    pub instance_id: String,
+    pub api_version: u32,
+    pub native_build: String,
+}
+
+impl Default for ServerIdentity {
+    fn default() -> Self {
+        Self {
+            instance_id: "embedded".to_owned(),
+            api_version: 1,
+            native_build: "unknown".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BackendRegistry {
+    inner: Arc<RwLock<BackendRegistryState>>,
+    active_leases: Arc<AtomicU64>,
+    mutating: Arc<AtomicBool>,
+}
+
+struct BackendRegistryState {
+    backend: Option<Arc<dyn CompletionBackend>>,
+    model_aliases: Arc<BTreeSet<String>>,
+    generation: u64,
+}
+
+pub struct BackendLease {
+    backend: Arc<dyn CompletionBackend>,
+    model_aliases: Arc<BTreeSet<String>>,
+    generation: u64,
+    active_leases: Arc<AtomicU64>,
+}
+
+pub struct BackendMutationGuard {
+    mutating: Arc<AtomicBool>,
+}
+
+impl Drop for BackendMutationGuard {
+    fn drop(&mut self) {
+        self.mutating.store(false, Ordering::Release);
+    }
+}
+
+impl BackendLease {
+    pub fn backend(&self) -> &Arc<dyn CompletionBackend> {
+        &self.backend
+    }
+
+    pub fn model_id(&self) -> &str {
+        self.backend.model_id()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn accepts_model(&self, requested: &str) -> bool {
+        requested == self.backend.model_id() || self.model_aliases.contains(requested)
+    }
+}
+
+impl Drop for BackendLease {
+    fn drop(&mut self) {
+        self.active_leases.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl BackendRegistry {
+    pub fn empty() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BackendRegistryState {
+                backend: None,
+                model_aliases: Arc::new(BTreeSet::new()),
+                generation: 0,
+            })),
+            active_leases: Arc::new(AtomicU64::new(0)),
+            mutating: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn with_backend(backend: Arc<dyn CompletionBackend>) -> Self {
+        let registry = Self::empty();
+        registry.replace(backend, BTreeSet::new());
+        registry
+    }
+
+    pub fn lease(&self) -> Option<BackendLease> {
+        if self.mutating.load(Ordering::Acquire) {
+            return None;
+        }
+        let state = self.inner.read().ok()?;
+        let backend = state.backend.clone()?;
+        self.active_leases.fetch_add(1, Ordering::AcqRel);
+        if self.mutating.load(Ordering::Acquire) {
+            self.active_leases.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(BackendLease {
+            backend,
+            model_aliases: Arc::clone(&state.model_aliases),
+            generation: state.generation,
+            active_leases: Arc::clone(&self.active_leases),
+        })
+    }
+
+    pub fn active_leases(&self) -> u64 {
+        self.active_leases.load(Ordering::Acquire)
+    }
+
+    pub fn try_begin_mutation(&self) -> Option<BackendMutationGuard> {
+        self.mutating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        if self.active_leases() > 0 {
+            self.mutating.store(false, Ordering::Release);
+            return None;
+        }
+        Some(BackendMutationGuard {
+            mutating: Arc::clone(&self.mutating),
+        })
+    }
+
+    pub fn replace(&self, backend: Arc<dyn CompletionBackend>, aliases: BTreeSet<String>) -> u64 {
+        let mut state = self.inner.write().expect("backend registry lock poisoned");
+        state.generation = state.generation.saturating_add(1);
+        state.backend = Some(backend);
+        state.model_aliases = Arc::new(aliases);
+        state.generation
+    }
+
+    pub fn clear(&self) -> u64 {
+        let mut state = self.inner.write().expect("backend registry lock poisoned");
+        state.generation = state.generation.saturating_add(1);
+        state.backend = None;
+        state.model_aliases = Arc::new(BTreeSet::new());
+        state.generation
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.read().map(|state| state.generation).unwrap_or(0)
+    }
 }
 
 impl AppState {
@@ -70,11 +222,26 @@ impl AppState {
     /// Construct API state from a backend shared with another server-owned service.
     pub fn from_shared_backend(backend: Arc<dyn CompletionBackend>) -> Self {
         Self {
-            backend,
-            model_aliases: Arc::new(BTreeSet::new()),
+            backends: BackendRegistry::with_backend(backend),
             inventory: None,
             hardware: None,
             previewer: None,
+            runtime: None,
+            identity: ServerIdentity::default(),
+            authorization: None,
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn model_free(backends: BackendRegistry) -> Self {
+        Self {
+            backends,
+            inventory: None,
+            hardware: None,
+            previewer: None,
+            runtime: None,
+            identity: ServerIdentity::default(),
+            authorization: None,
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -82,8 +249,12 @@ impl AppState {
     /// Accept an additional OpenAI request model name for the loaded backend.
     ///
     /// The backend's stable model ID remains authoritative; aliases are routing names only.
-    pub fn with_model_alias(mut self, alias: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.model_aliases).insert(alias.into());
+    pub fn with_model_alias(self, alias: impl Into<String>) -> Self {
+        if let Some(lease) = self.backends.lease() {
+            let mut aliases = (*lease.model_aliases).clone();
+            aliases.insert(alias.into());
+            self.backends.replace(Arc::clone(lease.backend()), aliases);
+        }
         self
     }
 
@@ -101,29 +272,159 @@ impl AppState {
         self.previewer = Some(previewer);
         self
     }
+
+    pub fn with_runtime(mut self, runtime: Arc<dyn RuntimeController>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_identity(mut self, identity: ServerIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub fn with_authorization(mut self, capability: impl Into<Arc<str>>) -> Self {
+        self.authorization = Some(capability.into());
+        self
+    }
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let mut protected = Router::new()
         .route("/v1/hardware", get(hardware))
         .route("/v1/models", get(models))
         .route("/v1/models/preview", post(preview_model))
         .route("/v1/models/download", post(download_model))
         .route("/v1/models/{model_id}", get(model).delete(delete_model))
+        .route("/v1/runtime", get(runtime_state))
+        .route(
+            "/v1/runtime/model",
+            post(load_runtime_model).delete(unload_runtime_model),
+        )
         .route("/props", get(props))
         .route("/v1/props", get(props))
         .route("/apply-template", post(apply_template))
         .route("/v1/apply-template", post(apply_template))
         .route("/v1/chat/completions", post(chat_completions))
+        .with_state(state.clone());
+    if let Some(capability) = state.authorization.clone() {
+        protected = protected.route_layer(middleware::from_fn_with_state(capability, authorize));
+    }
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn authorize(State(capability): State<Arc<str>>, request: Request, next: Next) -> Response {
+    let expected = format!("Bearer {capability}");
+    let supplied = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let matches = supplied.len() == expected.len()
+        && supplied
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0;
+    if matches {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HealthResponse {
     status: &'static str,
+    ready: bool,
     version: &'static str,
+    api_version: u32,
+    instance_id: String,
+    native_build: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeExecutionProfile {
+    pub policy: String,
+    pub context_length: u32,
+    pub parallel_sequences: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoadRuntimeModelRequest {
+    pub model_id: String,
+    pub profile: RuntimeExecutionProfile,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeStatus {
+    Empty,
+    Ready {
+        model_id: String,
+        generation: u64,
+        profile: RuntimeExecutionProfile,
+    },
+    Failed {
+        generation: u64,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeStateResponse {
+    pub generation: u64,
+    pub status: RuntimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeModelEvent {
+    Progress {
+        operation_id: String,
+        model_id: String,
+        stage: RuntimeLoadStage,
+    },
+    Ready {
+        operation_id: String,
+        state: RuntimeStateResponse,
+    },
+    Failed {
+        operation_id: String,
+        model_id: String,
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLoadStage {
+    Queued,
+    Resolving,
+    Assessing,
+    Unloading,
+    Loading,
+    Verifying,
+}
+
+pub trait RuntimeController: Send + Sync + 'static {
+    fn state(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>>;
+    fn load(&self, request: LoadRuntimeModelRequest) -> BoxStream<'static, RuntimeModelEvent>;
+    fn unload(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>>;
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -898,6 +1199,19 @@ impl ApiError {
         }
     }
 
+    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ErrorResponse {
+                error: ApiErrorBody {
+                    message: message.into(),
+                    r#type: "invalid_request_error",
+                    code,
+                },
+            },
+        }
+    }
+
     fn from_inference(error: InferenceError) -> Self {
         match error {
             InferenceError::InvalidConfig(message) => Self::invalid(message),
@@ -976,11 +1290,94 @@ impl IntoResponse for ApiError {
 #[utoipa::path(get, path = "/health", operation_id = "health", tag = "system", responses(
     (status = 200, description = "ICN is running", body = HealthResponse)
 ))]
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
+        ready: true,
         version: env!("CARGO_PKG_VERSION"),
+        api_version: state.identity.api_version,
+        instance_id: state.identity.instance_id,
+        native_build: state.identity.native_build,
     })
+}
+
+#[utoipa::path(get, path = "/v1/runtime", operation_id = "getRuntimeState", tag = "runtime", responses(
+    (status = 200, description = "Active ICN model runtime", body = RuntimeStateResponse),
+    (status = 500, description = "Runtime state unavailable", body = ErrorResponse)
+))]
+async fn runtime_state(
+    State(state): State<AppState>,
+) -> Result<Json<RuntimeStateResponse>, ApiError> {
+    let runtime = state
+        .runtime
+        .as_ref()
+        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
+    runtime
+        .state()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/runtime/model", operation_id = "loadRuntimeModel", tag = "runtime",
+    request_body = LoadRuntimeModelRequest,
+    responses(
+        (status = 200, description = "Runtime model load progress", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Invalid runtime request", body = ErrorResponse),
+        (status = 409, description = "Runtime mutation conflict", body = ErrorResponse)
+    )
+)]
+async fn load_runtime_model(
+    State(state): State<AppState>,
+    Json(request): Json<LoadRuntimeModelRequest>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    if request.model_id.is_empty()
+        || request.profile.context_length == 0
+        || request.profile.parallel_sequences == 0
+    {
+        return Err(ApiError::invalid(
+            "model_id, context_length, and parallel_sequences must be non-empty and positive",
+        ));
+    }
+    let runtime = state
+        .runtime
+        .as_ref()
+        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
+    let stream = runtime.load(request);
+    let framed = tokio_stream::StreamExt::map(stream, |event| {
+        let data = serde_json::to_string(&event).unwrap_or_else(|error| {
+            serde_json::json!({
+                "type": "failed",
+                "operation_id": "serialization-failed",
+                "model_id": "unknown",
+                "code": "serialization_failed",
+                "message": error.to_string(),
+                "retryable": false
+            })
+            .to_string()
+        });
+        Ok(Event::default().data(data))
+    });
+    Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
+}
+
+#[utoipa::path(delete, path = "/v1/runtime/model", operation_id = "unloadRuntimeModel", tag = "runtime", responses(
+    (status = 200, description = "Runtime after idempotent unload", body = RuntimeStateResponse),
+    (status = 409, description = "Runtime model is in use", body = ErrorResponse),
+    (status = 500, description = "Runtime unload failed", body = ErrorResponse)
+))]
+async fn unload_runtime_model(
+    State(state): State<AppState>,
+) -> Result<Json<RuntimeStateResponse>, ApiError> {
+    let runtime = state
+        .runtime
+        .as_ref()
+        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
+    runtime
+        .unload()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(get, path = "/v1/hardware", operation_id = "getHardware", tag = "system", responses(
@@ -1011,7 +1408,11 @@ async fn models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiErr
             .into_iter()
             .map(Model::inventory)
             .collect::<Result<Vec<_>, _>>()?,
-        None => vec![Model::loaded_only(state.backend.model_id().to_owned())],
+        None => state
+            .backends
+            .lease()
+            .map(|lease| vec![Model::loaded_only(lease.model_id().to_owned())])
+            .unwrap_or_default(),
     };
     Ok(Json(ModelList {
         object: "list",
@@ -1170,8 +1571,9 @@ fn json_value(value: impl Serialize) -> Result<JsonValue, ApiError> {
     (status = 500, description = "Properties unavailable", body = ErrorResponse)
 ))]
 async fn props(State(state): State<AppState>) -> Result<Json<PropsResponse>, ApiError> {
-    let properties = state
-        .backend
+    let lease = require_backend(&state)?;
+    let properties = lease
+        .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
     Ok(Json(props_response(properties)))
@@ -1189,14 +1591,14 @@ async fn apply_template(
     State(state): State<AppState>,
     Json(request): Json<ApplyTemplateRequest>,
 ) -> Result<Json<ApplyTemplateResponse>, ApiError> {
-    validate_model_selection(request.model.as_deref(), &state)?;
-    let properties = state
-        .backend
+    let lease = require_backend(&state)?;
+    validate_model_selection(request.model.as_deref(), &lease)?;
+    let properties = lease
+        .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
     let request = validate_apply_template_request(request, &properties.reasoning)?;
-    let backend = Arc::clone(&state.backend);
-    let prepared = tokio::task::spawn_blocking(move || backend.apply_template(request))
+    let prepared = tokio::task::spawn_blocking(move || lease.backend().apply_template(request))
         .await
         .map_err(|error| ApiError::server(format!("template task failed: {error}")))?
         .map_err(ApiError::from_inference)?;
@@ -1214,9 +1616,10 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    validate_model_selection(request.model.as_deref(), &state)?;
-    let properties = state
-        .backend
+    let lease = require_backend(&state)?;
+    validate_model_selection(request.model.as_deref(), &lease)?;
+    let properties = lease
+        .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
     let (request, include_usage) = validate_request(request, &properties.reasoning)?;
@@ -1225,8 +1628,7 @@ async fn chat_completions(
         state.next_id.fetch_add(1, Ordering::Relaxed)
     );
     let created = unix_timestamp();
-    let model = state.backend.model_id().to_owned();
-    let backend = Arc::clone(&state.backend);
+    let model = lease.model_id().to_owned();
     let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
 
     tokio::task::spawn_blocking(move || {
@@ -1248,7 +1650,7 @@ async fn chat_completions(
                 ))
             }
         };
-        let generation = match backend.complete(request, &mut callback) {
+        let generation = match lease.backend().complete(request, &mut callback) {
             Ok(generation) => generation,
             Err(error) => {
                 if emit_chunk(
@@ -1484,17 +1886,21 @@ fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
     }
 }
 
-fn validate_model_selection(requested: Option<&str>, state: &AppState) -> Result<(), ApiError> {
+fn require_backend(state: &AppState) -> Result<BackendLease, ApiError> {
+    state.backends.lease().ok_or_else(|| {
+        ApiError::conflict(
+            "model_not_loaded",
+            "no model is loaded by this inference node",
+        )
+    })
+}
+
+fn validate_model_selection(requested: Option<&str>, lease: &BackendLease) -> Result<(), ApiError> {
     match requested {
         Some("") => Err(ApiError::invalid("model must not be empty")),
-        Some(requested)
-            if requested != state.backend.model_id()
-                && !state.model_aliases.contains(requested) =>
-        {
-            Err(ApiError::invalid(format!(
-                "model {requested} is not loaded by this inference node"
-            )))
-        }
+        Some(requested) if !lease.accepts_model(requested) => Err(ApiError::invalid(format!(
+            "model {requested} is not loaded by this inference node"
+        ))),
         _ => Ok(()),
     }
 }
@@ -2096,6 +2502,9 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         model,
         download_model,
         delete_model,
+        runtime_state,
+        load_runtime_model,
+        unload_runtime_model,
         props,
         apply_template,
         chat_completions
@@ -2123,6 +2532,12 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         DownloadFileProgressSchema,
         DownloadFailureSchema,
         ModelDownloadEventSchema,
+        RuntimeExecutionProfile,
+        LoadRuntimeModelRequest,
+        RuntimeStatus,
+        RuntimeStateResponse,
+        RuntimeModelEvent,
+        RuntimeLoadStage,
         PropsResponse,
         ExecutionConfigResponse,
         ExecutionSettingsResponse,
@@ -2273,6 +2688,29 @@ impl StreamContract for DownloadModelStream {
     }
 }
 
+struct RuntimeModelStream;
+
+impl StreamContract for RuntimeModelStream {
+    type Event = RuntimeModelEvent;
+    const RESPONSE_STATUS: u16 = 200;
+
+    fn metadata() -> StreamMetadata {
+        StreamMetadata {
+            version: 1,
+            response_status: Self::RESPONSE_STATUS,
+            framing: StreamFraming::Sse,
+            data: StreamData {
+                encoding: "json",
+                schema: StreamSchemaRef {
+                    reference: format!("#/components/schemas/{}", Self::Event::name()),
+                },
+            },
+            termination: StreamTermination::Eof,
+            reconnect: StreamReconnect::None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenApiExportError {
     #[error("OpenAPI operation {0} was not generated")]
@@ -2302,6 +2740,11 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     attach_stream_contract::<DownloadModelStream>(
         &mut document,
         "downloadModel",
+        "text/event-stream",
+    )?;
+    attach_stream_contract::<RuntimeModelStream>(
+        &mut document,
+        "loadRuntimeModel",
         "text/event-stream",
     )?;
     Ok(document)
@@ -2899,6 +3342,49 @@ mod tests {
         assert!(relationships["properties"].get("component_path").is_none());
     }
 
+    #[test]
+    fn exported_runtime_contract_has_state_load_and_unload() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        assert!(value["paths"]["/v1/runtime"]["get"].is_object());
+        let mutation = &value["paths"]["/v1/runtime/model"];
+        assert_eq!(mutation["post"][STREAM_EXTENSION]["framing"], "sse");
+        assert_eq!(
+            mutation["post"][STREAM_EXTENSION]["termination"]["type"],
+            "eof"
+        );
+        assert!(mutation["delete"].is_object());
+    }
+
+    #[tokio::test]
+    async fn private_routes_require_the_owner_capability_but_health_does_not() {
+        let service = app(AppState::new(FakeBackend::new("test-model", "ok"))
+            .with_authorization("private-capability"));
+        let health = service
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let denied = service
+            .clone()
+            .oneshot(Request::get("/v1/props").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = service
+            .oneshot(
+                Request::get("/v1/props")
+                    .header("authorization", "Bearer private-capability")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn exposes_typed_properties_and_template_preparation() {
         let service = app(AppState::new(FakeBackend::new("test-model", "ok")));
@@ -2965,11 +3451,26 @@ mod tests {
     fn accepts_the_loaded_model_id_and_configured_aliases() {
         let state =
             AppState::new(FakeBackend::new("test-model", "ok")).with_model_alias("friendly-name");
+        let lease = state.backends.lease().expect("backend lease");
 
-        assert!(validate_model_selection(Some("test-model"), &state).is_ok());
-        assert!(validate_model_selection(Some("friendly-name"), &state).is_ok());
-        assert!(validate_model_selection(None, &state).is_ok());
-        assert!(validate_model_selection(Some("different-model"), &state).is_err());
+        assert!(validate_model_selection(Some("test-model"), &lease).is_ok());
+        assert!(validate_model_selection(Some("friendly-name"), &lease).is_ok());
+        assert!(validate_model_selection(None, &lease).is_ok());
+        assert!(validate_model_selection(Some("different-model"), &lease).is_err());
+    }
+
+    #[test]
+    fn backend_mutations_exclude_inference_leases_in_both_directions() {
+        let registry =
+            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ok")));
+        let lease = registry.lease().expect("initial lease");
+        assert!(registry.try_begin_mutation().is_none());
+        drop(lease);
+
+        let mutation = registry.try_begin_mutation().expect("mutation guard");
+        assert!(registry.lease().is_none());
+        drop(mutation);
+        assert!(registry.lease().is_some());
     }
 
     #[test]

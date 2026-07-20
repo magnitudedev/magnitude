@@ -13,7 +13,7 @@ anyhow = "1.0.100"
 axum = "0.8.8"
 base64 = "0.22.1"
 bytes = "1.12.1"
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.54", features = ["derive", "env"] }
 encoding_rs = "0.8.35"
 futures-util = "0.3.31"
 fs2 = "0.4.3"

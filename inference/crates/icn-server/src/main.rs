@@ -1,12 +1,20 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use futures_util::future::BoxFuture;
-use icn_api::{AppState, FakeBackend, app};
+use futures_util::{
+    future::BoxFuture,
+    stream::{BoxStream, StreamExt},
+};
+use icn_api::{
+    AppState, BackendRegistry, FakeBackend, LoadRuntimeModelRequest, RuntimeController,
+    RuntimeExecutionProfile, RuntimeLoadStage, RuntimeModelEvent, RuntimeStateResponse,
+    RuntimeStatus, ServerIdentity, app,
+};
 use icn_contracts::{
     CacheType, CompletionBackend, ComponentRole, ExecutionConfig, FlashAttention, GpuLayers,
     HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
@@ -20,6 +28,7 @@ use icn_hardware::{
 };
 use icn_models::{InventoryConfig, ModelManager, ModelPreviewService};
 use icn_reasoning::NativeTemplateAssessor;
+use tokio_stream::wrappers::ReceiverStream;
 
 mod build_identity;
 
@@ -49,6 +58,15 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
+        /// Opaque owner-provided identity echoed by the startup and health protocols.
+        #[arg(long, default_value = "standalone")]
+        instance_id: String,
+        /// Owning process. ICN exits if this process disappears.
+        #[arg(long)]
+        parent_pid: Option<u32>,
+        /// Private owner capability. Prefer the environment-backed form used by managed launch.
+        #[arg(long, env = "MAGNITUDE_ICN_AUTH_TOKEN", hide_env_values = true)]
+        auth_token: Option<String>,
         #[arg(long, conflicts_with_all = ["model", "model_id"])]
         fake: bool,
         #[arg(long, conflicts_with = "model_id")]
@@ -410,6 +428,523 @@ impl HardwareProvider for NativeHardwareAssessor {
     }
 }
 
+#[derive(Clone)]
+struct NativeRuntimeController {
+    backends: BackendRegistry,
+    inventory: Arc<ModelManager>,
+    assessor: Arc<NativeHardwareAssessor>,
+    native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
+    defaults: RuntimePlanDefaults,
+    state: Arc<tokio::sync::RwLock<RuntimeStateResponse>>,
+    mutation: Arc<tokio::sync::Mutex<()>>,
+    next_operation: Arc<AtomicU64>,
+}
+
+impl NativeRuntimeController {
+    fn new(
+        backends: BackendRegistry,
+        inventory: Arc<ModelManager>,
+        assessor: Arc<NativeHardwareAssessor>,
+        native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
+        defaults: RuntimePlanDefaults,
+        initial: RuntimeStateResponse,
+    ) -> Self {
+        Self {
+            backends,
+            inventory,
+            assessor,
+            native_executor,
+            defaults,
+            state: Arc::new(tokio::sync::RwLock::new(initial)),
+            mutation: Arc::new(tokio::sync::Mutex::new(())),
+            next_operation: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    async fn emit(
+        sender: &tokio::sync::mpsc::Sender<RuntimeModelEvent>,
+        event: RuntimeModelEvent,
+    ) -> bool {
+        sender.send(event).await.is_ok()
+    }
+
+    async fn fail(
+        &self,
+        sender: &tokio::sync::mpsc::Sender<RuntimeModelEvent>,
+        operation_id: String,
+        model_id: String,
+        code: &str,
+        message: impl Into<String>,
+        retryable: bool,
+        runtime_lost: bool,
+    ) {
+        let message = message.into();
+        if runtime_lost {
+            let generation = self.backends.generation();
+            *self.state.write().await = RuntimeStateResponse {
+                generation,
+                status: RuntimeStatus::Failed {
+                    generation,
+                    code: code.to_owned(),
+                    message: message.clone(),
+                },
+                operation_id: None,
+            };
+        } else {
+            self.state.write().await.operation_id = None;
+        }
+        let _ = Self::emit(
+            sender,
+            RuntimeModelEvent::Failed {
+                operation_id,
+                model_id,
+                code: code.to_owned(),
+                message,
+                retryable,
+            },
+        )
+        .await;
+    }
+
+    fn profile_defaults(
+        &self,
+        profile: &RuntimeExecutionProfile,
+    ) -> Result<RuntimePlanDefaults, InventoryError> {
+        if profile.policy != ASSESSMENT_PROFILE_RESOLVER {
+            return Err(InventoryError::InvalidRequest(format!(
+                "unsupported runtime profile policy; expected {ASSESSMENT_PROFILE_RESOLVER}"
+            )));
+        }
+        let mut defaults = self.defaults.clone();
+        defaults.context_size = profile.context_length;
+        defaults.max_sequences = profile.parallel_sequences;
+        Ok(defaults)
+    }
+
+    async fn resolved_load(
+        &self,
+        model_id: &str,
+        profile: &RuntimeExecutionProfile,
+    ) -> Result<(ResolvedModel, ResolvedExecutionPlan), InventoryError> {
+        let id = ModelId::parse(model_id.to_owned())?;
+        self.inventory.ensure_model_inventory().await?;
+        let resolved = self.inventory.resolve_ready(&id).await?;
+        let primary = resolved
+            .components
+            .iter()
+            .filter(|component| {
+                matches!(
+                    component.role,
+                    ComponentRole::Weights | ComponentRole::Shard
+                )
+            })
+            .min_by_key(|component| component.shard_index.unwrap_or(0))
+            .map(|component| component.path.clone())
+            .ok_or_else(|| InventoryError::NotReady("model has no runnable weights".into()))?;
+        let projector = resolved
+            .components
+            .iter()
+            .find(|component| component.role == ComponentRole::Projector)
+            .map(|component| component.path.clone());
+        let mtp = resolved
+            .components
+            .iter()
+            .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
+            .map(|component| component.path.clone())
+            .collect();
+        let defaults = self.profile_defaults(profile)?;
+        let plan = tokio::task::spawn_blocking(move || {
+            resolved_plan(primary, projector, MtpSelection::Automatic(mtp), &defaults)
+        })
+        .await
+        .map_err(|error| InventoryError::Internal(error.to_string()))?
+        .map_err(|error| {
+            InventoryError::Internal(format!("failed to resolve runtime plan: {error:#}"))
+        })?;
+        Ok((resolved, plan))
+    }
+
+    async fn run_load(
+        self,
+        request: LoadRuntimeModelRequest,
+        operation_id: String,
+        sender: tokio::sync::mpsc::Sender<RuntimeModelEvent>,
+    ) {
+        let Ok(_guard) = self.mutation.try_lock() else {
+            self.fail(
+                &sender,
+                operation_id,
+                request.model_id,
+                "runtime_busy",
+                "another runtime mutation is already active",
+                true,
+                false,
+            )
+            .await;
+            return;
+        };
+
+        let existing = self.state.read().await.clone();
+        if matches!(
+            &existing.status,
+            RuntimeStatus::Ready { model_id, profile, .. }
+                if model_id == &request.model_id && profile == &request.profile
+        ) {
+            let _ = Self::emit(
+                &sender,
+                RuntimeModelEvent::Ready {
+                    operation_id,
+                    state: existing,
+                },
+            )
+            .await;
+            return;
+        };
+        let Some(_backend_mutation) = self.backends.try_begin_mutation() else {
+            self.fail(
+                &sender,
+                operation_id,
+                request.model_id,
+                "model_in_use",
+                "the active runtime has in-flight inference or template requests",
+                true,
+                false,
+            )
+            .await;
+            return;
+        };
+
+        self.state.write().await.operation_id = Some(operation_id.clone());
+        for stage in [RuntimeLoadStage::Queued, RuntimeLoadStage::Resolving] {
+            if !Self::emit(
+                &sender,
+                RuntimeModelEvent::Progress {
+                    operation_id: operation_id.clone(),
+                    model_id: request.model_id.clone(),
+                    stage,
+                },
+            )
+            .await
+            {
+                self.state.write().await.operation_id = None;
+                return;
+            }
+        }
+
+        let (resolved, plan) = match self
+            .resolved_load(&request.model_id, &request.profile)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail(
+                    &sender,
+                    operation_id,
+                    request.model_id,
+                    "model_unavailable",
+                    error.to_string(),
+                    false,
+                    false,
+                )
+                .await;
+                return;
+            }
+        };
+        let _ = Self::emit(
+            &sender,
+            RuntimeModelEvent::Progress {
+                operation_id: operation_id.clone(),
+                model_id: request.model_id.clone(),
+                stage: RuntimeLoadStage::Assessing,
+            },
+        )
+        .await;
+
+        let assessment_result = {
+            let _assessment_guard = self.assessor.gate.lock().await;
+            tokio::task::spawn_blocking(move || assess_hardware(&plan, CapacityPolicy::default()))
+                .await
+        };
+        let assessed = match assessment_result {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                self.fail(
+                    &sender,
+                    operation_id,
+                    request.model_id,
+                    "assessment_failed",
+                    error.to_string(),
+                    true,
+                    false,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.fail(
+                    &sender,
+                    operation_id,
+                    request.model_id,
+                    "assessment_task_failed",
+                    error.to_string(),
+                    true,
+                    false,
+                )
+                .await;
+                return;
+            }
+        };
+        if let HardwareAssessment::DoesNotFit { memory, .. } = &assessed.assessment {
+            self.fail(
+                &sender,
+                operation_id,
+                request.model_id,
+                "does_not_fit",
+                format!(
+                    "runtime requires {} bytes but stable capacity is {} bytes",
+                    memory.required_bytes, memory.available_bytes
+                ),
+                false,
+                false,
+            )
+            .await;
+            return;
+        }
+        if matches!(assessed.assessment, HardwareAssessment::NotAssessed { .. }) {
+            self.fail(
+                &sender,
+                operation_id,
+                request.model_id,
+                "assessment_incomplete",
+                "runtime assessment did not produce a complete result",
+                false,
+                false,
+            )
+            .await;
+            return;
+        }
+
+        let _ = Self::emit(
+            &sender,
+            RuntimeModelEvent::Progress {
+                operation_id: operation_id.clone(),
+                model_id: request.model_id.clone(),
+                stage: RuntimeLoadStage::Unloading,
+            },
+        )
+        .await;
+        if let RuntimeStatus::Ready { model_id, .. } = &existing.status
+            && let Ok(id) = ModelId::parse(model_id.clone())
+        {
+            let _ = self
+                .inventory
+                .update_status(
+                    &id,
+                    ModelStatus::Available {
+                        ready_at: unix_timestamp(),
+                    },
+                )
+                .await;
+        }
+        if let Ok(mut slot) = self.native_executor.write() {
+            *slot = None;
+        }
+        self.backends.clear();
+
+        let _ = self
+            .inventory
+            .update_status(
+                &resolved.model.id,
+                ModelStatus::Loading {
+                    load_id: operation_id.clone(),
+                    stage: LoadStage::Opening,
+                    started_at: unix_timestamp(),
+                },
+            )
+            .await;
+        let _ = Self::emit(
+            &sender,
+            RuntimeModelEvent::Progress {
+                operation_id: operation_id.clone(),
+                model_id: request.model_id.clone(),
+                stage: RuntimeLoadStage::Loading,
+            },
+        )
+        .await;
+        let model_id = request.model_id.clone();
+        let backend = match tokio::task::spawn_blocking(move || {
+            LlamaCompletionBackend::load(model_id, assessed.plan)
+        })
+        .await
+        {
+            Ok(Ok(backend)) => Arc::new(backend),
+            Ok(Err(error)) => {
+                let _ = self
+                    .inventory
+                    .update_status(
+                        &resolved.model.id,
+                        ModelStatus::LoadFailed {
+                            attempted_at: unix_timestamp(),
+                            stage: LoadStage::Opening,
+                            code: "backend_load_failed".to_owned(),
+                            retryable: true,
+                        },
+                    )
+                    .await;
+                self.fail(
+                    &sender,
+                    operation_id,
+                    request.model_id,
+                    "backend_load_failed",
+                    error.to_string(),
+                    true,
+                    true,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.fail(
+                    &sender,
+                    operation_id,
+                    request.model_id,
+                    "load_task_failed",
+                    error.to_string(),
+                    true,
+                    true,
+                )
+                .await;
+                return;
+            }
+        };
+        let _ = Self::emit(
+            &sender,
+            RuntimeModelEvent::Progress {
+                operation_id: operation_id.clone(),
+                model_id: request.model_id.clone(),
+                stage: RuntimeLoadStage::Verifying,
+            },
+        )
+        .await;
+        let properties = match backend.properties() {
+            Ok(properties) => properties,
+            Err(error) => {
+                self.fail(
+                    &sender,
+                    operation_id,
+                    request.model_id,
+                    "verification_failed",
+                    error.to_string(),
+                    true,
+                    true,
+                )
+                .await;
+                return;
+            }
+        };
+        let mut aliases = std::collections::BTreeSet::new();
+        aliases.insert(resolved.model.name.clone());
+        let generation = self
+            .backends
+            .replace(Arc::clone(&backend) as Arc<dyn CompletionBackend>, aliases);
+        if let Ok(mut slot) = self.native_executor.write() {
+            *slot = Some(Arc::clone(&backend));
+        }
+        let mut execution: std::collections::BTreeMap<_, _> =
+            serde_json::to_value(&properties.execution.resolved)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        if let Ok(radix_cache) = serde_json::to_value(&self.defaults.radix_cache) {
+            execution.insert("radix_cache".to_owned(), radix_cache);
+        }
+        let _ = self
+            .inventory
+            .update_status(
+                &resolved.model.id,
+                ModelStatus::Loaded {
+                    loaded_at: unix_timestamp(),
+                    backend: "llama_cpp".to_owned(),
+                    context_length: properties.context_tokens,
+                    execution,
+                },
+            )
+            .await;
+        let state = RuntimeStateResponse {
+            generation,
+            status: RuntimeStatus::Ready {
+                model_id: request.model_id,
+                generation,
+                profile: request.profile,
+            },
+            operation_id: None,
+        };
+        *self.state.write().await = state.clone();
+        let _ = Self::emit(
+            &sender,
+            RuntimeModelEvent::Ready {
+                operation_id,
+                state,
+            },
+        )
+        .await;
+    }
+}
+
+impl RuntimeController for NativeRuntimeController {
+    fn state(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>> {
+        Box::pin(async move { Ok(self.state.read().await.clone()) })
+    }
+
+    fn load(&self, request: LoadRuntimeModelRequest) -> BoxStream<'static, RuntimeModelEvent> {
+        let operation_id = format!(
+            "runtime-{}",
+            self.next_operation.fetch_add(1, Ordering::Relaxed)
+        );
+        let runtime = self.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(runtime.run_load(request, operation_id, sender));
+        ReceiverStream::new(receiver).boxed()
+    }
+
+    fn unload(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>> {
+        Box::pin(async move {
+            let _guard = self.mutation.lock().await;
+            let Some(_backend_mutation) = self.backends.try_begin_mutation() else {
+                return Err(InventoryError::Busy(
+                    "the active runtime has in-flight inference or template requests".into(),
+                ));
+            };
+            let previous = self.state.read().await.clone();
+            if let RuntimeStatus::Ready { model_id, .. } = previous.status
+                && let Ok(id) = ModelId::parse(model_id)
+            {
+                self.inventory
+                    .update_status(
+                        &id,
+                        ModelStatus::Available {
+                            ready_at: unix_timestamp(),
+                        },
+                    )
+                    .await?;
+            }
+            if let Ok(mut slot) = self.native_executor.write() {
+                *slot = None;
+            }
+            let generation = self.backends.clear();
+            let state = RuntimeStateResponse {
+                generation,
+                status: RuntimeStatus::Empty,
+                operation_id: None,
+            };
+            *self.state.write().await = state.clone();
+            Ok(state)
+        })
+    }
+}
+
 impl std::str::FromStr for TensorSplitArg {
     type Err = String;
 
@@ -448,6 +983,9 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve {
             bind,
+            instance_id,
+            parent_pid,
+            auth_token,
             fake,
             model,
             model_id,
@@ -623,13 +1161,39 @@ async fn main() -> anyhow::Result<()> {
                     None,
                 )
             };
-            let (state, native_executor) = if fake || model.is_none() {
+            let backends = BackendRegistry::empty();
+            let (native_executor, initial_runtime) = if fake {
+                let model_id = model_alias.unwrap_or_else(|| "icn-fake".into());
+                let mut aliases = std::collections::BTreeSet::new();
+                aliases.insert(model_id.clone());
+                let generation = backends.replace(
+                    Arc::new(FakeBackend::new(model_id.clone(), "Hello from ICN.")),
+                    aliases,
+                );
                 (
-                    AppState::new(FakeBackend::new(
-                        model_alias.unwrap_or_else(|| "icn-fake".into()),
-                        "Hello from ICN.",
-                    )),
                     None,
+                    RuntimeStateResponse {
+                        generation,
+                        status: RuntimeStatus::Ready {
+                            model_id,
+                            generation,
+                            profile: RuntimeExecutionProfile {
+                                policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
+                                context_length: plan_defaults.context_size,
+                                parallel_sequences: plan_defaults.max_sequences,
+                            },
+                        },
+                        operation_id: None,
+                    },
+                )
+            } else if model.is_none() {
+                (
+                    None,
+                    RuntimeStateResponse {
+                        generation: backends.generation(),
+                        status: RuntimeStatus::Empty,
+                        operation_id: None,
+                    },
                 )
             } else {
                 let path = model.expect("model is present");
@@ -716,24 +1280,78 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .context("failed to project loaded model state")?;
                 let backend = Arc::new(backend);
+                let mut aliases = std::collections::BTreeSet::new();
+                aliases.insert(alias);
+                let generation =
+                    backends.replace(Arc::clone(&backend) as Arc<dyn CompletionBackend>, aliases);
                 (
-                    AppState::from_shared_backend(backend.clone()).with_model_alias(alias),
                     Some(backend),
+                    RuntimeStateResponse {
+                        generation,
+                        status: RuntimeStatus::Ready {
+                            model_id: inventory_id.0,
+                            generation,
+                            profile: RuntimeExecutionProfile {
+                                policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
+                                context_length: plan_defaults.context_size,
+                                parallel_sequences: plan_defaults.max_sequences,
+                            },
+                        },
+                        operation_id: None,
+                    },
                 )
             };
             *native_executor_slot
                 .write()
                 .map_err(|_| anyhow::anyhow!("native executor lock poisoned"))? = native_executor;
-            let state = state
+            let runtime = Arc::new(NativeRuntimeController::new(
+                backends.clone(),
+                inventory.clone(),
+                inventory_hardware_assessor.clone(),
+                native_executor_slot.clone(),
+                plan_defaults,
+                initial_runtime,
+            ));
+            let native_build = format!(
+                "bindings:{};llama_cpp:{}",
+                build_identity::BINDINGS_REVISION,
+                build_identity::LLAMA_CPP_REVISION
+            );
+            let identity = ServerIdentity {
+                instance_id: instance_id.clone(),
+                api_version: 1,
+                native_build: native_build.clone(),
+            };
+            let mut state = AppState::model_free(backends)
                 .with_inventory(inventory)
                 .with_hardware(inventory_hardware_assessor)
-                .with_previewer(previewer);
+                .with_previewer(previewer)
+                .with_runtime(runtime)
+                .with_identity(identity);
+            if let Some(auth_token) = auth_token {
+                state = state.with_authorization(auth_token);
+            }
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .with_context(|| format!("failed to bind {bind}"))?;
-            println!("magnitude-icn listening on http://{bind}");
+            let address = listener
+                .local_addr()
+                .context("failed to read bound address")?;
+            let origin = format!("http://{address}");
+            println!(
+                "MAGNITUDE_ICN_READY {}",
+                serde_json::json!({
+                    "type": "icn_ready",
+                    "protocolVersion": 1,
+                    "origin": origin,
+                    "instanceId": instance_id,
+                    "pid": std::process::id(),
+                    "apiVersion": 1,
+                    "nativeBuild": native_build,
+                })
+            );
             axum::serve(listener, app(state))
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(shutdown_signal(parent_pid))
                 .await?;
         }
         Command::Doctor => println!("ICN runtime and native backend loaded successfully"),
@@ -748,8 +1366,52 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(parent_pid: Option<u32>) {
+    tokio::select! {
+        _ = interrupt_signal() => {},
+        _ = parent_watchdog(parent_pid), if parent_pid.is_some() => {},
+    }
+}
+
+#[cfg(unix)]
+async fn interrupt_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler must install");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn interrupt_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn parent_watchdog(parent_pid: Option<u32>) {
+    let Some(parent_pid) = parent_pid else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        if !process_exists(parent_pid) {
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    // Signal zero performs an existence/permission check without delivering a signal.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    true
 }
 
 fn unix_timestamp() -> u64 {

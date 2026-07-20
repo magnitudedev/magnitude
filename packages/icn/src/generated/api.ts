@@ -80,6 +80,18 @@ export const getModelProperties = HttpApiEndpoint.get("getModelProperties", "/v1
     { status: 500 },
   )
 
+export const getRuntimeState = HttpApiEndpoint.get("getRuntimeState", "/v1/runtime")
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.RuntimeStateResponse, Schemas.RuntimeStateResponseEncoded> => Schemas.RuntimeStateResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const health = HttpApiEndpoint.get("health", "/health").addSuccess(
   S.suspend((): S.Schema<Schemas.HealthResponse, Schemas.HealthResponseEncoded> => Schemas.HealthResponse),
   { status: 200 },
@@ -112,6 +124,22 @@ export const previewModel = HttpApiEndpoint.post("previewModel", "/v1/models/pre
     { status: 500 },
   )
 
+export const unloadRuntimeModel = HttpApiEndpoint.del("unloadRuntimeModel", "/v1/runtime/model")
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.RuntimeStateResponse, Schemas.RuntimeStateResponseEncoded> => Schemas.RuntimeStateResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const ChatGroup = HttpApiGroup.make("chat").add(applyChatTemplate)
 
 export const ModelsGroup = HttpApiGroup.make("models")
@@ -121,6 +149,8 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(listModels)
   .add(previewModel)
 
+export const RuntimeGroup = HttpApiGroup.make("runtime").add(getRuntimeState).add(unloadRuntimeModel)
+
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
-export const IcnApi = HttpApi.make("IcnApi").add(ChatGroup).add(ModelsGroup).add(SystemGroup)
+export const IcnApi = HttpApi.make("IcnApi").add(ChatGroup).add(ModelsGroup).add(RuntimeGroup).add(SystemGroup)
