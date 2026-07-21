@@ -72,8 +72,6 @@ describe("local inference hardware projection", () => {
       },
       native_build: "test",
       enabled_backends: ["CPU", "MTL"],
-      assessment_policy: "test",
-      capacity_policy: "test",
       topology_fingerprint: "test",
       memory_domains: [{
         id: "system",

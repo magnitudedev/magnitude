@@ -30,7 +30,7 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
       supportedApiVersion: 1,
       expectedNativeBuild: Option.none(),
       expectedTarget: Option.none(),
-      requiredCapabilities: ["runtime_model_control"],
+      requiredCapabilities: ["model_load_control"],
       allowBuildMismatch: false,
       probeTimeout: Duration.seconds(2),
       downloadTimeout: Duration.seconds(30),
@@ -98,7 +98,7 @@ describe("ICN managed launch", () => {
       const executable = join(directory, "magnitude-icn");
       await writeFile(
         executable,
-        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["runtime_model_control"]}'\n`
+        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["model_load_control"]}'\n`
       );
       await chmod(executable, 0o755);
       try {
@@ -111,7 +111,7 @@ describe("ICN managed launch", () => {
                 supportedApiVersion: 1,
                 expectedNativeBuild: Option.some("native-test"),
                 expectedTarget: Option.some("test-target"),
-                requiredCapabilities: ["runtime_model_control"],
+                requiredCapabilities: ["model_load_control"],
                 allowBuildMismatch: false,
                 probeTimeout: Duration.seconds(2),
                 downloadTimeout: Duration.seconds(30),
@@ -146,7 +146,7 @@ describe("ICN managed launch", () => {
       await mkdir(payload, { recursive: true });
       await writeFile(
         executable,
-        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["runtime_model_control"]}'\n`
+        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["model_load_control"]}'\n`
       );
       await chmod(executable, 0o755);
       const bytes = await Bun.file(executable).arrayBuffer();
@@ -190,7 +190,7 @@ describe("ICN managed launch", () => {
           supportedApiVersion: 1,
           expectedNativeBuild: Option.some("native-test"),
           expectedTarget: Option.some("test-target"),
-          requiredCapabilities: ["runtime_model_control"],
+          requiredCapabilities: ["model_load_control"],
           allowBuildMismatch: false,
           probeTimeout: Duration.seconds(2),
           downloadTimeout: Duration.seconds(5),

@@ -23,12 +23,12 @@ use icn_contracts::{
     HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, ImageInput, InferenceError,
     InferenceEvent, InferenceStreamEvent, InventoryError, InventoryModel, ModelId, ModelInventory,
     ModelModalities, ModelPreview, ModelPreviewRequest, ModelPreviewer, ModelProperties,
-    PreparedChatInfo, ReasoningControl, ResponseFormat, SplitMode, TemplateCapabilities, ToolCall,
-    ToolChoice, ToolDefinition,
+    PreparedChatInfo, ReasoningControl, ResponseFormat, ServingProfile, SplitMode,
+    TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use utoipa::openapi::extensions::Extensions;
 use utoipa::openapi::path::Operation;
@@ -92,6 +92,8 @@ pub struct BackendRegistry {
     inner: Arc<RwLock<BackendRegistryState>>,
     active_leases: Arc<AtomicU64>,
     mutating: Arc<AtomicBool>,
+    mutation_available: Arc<Notify>,
+    lease_released: Arc<Notify>,
 }
 
 struct BackendRegistryState {
@@ -105,15 +107,18 @@ pub struct BackendLease {
     model_aliases: Arc<BTreeSet<String>>,
     generation: u64,
     active_leases: Arc<AtomicU64>,
+    lease_released: Arc<Notify>,
 }
 
 pub struct BackendMutationGuard {
     mutating: Arc<AtomicBool>,
+    mutation_available: Arc<Notify>,
 }
 
 impl Drop for BackendMutationGuard {
     fn drop(&mut self) {
         self.mutating.store(false, Ordering::Release);
+        self.mutation_available.notify_one();
     }
 }
 
@@ -138,6 +143,7 @@ impl BackendLease {
 impl Drop for BackendLease {
     fn drop(&mut self) {
         self.active_leases.fetch_sub(1, Ordering::AcqRel);
+        self.lease_released.notify_waiters();
     }
 }
 
@@ -151,6 +157,8 @@ impl BackendRegistry {
             })),
             active_leases: Arc::new(AtomicU64::new(0)),
             mutating: Arc::new(AtomicBool::new(false)),
+            mutation_available: Arc::new(Notify::new()),
+            lease_released: Arc::new(Notify::new()),
         }
     }
 
@@ -169,6 +177,7 @@ impl BackendRegistry {
         self.active_leases.fetch_add(1, Ordering::AcqRel);
         if self.mutating.load(Ordering::Acquire) {
             self.active_leases.fetch_sub(1, Ordering::AcqRel);
+            self.lease_released.notify_waiters();
             return None;
         }
         Some(BackendLease {
@@ -176,6 +185,7 @@ impl BackendRegistry {
             model_aliases: Arc::clone(&state.model_aliases),
             generation: state.generation,
             active_leases: Arc::clone(&self.active_leases),
+            lease_released: Arc::clone(&self.lease_released),
         })
     }
 
@@ -189,11 +199,38 @@ impl BackendRegistry {
             .ok()?;
         if self.active_leases() > 0 {
             self.mutating.store(false, Ordering::Release);
+            self.mutation_available.notify_one();
             return None;
         }
         Some(BackendMutationGuard {
             mutating: Arc::clone(&self.mutating),
+            mutation_available: Arc::clone(&self.mutation_available),
         })
+    }
+
+    pub async fn begin_mutation(&self) -> BackendMutationGuard {
+        loop {
+            let available = self.mutation_available.notified();
+            if self
+                .mutating
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Closing mutation admission first prevents an unbounded sequence of new
+                // inference leases from starving a queued replacement or unload.
+                while self.active_leases() > 0 {
+                    let released = self.lease_released.notified();
+                    if self.active_leases() > 0 {
+                        released.await;
+                    }
+                }
+                return BackendMutationGuard {
+                    mutating: Arc::clone(&self.mutating),
+                    mutation_available: Arc::clone(&self.mutation_available),
+                };
+            }
+            available.await;
+        }
     }
 
     pub fn replace(&self, backend: Arc<dyn CompletionBackend>, aliases: BTreeSet<String>) -> u64 {
@@ -314,11 +351,12 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/v1/models/download", post(download_model))
         .route("/v1/models/{model_id}", get(model).delete(delete_model))
-        .route("/v1/runtime", get(runtime_state))
         .route(
-            "/v1/runtime/model",
-            post(load_runtime_model).delete(unload_runtime_model),
+            "/v1/models/{model_id}/serving-configuration",
+            axum::routing::put(configure_model_serving),
         )
+        .route("/v1/models/{model_id}/load", post(load_model))
+        .route("/v1/models/{model_id}/unload", post(unload_model))
         .route("/props", get(props))
         .route("/v1/props", get(props))
         .route("/apply-template", post(apply_template))
@@ -367,57 +405,38 @@ pub struct HealthResponse {
     native_build: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeExecutionProfile {
-    pub policy: String,
+pub struct ServingProfileSchema {
     pub context_length: u32,
     pub parallel_sequences: u32,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServingConfigurationSchema {
+    pub profile: ServingProfileSchema,
+}
+
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct LoadRuntimeModelRequest {
-    pub model_id: String,
-    pub profile: RuntimeExecutionProfile,
+pub struct ConfigureModelServingRequest {
+    pub context_length: u32,
+    pub parallel_sequences: u32,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RuntimeStatus {
-    Empty,
-    Ready {
-        model_id: String,
-        generation: u64,
-        profile: RuntimeExecutionProfile,
-    },
-    Failed {
-        generation: u64,
-        code: String,
-        message: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeStateResponse {
-    pub generation: u64,
-    pub status: RuntimeStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RuntimeModelEvent {
+pub enum ModelLoadEvent {
     Progress {
         operation_id: String,
         model_id: String,
-        stage: RuntimeLoadStage,
+        stage: ModelLoadStage,
     },
     Ready {
         operation_id: String,
-        state: RuntimeStateResponse,
+        model_id: String,
+        generation: u64,
     },
     Failed {
         operation_id: String,
@@ -430,7 +449,7 @@ pub enum RuntimeModelEvent {
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum RuntimeLoadStage {
+pub enum ModelLoadStage {
     Queued,
     Resolving,
     Assessing,
@@ -440,9 +459,9 @@ pub enum RuntimeLoadStage {
 }
 
 pub trait RuntimeController: Send + Sync + 'static {
-    fn state(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>>;
-    fn load(&self, request: LoadRuntimeModelRequest) -> BoxStream<'static, RuntimeModelEvent>;
-    fn unload(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>>;
+    fn load(&self, model_id: String) -> BoxStream<'static, ModelLoadEvent>;
+    fn acquire(&self, model_id: String) -> BoxFuture<'_, Result<BackendLease, InventoryError>>;
+    fn unload(&self, model_id: String) -> BoxFuture<'_, Result<(), InventoryError>>;
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -466,8 +485,12 @@ pub struct Model {
     content_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     supported_parameters: Vec<String>,
-    #[schema(value_type = inventory_schema::ModelStatusSchema)]
-    status: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serving_configuration: Option<ServingConfigurationSchema>,
+    #[schema(value_type = inventory_schema::ModelAvailabilitySchema)]
+    availability: JsonValue,
+    #[schema(value_type = inventory_schema::ModelResidencySchema)]
+    residency: JsonValue,
     #[schema(value_type = inventory_schema::ModelSourceSchema)]
     source: JsonValue,
     #[schema(value_type = inventory_schema::ModelLocationSchema)]
@@ -492,7 +515,9 @@ impl Model {
             name: None,
             content_id: None,
             supported_parameters: Vec::new(),
-            status: JsonValue::Null,
+            serving_configuration: None,
+            availability: JsonValue::Null,
+            residency: JsonValue::Null,
             source: JsonValue::Null,
             location: JsonValue::Null,
             properties: JsonValue::Null,
@@ -511,7 +536,16 @@ impl Model {
             name: Some(model.name),
             content_id: Some(model.content_id.0),
             supported_parameters: model.supported_parameters,
-            status: json_value(model.status)?,
+            serving_configuration: model.serving_configuration.map(|configuration| {
+                ServingConfigurationSchema {
+                    profile: ServingProfileSchema {
+                        context_length: configuration.profile.context_length,
+                        parallel_sequences: configuration.profile.parallel_sequences,
+                    },
+                }
+            }),
+            availability: json_value(model.availability)?,
+            residency: json_value(model.residency)?,
             source: json_value(model.source)?,
             location: json_value(model.location)?,
             properties: json_value(model.properties)?,
@@ -586,6 +620,7 @@ pub struct DownloadModelRequestSchema {
     source: HuggingFaceDownloadSourceSchema,
     components: Vec<DownloadComponentSchema>,
     relationships: Vec<DownloadRelationshipSchema>,
+    serving_profile: ServingProfileSchema,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1311,56 +1346,32 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-#[utoipa::path(get, path = "/v1/runtime", operation_id = "getRuntimeState", tag = "runtime", responses(
-    (status = 200, description = "Active ICN model runtime", body = RuntimeStateResponse),
-    (status = 500, description = "Runtime state unavailable", body = ErrorResponse)
-))]
-#[tracing::instrument(name = "icn.runtime.state", skip_all, err(Debug))]
-async fn runtime_state(
-    State(state): State<AppState>,
-) -> Result<Json<RuntimeStateResponse>, ApiError> {
-    let runtime = state
-        .runtime
-        .as_ref()
-        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
-    runtime
-        .state()
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(post, path = "/v1/runtime/model", operation_id = "loadRuntimeModel", tag = "runtime",
-    request_body = LoadRuntimeModelRequest,
+#[utoipa::path(post, path = "/v1/models/{model_id}/load", operation_id = "loadModel", tag = "models",
+    params(("model_id" = String, Path, description = "Stable inventory model ID")),
     responses(
-        (status = 200, description = "Runtime model load progress", body = String, content_type = "text/event-stream"),
-        (status = 400, description = "Invalid runtime request", body = ErrorResponse),
-        (status = 409, description = "Runtime mutation conflict", body = ErrorResponse)
+        (status = 200, description = "Model load progress", body = String, content_type = "text/event-stream"),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 409, description = "Model cannot be loaded", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(
-    name = "icn.runtime.load",
+    name = "icn.model.load",
     skip_all,
-    fields(model.id = %request.model_id),
+    fields(model.id = %model_id),
     err(Debug)
 )]
-async fn load_runtime_model(
+async fn load_model(
     State(state): State<AppState>,
-    Json(request): Json<LoadRuntimeModelRequest>,
+    Path(model_id): Path<String>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    if request.model_id.is_empty()
-        || request.profile.context_length == 0
-        || request.profile.parallel_sequences == 0
-    {
-        return Err(ApiError::invalid(
-            "model_id, context_length, and parallel_sequences must be non-empty and positive",
-        ));
+    if model_id.is_empty() {
+        return Err(ApiError::invalid("model_id must be non-empty"));
     }
     let runtime = state
         .runtime
         .as_ref()
         .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
-    let stream = runtime.load(request);
+    let stream = runtime.load(model_id);
     let framed = tokio_stream::StreamExt::map(stream, |event| {
         let data = serde_json::to_string(&event).unwrap_or_else(|error| {
             serde_json::json!({
@@ -1378,23 +1389,28 @@ async fn load_runtime_model(
     Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
 }
 
-#[utoipa::path(delete, path = "/v1/runtime/model", operation_id = "unloadRuntimeModel", tag = "runtime", responses(
-    (status = 200, description = "Runtime after idempotent unload", body = RuntimeStateResponse),
-    (status = 409, description = "Runtime model is in use", body = ErrorResponse),
-    (status = 500, description = "Runtime unload failed", body = ErrorResponse)
-))]
-#[tracing::instrument(name = "icn.runtime.unload", skip_all, err(Debug))]
-async fn unload_runtime_model(
+#[utoipa::path(post, path = "/v1/models/{model_id}/unload", operation_id = "unloadModel", tag = "models",
+    params(("model_id" = String, Path, description = "Stable inventory model ID")),
+    responses(
+        (status = 204, description = "Model is not resident"),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 409, description = "Model is in use", body = ErrorResponse),
+        (status = 500, description = "Model unload failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.model.unload", skip_all, fields(model.id = %model_id), err(Debug))]
+async fn unload_model(
     State(state): State<AppState>,
-) -> Result<Json<RuntimeStateResponse>, ApiError> {
+    Path(model_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
     let runtime = state
         .runtime
         .as_ref()
         .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
     runtime
-        .unload()
+        .unload(model_id)
         .await
-        .map(Json)
+        .map(|()| StatusCode::NO_CONTENT)
         .map_err(ApiError::from_inventory)
 }
 
@@ -1532,6 +1548,37 @@ async fn model(
     let inventory = require_inventory(&state)?;
     let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
     let model = inventory.get(&id).await.map_err(ApiError::from_inventory)?;
+    Ok(Json(Model::inventory(model)?))
+}
+
+#[utoipa::path(put, path = "/v1/models/{model_id}/serving-configuration", operation_id = "configureModelServing", tag = "models",
+    params(("model_id" = String, Path, description = "Stable inventory model ID")),
+    request_body = ConfigureModelServingRequest,
+    responses(
+        (status = 200, description = "Updated inventory model", body = Model),
+        (status = 400, description = "Invalid serving profile", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 409, description = "Model is not available", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.configure_serving", skip_all, fields(model.id = %model_id), err(Debug))]
+async fn configure_model_serving(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    Json(request): Json<ConfigureModelServingRequest>,
+) -> Result<Json<Model>, ApiError> {
+    let inventory = require_inventory(&state)?;
+    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
+    let model = inventory
+        .configure_serving(
+            &id,
+            ServingProfile {
+                context_length: request.context_length,
+                parallel_sequences: request.parallel_sequences,
+            },
+        )
+        .await
+        .map_err(ApiError::from_inventory)?;
     Ok(Json(Model::inventory(model)?))
 }
 
@@ -1708,7 +1755,11 @@ async fn apply_template(
     request_body = ChatCompletionRequest,
     responses(
         (status = 200, description = "OpenAI-compatible server-sent events", body = String, content_type = "text/event-stream"),
-        (status = 400, description = "Invalid request", body = ErrorResponse)
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Requested model is unavailable", body = ErrorResponse),
+        (status = 409, description = "Runtime model cannot be admitted", body = ErrorResponse),
+        (status = 422, description = "Runtime target failed validation", body = ErrorResponse),
+        (status = 500, description = "Runtime load or inference failed", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(
@@ -1721,13 +1772,34 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let lease = require_backend(&state)?;
+    let request = validate_request(request)?;
+    let model_id = request
+        .model
+        .clone()
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| ApiError::invalid("model is required"))?;
+    let lease = if let Some(runtime) = state.runtime.as_ref() {
+        runtime
+            .acquire(model_id)
+            .await
+            .map_err(ApiError::from_inventory)?
+    } else {
+        require_backend(&state)?
+    };
+    chat_completion_with_lease(state, request, lease).await
+}
+
+async fn chat_completion_with_lease(
+    state: AppState,
+    request: ValidatedChatRequest,
+    lease: BackendLease,
+) -> Result<Response, ApiError> {
     validate_model_selection(request.model.as_deref(), &lease)?;
     let properties = lease
         .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
-    let (request, include_usage) = validate_request(request, &properties.reasoning)?;
+    let (request, include_usage) = finalize_request(request, &properties.reasoning)?;
     let id = format!(
         "chatcmpl-icn-{}",
         state.next_id.fetch_add(1, Ordering::Relaxed)
@@ -2030,31 +2102,29 @@ fn validate_apply_template_request(
     request: ApplyTemplateRequest,
     reasoning_profile: &icn_contracts::ReasoningProfile,
 ) -> Result<ChatTemplateRequest, ApiError> {
-    let (request, _) = validate_request(
-        ChatCompletionRequest {
-            model: request.model,
-            messages: request.messages,
-            max_tokens: None,
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            seed: None,
-            tools: request.tools,
-            tool_choice: request.tool_choice,
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: None,
-            thinking_budget_tokens: None,
-            response_format: request.response_format,
-            chat_template_kwargs: request.chat_template_kwargs,
-            stop: None,
-            stream: true,
-            stream_options: None,
-            cache_prompt: true,
-            ignore_eos: false,
-            timings_per_token: false,
-        },
-        reasoning_profile,
-    )?;
+    let validated = validate_request(ChatCompletionRequest {
+        model: request.model,
+        messages: request.messages,
+        max_tokens: None,
+        max_completion_tokens: None,
+        temperature: None,
+        top_p: None,
+        seed: None,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
+        parallel_tool_calls: request.parallel_tool_calls,
+        reasoning_effort: None,
+        thinking_budget_tokens: None,
+        response_format: request.response_format,
+        chat_template_kwargs: request.chat_template_kwargs,
+        stop: None,
+        stream: true,
+        stream_options: None,
+        cache_prompt: true,
+        ignore_eos: false,
+        timings_per_token: false,
+    })?;
+    let (request, _) = finalize_request(validated, reasoning_profile)?;
     Ok(request.template)
 }
 
@@ -2182,10 +2252,28 @@ fn apply_template_response(prepared: PreparedChatInfo) -> ApplyTemplateResponse 
     }
 }
 
-fn validate_request(
-    request: ChatCompletionRequest,
-    reasoning_profile: &icn_contracts::ReasoningProfile,
-) -> Result<(ChatRequest, bool), ApiError> {
+struct ValidatedChatRequest {
+    model: Option<String>,
+    messages: Vec<ChatMessage>,
+    tools: Vec<ToolDefinition>,
+    tool_choice: ToolChoice,
+    parallel_tool_calls: bool,
+    reasoning_effort: Option<ReasoningEffortRequest>,
+    thinking_budget_tokens: Option<u32>,
+    response_format: ResponseFormat,
+    template_args: BTreeMap<String, JsonValue>,
+    stop: Vec<String>,
+    max_tokens: u32,
+    temperature: f32,
+    top_p: f32,
+    seed: u32,
+    cache_prompt: bool,
+    ignore_eos: bool,
+    timings_per_token: bool,
+    include_usage: bool,
+}
+
+fn validate_request(request: ChatCompletionRequest) -> Result<ValidatedChatRequest, ApiError> {
     if !request.stream {
         return Err(ApiError::invalid(
             "ICN's MVP chat endpoint requires stream: true",
@@ -2228,44 +2316,70 @@ fn validate_request(
         .collect::<Result<Vec<_>, _>>()?;
     let (tools, tool_names) = tools(request.tools.unwrap_or_default())?;
     let tool_choice = tool_choice(request.tool_choice, &tool_names)?;
-    let mut template_args = request.chat_template_kwargs.unwrap_or_default();
+    let template_args = request.chat_template_kwargs.unwrap_or_default();
     if template_args.keys().any(String::is_empty) {
         return Err(ApiError::invalid(
             "chat_template_kwargs keys must not be empty",
         ));
     }
-    let reasoning = reasoning_control(
-        request.reasoning_effort,
-        request.thinking_budget_tokens,
-        &mut template_args,
-        reasoning_profile,
-    )?;
     let response_format = response_format(request.response_format)?;
     let stop = stops(request.stop)?;
-    Ok((
-        ChatRequest {
-            template: ChatTemplateRequest {
-                messages,
-                tools,
-                tool_choice,
-                parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-                reasoning,
-                response_format,
-                template_args,
-            },
-            stop,
-            max_tokens,
-            temperature,
-            top_p,
-            seed: request.seed.unwrap_or(DEFAULT_SEED),
-            cache_prompt: request.cache_prompt,
-            ignore_eos: request.ignore_eos,
-            timings_per_token: request.timings_per_token,
-        },
-        request
+    Ok(ValidatedChatRequest {
+        model: request.model,
+        messages,
+        tools,
+        tool_choice,
+        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+        reasoning_effort: request.reasoning_effort,
+        thinking_budget_tokens: request.thinking_budget_tokens,
+        response_format,
+        template_args,
+        stop,
+        max_tokens,
+        temperature,
+        top_p,
+        seed: request.seed.unwrap_or(DEFAULT_SEED),
+        cache_prompt: request.cache_prompt,
+        ignore_eos: request.ignore_eos,
+        timings_per_token: request.timings_per_token,
+        include_usage: request
             .stream_options
             .and_then(|options| options.include_usage)
             .unwrap_or(false),
+    })
+}
+
+fn finalize_request(
+    mut validated: ValidatedChatRequest,
+    reasoning_profile: &icn_contracts::ReasoningProfile,
+) -> Result<(ChatRequest, bool), ApiError> {
+    let reasoning = reasoning_control(
+        validated.reasoning_effort,
+        validated.thinking_budget_tokens,
+        &mut validated.template_args,
+        reasoning_profile,
+    )?;
+    Ok((
+        ChatRequest {
+            template: ChatTemplateRequest {
+                messages: validated.messages,
+                tools: validated.tools,
+                tool_choice: validated.tool_choice,
+                parallel_tool_calls: validated.parallel_tool_calls,
+                reasoning,
+                response_format: validated.response_format,
+                template_args: validated.template_args,
+            },
+            stop: validated.stop,
+            max_tokens: validated.max_tokens,
+            temperature: validated.temperature,
+            top_p: validated.top_p,
+            seed: validated.seed,
+            cache_prompt: validated.cache_prompt,
+            ignore_eos: validated.ignore_eos,
+            timings_per_token: validated.timings_per_token,
+        },
+        validated.include_usage,
     ))
 }
 
@@ -2623,11 +2737,11 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         models,
         preview_model,
         model,
+        configure_model_serving,
         download_model,
         delete_model,
-        runtime_state,
-        load_runtime_model,
-        unload_runtime_model,
+        load_model,
+        unload_model,
         props,
         apply_template,
         chat_completions
@@ -2643,7 +2757,8 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         inventory_schema::HuggingFaceRepositorySnapshotSchema,
         ModelList,
         Model,
-        inventory_schema::ModelStatusSchema,
+        inventory_schema::ModelAvailabilitySchema,
+        inventory_schema::ModelResidencySchema,
         inventory_schema::ModelSourceSchema,
         inventory_schema::ModelLocationSchema,
         inventory_schema::InventoryPropertiesSchema,
@@ -2659,12 +2774,11 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         DownloadFileProgressSchema,
         DownloadFailureSchema,
         ModelDownloadEventSchema,
-        RuntimeExecutionProfile,
-        LoadRuntimeModelRequest,
-        RuntimeStatus,
-        RuntimeStateResponse,
-        RuntimeModelEvent,
-        RuntimeLoadStage,
+        ServingProfileSchema,
+        ServingConfigurationSchema,
+        ConfigureModelServingRequest,
+        ModelLoadEvent,
+        ModelLoadStage,
         PropsResponse,
         ExecutionConfigResponse,
         ExecutionSettingsResponse,
@@ -2815,10 +2929,10 @@ impl StreamContract for DownloadModelStream {
     }
 }
 
-struct RuntimeModelStream;
+struct ModelLoadStream;
 
-impl StreamContract for RuntimeModelStream {
-    type Event = RuntimeModelEvent;
+impl StreamContract for ModelLoadStream {
+    type Event = ModelLoadEvent;
     const RESPONSE_STATUS: u16 = 200;
 
     fn metadata() -> StreamMetadata {
@@ -2869,11 +2983,7 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
         "downloadModel",
         "text/event-stream",
     )?;
-    attach_stream_contract::<RuntimeModelStream>(
-        &mut document,
-        "loadRuntimeModel",
-        "text/event-stream",
-    )?;
+    attach_stream_contract::<ModelLoadStream>(&mut document, "loadModel", "text/event-stream")?;
     Ok(document)
 }
 
@@ -3093,6 +3203,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use futures_util::StreamExt as _;
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use tower::ServiceExt;
@@ -3174,8 +3285,6 @@ mod tests {
                     },
                     "native_build": "test-build",
                     "enabled_backends": ["cpu"],
-                    "assessment_policy": "test-policy",
-                    "capacity_policy": "test-policy",
                     "topology_fingerprint": "topology",
                     "memory_domains": [{
                         "id": "system",
@@ -3228,7 +3337,6 @@ mod tests {
                     "assessments": [{
                         "profile_id": profile.id,
                         "artifact_fingerprint": "artifact",
-                        "execution_policy": profile.policy,
                         "hardware_topology": "topology",
                         "assessment": {"type": "not_assessed", "reason": "stub"},
                         "performance": {
@@ -3278,7 +3386,6 @@ mod tests {
                         },
                         "profiles": [{
                             "id": "interactive",
-                            "policy": "test-policy",
                             "context_length": 4096,
                             "parallel_sequences": 1
                         }]
@@ -3356,7 +3463,7 @@ mod tests {
             .properties()
             .expect("fake properties")
             .reasoning;
-        validate_request(request, &profile)
+        validate_request(request).and_then(|validated| finalize_request(validated, &profile))
     }
 
     fn stream_json(body: &str) -> Vec<Value> {
@@ -3380,6 +3487,94 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    struct StubRuntime {
+        backends: BackendRegistry,
+        acquisitions: Arc<AtomicU64>,
+    }
+
+    impl RuntimeController for StubRuntime {
+        fn load(&self, _model_id: String) -> BoxStream<'static, ModelLoadEvent> {
+            futures_util::stream::empty().boxed()
+        }
+
+        fn acquire(
+            &self,
+            _model_id: String,
+        ) -> BoxFuture<'_, Result<BackendLease, InventoryError>> {
+            Box::pin(async {
+                self.acquisitions.fetch_add(1, Ordering::Relaxed);
+                self.backends
+                    .lease()
+                    .ok_or_else(|| InventoryError::Internal("test backend unavailable".into()))
+            })
+        }
+
+        fn unload(&self, _model_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_acquires_the_requested_model_before_streaming() {
+        let backends =
+            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
+        let acquisitions = Arc::new(AtomicU64::new(0));
+        let runtime = Arc::new(StubRuntime {
+            backends: backends.clone(),
+            acquisitions: Arc::clone(&acquisitions),
+        });
+        let response = app(AppState::model_free(backends).with_runtime(runtime))
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("ready"));
+        assert_eq!(acquisitions.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_chat_is_rejected_before_runtime_admission() {
+        let backends =
+            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
+        let acquisitions = Arc::new(AtomicU64::new(0));
+        let runtime = Arc::new(StubRuntime {
+            backends: backends.clone(),
+            acquisitions: Arc::clone(&acquisitions),
+        });
+        let response = app(AppState::model_free(backends).with_runtime(runtime))
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "messages": [{"role": "assistant", "content": null}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(acquisitions.load(Ordering::Relaxed), 0);
     }
 
     struct ScriptedBackend {
@@ -3552,8 +3747,12 @@ mod tests {
         );
         let schemas = &value["components"]["schemas"];
         assert_eq!(
-            schemas["Model"]["properties"]["status"]["$ref"],
-            "#/components/schemas/ModelStatusSchema"
+            schemas["Model"]["properties"]["availability"]["$ref"],
+            "#/components/schemas/ModelAvailabilitySchema"
+        );
+        assert_eq!(
+            schemas["Model"]["properties"]["residency"]["$ref"],
+            "#/components/schemas/ModelResidencySchema"
         );
         assert_eq!(
             schemas["Model"]["properties"]["hardware"]["$ref"],
@@ -3569,16 +3768,16 @@ mod tests {
     }
 
     #[test]
-    fn exported_runtime_contract_has_state_load_and_unload() {
+    fn exported_contract_is_model_centric() {
         let value = serde_json::to_value(openapi().unwrap()).unwrap();
-        assert!(value["paths"]["/v1/runtime"]["get"].is_object());
-        let mutation = &value["paths"]["/v1/runtime/model"];
-        assert_eq!(mutation["post"][STREAM_EXTENSION]["framing"], "sse");
-        assert_eq!(
-            mutation["post"][STREAM_EXTENSION]["termination"]["type"],
-            "eof"
-        );
-        assert!(mutation["delete"].is_object());
+        assert!(value["paths"].get("/v1/runtime").is_none());
+        let load = &value["paths"]["/v1/models/{model_id}/load"]["post"];
+        assert_eq!(load[STREAM_EXTENSION]["framing"], "sse");
+        assert_eq!(load[STREAM_EXTENSION]["termination"]["type"], "eof");
+        assert!(value["paths"]["/v1/models/{model_id}/unload"]["post"].is_object());
+        let chat = &value["paths"]["/v1/chat/completions"]["post"];
+        assert_eq!(chat[STREAM_EXTENSION]["framing"], "sse");
+        assert_eq!(chat[STREAM_EXTENSION]["termination"]["value"], "[DONE]");
     }
 
     #[tokio::test]
@@ -3696,6 +3895,30 @@ mod tests {
         let mutation = registry.try_begin_mutation().expect("mutation guard");
         assert!(registry.lease().is_none());
         drop(mutation);
+        assert!(registry.lease().is_some());
+    }
+
+    #[tokio::test]
+    async fn coordinated_mutation_waits_for_the_response_lease() {
+        let registry =
+            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ok")));
+        let lease = registry.lease().expect("initial lease");
+        let waiting = registry.clone();
+        let mutation = tokio::spawn(async move { waiting.begin_mutation().await });
+        tokio::task::yield_now().await;
+        assert!(!mutation.is_finished());
+        assert!(
+            registry.lease().is_none(),
+            "queued mutation must close new lease admission"
+        );
+
+        drop(lease);
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(1), mutation)
+            .await
+            .expect("mutation should wake after lease release")
+            .expect("mutation task should complete");
+        assert!(registry.lease().is_none());
+        drop(guard);
         assert!(registry.lease().is_some());
     }
 

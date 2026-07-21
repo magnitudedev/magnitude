@@ -28,6 +28,34 @@ export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/v1/
     { status: 500 },
   )
 
+export const configureModelServing = HttpApiEndpoint.put(
+  "configureModelServing",
+  "/v1/models/:model_id/serving-configuration",
+)
+  .setPath(S.Struct({ model_id: S.String }))
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.ConfigureModelServingRequest, Schemas.ConfigureModelServingRequestEncoded> =>
+        Schemas.ConfigureModelServingRequest,
+    ),
+  )
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.Model, Schemas.ModelEncoded> => Schemas.Model),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+
 export const deleteModel = HttpApiEndpoint.del("deleteModel", "/v1/models/:model_id")
   .setPath(S.Struct({ model_id: S.String }))
   .setUrlParams(S.Struct({ dry_run: S.optionalWith(S.BooleanFromString, { exact: true, as: "Option" }) }))
@@ -73,18 +101,6 @@ export const getModel = HttpApiEndpoint.get("getModel", "/v1/models/:model_id")
 export const getModelProperties = HttpApiEndpoint.get("getModelProperties", "/v1/props")
   .addSuccess(
     S.suspend((): S.Schema<Schemas.PropsResponse, Schemas.PropsResponseEncoded> => Schemas.PropsResponse),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
-export const getRuntimeState = HttpApiEndpoint.get("getRuntimeState", "/v1/runtime")
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.RuntimeStateResponse, Schemas.RuntimeStateResponseEncoded> => Schemas.RuntimeStateResponse,
-    ),
     { status: 200 },
   )
   .addError(
@@ -173,12 +189,12 @@ export const searchHuggingFaceModels = HttpApiEndpoint.post("searchHuggingFaceMo
     { status: 500 },
   )
 
-export const unloadRuntimeModel = HttpApiEndpoint.del("unloadRuntimeModel", "/v1/runtime/model")
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.RuntimeStateResponse, Schemas.RuntimeStateResponseEncoded> => Schemas.RuntimeStateResponse,
-    ),
-    { status: 200 },
+export const unloadModel = HttpApiEndpoint.post("unloadModel", "/v1/models/:model_id/unload")
+  .setPath(S.Struct({ model_id: S.String }))
+  .addSuccess(S.Void, { status: 204 })
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -196,19 +212,14 @@ export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
   .add(searchHuggingFaceModels)
 
 export const ModelsGroup = HttpApiGroup.make("models")
+  .add(configureModelServing)
   .add(deleteModel)
   .add(getModel)
   .add(getModelProperties)
   .add(listModels)
   .add(previewModel)
-
-export const RuntimeGroup = HttpApiGroup.make("runtime").add(getRuntimeState).add(unloadRuntimeModel)
+  .add(unloadModel)
 
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
-export const IcnApi = HttpApi.make("IcnApi")
-  .add(ChatGroup)
-  .add(HuggingFaceGroup)
-  .add(ModelsGroup)
-  .add(RuntimeGroup)
-  .add(SystemGroup)
+export const IcnApi = HttpApi.make("IcnApi").add(ChatGroup).add(HuggingFaceGroup).add(ModelsGroup).add(SystemGroup)

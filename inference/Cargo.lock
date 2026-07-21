@@ -1405,6 +1405,7 @@ dependencies = [
  "getrandom 0.4.3",
  "icn-contracts",
  "icn-hardware",
+ "icn-mtp",
  "icn-reasoning",
  "libc",
  "llama-cpp-2",

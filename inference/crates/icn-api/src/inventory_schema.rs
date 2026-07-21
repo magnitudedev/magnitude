@@ -90,8 +90,6 @@ pub struct HardwareSnapshotSchema {
     system_memory: HardwareSystemMemorySchema,
     native_build: String,
     enabled_backends: Vec<String>,
-    assessment_policy: String,
-    capacity_policy: String,
     topology_fingerprint: String,
     memory_domains: Vec<HardwareMemoryDomainSchema>,
 }
@@ -113,7 +111,6 @@ pub struct ModelPreviewComponentSourceSchema {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ModelPreviewProfileSchema {
     id: String,
-    policy: String,
     context_length: u32,
     parallel_sequences: u32,
 }
@@ -128,7 +125,6 @@ pub struct ModelPreviewRequestSchema {
 pub struct ModelPreviewAssessmentSchema {
     profile_id: String,
     artifact_fingerprint: String,
-    execution_policy: String,
     hardware_topology: String,
     assessment: HardwareAssessmentSchema,
     performance: GenerationPerformanceAssessmentSchema,
@@ -362,7 +358,7 @@ pub enum LoadStageSchema {
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelStatusSchema {
+pub enum ModelAvailabilitySchema {
     Downloading {
         operation_id: String,
         stage: DownloadStageSchema,
@@ -393,6 +389,12 @@ pub enum ModelStatusSchema {
         code: String,
         message: String,
     },
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelResidencySchema {
+    NotResident,
     Loading {
         load_id: String,
         stage: LoadStageSchema,

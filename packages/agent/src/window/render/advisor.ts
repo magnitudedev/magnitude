@@ -275,6 +275,7 @@ export function advisorWindowToPrompt(input: AdvisorWindowPromptInput): Prompt {
       case 'fork_context':
       case 'goal_injection':
       case 'observer_turn':
+      case 'attempt_feedback':
         break
     }
   }

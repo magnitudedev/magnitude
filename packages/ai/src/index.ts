@@ -72,6 +72,7 @@ export {
   getHeader,
   headersFromHeaderList,
   payloadSample,
+  toCauseInfo,
   rejectedHttpResponse,
   StreamClientCorrectnessViolation,
   StreamOperationalFailure,

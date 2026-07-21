@@ -10,7 +10,7 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "bun run dev:version && bun run dev:client",
+    "dev": "bun run dev:version && bun run icn:build && bun run dev:client",
     "devl": "bun run dev:version && bun run dev:client:local",
     "dev:version": "bun run packages/version/scripts/generate-version.ts --dev",
     "dev:client": "bun run cli/src/index.tsx --debug",

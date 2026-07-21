@@ -116,6 +116,46 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Requested model is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Runtime model cannot be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Runtime target failed validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime load or inference failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "x-magnitude-stream": {
@@ -504,6 +544,199 @@
         }
       }
     },
+    "/v1/models/{model_id}/load": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "loadModel",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Stable inventory model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Model load progress",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model cannot be loaded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/ModelLoadEvent"
+            }
+          },
+          "framing": "sse",
+          "reconnect": {
+            "type": "none"
+          },
+          "responseStatus": 200,
+          "termination": {
+            "type": "eof"
+          },
+          "version": 1
+        }
+      }
+    },
+    "/v1/models/{model_id}/serving-configuration": {
+      "put": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "configureModelServing",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Stable inventory model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigureModelServingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated inventory model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Model"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid serving profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model is not available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/{model_id}/unload": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "unloadModel",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Stable inventory model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Model is not resident"
+          },
+          "404": {
+            "description": "Model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model is in use",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model unload failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/props": {
       "get": {
         "tags": [
@@ -523,141 +756,6 @@
           },
           "500": {
             "description": "Properties unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/runtime": {
-      "get": {
-        "tags": [
-          "runtime"
-        ],
-        "operationId": "getRuntimeState",
-        "responses": {
-          "200": {
-            "description": "Active ICN model runtime",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RuntimeStateResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Runtime state unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/runtime/model": {
-      "post": {
-        "tags": [
-          "runtime"
-        ],
-        "operationId": "loadRuntimeModel",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LoadRuntimeModelRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Runtime model load progress",
-            "content": {
-              "text/event-stream": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid runtime request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Runtime mutation conflict",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "x-magnitude-stream": {
-          "data": {
-            "encoding": "json",
-            "schema": {
-              "$ref": "#/components/schemas/RuntimeModelEvent"
-            }
-          },
-          "framing": "sse",
-          "reconnect": {
-            "type": "none"
-          },
-          "responseStatus": 200,
-          "termination": {
-            "type": "eof"
-          },
-          "version": 1
-        }
-      },
-      "delete": {
-        "tags": [
-          "runtime"
-        ],
-        "operationId": "unloadRuntimeModel",
-        "responses": {
-          "200": {
-            "description": "Runtime after idempotent unload",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RuntimeStateResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Runtime model is in use",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Runtime unload failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1445,6 +1543,26 @@
           "mtp"
         ]
       },
+      "ConfigureModelServingRequest": {
+        "type": "object",
+        "required": [
+          "context_length",
+          "parallel_sequences"
+        ],
+        "properties": {
+          "context_length": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "parallel_sequences": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "ContentIdentitySchema": {
         "oneOf": [
           {
@@ -1670,7 +1788,8 @@
         "required": [
           "source",
           "components",
-          "relationships"
+          "relationships",
+          "serving_profile"
         ],
         "properties": {
           "source": {
@@ -1687,6 +1806,9 @@
             "items": {
               "$ref": "#/components/schemas/DownloadRelationshipSchema"
             }
+          },
+          "serving_profile": {
+            "$ref": "#/components/schemas/ServingProfileSchema"
           }
         },
         "additionalProperties": false
@@ -2701,8 +2823,6 @@
           "system_memory",
           "native_build",
           "enabled_backends",
-          "assessment_policy",
-          "capacity_policy",
           "topology_fingerprint",
           "memory_domains"
         ],
@@ -2739,12 +2859,6 @@
             "items": {
               "type": "string"
             }
-          },
-          "assessment_policy": {
-            "type": "string"
-          },
-          "capacity_policy": {
-            "type": "string"
           },
           "topology_fingerprint": {
             "type": "string"
@@ -3295,22 +3409,6 @@
         },
         "additionalProperties": false
       },
-      "LoadRuntimeModelRequest": {
-        "type": "object",
-        "required": [
-          "model_id",
-          "profile"
-        ],
-        "properties": {
-          "model_id": {
-            "type": "string"
-          },
-          "profile": {
-            "$ref": "#/components/schemas/RuntimeExecutionProfile"
-          }
-        },
-        "additionalProperties": false
-      },
       "LoadStageSchema": {
         "type": "string",
         "enum": [
@@ -3355,7 +3453,8 @@
           "id",
           "object",
           "owned_by",
-          "status",
+          "availability",
+          "residency",
           "source",
           "location",
           "properties",
@@ -3397,8 +3496,21 @@
               "type": "string"
             }
           },
-          "status": {
-            "$ref": "#/components/schemas/ModelStatusSchema"
+          "serving_configuration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServingConfigurationSchema"
+              }
+            ]
+          },
+          "availability": {
+            "$ref": "#/components/schemas/ModelAvailabilitySchema"
+          },
+          "residency": {
+            "$ref": "#/components/schemas/ModelResidencySchema"
           },
           "source": {
             "$ref": "#/components/schemas/ModelSourceSchema"
@@ -3428,6 +3540,184 @@
           }
         },
         "additionalProperties": false
+      },
+      "ModelAvailabilitySchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "stage",
+              "completed_bytes",
+              "total_bytes",
+              "started_at",
+              "updated_at",
+              "type"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/components/schemas/DownloadStageSchema"
+              },
+              "completed_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "total_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "current_component": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "started_at": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "updated_at": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "downloading"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completed_bytes",
+              "total_bytes",
+              "resumable",
+              "last_error",
+              "updated_at",
+              "type"
+            ],
+            "properties": {
+              "completed_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "total_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "resumable": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "last_error": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "interrupted"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "ready_at",
+              "type"
+            ],
+            "properties": {
+              "ready_at": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "available"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "detected_at",
+              "code",
+              "message",
+              "type"
+            ],
+            "properties": {
+              "detected_at": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "invalid_artifact"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "detected_at",
+              "code",
+              "message",
+              "type"
+            ],
+            "properties": {
+              "detected_at": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "incompatible_artifact"
+                ]
+              }
+            }
+          }
+        ]
       },
       "ModelComponentSchema": {
         "type": "object",
@@ -3682,6 +3972,109 @@
         },
         "additionalProperties": false
       },
+      "ModelLoadEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "model_id",
+              "stage",
+              "type"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "model_id": {
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/components/schemas/ModelLoadStage"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "progress"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "model_id",
+              "generation",
+              "type"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "model_id": {
+                "type": "string"
+              },
+              "generation": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "model_id",
+              "code",
+              "message",
+              "retryable",
+              "type"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "model_id": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ModelLoadStage": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "resolving",
+          "assessing",
+          "unloading",
+          "loading",
+          "verifying"
+        ]
+      },
       "ModelLocationSchema": {
         "oneOf": [
           {
@@ -3830,7 +4223,6 @@
         "required": [
           "profile_id",
           "artifact_fingerprint",
-          "execution_policy",
           "hardware_topology",
           "assessment",
           "performance"
@@ -3840,9 +4232,6 @@
             "type": "string"
           },
           "artifact_fingerprint": {
-            "type": "string"
-          },
-          "execution_policy": {
             "type": "string"
           },
           "hardware_topology": {
@@ -3875,15 +4264,11 @@
         "type": "object",
         "required": [
           "id",
-          "policy",
           "context_length",
           "parallel_sequences"
         ],
         "properties": {
           "id": {
-            "type": "string"
-          },
-          "policy": {
             "type": "string"
           },
           "context_length": {
@@ -3975,236 +4360,18 @@
           }
         }
       },
-      "ModelSourceSchema": {
+      "ModelResidencySchema": {
         "oneOf": [
           {
             "type": "object",
             "required": [
-              "repository",
-              "requested_revision",
-              "commit",
               "type"
             ],
             "properties": {
-              "repository": {
-                "type": "string"
-              },
-              "requested_revision": {
-                "type": "string"
-              },
-              "commit": {
-                "type": "string"
-              },
-              "metadata": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/HubMetadataSchema"
-                  }
-                ]
-              },
               "type": {
                 "type": "string",
                 "enum": [
-                  "hugging_face"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "declared_by",
-              "type"
-            ],
-            "properties": {
-              "declared_by": {
-                "$ref": "#/components/schemas/LocalDeclarationSchema"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "local"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "ModelStatusSchema": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "operation_id",
-              "stage",
-              "completed_bytes",
-              "total_bytes",
-              "started_at",
-              "updated_at",
-              "type"
-            ],
-            "properties": {
-              "operation_id": {
-                "type": "string"
-              },
-              "stage": {
-                "$ref": "#/components/schemas/DownloadStageSchema"
-              },
-              "completed_bytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "total_bytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "current_component": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "started_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "updated_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "downloading"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "completed_bytes",
-              "total_bytes",
-              "resumable",
-              "last_error",
-              "updated_at",
-              "type"
-            ],
-            "properties": {
-              "completed_bytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "total_bytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "resumable": {
-                "type": "boolean"
-              },
-              "reason": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "last_error": {
-                "type": "string"
-              },
-              "updated_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "interrupted"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "ready_at",
-              "type"
-            ],
-            "properties": {
-              "ready_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "available"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "detected_at",
-              "code",
-              "message",
-              "type"
-            ],
-            "properties": {
-              "detected_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "code": {
-                "type": "string"
-              },
-              "message": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "invalid_artifact"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "detected_at",
-              "code",
-              "message",
-              "type"
-            ],
-            "properties": {
-              "detected_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "code": {
-                "type": "string"
-              },
-              "message": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "incompatible_artifact"
+                  "not_resident"
                 ]
               }
             }
@@ -4323,6 +4490,64 @@
                 "type": "string",
                 "enum": [
                   "load_failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ModelSourceSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "repository",
+              "requested_revision",
+              "commit",
+              "type"
+            ],
+            "properties": {
+              "repository": {
+                "type": "string"
+              },
+              "requested_revision": {
+                "type": "string"
+              },
+              "commit": {
+                "type": "string"
+              },
+              "metadata": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/HubMetadataSchema"
+                  }
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "hugging_face"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "declared_by",
+              "type"
+            ],
+            "properties": {
+              "declared_by": {
+                "$ref": "#/components/schemas/LocalDeclarationSchema"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "local"
                 ]
               }
             }
@@ -4722,17 +4947,25 @@
           }
         ]
       },
-      "RuntimeExecutionProfile": {
+      "ServingConfigurationSchema": {
         "type": "object",
         "required": [
-          "policy",
+          "profile"
+        ],
+        "properties": {
+          "profile": {
+            "$ref": "#/components/schemas/ServingProfileSchema"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ServingProfileSchema": {
+        "type": "object",
+        "required": [
           "context_length",
           "parallel_sequences"
         ],
         "properties": {
-          "policy": {
-            "type": "string"
-          },
           "context_length": {
             "type": "integer",
             "format": "int32",
@@ -4745,201 +4978,6 @@
           }
         },
         "additionalProperties": false
-      },
-      "RuntimeLoadStage": {
-        "type": "string",
-        "enum": [
-          "queued",
-          "resolving",
-          "assessing",
-          "unloading",
-          "loading",
-          "verifying"
-        ]
-      },
-      "RuntimeModelEvent": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "operation_id",
-              "model_id",
-              "stage",
-              "type"
-            ],
-            "properties": {
-              "operation_id": {
-                "type": "string"
-              },
-              "model_id": {
-                "type": "string"
-              },
-              "stage": {
-                "$ref": "#/components/schemas/RuntimeLoadStage"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "progress"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "operation_id",
-              "state",
-              "type"
-            ],
-            "properties": {
-              "operation_id": {
-                "type": "string"
-              },
-              "state": {
-                "$ref": "#/components/schemas/RuntimeStateResponse"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "ready"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "operation_id",
-              "model_id",
-              "code",
-              "message",
-              "retryable",
-              "type"
-            ],
-            "properties": {
-              "operation_id": {
-                "type": "string"
-              },
-              "model_id": {
-                "type": "string"
-              },
-              "code": {
-                "type": "string"
-              },
-              "message": {
-                "type": "string"
-              },
-              "retryable": {
-                "type": "boolean"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "failed"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "RuntimeStateResponse": {
-        "type": "object",
-        "required": [
-          "generation",
-          "status"
-        ],
-        "properties": {
-          "generation": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "status": {
-            "$ref": "#/components/schemas/RuntimeStatus"
-          },
-          "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "additionalProperties": false
-      },
-      "RuntimeStatus": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "empty"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "model_id",
-              "generation",
-              "profile",
-              "type"
-            ],
-            "properties": {
-              "model_id": {
-                "type": "string"
-              },
-              "generation": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "profile": {
-                "$ref": "#/components/schemas/RuntimeExecutionProfile"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "ready"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "generation",
-              "code",
-              "message",
-              "type"
-            ],
-            "properties": {
-              "generation": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "code": {
-                "type": "string"
-              },
-              "message": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "failed"
-                ]
-              }
-            }
-          }
-        ]
       },
       "SplitModeResponse": {
         "type": "string",

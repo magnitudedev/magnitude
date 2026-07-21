@@ -1,4 +1,4 @@
-import { Context, Data, Effect, Layer, PubSub, Stream } from "effect"
+import { Context, Data, Effect, Layer, PubSub, Ref, Stream } from "effect"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
@@ -22,6 +22,7 @@ export interface LocalModelConfigurationApi {
   readonly selectProfile: (profile: SelectedLocalModelProfile) => Effect.Effect<void, ModelConfigurationError>
   readonly updateSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, ModelConfigurationError>
   readonly recordUse: (slotId: SlotId, providerModelId: ProviderModelId) => Effect.Effect<void>
+  readonly revision: Effect.Effect<number>
   readonly changes: Stream.Stream<void>
 }
 
@@ -41,7 +42,11 @@ type Storage = Pick<ConfigStorageShape, "getLocalInferenceConfig" | "getModelCon
 export const makeLocalModelConfiguration = (storage: Storage): Effect.Effect<LocalModelConfigurationApi> =>
   Effect.gen(function* () {
     const changes = yield* PubSub.unbounded<void>()
-    const publish = PubSub.publish(changes, undefined).pipe(Effect.asVoid)
+    const revision = yield* Ref.make(0)
+    const publish = Ref.update(revision, (value) => value + 1).pipe(
+      Effect.zipRight(PubSub.publish(changes, undefined)),
+      Effect.asVoid,
+    )
     const mutate = (operation: string, update: (current: MagnitudeConfig) => MagnitudeConfig) =>
       storage.update(update).pipe(
         Effect.mapError((cause) => failure(operation, cause)),
@@ -72,10 +77,12 @@ export const makeLocalModelConfiguration = (storage: Storage): Effect.Effect<Loc
           else delete slots[slotId]
           if (update.providerId === "local") localSlotIntent[slotId] = "local"
           else if (update.providerId) localSlotIntent[slotId] = "cloud"
+          else delete localSlotIntent[slotId]
         }
         return { ...current, models: { ...models, slots, localSlotIntent } }
       }),
       recordUse: () => Effect.void,
+      revision: Ref.get(revision),
       changes: Stream.fromPubSub(changes),
     })
   })

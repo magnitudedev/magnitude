@@ -46,7 +46,9 @@ API / caller threads
 `LlamaCompletionBackend` is the public handle. Loading it accepts serializable execution intent,
 starts a named executor thread, initializes the native backend, creates a fresh process-local backend
 plan, and consumes that exact owned plan to initialize the model, context, chat templates, worker
-pools, and optional projector or MTP runtime. It then waits for an explicit readiness result. The
+pools, and optional projector or MTP runtime. It then returns a typed readiness result which
+distinguishes invalid or incompatible artifacts, `DoesNotFit`, operational planning failure,
+allocation failure, and success with normalized resolved evidence. The
 handle exposes completion, template application, model properties, and idle-only native planning
 operations.
 
@@ -60,6 +62,16 @@ loading always replans under current conditions.
 ## Ownership and concurrency
 
 One executor thread exclusively owns each model's mutable native resources. This gives the engine a clear serialization boundary for llama.cpp memory operations, sequence mutations, sampling state, and shutdown. Callers may be concurrent, but they communicate with the owner rather than locking the native context directly.
+
+The executor also exclusively owns process-global backend initialization for a resident runtime.
+Load-time MTP selection, fit planning, and model construction occur in that same initialized backend
+session. The selected MTP configuration remains part of the execution intent passed to fitting, so
+target and draft memory are assessed together. A serving-process preflight must never initialize a
+temporary backend before invoking the executor. Model-free preview and inventory assessment use
+isolated worker processes so their backend lifetime cannot conflict with the resident executor.
+The same MTP selector implementation and policy fingerprint are used in isolated assessment and
+resident loading. Target identity includes the selected component set and serving-configuration
+revision, and parity tests compare normalized fit evidence with loaded execution evidence.
 
 There are three bounded flows:
 

@@ -22,6 +22,7 @@ import {
 import type { LocalModelCatalogEntry } from "./types"
 import { LocalModelInventoryChanges } from "./inventory-changes"
 import { LocalModelConfiguration } from "./model-configuration"
+import { reconcileSelectedServingConfiguration } from "./serving-configuration"
 import { AcnActivityTracker } from "../activity-tracker"
 
 const PREVIEW_REQUEST_CONCURRENCY = 12
@@ -64,10 +65,8 @@ const localError = (code: LocalInferenceError["code"], operation: string, cause:
 const profileFor = (
   entry: LocalModelCatalogEntry,
   contextLength: number,
-  policy: string,
 ) => ({
   id: `${entry.id}:p${PROFILE_PARALLEL_SEQUENCES}:ctx${contextLength}`,
-  policy,
   context_length: contextLength,
   parallel_sequences: PROFILE_PARALLEL_SEQUENCES,
 })
@@ -79,12 +78,8 @@ const sourceFor = (entry: LocalModelCatalogEntry): Generated.ModelPreviewSourceS
   additional_components: entry.additionalComponents,
 })
 
-const isStoredArtifactStatus = (status: Generated.ModelStatusSchema): boolean =>
-  status.type === "available"
-    || status.type === "loading"
-    || status.type === "loaded"
-    || status.type === "unloading"
-    || status.type === "load_failed"
+const isStoredArtifactStatus = (availability: Generated.ModelAvailabilitySchema): boolean =>
+  availability.type === "available"
 
 const fitAssessment = (assessment: Generated.HardwareAssessmentSchema): LocalModelFitAssessment => {
   if (assessment.type !== "fits" && assessment.type !== "does_not_fit") {
@@ -265,11 +260,11 @@ export const selectRecommendationPortfolio = (
   return selected.map(({ candidate, badge }) => ({ ...candidate.value, badge }))
 }
 
-const operationStage = (event: Generated.ModelDownloadEventSchema | Generated.RuntimeModelEvent): LocalInferenceOperationSnapshot["stage"] => {
+const operationStage = (event: Generated.ModelDownloadEventSchema | Generated.ModelLoadEvent): LocalInferenceOperationSnapshot["stage"] => {
   if (event.type === "resolving") return "resolving"
   if (event.type === "checking_space") return "checking_space"
   if (event.type === "ready") return "ready"
-  if (event.type === "failed") return "verifying"
+  if (event.type === "failed") return "queued"
   return event.stage === "publishing" ? "publishing"
     : event.stage === "downloading" ? "downloading"
     : event.stage === "assessing" ? "assessing"
@@ -302,11 +297,10 @@ export const LocalInferenceLive: Layer.Layer<
   const lock = yield* Effect.makeSemaphore(1)
   const recommendationRefreshLock = yield* Effect.makeSemaphore(1)
 
-  const resolveHubRepository = (repository: string) => Effect.gen(function* () {
-    return yield* client.huggingFace.resolveHuggingFaceRepository({
+  const resolveHubRepository = (repository: string) =>
+    client.huggingFace.resolveHuggingFaceRepository({
       payload: { repository, revision: "main" },
     })
-  })
 
   const resolveCanonicalCatalog = Effect.gen(function* () {
     const repositories = [...new Set(LOCAL_MODEL_CATALOG_OVERLAY.models.flatMap((model) =>
@@ -341,14 +335,20 @@ export const LocalInferenceLive: Layer.Layer<
     } satisfies ResolvedCatalog
   })
 
-  const previews = (hardware: Generated.HardwareSnapshotSchema, entries: readonly LocalModelCatalogEntry[]) => Effect.forEach(
+  yield* reconcileSelectedServingConfiguration(client, configuration).pipe(
+    Effect.catchAll((cause) => Effect.logWarning("Unable to migrate legacy local model selection").pipe(
+      Effect.annotateLogs({ cause: String(cause) }),
+    )),
+  )
+
+  const previews = (entries: readonly LocalModelCatalogEntry[]) => Effect.forEach(
     entries,
     (entry) => {
       const contexts = PROFILE_CONTEXTS.filter((context) => entry.supportedContextTokens.includes(context))
       return client.models.previewModel({
         payload: {
           source: sourceFor(entry),
-          profiles: contexts.map((context) => profileFor(entry, context, hardware.assessment_policy)),
+          profiles: contexts.map((context) => profileFor(entry, context)),
         },
       }).pipe(
         Effect.map((preview) => ({ entry, preview })),
@@ -367,8 +367,6 @@ export const LocalInferenceLive: Layer.Layer<
     const key = [
       hardware.native_build,
       hardware.topology_fingerprint,
-      hardware.capacity_policy,
-      hardware.assessment_policy,
       ...catalog.commits,
     ].join(":")
     const cached = (yield* Ref.get(recommendationCache)).get(key)
@@ -378,7 +376,7 @@ export const LocalInferenceLive: Layer.Layer<
       0,
     )
     const plausibleEntries = catalog.entries.filter((entry) => entry.publishedWeightBytes <= totalStableCapacity)
-    const previewResults = yield* previews(hardware, plausibleEntries)
+    const previewResults = yield* previews(plausibleEntries)
     const items = previewResults.flatMap((result) => result._tag === "Right" ? [result.right] : [])
     const candidates = items.flatMap(({ entry, preview }) => preview.assessments.flatMap((assessment) => {
       const value = recommendationFrom(entry, preview, assessment)
@@ -398,27 +396,17 @@ export const LocalInferenceLive: Layer.Layer<
     return result
   })
 
-  const resolveCatalogSelection = (selectionId: string) => Effect.gen(function* () {
-    const config = yield* configuration.get.pipe(Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)))
-    const recommendationList = yield* recommendations().pipe(
-      Effect.mapError((cause) => localError("icn_unavailable", "preview local model recommendations", cause)),
-    )
-    const recommendation = recommendationList.recommendations.find((item) => item.configurationId === selectionId || item.catalogModelId === selectionId)
-    const catalogId = recommendation?.catalogModelId ?? config.selectedProfile?.catalogModelId
-    return catalogId ? (yield* Ref.get(resolvedCatalog)).get(catalogId) : undefined
-  })
-
   const resolveStoredModel = (selectionId: string) => Effect.gen(function* () {
     const models = (yield* client.models.listModels({})).data
     const direct = models.find((model) => model.id === selectionId)
     if (direct) return direct
-    const entry = yield* resolveCatalogSelection(selectionId)
-    if (!entry) return undefined
-    return models.find((model) => {
-      if (model.source.type !== "hugging_face" || model.source.repository !== entry.repo) return false
-      const components = model.location.type === "file" ? [model.location.component] : model.location.components
-      return components.some((component) => component.path === entry.primaryGguf)
-    })
+    const config = yield* configuration.get.pipe(
+      Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)),
+    )
+    const selected = config.selectedProfile
+    return selected?.configurationId === selectionId && selected.providerModelId
+      ? models.find((model) => model.id === selected.providerModelId)
+      : undefined
   })
 
   const stateValue = (
@@ -426,20 +414,16 @@ export const LocalInferenceLive: Layer.Layer<
     recommendationFailureCount = 0,
     currentOperations: readonly LocalInferenceOperationSnapshot[] = [],
   ) => Effect.gen(function* () {
-    const [hardware, inventory, runtime] = yield* Effect.all([
+    const [hardware, inventory] = yield* Effect.all([
       client.system.getHardware({}),
       client.models.listModels({}),
-      client.runtime.getRuntimeState({}),
-    ], { concurrency: 3 })
-    const activeId = runtime.status.type === "ready" ? runtime.status.model_id : undefined
+    ], { concurrency: 2 })
+    const active = inventory.data.find((model) => model.residency.type === "loaded")
+    const activeId = active?.id
     const choices: LocalModelChoice[] = inventory.data
-      .filter((model) => isStoredArtifactStatus(model.status))
+      .filter((model) => isStoredArtifactStatus(model.availability))
       .map((model) => {
-        const contextTokens = activeId === model.id && runtime.status.type === "ready"
-          ? runtime.status.profile.context_length
-          : model.hardware.type === "fits"
-            ? model.hardware.profile.context_length
-            : undefined
+        const contextTokens = Option.getOrUndefined(model.serving_configuration)?.profile.context_length
         const properties = model.properties.type === "inspected" ? model.properties : undefined
         const quantization = properties ? Option.getOrUndefined(properties.quantization) : undefined
         return {
@@ -468,10 +452,11 @@ export const LocalInferenceLive: Layer.Layer<
         }
       })
     return {
-      activeBinding: runtime.status.type === "ready" ? {
-        selectionId: runtime.status.model_id,
-        providerModelId: ProviderModelIdSchema.make(runtime.status.model_id),
-        contextTokens: runtime.status.profile.context_length,
+      activeBinding: active && active.residency.type === "loaded" ? {
+        selectionId: active.id,
+        providerModelId: ProviderModelIdSchema.make(active.id),
+        contextTokens: Option.getOrUndefined(active.serving_configuration)?.profile.context_length
+          ?? active.residency.context_length,
       } : null,
       host: { _tag: "Available" as const, profile: hostToWire(hardware) },
       choices,
@@ -525,11 +510,20 @@ export const LocalInferenceLive: Layer.Layer<
     Effect.flatMap((next) => mirror.setIfChanged(next, (left, right) => JSON.stringify(left) === JSON.stringify(right))),
     Effect.asVoid,
   )
+  yield* changes.stream.pipe(
+    Stream.runForEach(() => reconcileState),
+    Effect.catchAll(() => Effect.void),
+    Effect.forkScoped,
+  )
 
   const setOperation = (snapshot: LocalInferenceOperationSnapshot) => mirror.update((state) => {
-    const operations = state.operations.some((operation) => operation.operationId === snapshot.operationId)
-      ? state.operations.map((operation) => operation.operationId === snapshot.operationId ? snapshot : operation)
-      : [...state.operations, snapshot]
+    const previous = state.operations.find((operation) => operation.operationId === snapshot.operationId)
+    const next = snapshot.status === "failed" && previous
+      ? { ...snapshot, stage: previous.stage }
+      : snapshot
+    const operations = previous
+      ? state.operations.map((operation) => operation.operationId === snapshot.operationId ? next : operation)
+      : [...state.operations, next]
     return { ...state, operations: boundOperationHistory(operations) }
   }).pipe(Effect.asVoid)
 
@@ -618,9 +612,13 @@ export const LocalInferenceLive: Layer.Layer<
             shard_index: index === 0 ? Option.none() : Option.some(index),
           })),
           relationships: [],
+          serving_profile: {
+            context_length: recommendation.contextTokens,
+            parallel_sequences: PROFILE_PARALLEL_SEQUENCES,
+          },
         }
         return client.models.downloadModel({ payload: request }).pipe(
-          Stream.runForEach((event) => {
+          Effect.flatMap(({ events }) => Stream.runForEach(events, (event) => {
             const modelId = event.type === "ready"
               ? event.model.id
               : event.type === "checking_space" || event.type === "progress"
@@ -630,7 +628,7 @@ export const LocalInferenceLive: Layer.Layer<
                   : recommendation.catalogModelId
             const total = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.total_bytes : 0
             const completed = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.completed_bytes : 0
-            return setOperation({
+            const update = setOperation({
               ...operation,
               upstreamOperationId: event.operation_id,
               providerModelId: ProviderModelIdSchema.make(modelId),
@@ -644,7 +642,15 @@ export const LocalInferenceLive: Layer.Layer<
               } } : {}),
               updatedAt: new Date().toISOString(),
             })
-          }),
+            return event.type === "ready"
+              ? update.pipe(Effect.zipRight(configuration.selectProfile({
+                  configurationId,
+                  catalogModelId: recommendation.catalogModelId,
+                  contextTokens: recommendation.contextTokens,
+                  providerModelId: event.model.id,
+                }).pipe(Effect.orDie)))
+              : update
+          })),
           Effect.mapError((cause) => localError("configuration_failed", "download local model", cause)),
           Effect.zipRight(reconcileState),
           Effect.zipRight(changes.publish),
@@ -667,26 +673,14 @@ export const LocalInferenceLive: Layer.Layer<
           false,
         )
       }
-      const config = yield* configuration.get.pipe(
-        Effect.mapError((cause) => localError("configuration_failed", "read local model configuration", cause)),
+      yield* reconcileSelectedServingConfiguration(client, configuration, [model]).pipe(
+        Effect.mapError((cause) => localError("configuration_failed", "configure local model serving", cause)),
       )
-      const contextLength = config.selectedProfile?.contextTokens
-        ?? (model.hardware.type === "fits" ? model.hardware.profile.context_length : 100_000)
-      const hardware = yield* client.system.getHardware({}).pipe(
-        Effect.mapError((cause) => localError("icn_unavailable", "read ICN execution policy", cause)),
-      )
-      yield* client.runtime.loadRuntimeModel({ payload: {
-        model_id: model.id,
-        profile: {
-          policy: hardware.assessment_policy,
-          context_length: contextLength,
-          parallel_sequences: PROFILE_PARALLEL_SEQUENCES,
-        },
-      } }).pipe(
-        Stream.runForEach((event) => setOperation({
+      yield* client.models.loadModel({ path: { model_id: model.id } }).pipe(
+        Effect.flatMap(({ events }) => Stream.runForEach(events, (event) => setOperation({
           ...operation,
           upstreamOperationId: event.operation_id,
-          providerModelId: ProviderModelIdSchema.make(event.type === "ready" ? model.id : event.model_id),
+          providerModelId: ProviderModelIdSchema.make(event.model_id),
           status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
           stage: operationStage(event),
           ...(event.type === "failed" ? { failure: {
@@ -695,7 +689,7 @@ export const LocalInferenceLive: Layer.Layer<
             retryable: event.retryable,
           } } : {}),
           updatedAt: new Date().toISOString(),
-        })),
+        }))),
         Effect.mapError((cause) => localError("runtime_start_failed", "activate local model", cause)),
       )
       yield* reconcileState
@@ -713,27 +707,52 @@ export const LocalInferenceLive: Layer.Layer<
     yield* changes.publish
   }))
 
-  const disable = lock.withPermits(1)(client.runtime.unloadRuntimeModel({}).pipe(
-    Effect.mapError((cause) => localError("configuration_failed", "disable local inference", cause)),
-    Effect.zipRight(reconcileState),
-    Effect.zipRight(changes.publish),
-  ))
+  const disable = lock.withPermits(1)(Effect.gen(function* () {
+    const models = yield* configuration.getModels.pipe(
+      Effect.mapError((cause) => localError("configuration_failed", "read model slots", cause)),
+    )
+    const slots = models?.slots ?? {}
+    const updates = Object.fromEntries(
+      (["primary", "secondary"] as const)
+        .filter((slotId) => slots[slotId]?.providerId === "local")
+        .map((slotId) => [slotId, {}]),
+    )
+    if (Object.keys(updates).length > 0) {
+      yield* configuration.updateSlots(updates).pipe(
+        Effect.mapError((cause) => localError("configuration_failed", "clear local model slots", cause)),
+      )
+    }
+    const inventory = yield* client.models.listModels({}).pipe(
+      Effect.mapError((cause) => localError("icn_unavailable", "read local models", cause)),
+    )
+    yield* Effect.forEach(
+      inventory.data.filter((model) => model.residency.type === "loaded"),
+      (model) => client.models.unloadModel({ path: { model_id: model.id } }),
+      { discard: true },
+    ).pipe(Effect.mapError((cause) => localError("configuration_failed", "disable local inference", cause)))
+    yield* reconcileState
+    yield* changes.publish
+  }))
 
   const restart = (requestId: string) => runAccepted(
     acceptOperation(requestId, "restart", { _tag: "runtime" }, ProviderModelIdSchema.make("local-runtime")),
     (operation) => Effect.gen(function* () {
-      const runtime = yield* client.runtime.getRuntimeState({}).pipe(Effect.mapError((cause) => localError("icn_unavailable", "read local runtime", cause)))
-      if (runtime.status.type !== "ready") {
+      const inventory = yield* client.models.listModels({}).pipe(
+        Effect.mapError((cause) => localError("icn_unavailable", "read local models", cause)),
+      )
+      const current = inventory.data.find((model) => model.residency.type === "loaded")
+      if (!current) {
         yield* setOperation({ ...operation, status: "completed", stage: "ready", updatedAt: new Date().toISOString() })
         return
       }
-      const current = runtime.status
-      yield* client.runtime.unloadRuntimeModel({}).pipe(Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)))
-      yield* client.runtime.loadRuntimeModel({ payload: { model_id: current.model_id, profile: current.profile } }).pipe(
-        Stream.runForEach((event) => setOperation({
+      yield* client.models.unloadModel({ path: { model_id: current.id } }).pipe(
+        Effect.mapError((cause) => localError("runtime_start_failed", "unload local inference for restart", cause)),
+      )
+      yield* client.models.loadModel({ path: { model_id: current.id } }).pipe(
+        Effect.flatMap(({ events }) => Stream.runForEach(events, (event) => setOperation({
           ...operation,
           upstreamOperationId: event.operation_id,
-          providerModelId: ProviderModelIdSchema.make(event.type === "ready" ? current.model_id : event.model_id),
+          providerModelId: ProviderModelIdSchema.make(event.model_id),
           status: event.type === "failed" ? "failed" : event.type === "ready" ? "completed" : "running",
           stage: operationStage(event),
           ...(event.type === "failed" ? { failure: {
@@ -742,7 +761,7 @@ export const LocalInferenceLive: Layer.Layer<
             retryable: event.retryable,
           } } : {}),
           updatedAt: new Date().toISOString(),
-        })),
+        }))),
         Effect.mapError((cause) => localError("runtime_start_failed", "restart local inference", cause)),
       )
       yield* reconcileState

@@ -454,8 +454,8 @@ function startDesktopRpcServer(): void {
   )
 }
 
-app.whenReady().then(async () => {
-  // 1. Resolve login shell environment BEFORE spawning ACN
+app.whenReady().then(() => {
+  // 1. Resolve the login shell environment before any lazy ACN spawn.
   inheritLoginShellEnv()
 
   // 2. Start the desktop RPC server BEFORE creating any window, regardless of
@@ -466,20 +466,8 @@ app.whenReady().then(async () => {
   // 3. Set up application menu
   Menu.setApplicationMenu(buildMenu())
 
-  // 4. Ensure daemon is running (spawn if needed). The URL stays internal to
-  //    the DaemonSpawner contract; it is not passed as renderer app state.
-  try {
-    daemonUrl = await ensureDaemonRunning()
-  } catch (err) {
-    // Handle DaemonError with user-friendly messages
-    const message = formatDaemonError(err)
-    console.error("[desktop] Daemon connection failed:", message)
-    createWindow()
-    return
-  }
-
-  // 5. Create the window. The preload bridge asks main to ensure daemon
-  // readiness, so renderer reloads retry instead of waiting for a one-shot event.
+  // 4. Create the window without touching daemon lifecycle. The renderer's
+  // shared SDK coordinator discovers or spawns on first RPC demand.
   createWindow()
 })
 
@@ -490,36 +478,8 @@ app.on("window-all-closed", () => {
   }
 })
 
-app.on("activate", async () => {
+app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length !== 0) return
-
-  // Re-check the daemon before creating a window. On macOS, when all windows
-  // are closed and the user reactivates the app, the previously-discovered
-  // daemonUrl may be stale (the daemon could have died while the app was
-  // inactive). We health-check the existing URL first; if it's unreachable,
-  // we discover or spawn a fresh daemon.
-  if (daemonUrl) {
-    try {
-      const res = await fetch(`${daemonUrl}/health`)
-      if (res.ok) {
-        createWindow()
-        return
-      }
-    } catch {
-      // Health check failed — fall through to re-ensure
-    }
-  }
-
-  // Discover or spawn a fresh daemon.
-  try {
-    daemonUrl = await ensureDaemonRunning()
-  } catch (err) {
-    const message = formatDaemonError(err)
-    console.error("[desktop] Daemon re-ensurance failed:", message)
-    createWindow()
-    return
-  }
-
   createWindow()
 })
 

@@ -8,6 +8,9 @@ applies_to:
   - packages/sdk/src/remote-spawner.ts
   - cli/src/platform/**
   - desktop/src/platform.ts
+  - desktop/src/main.ts
+  - desktop/src/preload.ts
+  - desktop/src/desktop-rpc.ts
   - desktop/src/renderer.tsx
   - web/src/platform/**
   - web/src/renderer.tsx
@@ -98,9 +101,20 @@ The winner holds the claim until a canonical healthy registration is observable 
 Other contenders wait for the claim and then repeat the mandatory health recheck. They do not spawn
 speculative candidates.
 
-The claim uses an atomic filesystem operation and has a bounded stale-claim recovery policy. Claim
-release and stale recovery operate only on the exact per-version claim path. A claim contains no
-credentials or session data.
+The claim is a complete owner record containing an opaque token plus the owning process identity.
+It is published atomically by hard-linking a fully written private file to the well-known election
+path, so observers can never see a claim without its owner identity. Stale-claim recovery is bounded
+by age but must also prove that the recorded owner process is dead; elapsed time alone never permits
+stealing a live claim. Recovery hard-links the exact dead claim to a token-specific retained
+tombstone before removing the election path. The retained link elects one recovery winner, allows a
+later contender to finish an interrupted recovery, and prevents a delayed contender from removing a
+newer owner. Claim release and stale recovery operate only on the exact per-version claim path. A
+claim contains no credentials or session data.
+
+The age bound is a short owner-record publication grace and is always shorter than one contender's
+spawn-election wait budget. It is not a crash-recovery delay. Once the grace has elapsed, a recorded
+dead owner is recoverable during the current ensure attempt; a recorded live owner remains
+ineligible regardless of claim age.
 
 A healthy compatible registration is never intentionally replaced by a new candidate. ACN's
 ownership watchdog is defensive corruption/failure detection, not the election algorithm.

@@ -67,6 +67,7 @@ export const SelectedLocalModelProfileSchema = Schema.Struct({
   configurationId: Schema.String,
   catalogModelId: Schema.String,
   contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  providerModelId: Schema.optional(Schema.String),
 })
 export type SelectedLocalModelProfile = Schema.Schema.Type<typeof SelectedLocalModelProfileSchema>
 

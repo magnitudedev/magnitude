@@ -2,6 +2,7 @@ import * as Command from "@effect/platform/Command";
 import * as CommandExecutor from "@effect/platform/CommandExecutor";
 import * as FileSystem from "@effect/platform/FileSystem";
 import * as HttpClient from "@effect/platform/HttpClient";
+import * as HttpClientError from "@effect/platform/HttpClientError";
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
 import * as Path from "@effect/platform/Path";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
@@ -1014,10 +1015,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         schedule: Schedule.spaced("50 millis"),
         while: (cause) =>
           cause instanceof GeneratedClientTransportError &&
-          typeof cause.cause === "object" &&
-          cause.cause !== null &&
-          "_tag" in cause.cause &&
-          cause.cause._tag === "RequestError",
+          cause.cause instanceof HttpClientError.RequestError,
       }),
       Effect.mapError((cause) =>
         cause instanceof IcnLifecycleError

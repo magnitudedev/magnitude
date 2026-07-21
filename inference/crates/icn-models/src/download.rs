@@ -11,8 +11,8 @@ use hf_hub::HFError;
 use icn_contracts::{
     ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress,
     DownloadModelRequest, DownloadStage, HardwareAssessment, HuggingFaceDownloadSource, Integrity,
-    InventoryError, InventoryModel, InventoryProperties, ModelComponent, ModelDownloadEvent,
-    ModelLocation, ModelSource, ModelStatus,
+    InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
+    ModelDownloadEvent, ModelLocation, ModelResidency, ModelSource, ServingConfiguration,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -137,7 +137,7 @@ impl ModelManager {
                 && let Some(model) = models.get_mut(model_id)
             {
                 let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
-                model.status = ModelStatus::Interrupted {
+                model.availability = ModelAvailability::Interrupted {
                     completed_bytes,
                     total_bytes,
                     resumable: failure.resumable,
@@ -272,16 +272,25 @@ impl ModelManager {
             });
         }
 
-        if let Ok(models) = self.models.read()
-            && let Some(existing) = models.get(&model_id)
-            && matches!(
-                existing.status,
-                ModelStatus::Available { .. } | ModelStatus::Loaded { .. }
-            )
-        {
+        let existing = self.models.read().ok().and_then(|models| {
+            models
+                .get(&model_id)
+                .filter(|model| matches!(model.availability, ModelAvailability::Available { .. }))
+                .cloned()
+        });
+        if existing.is_some() {
+            let configured = self
+                .configure_serving_model(&model_id, request.serving_profile.clone())
+                .await
+                .map_err(|error| DownloadError {
+                    code: "configuration_failed",
+                    message: error.to_string(),
+                    retryable: false,
+                    resumable: false,
+                })?;
             operation.sender.send_replace(ModelDownloadEvent::Ready {
                 operation_id: operation_id.to_owned(),
-                model: Box::new(existing.clone()),
+                model: Box::new(configured),
             });
             return Ok(());
         }
@@ -293,7 +302,10 @@ impl ModelManager {
             created: started_at,
             name: repository.clone(),
             supported_parameters: Vec::new(),
-            status: ModelStatus::Downloading {
+            serving_configuration: Some(ServingConfiguration {
+                profile: request.serving_profile.clone(),
+            }),
+            availability: ModelAvailability::Downloading {
                 operation_id: operation_id.to_owned(),
                 stage: DownloadStage::Queued,
                 completed_bytes,
@@ -302,6 +314,7 @@ impl ModelManager {
                 started_at,
                 updated_at: started_at,
             },
+            residency: ModelResidency::NotResident,
             source: ModelSource::HuggingFace {
                 repository: repository.clone(),
                 requested_revision: revision.clone(),
@@ -450,7 +463,7 @@ impl ModelManager {
                         && let Some(model) = models.get_mut(&model_id)
                     {
                         let updated_at = now();
-                        model.status = ModelStatus::Downloading {
+                        model.availability = ModelAvailability::Downloading {
                             operation_id: operation_id.to_owned(),
                             stage,
                             completed_bytes: completed,
@@ -522,7 +535,7 @@ impl ModelManager {
                 retryable: false,
                 resumable: false,
             })?;
-        let model = build_model(
+        let mut model = build_model(
             manifest.model_id.clone(),
             manifest.content_id.clone(),
             manifest.created_at,
@@ -551,6 +564,9 @@ impl ModelManager {
             retryable: true,
             resumable: true,
         })?;
+        model.serving_configuration = Some(ServingConfiguration {
+            profile: request.serving_profile.clone(),
+        });
         let ready = self
             .complete_and_publish_model(model)
             .await

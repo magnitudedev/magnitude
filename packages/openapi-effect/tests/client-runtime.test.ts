@@ -94,15 +94,15 @@ describe("generated stream client runtime", () => {
       { baseUrl: "http://127.0.0.1:1" },
       descriptor
     );
-    const values = await Effect.runPromise(
-      Stream.runCollect(
-        run({
+    const admitted = await Effect.runPromise(
+      run({
           path: { model_id: "a/b" },
           urlParams: { follow: true },
           payload: { count: 2 },
-        })
-      )
+      })
     );
+    const values = await Effect.runPromise(Stream.runCollect(admitted.events));
+    expect(admitted.status).toBe(200);
     expect(Chunk.toReadonlyArray(values)).toEqual([{ value: 1 }]);
     expect(seen?.url).toBe("http://127.0.0.1:1/models/a%2Fb/events");
     expect(seen?.urlParams).toEqual([["follow", "true"]]);
@@ -131,13 +131,11 @@ describe("generated stream client runtime", () => {
       descriptor
     );
     const error = await Effect.runPromise(
-      Stream.runDrain(
-        call({
+      call({
           path: { model_id: "model" },
           urlParams: { follow: false },
           payload: { count: 1 },
-        })
-      ).pipe(Effect.flip)
+      }).pipe(Effect.flip)
     );
     expect(error).toBeInstanceOf(GeneratedClientRemoteError);
     expect(
@@ -161,13 +159,14 @@ describe("generated stream client runtime", () => {
       descriptor
     );
     const incomplete = await Effect.runPromise(
-      Stream.runDrain(
-        truncatedCall({
+      truncatedCall({
           path: { model_id: "model" },
           urlParams: { follow: false },
           payload: { count: 1 },
-        })
-      ).pipe(Effect.flip)
+      }).pipe(
+        Effect.flatMap((response) => Stream.runDrain(response.events)),
+        Effect.flip,
+      )
     );
     expect(incomplete).toBeInstanceOf(GeneratedClientIncompleteStreamError);
   });
@@ -204,7 +203,9 @@ describe("generated stream client runtime", () => {
         path: { model_id: "model" },
         urlParams: { follow: true },
         payload: { count: 1 },
-      }).pipe(Stream.take(2), Stream.runCollect)
+      }).pipe(
+        Effect.flatMap((response) => response.events.pipe(Stream.take(2), Stream.runCollect)),
+      )
     );
     expect(Chunk.toReadonlyArray(values)).toEqual([{ value: 1 }, { value: 2 }]);
     expect(headers).toEqual([undefined, "1"]);

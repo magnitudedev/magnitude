@@ -212,7 +212,6 @@ struct DiscoveredDevice {
 struct HardwareEnvironment {
     native_build: String,
     enabled_backends: Vec<String>,
-    assessment_policy: String,
     platform: String,
     architecture: String,
     logical_cores: usize,
@@ -234,7 +233,6 @@ pub fn discover_hardware(
     policy: CapacityPolicy,
     native_build: impl Into<String>,
     enabled_backends: Vec<String>,
-    assessment_policy: impl Into<String>,
 ) -> HardwareSnapshot {
     let mut system = System::new_with_specifics(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
@@ -277,7 +275,6 @@ pub fn discover_hardware(
         HardwareEnvironment {
             native_build: native_build.into(),
             enabled_backends,
-            assessment_policy: assessment_policy.into(),
             platform: std::env::consts::OS.to_owned(),
             architecture: std::env::consts::ARCH.to_owned(),
             logical_cores: std::thread::available_parallelism().map_or(1, |value| value.get()),
@@ -441,11 +438,6 @@ fn hardware_snapshot_from_devices(
         system_memory: environment.system_memory,
         native_build: environment.native_build,
         enabled_backends: environment.enabled_backends,
-        assessment_policy: environment.assessment_policy,
-        capacity_policy: format!(
-            "native-fit-stable-total;memory-domains=platform-native;reserve-per-domain={}",
-            policy.reserve_bytes_per_domain
-        ),
         topology_fingerprint,
         memory_domains: domains,
     }
@@ -504,7 +496,6 @@ pub fn discover(
     policy: CapacityPolicy,
     native_build: impl Into<String>,
     enabled_backends: Vec<String>,
-    assessment_policy: impl Into<String>,
 ) -> Result<HardwareSnapshot, EstimateError> {
     let backend = LlamaBackend::init().map_err(EstimateError::Backend)?;
     Ok(discover_hardware(
@@ -512,7 +503,6 @@ pub fn discover(
         policy,
         native_build,
         enabled_backends,
-        assessment_policy,
     ))
 }
 
@@ -2340,7 +2330,6 @@ mod tests {
             HardwareEnvironment {
                 native_build: "build".to_owned(),
                 enabled_backends: vec!["vulkan".to_owned(), "cuda".to_owned()],
-                assessment_policy: "assessment".to_owned(),
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
                 logical_cores: 8,
@@ -2403,7 +2392,6 @@ mod tests {
             HardwareEnvironment {
                 native_build: "build".to_owned(),
                 enabled_backends: vec!["cpu".to_owned(), "cuda".to_owned(), "vulkan".to_owned()],
-                assessment_policy: "assessment".to_owned(),
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
                 logical_cores: 8,
@@ -2457,7 +2445,6 @@ mod tests {
             HardwareEnvironment {
                 native_build: "build".to_owned(),
                 enabled_backends: vec!["metal".to_owned(), "cpu".to_owned()],
-                assessment_policy: "assessment".to_owned(),
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 logical_cores: 8,
@@ -2476,7 +2463,6 @@ mod tests {
             HardwareEnvironment {
                 native_build: "build".to_owned(),
                 enabled_backends: vec!["cpu".to_owned(), "metal".to_owned()],
-                assessment_policy: "assessment".to_owned(),
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 logical_cores: 8,
@@ -2537,7 +2523,6 @@ mod tests {
             HardwareEnvironment {
                 native_build: "build".to_owned(),
                 enabled_backends: vec!["cpu".to_owned(), "metal".to_owned()],
-                assessment_policy: "assessment".to_owned(),
                 platform: "macos".to_owned(),
                 architecture: "x86_64".to_owned(),
                 logical_cores: 8,

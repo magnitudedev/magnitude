@@ -175,7 +175,7 @@ impl ModelLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelStatus {
+pub enum ModelAvailability {
     Downloading {
         operation_id: String,
         stage: DownloadStage,
@@ -206,6 +206,12 @@ pub enum ModelStatus {
         code: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelResidency {
+    NotResident,
     Loading {
         load_id: String,
         stage: LoadStage,
@@ -644,8 +650,6 @@ pub struct HardwareSnapshot {
     pub system_memory: HardwareSystemMemory,
     pub native_build: String,
     pub enabled_backends: Vec<String>,
-    pub assessment_policy: String,
-    pub capacity_policy: String,
     pub topology_fingerprint: String,
     pub memory_domains: Vec<HardwareMemoryDomain>,
 }
@@ -670,7 +674,6 @@ pub struct ModelPreviewComponentSource {
 #[serde(deny_unknown_fields)]
 pub struct ModelPreviewProfile {
     pub id: String,
-    pub policy: String,
     pub context_length: u32,
     pub parallel_sequences: u32,
 }
@@ -687,7 +690,6 @@ pub struct ModelPreviewRequest {
 pub struct ModelPreviewAssessment {
     pub profile_id: String,
     pub artifact_fingerprint: String,
-    pub execution_policy: String,
     pub hardware_topology: String,
     pub assessment: HardwareAssessment,
     pub performance: GenerationPerformanceAssessment,
@@ -769,13 +771,29 @@ pub struct InventoryModel {
     pub created: u64,
     pub name: String,
     pub supported_parameters: Vec<String>,
-    pub status: ModelStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_configuration: Option<ServingConfiguration>,
+    pub availability: ModelAvailability,
+    pub residency: ModelResidency,
     pub source: ModelSource,
     pub location: ModelLocation,
     pub properties: InventoryProperties,
     pub hardware: HardwareAssessment,
     pub operations: Vec<ModelOperation>,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingProfile {
+    pub context_length: u32,
+    pub parallel_sequences: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingConfiguration {
+    pub profile: ServingProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,6 +825,7 @@ pub struct DownloadModelRequest {
     pub components: Vec<DownloadComponent>,
     #[serde(default)]
     pub relationships: Vec<ComponentRelationship>,
+    pub serving_profile: ServingProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -917,11 +936,16 @@ pub trait ModelInventory: Send + Sync + 'static {
     fn plan_delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletePlan, InventoryError>>;
     fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
     fn resolve_ready(&self, id: &ModelId) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>>;
-    fn update_status(
+    fn update_residency(
         &self,
         id: &ModelId,
-        status: ModelStatus,
+        residency: ModelResidency,
     ) -> BoxFuture<'_, Result<(), InventoryError>>;
+    fn configure_serving(
+        &self,
+        id: &ModelId,
+        profile: ServingProfile,
+    ) -> BoxFuture<'_, Result<InventoryModel, InventoryError>>;
 }
 
 /// Canonical inventory assessment implemented by the server composition root.
@@ -936,6 +960,14 @@ pub trait InventoryHardwareAssessor: Send + Sync + 'static {
         &self,
         model: ResolvedModel,
     ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>>;
+
+    fn assess_serving(
+        &self,
+        model: ResolvedModel,
+        _profile: ServingProfile,
+    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
+        self.assess(model)
+    }
 }
 
 pub trait HardwareProvider: Send + Sync + 'static {
@@ -944,8 +976,6 @@ pub trait HardwareProvider: Send + Sync + 'static {
 
 /// Canonical profile-aware model assessment used by inventory and remote preview.
 pub trait ModelHardwareAssessor: HardwareProvider {
-    fn policy_identity(&self) -> &str;
-
     fn cache_key(
         &self,
         profile: Option<&ModelPreviewProfile>,

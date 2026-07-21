@@ -34,7 +34,7 @@ pub(crate) fn json() -> Value {
             "model_inventory",
             "model_preview",
             "model_download",
-            "runtime_model_control",
+            "model_load_control",
             "chat_streaming"
         ],
         "target": TARGET,

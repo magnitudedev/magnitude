@@ -25,17 +25,15 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         searchHuggingFaceModels: makeHttpOperation(http, options, Operations.searchHuggingFaceModelsOperation),
       },
       models: {
+        configureModelServing: makeHttpOperation(http, options, Operations.configureModelServingOperation),
         deleteModel: makeHttpOperation(http, options, Operations.deleteModelOperation),
         getModel: makeHttpOperation(http, options, Operations.getModelOperation),
         getModelProperties: makeHttpOperation(http, options, Operations.getModelPropertiesOperation),
         listModels: makeHttpOperation(http, options, Operations.listModelsOperation),
         previewModel: makeHttpOperation(http, options, Operations.previewModelOperation),
+        unloadModel: makeHttpOperation(http, options, Operations.unloadModelOperation),
         downloadModel: makeStreamOperation(http, options, Operations.downloadModelOperation),
-      },
-      runtime: {
-        getRuntimeState: makeHttpOperation(http, options, Operations.getRuntimeStateOperation),
-        unloadRuntimeModel: makeHttpOperation(http, options, Operations.unloadRuntimeModelOperation),
-        loadRuntimeModel: makeStreamOperation(http, options, Operations.loadRuntimeModelOperation),
+        loadModel: makeStreamOperation(http, options, Operations.loadModelOperation),
       },
       system: {
         getHardware: makeHttpOperation(http, options, Operations.getHardwareOperation),

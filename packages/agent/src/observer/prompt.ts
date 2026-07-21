@@ -363,6 +363,14 @@ export function observerWindowToPrompt(input: ObserverWindowPromptInput): Prompt
         break
       }
 
+      case 'attempt_feedback': {
+        const feedback = renderFeedbackText(msg.feedback)
+        if (feedback) {
+          messages.push(textMessage(`<magnitude>\n<feedback from="user">\n${feedback}\n</feedback>\n</magnitude>`))
+        }
+        break
+      }
+
       case 'context': {
         const rendered = contextEntryToObserverMessages(msg.timeline, timezone)
         if (rendered.length > 0) {

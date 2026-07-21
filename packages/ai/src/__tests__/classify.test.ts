@@ -89,5 +89,6 @@ describe("streamStartFailureFromRejectedResponse", () => {
     expect(snapshot.tag).toBe("StreamStartProviderRejection")
     expect(snapshot.detailTag).toBe("ContextLimitExceeded")
     expect(snapshot.responseStatus).toBe(400)
+    expect(snapshot.providerMessage).toBe("prompt is too long")
   })
 })

@@ -7,27 +7,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use futures_util::{
     future::BoxFuture,
     stream::{BoxStream, StreamExt},
 };
 use icn_api::{
-    AppState, BackendRegistry, FakeBackend, LoadRuntimeModelRequest, RuntimeController,
-    RuntimeExecutionProfile, RuntimeLoadStage, RuntimeModelEvent, RuntimeStateResponse,
-    RuntimeStatus, ServerIdentity, app,
+    AppState, BackendRegistry, FakeBackend, ModelLoadEvent, ModelLoadStage, RuntimeController,
+    ServerIdentity, app,
 };
 use icn_contracts::{
     CacheType, CompletionBackend, ComponentRole, ExecutionConfig, ExecutionIntent, FlashAttention,
     GenerationPerformanceAssessment, GpuLayers, HardwareAssessment, HardwareProvider,
     HardwareSnapshot, InventoryError, InventoryHardwareAssessor, LoadStage,
     ModelExecutionAssessment, ModelHardwareAssessor, ModelId, ModelInventory, ModelPreviewProfile,
-    ModelStatus, ProjectorConfig, ResolvedModel, SplitMode, TemplateAssessment, TemplateAssessor,
+    ModelResidency, ProjectorConfig, ResolvedModel, SplitMode, TemplateAssessment,
+    TemplateAssessor,
 };
-use icn_engine::LlamaCompletionBackend;
-use icn_hardware::{CapacityPolicy, assess as assess_hardware, discover, discover_hardware};
+use icn_engine::{LlamaCompletionBackend, ModelLoadError, MtpCandidateSelection};
+use icn_hardware::{CapacityPolicy, discover, discover_hardware};
 use icn_models::{InventoryConfig, ModelManager, ModelPreviewService};
-use tokio_stream::wrappers::ReceiverStream;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Instrument as _;
 
@@ -43,13 +42,6 @@ mod telemetry;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FlashAttentionArg {
-    Auto,
-    Off,
-    On,
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,29 +61,9 @@ enum Command {
         /// Private owner capability. Prefer the environment-backed form used by managed launch.
         #[arg(long, env = "MAGNITUDE_ICN_AUTH_TOKEN", hide_env_values = true)]
         auth_token: Option<String>,
-        #[arg(long, conflicts_with_all = ["model", "model_id"])]
-        fake: bool,
-        #[arg(long, conflicts_with = "model_id")]
-        model: Option<PathBuf>,
-        /// Load a ready inventory model by its stable ID.
-        #[arg(long, conflicts_with = "model")]
-        model_id: Option<String>,
-        /// Multimodal projector GGUF paired with the loaded text model.
-        #[arg(long, requires = "model")]
-        mmproj: Option<PathBuf>,
-        /// Explicit separate MTP GGUF. Bundled MTP is selected natively before this override.
-        #[arg(long, requires = "model")]
-        mtp_model: Option<PathBuf>,
-        #[arg(long, requires = "mmproj")]
-        no_mmproj_offload: bool,
-        #[arg(long, requires = "mmproj")]
-        no_mmproj_warmup: bool,
-        #[arg(long, requires = "mmproj")]
-        image_min_tokens: Option<NonZeroU32>,
-        #[arg(long, requires = "mmproj")]
-        image_max_tokens: Option<NonZeroU32>,
+        /// Deterministic in-memory backend used only by protocol tests.
         #[arg(long)]
-        model_alias: Option<String>,
+        fake: bool,
         /// Magnitude-owned model inventory and Hugging Face cache root.
         #[arg(long, visible_alias = "models-dir")]
         model_store: Option<PathBuf>,
@@ -101,48 +73,6 @@ enum Command {
         /// Additional read-only Hugging Face hub cache roots.
         #[arg(long = "hf-cache", visible_alias = "hf-cache-dir")]
         hf_caches: Vec<PathBuf>,
-        #[arg(long, default_value_t = 4096)]
-        context_size: u32,
-        #[arg(long, default_value_t = 512)]
-        batch_size: u32,
-        #[arg(long, default_value_t = 512)]
-        ubatch_size: u32,
-        #[arg(long, default_value_t = 1)]
-        max_sequences: u32,
-        #[arg(long)]
-        prefill_quantum: Option<u32>,
-        /// GPU layers: `auto` runs pinned common/fit, `all` fully offloads, or use a count.
-        #[arg(long, default_value = "auto")]
-        gpu_layers: GpuLayers,
-        /// Disable model memory mapping (enabled by the native service profile).
-        #[arg(long)]
-        no_mmap: bool,
-        /// Keep mapped model pages resident in RAM.
-        #[arg(long)]
-        mlock: bool,
-        #[arg(long, default_value = "layer")]
-        split_mode: SplitMode,
-        /// Comma-separated per-device model placement proportions.
-        #[arg(long)]
-        tensor_split: Option<TensorSplitArg>,
-        #[arg(long, default_value = "f16")]
-        cache_type_k: CacheType,
-        #[arg(long, default_value = "f16")]
-        cache_type_v: CacheType,
-        #[arg(long)]
-        no_kv_offload: bool,
-        #[arg(long)]
-        no_op_offload: bool,
-        #[arg(long)]
-        swa_full: bool,
-        #[arg(long)]
-        kv_unified: bool,
-        #[arg(long)]
-        threads: Option<NonZeroU32>,
-        #[arg(long)]
-        threads_batch: Option<NonZeroU32>,
-        #[arg(long, value_enum, default_value_t = FlashAttentionArg::Auto)]
-        flash_attention: FlashAttentionArg,
     },
     Doctor,
     Version {
@@ -154,9 +84,6 @@ enum Command {
     #[command(hide = true)]
     TemplateWorker,
 }
-
-#[derive(Debug, Clone)]
-struct TensorSplitArg(Vec<f32>);
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct RuntimePlanDefaults {
@@ -172,20 +99,55 @@ struct RuntimePlanDefaults {
     image_max_tokens: Option<NonZeroU32>,
 }
 
-#[derive(Debug)]
-enum MtpSelection {
-    Automatic(Vec<PathBuf>),
-    Explicit(PathBuf),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeExecutionProfile {
+    context_length: u32,
+    parallel_sequences: u32,
 }
 
-fn select_mtp(plan: &mut ExecutionIntent, mtp_selection: MtpSelection) -> anyhow::Result<()> {
-    let candidates = match &mtp_selection {
-        MtpSelection::Automatic(paths) => icn_mtp::CandidatePolicy::Automatic(paths),
-        MtpSelection::Explicit(path) => icn_mtp::CandidatePolicy::Explicit(path),
-    };
-    plan.mtp = icn_mtp::select_mtp(plan, candidates)
-        .context("failed to select a native MTP configuration")?;
-    Ok(())
+#[derive(Debug, Clone)]
+struct ResidentTarget {
+    model_id: String,
+    profile: RuntimeExecutionProfile,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeState {
+    generation: u64,
+    resident: Option<ResidentTarget>,
+}
+
+fn runtime_plan_defaults() -> RuntimePlanDefaults {
+    RuntimePlanDefaults {
+        // Managed product models always overwrite context and parallelism from their persisted
+        // serving configuration. This conservative value is only the discovery/migration fallback
+        // for unmanaged local artifacts that predate serving configurations.
+        context_size: 4096,
+        batch_size: 512,
+        ubatch_size: 512,
+        max_sequences: 1,
+        prefill_quantum: 512,
+        execution: ExecutionConfig {
+            gpu_layers: GpuLayers::Auto,
+            use_mmap: true,
+            use_mlock: false,
+            split_mode: SplitMode::Layer,
+            tensor_split: None,
+            cache_type_k: CacheType::F16,
+            cache_type_v: CacheType::F16,
+            offload_kqv: true,
+            operation_offload: true,
+            swa_full: false,
+            kv_unified: false,
+            threads: None,
+            threads_batch: None,
+            flash_attention: FlashAttention::Auto,
+        },
+        projector_use_gpu: true,
+        projector_warmup: true,
+        image_min_tokens: None,
+        image_max_tokens: None,
+    }
 }
 
 fn execution_intent(
@@ -213,29 +175,6 @@ fn execution_intent(
     })
 }
 
-fn load_execution_intent(
-    model_path: PathBuf,
-    projector_path: Option<PathBuf>,
-    mtp_selection: MtpSelection,
-    defaults: &RuntimePlanDefaults,
-) -> anyhow::Result<ExecutionIntent> {
-    let mut intent = execution_intent(model_path, projector_path, defaults)?;
-    match assess_hardware(&intent, CapacityPolicy::default())?.assessment {
-        HardwareAssessment::InvalidArtifact { code, message } => {
-            anyhow::bail!("invalid artifact ({code}): {message}")
-        }
-        HardwareAssessment::IncompatibleArtifact { code, message } => {
-            anyhow::bail!("incompatible artifact ({code}): {message}")
-        }
-        HardwareAssessment::DoesNotFit { .. } | HardwareAssessment::NotAssessed { .. } => {
-            return Ok(intent);
-        }
-        HardwareAssessment::Fits { .. } => {}
-    }
-    select_mtp(&mut intent, mtp_selection)?;
-    Ok(intent)
-}
-
 struct NativeHardwareAssessor {
     defaults: RuntimePlanDefaults,
     native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
@@ -249,6 +188,10 @@ struct CalibrationCache {
     topology_fingerprint: Option<String>,
     result: Option<Result<llama_cpp_2::model::params::fit::FitCalibration, String>>,
 }
+
+const ASSESSMENT_RESOLVER_REVISION: &str = "icn-backend-plan-v1";
+const CAPACITY_POLICY_REVISION: &str = "stable-total-reserve-v1";
+const MTP_SELECTOR_REVISION: &str = "icn-mtp-selector-v1";
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PlanningWorkerRequest {
@@ -291,7 +234,6 @@ impl TemplateAssessor for NativeTemplateAssessor {
     }
 }
 
-const ASSESSMENT_PROFILE_RESOLVER: &str = "icn-backend-plan-v1";
 #[cfg(not(test))]
 const PLANNING_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 #[cfg(not(test))]
@@ -446,20 +388,17 @@ impl NativeHardwareAssessor {
         profile: Option<&ModelPreviewProfile>,
         snapshot: &HardwareSnapshot,
     ) -> Result<String, InventoryError> {
-        if profile.is_some_and(|profile| profile.policy != ASSESSMENT_PROFILE_RESOLVER) {
-            return Err(InventoryError::InvalidRequest(format!(
-                "unsupported model assessment policy; expected {ASSESSMENT_PROFILE_RESOLVER}"
-            )));
-        }
         serde_json::to_string(&(
-            ASSESSMENT_PROFILE_RESOLVER,
+            ASSESSMENT_RESOLVER_REVISION,
+            CAPACITY_POLICY_REVISION,
+            CapacityPolicy::default().reserve_bytes_per_domain,
+            MTP_SELECTOR_REVISION,
             icn_hardware::GENERATION_PERFORMANCE_METHOD,
             llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
             llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
             &snapshot.native_build,
             &snapshot.enabled_backends,
             &snapshot.topology_fingerprint,
-            &snapshot.capacity_policy,
             self.effective_defaults(profile),
         ))
         .map_err(|error| InventoryError::Internal(error.to_string()))
@@ -786,13 +725,27 @@ impl InventoryHardwareAssessor for NativeHardwareAssessor {
     ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
         Box::pin(self.assess_resolved(resolved, None))
     }
+
+    fn assess_serving(
+        &self,
+        resolved: ResolvedModel,
+        profile: icn_contracts::ServingProfile,
+    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
+        Box::pin(async move {
+            self.assess_resolved(
+                resolved,
+                Some(&ModelPreviewProfile {
+                    id: "serving".to_owned(),
+                    context_length: profile.context_length,
+                    parallel_sequences: profile.parallel_sequences,
+                }),
+            )
+            .await
+        })
+    }
 }
 
 impl ModelHardwareAssessor for NativeHardwareAssessor {
-    fn policy_identity(&self) -> &str {
-        ASSESSMENT_PROFILE_RESOLVER
-    }
-
     fn cache_key(
         &self,
         profile: Option<&ModelPreviewProfile>,
@@ -851,17 +804,11 @@ impl HardwareProvider for NativeHardwareAssessor {
                             CapacityPolicy::default(),
                             native_build,
                             enabled_backends,
-                            ASSESSMENT_PROFILE_RESOLVER,
                         ))
                     })
                     .map_err(|error| InventoryError::Internal(error.to_string()))?,
-                None => discover(
-                    CapacityPolicy::default(),
-                    native_build,
-                    enabled_backends,
-                    ASSESSMENT_PROFILE_RESOLVER,
-                )
-                .map_err(|error| InventoryError::Internal(error.to_string())),
+                None => discover(CapacityPolicy::default(), native_build, enabled_backends)
+                    .map_err(|error| InventoryError::Internal(error.to_string())),
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
@@ -881,10 +828,9 @@ impl HardwareProvider for NativeHardwareAssessor {
 struct NativeRuntimeController {
     backends: BackendRegistry,
     inventory: Arc<ModelManager>,
-    assessor: Arc<NativeHardwareAssessor>,
     native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
     defaults: RuntimePlanDefaults,
-    state: Arc<tokio::sync::RwLock<RuntimeStateResponse>>,
+    state: Arc<tokio::sync::RwLock<RuntimeState>>,
     mutation: Arc<tokio::sync::Mutex<()>>,
     next_operation: Arc<AtomicU64>,
 }
@@ -893,15 +839,13 @@ impl NativeRuntimeController {
     fn new(
         backends: BackendRegistry,
         inventory: Arc<ModelManager>,
-        assessor: Arc<NativeHardwareAssessor>,
         native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
         defaults: RuntimePlanDefaults,
-        initial: RuntimeStateResponse,
+        initial: RuntimeState,
     ) -> Self {
         Self {
             backends,
             inventory,
-            assessor,
             native_executor,
             defaults,
             state: Arc::new(tokio::sync::RwLock::new(initial)),
@@ -911,15 +855,15 @@ impl NativeRuntimeController {
     }
 
     async fn emit(
-        sender: &tokio::sync::mpsc::Sender<RuntimeModelEvent>,
-        event: RuntimeModelEvent,
+        sender: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
+        event: ModelLoadEvent,
     ) -> bool {
-        sender.send(event).await.is_ok()
+        sender.send(event).is_ok()
     }
 
     async fn fail(
         &self,
-        sender: &tokio::sync::mpsc::Sender<RuntimeModelEvent>,
+        sender: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
         operation_id: String,
         model_id: String,
         code: &str,
@@ -939,21 +883,14 @@ impl NativeRuntimeController {
         );
         if runtime_lost {
             let generation = self.backends.generation();
-            *self.state.write().await = RuntimeStateResponse {
+            *self.state.write().await = RuntimeState {
                 generation,
-                status: RuntimeStatus::Failed {
-                    generation,
-                    code: code.to_owned(),
-                    message: message.clone(),
-                },
-                operation_id: None,
+                resident: None,
             };
-        } else {
-            self.state.write().await.operation_id = None;
         }
         let _ = Self::emit(
             sender,
-            RuntimeModelEvent::Failed {
+            ModelLoadEvent::Failed {
                 operation_id,
                 model_id,
                 code: code.to_owned(),
@@ -964,15 +901,46 @@ impl NativeRuntimeController {
         .await;
     }
 
+    async fn fail_load(
+        &self,
+        sender: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
+        resolved_id: &ModelId,
+        stage: LoadStage,
+        operation_id: String,
+        model_id: String,
+        code: &str,
+        message: impl Into<String>,
+        retryable: bool,
+    ) {
+        let message = message.into();
+        let _ = self
+            .inventory
+            .update_residency(
+                resolved_id,
+                ModelResidency::LoadFailed {
+                    attempted_at: unix_timestamp(),
+                    stage,
+                    code: code.to_owned(),
+                    retryable,
+                },
+            )
+            .await;
+        self.fail(
+            sender,
+            operation_id,
+            model_id,
+            code,
+            message,
+            retryable,
+            true,
+        )
+        .await;
+    }
+
     fn profile_defaults(
         &self,
         profile: &RuntimeExecutionProfile,
     ) -> Result<RuntimePlanDefaults, InventoryError> {
-        if profile.policy != ASSESSMENT_PROFILE_RESOLVER {
-            return Err(InventoryError::InvalidRequest(format!(
-                "unsupported runtime profile policy; expected {ASSESSMENT_PROFILE_RESOLVER}"
-            )));
-        }
         let mut defaults = self.defaults.clone();
         defaults.context_size = profile.context_length;
         defaults.max_sequences = profile.parallel_sequences;
@@ -983,7 +951,7 @@ impl NativeRuntimeController {
         &self,
         model_id: &str,
         profile: &RuntimeExecutionProfile,
-    ) -> Result<(ResolvedModel, ExecutionIntent), InventoryError> {
+    ) -> Result<(ResolvedModel, ExecutionIntent, MtpCandidateSelection), InventoryError> {
         let id = ModelId::parse(model_id.to_owned())?;
         self.inventory.ensure_model_inventory().await?;
         let resolved = self.inventory.resolve_ready(&id).await?;
@@ -1011,205 +979,118 @@ impl NativeRuntimeController {
             .map(|component| component.path.clone())
             .collect();
         let defaults = self.profile_defaults(profile)?;
-        let plan = spawn_blocking_traced(move || {
-            load_execution_intent(primary, projector, MtpSelection::Automatic(mtp), &defaults)
-        })
-        .await
-        .map_err(|error| InventoryError::Internal(error.to_string()))?
-        .map_err(|error| {
-            InventoryError::Internal(format!("failed to resolve runtime plan: {error:#}"))
+        let plan = execution_intent(primary, projector, &defaults).map_err(|error| {
+            InventoryError::Internal(format!("failed to resolve runtime intent: {error:#}"))
         })?;
-        Ok((resolved, plan))
+        Ok((resolved, plan, MtpCandidateSelection::Automatic(mtp)))
     }
 
     #[tracing::instrument(
         name = "icn.runtime.load.operation",
         skip_all,
-        fields(operation.id = %operation_id, model.id = %request.model_id)
+        fields(operation.id = %operation_id, model.id = %model_id)
     )]
-    async fn run_load(
+    async fn perform_transition(
         self,
-        request: LoadRuntimeModelRequest,
+        model_id: String,
         operation_id: String,
-        sender: tokio::sync::mpsc::Sender<RuntimeModelEvent>,
-    ) {
-        let Ok(_guard) = self.mutation.try_lock() else {
-            self.fail(
-                &sender,
-                operation_id,
-                request.model_id,
-                "runtime_busy",
-                "another runtime mutation is already active",
-                true,
-                false,
-            )
-            .await;
-            return;
-        };
-
+        sender: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
+    ) -> Result<(), InventoryError> {
         let existing = self.state.read().await.clone();
-        if matches!(
-            &existing.status,
-            RuntimeStatus::Ready { model_id, profile, .. }
-                if model_id == &request.model_id && profile == &request.profile
-        ) {
-            let _ = Self::emit(
-                &sender,
-                RuntimeModelEvent::Ready {
-                    operation_id,
-                    state: existing,
-                },
-            )
-            .await;
-            return;
-        };
-        let Some(_backend_mutation) = self.backends.try_begin_mutation() else {
-            self.fail(
-                &sender,
-                operation_id,
-                request.model_id,
-                "model_in_use",
-                "the active runtime has in-flight inference or template requests",
-                true,
-                false,
-            )
-            .await;
-            return;
-        };
-
-        self.state.write().await.operation_id = Some(operation_id.clone());
-        for stage in [RuntimeLoadStage::Queued, RuntimeLoadStage::Resolving] {
-            if !Self::emit(
-                &sender,
-                RuntimeModelEvent::Progress {
-                    operation_id: operation_id.clone(),
-                    model_id: request.model_id.clone(),
-                    stage,
-                },
-            )
-            .await
-            {
-                self.state.write().await.operation_id = None;
-                return;
-            }
-        }
-
-        let (resolved, plan) = match self
-            .resolved_load(&request.model_id, &request.profile)
-            .await
-        {
-            Ok(value) => value,
+        let profile = match self.load_profile(&model_id).await {
+            Ok(profile) => profile,
             Err(error) => {
                 self.fail(
                     &sender,
                     operation_id,
-                    request.model_id,
+                    model_id,
                     "model_unavailable",
                     error.to_string(),
                     false,
                     false,
                 )
                 .await;
-                return;
+                return Err(InventoryError::NotReady(error.to_string()));
             }
         };
-        let _ = Self::emit(
-            &sender,
-            RuntimeModelEvent::Progress {
-                operation_id: operation_id.clone(),
-                model_id: request.model_id.clone(),
-                stage: RuntimeLoadStage::Assessing,
-            },
-        )
-        .await;
 
-        let assessment_result = {
-            let _assessment_guard = self.assessor.gate.lock().await;
-            spawn_blocking_traced(move || assess_hardware(&plan, CapacityPolicy::default())).await
-        };
-        let assessed = match assessment_result {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => {
-                self.fail(
-                    &sender,
+        if existing
+            .resident
+            .as_ref()
+            .is_some_and(|resident| resident.model_id == model_id && resident.profile == profile)
+        {
+            let _ = Self::emit(
+                &sender,
+                ModelLoadEvent::Ready {
                     operation_id,
-                    request.model_id,
-                    "assessment_failed",
-                    error.to_string(),
-                    true,
-                    false,
-                )
-                .await;
-                return;
-            }
+                    model_id,
+                    generation: existing.generation,
+                },
+            )
+            .await;
+            return Ok(());
+        };
+        let _backend_mutation = self.backends.begin_mutation().await;
+
+        for stage in [ModelLoadStage::Queued, ModelLoadStage::Resolving] {
+            let _ = Self::emit(
+                &sender,
+                ModelLoadEvent::Progress {
+                    operation_id: operation_id.clone(),
+                    model_id: model_id.clone(),
+                    stage,
+                },
+            )
+            .await;
+        }
+
+        let (resolved, plan, mtp_selection) = match self.resolved_load(&model_id, &profile).await {
+            Ok(value) => value,
             Err(error) => {
                 self.fail(
                     &sender,
                     operation_id,
-                    request.model_id,
-                    "assessment_task_failed",
+                    model_id,
+                    "model_unavailable",
                     error.to_string(),
-                    true,
+                    false,
                     false,
                 )
                 .await;
-                return;
+                return Err(InventoryError::NotReady(error.to_string()));
             }
         };
-        if let HardwareAssessment::DoesNotFit { memory, .. } = &assessed.assessment {
-            self.fail(
-                &sender,
-                operation_id,
-                request.model_id,
-                "does_not_fit",
-                format!(
-                    "runtime requires {} bytes but stable capacity is {} bytes",
-                    memory.required_bytes, memory.available_bytes
-                ),
-                false,
-                false,
-            )
-            .await;
-            return;
-        }
-        if matches!(assessed.assessment, HardwareAssessment::NotAssessed { .. }) {
-            self.fail(
-                &sender,
-                operation_id,
-                request.model_id,
-                "assessment_incomplete",
-                "runtime assessment did not produce a complete result",
-                false,
-                false,
-            )
-            .await;
-            return;
-        }
-        let execution_backend = match &assessed.assessment {
-            HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
-            _ => "native".to_owned(),
+        let _ = Self::emit(
+            &sender,
+            ModelLoadEvent::Progress {
+                operation_id: operation_id.clone(),
+                model_id: model_id.clone(),
+                stage: ModelLoadStage::Assessing,
+            },
+        )
+        .await;
+
+        let generation = self.backends.generation();
+        *self.state.write().await = RuntimeState {
+            generation,
+            resident: None,
         };
 
         let _ = Self::emit(
             &sender,
-            RuntimeModelEvent::Progress {
+            ModelLoadEvent::Progress {
                 operation_id: operation_id.clone(),
-                model_id: request.model_id.clone(),
-                stage: RuntimeLoadStage::Unloading,
+                model_id: model_id.clone(),
+                stage: ModelLoadStage::Unloading,
             },
         )
         .await;
-        if let RuntimeStatus::Ready { model_id, .. } = &existing.status
-            && let Ok(id) = ModelId::parse(model_id.clone())
+        if let Some(resident) = &existing.resident
+            && let Ok(id) = ModelId::parse(resident.model_id.clone())
         {
             let _ = self
                 .inventory
-                .update_status(
-                    &id,
-                    ModelStatus::Available {
-                        ready_at: unix_timestamp(),
-                    },
-                )
+                .update_residency(&id, ModelResidency::NotResident)
                 .await;
         }
         if let Ok(mut slot) = self.native_executor.write() {
@@ -1219,9 +1100,9 @@ impl NativeRuntimeController {
 
         let _ = self
             .inventory
-            .update_status(
+            .update_residency(
                 &resolved.model.id,
-                ModelStatus::Loading {
+                ModelResidency::Loading {
                     load_id: operation_id.clone(),
                     stage: LoadStage::Opening,
                     started_at: unix_timestamp(),
@@ -1230,84 +1111,97 @@ impl NativeRuntimeController {
             .await;
         let _ = Self::emit(
             &sender,
-            RuntimeModelEvent::Progress {
+            ModelLoadEvent::Progress {
                 operation_id: operation_id.clone(),
-                model_id: request.model_id.clone(),
-                stage: RuntimeLoadStage::Loading,
+                model_id: model_id.clone(),
+                stage: ModelLoadStage::Loading,
             },
         )
         .await;
-        let model_id = request.model_id.clone();
+        let load_model_id = model_id.clone();
         let backend = match spawn_blocking_traced(move || {
-            LlamaCompletionBackend::load(model_id, assessed.plan)
+            LlamaCompletionBackend::load(load_model_id, plan, mtp_selection)
         })
         .await
         {
             Ok(Ok(backend)) => Arc::new(backend),
             Ok(Err(error)) => {
-                let _ = self
-                    .inventory
-                    .update_status(
-                        &resolved.model.id,
-                        ModelStatus::LoadFailed {
-                            attempted_at: unix_timestamp(),
-                            stage: LoadStage::Opening,
-                            code: "backend_load_failed".to_owned(),
-                            retryable: true,
-                        },
-                    )
-                    .await;
-                self.fail(
+                let (code, retryable) = match &error {
+                    ModelLoadError::InvalidConfiguration(_) => ("invalid_configuration", false),
+                    ModelLoadError::MtpSelection(_) => ("incompatible_auxiliary", false),
+                    ModelLoadError::Planning(_) => ("planner_failed", true),
+                    ModelLoadError::AssessmentRejected(HardwareAssessment::DoesNotFit {
+                        ..
+                    }) => ("does_not_fit", false),
+                    ModelLoadError::AssessmentRejected(HardwareAssessment::InvalidArtifact {
+                        ..
+                    }) => ("invalid_artifact", false),
+                    ModelLoadError::AssessmentRejected(
+                        HardwareAssessment::IncompatibleArtifact { .. },
+                    ) => ("incompatible_artifact", false),
+                    ModelLoadError::AssessmentRejected(HardwareAssessment::NotAssessed {
+                        ..
+                    }) => ("planner_failed", true),
+                    ModelLoadError::AssessmentRejected(HardwareAssessment::Fits { .. }) => {
+                        ("planner_invariant", false)
+                    }
+                    ModelLoadError::Backend(_) => ("backend_load_failed", true),
+                };
+                self.fail_load(
                     &sender,
+                    &resolved.model.id,
+                    LoadStage::Opening,
                     operation_id,
-                    request.model_id,
-                    "backend_load_failed",
+                    model_id,
+                    code,
                     error.to_string(),
-                    true,
-                    true,
+                    retryable,
                 )
                 .await;
-                return;
+                return Err(InventoryError::Internal(error.to_string()));
             }
             Err(error) => {
-                self.fail(
+                self.fail_load(
                     &sender,
+                    &resolved.model.id,
+                    LoadStage::Opening,
                     operation_id,
-                    request.model_id,
+                    model_id,
                     "load_task_failed",
                     error.to_string(),
                     true,
-                    true,
                 )
                 .await;
-                return;
+                return Err(InventoryError::Internal(error.to_string()));
             }
         };
         let _ = Self::emit(
             &sender,
-            RuntimeModelEvent::Progress {
+            ModelLoadEvent::Progress {
                 operation_id: operation_id.clone(),
-                model_id: request.model_id.clone(),
-                stage: RuntimeLoadStage::Verifying,
+                model_id: model_id.clone(),
+                stage: ModelLoadStage::Verifying,
             },
         )
         .await;
         let properties = match backend.properties() {
             Ok(properties) => properties,
             Err(error) => {
-                self.fail(
+                self.fail_load(
                     &sender,
+                    &resolved.model.id,
+                    LoadStage::Warming,
                     operation_id,
-                    request.model_id,
+                    model_id,
                     "verification_failed",
                     error.to_string(),
                     true,
-                    true,
                 )
                 .await;
-                return;
+                return Err(InventoryError::Internal(error.to_string()));
             }
         };
+        let execution_backend = backend.acceleration().to_owned();
         let mut aliases = std::collections::BTreeSet::new();
         aliases.insert(resolved.model.name.clone());
         let generation = self
@@ -1325,9 +1219,9 @@ impl NativeRuntimeController {
                 .collect();
         let _ = self
             .inventory
-            .update_status(
+            .update_residency(
                 &resolved.model.id,
-                ModelStatus::Loaded {
+                ModelResidency::Loaded {
                     loaded_at: unix_timestamp(),
                     backend: execution_backend,
                     context_length: properties.context_tokens,
@@ -1335,114 +1229,151 @@ impl NativeRuntimeController {
                 },
             )
             .await;
-        let state = RuntimeStateResponse {
+        let state = RuntimeState {
             generation,
-            status: RuntimeStatus::Ready {
-                model_id: request.model_id,
-                generation,
-                profile: request.profile,
-            },
-            operation_id: None,
+            resident: Some(ResidentTarget {
+                model_id: model_id.clone(),
+                profile,
+            }),
         };
         *self.state.write().await = state.clone();
         let _ = Self::emit(
             &sender,
-            RuntimeModelEvent::Ready {
+            ModelLoadEvent::Ready {
                 operation_id,
-                state,
+                model_id,
+                generation,
             },
         )
         .await;
         tracing::info!("runtime model ready");
+        Ok(())
+    }
+
+    async fn load_profile(
+        &self,
+        model_id: &str,
+    ) -> Result<RuntimeExecutionProfile, InventoryError> {
+        let id = ModelId::parse(model_id.to_owned())?;
+        self.inventory.ensure_model_inventory().await?;
+        let model = self.inventory.get(&id).await?;
+        let configuration = model.serving_configuration.ok_or_else(|| {
+            InventoryError::NotReady("model has no serving configuration".to_owned())
+        })?;
+        Ok(RuntimeExecutionProfile {
+            context_length: configuration.profile.context_length,
+            parallel_sequences: configuration.profile.parallel_sequences,
+        })
     }
 }
 
 impl RuntimeController for NativeRuntimeController {
-    fn state(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>> {
-        Box::pin(async move { Ok(self.state.read().await.clone()) })
-    }
-
-    fn load(&self, request: LoadRuntimeModelRequest) -> BoxStream<'static, RuntimeModelEvent> {
+    fn load(&self, model_id: String) -> BoxStream<'static, ModelLoadEvent> {
         let operation_id = format!(
             "runtime-{}",
             self.next_operation.fetch_add(1, Ordering::Relaxed)
         );
         let runtime = self.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(
-            runtime
-                .run_load(request, operation_id, sender)
-                .in_current_span(),
+            async move {
+                let _guard = runtime.mutation.lock().await;
+                let _ = runtime
+                    .clone()
+                    .perform_transition(model_id, operation_id, sender)
+                    .await;
+            }
+            .in_current_span(),
         );
-        ReceiverStream::new(receiver).boxed()
+        tokio_stream::wrappers::UnboundedReceiverStream::new(receiver).boxed()
     }
 
-    fn unload(&self) -> BoxFuture<'_, Result<RuntimeStateResponse, InventoryError>> {
+    fn acquire(
+        &self,
+        model_id: String,
+    ) -> BoxFuture<'_, Result<icn_api::BackendLease, InventoryError>> {
+        let runtime = self.clone();
+        Box::pin(async move {
+            tokio::spawn(
+                async move {
+                    let _guard = runtime.mutation.lock().await;
+                    let operation_id = format!(
+                        "runtime-{}",
+                        runtime.next_operation.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+                    runtime
+                        .clone()
+                        .perform_transition(model_id.clone(), operation_id, sender)
+                        .await?;
+
+                    let state = runtime.state.read().await.clone();
+                    if !state
+                        .resident
+                        .as_ref()
+                        .is_some_and(|resident| resident.model_id == model_id)
+                    {
+                        return Err(InventoryError::Internal(
+                            "runtime readiness completed without the requested target".into(),
+                        ));
+                    }
+                    runtime.backends.lease().ok_or_else(|| {
+                        InventoryError::Internal(
+                            "runtime target became unavailable before generation admission".into(),
+                        )
+                    })
+                }
+                .in_current_span(),
+            )
+            .await
+            .map_err(|error| {
+                InventoryError::Internal(format!("runtime admission task failed: {error}"))
+            })?
+        })
+    }
+
+    fn unload(&self, model_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
         Box::pin(async move {
             let _guard = self.mutation.lock().await;
-            let Some(_backend_mutation) = self.backends.try_begin_mutation() else {
-                return Err(InventoryError::Busy(
-                    "the active runtime has in-flight inference or template requests".into(),
-                ));
-            };
             let previous = self.state.read().await.clone();
-            if let RuntimeStatus::Ready { model_id, .. } = previous.status
-                && let Ok(id) = ModelId::parse(model_id)
+            let resident = previous
+                .resident
+                .as_ref()
+                .filter(|resident| resident.model_id == model_id)
+                .and_then(|resident| ModelId::parse(resident.model_id.clone()).ok());
+            let Some(id) = resident else {
+                return Ok(());
+            };
             {
+                let load_id = format!(
+                    "runtime-{}",
+                    self.next_operation.fetch_add(1, Ordering::Relaxed)
+                );
                 self.inventory
-                    .update_status(
+                    .update_residency(
                         &id,
-                        ModelStatus::Available {
-                            ready_at: unix_timestamp(),
+                        ModelResidency::Unloading {
+                            load_id,
+                            started_at: unix_timestamp(),
                         },
                     )
                     .await?;
             }
+            let _backend_mutation = self.backends.begin_mutation().await;
             if let Ok(mut slot) = self.native_executor.write() {
                 *slot = None;
             }
             let generation = self.backends.clear();
-            let state = RuntimeStateResponse {
+            self.inventory
+                .update_residency(&id, ModelResidency::NotResident)
+                .await?;
+            let state = RuntimeState {
                 generation,
-                status: RuntimeStatus::Empty,
-                operation_id: None,
+                resident: None,
             };
             *self.state.write().await = state.clone();
-            Ok(state)
+            Ok(())
         })
-    }
-}
-
-impl std::str::FromStr for TensorSplitArg {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() {
-            return Err("tensor split must contain at least one weight".to_owned());
-        }
-        let weights = value
-            .split([',', '/'])
-            .enumerate()
-            .map(|(index, weight)| {
-                weight.parse::<f32>().map_err(|_| {
-                    format!("tensor split weight {index} is not a valid number: {weight:?}")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some((index, weight)) = weights
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, weight)| !weight.is_finite() || *weight < 0.0)
-        {
-            return Err(format!(
-                "tensor split weight {index} must be finite and non-negative, received {weight}"
-            ));
-        }
-        if !weights.iter().any(|weight| *weight > 0.0) {
-            return Err("tensor split must assign a positive weight to at least one device".into());
-        }
-        Ok(Self(weights))
     }
 }
 
@@ -1459,37 +1390,9 @@ async fn main() -> anyhow::Result<()> {
             parent_pid,
             auth_token,
             fake,
-            model,
-            model_id,
-            mmproj,
-            mtp_model,
-            no_mmproj_offload,
-            no_mmproj_warmup,
-            image_min_tokens,
-            image_max_tokens,
-            model_alias,
             model_store,
             model_sources,
             hf_caches,
-            context_size,
-            batch_size,
-            ubatch_size,
-            max_sequences,
-            prefill_quantum,
-            gpu_layers,
-            no_mmap,
-            mlock,
-            split_mode,
-            tensor_split,
-            cache_type_k,
-            cache_type_v,
-            no_kv_offload,
-            no_op_offload,
-            swa_full,
-            kv_unified,
-            threads,
-            threads_batch,
-            flash_attention,
         } => {
             let inventory_root = match model_store {
                 Some(root) => root,
@@ -1500,37 +1403,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("invalid model inventory configuration")?;
             inventory_config.model_sources.extend(model_sources);
             inventory_config.hf_cache_dirs.extend(hf_caches);
-            let plan_defaults = RuntimePlanDefaults {
-                context_size,
-                batch_size,
-                ubatch_size,
-                max_sequences,
-                prefill_quantum: prefill_quantum.unwrap_or(batch_size),
-                execution: ExecutionConfig {
-                    gpu_layers,
-                    use_mmap: !no_mmap,
-                    use_mlock: mlock,
-                    split_mode,
-                    tensor_split: tensor_split.map(|value| value.0),
-                    cache_type_k,
-                    cache_type_v,
-                    offload_kqv: !no_kv_offload,
-                    operation_offload: !no_op_offload,
-                    swa_full,
-                    kv_unified,
-                    threads,
-                    threads_batch,
-                    flash_attention: match flash_attention {
-                        FlashAttentionArg::Auto => FlashAttention::Auto,
-                        FlashAttentionArg::Off => FlashAttention::Disabled,
-                        FlashAttentionArg::On => FlashAttention::Enabled,
-                    },
-                },
-                projector_use_gpu: !no_mmproj_offload,
-                projector_warmup: !no_mmproj_warmup,
-                image_min_tokens,
-                image_max_tokens,
-            };
+            let plan_defaults = runtime_plan_defaults();
             let inventory = Arc::new(
                 ModelManager::open_with_template_assessor(
                     inventory_config,
@@ -1554,234 +1427,43 @@ async fn main() -> anyhow::Result<()> {
                 inventory.clone(),
                 inventory_hardware_assessor.clone(),
             ));
-            let (model, mmproj, mtp_model, model_alias, selected_inventory_id) = if let Some(
-                raw_id,
-            ) = model_id
-            {
-                if mmproj.is_some() || mtp_model.is_some() {
-                    anyhow::bail!(
-                        "--model-id resolves projector and MTP components from inventory; explicit --mmproj/--mtp-model overrides are not allowed"
-                    );
-                }
-                let id = ModelId::parse(raw_id).context("invalid inventory model ID")?;
-                inventory
-                    .ensure_model_inventory()
-                    .await
-                    .context("failed to reconcile inventory for model selection")?;
-                let resolved = inventory
-                    .resolve_ready(&id)
-                    .await
-                    .context("failed to resolve inventory model")?;
-                let primary = resolved
-                    .components
-                    .iter()
-                    .filter(|component| {
-                        matches!(
-                            component.role,
-                            ComponentRole::Weights | ComponentRole::Shard
-                        )
-                    })
-                    .min_by_key(|component| component.shard_index.unwrap_or(0))
-                    .map(|component| component.path.clone())
-                    .context("inventory model has no runnable weight component")?;
-                let projector = resolved
-                    .components
-                    .iter()
-                    .find(|component| component.role == ComponentRole::Projector)
-                    .map(|component| component.path.clone());
-                let mtp = resolved
-                    .components
-                    .iter()
-                    .filter(|component| {
-                        matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft)
-                    })
-                    .map(|component| component.path.clone())
-                    .collect();
-                (
-                    Some(primary),
-                    projector,
-                    MtpSelection::Automatic(mtp),
-                    model_alias.or(Some(resolved.model.name)),
-                    Some(id),
-                )
-            } else {
-                (
-                    model,
-                    mmproj,
-                    mtp_model.map_or_else(
-                        || MtpSelection::Automatic(Vec::new()),
-                        MtpSelection::Explicit,
-                    ),
-                    model_alias,
-                    None,
-                )
-            };
             let backends = BackendRegistry::empty();
-            let (native_executor, initial_runtime) = if fake {
-                let model_id = model_alias.unwrap_or_else(|| "icn-fake".into());
+            if fake {
+                let model_id = "icn-fake".to_owned();
                 let mut aliases = std::collections::BTreeSet::new();
                 aliases.insert(model_id.clone());
-                let generation = backends.replace(
+                backends.replace(
                     Arc::new(FakeBackend::new(model_id.clone(), "Hello from ICN.")),
                     aliases,
                 );
-                (
-                    None,
-                    RuntimeStateResponse {
-                        generation,
-                        status: RuntimeStatus::Ready {
-                            model_id,
-                            generation,
-                            profile: RuntimeExecutionProfile {
-                                policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
-                                context_length: plan_defaults.context_size,
-                                parallel_sequences: plan_defaults.max_sequences,
-                            },
-                        },
-                        operation_id: None,
-                    },
-                )
-            } else if model.is_none() {
-                (
-                    None,
-                    RuntimeStateResponse {
-                        generation: backends.generation(),
-                        status: RuntimeStatus::Empty,
-                        operation_id: None,
-                    },
-                )
-            } else {
-                let path = model.expect("model is present");
-                let alias = model_alias.unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("local-model")
-                        .to_owned()
-                });
-                let inventory_id = match selected_inventory_id {
-                    Some(id) => id,
-                    None => inventory
-                        .register_active_model(&path, Some(&alias))
-                        .await
-                        .context("failed to register the active model")?,
-                };
-                let requested_plan =
-                    load_execution_intent(path, mmproj, mtp_model, &plan_defaults)?;
-                let assessed = assess_hardware(&requested_plan, CapacityPolicy::default())
-                    .context("failed to assess execution intent")?;
-                if let icn_contracts::HardwareAssessment::DoesNotFit { memory, .. } =
-                    &assessed.assessment
-                {
-                    anyhow::bail!(
-                        "execution intent requires {} bytes but stable capacity is {} bytes",
-                        memory.required_bytes,
-                        memory.available_bytes
-                    );
-                }
-                let execution_backend = match &assessed.assessment {
-                    HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
-                    _ => "native".to_owned(),
-                };
-                let load_id = format!("load-{}", unix_timestamp());
-                inventory
-                    .update_status(
-                        &inventory_id,
-                        ModelStatus::Loading {
-                            load_id,
-                            stage: LoadStage::Opening,
-                            started_at: unix_timestamp(),
-                        },
-                    )
-                    .await
-                    .context("failed to project model loading state")?;
-                let backend = match LlamaCompletionBackend::load(
-                    inventory_id.0.clone(),
-                    assessed.plan.clone(),
-                ) {
-                    Ok(backend) => backend,
-                    Err(error) => {
-                        let _ = inventory
-                            .update_status(
-                                &inventory_id,
-                                ModelStatus::LoadFailed {
-                                    attempted_at: unix_timestamp(),
-                                    stage: LoadStage::Opening,
-                                    code: "backend_load_failed".to_owned(),
-                                    retryable: true,
-                                },
-                            )
-                            .await;
-                        return Err(error).context("failed to load native backend");
-                    }
-                };
-                let properties = backend
-                    .properties()
-                    .context("failed to read loaded model properties")?;
-                let execution: std::collections::BTreeMap<_, _> =
-                    serde_json::to_value(&properties.execution.resolved)
-                        .ok()
-                        .and_then(|value| value.as_object().cloned())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect();
-                inventory
-                    .update_status(
-                        &inventory_id,
-                        ModelStatus::Loaded {
-                            loaded_at: unix_timestamp(),
-                            backend: execution_backend,
-                            context_length: properties.context_tokens,
-                            execution,
-                        },
-                    )
-                    .await
-                    .context("failed to project loaded model state")?;
-                let backend = Arc::new(backend);
-                let mut aliases = std::collections::BTreeSet::new();
-                aliases.insert(alias);
-                let generation =
-                    backends.replace(Arc::clone(&backend) as Arc<dyn CompletionBackend>, aliases);
-                (
-                    Some(backend),
-                    RuntimeStateResponse {
-                        generation,
-                        status: RuntimeStatus::Ready {
-                            model_id: inventory_id.0,
-                            generation,
-                            profile: RuntimeExecutionProfile {
-                                policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
-                                context_length: plan_defaults.context_size,
-                                parallel_sequences: plan_defaults.max_sequences,
-                            },
-                        },
-                        operation_id: None,
-                    },
-                )
-            };
-            *native_executor_slot
-                .write()
-                .map_err(|_| anyhow::anyhow!("native executor lock poisoned"))? = native_executor;
-            let runtime = Arc::new(NativeRuntimeController::new(
-                backends.clone(),
-                inventory.clone(),
-                inventory_hardware_assessor.clone(),
-                native_executor_slot.clone(),
-                plan_defaults,
-                initial_runtime,
-            ));
+            }
             let native_build = build_identity::native_build();
             let identity = ServerIdentity {
                 instance_id: instance_id.clone(),
                 api_version: 1,
                 native_build: native_build.clone(),
             };
+            let runtime = (!fake).then(|| {
+                Arc::new(NativeRuntimeController::new(
+                    backends.clone(),
+                    inventory.clone(),
+                    native_executor_slot,
+                    plan_defaults,
+                    RuntimeState {
+                        generation: backends.generation(),
+                        resident: None,
+                    },
+                ))
+            });
             let mut state = AppState::model_free(backends)
                 .with_inventory(inventory)
                 .with_hardware(inventory_hardware_assessor)
                 .with_previewer(previewer.clone())
                 .with_hugging_face_catalog(previewer)
-                .with_runtime(runtime)
                 .with_identity(identity);
+            if let Some(runtime) = runtime {
+                state = state.with_runtime(runtime);
+            }
             if let Some(auth_token) = auth_token {
                 state = state.with_authorization(auth_token);
             }
@@ -1937,14 +1619,11 @@ mod tests {
             },
             native_build: "native".to_owned(),
             enabled_backends: vec!["cpu".to_owned()],
-            assessment_policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
-            capacity_policy: "capacity".to_owned(),
             topology_fingerprint: "topology".to_owned(),
             memory_domains: Vec::new(),
         };
         let equivalent_preview = ModelPreviewProfile {
             id: "caller-correlation-does-not-affect-fit".to_owned(),
-            policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
             context_length: 128,
             parallel_sequences: 1,
         };
@@ -1965,17 +1644,6 @@ mod tests {
                     &snapshot,
                 )
                 .unwrap()
-        );
-        assert!(
-            assessor
-                .assessment_cache_key(
-                    Some(&ModelPreviewProfile {
-                        policy: "unknown-policy".to_owned(),
-                        ..equivalent_preview
-                    }),
-                    &snapshot,
-                )
-                .is_err()
         );
     }
 
@@ -2022,7 +1690,6 @@ mod tests {
         });
         let profile = ModelPreviewProfile {
             id: "parity".to_owned(),
-            policy: ASSESSMENT_PROFILE_RESOLVER.to_owned(),
             context_length: 128,
             parallel_sequences: 1,
         };
@@ -2104,119 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_cli_defaults_and_explicit_values_are_typed() {
-        let defaults = Cli::try_parse_from(["magnitude-icn", "serve", "--fake"]).unwrap();
-        let Command::Serve {
-            gpu_layers,
-            no_mmap,
-            mlock,
-            split_mode,
-            tensor_split,
-            cache_type_k,
-            cache_type_v,
-            no_kv_offload,
-            no_op_offload,
-            swa_full,
-            kv_unified,
-            threads,
-            threads_batch,
-            ..
-        } = defaults.command
-        else {
-            panic!("expected serve command")
-        };
-        assert_eq!(gpu_layers, GpuLayers::Auto);
-        assert!(!no_mmap && !mlock);
-        assert_eq!(split_mode, SplitMode::Layer);
-        assert!(tensor_split.is_none());
-        assert_eq!(cache_type_k, CacheType::F16);
-        assert_eq!(cache_type_v, CacheType::F16);
-        assert!(!no_kv_offload && !no_op_offload && !swa_full && !kv_unified);
-        assert!(threads.is_none() && threads_batch.is_none());
-
-        let explicit = Cli::try_parse_from([
-            "magnitude-icn",
-            "serve",
-            "--fake",
-            "--gpu-layers",
-            "all",
-            "--no-mmap",
-            "--mlock",
-            "--split-mode",
-            "row",
-            "--tensor-split",
-            "3,1",
-            "--cache-type-k",
-            "q8_0",
-            "--threads",
-            "6",
-            "--threads-batch",
-            "8",
-        ])
-        .unwrap();
-        let Command::Serve {
-            gpu_layers,
-            no_mmap,
-            mlock,
-            split_mode,
-            tensor_split,
-            cache_type_k,
-            threads,
-            threads_batch,
-            ..
-        } = explicit.command
-        else {
-            panic!("expected serve command")
-        };
-        assert_eq!(gpu_layers, GpuLayers::All);
-        assert!(no_mmap && mlock);
-        assert_eq!(split_mode, SplitMode::Row);
-        assert_eq!(tensor_split.unwrap().0, vec![3.0, 1.0]);
-        assert_eq!(cache_type_k, CacheType::Q8_0);
-        assert_eq!(threads, NonZeroU32::new(6));
-        assert_eq!(threads_batch, NonZeroU32::new(8));
-    }
-
-    #[test]
-    fn tensor_split_cli_rejects_unsafe_weights() {
-        assert!("0,0".parse::<TensorSplitArg>().is_err());
-        assert!("1,-1".parse::<TensorSplitArg>().is_err());
-        assert!("NaN,1".parse::<TensorSplitArg>().is_err());
-    }
-
-    #[test]
-    fn inventory_model_id_is_mutually_exclusive_with_paths_and_fake_mode() {
-        assert!(
-            Cli::try_parse_from([
-                "magnitude-icn",
-                "serve",
-                "--model-id",
-                "mdl_0123456789abcdef"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "magnitude-icn",
-                "serve",
-                "--model-id",
-                "mdl_0123456789abcdef",
-                "--model",
-                "/tmp/model.gguf"
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "magnitude-icn",
-                "serve",
-                "--model-id",
-                "mdl_0123456789abcdef",
-                "--fake"
-            ])
-            .is_err()
-        );
-
+    fn inventory_flag_aliases_parse() {
         let aliases = Cli::try_parse_from([
             "magnitude-icn",
             "serve",

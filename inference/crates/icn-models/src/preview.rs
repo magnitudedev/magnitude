@@ -116,7 +116,6 @@ impl ModelPreviewService {
             assessments.push(ModelPreviewAssessment {
                 profile_id: profile.id.clone(),
                 artifact_fingerprint: source_fingerprint.clone(),
-                execution_policy: self.assessor.policy_identity().to_owned(),
                 hardware_topology: snapshot.topology_fingerprint.clone(),
                 assessment: assessment.hardware,
                 performance: assessment.performance,
@@ -227,7 +226,6 @@ impl ModelPreviewService {
                 Ok(ModelPreviewAssessment {
                     profile_id: profile.id,
                     artifact_fingerprint: prepared.artifact_fingerprint.clone(),
-                    execution_policy: self.assessor.policy_identity().to_owned(),
                     hardware_topology: snapshot.topology_fingerprint.clone(),
                     assessment: assessment.hardware,
                     performance: assessment.performance,
@@ -422,14 +420,13 @@ fn validate_preview_request(request: &ModelPreviewRequest) -> Result<(), Invento
     }
     if request.profiles.iter().any(|profile| {
         profile.id.is_empty()
-            || profile.policy.is_empty()
             || profile.context_length == 0
             || profile.context_length > MAX_PREVIEW_CONTEXT_TOKENS
             || profile.parallel_sequences == 0
             || profile.parallel_sequences > MAX_PREVIEW_PARALLEL_SEQUENCES
     }) {
         return Err(InventoryError::InvalidRequest(
-            "preview profiles require IDs, versioned policies, context, and parallelism".to_owned(),
+            "preview profiles require IDs, context, and parallelism".to_owned(),
         ));
     }
     let mut ids = std::collections::BTreeSet::new();
@@ -1539,8 +1536,6 @@ mod tests {
                     },
                     native_build: "native".to_owned(),
                     enabled_backends: vec!["cpu".to_owned()],
-                    assessment_policy: "test-policy".to_owned(),
-                    capacity_policy: "stable".to_owned(),
                     topology_fingerprint: "topology".to_owned(),
                     memory_domains: Vec::new(),
                 })
@@ -1549,10 +1544,6 @@ mod tests {
     }
 
     impl ModelHardwareAssessor for CountingProfileAssessor {
-        fn policy_identity(&self) -> &str {
-            "test-policy"
-        }
-
         fn cache_key(
             &self,
             profile: Option<&icn_contracts::ModelPreviewProfile>,
@@ -1647,7 +1638,6 @@ mod tests {
         };
         let profile = icn_contracts::ModelPreviewProfile {
             id: "profile".to_owned(),
-            policy: "policy".to_owned(),
             context_length: 4096,
             parallel_sequences: 1,
         };
@@ -1967,7 +1957,6 @@ mod tests {
             source,
             profiles: vec![icn_contracts::ModelPreviewProfile {
                 id: "profile".to_owned(),
-                policy: "test-policy".to_owned(),
                 context_length: 4096,
                 parallel_sequences: 1,
             }],

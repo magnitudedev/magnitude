@@ -172,7 +172,7 @@ pub(crate) fn validate_repository(repository: &str) -> Result<(), InventoryError
 mod tests {
     use std::path::PathBuf;
 
-    use icn_contracts::{DownloadComponent, HuggingFaceDownloadSource};
+    use icn_contracts::{DownloadComponent, HuggingFaceDownloadSource, ServingProfile};
 
     use super::*;
 
@@ -189,6 +189,10 @@ mod tests {
                 expected_sha256: None,
             }],
             relationships: Vec::new(),
+            serving_profile: ServingProfile {
+                context_length: 4_096,
+                parallel_sequences: 1,
+            },
         }
     }
 

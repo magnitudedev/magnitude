@@ -9,8 +9,9 @@ use hf_hub::HFClient;
 use icn_contracts::{
     CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, HardwareAssessment,
     Integrity, InventoryError, InventoryHardwareAssessor, InventoryModel, InventoryProperties,
-    LocalDeclaration, ModelComponent, ModelId, ModelLocation, ModelOperation, ModelSource,
-    ModelStatus, ReasoningCapability, TemplateAssessor,
+    LocalDeclaration, ModelAvailability, ModelComponent, ModelId, ModelLocation, ModelOperation,
+    ModelResidency, ModelSource, ReasoningCapability, ServingConfiguration, ServingProfile,
+    TemplateAssessor,
 };
 use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
@@ -117,6 +118,83 @@ impl Clone for ModelManager {
 }
 
 impl ModelManager {
+    pub(crate) async fn configure_serving_model(
+        &self,
+        id: &ModelId,
+        profile: ServingProfile,
+    ) -> Result<InventoryModel, InventoryError> {
+        if profile.context_length == 0 || profile.parallel_sequences == 0 {
+            return Err(InventoryError::InvalidRequest(
+                "serving profile values must be positive".to_owned(),
+            ));
+        }
+        self.ensure_model_inventory().await?;
+        let current = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+        if !matches!(current.availability, ModelAvailability::Available { .. }) {
+            return Err(InventoryError::NotReady(id.0.clone()));
+        }
+        if current
+            .serving_configuration
+            .as_ref()
+            .is_some_and(|configuration| configuration.profile == profile)
+        {
+            return Ok(current);
+        }
+        let assessor = self
+            .hardware_assessor
+            .read()
+            .map_err(|_| InventoryError::Internal("hardware assessor lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| {
+                InventoryError::Internal("inventory hardware assessor is not configured".to_owned())
+            })?;
+        let resolved = icn_contracts::ResolvedModel {
+            components: crate::service::resolve_components(&self.config.root, &current)?,
+            model: current,
+        };
+        let assessment = assessor.assess_serving(resolved, profile.clone()).await?;
+        if !matches!(assessment, HardwareAssessment::Fits { .. }) {
+            return Err(InventoryError::NotReady(
+                "serving profile does not fit the available hardware".to_owned(),
+            ));
+        }
+        let _guard = self.ensure_gate.lock().await;
+        let mut models = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .clone();
+        let model = models
+            .get_mut(id)
+            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+        if !matches!(model.availability, ModelAvailability::Available { .. }) {
+            return Err(InventoryError::NotReady(id.0.clone()));
+        }
+        model.serving_configuration = Some(ServingConfiguration { profile });
+        model.hardware = assessment;
+        model.updated_at = now();
+        let updated = model.clone();
+
+        let evidence = self
+            .cache_evidence
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
+            .clone();
+        persist_inventory_index(&self.cache, &models, &evidence);
+        *self
+            .models
+            .write()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? = models;
+        self.ensure_generation.fetch_add(1, Ordering::Release);
+        Ok(updated)
+    }
+
     pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
         Self::open_with_template_assessor(config, None).await
     }
@@ -252,9 +330,16 @@ impl ModelManager {
                         })?,
                 };
                 if matches!(model.properties, InventoryProperties::Inspected { .. }) {
+                    let assessment_key = hardware_key_for_profile(
+                        &hardware_key,
+                        model
+                            .serving_configuration
+                            .as_ref()
+                            .map(|value| &value.profile),
+                    )?;
                     model.hardware = self
                         .cache
-                        .read_hardware_assessment(&model.content_id, &hardware_key)
+                        .read_hardware_assessment(&model.content_id, &assessment_key)
                         .unwrap_or(HardwareAssessment::NotAssessed {
                             reason: "cache_miss".to_owned(),
                         });
@@ -269,18 +354,47 @@ impl ModelManager {
                                 model,
                             )?,
                         };
-                        let assessment = assessor
+                        let assessor = assessor
                             .as_ref()
-                            .expect("inspected models require an assessor")
-                            .assess(resolved)
-                            .await?;
-                        self.cache.write_hardware_assessment(
-                            &model.content_id,
-                            &hardware_key,
-                            &assessment,
-                        );
+                            .expect("inspected models require an assessor");
+                        let assessment = match model.serving_configuration.as_ref() {
+                            Some(configuration) => {
+                                assessor
+                                    .assess_serving(resolved, configuration.profile.clone())
+                                    .await?
+                            }
+                            None => assessor.assess(resolved).await?,
+                        };
                         model.hardware = assessment;
                     }
+                    self.cache.write_hardware_assessment(
+                        &model.content_id,
+                        &assessment_key,
+                        &model.hardware,
+                    );
+                    if model.serving_configuration.is_none()
+                        && let HardwareAssessment::Fits { profile, .. } = &model.hardware
+                    {
+                        let serving_profile = ServingProfile {
+                            context_length: profile.context_length,
+                            parallel_sequences: 1,
+                        };
+                        model.serving_configuration = Some(ServingConfiguration {
+                            profile: serving_profile,
+                        });
+                    }
+                    let assessment_key = hardware_key_for_profile(
+                        &hardware_key,
+                        model
+                            .serving_configuration
+                            .as_ref()
+                            .map(|value| &value.profile),
+                    )?;
+                    self.cache.write_hardware_assessment(
+                        &model.content_id,
+                        &assessment_key,
+                        &model.hardware,
+                    );
                 }
                 next_evidence.insert(model.id.clone(), evidence);
             }
@@ -401,7 +515,7 @@ impl ModelManager {
                 })
             })
             .transpose()?;
-        if matches!(model.status, ModelStatus::Available { .. }) {
+        if matches!(model.availability, ModelAvailability::Available { .. }) {
             let assessor = self
                 .hardware_assessor
                 .read()
@@ -419,10 +533,37 @@ impl ModelManager {
                 model: model.clone(),
                 components: crate::service::resolve_components(&self.config.root, &model)?,
             };
-            let assessment = assessor.assess(resolved).await?;
-            self.cache
-                .write_hardware_assessment(&model.content_id, &hardware_key, &assessment);
+            let assessment = match model.serving_configuration.as_ref() {
+                Some(configuration) => {
+                    assessor
+                        .assess_serving(resolved, configuration.profile.clone())
+                        .await?
+                }
+                None => assessor.assess(resolved).await?,
+            };
             model.hardware = assessment;
+            if model.serving_configuration.is_none()
+                && let HardwareAssessment::Fits { profile, .. } = &model.hardware
+            {
+                model.serving_configuration = Some(ServingConfiguration {
+                    profile: ServingProfile {
+                        context_length: profile.context_length,
+                        parallel_sequences: 1,
+                    },
+                });
+            }
+            let assessment_key = hardware_key_for_profile(
+                &hardware_key,
+                model
+                    .serving_configuration
+                    .as_ref()
+                    .map(|value| &value.profile),
+            )?;
+            self.cache.write_hardware_assessment(
+                &model.content_id,
+                &assessment_key,
+                &model.hardware,
+            );
         }
         let mut models = self
             .models
@@ -483,37 +624,40 @@ impl ModelManager {
     }
 }
 
+fn hardware_key_for_profile(
+    base: &str,
+    profile: Option<&ServingProfile>,
+) -> Result<String, InventoryError> {
+    match profile {
+        None => Ok(base.to_owned()),
+        Some(profile) => serde_json::to_vec(&(base, profile))
+            .map(|bytes| fingerprint(&bytes))
+            .map_err(|error| InventoryError::Internal(error.to_string())),
+    }
+}
+
 fn is_cacheable_model(model: &InventoryModel) -> Result<bool, InventoryError> {
-    match (&model.status, &model.properties) {
-        (
-            ModelStatus::Available { .. }
-            | ModelStatus::Loading { .. }
-            | ModelStatus::Loaded { .. }
-            | ModelStatus::Unloading { .. }
-            | ModelStatus::LoadFailed { .. },
-            InventoryProperties::Inspected { .. },
-        ) => Ok(true),
-        (ModelStatus::InvalidArtifact { .. }, InventoryProperties::Unavailable { .. }) => Ok(true),
-        (ModelStatus::IncompatibleArtifact { .. }, InventoryProperties::Unavailable { .. }) => {
+    match (&model.availability, &model.properties) {
+        (ModelAvailability::Available { .. }, InventoryProperties::Inspected { .. }) => Ok(true),
+        (ModelAvailability::InvalidArtifact { .. }, InventoryProperties::Unavailable { .. }) => {
             Ok(true)
         }
         (
-            ModelStatus::Available { .. }
-            | ModelStatus::Loading { .. }
-            | ModelStatus::Loaded { .. }
-            | ModelStatus::Unloading { .. }
-            | ModelStatus::LoadFailed { .. },
-            _,
-        ) => Err(InventoryError::Internal(format!(
+            ModelAvailability::IncompatibleArtifact { .. },
+            InventoryProperties::Unavailable { .. },
+        ) => Ok(true),
+        (ModelAvailability::Available { .. }, _) => Err(InventoryError::Internal(format!(
             "ready model {} has incomplete properties",
             model.id.0
         ))),
-        (ModelStatus::InvalidArtifact { .. } | ModelStatus::IncompatibleArtifact { .. }, _) => {
-            Err(InventoryError::Internal(format!(
-                "unavailable model {} has inconsistent properties",
-                model.id.0
-            )))
-        }
+        (
+            ModelAvailability::InvalidArtifact { .. }
+            | ModelAvailability::IncompatibleArtifact { .. },
+            _,
+        ) => Err(InventoryError::Internal(format!(
+            "unavailable model {} has inconsistent properties",
+            model.id.0
+        ))),
         _ => Ok(false),
     }
 }
@@ -527,14 +671,10 @@ fn inventory_snapshot_is_current(
         .values()
         .filter(|model| {
             matches!(
-                model.status,
-                ModelStatus::Available { .. }
-                    | ModelStatus::Loading { .. }
-                    | ModelStatus::Loaded { .. }
-                    | ModelStatus::Unloading { .. }
-                    | ModelStatus::LoadFailed { .. }
-                    | ModelStatus::InvalidArtifact { .. }
-                    | ModelStatus::IncompatibleArtifact { .. }
+                model.availability,
+                ModelAvailability::Available { .. }
+                    | ModelAvailability::InvalidArtifact { .. }
+                    | ModelAvailability::IncompatibleArtifact { .. }
             )
         })
         .all(|model| {
@@ -558,17 +698,8 @@ fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
         if model.id != id {
             continue;
         }
-        if matches!(
-            model.status,
-            ModelStatus::Loading { .. }
-                | ModelStatus::Loaded { .. }
-                | ModelStatus::Unloading { .. }
-                | ModelStatus::LoadFailed { .. }
-        ) {
-            model.status = ModelStatus::Available {
-                ready_at: model.updated_at,
-            };
-        }
+        model.residency = ModelResidency::NotResident;
+        model.serving_configuration = None;
         models.insert(id, model);
     }
     let mut evidence = BTreeMap::new();
@@ -589,8 +720,16 @@ fn persist_inventory_index(
     models: &BTreeMap<ModelId, InventoryModel>,
     evidence: &BTreeMap<ModelId, CacheEvidence>,
 ) {
+    let models = models
+        .iter()
+        .map(|(id, model)| {
+            let mut cached = model.clone();
+            cached.serving_configuration = None;
+            (id.clone(), cached)
+        })
+        .collect();
     cache.write_inventory(&InventoryCache {
-        models: models.clone(),
+        models,
         evidence: evidence.clone(),
     });
 }
@@ -1062,7 +1201,8 @@ fn scan_interrupted(
             created: manifest.started_at,
             name: manifest.repository.clone(),
             supported_parameters: Vec::new(),
-            status: ModelStatus::Interrupted {
+            serving_configuration: None,
+            availability: ModelAvailability::Interrupted {
                 completed_bytes,
                 total_bytes,
                 resumable: true,
@@ -1072,6 +1212,7 @@ fn scan_interrupted(
                     .unwrap_or_else(|| "daemon_restarted".to_owned()),
                 updated_at: manifest.updated_at,
             },
+            residency: ModelResidency::NotResident,
             source: ModelSource::HuggingFace {
                 repository: manifest.repository,
                 requested_revision: manifest.requested_revision,
@@ -1145,16 +1286,13 @@ fn reuse_inspection(
         .and_then(|_| cached_models.get(&candidate.id))
         .filter(|model| {
             matches!(
-                (&model.status, &model.properties),
+                (&model.availability, &model.properties),
                 (
-                    ModelStatus::Available { .. }
-                        | ModelStatus::Loading { .. }
-                        | ModelStatus::Loaded { .. }
-                        | ModelStatus::Unloading { .. }
-                        | ModelStatus::LoadFailed { .. },
+                    ModelAvailability::Available { .. },
                     InventoryProperties::Inspected { .. }
                 ) | (
-                    ModelStatus::InvalidArtifact { .. } | ModelStatus::IncompatibleArtifact { .. },
+                    ModelAvailability::InvalidArtifact { .. }
+                        | ModelAvailability::IncompatibleArtifact { .. },
                     InventoryProperties::Unavailable { .. },
                 )
             )
@@ -1164,23 +1302,33 @@ fn reuse_inspection(
         model.content_id = candidate.content_id.clone();
         model.source = candidate.source.clone();
         model.location = candidate.location.clone();
-        model.operations = match &model.status {
-            ModelStatus::Available { .. } | ModelStatus::LoadFailed { .. } => {
+        model.operations = match (&model.availability, &model.residency) {
+            (
+                ModelAvailability::Available { .. },
+                ModelResidency::NotResident | ModelResidency::LoadFailed { .. },
+            ) => {
                 let mut operations = vec![ModelOperation::Load];
                 if candidate.deletable {
                     operations.push(ModelOperation::Delete);
                 }
                 operations
             }
-            ModelStatus::Loaded { .. } => vec![ModelOperation::Unload],
-            ModelStatus::Loading { .. } | ModelStatus::Unloading { .. } => Vec::new(),
-            ModelStatus::InvalidArtifact { .. } | ModelStatus::IncompatibleArtifact { .. } => {
-                candidate
-                    .deletable
-                    .then_some(ModelOperation::Delete)
-                    .into_iter()
-                    .collect()
+            (ModelAvailability::Available { .. }, ModelResidency::Loaded { .. }) => {
+                vec![ModelOperation::Unload]
             }
+            (
+                ModelAvailability::Available { .. },
+                ModelResidency::Loading { .. } | ModelResidency::Unloading { .. },
+            ) => Vec::new(),
+            (
+                ModelAvailability::InvalidArtifact { .. }
+                | ModelAvailability::IncompatibleArtifact { .. },
+                _,
+            ) => candidate
+                .deletable
+                .then_some(ModelOperation::Delete)
+                .into_iter()
+                .collect(),
             _ => unreachable!("only terminal discovery records are reusable"),
         };
         // Hardware has an independent cache key and is restored only after that key is checked.
@@ -1196,7 +1344,7 @@ fn enrich_candidate(
     cache: &ModelCache,
     assessor: Option<&dyn TemplateAssessor>,
 ) -> Result<InventoryModel, InventoryError> {
-    build_model(
+    let model = build_model(
         candidate.id.clone(),
         candidate.content_id.clone(),
         candidate.created,
@@ -1207,7 +1355,8 @@ fn enrich_candidate(
         candidate.deletable,
         cache,
         assessor,
-    )
+    )?;
+    Ok(model)
 }
 
 // This construction boundary intentionally lists every independently acquired inventory field;
@@ -1358,7 +1507,9 @@ pub(crate) fn build_model(
         created,
         name: inspected.name,
         supported_parameters: inspected.supported_parameters,
-        status: ModelStatus::Available { ready_at },
+        serving_configuration: None,
+        availability: ModelAvailability::Available { ready_at },
+        residency: ModelResidency::NotResident,
         source,
         location,
         properties: inspected.properties,
@@ -1399,14 +1550,14 @@ fn unavailable_model(
     message: String,
     incompatible: bool,
 ) -> InventoryModel {
-    let status = if incompatible {
-        ModelStatus::IncompatibleArtifact {
+    let availability = if incompatible {
+        ModelAvailability::IncompatibleArtifact {
             detected_at,
             code: code.to_owned(),
             message: message.clone(),
         }
     } else {
-        ModelStatus::InvalidArtifact {
+        ModelAvailability::InvalidArtifact {
             detected_at,
             code: code.to_owned(),
             message: message.clone(),
@@ -1422,7 +1573,9 @@ fn unavailable_model(
             .unwrap_or("local model")
             .to_owned(),
         supported_parameters: Vec::new(),
-        status,
+        serving_configuration: None,
+        availability,
+        residency: ModelResidency::NotResident,
         source,
         location,
         properties: InventoryProperties::Unavailable { reason: message },
@@ -1942,17 +2095,26 @@ mod tests {
         let first = first.unwrap();
         assert_eq!(first, second.unwrap());
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0].status, ModelStatus::Available { .. }));
+        assert!(matches!(
+            first[0].availability,
+            ModelAvailability::Available { .. }
+        ));
         assert!(matches!(
             first[0].properties,
             InventoryProperties::Inspected { .. }
         ));
         assert!(matches!(first[0].hardware, HardwareAssessment::Fits { .. }));
+        let serving = first[0]
+            .serving_configuration
+            .as_ref()
+            .expect("available models have a serving configuration");
+        assert_eq!(serving.profile.context_length, 4096);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&fs::read(store.join("cache/indexes/inventory.json")).unwrap())
-                .unwrap();
+        let persisted_bytes = fs::read(store.join("cache/indexes/inventory.json")).unwrap();
+        let persisted_text = String::from_utf8(persisted_bytes.clone()).unwrap();
+        assert!(!persisted_text.contains("serving_configuration"));
+        let persisted: serde_json::Value = serde_json::from_slice(&persisted_bytes).unwrap();
         assert!(persisted.get("version").is_none());
 
         let reopened =
@@ -1966,9 +2128,9 @@ mod tests {
         assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
 
         reopened
-            .update_status(
+            .update_residency(
                 &warm[0].id,
-                ModelStatus::Loaded {
+                ModelResidency::Loaded {
                     loaded_at: now(),
                     backend: "test".to_owned(),
                     context_length: 4096,
@@ -1978,7 +2140,7 @@ mod tests {
             .await
             .unwrap();
         let loaded = reopened.list().await.unwrap();
-        assert!(matches!(loaded[0].status, ModelStatus::Loaded { .. }));
+        assert!(matches!(loaded[0].residency, ModelResidency::Loaded { .. }));
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
 

@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::num::{NonZeroI32, NonZeroU32};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
@@ -15,9 +16,9 @@ use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatRequest, ChatTemplateRequest,
     CompletionBackend, ExecutionConfig, ExecutionConfigReport, ExecutionIntent, FinishReason,
     FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
-    ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent, ModelModalities,
-    ModelProperties, PreparedChatInfo, ProjectorConfig, ReasoningControl, ResponseFormat,
-    SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
+    HardwareAssessment, ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent,
+    ModelModalities, ModelProperties, PreparedChatInfo, ProjectorConfig, ReasoningControl,
+    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -187,8 +188,54 @@ enum FlushOutcome {
 pub struct LlamaCompletionBackend {
     model_id: String,
     properties: ModelProperties,
+    acceleration: String,
     commands: SyncSender<ExecutorCommand>,
     executor: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MtpCandidateSelection {
+    Automatic(Vec<PathBuf>),
+    Explicit(PathBuf),
+}
+
+#[derive(Debug)]
+pub enum ModelLoadError {
+    InvalidConfiguration(String),
+    MtpSelection(String),
+    Planning(String),
+    AssessmentRejected(HardwareAssessment),
+    Backend(String),
+}
+
+impl std::fmt::Display for ModelLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfiguration(message) => {
+                write!(formatter, "invalid model configuration: {message}")
+            }
+            Self::MtpSelection(message) => write!(formatter, "MTP selection failed: {message}"),
+            Self::Planning(message) => write!(formatter, "native load planning failed: {message}"),
+            Self::AssessmentRejected(assessment) => write!(
+                formatter,
+                "native load assessment rejected the model: {assessment:?}"
+            ),
+            Self::Backend(message) => {
+                write!(formatter, "native backend initialization failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModelLoadError {}
+
+impl From<InferenceError> for ModelLoadError {
+    fn from(error: InferenceError) -> Self {
+        match error {
+            InferenceError::InvalidConfig(message) => Self::InvalidConfiguration(message),
+            other => Self::Backend(other.to_string()),
+        }
+    }
 }
 
 impl LlamaCompletionBackend {
@@ -202,21 +249,23 @@ impl LlamaCompletionBackend {
     pub fn load(
         model_id: impl Into<String>,
         config: ExecutionIntent,
-    ) -> Result<Self, InferenceError> {
-        validate_model_config(&config)?;
+        mtp_selection: MtpCandidateSelection,
+    ) -> Result<Self, ModelLoadError> {
+        validate_model_config(&config).map_err(ModelLoadError::from)?;
         let model_id = model_id.into();
         tracing::Span::current().record("model.id", model_id.as_str());
         let (commands, command_receiver) = sync_channel(COMMAND_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = sync_channel(1);
         let executor = thread::Builder::new()
             .name(format!("icn-llama-{}", model_id))
-            .spawn(move || executor_main(config, command_receiver, ready_sender))
-            .map_err(backend_error)?;
+            .spawn(move || executor_main(config, mtp_selection, command_receiver, ready_sender))
+            .map_err(|error| ModelLoadError::Backend(error.to_string()))?;
 
         match ready_receiver.recv() {
-            Ok(Ok(properties)) => Ok(Self {
+            Ok(Ok((properties, acceleration))) => Ok(Self {
                 model_id,
                 properties,
+                acceleration,
                 commands,
                 executor: Mutex::new(Some(executor)),
             }),
@@ -226,9 +275,15 @@ impl LlamaCompletionBackend {
             }
             Err(_) => {
                 let _ = executor.join();
-                Err(InferenceError::ExecutorStopped)
+                Err(InferenceError::ExecutorStopped.into())
             }
         }
+    }
+
+    /// The normalized acceleration selected by the native load plan.
+    #[must_use]
+    pub fn acceleration(&self) -> &str {
+        &self.acceleration
     }
 
     /// Run model-free native planning against the executor's initialized llama.cpp backend.
@@ -340,14 +395,26 @@ impl Drop for LlamaCompletionBackend {
 }
 
 fn executor_main(
-    requested: ExecutionIntent,
+    mut requested: ExecutionIntent,
+    mtp_selection: MtpCandidateSelection,
     commands: Receiver<ExecutorCommand>,
-    ready: SyncSender<Result<ModelProperties, InferenceError>>,
+    ready: SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
 ) {
     let backend = match LlamaBackend::init() {
         Ok(backend) => backend,
         Err(error) => {
-            let _ = ready.send(Err(backend_error(error)));
+            let _ = ready.send(Err(ModelLoadError::Backend(error.to_string())));
+            return;
+        }
+    };
+    let candidates = match &mtp_selection {
+        MtpCandidateSelection::Automatic(paths) => icn_mtp::CandidatePolicy::Automatic(paths),
+        MtpCandidateSelection::Explicit(path) => icn_mtp::CandidatePolicy::Explicit(path),
+    };
+    requested.mtp = match icn_mtp::select_mtp_with_backend(&backend, &requested, candidates) {
+        Ok(mtp) => mtp,
+        Err(error) => {
+            let _ = ready.send(Err(ModelLoadError::MtpSelection(error.to_string())));
             return;
         }
     };
@@ -358,7 +425,14 @@ fn executor_main(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            let _ = ready.send(Err(backend_error(error)));
+            let _ = ready.send(Err(ModelLoadError::Planning(error.to_string())));
+            return;
+        }
+    };
+    let acceleration = match &planned.assessed.assessment {
+        HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
+        assessment => {
+            let _ = ready.send(Err(ModelLoadError::AssessmentRejected(assessment.clone())));
             return;
         }
     };
@@ -369,14 +443,14 @@ fn executor_main(
     let threads = match nonzero_i32(threads, "threads") {
         Ok(value) => value,
         Err(error) => {
-            let _ = ready.send(Err(error));
+            let _ = ready.send(Err(error.into()));
             return;
         }
     };
     let threads_batch = match nonzero_i32(threads_batch, "threads_batch") {
         Ok(value) => value,
         Err(error) => {
-            let _ = ready.send(Err(error));
+            let _ = ready.send(Err(error.into()));
             return;
         }
     };
@@ -390,21 +464,21 @@ fn executor_main(
         match LlamaModel::load_from_file(&backend, &model_path, model_params.as_ref().get_ref()) {
             Ok(model) => model,
             Err(error) => {
-                let _ = ready.send(Err(backend_error(error)));
+                let _ = ready.send(Err(backend_error(error).into()));
                 return;
             }
         };
     let chat_templates = match CommonChatTemplates::from_model(&model) {
         Ok(templates) => templates,
         Err(error) => {
-            let _ = ready.send(Err(backend_error(error)));
+            let _ = ready.send(Err(backend_error(error).into()));
             return;
         }
     };
     let context = match model.new_context(&backend, context_params) {
         Ok(context) => context,
         Err(error) => {
-            let _ = ready.send(Err(backend_error(error)));
+            let _ = ready.send(Err(backend_error(error).into()));
             return;
         }
     };
@@ -424,7 +498,7 @@ fn executor_main(
             ) {
                 Ok(model) => Some(model),
                 Err(error) => {
-                    let _ = ready.send(Err(backend_error(error)));
+                    let _ = ready.send(Err(backend_error(error).into()));
                     return;
                 }
             }
@@ -432,7 +506,8 @@ fn executor_main(
         (icn_contracts::MtpConfig::Enabled { .. }, None) => {
             let _ = ready.send(Err(InferenceError::InvalidConfig(
                 "native planner omitted the enabled MTP plan".to_owned(),
-            )));
+            )
+            .into()));
             return;
         }
         _ => None,
@@ -448,7 +523,8 @@ fn executor_main(
             let Some((_, _, draft_context_params, _, _)) = native_mtp.as_ref() else {
                 let _ = ready.send(Err(InferenceError::InvalidConfig(
                     "native planner omitted the enabled MTP context".to_owned(),
-                )));
+                )
+                .into()));
                 return;
             };
             let draft_context_params = draft_context_params.clone();
@@ -467,7 +543,7 @@ fn executor_main(
             ) {
                 Ok(mtp) => Some(mtp),
                 Err(error) => {
-                    let _ = ready.send(Err(backend_error(error)));
+                    let _ = ready.send(Err(backend_error(error).into()));
                     return;
                 }
             }
@@ -485,7 +561,7 @@ fn executor_main(
                 ) {
                     Ok(runtime) => Some(runtime),
                     Err(error) => {
-                        let _ = ready.send(Err(error));
+                        let _ = ready.send(Err(error.into()));
                         return;
                     }
                 },
@@ -500,7 +576,7 @@ fn executor_main(
     let mut main_pool = match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads)) {
         Ok(pool) => pool,
         Err(error) => {
-            let _ = ready.send(Err(backend_error(error)));
+            let _ = ready.send(Err(backend_error(error).into()));
             return;
         }
     };
@@ -509,7 +585,7 @@ fn executor_main(
             match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads)) {
                 Ok(pool) => pool,
                 Err(error) => {
-                    let _ = ready.send(Err(backend_error(error)));
+                    let _ = ready.send(Err(backend_error(error).into()));
                     return;
                 }
             };
@@ -529,13 +605,14 @@ fn executor_main(
                 &mut multimodal,
                 &commands,
                 &ready,
+                acceleration.clone(),
             );
         } else {
             let mut batch_pool =
                 match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
                     Ok(pool) => pool,
                     Err(error) => {
-                        let _ = ready.send(Err(backend_error(error)));
+                        let _ = ready.send(Err(backend_error(error).into()));
                         return;
                     }
                 };
@@ -543,7 +620,7 @@ fn executor_main(
                 match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
                     Ok(pool) => pool,
                     Err(error) => {
-                        let _ = ready.send(Err(backend_error(error)));
+                        let _ = ready.send(Err(backend_error(error).into()));
                         return;
                     }
                 };
@@ -562,6 +639,7 @@ fn executor_main(
                 &mut multimodal,
                 &commands,
                 &ready,
+                acceleration.clone(),
             );
         }
     } else if threads == threads_batch {
@@ -581,6 +659,7 @@ fn executor_main(
             &mut multimodal,
             &commands,
             &ready,
+            acceleration.clone(),
         );
     } else {
         let mut context = context
@@ -590,7 +669,7 @@ fn executor_main(
             match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
                 Ok(pool) => pool,
                 Err(error) => {
-                    let _ = ready.send(Err(backend_error(error)));
+                    let _ = ready.send(Err(backend_error(error).into()));
                     return;
                 }
             };
@@ -607,6 +686,7 @@ fn executor_main(
             &mut multimodal,
             &commands,
             &ready,
+            acceleration,
         );
     }
 }
@@ -652,10 +732,11 @@ fn run_initialized_executor<'model>(
     mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
-    ready: &SyncSender<Result<ModelProperties, InferenceError>>,
+    ready: &SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
+    acceleration: String,
 ) {
     if let Err(error) = warm_up(model, context, mtp.as_deref_mut()) {
-        let _ = ready.send(Err(error));
+        let _ = ready.send(Err(error.into()));
         return;
     }
     let modalities = multimodal
@@ -671,11 +752,11 @@ fn run_initialized_executor<'model>(
     ) {
         Ok(properties) => properties,
         Err(error) => {
-            let _ = ready.send(Err(error));
+            let _ = ready.send(Err(error.into()));
             return;
         }
     };
-    if ready.send(Ok(properties)).is_err() {
+    if ready.send(Ok((properties, acceleration))).is_err() {
         return;
     }
     run_scheduler(
