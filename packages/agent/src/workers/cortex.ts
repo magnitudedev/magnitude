@@ -60,8 +60,7 @@ import { isToolKey, type ToolKey } from '../tools/toolkits'
 import { buildStandardHooks } from '../execution/harness-hooks'
 import { TurnContextTag } from '../engine/turn-context'
 import { ConfigAmbient } from '../ambient/config-ambient'
-import { getSlotConfigForRole, getSlotConfigOrNull } from '../ambient/config-ambient'
-import { ROLE_TO_SLOT } from '@magnitudedev/roles'
+import { getSlotConfigForRole } from '../ambient/config-ambient'
 import { ImageQueryTarget } from '../tools/query-image'
 import { SessionOptionsAmbient } from '../ambient/session-ambient'
 import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
@@ -202,9 +201,10 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         }
 
         const turnContextLayer = Layer.succeed(TurnContextTag, { turnId, chainId, forkId })
-        const activeSlotId = ROLE_TO_SLOT[roleId]
-        const otherSlot = getSlotConfigOrNull(configState, activeSlotId === 'primary' ? 'secondary' : 'primary')
-        const turnLayer = Layer.merge(Layer.merge(forkLayer, turnContextLayer), Layer.succeed(ImageQueryTarget, { slot: otherSlot }))
+        // Opposite-slot image queries are temporarily disabled with the secondary model.
+        // const activeSlotId = ROLE_TO_SLOT[roleId]
+        // const otherSlot = getSlotConfigOrNull(configState, activeSlotId === 'primary' ? 'secondary' : 'primary')
+        const turnLayer = Layer.merge(Layer.merge(forkLayer, turnContextLayer), Layer.succeed(ImageQueryTarget, { slot: null }))
 
         // Record turn-start checkpoint — captures state at the turn boundary
         // so checkpoint_rollback can restore to "before this turn".

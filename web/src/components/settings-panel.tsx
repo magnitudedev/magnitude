@@ -11,7 +11,7 @@ import { Result } from "@effect-atom/atom-react"
 import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
 import type { CloudUsageResponse, UsagePeriod, SlotId, ReasoningEffort, LocalModelChoice } from "@magnitudedev/sdk"
-import { ModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, SLOT_IDS } from "@magnitudedev/sdk"
+import { ModelCatalogLifecycle } from "@magnitudedev/sdk"
 import type { UseModelConfigResult } from "@magnitudedev/client-common"
 
 export type { UsagePeriod } from "@magnitudedev/sdk"
@@ -731,7 +731,7 @@ function SlotCard({
             color: "var(--accent-primary)",
           }}
         >
-          {entry.label} Model
+          {entry.label}
         </span>
       </div>
 
