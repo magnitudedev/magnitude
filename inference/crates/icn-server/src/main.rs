@@ -25,7 +25,7 @@ use icn_contracts::{
     TemplateAssessor,
 };
 use icn_engine::{LlamaCompletionBackend, ModelLoadError, MtpCandidateSelection};
-use icn_hardware::{CapacityPolicy, discover, discover_hardware};
+use icn_hardware::{CapacityPolicy, discover};
 use icn_models::{InventoryConfig, ModelManager, ModelPreviewService};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Instrument as _;
@@ -175,9 +175,16 @@ fn execution_intent(
     })
 }
 
+#[derive(Clone)]
+struct ResidentNativeExecutor {
+    generation: u64,
+    model_id: String,
+    backend: Arc<LlamaCompletionBackend>,
+}
+
 struct NativeHardwareAssessor {
     defaults: RuntimePlanDefaults,
-    native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
+    native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
     gate: tokio::sync::Mutex<()>,
     planning_slots: Arc<tokio::sync::Semaphore>,
     calibration: tokio::sync::Mutex<CalibrationCache>,
@@ -792,26 +799,46 @@ impl HardwareProvider for NativeHardwareAssessor {
                 .map_err(|_| InventoryError::Internal("native executor lock poisoned".to_owned()))?
                 .clone();
             let native_build = build_identity::native_build();
+            let observed_runtime = native_executor
+                .as_ref()
+                .map(|resident| (resident.generation, resident.model_id.clone()));
             let enabled_backends = build_identity::enabled_backends()
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
-            let snapshot = spawn_blocking_traced(move || match native_executor {
-                Some(executor) => executor
-                    .run_exclusive_native(move |backend| {
-                        Ok(discover_hardware(
-                            backend,
+            let mut snapshot = spawn_blocking_traced(move || match native_executor {
+                Some(resident) => {
+                    let snapshot = resident
+                        .backend
+                        .observe_hardware(
+                            resident.generation,
                             CapacityPolicy::default(),
                             native_build,
                             enabled_backends,
-                        ))
-                    })
-                    .map_err(|error| InventoryError::Internal(error.to_string()))?,
+                        )
+                        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+                    Ok(snapshot)
+                }
                 None => discover(CapacityPolicy::default(), native_build, enabled_backends)
                     .map_err(|error| InventoryError::Internal(error.to_string())),
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
+            if let Some((generation, model_id)) = observed_runtime {
+                let unchanged = self
+                    .native_executor
+                    .read()
+                    .map_err(|_| {
+                        InventoryError::Internal("native executor lock poisoned".to_owned())
+                    })?
+                    .as_ref()
+                    .is_some_and(|current| {
+                        current.generation == generation && current.model_id == model_id
+                    });
+                if !unchanged {
+                    snapshot.resident_memory = None;
+                }
+            }
             let mut calibration = self.calibration.lock().await;
             if calibration.topology_fingerprint.as_deref()
                 != Some(snapshot.topology_fingerprint.as_str())
@@ -828,7 +855,7 @@ impl HardwareProvider for NativeHardwareAssessor {
 struct NativeRuntimeController {
     backends: BackendRegistry,
     inventory: Arc<ModelManager>,
-    native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
+    native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
     defaults: RuntimePlanDefaults,
     state: Arc<tokio::sync::RwLock<RuntimeState>>,
     mutation: Arc<tokio::sync::Mutex<()>>,
@@ -839,7 +866,7 @@ impl NativeRuntimeController {
     fn new(
         backends: BackendRegistry,
         inventory: Arc<ModelManager>,
-        native_executor: Arc<RwLock<Option<Arc<LlamaCompletionBackend>>>>,
+        native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
         defaults: RuntimePlanDefaults,
         initial: RuntimeState,
     ) -> Self {
@@ -1208,7 +1235,11 @@ impl NativeRuntimeController {
             .backends
             .replace(Arc::clone(&backend) as Arc<dyn CompletionBackend>, aliases);
         if let Ok(mut slot) = self.native_executor.write() {
-            *slot = Some(Arc::clone(&backend));
+            *slot = Some(ResidentNativeExecutor {
+                generation,
+                model_id: model_id.clone(),
+                backend: Arc::clone(&backend),
+            });
         }
         let execution: std::collections::BTreeMap<_, _> =
             serde_json::to_value(&properties.execution.resolved)
@@ -1621,6 +1652,7 @@ mod tests {
             enabled_backends: vec!["cpu".to_owned()],
             topology_fingerprint: "topology".to_owned(),
             memory_domains: Vec::new(),
+            resident_memory: None,
         };
         let equivalent_preview = ModelPreviewProfile {
             id: "caller-correlation-does-not-affect-fit".to_owned(),

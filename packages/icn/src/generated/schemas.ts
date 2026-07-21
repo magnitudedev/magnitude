@@ -890,6 +890,8 @@ export const HardwareDeviceSchema = S.extend(
       { exact: true, as: "Option" },
     ),
     name: S.String,
+    native_index: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    physical_id: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )
@@ -986,6 +988,13 @@ export const HardwareSnapshotSchema = S.extend(
     ),
     native_build: S.String,
     platform: S.String,
+    resident_memory: S.optionalWith(
+      S.Union(
+        S.Null,
+        S.suspend((): S.Schema<ResidentMemorySchema, ResidentMemorySchemaEncoded> => ResidentMemorySchema),
+      ),
+      { exact: true, as: "Option" },
+    ),
     system_memory: S.suspend(
       (): S.Schema<HardwareSystemMemorySchema, HardwareSystemMemorySchemaEncoded> => HardwareSystemMemorySchema,
     ),
@@ -1847,6 +1856,34 @@ export type ReasoningProfileResponseEncoded = S.Schema.Encoded<typeof ReasoningP
 export const ReasoningVisibilitySchema = S.Union(S.Literal("hidden"), S.Literal("preserved"), S.Literal("configurable"))
 export type ReasoningVisibilitySchema = S.Schema.Type<typeof ReasoningVisibilitySchema>
 export type ReasoningVisibilitySchemaEncoded = S.Schema.Encoded<typeof ReasoningVisibilitySchema>
+
+export const ResidentMemoryDomainSchema = S.extend(
+  S.Struct({
+    auxiliary_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    compute_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    context_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    memory_domain_id: S.String,
+    model_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type ResidentMemoryDomainSchema = S.Schema.Type<typeof ResidentMemoryDomainSchema>
+export type ResidentMemoryDomainSchemaEncoded = S.Schema.Encoded<typeof ResidentMemoryDomainSchema>
+
+export const ResidentMemorySchema = S.extend(
+  S.Struct({
+    domains: S.Array(
+      S.suspend(
+        (): S.Schema<ResidentMemoryDomainSchema, ResidentMemoryDomainSchemaEncoded> => ResidentMemoryDomainSchema,
+      ),
+    ),
+    model_id: S.String,
+    runtime_generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type ResidentMemorySchema = S.Schema.Type<typeof ResidentMemorySchema>
+export type ResidentMemorySchemaEncoded = S.Schema.Encoded<typeof ResidentMemorySchema>
 
 export const ResponseFormatRequest = S.Union(
   S.extend(

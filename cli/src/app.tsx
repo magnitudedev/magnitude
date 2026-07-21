@@ -49,6 +49,7 @@ import { ComposerContainer } from './features/composer/container'
 import { WorkingTimerContainer, TaskListContainer } from './features/agent-status/container'
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
+import { LocalRuntimeStatusBar } from './features/local-inference/status-bar'
 import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/sessions/container'
 import {
   ModelSetupScreen,
@@ -232,13 +233,6 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const ephemeralMessage = useSyncExternalStore(subscribeEphemeralMessage, getEphemeralMessageSnapshot)
   const localInference = useLocalInferenceQuery()
   const localInferenceSnapshot = Result.value(localInference)
-  const loadedLocalModels = Option.getOrElse(Option.map(localInferenceSnapshot, (snapshot) =>
-    snapshot.choices.filter((choice) =>
-        choice._tag === 'Running'
-        && (choice.residency === 'loaded' || choice.residency === 'sleeping'))), () => [])
-  const loadingLocalModels = Option.getOrElse(Option.map(localInferenceSnapshot, (snapshot) =>
-    snapshot.operations.filter((operation) => operation.status === 'running')), () => [])
-
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
 
@@ -291,6 +285,13 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
           style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, position: 'relative', height: '100%' }}
         >
           <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
+            {Option.getOrNull(Option.map(localInferenceSnapshot, (snapshot) => (
+              <LocalRuntimeStatusBar
+                state={snapshot}
+                width={chatColumnWidth}
+                onOpenHardware={() => setSettingsOpen(true)}
+              />
+            )))}
             <ChatTimelineContainer
               header={startupHeader}
               chatColumnWidth={chatColumnWidth}
@@ -307,16 +308,6 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
               handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
               modelsConfigured={props.modelsConfigured}
             />
-            {(loadedLocalModels.length > 0 || loadingLocalModels.length > 0) && (
-              <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0 }}>
-                <text style={{ fg: theme.muted }}>
-                  {[
-                    loadedLocalModels.length > 0 ? `Local loaded: ${loadedLocalModels.map((model) => model.displayName).join(' · ')}` : null,
-                    ...loadingLocalModels.map((operation) => `${operation.kind === "download" ? "Downloading" : operation.kind === "activate" ? "Activating" : "Restarting"} ${operation.providerModelId}: ${operation.stage}${operation.progress === undefined || operation.progress.totalBytes === 0 ? '' : ` ${Math.round(operation.progress.completedBytes / operation.progress.totalBytes * 100)}%`}`),
-                  ].filter(Boolean).join('  ·  ')}
-                </text>
-              </box>
-            )}
           </box>
 
           {clipboardToast && (

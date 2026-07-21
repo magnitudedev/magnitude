@@ -1,6 +1,6 @@
 //! Persistent llama.cpp executor for ICN.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::{NonZeroI32, NonZeroU32};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,9 +16,10 @@ use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatRequest, ChatTemplateRequest,
     CompletionBackend, ExecutionConfig, ExecutionConfigReport, ExecutionIntent, FinishReason,
     FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
-    HardwareAssessment, ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent,
-    ModelModalities, ModelProperties, PreparedChatInfo, ProjectorConfig, ReasoningControl,
-    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
+    HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceEvent,
+    InferenceStreamEvent, ModelModalities, ModelProperties, PreparedChatInfo, ProjectorConfig,
+    ReasoningControl, ResidentMemory, ResidentMemoryDomain, ResponseFormat, SplitMode,
+    TemplateCapabilities, ToolCall, ToolChoice,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -33,6 +34,7 @@ use llama_cpp_2::common_sampling::{
     CommonSamplerConfig, ReasoningBudgetLimit,
 };
 use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::context::{LlamaMemoryBreakdown, LlamaMemoryLocation};
 use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
@@ -85,6 +87,42 @@ const IDLE_ADMISSION_COALESCE_INTERVAL: Duration = Duration::from_millis(1);
 
 type ExclusiveNativeTask = Box<dyn FnOnce(&LlamaBackend) + Send + 'static>;
 
+struct HardwareObservationRequest {
+    model_id: String,
+    runtime_generation: u64,
+    policy: icn_hardware::CapacityPolicy,
+    native_build: String,
+    enabled_backends: Vec<String>,
+    response: SyncSender<HardwareSnapshot>,
+}
+
+#[derive(Clone)]
+enum ResidentAllocationEvidence {
+    Available(Vec<ResidentAllocation>),
+    CaptureFailed,
+}
+
+#[derive(Clone)]
+struct ResidentAllocation {
+    location: LlamaMemoryLocation,
+    model_bytes: u64,
+    context_bytes: u64,
+    compute_bytes: u64,
+    auxiliary_bytes: u64,
+}
+
+impl From<LlamaMemoryBreakdown> for ResidentAllocation {
+    fn from(value: LlamaMemoryBreakdown) -> Self {
+        Self {
+            location: value.location,
+            model_bytes: value.model_bytes,
+            context_bytes: value.context_bytes,
+            compute_bytes: value.compute_bytes,
+            auxiliary_bytes: 0,
+        }
+    }
+}
+
 enum ExecutorCommand {
     Complete {
         request: ChatRequest,
@@ -101,6 +139,7 @@ enum ExecutorCommand {
     RunExclusiveNative {
         task: ExclusiveNativeTask,
     },
+    ObserveHardware(HardwareObservationRequest),
     Shutdown,
 }
 
@@ -311,6 +350,31 @@ impl LlamaCompletionBackend {
             })?;
         receiver.recv().map_err(|_| InferenceError::ExecutorStopped)
     }
+
+    /// Capture current hardware state between scheduler batches without waiting for inference to
+    /// become idle.
+    pub fn observe_hardware(
+        &self,
+        runtime_generation: u64,
+        policy: icn_hardware::CapacityPolicy,
+        native_build: String,
+        enabled_backends: Vec<String>,
+    ) -> Result<HardwareSnapshot, InferenceError> {
+        let (response, receiver) = sync_channel(1);
+        self.commands
+            .send(ExecutorCommand::ObserveHardware(
+                HardwareObservationRequest {
+                    model_id: self.model_id.clone(),
+                    runtime_generation,
+                    policy,
+                    native_build,
+                    enabled_backends,
+                    response,
+                },
+            ))
+            .map_err(|_| InferenceError::ExecutorStopped)?;
+        receiver.recv().map_err(|_| InferenceError::ExecutorStopped)
+    }
 }
 
 impl CompletionBackend for LlamaCompletionBackend {
@@ -436,6 +500,29 @@ fn executor_main(
             return;
         }
     };
+    #[cfg(feature = "mtmd")]
+    let auxiliary_allocations = planned
+        .assessed
+        .projector_memory
+        .iter()
+        .map(|estimate| ResidentAllocation {
+            location: estimate
+                .device_index
+                .map_or(LlamaMemoryLocation::Host, |native_index| {
+                    LlamaMemoryLocation::Device {
+                        backend: String::new(),
+                        physical_id: None,
+                        native_index,
+                    }
+                }),
+            model_bytes: 0,
+            context_bytes: 0,
+            compute_bytes: 0,
+            auxiliary_bytes: estimate.bytes,
+        })
+        .collect::<Vec<_>>();
+    #[cfg(not(feature = "mtmd"))]
+    let auxiliary_allocations = Vec::<ResidentAllocation>::new();
     let config = planned.assessed.plan;
     let native_mtp = planned.native_mtp.map(|plan| plan.into_parts());
     let (model_path, model_params, context_params, threads, threads_batch) =
@@ -512,6 +599,7 @@ fn executor_main(
         }
         _ => None,
     };
+    let draft_has_separate_model = draft_model.is_some();
     let mut mtp = match &config.mtp {
         icn_contracts::MtpConfig::Disabled { .. } => None,
         icn_contracts::MtpConfig::Enabled {
@@ -601,6 +689,8 @@ fn executor_main(
                 &chat_templates,
                 &mut attached,
                 Some(&mut draft_attached),
+                draft_has_separate_model,
+                &auxiliary_allocations,
                 Some(&mut operations),
                 &mut multimodal,
                 &commands,
@@ -635,6 +725,8 @@ fn executor_main(
                 &chat_templates,
                 &mut attached,
                 Some(&mut draft_attached),
+                draft_has_separate_model,
+                &auxiliary_allocations,
                 Some(&mut operations),
                 &mut multimodal,
                 &commands,
@@ -655,6 +747,8 @@ fn executor_main(
             &chat_templates,
             &mut attached,
             None,
+            false,
+            &auxiliary_allocations,
             None,
             &mut multimodal,
             &commands,
@@ -682,6 +776,8 @@ fn executor_main(
             &chat_templates,
             &mut attached,
             None,
+            false,
+            &auxiliary_allocations,
             None,
             &mut multimodal,
             &commands,
@@ -729,6 +825,8 @@ fn run_initialized_executor<'model>(
     chat_templates: &CommonChatTemplates,
     context: &mut LlamaContext<'model>,
     draft_context: Option<&mut LlamaContext<'model>>,
+    draft_has_separate_model: bool,
+    auxiliary_allocations: &[ResidentAllocation],
     mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
@@ -739,6 +837,12 @@ fn run_initialized_executor<'model>(
         let _ = ready.send(Err(error.into()));
         return;
     }
+    let resident_allocations = capture_resident_allocations(
+        context,
+        draft_context.as_deref(),
+        draft_has_separate_model,
+        auxiliary_allocations,
+    );
     let modalities = multimodal
         .as_ref()
         .map_or_else(ModelModalities::default, multimodal_modalities);
@@ -769,7 +873,94 @@ fn run_initialized_executor<'model>(
         mtp,
         multimodal,
         commands,
+        resident_allocations,
     );
+}
+
+fn capture_resident_allocations(
+    context: &LlamaContext<'_>,
+    draft_context: Option<&LlamaContext<'_>>,
+    draft_has_separate_model: bool,
+    auxiliary_allocations: &[ResidentAllocation],
+) -> ResidentAllocationEvidence {
+    let Ok(target) = context.memory_breakdown() else {
+        return ResidentAllocationEvidence::CaptureFailed;
+    };
+    let mut allocations = target
+        .into_iter()
+        .map(ResidentAllocation::from)
+        .collect::<Vec<_>>();
+    if let Some(draft_context) = draft_context {
+        let Ok(draft) = draft_context.memory_breakdown() else {
+            return ResidentAllocationEvidence::CaptureFailed;
+        };
+        let mut draft = draft
+            .into_iter()
+            .map(ResidentAllocation::from)
+            .collect::<Vec<_>>();
+        if !draft_has_separate_model {
+            for allocation in &mut draft {
+                allocation.model_bytes = 0;
+            }
+        }
+        allocations.extend(draft);
+    }
+    allocations.extend_from_slice(auxiliary_allocations);
+    ResidentAllocationEvidence::Available(allocations)
+}
+
+fn resident_memory_state(
+    snapshot: &HardwareSnapshot,
+    evidence: &ResidentAllocationEvidence,
+    model_id: String,
+    runtime_generation: u64,
+) -> Option<ResidentMemory> {
+    let ResidentAllocationEvidence::Available(allocations) = evidence else {
+        return None;
+    };
+    let mut domains = BTreeMap::<String, ResidentMemoryDomain>::new();
+    for allocation in allocations {
+        let location = match &allocation.location {
+            LlamaMemoryLocation::Host => icn_hardware::NativeMemoryLocation::Host,
+            LlamaMemoryLocation::Device {
+                backend,
+                physical_id,
+                native_index,
+                ..
+            } => icn_hardware::NativeMemoryLocation::Device {
+                backend: backend.clone(),
+                physical_id: physical_id.clone(),
+                native_index: *native_index,
+            },
+        };
+        let Some(domain_id) = icn_hardware::resolve_memory_domain(snapshot, &location) else {
+            return None;
+        };
+        let domain = domains
+            .entry(domain_id.to_owned())
+            .or_insert_with(|| ResidentMemoryDomain {
+                memory_domain_id: domain_id.to_owned(),
+                model_bytes: 0,
+                context_bytes: 0,
+                compute_bytes: 0,
+                auxiliary_bytes: 0,
+            });
+        domain.model_bytes = domain.model_bytes.saturating_add(allocation.model_bytes);
+        domain.context_bytes = domain
+            .context_bytes
+            .saturating_add(allocation.context_bytes);
+        domain.compute_bytes = domain
+            .compute_bytes
+            .saturating_add(allocation.compute_bytes);
+        domain.auxiliary_bytes = domain
+            .auxiliary_bytes
+            .saturating_add(allocation.auxiliary_bytes);
+    }
+    Some(ResidentMemory {
+        model_id,
+        runtime_generation,
+        domains: domains.into_values().collect(),
+    })
 }
 
 // The scheduler composition root receives each owned runtime subsystem explicitly. Keeping these
@@ -785,12 +976,14 @@ fn run_scheduler<'model>(
     mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
+    resident_allocations: ResidentAllocationEvidence,
 ) {
     let mut sequence_pool = SequencePool::new(config.max_sequences);
     let mut planner = BatchPlanner::new(config.prefill_quantum as usize);
     let mut decode_buffer = LlamaBatch::new(context.n_batch() as usize, 1);
     let mut queued = VecDeque::<QueuedCompletion>::new();
     let mut exclusive_native = VecDeque::<ExclusiveNativeTask>::new();
+    let mut hardware_observations = VecDeque::<HardwareObservationRequest>::new();
     let mut active = Vec::<ActiveRequest<'_>>::new();
     let mut shutting_down = false;
     let max_tracked = COMMAND_QUEUE_CAPACITY + config.max_sequences as usize;
@@ -802,10 +995,27 @@ fn run_scheduler<'model>(
             multimodal.as_ref().map(multimodal_marker),
             &mut queued,
             &mut exclusive_native,
+            &mut hardware_observations,
             &active,
             max_tracked,
             &mut shutting_down,
         );
+
+        if let Some(observation) = hardware_observations.pop_front() {
+            let mut snapshot = icn_hardware::discover_hardware(
+                backend,
+                observation.policy,
+                observation.native_build,
+                observation.enabled_backends,
+            );
+            snapshot.resident_memory = resident_memory_state(
+                &snapshot,
+                &resident_allocations,
+                observation.model_id,
+                observation.runtime_generation,
+            );
+            let _ = observation.response.try_send(snapshot);
+        }
 
         if active.is_empty()
             && queued.is_empty()
@@ -830,6 +1040,7 @@ fn run_scheduler<'model>(
                         multimodal.as_ref().map(multimodal_marker),
                         &mut queued,
                         &mut exclusive_native,
+                        &mut hardware_observations,
                         0,
                         max_tracked,
                         &mut shutting_down,
@@ -932,6 +1143,7 @@ fn run_scheduler<'model>(
                     multimodal.as_ref().map(multimodal_marker),
                     &mut queued,
                     &mut exclusive_native,
+                    &mut hardware_observations,
                     active.len(),
                     max_tracked,
                     &mut shutting_down,
@@ -952,6 +1164,7 @@ fn drain_commands(
     media_marker: Option<&str>,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
+    hardware_observations: &mut VecDeque<HardwareObservationRequest>,
     active: &[ActiveRequest<'_>],
     max_tracked: usize,
     shutting_down: &mut bool,
@@ -964,6 +1177,7 @@ fn drain_commands(
                 media_marker,
                 queued,
                 exclusive_native,
+                hardware_observations,
                 active.len(),
                 max_tracked,
                 shutting_down,
@@ -984,6 +1198,7 @@ fn handle_command(
     media_marker: Option<&str>,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
+    hardware_observations: &mut VecDeque<HardwareObservationRequest>,
     active_count: usize,
     max_tracked: usize,
     shutting_down: &mut bool,
@@ -1029,6 +1244,13 @@ fn handle_command(
         ExecutorCommand::RunExclusiveNative { task } => {
             if !*shutting_down {
                 exclusive_native.push_back(task);
+            }
+        }
+        ExecutorCommand::ObserveHardware(observation) => {
+            if *shutting_down {
+                drop(observation.response);
+            } else {
+                hardware_observations.push_back(observation);
             }
         }
         ExecutorCommand::Shutdown => *shutting_down = true,
@@ -3668,5 +3890,76 @@ mod tests {
             12.0
         );
         assert_eq!(generation_elapsed_ms(None, None), 0.0);
+    }
+
+    #[test]
+    fn resident_allocations_collapse_host_and_metal_into_unified_memory() {
+        use icn_contracts::{
+            HardwareDevice, HardwareDeviceKind, HardwareMemoryDomain,
+            HardwareMemoryDomainKind, HardwareSystemMemory,
+        };
+
+        let snapshot = HardwareSnapshot {
+            captured_at: 1,
+            platform: "macos".to_owned(),
+            architecture: "aarch64".to_owned(),
+            cpu_model: Some("Apple".to_owned()),
+            logical_cores: 8,
+            system_memory: HardwareSystemMemory {
+                total_bytes: 64,
+                current_available_bytes: Some(20),
+            },
+            native_build: "test".to_owned(),
+            enabled_backends: vec!["MTL".to_owned()],
+            topology_fingerprint: "test".to_owned(),
+            memory_domains: vec![HardwareMemoryDomain {
+                id: "system".to_owned(),
+                kind: HardwareMemoryDomainKind::UnifiedMemory,
+                total_capacity_bytes: 64,
+                stable_capacity_bytes: 60,
+                current_free_bytes: Some(20),
+                shares_system_memory: true,
+                devices: vec![HardwareDevice {
+                    id: "metal".to_owned(),
+                    native_index: 1,
+                    backend: "MTL".to_owned(),
+                    physical_id: Some("metal-0".to_owned()),
+                    name: "MTL0".to_owned(),
+                    description: "Apple".to_owned(),
+                    kind: HardwareDeviceKind::Gpu,
+                    memory_limit: None,
+                }],
+            }],
+            resident_memory: None,
+        };
+        let evidence = ResidentAllocationEvidence::Available(vec![
+            ResidentAllocation {
+                location: LlamaMemoryLocation::Host,
+                model_bytes: 3,
+                context_bytes: 2,
+                compute_bytes: 1,
+                auxiliary_bytes: 0,
+            },
+            ResidentAllocation {
+                location: LlamaMemoryLocation::Device {
+                    backend: "MTL".to_owned(),
+                    physical_id: Some("metal-0".to_owned()),
+                    native_index: 1,
+                },
+                model_bytes: 5,
+                context_bytes: 4,
+                compute_bytes: 3,
+                auxiliary_bytes: 2,
+            },
+        ]);
+
+        let resident = resident_memory_state(&snapshot, &evidence, "model".to_owned(), 7)
+            .expect("exact device identities resolve");
+        assert_eq!(resident.domains.len(), 1);
+        assert_eq!(resident.domains[0].memory_domain_id, "system");
+        assert_eq!(resident.domains[0].model_bytes, 8);
+        assert_eq!(resident.domains[0].context_bytes, 6);
+        assert_eq!(resident.domains[0].compute_bytes, 4);
+        assert_eq!(resident.domains[0].auxiliary_bytes, 2);
     }
 }

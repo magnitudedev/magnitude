@@ -612,7 +612,9 @@ pub struct HardwareDeviceMemoryLimit {
 #[serde(deny_unknown_fields)]
 pub struct HardwareDevice {
     pub id: String,
+    pub native_index: usize,
     pub backend: String,
+    pub physical_id: Option<String>,
     pub name: String,
     pub description: String,
     pub kind: HardwareDeviceKind,
@@ -641,6 +643,24 @@ pub struct HardwareMemoryDomain {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResidentMemoryDomain {
+    pub memory_domain_id: String,
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub compute_bytes: u64,
+    pub auxiliary_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidentMemory {
+    pub model_id: String,
+    pub runtime_generation: u64,
+    pub domains: Vec<ResidentMemoryDomain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardwareSnapshot {
     pub captured_at: u64,
     pub platform: String,
@@ -652,6 +672,7 @@ pub struct HardwareSnapshot {
     pub enabled_backends: Vec<String>,
     pub topology_fingerprint: String,
     pub memory_domains: Vec<HardwareMemoryDomain>,
+    pub resident_memory: Option<ResidentMemory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

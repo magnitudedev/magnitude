@@ -440,6 +440,7 @@ fn hardware_snapshot_from_devices(
         enabled_backends: environment.enabled_backends,
         topology_fingerprint,
         memory_domains: domains,
+        resident_memory: None,
     }
 }
 
@@ -484,11 +485,61 @@ fn public_device(
         });
     HardwareDevice {
         id: format!("native-{:x}", Sha256::digest(identity.as_bytes())),
+        native_index: device.native_index,
         backend: device.backend,
+        physical_id: device.physical_id,
         name: device.name,
         description: device.description,
         kind: device.kind,
         memory_limit,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeMemoryLocation {
+    Host,
+    Device {
+        backend: String,
+        physical_id: Option<String>,
+        native_index: usize,
+    },
+}
+
+/// Resolve native allocation identity through the same logical-device topology used for fitting.
+/// Display names and capacity similarity are intentionally not identity evidence.
+pub fn resolve_memory_domain<'a>(
+    snapshot: &'a HardwareSnapshot,
+    location: &NativeMemoryLocation,
+) -> Option<&'a str> {
+    match location {
+        NativeMemoryLocation::Host => snapshot
+            .memory_domains
+            .iter()
+            .find(|domain| domain.shares_system_memory)
+            .map(|domain| domain.id.as_str()),
+        NativeMemoryLocation::Device {
+            backend,
+            physical_id,
+            native_index,
+        } => snapshot.memory_domains.iter().find_map(|domain| {
+            domain
+                .devices
+                .iter()
+                .any(
+                    |device| match (physical_id.as_deref(), device.physical_id.as_deref()) {
+                        (Some(expected), Some(actual)) => {
+                            device.backend.eq_ignore_ascii_case(backend) && expected == actual
+                        }
+                        (None, _) => {
+                            *native_index == device.native_index
+                                && (backend.is_empty()
+                                    || device.backend.eq_ignore_ascii_case(backend))
+                        }
+                        _ => false,
+                    },
+                )
+                .then_some(domain.id.as_str())
+        }),
     }
 }
 
@@ -2347,6 +2398,21 @@ mod tests {
             assert_eq!(domain.devices.len(), 2);
         }
         assert_eq!(snapshot.enabled_backends, vec!["cuda", "vulkan"]);
+        assert_eq!(
+            resolve_memory_domain(&snapshot, &NativeMemoryLocation::Host),
+            Some("system"),
+        );
+        assert_eq!(
+            resolve_memory_domain(
+                &snapshot,
+                &NativeMemoryLocation::Device {
+                    backend: "CUDA".to_owned(),
+                    physical_id: Some("0000:01:00.0".to_owned()),
+                    native_index: 0,
+                },
+            ),
+            Some(snapshot.memory_domains[1].id.as_str()),
+        );
     }
 
     #[test]

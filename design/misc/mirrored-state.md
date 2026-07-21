@@ -48,3 +48,11 @@ service-owned scope. Their progress and terminal result live in the applicable m
 client-provided request ID makes retries idempotent, while domain target identity coalesces duplicate
 active work. Unary mutation pending state describes only command acceptance and must never be used as
 a page-wide busy flag.
+
+An owning service may sample volatile observational input into one field of an existing mirror.
+Such a sampler must perform a narrow source-owned transition: a local-inference hardware tick, for
+example, may fetch hardware and replace the host field but must not list models, rebuild
+recommendations, or rewrite operations. Structurally unchanged samples are no-ops. A failed sample
+silently retains the last good value and retries; it does not create a user-visible failure state or
+erase unrelated authoritative fields. The sampler's lifetime belongs to the service scope and its
+activity does not become a client-owned polling loop.

@@ -10,7 +10,11 @@ applies_to:
   - packages/protocol/src/rpcs/local-inference.ts
   - packages/protocol/src/schemas/local-inference.ts
   - packages/client-common/src/hooks/use-local-inference-state.ts
+  - packages/client-common/src/utils/hardware-memory.ts
   - cli/src/features/local-inference/**
+  - cli/src/features/overlays/settings.tsx
+  - cli/src/components/hardware-memory-domain.tsx
+  - cli/src/components/stacked-bar.tsx
 ---
 
 # ICN hardware discovery and model fitting
@@ -542,6 +546,36 @@ Neither path alone guarantees protection from:
 
 The actual load path remains the final safety boundary and reassesses its resolved execution plan.
 Performance claims require separate benchmark evidence.
+
+## Resident memory observation
+
+`GET /v1/hardware` is also the sole public view of current resident-runtime memory. Its hardware
+snapshot may carry generation-bound per-domain allocation evidence in the native categories model,
+context, compute, and auxiliary. No parallel telemetry endpoint or ACN-side device probe is
+permitted.
+
+The resident executor captures actual model, context, and compute backend-buffer allocations after
+initialization and warm-up. It accounts shared target/draft ownership once and retains exact
+projector allocation evidence when the projector has no live allocation accessor. The existing
+physical-domain resolver maps these allocations by exact backend device identity; display names are
+never identity evidence.
+
+Current free memory remains volatile. A semantic read-only hardware observation command runs on the
+resident executor between scheduler batches and combines current backend-device readings with the
+generation's immutable allocation evidence. It does not wait for inference to become idle and does
+not replace idle-only native planning.
+
+Resident attribution is optional. An unresolved device, runtime-generation race, or unsupported
+allocation source omits only attribution; accurate
+topology and total/free capacity remain usable. Allocated bytes and physically resident mmap pages
+can differ on shared memory, so consumers must not fabricate a negative residual category.
+
+CLI memory bars use one reusable stacked-bar renderer in both the detailed hardware view and the
+compact chat status. Segment boundaries are quantized to eighths of a terminal cell and rendered
+with a partial-block foreground over the following segment's background, preserving a contiguous
+bar without whole-cell rounding. Weights/fixed cost, KV cache, system/apps, and free capacity use
+distinct semantic theme colors; incomplete attribution falls back to used versus free without
+fabricating categories.
 
 ## Conformance and acceptance criteria
 

@@ -2604,6 +2604,7 @@
         "type": "object",
         "required": [
           "id",
+          "native_index",
           "backend",
           "name",
           "description",
@@ -2613,8 +2614,18 @@
           "id": {
             "type": "string"
           },
+          "native_index": {
+            "type": "integer",
+            "minimum": 0
+          },
           "backend": {
             "type": "string"
+          },
+          "physical_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
@@ -2868,6 +2879,16 @@
             "items": {
               "$ref": "#/components/schemas/HardwareMemoryDomainSchema"
             }
+          },
+          "resident_memory": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResidentMemorySchema"
+              }
+            ]
           }
         }
       },
@@ -4878,6 +4899,65 @@
           "preserved",
           "configurable"
         ]
+      },
+      "ResidentMemoryDomainSchema": {
+        "type": "object",
+        "required": [
+          "memory_domain_id",
+          "model_bytes",
+          "context_bytes",
+          "compute_bytes",
+          "auxiliary_bytes"
+        ],
+        "properties": {
+          "memory_domain_id": {
+            "type": "string"
+          },
+          "model_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "context_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "compute_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "auxiliary_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ResidentMemorySchema": {
+        "type": "object",
+        "required": [
+          "model_id",
+          "runtime_generation",
+          "domains"
+        ],
+        "properties": {
+          "model_id": {
+            "type": "string"
+          },
+          "runtime_generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResidentMemoryDomainSchema"
+            }
+          }
+        }
       },
       "ResponseFormatRequest": {
         "oneOf": [

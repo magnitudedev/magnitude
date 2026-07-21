@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Option, Ref, Scope, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, Ref, Schedule, Scope, Stream } from "effect"
 import { createId } from "@magnitudedev/generate-id"
 import { IcnApiClient, Generated } from "@magnitudedev/icn"
 import {
@@ -102,18 +102,50 @@ const fitAssessment = (assessment: Generated.HardwareAssessmentSchema): LocalMod
 const displayBackendName = (backend: string): string =>
   backend.toUpperCase() === "MTL" ? "Metal" : backend
 
+const safeUnsignedInteger = (value: number, field: string): number => {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${field} is outside the JavaScript safe-integer range`)
+  }
+  return value
+}
+
+const safeOptionalUnsignedInteger = (
+  value: Option.Option<number | null>,
+  field: string,
+): number | null => Option.getOrNull(Option.flatMap(value, (number) =>
+  number === null ? Option.none() : Option.some(safeUnsignedInteger(number, field))))
+
+const residentMemoryToWire = (
+  memory: Option.Option<Generated.ResidentMemorySchema | null>,
+): LocalInferenceHostProfile["residentMemory"] => {
+  const value = Option.getOrNull(memory)
+  if (value === null) return null
+  return {
+    modelId: value.model_id,
+    runtimeGeneration: safeUnsignedInteger(value.runtime_generation, "runtime generation"),
+    domains: value.domains.map((domain) => ({
+      memoryDomainId: domain.memory_domain_id,
+      modelBytes: safeUnsignedInteger(domain.model_bytes, "resident model bytes"),
+      contextBytes: safeUnsignedInteger(domain.context_bytes, "resident context bytes"),
+      computeBytes: safeUnsignedInteger(domain.compute_bytes, "resident compute bytes"),
+      auxiliaryBytes: safeUnsignedInteger(domain.auxiliary_bytes, "resident auxiliary bytes"),
+    })),
+  }
+}
+
 export const hostToWire = (hardware: Generated.HardwareSnapshotSchema): LocalInferenceHostProfile => ({
   platform: hardware.platform,
   architecture: hardware.architecture,
-  systemMemoryBytes: hardware.system_memory.total_bytes,
+  topologyFingerprint: hardware.topology_fingerprint,
+  systemMemoryBytes: safeUnsignedInteger(hardware.system_memory.total_bytes, "system memory bytes"),
   cpuModel: Option.getOrNull(hardware.cpu_model),
   logicalCores: Math.max(1, hardware.logical_cores),
   memoryDomains: hardware.memory_domains.map((domain) => ({
     id: domain.id,
     kind: domain.kind,
-    totalCapacityBytes: domain.total_capacity_bytes,
-    stableCapacityBytes: domain.stable_capacity_bytes,
-    currentFreeBytes: Option.getOrNull(domain.current_free_bytes),
+    totalCapacityBytes: safeUnsignedInteger(domain.total_capacity_bytes, "memory-domain capacity"),
+    stableCapacityBytes: safeUnsignedInteger(domain.stable_capacity_bytes, "memory-domain stable capacity"),
+    currentFreeBytes: safeOptionalUnsignedInteger(domain.current_free_bytes, "memory-domain free bytes"),
     sharesSystemMemory: domain.shares_system_memory,
     backendNames: [...new Set(domain.devices
       .filter((device) => device.kind !== "cpu")
@@ -123,6 +155,7 @@ export const hostToWire = (hardware: Generated.HardwareSnapshotSchema): LocalInf
       .map((device) => device.description),
     splitGroupId: null,
   })),
+  residentMemory: residentMemoryToWire(hardware.resident_memory),
 })
 
 const recommendationFrom = (
@@ -296,6 +329,7 @@ export const LocalInferenceLive: Layer.Layer<
   const resolvedCatalog = yield* Ref.make<ReadonlyMap<string, LocalModelCatalogEntry>>(new Map())
   const lock = yield* Effect.makeSemaphore(1)
   const recommendationRefreshLock = yield* Effect.makeSemaphore(1)
+  const hardwareRefreshLock = yield* Effect.makeSemaphore(1)
 
   const resolveHubRepository = (repository: string) =>
     client.huggingFace.resolveHuggingFaceRepository({
@@ -409,18 +443,10 @@ export const LocalInferenceLive: Layer.Layer<
       : undefined
   })
 
-  const stateValue = (
-    recommendationState: LocalInferenceRecommendationState,
-    recommendationFailureCount = 0,
-    currentOperations: readonly LocalInferenceOperationSnapshot[] = [],
-  ) => Effect.gen(function* () {
-    const [hardware, inventory] = yield* Effect.all([
-      client.system.getHardware({}),
-      client.models.listModels({}),
-    ], { concurrency: 2 })
-    const active = inventory.data.find((model) => model.residency.type === "loaded")
+  const projectInventory = (models: readonly Generated.Model[]) => {
+    const active = models.find((model) => model.residency.type === "loaded")
     const activeId = active?.id
-    const choices: LocalModelChoice[] = inventory.data
+    const choices: LocalModelChoice[] = models
       .filter((model) => isStoredArtifactStatus(model.availability))
       .map((model) => {
         const contextTokens = Option.getOrUndefined(model.serving_configuration)?.profile.context_length
@@ -458,8 +484,22 @@ export const LocalInferenceLive: Layer.Layer<
         contextTokens: Option.getOrUndefined(active.serving_configuration)?.profile.context_length
           ?? active.residency.context_length,
       } : null,
-      host: { _tag: "Available" as const, profile: hostToWire(hardware) },
       choices,
+    }
+  }
+
+  const stateValue = (
+    recommendationState: LocalInferenceRecommendationState,
+    recommendationFailureCount = 0,
+    currentOperations: readonly LocalInferenceOperationSnapshot[] = [],
+  ) => Effect.gen(function* () {
+    const [hardware, inventory] = yield* Effect.all([
+      client.system.getHardware({}),
+      client.models.listModels({}),
+    ], { concurrency: 2 })
+    return {
+      ...projectInventory(inventory.data),
+      host: { _tag: "Available" as const, profile: hostToWire(hardware) },
       operations: currentOperations,
       recommendationState,
       warnings: recommendationState._tag === "Ready" && recommendationFailureCount > 0
@@ -501,17 +541,40 @@ export const LocalInferenceLive: Layer.Layer<
   }).pipe(Effect.catchAll(() => Effect.void)))
   yield* refresh.pipe(Effect.forkScoped)
 
-  const reconcileState = mirror.get.pipe(
-    Effect.flatMap((current) => stateValue(
-      current.state.recommendationState,
-      current.state.warnings.some((warning) => warning.code === "preview_failed") ? 1 : 0,
-      current.state.operations,
-    )),
-    Effect.flatMap((next) => mirror.setIfChanged(next, (left, right) => JSON.stringify(left) === JSON.stringify(right))),
+  const reconcileState = client.models.listModels({}).pipe(
+    Effect.mapError((cause) => localError("icn_unavailable", "reconcile local model inventory", cause)),
+    Effect.map((inventory) => projectInventory(inventory.data)),
+    Effect.flatMap((inventory) => mirror.modify((state) => {
+      const next = { ...state, ...inventory }
+      const changed = JSON.stringify(state.activeBinding) !== JSON.stringify(next.activeBinding)
+        || JSON.stringify(state.choices) !== JSON.stringify(next.choices)
+      return { state: changed ? next : state, result: undefined, changed }
+    })),
     Effect.asVoid,
   )
+
+  const refreshHardware = hardwareRefreshLock.withPermits(1)(
+    client.system.getHardware({}).pipe(
+      Effect.map(hostToWire),
+      Effect.flatMap((profile) => mirror.modify((state) => {
+        const host = { _tag: "Available" as const, profile }
+        const changed = JSON.stringify(state.host) !== JSON.stringify(host)
+        return {
+          state: changed ? { ...state, host } : state,
+          result: undefined,
+          changed,
+        }
+      })),
+      Effect.asVoid,
+      Effect.catchAll(() => Effect.void),
+    ),
+  )
+
+  yield* Effect.repeat(refreshHardware, Schedule.spaced("2 seconds")).pipe(
+    Effect.forkScoped,
+  )
   yield* changes.stream.pipe(
-    Stream.runForEach(() => reconcileState),
+    Stream.runForEach(() => reconcileState.pipe(Effect.zipRight(refreshHardware))),
     Effect.catchAll(() => Effect.void),
     Effect.forkScoped,
   )

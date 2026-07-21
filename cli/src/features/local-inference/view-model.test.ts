@@ -51,6 +51,7 @@ describe("local inference selection view model", () => {
     expect(describeLocalHardware({
       platform: "macos",
       architecture: "aarch64",
+      topologyFingerprint: "test",
       systemMemoryBytes: 64 * 1024 ** 3,
       cpuModel: "Apple M4 Max",
       logicalCores: 16,
@@ -65,6 +66,7 @@ describe("local inference selection view model", () => {
         deviceNames: ["Apple M4 Max"],
         splitGroupId: null,
       }],
+      residentMemory: null,
     })).toEqual({
       system: {
         name: "Apple M4 Max",
@@ -82,6 +84,7 @@ describe("local inference selection view model", () => {
     expect(describeLocalHardware({
       platform: "linux",
       architecture: "x86_64",
+      topologyFingerprint: "test",
       systemMemoryBytes: 32 * gib,
       cpuModel: "Example CPU",
       logicalCores: 8,
@@ -96,6 +99,7 @@ describe("local inference selection view model", () => {
         deviceNames: ["Integrated GPU"],
         splitGroupId: null,
       }],
+      residentMemory: null,
     })).toEqual({
       system: {
         name: "Example CPU",
@@ -113,6 +117,7 @@ describe("local inference selection view model", () => {
     expect(describeLocalHardware({
       platform: "linux",
       architecture: "x64",
+      topologyFingerprint: "test",
       systemMemoryBytes: 128 * gib,
       cpuModel: "AMD Ryzen Threadripper",
       logicalCores: 64,
@@ -137,6 +142,7 @@ describe("local inference selection view model", () => {
         deviceNames: [`NVIDIA GeForce RTX 4090 #${index + 1}`],
         splitGroupId: "cuda:group",
       }))],
+      residentMemory: null,
     })).toEqual({
       system: {
         name: "AMD Ryzen Threadripper",

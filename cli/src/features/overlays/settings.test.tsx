@@ -20,6 +20,7 @@ const localInferenceState = {
     profile: {
       platform: "macos",
       architecture: "aarch64",
+      topologyFingerprint: "test",
       systemMemoryBytes: 64 * gib,
       cpuModel: "Apple M4 Max",
       logicalCores: 16,
@@ -28,12 +29,23 @@ const localInferenceState = {
         kind: "unified_memory",
         totalCapacityBytes: 64 * gib,
         stableCapacityBytes: 51.2 * gib,
-        currentFreeBytes: null,
+        currentFreeBytes: 12 * gib,
         sharesSystemMemory: true,
         backendNames: ["Metal"],
         deviceNames: ["Apple M4 Max"],
         splitGroupId: null,
       }],
+      residentMemory: {
+        modelId: "model",
+        runtimeGeneration: 1,
+        domains: [{
+          memoryDomainId: "system",
+          modelBytes: 27 * gib,
+          contextBytes: 6 * gib,
+          computeBytes: 1.5 * gib,
+          auxiliaryBytes: 0.5 * gib,
+        }],
+      },
     },
   },
   choices: [],
@@ -56,6 +68,9 @@ vi.mock("../../hooks/use-theme", () => ({
     error: "red",
     warning: "yellow",
     border: "gray",
+    secondary: "gray",
+    info: "cyan",
+    link: "blue",
     terminalDetectedBg: "black",
   }),
 }))
@@ -88,7 +103,13 @@ test("settings starts with detected hardware followed by explicit Magnitude Clou
     const frame = view.captureCharFrame()
     expect(frame).toContain("DETECTED HARDWARE")
     expect(frame).toContain("Apple M4 Max")
-    expect(frame).toContain("64.0 GiB unified memory · Metal GPU acceleration")
+    expect(frame).toContain("Metal acceleration")
+    expect(frame).toContain("Apple M4 Max · Unified memory")
+    expect(frame).toContain("52.0 GiB / 64.0 GiB used")
+    expect(frame).toContain("Weights       29.0 GiB")
+    expect(frame).toContain("KV cache      6.0 GiB")
+    expect(frame).toContain("System & apps 17.0 GiB")
+    expect(frame).toContain("Free          12.0 GiB")
     expect(frame).toContain("Magnitude Cloud")
     expect(frame).toContain("○ Not connected")
     expect(frame).not.toContain("No Magnitude Cloud API key · No cloud model access")
