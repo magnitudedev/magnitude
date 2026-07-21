@@ -185,14 +185,15 @@ export function selectAgentToolKeys(input: AgentToolSelectionInput): readonly To
   }
 
   const activeSlotId = ROLE_TO_SLOT[roleId]
-  const otherSlotId = activeSlotId === 'primary' ? 'secondary' : 'primary'
   const activeSlot = configState.bySlot[activeSlotId]
-  const otherSlot = configState.bySlot[otherSlotId]
   const activeHasVision = activeSlot._tag === 'Ready' && activeSlot.config.vision === true
-  const otherHasVision = otherSlot._tag === 'Ready' && otherSlot.config.vision === true
+  // Opposite-slot vision fallback is temporarily disabled with the secondary model.
+  // const otherSlotId = activeSlotId === 'primary' ? 'secondary' : 'primary'
+  // const otherSlot = configState.bySlot[otherSlotId]
+  // const otherHasVision = otherSlot._tag === 'Ready' && otherSlot.config.vision === true
   keys = keys.filter(key => key !== 'fileView' && key !== 'queryImage')
   if (activeHasVision) keys.push('fileView')
-  else if (otherHasVision) keys.push('queryImage')
+  // else if (otherHasVision) keys.push('queryImage')
 
   return keys
 }

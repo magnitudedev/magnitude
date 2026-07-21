@@ -65,7 +65,6 @@ import {
 } from "@magnitudedev/client-common"
 import {
   ROLE_TO_SLOT,
-  SLOT_IDS,
   SLOT_DISPLAY_NAMES,
   SLOT_DESCRIPTIONS,
 } from "@magnitudedev/sdk"
@@ -489,7 +488,10 @@ function SettingsPanelContainer({
 
   // ── Slots ──
   const slots = useMemo(() => {
-    return SLOT_IDS.map((slotId) => ({
+    return ([
+      "primary",
+      // "secondary", // Secondary model settings are temporarily hidden.
+    ] as const).map((slotId) => ({
       slotId,
       label: SLOT_DISPLAY_NAMES[slotId],
       description: SLOT_DESCRIPTIONS[slotId],

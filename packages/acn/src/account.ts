@@ -279,7 +279,10 @@ export function slotStatesFromModels(
 
 function compatibilityProfiles(states: SlotStates): SlotProfiles {
   let profiles: SlotProfiles = {}
-  for (const slotId of SLOT_IDS) {
+  for (const slotId of [
+    "primary",
+    // "secondary", // Secondary model exposure is temporarily disabled.
+  ] as const) {
     const state = states[slotId]
     if (state._tag !== "Ready") continue
     profiles = { ...profiles, [slotId]: {
@@ -468,7 +471,10 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       const persistRemovedEffortFallbacks = (models: readonly ProviderModel[]) => Effect.gen(function* () {
         const configured = yield* modelConfiguration.getModels
         const updates: Partial<Record<SlotId, SlotModelConfig>> = {}
-        for (const slotId of SLOT_IDS) {
+        for (const slotId of [
+          "primary",
+          // "secondary", // Secondary model maintenance is temporarily disabled.
+        ] as const) {
           const slot = configured?.slots?.[slotId]
           if (!slot?.providerId || !slot.providerModelId || !slot.reasoningEffort) continue
           const model = models.find((candidate) => candidate.providerId === slot.providerId
@@ -490,7 +496,10 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
         slots: SlotStates,
         retryFailed: boolean,
       ) => Effect.forEach(
-        [...new Map(Object.values(slots).flatMap((slot) => slot._tag === "Unassigned"
+        [...new Map([
+          slots.primary,
+          // slots.secondary, // Secondary model discovery is temporarily disabled.
+        ].flatMap((slot) => slot._tag === "Unassigned"
           ? []
           : [[`${slot.selection.providerId}\0${slot.selection.providerModelId}`, slot.selection] as const])).values()],
         (selection) => {

@@ -17,7 +17,7 @@ import {
   selectedCwdAtom,
   useTimelineStatus,
 } from '@magnitudedev/client-common'
-import { forkIdToKey, ROLE_TO_SLOT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
+import { forkIdToKey, ROLE_TO_SLOT, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
 import { showRecentChatsOverlayAtom, authSourceAtom, cloudModelsOpenAtom, modelSetupRouteAtom } from '../../state/cli-atoms'
 import type { ActionId } from '../../types/ui-actions'
 import { deriveSettingsAuthInfo, type AuthInfo } from './auth-display'
@@ -92,7 +92,10 @@ export function AppOverlaysContainer({
   }), [apiKey, authSource, saveApiKey, disconnectApiKey, saveError, saving])
 
   const slots = useMemo(() => {
-    return SLOT_IDS.map((slotId) => ({
+    return ([
+      'primary',
+      // 'secondary', // Secondary model settings are temporarily hidden.
+    ] as const).map((slotId) => ({
       slotId,
       label: SLOT_DISPLAY_NAMES[slotId],
       description: SLOT_DESCRIPTIONS[slotId],

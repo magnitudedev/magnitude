@@ -8,7 +8,7 @@ import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
 import { reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
-import { ModelCatalogLifecycle, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
+import { ModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
 import { describeLocalHardware } from '../local-inference/view-model'
@@ -572,7 +572,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             <text style={{ fg: theme.error }}>Failed to update model configuration.</text>
           </box>
         )}
-        {SLOT_IDS.map((slotId) => {
+        {([
+          'primary',
+          // 'secondary', // Secondary model settings are temporarily hidden.
+        ] as const).map((slotId) => {
           const label = SLOT_DISPLAY_NAMES[slotId]
           const description = SLOT_DESCRIPTIONS[slotId]
           const selected = selectedForSlot(slotId)

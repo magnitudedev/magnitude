@@ -47,8 +47,8 @@ describe('dynamic image tooling', () => {
     expect(imageTools(config(true, false))).toEqual(['fileView'])
   })
 
-  it('uses query_image when only the opposite slot has vision', () => {
-    expect(imageTools(config(false, true))).toEqual(['queryImage'])
+  it('does not use the disabled opposite slot for vision', () => {
+    expect(imageTools(config(false, true))).toEqual([])
   })
 
   it('exposes no image tool when neither capability is available', () => {
@@ -68,14 +68,14 @@ describe('dynamic image tooling', () => {
     expect(imageTools(state)).toEqual([])
   })
 
-  it('evaluates secondary roles symmetrically', () => {
+  it('routes worker roles through the primary slot', () => {
     const keys = selectAgentToolKeys({
       roleId: 'engineer',
       configState: config(true, false),
       solo: false,
       vcsAvailable: false,
     })
-    expect(keys.filter(key => key === 'fileView' || key === 'queryImage')).toEqual(['queryImage'])
+    expect(keys.filter(key => key === 'fileView' || key === 'queryImage')).toEqual(['fileView'])
   })
 
   it('does not churn materialized tools when only the config revision changes', () => {
@@ -119,7 +119,7 @@ describe('dynamic image tooling', () => {
         return yield* projection.getFork(null)
       }))
       expect(before.configRevision).toBe(1)
-      expect(before.toolKeys).toContain('queryImage')
+      expect(before.toolKeys).not.toContain('queryImage')
       expect(before.toolKeys).not.toContain('fileView')
 
       await client.runEffect(Effect.gen(function* () {

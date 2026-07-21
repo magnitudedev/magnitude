@@ -28,10 +28,15 @@ export const ROLE_TO_SLOT: Readonly<Record<RoleId, SlotId>> = {
   architect: 'primary',
   scientist: 'primary',
   advisor: 'primary',
-  engineer: 'secondary',
-  critic: 'secondary',
-  artisan: 'secondary',
-  scout: 'secondary',
+  engineer: 'primary',
+  critic: 'primary',
+  artisan: 'primary',
+  scout: 'primary',
+  // Secondary model routing is temporarily disabled.
+  // engineer: 'secondary',
+  // critic: 'secondary',
+  // artisan: 'secondary',
+  // scout: 'secondary',
 }
 
 /** Default reasoning effort per slot (hardcoded product decision). */
@@ -45,12 +50,12 @@ export const SLOT_IDS = ['primary', 'secondary'] as const
 
 /** User-facing display names (capitalized slot IDs). */
 export const SLOT_DISPLAY_NAMES: Readonly<Record<SlotId, string>> = {
-  primary: 'Primary',
+  primary: 'Model',
   secondary: 'Secondary',
 }
 
 /** Help text shown under each slot card in the settings UI. */
 export const SLOT_DESCRIPTIONS: Readonly<Record<SlotId, string>> = {
-  primary: 'The model you chat with and which delegates tasks to worker models.',
+  primary: 'Used for chat and all agent tasks.',
   secondary: 'Used for all worker tasks — implementation, review, exploration, and creative work.',
 }
