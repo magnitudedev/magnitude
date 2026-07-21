@@ -95,7 +95,7 @@ impl ModelPreviewService {
             let Some(assessment) = self
                 .models
                 .cache
-                .read_hardware_assessment(&content_id, &hardware_key)
+                .read_execution_assessment(&content_id, &hardware_key)
             else {
                 return Ok(None);
             };
@@ -104,7 +104,8 @@ impl ModelPreviewService {
                 artifact_fingerprint: source_fingerprint.clone(),
                 execution_policy: self.assessor.policy_identity().to_owned(),
                 hardware_topology: snapshot.topology_fingerprint.clone(),
-                assessment,
+                assessment: assessment.hardware,
+                performance: assessment.performance,
             });
         }
         Ok(Some(ModelPreview {
@@ -141,7 +142,7 @@ impl ModelPreviewService {
                 let assessment = self
                     .models
                     .cache
-                    .read_hardware_assessment(content_id, &hardware_key);
+                    .read_execution_assessment(content_id, &hardware_key);
                 Ok((profile, hardware_key, assessment))
             })
             .collect::<Result<Vec<_>, InventoryError>>()?;
@@ -155,10 +156,10 @@ impl ModelPreviewService {
         missing_keys.dedup();
         let mut gates = Vec::with_capacity(missing_keys.len());
         for hardware_key in missing_keys {
-            gates.push(self.work_gate(&format!(
-                "assessment:{}:{hardware_key}",
-                content_id.0
-            )).await);
+            gates.push(
+                self.work_gate(&format!("assessment:{}:{hardware_key}", content_id.0))
+                    .await,
+            );
         }
         let mut guards = Vec::with_capacity(gates.len());
         for gate in &gates {
@@ -171,7 +172,7 @@ impl ModelPreviewService {
                 *assessment = self
                     .models
                     .cache
-                    .read_hardware_assessment(content_id, hardware_key);
+                    .read_execution_assessment(content_id, hardware_key);
             }
             if assessment.is_none() {
                 missing_indices.push(index);
@@ -184,7 +185,7 @@ impl ModelPreviewService {
                 .collect();
             let measured = self
                 .assessor
-                .assess_profiles(prepared.model.clone(), missing_profiles)
+                .assess_execution_profiles(prepared.model.clone(), missing_profiles)
                 .await?;
             if measured.len() != missing_indices.len() {
                 return Err(InventoryError::Internal(
@@ -192,7 +193,7 @@ impl ModelPreviewService {
                 ));
             }
             for (index, assessment) in missing_indices.into_iter().zip(measured) {
-                self.models.cache.write_hardware_assessment(
+                self.models.cache.write_execution_assessment(
                     content_id,
                     &entries[index].1,
                     &assessment,
@@ -204,16 +205,18 @@ impl ModelPreviewService {
         entries
             .into_iter()
             .map(|(profile, _, assessment)| {
+                let assessment = assessment.ok_or_else(|| {
+                    InventoryError::Internal(
+                        "profile assessment was neither cached nor measured".to_owned(),
+                    )
+                })?;
                 Ok(ModelPreviewAssessment {
                     profile_id: profile.id,
                     artifact_fingerprint: prepared.artifact_fingerprint.clone(),
                     execution_policy: self.assessor.policy_identity().to_owned(),
                     hardware_topology: snapshot.topology_fingerprint.clone(),
-                    assessment: assessment.ok_or_else(|| {
-                        InventoryError::Internal(
-                            "profile assessment was neither cached nor measured".to_owned(),
-                        )
-                    })?,
+                    assessment: assessment.hardware,
+                    performance: assessment.performance,
                 })
             })
             .collect()
@@ -1418,7 +1421,7 @@ mod tests {
             manager
                 .cache
                 .read_hardware_assessment(&content_id, "profile:hardware"),
-            Some(assessment)
+            Some(assessment.clone())
         );
         assert!(
             manager
@@ -1439,6 +1442,24 @@ mod tests {
                 .cache
                 .read_hardware_assessment(&content_id, "operational-failure")
                 .is_none()
+        );
+
+        let execution = icn_contracts::ModelExecutionAssessment {
+            hardware: assessment.clone(),
+            performance: icn_contracts::GenerationPerformanceAssessment::Unavailable {
+                method: "native".to_owned(),
+                code: "calibration_failed".to_owned(),
+                message: "calibration is advisory".to_owned(),
+            },
+        };
+        manager
+            .cache
+            .write_execution_assessment(&content_id, "profile:execution", &execution);
+        assert_eq!(
+            manager
+                .cache
+                .read_execution_assessment(&content_id, "profile:execution"),
+            Some(execution)
         );
     }
 
@@ -1510,7 +1531,13 @@ mod tests {
             service.preview(request.clone()),
             service.preview(request.clone())
         );
-        assert_eq!(first.unwrap(), second.unwrap());
+        let first = first.unwrap();
+        assert_eq!(first, second.unwrap());
+        assert!(matches!(
+            first.assessments[0].performance,
+            icn_contracts::GenerationPerformanceAssessment::Unavailable { ref code, .. }
+                if code == "not_requested"
+        ));
         assert_eq!(assessor.0.load(Ordering::SeqCst), 1);
         fs::remove_dir_all(store.join("cache/blobs")).unwrap();
         service.preview(request).await.unwrap();

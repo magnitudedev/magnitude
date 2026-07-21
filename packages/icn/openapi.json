@@ -1840,6 +1840,140 @@
           "function"
         ]
       },
+      "GenerationPerformanceAssessmentSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "method",
+              "confidence",
+              "workload",
+              "always_active_weight_bytes",
+              "routed_expert_weight_bytes",
+              "expert_count",
+              "expert_used_count",
+              "cross_memory_domain_placement",
+              "points",
+              "status"
+            ],
+            "properties": {
+              "method": {
+                "type": "string"
+              },
+              "confidence": {
+                "$ref": "#/components/schemas/GenerationPerformanceConfidenceSchema"
+              },
+              "workload": {
+                "type": "string"
+              },
+              "always_active_weight_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "routed_expert_weight_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "expert_count": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "expert_used_count": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "cross_memory_domain_placement": {
+                "type": "boolean"
+              },
+              "points": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/GenerationSpeedPointSchema"
+                }
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "estimated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "method",
+              "code",
+              "message",
+              "status"
+            ],
+            "properties": {
+              "method": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "unavailable"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "GenerationPerformanceConfidenceSchema": {
+        "type": "string",
+        "enum": [
+          "high",
+          "moderate",
+          "low"
+        ]
+      },
+      "GenerationSpeedPointSchema": {
+        "type": "object",
+        "required": [
+          "context_tokens",
+          "kv_bytes_read_per_token",
+          "lower_tokens_per_second",
+          "expected_tokens_per_second",
+          "upper_tokens_per_second"
+        ],
+        "properties": {
+          "context_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "kv_bytes_read_per_token": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lower_tokens_per_second": {
+            "type": "number",
+            "format": "double"
+          },
+          "expected_tokens_per_second": {
+            "type": "number",
+            "format": "double"
+          },
+          "upper_tokens_per_second": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "additionalProperties": false
+      },
       "GpuLayersResponse": {
         "oneOf": [
           {
@@ -3401,7 +3535,8 @@
           "artifact_fingerprint",
           "execution_policy",
           "hardware_topology",
-          "assessment"
+          "assessment",
+          "performance"
         ],
         "properties": {
           "profile_id": {
@@ -3418,6 +3553,9 @@
           },
           "assessment": {
             "$ref": "#/components/schemas/HardwareAssessmentSchema"
+          },
+          "performance": {
+            "$ref": "#/components/schemas/GenerationPerformanceAssessmentSchema"
           }
         }
       },

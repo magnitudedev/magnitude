@@ -43,6 +43,11 @@ ICN owns:
 - compatibility classification for the pinned runtime and requested execution profile;
 - hardware and fit cache identity, invalidation, and failure classification.
 
+Generation-throughput estimation is separate evidence produced by the same native planning path.
+Its workload, calibration, confidence, and failure guarantees are defined in
+[generation-performance estimation](./performance-estimation.md). A performance failure never
+changes a hardware-fit result.
+
 ACN owns:
 
 - the curated set of recommended artifact identities;

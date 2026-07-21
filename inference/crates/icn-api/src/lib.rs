@@ -3106,7 +3106,13 @@ mod tests {
                         "artifact_fingerprint": "artifact",
                         "execution_policy": profile.policy,
                         "hardware_topology": "topology",
-                        "assessment": {"type": "not_assessed", "reason": "stub"}
+                        "assessment": {"type": "not_assessed", "reason": "stub"},
+                        "performance": {
+                            "status": "unavailable",
+                            "method": "not_requested",
+                            "code": "not_requested",
+                            "message": "generation performance was not requested"
+                        }
                     }]
                 }))
                 .map_err(|error| InventoryError::Internal(error.to_string()))

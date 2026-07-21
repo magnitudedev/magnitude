@@ -624,6 +624,60 @@ export const FunctionType = S.Literal("function")
 export type FunctionType = S.Schema.Type<typeof FunctionType>
 export type FunctionTypeEncoded = S.Schema.Encoded<typeof FunctionType>
 
+export const GenerationPerformanceAssessmentSchema = S.Union(
+  S.extend(
+    S.Struct({
+      always_active_weight_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      confidence: S.suspend(
+        (): S.Schema<GenerationPerformanceConfidenceSchema, GenerationPerformanceConfidenceSchemaEncoded> =>
+          GenerationPerformanceConfidenceSchema,
+      ),
+      cross_memory_domain_placement: S.Boolean,
+      expert_count: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      expert_used_count: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      method: S.String,
+      points: S.Array(
+        S.suspend(
+          (): S.Schema<GenerationSpeedPointSchema, GenerationSpeedPointSchemaEncoded> => GenerationSpeedPointSchema,
+        ),
+      ),
+      routed_expert_weight_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      status: S.Literal("estimated"),
+      workload: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      code: S.String,
+      message: S.String,
+      method: S.String,
+      status: S.Literal("unavailable"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type GenerationPerformanceAssessmentSchema = S.Schema.Type<typeof GenerationPerformanceAssessmentSchema>
+export type GenerationPerformanceAssessmentSchemaEncoded = S.Schema.Encoded<
+  typeof GenerationPerformanceAssessmentSchema
+>
+
+export const GenerationPerformanceConfidenceSchema = S.Union(S.Literal("high"), S.Literal("moderate"), S.Literal("low"))
+export type GenerationPerformanceConfidenceSchema = S.Schema.Type<typeof GenerationPerformanceConfidenceSchema>
+export type GenerationPerformanceConfidenceSchemaEncoded = S.Schema.Encoded<
+  typeof GenerationPerformanceConfidenceSchema
+>
+
+export const GenerationSpeedPointSchema = S.Struct({
+  context_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  expected_tokens_per_second: S.Number,
+  kv_bytes_read_per_token: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  lower_tokens_per_second: S.Number,
+  upper_tokens_per_second: S.Number,
+})
+export type GenerationSpeedPointSchema = S.Schema.Type<typeof GenerationSpeedPointSchema>
+export type GenerationSpeedPointSchemaEncoded = S.Schema.Encoded<typeof GenerationSpeedPointSchema>
+
 export const GpuLayersResponse = S.Union(
   S.extend(
     S.Struct({
@@ -1285,6 +1339,10 @@ export const ModelPreviewAssessmentSchema = S.extend(
     ),
     execution_policy: S.String,
     hardware_topology: S.String,
+    performance: S.suspend(
+      (): S.Schema<GenerationPerformanceAssessmentSchema, GenerationPerformanceAssessmentSchemaEncoded> =>
+        GenerationPerformanceAssessmentSchema,
+    ),
     profile_id: S.String,
   }),
   S.Record({ key: S.String, value: JsonValue }),
