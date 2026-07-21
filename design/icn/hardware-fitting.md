@@ -375,12 +375,23 @@ reserved memory when the underlying planner can do so. Unsupported component com
 
 ## Catalog integration
 
-The maintained catalog contains deliberate product facts and immutable artifact selectors. Humans
-choose the repository, commit, primary artifact selector, product grouping, quality rank, fidelity
-evidence, license decision, and any reviewed display override. ICN resolves the exact component
-set, sizes, content identities, GGUF properties, and header identities from that immutable source
-as part of preview. ACN does not duplicate those artifact-derived facts in a generated or
-hand-maintained table.
+ACN owns one versioned, model-centric catalog overlay. A checkpoint appears once and groups its
+curated quantization choices. The checked-in overlay contains stable Hugging Face model and artifact
+repository IDs, quantization selectors, product context profiles, display identity, quality and
+fidelity evidence, benchmark methodology, and license review. It does not contain mutable Hub
+commit revisions, filenames, shard membership, byte sizes, or content hashes.
+
+ICN owns live Hugging Face discovery. Repository resolution accepts a mutable ref such as `main`
+and returns an immutable per-request snapshot containing the resolved commit, current GGUF files,
+sizes, content identities, license data, and Hub metadata. Search returns current GGUF repositories.
+ACN joins an optional curated overlay to that snapshot. A repository absent from the overlay remains
+usable and can still receive artifact-derived fit and performance estimates, but it receives no
+Magnitude quality, fidelity, or support claim.
+
+Preview and download consume the exact commit returned by resolution. The commit is transient
+provenance for that preview or download, never a hand-maintained catalog pin. This prevents a
+mutable branch from changing between selection and acquisition while allowing normal catalog
+refreshes to observe current Hub state.
 
 ACN submits catalog artifact identities and fixed product profiles to the preview API. It
 excludes invalid, incompatible, and `DoesNotFit` candidates and applies only product ranking to the
@@ -409,22 +420,27 @@ to the primary recommendation: a smaller option must have materially lower runti
 higher-fidelity option must have a higher curated fidelity rank, and an alternative should prefer a
 different model family. List position alone never determines those labels.
 
-### Catalog source versus generated artifact facts
+### Catalog overlay versus runtime artifact facts
 
-The hand-maintained catalog retains only deliberate product decisions: which model/artifact to
-offer, immutable repository revision and primary selector, display and grouping policy, license
-review, quality rank, fidelity evidence, and supported product context profiles.
+Magnitude evidence states whether it applies to the exact artifact, a quantized checkpoint, or only
+a cross-model quantization tier; evidence may never be silently promoted to a stronger scope. An
+online maintainer audit verifies that every stable repository ID still exists, every selector still
+resolves uniquely against current Hub state, and reviewed licenses have not unexpectedly changed.
+The audit reports current revisions but never writes them into the overlay.
 
-Runtime code must not contain a second table of GGUF architecture, component membership, sizes,
-content identities, tensor, KV, recurrent-state, or memory-estimator inputs. Runtime preview sends
-the immutable selector to ICN, and ICN resolves and validates those facts from the pinned source.
+Runtime code must not use the overlay as a second implementation of GGUF inspection. ICN's resolved
+snapshot and preview supply shard membership, sizes, content identities, tensor metadata, parameter
+counts, context, KV and recurrent-state dimensions, placement, backend support, memory, and speed.
+ACN may use resolved file size only as a cheap rejection test before preview; it does not estimate
+fit from that size.
 
 ## Bun and client boundary
 
 ACN obtains host/device facts from `GET /v1/hardware`, downloaded
-model facts from `GET /v1/models`, and remote candidate assessments from
-`POST /v1/models/preview`. ACN continues to submit the fixed product profiles and rank successful
-candidates using curated quality, fidelity, and portfolio-diversity policy.
+model facts from `GET /v1/models`, current Hub snapshots and search from the Hugging Face discovery
+endpoints, and remote candidate assessments from `POST /v1/models/preview`. ACN continues to submit
+the fixed product profiles and rank successful candidates using curated quality, fidelity, and
+portfolio-diversity policy.
 
 ACN contains no host inspection, native-backend device probing, memory-domain normalization,
 stable-capacity arithmetic, hand-maintained runtime GGUF metadata, runtime-byte formulas, or direct
@@ -558,6 +574,12 @@ The implementation conforms when:
   assessment work to be repeated and never changes the resulting assessment;
 - `DoesNotFit`, invalid artifact, incompatible artifact, and operational failure remain distinct;
 - loading independently validates the exact execution plan it will allocate;
-- catalog runtime facts derivable from pinned artifacts are resolved by ICN rather than maintained
+- catalog runtime facts derivable from Hub artifacts are resolved by ICN rather than maintained
   in a parallel Bun metadata table;
-- regular builds and client operation do not require mutable Hugging Face metadata.
+- the canonical overlay groups quantizations under stable checkpoint identities and contains no
+  commit, filename, shard, size, or content-hash snapshot;
+- an explicit maintainer audit verifies current repositories, unique selectors, source identities,
+  and reviewed licenses without downloading model weights or writing current commits into source;
+- live resolution returns an immutable commit used unchanged by preview and download;
+- short-lived discovery caches expire by ref and header/assessment caches remain keyed by immutable
+  artifact identity, hardware topology, and estimator policy.

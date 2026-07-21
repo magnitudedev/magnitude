@@ -6,10 +6,13 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use icn_contracts::{
-    ComponentRelationship, ComponentRole, ContentIdentity, HardwareProvider, Integrity,
-    InventoryError, ModelComponent, ModelHardwareAssessor, ModelId, ModelLocation, ModelPreview,
-    ModelPreviewAssessment, ModelPreviewProfile, ModelPreviewRequest, ModelPreviewSource,
-    ModelPreviewer, ModelSource, ResolvedComponent, ResolvedModel,
+    ComponentRelationship, ComponentRole, ContentIdentity, HardwareProvider,
+    HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult,
+    HuggingFaceModelSearchResults, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
+    HuggingFaceRepositorySnapshot, Integrity, InventoryError, ModelComponent,
+    ModelHardwareAssessor, ModelId, ModelLocation, ModelPreview, ModelPreviewAssessment,
+    ModelPreviewProfile, ModelPreviewRequest, ModelPreviewSource, ModelPreviewer, ModelSource,
+    ResolvedComponent, ResolvedModel,
 };
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
@@ -28,12 +31,21 @@ const MAX_MODEL_COMPONENTS: u32 = 256;
 const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_PREVIEW_CONTEXT_TOKENS: u32 = 16 * 1024 * 1024;
 const MAX_PREVIEW_PARALLEL_SEQUENCES: u32 = 64;
+const MAX_HUB_SEARCH_RESULTS: u32 = 50;
+const MAX_HUB_SEARCH_QUERY_BYTES: usize = 200;
+const HUB_REPOSITORY_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
+const HUB_SEARCH_TTL: Duration = Duration::from_secs(60);
+const MAX_DISCOVERY_CACHE_ENTRIES: usize = 256;
 
 pub struct ModelPreviewService {
     models: Arc<ModelManager>,
     assessor: Arc<dyn ModelHardwareAssessor>,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
     hardware_snapshot: tokio::sync::Mutex<Option<(Instant, icn_contracts::HardwareSnapshot)>>,
+    hub_repository_snapshots:
+        tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceRepositorySnapshot)>>,
+    hub_search_results:
+        tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
 }
 
 impl ModelPreviewService {
@@ -44,6 +56,8 @@ impl ModelPreviewService {
             assessor,
             work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
             hardware_snapshot: tokio::sync::Mutex::new(None),
+            hub_repository_snapshots: tokio::sync::Mutex::new(BTreeMap::new()),
+            hub_search_results: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -264,6 +278,142 @@ impl ModelPreviewer for ModelPreviewService {
     }
 }
 
+impl HuggingFaceModelCatalog for ModelPreviewService {
+    fn search(
+        &self,
+        request: HuggingFaceModelSearchRequest,
+    ) -> futures_util::future::BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>>
+    {
+        Box::pin(async move {
+            let query = request.query.trim();
+            if query.is_empty()
+                || query.len() > MAX_HUB_SEARCH_QUERY_BYTES
+                || request.limit == 0
+                || request.limit > MAX_HUB_SEARCH_RESULTS
+            {
+                return Err(InventoryError::InvalidRequest(format!(
+                    "Hugging Face search requires a non-empty query of at most {MAX_HUB_SEARCH_QUERY_BYTES} bytes and a limit between 1 and {MAX_HUB_SEARCH_RESULTS}"
+                )));
+            }
+            let cache_key = format!("{}:{}", query.to_lowercase(), request.limit);
+            {
+                let mut cache = self.hub_search_results.lock().await;
+                cache.retain(|_, (captured, _)| captured.elapsed() <= HUB_SEARCH_TTL);
+                if let Some((_, cached)) = cache.get(&cache_key) {
+                    return Ok(cached.clone());
+                }
+            }
+            let http = reqwest::Client::builder()
+                .build()
+                .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+            let mut url = reqwest::Url::parse(self.models.client.endpoint())
+                .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            url.path_segments_mut()
+                .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?
+                .pop_if_empty()
+                .push("api")
+                .push("models");
+            url.query_pairs_mut()
+                .append_pair("search", query)
+                .append_pair("filter", "gguf")
+                .append_pair("sort", "downloads")
+                .append_pair("direction", "-1")
+                .append_pair("limit", &request.limit.to_string())
+                .append_pair("expand", "sha")
+                .append_pair("expand", "lastModified")
+                .append_pair("expand", "downloads")
+                .append_pair("expand", "likes")
+                .append_pair("expand", "tags")
+                .append_pair("expand", "private")
+                .append_pair("expand", "gated");
+            let mut outbound = http.get(url);
+            if let Some(token) = hub_token() {
+                outbound = outbound.bearer_auth(token);
+            }
+            let response = outbound
+                .send()
+                .await
+                .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(InventoryError::Upstream(format!(
+                    "Hugging Face search returned HTTP {}",
+                    response.status()
+                )));
+            }
+            let metadata: Vec<HubSearchModel> = serde_json::from_slice(
+                &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
+            )
+            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+            let results = HuggingFaceModelSearchResults {
+                models: metadata
+                    .into_iter()
+                    .filter_map(HubSearchModel::into_contract)
+                    .collect(),
+            };
+            let mut cache = self.hub_search_results.lock().await;
+            cache.insert(cache_key, (Instant::now(), results.clone()));
+            trim_discovery_cache(&mut cache);
+            Ok(results)
+        })
+    }
+
+    fn resolve(
+        &self,
+        request: HuggingFaceRepositoryRequest,
+    ) -> futures_util::future::BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>>
+    {
+        Box::pin(async move {
+            if !valid_repository(&request.repository) {
+                return Err(InventoryError::InvalidRequest(
+                    "Hugging Face repository must use owner/repository form".to_owned(),
+                ));
+            }
+            let revision = request.revision.as_str();
+            if !valid_hub_revision(revision) {
+                return Err(InventoryError::InvalidRequest(
+                    "Hugging Face revision contains unsupported characters".to_owned(),
+                ));
+            }
+            let cache_key = format!("{}@{}", request.repository, revision);
+            {
+                let mut cache = self.hub_repository_snapshots.lock().await;
+                cache.retain(|_, (captured, _)| captured.elapsed() <= HUB_REPOSITORY_SNAPSHOT_TTL);
+                if let Some((_, cached)) = cache.get(&cache_key) {
+                    return Ok(cached.clone());
+                }
+            }
+            let http = reqwest::Client::builder()
+                .build()
+                .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+            let metadata = fetch_hub_model(
+                &http,
+                self.models.client.endpoint(),
+                &request.repository,
+                revision,
+            )
+            .await?;
+            let snapshot = metadata.into_snapshot(request.repository)?;
+            let mut cache = self.hub_repository_snapshots.lock().await;
+            cache.insert(cache_key, (Instant::now(), snapshot.clone()));
+            trim_discovery_cache(&mut cache);
+            Ok(snapshot)
+        })
+    }
+}
+
+fn trim_discovery_cache<T>(cache: &mut BTreeMap<String, (Instant, T)>) {
+    while cache.len() > MAX_DISCOVERY_CACHE_ENTRIES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (captured, _))| *captured)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
 fn validate_preview_request(request: &ModelPreviewRequest) -> Result<(), InventoryError> {
     if request.profiles.is_empty() || request.profiles.len() > 16 {
         return Err(InventoryError::InvalidRequest(
@@ -322,9 +472,137 @@ struct CachedComponent {
 
 #[derive(Debug, Deserialize)]
 struct HubModel {
+    #[serde(default)]
+    id: Option<String>,
     sha: Option<String>,
+    #[serde(default, rename = "lastModified")]
+    last_modified: Option<String>,
+    #[serde(default)]
+    downloads: Option<u64>,
+    #[serde(default)]
+    likes: Option<u64>,
+    #[serde(default)]
+    gated: Option<serde_json::Value>,
+    #[serde(default)]
+    private: Option<bool>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default, rename = "cardData")]
+    card_data: Option<serde_json::Value>,
     #[serde(default)]
     siblings: Vec<HubSibling>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubSearchModel {
+    id: String,
+    sha: Option<String>,
+    #[serde(default, rename = "lastModified")]
+    last_modified: Option<String>,
+    #[serde(default)]
+    downloads: Option<u64>,
+    #[serde(default)]
+    likes: Option<u64>,
+    #[serde(default)]
+    gated: Option<serde_json::Value>,
+    #[serde(default)]
+    private: Option<bool>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+impl HubSearchModel {
+    fn into_contract(self) -> Option<HuggingFaceModelSearchResult> {
+        Some(HuggingFaceModelSearchResult {
+            repository: self.id,
+            commit: immutable_commit(self.sha?)?,
+            last_modified: self.last_modified,
+            downloads: self.downloads,
+            likes: self.likes,
+            gated: hub_gated(self.gated.as_ref()),
+            private: self.private.unwrap_or(false),
+            tags: self.tags,
+        })
+    }
+}
+
+impl HubModel {
+    fn into_snapshot(
+        self,
+        requested_repository: String,
+    ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+        if self.siblings.len() > MAX_HUB_SIBLINGS {
+            return Err(InventoryError::Integrity(
+                "Hugging Face metadata contains too many files".to_owned(),
+            ));
+        }
+        let commit = self.sha.and_then(immutable_commit).ok_or_else(|| {
+            InventoryError::Integrity(
+                "Hugging Face repository did not resolve to an immutable commit".to_owned(),
+            )
+        })?;
+        let mut gguf_files = self
+            .siblings
+            .iter()
+            .filter(|sibling| valid_gguf_path(Path::new(&sibling.rfilename)))
+            .map(|sibling| {
+                let (size_bytes, content) = sibling_identity(sibling)?;
+                Ok(HuggingFaceRepositoryFile {
+                    path: PathBuf::from(&sibling.rfilename),
+                    size_bytes,
+                    content,
+                })
+            })
+            .collect::<Result<Vec<_>, InventoryError>>()?;
+        gguf_files.sort_by(|left, right| left.path.cmp(&right.path));
+        if gguf_files.is_empty() {
+            return Err(InventoryError::Unsupported(format!(
+                "{} does not contain GGUF artifacts",
+                requested_repository
+            )));
+        }
+        let card = self.card_data.as_ref();
+        let license = card
+            .and_then(|value| value.get("license"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| tag_value(&self.tags, "license:"));
+        let license_url = card
+            .and_then(|value| value.get("license_link"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let mut base_models = card
+            .and_then(|value| value.get("base_model"))
+            .map(json_strings)
+            .unwrap_or_default();
+        if base_models.is_empty() {
+            base_models = self
+                .tags
+                .iter()
+                .filter_map(|tag| {
+                    tag.strip_prefix("base_model:quantized:")
+                        .or_else(|| tag.strip_prefix("base_model:"))
+                        .map(ToOwned::to_owned)
+                })
+                .collect();
+        }
+        base_models.sort();
+        base_models.dedup();
+        Ok(HuggingFaceRepositorySnapshot {
+            repository: self.id.unwrap_or(requested_repository),
+            commit,
+            last_modified: self.last_modified,
+            downloads: self.downloads,
+            likes: self.likes,
+            gated: hub_gated(self.gated.as_ref()),
+            private: self.private.unwrap_or(false),
+            license,
+            license_url,
+            base_models,
+            tags: self.tags,
+            gguf_files,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +618,65 @@ struct HubSibling {
 struct HubLfs {
     sha256: String,
     size: u64,
+}
+
+async fn fetch_hub_model(
+    http: &reqwest::Client,
+    endpoint: &str,
+    repository: &str,
+    revision: &str,
+) -> Result<HubModel, InventoryError> {
+    let url = hub_metadata_url(endpoint, repository, revision)?;
+    let mut request = http.get(url).query(&[("blobs", "true")]);
+    if let Some(token) = hub_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(InventoryError::Upstream(format!(
+            "Hugging Face metadata returned HTTP {}",
+            response.status()
+        )));
+    }
+    serde_json::from_slice(&bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?)
+        .map_err(|error| InventoryError::Upstream(error.to_string()))
+}
+
+fn immutable_commit(value: String) -> Option<String> {
+    ((40..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(value)
+}
+
+fn hub_gated(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| {
+        !matches!(
+            value,
+            serde_json::Value::Bool(false) | serde_json::Value::Null
+        )
+    })
+}
+
+fn tag_value(tags: &[String], prefix: &str) -> Option<String> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix(prefix).map(ToOwned::to_owned))
+}
+
+fn json_strings(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(value) => vec![value.clone()],
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 struct SelectedComponent<'a> {
@@ -390,25 +727,13 @@ impl ModelManager {
         let http = reqwest::Client::builder()
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let url = hub_metadata_url(self.client.endpoint(), &source.repository, &source.revision)?;
-        let mut request = http.get(url).query(&[("blobs", "true")]);
-        if let Some(token) = hub_token() {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        if !response.status().is_success() {
-            return Err(InventoryError::Upstream(format!(
-                "Hugging Face metadata returned HTTP {}",
-                response.status()
-            )));
-        }
-        let metadata: HubModel = serde_json::from_slice(
-            &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
+        let metadata = fetch_hub_model(
+            &http,
+            self.client.endpoint(),
+            &source.repository,
+            &source.revision,
         )
-        .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+        .await?;
         if metadata.siblings.len() > MAX_HUB_SIBLINGS {
             return Err(InventoryError::Integrity(
                 "Hugging Face metadata contains too many files".to_owned(),
@@ -577,10 +902,7 @@ fn hub_metadata_url(
 }
 
 fn validate_source(source: &ModelPreviewSource) -> Result<(), InventoryError> {
-    let mut repository_parts = source.repository.split('/');
-    let valid_repository = repository_parts.next().is_some_and(|part| !part.is_empty())
-        && repository_parts.next().is_some_and(|part| !part.is_empty())
-        && repository_parts.next().is_none();
+    let valid_repository = valid_repository(&source.repository);
     let valid_revision = (40..=64).contains(&source.revision.len())
         && source
             .revision
@@ -606,6 +928,35 @@ fn validate_source(source: &ModelPreviewSource) -> Result<(), InventoryError> {
                 .to_owned(),
         ))
     }
+}
+
+fn valid_repository(repository: &str) -> bool {
+    let mut parts = repository.split('/');
+    parts.next().is_some_and(valid_repository_part)
+        && parts.next().is_some_and(valid_repository_part)
+        && parts.next().is_none()
+}
+
+fn valid_repository_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_hub_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= 200
+        && revision != "."
+        && revision != ".."
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+        && revision
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn valid_gguf_path(path: &Path) -> bool {
@@ -1037,6 +1388,100 @@ mod tests {
     };
 
     struct TestTemplateAssessor;
+
+    #[test]
+    fn hub_search_results_require_immutable_commits() {
+        let valid = HubSearchModel {
+            id: "owner/model-gguf".to_owned(),
+            sha: Some("a".repeat(40)),
+            last_modified: Some("2026-07-20T00:00:00Z".to_owned()),
+            downloads: Some(42),
+            likes: Some(7),
+            gated: Some(serde_json::Value::Bool(false)),
+            private: Some(false),
+            tags: vec!["gguf".to_owned()],
+        }
+        .into_contract()
+        .unwrap();
+        assert_eq!(valid.repository, "owner/model-gguf");
+        assert_eq!(valid.commit, "a".repeat(40));
+
+        let invalid = HubSearchModel {
+            id: "owner/model".to_owned(),
+            sha: Some("main".to_owned()),
+            last_modified: None,
+            downloads: None,
+            likes: None,
+            gated: None,
+            private: None,
+            tags: Vec::new(),
+        };
+        assert!(invalid.into_contract().is_none());
+    }
+
+    #[test]
+    fn hub_coordinates_reject_path_traversal_but_allow_branch_names() {
+        assert!(valid_repository("owner/model.gguf"));
+        assert!(!valid_repository("../model"));
+        assert!(!valid_repository("owner/model/extra"));
+        assert!(valid_hub_revision("refs/pr/123"));
+        assert!(valid_hub_revision("feature/catalog-v2"));
+        assert!(!valid_hub_revision("../main"));
+        assert!(!valid_hub_revision("main?blobs=true"));
+    }
+
+    #[test]
+    fn hub_snapshot_keeps_only_identified_gguf_files_and_live_metadata() {
+        let snapshot = HubModel {
+            id: Some("owner/model-gguf".to_owned()),
+            sha: Some("b".repeat(40)),
+            last_modified: None,
+            downloads: Some(11),
+            likes: Some(3),
+            gated: Some(serde_json::Value::String("manual".to_owned())),
+            private: Some(false),
+            tags: vec![
+                "gguf".to_owned(),
+                "license:apache-2.0".to_owned(),
+                "base_model:quantized:owner/base".to_owned(),
+            ],
+            card_data: Some(serde_json::json!({
+                "license": "apache-2.0",
+                "license_link": "https://example.invalid/license",
+                "base_model": ["owner/base"]
+            })),
+            siblings: vec![
+                HubSibling {
+                    rfilename: "model-Q4_K_M.gguf".to_owned(),
+                    size: Some(123),
+                    blob_id: Some("c".repeat(40)),
+                    lfs: Some(HubLfs {
+                        sha256: "d".repeat(64),
+                        size: 123,
+                    }),
+                },
+                HubSibling {
+                    rfilename: "README.md".to_owned(),
+                    size: Some(5),
+                    blob_id: Some("e".repeat(40)),
+                    lfs: None,
+                },
+            ],
+        }
+        .into_snapshot("owner/model-gguf".to_owned())
+        .unwrap();
+
+        assert_eq!(snapshot.commit, "b".repeat(40));
+        assert!(snapshot.gated);
+        assert_eq!(snapshot.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(snapshot.base_models, vec!["owner/base"]);
+        assert_eq!(snapshot.gguf_files.len(), 1);
+        assert_eq!(snapshot.gguf_files[0].size_bytes, 123);
+        assert!(matches!(
+            snapshot.gguf_files[0].content,
+            ContentIdentity::Sha256 { .. }
+        ));
+    }
 
     impl TemplateAssessor for TestTemplateAssessor {
         fn cache_identity(&self) -> &str {

@@ -64,7 +64,8 @@
     "icn:dev": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- serve --fake",
     "icn:serve": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- serve",
     "icn:doctor": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- doctor",
-    "icn:version": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- version --json"
+    "icn:version": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- version --json",
+    "local-model-catalog:validate": "bun run --cwd packages/acn catalog:validate"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",

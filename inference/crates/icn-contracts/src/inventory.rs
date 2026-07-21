@@ -705,6 +705,64 @@ pub struct ModelPreview {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HuggingFaceModelSearchRequest {
+    pub query: String,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HuggingFaceModelSearchResult {
+    pub repository: String,
+    pub commit: String,
+    pub last_modified: Option<String>,
+    pub downloads: Option<u64>,
+    pub likes: Option<u64>,
+    pub gated: bool,
+    pub private: bool,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HuggingFaceModelSearchResults {
+    pub models: Vec<HuggingFaceModelSearchResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HuggingFaceRepositoryRequest {
+    pub repository: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HuggingFaceRepositoryFile {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub content: ContentIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HuggingFaceRepositorySnapshot {
+    pub repository: String,
+    pub commit: String,
+    pub last_modified: Option<String>,
+    pub downloads: Option<u64>,
+    pub likes: Option<u64>,
+    pub gated: bool,
+    pub private: bool,
+    pub license: Option<String>,
+    pub license_url: Option<String>,
+    pub base_models: Vec<String>,
+    pub tags: Vec<String>,
+    pub gguf_files: Vec<HuggingFaceRepositoryFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InventoryModel {
     pub id: ModelId,
     pub content_id: ContentId,
@@ -937,6 +995,20 @@ pub trait ModelPreviewer: Send + Sync + 'static {
         &self,
         request: ModelPreviewRequest,
     ) -> BoxFuture<'_, Result<ModelPreview, InventoryError>>;
+}
+
+/// Live Hugging Face discovery. Resolved commits are immutable snapshots for a
+/// subsequent preview or download, not catalog pins.
+pub trait HuggingFaceModelCatalog: Send + Sync + 'static {
+    fn search(
+        &self,
+        request: HuggingFaceModelSearchRequest,
+    ) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>>;
+
+    fn resolve(
+        &self,
+        request: HuggingFaceRepositoryRequest,
+    ) -> BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>>;
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -168,6 +168,106 @@
         }
       }
     },
+    "/v1/hugging-face/models/resolve": {
+      "post": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "resolveHuggingFaceRepository",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryRequestSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Immutable snapshot of the requested live Hugging Face repository",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HuggingFaceRepositorySnapshotSchema"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid repository request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Hugging Face resolution failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/hugging-face/models/search": {
+      "post": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "searchHuggingFaceModels",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceModelSearchRequestSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Live Hugging Face GGUF model search",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HuggingFaceModelSearchResultsSchema"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid search request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Hugging Face search failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models": {
       "get": {
         "tags": [
@@ -2804,6 +2904,203 @@
             }
           }
         ]
+      },
+      "HuggingFaceModelSearchRequestSchema": {
+        "type": "object",
+        "required": [
+          "query",
+          "limit"
+        ],
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "HuggingFaceModelSearchResultSchema": {
+        "type": "object",
+        "required": [
+          "repository",
+          "commit",
+          "gated",
+          "private",
+          "tags"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "last_modified": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "downloads": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "likes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "gated": {
+            "type": "boolean"
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "HuggingFaceModelSearchResultsSchema": {
+        "type": "object",
+        "required": [
+          "models"
+        ],
+        "properties": {
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HuggingFaceModelSearchResultSchema"
+            }
+          }
+        }
+      },
+      "HuggingFaceRepositoryFileSchema": {
+        "type": "object",
+        "required": [
+          "path",
+          "size_bytes",
+          "content"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "content": {
+            "$ref": "#/components/schemas/ContentIdentitySchema"
+          }
+        }
+      },
+      "HuggingFaceRepositoryRequestSchema": {
+        "type": "object",
+        "required": [
+          "repository",
+          "revision"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "string"
+          }
+        }
+      },
+      "HuggingFaceRepositorySnapshotSchema": {
+        "type": "object",
+        "required": [
+          "repository",
+          "commit",
+          "gated",
+          "private",
+          "base_models",
+          "tags",
+          "gguf_files"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "last_modified": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "downloads": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "likes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "gated": {
+            "type": "boolean"
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "license": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "license_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "gguf_files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HuggingFaceRepositoryFileSchema"
+            }
+          }
+        }
       },
       "ImageUrlRequest": {
         "type": "object",

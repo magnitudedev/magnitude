@@ -91,9 +91,10 @@ response, and incomplete stream termination remain distinct generated client fai
 
 Every operation in the normalized IR is emitted into the callable client automatically. There is
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
-and identity, hardware, model list/get/preview/download/delete, active-runtime state and
-load/unload, template application, model properties, and streamed chat completion. Generator tests
-prove that the manifest, descriptors, and callable client contain the same operation set.
+and identity, hardware, live Hugging Face GGUF search and repository resolution, model
+list/get/preview/download/delete, active-runtime state and load/unload, template application, model
+properties, and streamed chat completion. Generator tests prove that the manifest, descriptors,
+and callable client contain the same operation set.
 
 The ICN package checks in generated output and re-exports it deliberately. Its only hand-written
 runtime module is lifecycle management. The lifecycle creates the generated client after readiness

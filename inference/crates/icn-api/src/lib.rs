@@ -18,11 +18,13 @@ use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
     ChatTemplateRequest, CompletionBackend, DownloadModelRequest, ExecutionConfig,
     ExecutionConfigReport, FinishReason, FlashAttention, Generation, GenerationMetrics,
-    GenerationSnapshot, GpuLayers, GrammarTrigger, HardwareProvider, HardwareSnapshot, ImageInput,
-    InferenceError, InferenceEvent, InferenceStreamEvent, InventoryError, InventoryModel, ModelId,
-    ModelInventory, ModelModalities, ModelPreview, ModelPreviewRequest, ModelPreviewer,
-    ModelProperties, PreparedChatInfo, ReasoningControl, ResponseFormat, SplitMode,
-    TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
+    GenerationSnapshot, GpuLayers, GrammarTrigger, HardwareProvider, HardwareSnapshot,
+    HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults,
+    HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, ImageInput, InferenceError,
+    InferenceEvent, InferenceStreamEvent, InventoryError, InventoryModel, ModelId, ModelInventory,
+    ModelModalities, ModelPreview, ModelPreviewRequest, ModelPreviewer, ModelProperties,
+    PreparedChatInfo, ReasoningControl, ResponseFormat, SplitMode, TemplateCapabilities, ToolCall,
+    ToolChoice, ToolDefinition,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -61,6 +63,7 @@ pub struct AppState {
     inventory: Option<Arc<dyn ModelInventory>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
     previewer: Option<Arc<dyn ModelPreviewer>>,
+    hugging_face_catalog: Option<Arc<dyn HuggingFaceModelCatalog>>,
     runtime: Option<Arc<dyn RuntimeController>>,
     identity: ServerIdentity,
     authorization: Option<Arc<str>>,
@@ -226,6 +229,7 @@ impl AppState {
             inventory: None,
             hardware: None,
             previewer: None,
+            hugging_face_catalog: None,
             runtime: None,
             identity: ServerIdentity::default(),
             authorization: None,
@@ -239,6 +243,7 @@ impl AppState {
             inventory: None,
             hardware: None,
             previewer: None,
+            hugging_face_catalog: None,
             runtime: None,
             identity: ServerIdentity::default(),
             authorization: None,
@@ -273,6 +278,11 @@ impl AppState {
         self
     }
 
+    pub fn with_hugging_face_catalog(mut self, catalog: Arc<dyn HuggingFaceModelCatalog>) -> Self {
+        self.hugging_face_catalog = Some(catalog);
+        self
+    }
+
     pub fn with_runtime(mut self, runtime: Arc<dyn RuntimeController>) -> Self {
         self.runtime = Some(runtime);
         self
@@ -294,6 +304,14 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/hardware", get(hardware))
         .route("/v1/models", get(models))
         .route("/v1/models/preview", post(preview_model))
+        .route(
+            "/v1/hugging-face/models/search",
+            post(search_hugging_face_models),
+        )
+        .route(
+            "/v1/hugging-face/models/resolve",
+            post(resolve_hugging_face_repository),
+        )
         .route("/v1/models/download", post(download_model))
         .route("/v1/models/{model_id}", get(model).delete(delete_model))
         .route("/v1/runtime", get(runtime_state))
@@ -1392,6 +1410,54 @@ async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot
         .ok_or_else(|| ApiError::server("hardware discovery is not configured"))?;
     provider
         .snapshot()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/hugging-face/models/search", operation_id = "searchHuggingFaceModels", tag = "hugging-face",
+    request_body(content = inventory_schema::HuggingFaceModelSearchRequestSchema, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Live Hugging Face GGUF model search", body = inventory_schema::HuggingFaceModelSearchResultsSchema),
+        (status = 400, description = "Invalid search request", body = ErrorResponse),
+        (status = 500, description = "Hugging Face search failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.hugging_face.search", skip_all, err(Debug))]
+async fn search_hugging_face_models(
+    State(state): State<AppState>,
+    Json(request): Json<HuggingFaceModelSearchRequest>,
+) -> Result<Json<HuggingFaceModelSearchResults>, ApiError> {
+    let catalog = state
+        .hugging_face_catalog
+        .as_ref()
+        .ok_or_else(|| ApiError::server("Hugging Face discovery is not configured"))?;
+    catalog
+        .search(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/hugging-face/models/resolve", operation_id = "resolveHuggingFaceRepository", tag = "hugging-face",
+    request_body(content = inventory_schema::HuggingFaceRepositoryRequestSchema, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Immutable snapshot of the requested live Hugging Face repository", body = inventory_schema::HuggingFaceRepositorySnapshotSchema),
+        (status = 400, description = "Invalid repository request", body = ErrorResponse),
+        (status = 500, description = "Hugging Face resolution failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.hugging_face.resolve", skip_all, err(Debug))]
+async fn resolve_hugging_face_repository(
+    State(state): State<AppState>,
+    Json(request): Json<HuggingFaceRepositoryRequest>,
+) -> Result<Json<HuggingFaceRepositorySnapshot>, ApiError> {
+    let catalog = state
+        .hugging_face_catalog
+        .as_ref()
+        .ok_or_else(|| ApiError::server("Hugging Face discovery is not configured"))?;
+    catalog
+        .resolve(request)
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -2552,6 +2618,8 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
     paths(
         health,
         hardware,
+        search_hugging_face_models,
+        resolve_hugging_face_repository,
         models,
         preview_model,
         model,
@@ -2569,6 +2637,10 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         inventory_schema::HardwareSnapshotSchema,
         inventory_schema::ModelPreviewRequestSchema,
         inventory_schema::ModelPreviewSchema,
+        inventory_schema::HuggingFaceModelSearchRequestSchema,
+        inventory_schema::HuggingFaceModelSearchResultsSchema,
+        inventory_schema::HuggingFaceRepositoryRequestSchema,
+        inventory_schema::HuggingFaceRepositorySnapshotSchema,
         ModelList,
         Model,
         inventory_schema::ModelStatusSchema,
@@ -3027,6 +3099,58 @@ mod tests {
 
     struct StubHardware;
 
+    struct StubHuggingFaceCatalog;
+
+    impl HuggingFaceModelCatalog for StubHuggingFaceCatalog {
+        fn search(
+            &self,
+            request: HuggingFaceModelSearchRequest,
+        ) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>> {
+            Box::pin(async move {
+                Ok(HuggingFaceModelSearchResults {
+                    models: vec![icn_contracts::HuggingFaceModelSearchResult {
+                        repository: format!("owner/{}", request.query),
+                        commit: "a".repeat(40),
+                        last_modified: None,
+                        downloads: Some(10),
+                        likes: Some(2),
+                        gated: false,
+                        private: false,
+                        tags: vec!["gguf".to_owned()],
+                    }],
+                })
+            })
+        }
+
+        fn resolve(
+            &self,
+            request: HuggingFaceRepositoryRequest,
+        ) -> BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>> {
+            Box::pin(async move {
+                Ok(HuggingFaceRepositorySnapshot {
+                    repository: request.repository,
+                    commit: "b".repeat(40),
+                    last_modified: None,
+                    downloads: None,
+                    likes: None,
+                    gated: false,
+                    private: false,
+                    license: Some("apache-2.0".to_owned()),
+                    license_url: None,
+                    base_models: Vec::new(),
+                    tags: vec!["gguf".to_owned()],
+                    gguf_files: vec![icn_contracts::HuggingFaceRepositoryFile {
+                        path: "model.gguf".into(),
+                        size_bytes: 123,
+                        content: icn_contracts::ContentIdentity::Sha256 {
+                            value: "c".repeat(64),
+                        },
+                    }],
+                })
+            })
+        }
+    }
+
     impl HardwareProvider for StubHardware {
         fn snapshot(
             &self,
@@ -3171,6 +3295,46 @@ mod tests {
                 .unwrap();
         assert_eq!(body["repository"], "owner/repository");
         assert_eq!(body["assessments"][0]["profile_id"], "interactive");
+    }
+
+    #[tokio::test]
+    async fn hugging_face_endpoints_expose_live_search_and_immutable_resolution() {
+        let state = AppState::new(FakeBackend::new("test-model", ""))
+            .with_hugging_face_catalog(Arc::new(StubHuggingFaceCatalog));
+        let search = app(state.clone())
+            .oneshot(
+                Request::post("/v1/hugging-face/models/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "query": "model", "limit": 5 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::OK);
+        let search_body: Value =
+            serde_json::from_slice(&search.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(search_body["models"][0]["repository"], "owner/model");
+
+        let resolve = app(state)
+            .oneshot(
+                Request::post("/v1/hugging-face/models/resolve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "repository": "owner/model", "revision": "main" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolve.status(), StatusCode::OK);
+        let resolve_body: Value =
+            serde_json::from_slice(&resolve.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(resolve_body["commit"], "b".repeat(40));
+        assert_eq!(resolve_body["gguf_files"][0]["size_bytes"], 123);
     }
 
     fn request_from_json(value: Value) -> ChatCompletionRequest {

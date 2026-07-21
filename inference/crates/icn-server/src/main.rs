@@ -1778,7 +1778,8 @@ async fn main() -> anyhow::Result<()> {
             let mut state = AppState::model_free(backends)
                 .with_inventory(inventory)
                 .with_hardware(inventory_hardware_assessor)
-                .with_previewer(previewer)
+                .with_previewer(previewer.clone())
+                .with_hugging_face_catalog(previewer)
                 .with_runtime(runtime)
                 .with_identity(identity);
             if let Some(auth_token) = auth_token {

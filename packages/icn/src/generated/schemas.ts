@@ -1045,6 +1045,104 @@ export const HuggingFaceDownloadSourceSchema = S.extend(
 export type HuggingFaceDownloadSourceSchema = S.Schema.Type<typeof HuggingFaceDownloadSourceSchema>
 export type HuggingFaceDownloadSourceSchemaEncoded = S.Schema.Encoded<typeof HuggingFaceDownloadSourceSchema>
 
+export const HuggingFaceModelSearchRequestSchema = S.extend(
+  S.Struct({
+    limit: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    query: S.String,
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HuggingFaceModelSearchRequestSchema = S.Schema.Type<typeof HuggingFaceModelSearchRequestSchema>
+export type HuggingFaceModelSearchRequestSchemaEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchRequestSchema>
+
+export const HuggingFaceModelSearchResultSchema = S.extend(
+  S.Struct({
+    commit: S.String,
+    downloads: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+      exact: true,
+      as: "Option",
+    }),
+    gated: S.Boolean,
+    last_modified: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+    likes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+      exact: true,
+      as: "Option",
+    }),
+    private: S.Boolean,
+    repository: S.String,
+    tags: S.Array(S.String),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HuggingFaceModelSearchResultSchema = S.Schema.Type<typeof HuggingFaceModelSearchResultSchema>
+export type HuggingFaceModelSearchResultSchemaEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResultSchema>
+
+export const HuggingFaceModelSearchResultsSchema = S.extend(
+  S.Struct({
+    models: S.Array(
+      S.suspend(
+        (): S.Schema<HuggingFaceModelSearchResultSchema, HuggingFaceModelSearchResultSchemaEncoded> =>
+          HuggingFaceModelSearchResultSchema,
+      ),
+    ),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HuggingFaceModelSearchResultsSchema = S.Schema.Type<typeof HuggingFaceModelSearchResultsSchema>
+export type HuggingFaceModelSearchResultsSchemaEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResultsSchema>
+
+export const HuggingFaceRepositoryFileSchema = S.extend(
+  S.Struct({
+    content: S.suspend((): S.Schema<ContentIdentitySchema, ContentIdentitySchemaEncoded> => ContentIdentitySchema),
+    path: S.String,
+    size_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HuggingFaceRepositoryFileSchema = S.Schema.Type<typeof HuggingFaceRepositoryFileSchema>
+export type HuggingFaceRepositoryFileSchemaEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryFileSchema>
+
+export const HuggingFaceRepositoryRequestSchema = S.extend(
+  S.Struct({
+    repository: S.String,
+    revision: S.String,
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HuggingFaceRepositoryRequestSchema = S.Schema.Type<typeof HuggingFaceRepositoryRequestSchema>
+export type HuggingFaceRepositoryRequestSchemaEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryRequestSchema>
+
+export const HuggingFaceRepositorySnapshotSchema = S.extend(
+  S.Struct({
+    base_models: S.Array(S.String),
+    commit: S.String,
+    downloads: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+      exact: true,
+      as: "Option",
+    }),
+    gated: S.Boolean,
+    gguf_files: S.Array(
+      S.suspend(
+        (): S.Schema<HuggingFaceRepositoryFileSchema, HuggingFaceRepositoryFileSchemaEncoded> =>
+          HuggingFaceRepositoryFileSchema,
+      ),
+    ),
+    last_modified: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+    license: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+    license_url: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+    likes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+      exact: true,
+      as: "Option",
+    }),
+    private: S.Boolean,
+    repository: S.String,
+    tags: S.Array(S.String),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type HuggingFaceRepositorySnapshotSchema = S.Schema.Type<typeof HuggingFaceRepositorySnapshotSchema>
+export type HuggingFaceRepositorySnapshotSchemaEncoded = S.Schema.Encoded<typeof HuggingFaceRepositorySnapshotSchema>
+
 export const ImageUrlRequest = S.Struct({
   url: S.String,
 })

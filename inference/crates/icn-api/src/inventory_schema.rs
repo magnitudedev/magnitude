@@ -183,6 +183,58 @@ pub struct ModelPreviewSchema {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct HuggingFaceModelSearchRequestSchema {
+    query: String,
+    limit: u32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HuggingFaceModelSearchResultSchema {
+    repository: String,
+    commit: String,
+    last_modified: Option<String>,
+    downloads: Option<u64>,
+    likes: Option<u64>,
+    gated: bool,
+    private: bool,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HuggingFaceModelSearchResultsSchema {
+    models: Vec<HuggingFaceModelSearchResultSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HuggingFaceRepositoryRequestSchema {
+    repository: String,
+    revision: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HuggingFaceRepositoryFileSchema {
+    path: String,
+    size_bytes: u64,
+    content: ContentIdentitySchema,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HuggingFaceRepositorySnapshotSchema {
+    repository: String,
+    commit: String,
+    last_modified: Option<String>,
+    downloads: Option<u64>,
+    likes: Option<u64>,
+    gated: bool,
+    private: bool,
+    license: Option<String>,
+    license_url: Option<String>,
+    base_models: Vec<String>,
+    tags: Vec<String>,
+    gguf_files: Vec<HuggingFaceRepositoryFileSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentIdentitySchema {
     Sha256 { value: String },

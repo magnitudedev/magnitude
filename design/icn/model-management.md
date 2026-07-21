@@ -141,6 +141,13 @@ artifacts. Inventory, artifact resolution, metadata inspection, reasoning detect
 assessment, and profile execution assessment are domains within this cache, not independent cache systems. ACN and clients never
 read, write, or construct paths inside it.
 
+Live Hugging Face search and mutable-ref resolution are bounded discovery operations owned by ICN.
+Search results use a brief in-memory TTL. Repository snapshots use a short in-memory TTL keyed by
+repository and requested ref. A successful resolution returns an immutable commit; downstream
+header, inspection, assessment, preview, and download evidence keys use that commit and published
+content identities rather than the mutable ref. Expiration can cause another metadata request but
+never invalidates a complete immutable artifact result.
+
 The cache lives below the configured model-store root and has two top-level data forms:
 
 ```text
