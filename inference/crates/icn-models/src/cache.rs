@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use getrandom::fill;
-use icn_contracts::{ContentId, HardwareAssessment};
+use icn_contracts::{ContentId, HardwareAssessment, ModelExecutionAssessment};
 use icn_utils::file_cache::{
     read_bytes, read_json, read_object, write_bytes_atomic, write_json_atomic,
 };
@@ -19,6 +19,7 @@ pub enum ModelIndexKind {
     Artifact,
     ArtifactInspection,
     HardwareAssessment,
+    ExecutionAssessment,
 }
 
 impl ModelIndexKind {
@@ -27,6 +28,7 @@ impl ModelIndexKind {
             Self::Artifact => "artifacts",
             Self::ArtifactInspection => "inspections/artifacts",
             Self::HardwareAssessment => "assessments/hardware",
+            Self::ExecutionAssessment => "assessments/execution",
         }
     }
 }
@@ -114,7 +116,7 @@ impl ModelCache {
         content_id: &ContentId,
         hardware_evidence: &str,
     ) -> Option<HardwareAssessment> {
-        self.read_index(
+        self.read_index::<HardwareAssessment>(
             ModelIndexKind::HardwareAssessment,
             &hardware_assessment_evidence(content_id, hardware_evidence),
         )
@@ -131,6 +133,33 @@ impl ModelCache {
             self.write_index(
                 ModelIndexKind::HardwareAssessment,
                 &hardware_assessment_evidence(content_id, hardware_evidence),
+                assessment,
+            );
+        }
+    }
+
+    pub fn read_execution_assessment(
+        &self,
+        content_id: &ContentId,
+        execution_evidence: &str,
+    ) -> Option<ModelExecutionAssessment> {
+        self.read_index::<ModelExecutionAssessment>(
+            ModelIndexKind::ExecutionAssessment,
+            &hardware_assessment_evidence(content_id, execution_evidence),
+        )
+        .filter(|assessment| is_terminal_assessment(&assessment.hardware))
+    }
+
+    pub fn write_execution_assessment(
+        &self,
+        content_id: &ContentId,
+        execution_evidence: &str,
+        assessment: &ModelExecutionAssessment,
+    ) {
+        if is_terminal_assessment(&assessment.hardware) {
+            self.write_index(
+                ModelIndexKind::ExecutionAssessment,
+                &hardware_assessment_evidence(content_id, execution_evidence),
                 assessment,
             );
         }

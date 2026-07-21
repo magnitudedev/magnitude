@@ -131,6 +131,46 @@ pub struct ModelPreviewAssessmentSchema {
     execution_policy: String,
     hardware_topology: String,
     assessment: HardwareAssessmentSchema,
+    performance: GenerationPerformanceAssessmentSchema,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationPerformanceConfidenceSchema {
+    High,
+    Moderate,
+    Low,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationSpeedPointSchema {
+    context_tokens: u32,
+    kv_bytes_read_per_token: u64,
+    lower_tokens_per_second: f64,
+    expected_tokens_per_second: f64,
+    upper_tokens_per_second: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GenerationPerformanceAssessmentSchema {
+    Estimated {
+        method: String,
+        confidence: GenerationPerformanceConfidenceSchema,
+        workload: String,
+        always_active_weight_bytes: u64,
+        routed_expert_weight_bytes: u64,
+        expert_count: u32,
+        expert_used_count: u32,
+        cross_memory_domain_placement: bool,
+        points: Vec<GenerationSpeedPointSchema>,
+    },
+    Unavailable {
+        method: String,
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize, ToSchema)]

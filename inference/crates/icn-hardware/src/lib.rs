@@ -1,6 +1,6 @@
 //! Model-free memory fitting over the exact pinned llama.cpp `common/fit` path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, NulError};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -13,20 +13,39 @@ use llama_cpp_2::context::params::{
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::params::fit::{
-    FitDeviceEstimate, FitDeviceKind, FitMemoryEstimate, FitStatus,
+    FitCalibration, FitCalibrationMetric, FitDecodeWorkload, FitDecodeWorkloadAssessment,
+    FitDeviceEstimate, FitDeviceKind, FitMemoryEstimate, FitStatus, FitTensorWorkloadKind,
 };
 use llama_cpp_2::model::params::fit::{FitReport, FitReportError};
 
 use icn_contracts::{
-    ExecutionIntent, HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceKind,
+    ExecutionIntent, GenerationPerformanceAssessment, GenerationPerformanceConfidence,
+    GenerationSpeedPoint, HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceKind,
     HardwareDeviceMemoryAssessment, HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitKind,
     HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment, HardwareMemoryDomainKind,
-    HardwareProfile, HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory, MtpConfig,
-    MtpSource,
+    HardwareProfile, HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory,
+    ModelExecutionAssessment, MtpConfig, MtpSource,
 };
 use llama_cpp_2::LlamaBackendDeviceType;
 use sha2::{Digest, Sha256};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+
+pub const GENERATION_PERFORMANCE_CONTEXTS: [u32; 4] = [8_192, 32_768, 100_000, 200_000];
+pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v2";
+// Versioned ICN policy for work not represented by the synthetic matrix-operation calibration.
+// Changing any of these constants requires a new GENERATION_PERFORMANCE_METHOD identity.
+const GENERATION_PERFORMANCE_WORKLOAD: &str = "baseline_single_sequence_decode";
+const DENSE_DECODE_EFFICIENCY: f64 = 0.82;
+const ROUTED_DECODE_EFFICIENCY: f64 = 0.75;
+const CROSS_DOMAIN_PLACEMENT_EFFICIENCY: f64 = 0.88;
+const CALIBRATION_SPREAD_WEIGHT: f64 = 1.5;
+const MINIMUM_UNCERTAINTY: f64 = 0.12;
+const MAXIMUM_CALIBRATION_UNCERTAINTY: f64 = 0.45;
+const ROUTING_UNCERTAINTY: f64 = 0.08;
+const MAXIMUM_ROUTED_UNCERTAINTY: f64 = 0.55;
+const CROSS_DOMAIN_PLACEMENT_UNCERTAINTY: f64 = 0.12;
+const MAXIMUM_CROSS_DOMAIN_UNCERTAINTY: f64 = 0.65;
+const UPPER_BOUND_UNCERTAINTY_WEIGHT: f64 = 0.65;
 
 fn cache_type_into_native(cache_type: CacheType) -> KvCacheType {
     match cache_type {
@@ -541,7 +560,15 @@ pub fn assess_intent_with_backend(
     requested: &ExecutionIntent,
     policy: CapacityPolicy,
 ) -> Result<AssessedExecutionPlan, AssessmentError> {
-    Ok(plan_and_assess(backend, requested, policy)?.0)
+    Ok(plan_and_assess(backend, requested, policy, false)?.0)
+}
+
+fn assess_intent_with_decode_workload(
+    backend: &LlamaBackend,
+    requested: &ExecutionIntent,
+    policy: CapacityPolicy,
+) -> Result<AssessedExecutionPlan, AssessmentError> {
+    Ok(plan_and_assess(backend, requested, policy, true)?.0)
 }
 
 /// Plan a load and retain the exact fitted native parameter object that produced its assessment.
@@ -550,7 +577,7 @@ pub fn plan_load_with_backend(
     requested: &ExecutionIntent,
     policy: CapacityPolicy,
 ) -> Result<BackendLoadPlan, AssessmentError> {
-    let (assessed, native) = plan_and_assess(backend, requested, policy)?;
+    let (assessed, native) = plan_and_assess(backend, requested, policy, false)?;
     let native = match (native, &assessed.assessment) {
         (Some(native), _) => native,
         (None, HardwareAssessment::IncompatibleArtifact { code, message }) => {
@@ -570,8 +597,13 @@ pub fn plan_load_with_backend(
     let native_mtp = match requested.mtp {
         MtpConfig::Disabled { .. } => None,
         MtpConfig::Enabled { .. } => Some(
-            plan_fit_with_backend(backend, &fit_request(&assessed.plan, true)?, Some(&native))?
-                .native,
+            plan_fit_with_backend(
+                backend,
+                &fit_request(&assessed.plan, true)?,
+                Some(&native),
+                false,
+            )?
+            .native,
         ),
     };
     Ok(BackendLoadPlan {
@@ -585,9 +617,11 @@ fn plan_and_assess(
     backend: &LlamaBackend,
     requested: &ExecutionIntent,
     policy: CapacityPolicy,
+    capture_decode_workload: bool,
 ) -> Result<(AssessedExecutionPlan, Option<NativeParameterPlan>), AssessmentError> {
     let target_request = fit_request(requested, false)?;
-    let target_fit = plan_fit_with_backend(backend, &target_request, None)?;
+    let target_fit =
+        plan_fit_with_backend(backend, &target_request, None, capture_decode_workload)?;
     let text_report = target_fit.report.clone();
     if text_report.status == FitStatus::Error {
         return Ok((
@@ -812,6 +846,496 @@ pub fn assess_with_backend(
     assess_intent_with_backend(backend, requested, policy)
 }
 
+fn generation_performance(
+    hardware: &HardwareAssessment,
+    decode_workload: &FitDecodeWorkloadAssessment,
+    devices: &[FitDeviceEstimate],
+    unified_memory: bool,
+    calibration: Option<&FitCalibration>,
+    configured_context_tokens: u32,
+) -> GenerationPerformanceAssessment {
+    if !matches!(hardware, HardwareAssessment::Fits { .. }) {
+        return unavailable_generation_performance(
+            "configuration_does_not_fit",
+            "generation performance is unavailable for a configuration that does not fit",
+        );
+    }
+    let Some(calibration) = calibration else {
+        return GenerationPerformanceAssessment::not_requested();
+    };
+    let workload = match decode_workload {
+        FitDecodeWorkloadAssessment::Available { workload } => workload,
+        FitDecodeWorkloadAssessment::Unavailable { reason } => {
+            return unavailable_generation_performance(
+                "native_workload_unavailable",
+                reason.clone(),
+            );
+        }
+    };
+    let cross_memory_domain_placement =
+        match workload_crosses_memory_domains(workload, devices, unified_memory) {
+            Ok(value) => value,
+            Err(failure) => {
+                return unavailable_generation_performance(failure.code, failure.message);
+            }
+        };
+    match estimate_generation_performance(
+        workload,
+        calibration,
+        configured_context_tokens,
+        &GENERATION_PERFORMANCE_CONTEXTS,
+        cross_memory_domain_placement,
+    ) {
+        Ok(estimate) => estimate,
+        Err(failure) => unavailable_generation_performance(failure.code, failure.message),
+    }
+}
+
+fn unavailable_generation_performance(
+    code: &str,
+    message: impl Into<String>,
+) -> GenerationPerformanceAssessment {
+    GenerationPerformanceAssessment::Unavailable {
+        method: GENERATION_PERFORMANCE_METHOD.to_owned(),
+        code: code.to_owned(),
+        message: message.into(),
+    }
+}
+
+#[derive(Debug)]
+struct PerformanceEstimateFailure {
+    code: &'static str,
+    message: String,
+}
+
+impl PerformanceEstimateFailure {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CalibrationSelection<'a> {
+    metric: &'a FitCalibrationMetric,
+    exact: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PerformanceMemoryDomain {
+    HostShared,
+    Physical(String),
+    NativeDevice(usize),
+}
+
+fn performance_memory_domain(
+    device: &FitDeviceEstimate,
+    unified_memory: bool,
+) -> PerformanceMemoryDomain {
+    if unified_memory
+        || device.kind == FitDeviceKind::Host
+        || device.backend_device_type() == LlamaBackendDeviceType::IntegratedGpu
+    {
+        PerformanceMemoryDomain::HostShared
+    } else if let Some(physical_id) = &device.device_id {
+        PerformanceMemoryDomain::Physical(physical_id.clone())
+    } else {
+        PerformanceMemoryDomain::NativeDevice(device.index)
+    }
+}
+
+fn workload_crosses_memory_domains(
+    workload: &FitDecodeWorkload,
+    devices: &[FitDeviceEstimate],
+    unified_memory: bool,
+) -> Result<bool, PerformanceEstimateFailure> {
+    let mut domains = BTreeSet::new();
+    let mut record = |backend_type: i32, backend: &str, device_id: &Option<String>| {
+        let device = devices.iter().find(|device| {
+            device.backend_type == backend_type
+                && device.backend == backend
+                && device.device_id == *device_id
+        });
+        let Some(device) = device else {
+            return Err(PerformanceEstimateFailure::new(
+                "workload_device_unresolved",
+                format!(
+                    "native workload device {backend}/{} is absent from the fit topology",
+                    device_id.as_deref().unwrap_or("<unknown>")
+                ),
+            ));
+        };
+        domains.insert(performance_memory_domain(device, unified_memory));
+        Ok(())
+    };
+    for tensor in &workload.tensors {
+        record(tensor.backend_type, &tensor.backend, &tensor.device_id)?;
+    }
+    for layer in &workload.kv_layers {
+        record(layer.backend_type, &layer.backend, &layer.device_id)?;
+    }
+    Ok(domains.len() > 1)
+}
+
+fn validate_calibration(calibration: &FitCalibration) -> Result<(), PerformanceEstimateFailure> {
+    if calibration.method != llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD {
+        return Err(PerformanceEstimateFailure::new(
+            "unsupported_calibration_schema",
+            "native calibration schema is not supported",
+        ));
+    }
+    if calibration.metrics.is_empty() {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_calibration",
+            "native calibration contains no metrics",
+        ));
+    }
+    let mut identities = BTreeSet::new();
+    for metric in &calibration.metrics {
+        if metric.backend.is_empty()
+            || metric.device_id.as_ref().is_some_and(String::is_empty)
+            || !metric.bytes_per_second.is_finite()
+            || metric.bytes_per_second <= 0.0
+            || !metric.launch_microseconds.is_finite()
+            || metric.launch_microseconds < 0.0
+            || !metric.relative_spread.is_finite()
+            || metric.relative_spread < 0.0
+        {
+            return Err(PerformanceEstimateFailure::new(
+                "invalid_calibration",
+                "native calibration contains an invalid identity or numeric value",
+            ));
+        }
+        if !identities.insert((
+            metric.backend_type,
+            metric.backend.as_str(),
+            metric.device_id.as_deref(),
+            metric.tensor_type,
+            metric.routed,
+        )) {
+            return Err(PerformanceEstimateFailure::new(
+                "invalid_calibration",
+                "native calibration contains duplicate operation metrics",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn calibration_for<'a>(
+    calibration: &'a FitCalibration,
+    backend_type: i32,
+    backend: &str,
+    device_id: &Option<String>,
+    tensor_type: i32,
+    routed: bool,
+) -> Result<CalibrationSelection<'a>, PerformanceEstimateFailure> {
+    let mut fallback = None;
+    for metric in calibration.metrics.iter().filter(|metric| {
+        metric.backend_type == backend_type
+            && metric.backend == backend
+            && metric.device_id == *device_id
+            && metric.routed == routed
+    }) {
+        if metric.tensor_type == tensor_type {
+            return Ok(CalibrationSelection {
+                metric,
+                exact: true,
+            });
+        }
+        if fallback.is_none_or(|current: &FitCalibrationMetric| {
+            metric.bytes_per_second < current.bytes_per_second
+        }) {
+            fallback = Some(metric);
+        }
+    }
+    fallback
+        .map(|metric| CalibrationSelection {
+            metric,
+            exact: false,
+        })
+        .ok_or_else(|| {
+            PerformanceEstimateFailure::new(
+                "calibration_coverage_missing",
+                format!(
+                    "no {} calibration covers backend {backend} device {}",
+                    if routed { "routed" } else { "dense" },
+                    device_id.as_deref().unwrap_or("<unknown>")
+                ),
+            )
+        })
+}
+
+fn active_routed_bytes(
+    bytes: u64,
+    expert_count: u32,
+    expert_used_count: u32,
+) -> Result<u64, PerformanceEstimateFailure> {
+    if expert_count == 0 || expert_used_count == 0 || expert_used_count > expert_count {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_expert_metadata",
+            "routed tensors require a non-zero selected-expert count within the total expert count",
+        ));
+    }
+    let numerator = u128::from(bytes)
+        .checked_mul(u128::from(expert_used_count))
+        .ok_or_else(|| {
+            PerformanceEstimateFailure::new(
+                "workload_overflow",
+                "routed expert byte calculation overflowed",
+            )
+        })?;
+    let scaled = numerator.div_ceil(u128::from(expert_count));
+    u64::try_from(scaled).map_err(|_| {
+        PerformanceEstimateFailure::new(
+            "workload_overflow",
+            "routed expert byte calculation exceeds u64",
+        )
+    })
+}
+
+fn operation_seconds(bytes: u64, metric: &FitCalibrationMetric) -> f64 {
+    bytes as f64 / metric.bytes_per_second + metric.launch_microseconds / 1_000_000.0
+}
+
+fn estimate_generation_performance(
+    workload: &FitDecodeWorkload,
+    calibration: &FitCalibration,
+    configured_context_tokens: u32,
+    requested_contexts: &[u32],
+    cross_memory_domain_placement: bool,
+) -> Result<GenerationPerformanceAssessment, PerformanceEstimateFailure> {
+    if workload.method != llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD {
+        return Err(PerformanceEstimateFailure::new(
+            "unsupported_workload_schema",
+            "native decode workload schema is not supported",
+        ));
+    }
+    validate_calibration(calibration)?;
+    if workload.tensors.is_empty() || workload.kv_layers.is_empty() {
+        return Err(PerformanceEstimateFailure::new(
+            "incomplete_native_workload",
+            "native decode workload omitted tensors or KV layers",
+        ));
+    }
+    if configured_context_tokens == 0 || requested_contexts.is_empty() {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_context_curve",
+            "no non-zero occupied context depths were requested",
+        ));
+    }
+
+    let has_routed_tensors = workload
+        .tensors
+        .iter()
+        .any(|tensor| tensor.kind == FitTensorWorkloadKind::RoutedExpert);
+    if has_routed_tensors {
+        active_routed_bytes(1, workload.expert_count, workload.expert_used_count)?;
+    } else if workload.expert_count != 0 || workload.expert_used_count != 0 {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_expert_metadata",
+            "expert metadata is present without routed expert tensors",
+        ));
+    }
+
+    let mut always_active_weight_bytes = 0_u64;
+    let mut routed_expert_weight_bytes = 0_u64;
+    let mut weight_seconds = 0.0_f64;
+    let mut weight_uncertainty_seconds = 0.0_f64;
+    let mut used_fallback_calibration = false;
+    for tensor in &workload.tensors {
+        if tensor.stored_bytes == 0
+            || tensor.operation_bytes == 0
+            || tensor.operation_bytes > tensor.stored_bytes
+        {
+            return Err(PerformanceEstimateFailure::new(
+                "invalid_native_workload",
+                format!("tensor {} has invalid byte counts", tensor.name),
+            ));
+        }
+        let routed = tensor.kind == FitTensorWorkloadKind::RoutedExpert;
+        let active_bytes = if routed {
+            routed_expert_weight_bytes = routed_expert_weight_bytes
+                .checked_add(tensor.stored_bytes)
+                .ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "routed expert tensor accounting overflowed",
+                    )
+                })?;
+            active_routed_bytes(
+                tensor.operation_bytes,
+                workload.expert_count,
+                workload.expert_used_count,
+            )?
+        } else {
+            always_active_weight_bytes = always_active_weight_bytes
+                .checked_add(tensor.operation_bytes)
+                .ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "always-active tensor accounting overflowed",
+                    )
+                })?;
+            tensor.operation_bytes
+        };
+        let selection = calibration_for(
+            calibration,
+            tensor.backend_type,
+            &tensor.backend,
+            &tensor.device_id,
+            tensor.tensor_type,
+            routed,
+        )?;
+        used_fallback_calibration |= !selection.exact;
+        let seconds = operation_seconds(active_bytes, selection.metric);
+        weight_seconds += seconds;
+        weight_uncertainty_seconds += seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+    }
+    if !weight_seconds.is_finite() || weight_seconds <= 0.0 {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_native_workload",
+            "native tensor workload produced no finite work",
+        ));
+    }
+
+    let mut confidence = if has_routed_tensors || workload.hybrid_model {
+        GenerationPerformanceConfidence::Moderate
+    } else {
+        GenerationPerformanceConfidence::High
+    };
+    if used_fallback_calibration || cross_memory_domain_placement || workload.recurrent_model {
+        confidence = GenerationPerformanceConfidence::Low;
+    }
+
+    let mut contexts = requested_contexts
+        .iter()
+        .map(|context| (*context).min(configured_context_tokens))
+        .filter(|context| *context > 0)
+        .collect::<Vec<_>>();
+    contexts.sort_unstable();
+    contexts.dedup();
+    if contexts.is_empty() {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_context_curve",
+            "requested occupied context depths resolve to zero",
+        ));
+    }
+
+    let mut expected_efficiency = if has_routed_tensors {
+        ROUTED_DECODE_EFFICIENCY
+    } else {
+        DENSE_DECODE_EFFICIENCY
+    };
+    if cross_memory_domain_placement {
+        expected_efficiency *= CROSS_DOMAIN_PLACEMENT_EFFICIENCY;
+    }
+    let mut points = Vec::with_capacity(contexts.len());
+    for context_tokens in contexts {
+        let mut kv_bytes_read_per_token = 0_u64;
+        let mut kv_seconds = 0.0_f64;
+        let mut kv_uncertainty_seconds = 0.0_f64;
+        for layer in &workload.kv_layers {
+            let attended_tokens = if layer.sliding_window_tokens == 0 {
+                context_tokens
+            } else {
+                context_tokens.min(layer.sliding_window_tokens)
+            };
+            for (tensor_type, row_bytes) in [
+                (layer.key_type, layer.key_bytes_per_token),
+                (layer.value_type, layer.value_bytes_per_token),
+            ] {
+                let bytes = row_bytes
+                    .checked_mul(u64::from(attended_tokens))
+                    .ok_or_else(|| {
+                        PerformanceEstimateFailure::new(
+                            "workload_overflow",
+                            "KV traffic calculation overflowed",
+                        )
+                    })?;
+                kv_bytes_read_per_token =
+                    kv_bytes_read_per_token.checked_add(bytes).ok_or_else(|| {
+                        PerformanceEstimateFailure::new(
+                            "workload_overflow",
+                            "KV traffic accounting overflowed",
+                        )
+                    })?;
+                let selection = calibration_for(
+                    calibration,
+                    layer.backend_type,
+                    &layer.backend,
+                    &layer.device_id,
+                    tensor_type,
+                    false,
+                )?;
+                if !selection.exact {
+                    confidence = GenerationPerformanceConfidence::Low;
+                }
+                let seconds = operation_seconds(bytes, selection.metric);
+                kv_seconds += seconds;
+                kv_uncertainty_seconds +=
+                    seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+            }
+        }
+        let raw_seconds = weight_seconds + kv_seconds;
+        if !raw_seconds.is_finite() || raw_seconds <= 0.0 {
+            return Err(PerformanceEstimateFailure::new(
+                "invalid_estimate",
+                "generation calculation produced a non-finite token time",
+            ));
+        }
+        let observed_spread = (weight_uncertainty_seconds + kv_uncertainty_seconds) / raw_seconds;
+        let mut uncertainty = (observed_spread * CALIBRATION_SPREAD_WEIGHT)
+            .clamp(MINIMUM_UNCERTAINTY, MAXIMUM_CALIBRATION_UNCERTAINTY);
+        if has_routed_tensors {
+            uncertainty = (uncertainty + ROUTING_UNCERTAINTY).min(MAXIMUM_ROUTED_UNCERTAINTY);
+        }
+        if cross_memory_domain_placement {
+            uncertainty = (uncertainty + CROSS_DOMAIN_PLACEMENT_UNCERTAINTY)
+                .min(MAXIMUM_CROSS_DOMAIN_UNCERTAINTY);
+        }
+        let lower_tokens_per_second = expected_efficiency * (1.0 - uncertainty) / raw_seconds;
+        let expected_tokens_per_second = expected_efficiency / raw_seconds;
+        let upper_tokens_per_second =
+            (expected_efficiency * (1.0 + uncertainty * UPPER_BOUND_UNCERTAINTY_WEIGHT)).min(1.0)
+                / raw_seconds;
+        if [
+            lower_tokens_per_second,
+            expected_tokens_per_second,
+            upper_tokens_per_second,
+        ]
+        .iter()
+        .any(|rate| !rate.is_finite() || *rate <= 0.0)
+        {
+            return Err(PerformanceEstimateFailure::new(
+                "invalid_estimate",
+                "generation calculation produced a non-finite token rate",
+            ));
+        }
+        points.push(GenerationSpeedPoint {
+            context_tokens,
+            kv_bytes_read_per_token,
+            lower_tokens_per_second,
+            expected_tokens_per_second,
+            upper_tokens_per_second,
+        });
+    }
+
+    Ok(GenerationPerformanceAssessment::Estimated {
+        method: GENERATION_PERFORMANCE_METHOD.to_owned(),
+        confidence,
+        workload: GENERATION_PERFORMANCE_WORKLOAD.to_owned(),
+        always_active_weight_bytes,
+        routed_expert_weight_bytes,
+        expert_count: workload.expert_count,
+        expert_used_count: workload.expert_used_count,
+        cross_memory_domain_placement,
+        points,
+    })
+}
+
 /// Assess several product profiles for one model. The requested no-allocation model is
 /// constructed once and llama.cpp constructs an exact context graph for every profile.
 /// Upstream fitting is invoked only for profiles whose requested plan does not fit and
@@ -821,6 +1345,28 @@ pub fn assess_profiles_with_backend(
     requested: &[ExecutionIntent],
     policy: CapacityPolicy,
 ) -> Result<Vec<HardwareAssessment>, AssessmentError> {
+    Ok(assess_profiles_impl(backend, requested, policy, None)?
+        .into_iter()
+        .map(|assessment| assessment.hardware)
+        .collect())
+}
+
+/// Assess several product profiles and attach native baseline-decode performance evidence.
+pub fn assess_execution_profiles_with_backend(
+    backend: &LlamaBackend,
+    requested: &[ExecutionIntent],
+    policy: CapacityPolicy,
+    calibration: &FitCalibration,
+) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
+    assess_profiles_impl(backend, requested, policy, Some(calibration))
+}
+
+fn assess_profiles_impl(
+    backend: &LlamaBackend,
+    requested: &[ExecutionIntent],
+    policy: CapacityPolicy,
+    calibration: Option<&FitCalibration>,
+) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
     if requested.is_empty() {
         return Ok(Vec::new());
     }
@@ -848,12 +1394,20 @@ pub fn assess_profiles_with_backend(
         .iter()
         .map(|plan| plan.context_params.clone())
         .collect::<Vec<_>>();
-    let reports = native[0]
-        .model_params
-        .as_ref()
-        .get_ref()
-        .measure_contexts(&model_path, &contexts, &margins)
-        .map_err(EstimateError::Fit)?;
+    let reports = match calibration {
+        Some(_) => native[0]
+            .model_params
+            .as_ref()
+            .get_ref()
+            .measure_contexts_with_decode_workload(&model_path, &contexts, &margins),
+        None => native[0].model_params.as_ref().get_ref().measure_contexts(
+            &model_path,
+            &contexts,
+            &margins,
+        ),
+    }
+    .map_err(EstimateError::Fit)?;
+    let unified_memory = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 
     requested
         .iter()
@@ -870,18 +1424,26 @@ pub fn assess_profiles_with_backend(
             )?;
             if preferred.fits {
                 let plan = assessed_intent(intent, &report, Measurement::Initial);
-                return Ok(fits_assessment(
-                    &plan,
-                    &preferred,
-                    HardwareRecommendation::Recommended,
-                ));
+                let hardware =
+                    fits_assessment(&plan, &preferred, HardwareRecommendation::Recommended);
+                return Ok(ModelExecutionAssessment {
+                    performance: generation_performance(
+                        &hardware,
+                        &report.decode_workload,
+                        &report.devices,
+                        unified_memory,
+                        calibration,
+                        report.fitted.resolved_context_tokens,
+                    ),
+                    hardware,
+                });
             }
 
             // Every load must store every tensor exactly once in some physical memory
             // domain. llama_model_size is the native model's exact tensor storage, so
             // exceeding aggregate stable capacity is a proof of non-fit, not an estimate.
             if report.model.tensor_bytes > preferred.available_bytes {
-                return Ok(HardwareAssessment::DoesNotFit {
+                let hardware = HardwareAssessment::DoesNotFit {
                     profile: hardware_profile(intent, &preferred),
                     memory: HardwareDeficit {
                         required_bytes: preferred.required_bytes,
@@ -892,10 +1454,36 @@ pub fn assess_profiles_with_backend(
                     },
                     limiting_resource: preferred.limiting_resource,
                     alternative: None,
+                };
+                return Ok(ModelExecutionAssessment {
+                    performance: generation_performance(
+                        &hardware,
+                        &report.decode_workload,
+                        &report.devices,
+                        unified_memory,
+                        calibration,
+                        report.fitted.resolved_context_tokens,
+                    ),
+                    hardware,
                 });
             }
 
-            Ok(assess_with_backend(backend, intent, policy)?.assessment)
+            let assessed = match calibration {
+                Some(_) => assess_intent_with_decode_workload(backend, intent, policy)?,
+                None => assess_with_backend(backend, intent, policy)?,
+            };
+            let performance = generation_performance(
+                &assessed.assessment,
+                &assessed.text_report.decode_workload,
+                &assessed.text_report.devices,
+                unified_memory,
+                calibration,
+                assessed.text_report.fitted.resolved_context_tokens,
+            );
+            Ok(ModelExecutionAssessment {
+                performance,
+                hardware: assessed.assessment,
+            })
         })
         .collect()
 }
@@ -1409,7 +1997,7 @@ pub fn estimate_with_backend(
     backend: &LlamaBackend,
     request: &FitRequest,
 ) -> Result<FitReport, EstimateError> {
-    Ok(plan_fit_with_backend(backend, request, None)?.report)
+    Ok(plan_fit_with_backend(backend, request, None, false)?.report)
 }
 
 /// Estimate an MTP model/context linked to the exact target execution context.
@@ -1418,8 +2006,8 @@ pub fn estimate_linked_with_backend(
     request: &FitRequest,
     target: &FitRequest,
 ) -> Result<FitReport, EstimateError> {
-    let target = plan_fit_with_backend(backend, target, None)?;
-    Ok(plan_fit_with_backend(backend, request, Some(&target.native))?.report)
+    let target = plan_fit_with_backend(backend, target, None, false)?;
+    Ok(plan_fit_with_backend(backend, request, Some(&target.native), false)?.report)
 }
 
 pub struct NativeParameterPlan {
@@ -1509,6 +2097,7 @@ fn plan_fit_with_backend(
     _backend: &LlamaBackend,
     request: &FitRequest,
     linked_target: Option<&NativeParameterPlan>,
+    capture_decode_workload: bool,
 ) -> Result<NativeFitPlan, EstimateError> {
     let mut native = native_parameter_plan(request)?;
     let model_path = path_c_string(&request.model)?;
@@ -1528,6 +2117,17 @@ fn plan_fit_with_backend(
                     model_params: target.model_params.as_ref().get_ref(),
                     context_params: &target.context_params,
                 },
+                &mut margins,
+                request.options.minimum_context_tokens,
+            )
+            .map_err(EstimateError::Fit)?
+    } else if capture_decode_workload {
+        native
+            .model_params
+            .as_mut()
+            .fit_params_report_with_decode_workload(
+                &model_path,
+                &mut native.context_params,
                 &mut margins,
                 request.options.minimum_context_tokens,
             )
@@ -2252,5 +2852,529 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.required_bytes, 700);
+    }
+
+    fn calibration_metric(
+        backend: &str,
+        device_id: &str,
+        tensor_type: i32,
+        routed: bool,
+        bytes_per_second: f64,
+    ) -> FitCalibrationMetric {
+        FitCalibrationMetric {
+            backend_type: 2,
+            backend: backend.to_owned(),
+            device_id: Some(device_id.to_owned()),
+            tensor_type,
+            routed,
+            bytes_per_second,
+            launch_microseconds: 0.0,
+            relative_spread: 0.0,
+        }
+    }
+
+    fn calibration(metrics: Vec<FitCalibrationMetric>) -> FitCalibration {
+        FitCalibration {
+            method: llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD.to_owned(),
+            metrics,
+            elapsed_microseconds: 1,
+        }
+    }
+
+    fn tensor(
+        name: &str,
+        kind: FitTensorWorkloadKind,
+        stored_bytes: u64,
+        operation_bytes: u64,
+        tensor_type: i32,
+        backend: &str,
+        device_id: &str,
+    ) -> llama_cpp_2::model::params::fit::FitTensorWorkload {
+        llama_cpp_2::model::params::fit::FitTensorWorkload {
+            name: name.to_owned(),
+            backend_type: 2,
+            backend: backend.to_owned(),
+            device_id: Some(device_id.to_owned()),
+            tensor_type,
+            kind,
+            stored_bytes,
+            operation_bytes,
+        }
+    }
+
+    fn kv_layer(
+        layer: u32,
+        row_bytes: u64,
+        sliding_window_tokens: u32,
+        recurrent: bool,
+        backend: &str,
+        device_id: &str,
+    ) -> llama_cpp_2::model::params::fit::FitKvLayerWorkload {
+        llama_cpp_2::model::params::fit::FitKvLayerWorkload {
+            layer,
+            backend_type: 2,
+            backend: backend.to_owned(),
+            device_id: Some(device_id.to_owned()),
+            key_type: 1,
+            value_type: 1,
+            key_bytes_per_token: row_bytes,
+            value_bytes_per_token: row_bytes,
+            sliding_window_tokens,
+            recurrent,
+        }
+    }
+
+    fn workload(
+        tensors: Vec<llama_cpp_2::model::params::fit::FitTensorWorkload>,
+        kv_layers: Vec<llama_cpp_2::model::params::fit::FitKvLayerWorkload>,
+        expert_count: u32,
+        expert_used_count: u32,
+    ) -> FitDecodeWorkload {
+        FitDecodeWorkload {
+            method: llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD.to_owned(),
+            expert_count,
+            expert_used_count,
+            hybrid_model: false,
+            recurrent_model: kv_layers.iter().any(|layer| layer.recurrent),
+            tensors,
+            kv_layers,
+        }
+    }
+
+    fn performance_device(
+        index: usize,
+        kind: FitDeviceKind,
+        backend_type: i32,
+        backend: &str,
+        device_id: &str,
+    ) -> FitDeviceEstimate {
+        FitDeviceEstimate {
+            index,
+            kind,
+            backend_type,
+            backend: backend.to_owned(),
+            device_id: Some(device_id.to_owned()),
+            name: device_id.to_owned(),
+            description: device_id.to_owned(),
+            initial: None,
+            fitted: None,
+            margin_bytes: None,
+        }
+    }
+
+    #[test]
+    fn apple_cpu_and_metal_workload_share_one_performance_memory_domain() {
+        let workload = workload(
+            vec![tensor(
+                "token_embd.weight",
+                FitTensorWorkloadKind::RowLookup,
+                10_000,
+                100,
+                1,
+                "CPU",
+                "CPU",
+            )],
+            vec![kv_layer(0, 10, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let devices = [
+            performance_device(0, FitDeviceKind::Host, 2, "CPU", "CPU"),
+            performance_device(1, FitDeviceKind::Accelerator, 2, "Metal", "MTL0"),
+        ];
+
+        assert!(!workload_crosses_memory_domains(&workload, &devices, true).unwrap());
+    }
+
+    #[test]
+    fn workload_on_distinct_accelerator_memory_domains_is_cross_domain() {
+        let mut workload = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "CUDA",
+                "GPU0",
+            )],
+            vec![kv_layer(0, 10, 0, false, "CUDA", "GPU1")],
+            0,
+            0,
+        );
+        workload.tensors[0].backend_type = 1;
+        workload.kv_layers[0].backend_type = 1;
+        let devices = [
+            performance_device(0, FitDeviceKind::Accelerator, 1, "CUDA", "GPU0"),
+            performance_device(1, FitDeviceKind::Accelerator, 1, "CUDA", "GPU1"),
+        ];
+
+        assert!(workload_crosses_memory_domains(&workload, &devices, false).unwrap());
+    }
+
+    fn estimated_parts(
+        assessment: GenerationPerformanceAssessment,
+    ) -> (
+        GenerationPerformanceConfidence,
+        u64,
+        u64,
+        bool,
+        Vec<GenerationSpeedPoint>,
+    ) {
+        let GenerationPerformanceAssessment::Estimated {
+            confidence,
+            always_active_weight_bytes,
+            routed_expert_weight_bytes,
+            cross_memory_domain_placement,
+            points,
+            ..
+        } = assessment
+        else {
+            panic!("expected generation estimate")
+        };
+        (
+            confidence,
+            always_active_weight_bytes,
+            routed_expert_weight_bytes,
+            cross_memory_domain_placement,
+            points,
+        )
+    }
+
+    #[test]
+    fn dense_estimator_uses_native_operation_bytes_and_context_kv_traffic() {
+        let workload = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                800,
+                800,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 10, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let (confidence, always_bytes, routed_bytes, hybrid, points) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 20, &[10, 20], false).unwrap(),
+        );
+        assert_eq!(confidence, GenerationPerformanceConfidence::High);
+        assert_eq!(always_bytes, 800);
+        assert_eq!(routed_bytes, 0);
+        assert!(!hybrid);
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].kv_bytes_read_per_token, 200);
+        assert_eq!(points[1].kv_bytes_read_per_token, 400);
+        assert!((points[0].expected_tokens_per_second - 0.82).abs() < 1e-12);
+        assert!((points[1].expected_tokens_per_second - (0.82 / 1.2)).abs() < 1e-12);
+        assert!(points.iter().all(|point| {
+            point.lower_tokens_per_second <= point.expected_tokens_per_second
+                && point.expected_tokens_per_second <= point.upper_tokens_per_second
+        }));
+    }
+
+    #[test]
+    fn row_lookups_do_not_charge_the_complete_embedding_table() {
+        let workload = workload(
+            vec![tensor(
+                "token_embd.weight",
+                FitTensorWorkloadKind::RowLookup,
+                10_000,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 1, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let (_, always_bytes, _, _, _) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 10, &[10], false).unwrap(),
+        );
+        assert_eq!(always_bytes, 100);
+    }
+
+    #[test]
+    fn moe_estimator_scales_only_routed_pools_by_selected_experts() {
+        let workload = workload(
+            vec![
+                tensor(
+                    "blk.0.ffn_gate.weight",
+                    FitTensorWorkloadKind::AlwaysActive,
+                    400,
+                    400,
+                    1,
+                    "Metal",
+                    "MTL0",
+                ),
+                tensor(
+                    "blk.0.ffn_gate_exps.weight",
+                    FitTensorWorkloadKind::RoutedExpert,
+                    800,
+                    800,
+                    1,
+                    "Metal",
+                    "MTL0",
+                ),
+            ],
+            vec![kv_layer(0, 5, 0, false, "Metal", "MTL0")],
+            8,
+            2,
+        );
+        let calibration = calibration(vec![
+            calibration_metric("Metal", "MTL0", 1, false, 1_000.0),
+            calibration_metric("Metal", "MTL0", 1, true, 1_000.0),
+        ]);
+        let (confidence, always_bytes, routed_bytes, _, points) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 10, &[10], false).unwrap(),
+        );
+        assert_eq!(confidence, GenerationPerformanceConfidence::Moderate);
+        assert_eq!(always_bytes, 400);
+        assert_eq!(routed_bytes, 800);
+        // 400 always-active + 200 selected expert + 100 KV bytes at 1,000 B/s.
+        assert!((points[0].expected_tokens_per_second - (0.75 / 0.7)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sliding_window_caps_only_its_own_layer() {
+        let workload = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![
+                kv_layer(0, 5, 0, false, "Metal", "MTL0"),
+                kv_layer(1, 5, 10, false, "Metal", "MTL0"),
+            ],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let (_, _, _, _, points) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 20, &[10, 20], false).unwrap(),
+        );
+        assert_eq!(points[0].kv_bytes_read_per_token, 200);
+        assert_eq!(points[1].kv_bytes_read_per_token, 300);
+        assert!(points[1].expected_tokens_per_second < points[0].expected_tokens_per_second);
+    }
+
+    #[test]
+    fn cross_domain_placement_and_calibration_fallback_are_conservative() {
+        let workload = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                7,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 5, 0, false, "CPU", "CPU")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![
+            calibration_metric("Metal", "MTL0", 1, false, 1_000.0),
+            calibration_metric("Metal", "MTL0", 2, false, 500.0),
+            calibration_metric("CPU", "CPU", 1, false, 500.0),
+        ]);
+        let (confidence, _, _, hybrid, points) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 10, &[10], true).unwrap(),
+        );
+        assert_eq!(confidence, GenerationPerformanceConfidence::Low);
+        assert!(hybrid);
+        // Unknown Metal type 7 uses the slower same-operation fallback (type 2 at 500 B/s).
+        assert!((points[0].expected_tokens_per_second - (0.82 * 0.88 / 0.4)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn more_active_weights_or_experts_never_improve_the_estimate() {
+        let calibration = calibration(vec![
+            calibration_metric("Metal", "MTL0", 1, false, 1_000.0),
+            calibration_metric("Metal", "MTL0", 1, true, 1_000.0),
+        ]);
+        let make_workload = |always_active_bytes, expert_used_count| {
+            workload(
+                vec![
+                    tensor(
+                        "output.weight",
+                        FitTensorWorkloadKind::AlwaysActive,
+                        always_active_bytes,
+                        always_active_bytes,
+                        1,
+                        "Metal",
+                        "MTL0",
+                    ),
+                    tensor(
+                        "blk.0.ffn_exps.weight",
+                        FitTensorWorkloadKind::RoutedExpert,
+                        800,
+                        800,
+                        1,
+                        "Metal",
+                        "MTL0",
+                    ),
+                ],
+                vec![kv_layer(0, 1, 0, false, "Metal", "MTL0")],
+                8,
+                expert_used_count,
+            )
+        };
+        let rate = |workload: &FitDecodeWorkload| {
+            estimated_parts(
+                estimate_generation_performance(workload, &calibration, 10, &[10], false).unwrap(),
+            )
+            .4[0]
+                .expected_tokens_per_second
+        };
+
+        let baseline = rate(&make_workload(100, 1));
+        assert!(rate(&make_workload(200, 1)) < baseline);
+        assert!(rate(&make_workload(100, 4)) < baseline);
+    }
+
+    #[test]
+    fn incomplete_moe_and_calibration_evidence_fail_typed() {
+        let invalid_moe = workload(
+            vec![tensor(
+                "blk.0.ffn_exps.weight",
+                FitTensorWorkloadKind::RoutedExpert,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 1, 0, false, "Metal", "MTL0")],
+            8,
+            0,
+        );
+        let dense_only = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let error = estimate_generation_performance(&invalid_moe, &dense_only, 10, &[10], false)
+            .expect_err("invalid expert metadata must fail");
+        assert_eq!(error.code, "invalid_expert_metadata");
+
+        let valid_moe = FitDecodeWorkload {
+            expert_used_count: 2,
+            ..invalid_moe
+        };
+        let error = estimate_generation_performance(&valid_moe, &dense_only, 10, &[10], false)
+            .expect_err("dense calibration must not substitute for routed work");
+        assert_eq!(error.code, "calibration_coverage_missing");
+
+        let dense = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 1, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let mut malformed = dense_only.clone();
+        malformed.metrics.push(calibration_metric(
+            "unused-backend",
+            "unused-device",
+            1,
+            false,
+            f64::NAN,
+        ));
+        let error = estimate_generation_performance(&dense, &malformed, 10, &[10], false)
+            .expect_err("every calibration metric must be validated before use");
+        assert_eq!(error.code, "invalid_calibration");
+    }
+
+    #[test]
+    fn kv_overflow_and_recurrent_workloads_are_handled_conservatively() {
+        let mut recurrent = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 1, 0, true, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let (confidence, _, _, _, _) = estimated_parts(
+            estimate_generation_performance(&recurrent, &calibration, 10, &[10], false).unwrap(),
+        );
+        assert_eq!(confidence, GenerationPerformanceConfidence::Low);
+
+        recurrent.kv_layers[0].key_bytes_per_token = u64::MAX;
+        let error = estimate_generation_performance(&recurrent, &calibration, 2, &[2], false)
+            .expect_err("KV byte overflow must fail");
+        assert_eq!(error.code, "workload_overflow");
+    }
+
+    #[test]
+    fn non_fitting_configuration_never_exposes_a_speed_estimate() {
+        let hardware = HardwareAssessment::DoesNotFit {
+            profile: HardwareProfile {
+                context_length: 200_000,
+                acceleration: "cpu".to_owned(),
+                device: "system".to_owned(),
+            },
+            memory: HardwareDeficit {
+                required_bytes: 2,
+                available_bytes: 1,
+                deficit_bytes: 1,
+                domains: Vec::new(),
+                device_constraints: Vec::new(),
+            },
+            limiting_resource: "system".to_owned(),
+            alternative: None,
+        };
+        let performance = generation_performance(
+            &hardware,
+            &FitDecodeWorkloadAssessment::Available {
+                workload: workload(
+                    vec![tensor(
+                        "output.weight",
+                        FitTensorWorkloadKind::AlwaysActive,
+                        1,
+                        1,
+                        1,
+                        "CPU",
+                        "CPU",
+                    )],
+                    vec![kv_layer(0, 1, 0, false, "CPU", "CPU")],
+                    0,
+                    0,
+                ),
+            },
+            &[],
+            false,
+            Some(&calibration(vec![calibration_metric(
+                "CPU", "CPU", 1, false, 1_000.0,
+            )])),
+            8_192,
+        );
+        assert!(matches!(
+            performance,
+            GenerationPerformanceAssessment::Unavailable { ref code, .. }
+                if code == "configuration_does_not_fit"
+        ));
     }
 }

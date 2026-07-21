@@ -137,8 +137,8 @@ may still offer deletion. Their presence does not weaken the property invariant 
 ## Model-derived cache
 
 ICN model management owns one cache for all recomputable facts derived from local or remote model
-artifacts. Inventory, artifact resolution, metadata inspection, reasoning detection, and hardware
-assessment are domains within this cache, not independent cache systems. ACN and clients never
+artifacts. Inventory, artifact resolution, metadata inspection, reasoning detection, hardware
+assessment, and profile execution assessment are domains within this cache, not independent cache systems. ACN and clients never
 read, write, or construct paths inside it.
 
 The cache lives below the configured model-store root and has two top-level data forms:
@@ -160,6 +160,8 @@ The cache lives below the configured model-store root and has two top-level data
       assessments/
         hardware/
           <assessment-key>.json
+        execution/
+          <assessment-key>.json
 ```
 
 Blobs are exact byte sequences acquired from an authoritative source and retained to avoid
@@ -168,9 +170,11 @@ validated for expected length, digest, and domain-specific structure before use.
 
 Indexes are computed structured projections regenerated from authoritative artifacts, validated
 blobs, runtime state, hardware state, or other current inputs. The inventory, resolved artifacts,
-artifact inspections (including template and reasoning results), and hardware assessments are
-indexes. Each index key covers every input capable of changing its result. Invalid or incomplete
-entries are misses at the smallest independently recomputable unit.
+artifact inspections (including template and reasoning results), hardware assessments, and preview
+execution assessments are indexes. An execution assessment atomically contains the hardware fit
+and optional generation-performance evidence produced from that same native placement. Each index
+key covers every input capable of changing its result. Invalid or incomplete entries are misses at
+the smallest independently recomputable unit.
 
 The distinction controls identity, validation, and garbage collection, but not failure behavior.
 Both use the shared [file-based cache and recovery contract](../misc/file-based-caching.md). One
@@ -181,7 +185,7 @@ creating another persistence mechanism. `icn-utils` supplies no-fail file mechan
 nothing about model domains or evidence keys.
 
 Cache lookup precedes expensive source materialization. When the resolved-artifact index, artifact
-inspection, and every requested hardware assessment are independently valid, preview assembles its
+inspection, and every requested execution assessment are independently valid, preview assembles its
 response from those indexes without opening header blobs, constructing sparse files, running GGUF
 or template inspection, querying the remote source, or invoking native planning. A source blob is
 required to recompute a missing derived fact; its later deletion does not invalidate an otherwise
@@ -195,7 +199,7 @@ immutable remote sources -> blobs -+-> artifact index -> inspection indexes
                                                         |              |
 runtime/template policy --------------------------------+              |
                                                                        v
-hardware + execution profile ---------------------------> hardware assessment index
+hardware + execution profile ---------------------------> execution assessment index
                                                                        |
                                                                        v
                                                            inventory index projection
@@ -265,7 +269,8 @@ The implementation satisfies this design when:
 - all ICN model-derived persistence is under the one model-management cache root and is classified
   as either a source blob or a computed index;
 - domain code does not construct cache paths or create feature-specific cache services;
-- preview and available flows reuse identical typed results exactly when their evidence keys match;
+- preview and available flows reuse identical typed results within their cache domains exactly when
+  their evidence keys match;
 - deleting or making the complete cache unwritable does not change computed results or fail an
   otherwise successful operation;
 - simultaneous lists share one ensure operation;
