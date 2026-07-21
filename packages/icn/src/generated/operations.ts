@@ -317,6 +317,78 @@ export const previewModelOperation = {
   payloadRequired: true,
 } as const
 
+export const resolveHuggingFaceRepositoryOperation = {
+  operationId: "resolveHuggingFaceRepository",
+  transport: "http",
+  method: "POST",
+  path: "/v1/hugging-face/models/resolve",
+  group: "hugging-face",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.HuggingFaceRepositorySnapshotSchema, Schemas.HuggingFaceRepositorySnapshotSchemaEncoded> =>
+          Schemas.HuggingFaceRepositorySnapshotSchema,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.HuggingFaceRepositoryRequestSchema, Schemas.HuggingFaceRepositoryRequestSchemaEncoded> =>
+      Schemas.HuggingFaceRepositoryRequestSchema,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const searchHuggingFaceModelsOperation = {
+  operationId: "searchHuggingFaceModels",
+  transport: "http",
+  method: "POST",
+  path: "/v1/hugging-face/models/search",
+  group: "hugging-face",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.HuggingFaceModelSearchResultsSchema, Schemas.HuggingFaceModelSearchResultsSchemaEncoded> =>
+          Schemas.HuggingFaceModelSearchResultsSchema,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.HuggingFaceModelSearchRequestSchema, Schemas.HuggingFaceModelSearchRequestSchemaEncoded> =>
+      Schemas.HuggingFaceModelSearchRequestSchema,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
 export const unloadRuntimeModelOperation = {
   operationId: "unloadRuntimeModel",
   transport: "http",

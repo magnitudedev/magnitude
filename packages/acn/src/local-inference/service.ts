@@ -14,7 +14,11 @@ import {
 } from "@magnitudedev/protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { makeMirroredState, MirroredStateChanges } from "../mirrored-state"
-import { LOCAL_MODEL_CATALOG, catalogSourcePageUrl } from "./catalog"
+import {
+  LOCAL_MODEL_CATALOG_OVERLAY,
+  catalogSourcePageUrl,
+  resolveCatalogArtifact,
+} from "./catalog"
 import type { LocalModelCatalogEntry } from "./types"
 import { LocalModelInventoryChanges } from "./inventory-changes"
 import { LocalModelConfiguration } from "./model-configuration"
@@ -29,6 +33,12 @@ const TERMINAL_OPERATION_HISTORY = 24
 
 interface RecommendationResult {
   readonly recommendations: readonly LocalModelRecommendation[]
+  readonly failureCount: number
+}
+
+interface ResolvedCatalog {
+  readonly entries: readonly LocalModelCatalogEntry[]
+  readonly commits: readonly string[]
   readonly failureCount: number
 }
 
@@ -288,11 +298,51 @@ export const LocalInferenceLive: Layer.Layer<
   const activity = yield* AcnActivityTracker
   const serviceScope = yield* Scope.Scope
   const recommendationCache = yield* Ref.make<ReadonlyMap<string, RecommendationResult>>(new Map())
+  const resolvedCatalog = yield* Ref.make<ReadonlyMap<string, LocalModelCatalogEntry>>(new Map())
   const lock = yield* Effect.makeSemaphore(1)
   const recommendationRefreshLock = yield* Effect.makeSemaphore(1)
 
-  const previews = (hardware: Generated.HardwareSnapshotSchema) => Effect.forEach(
-    LOCAL_MODEL_CATALOG,
+  const resolveHubRepository = (repository: string) => Effect.gen(function* () {
+    return yield* client.huggingFace.resolveHuggingFaceRepository({
+      payload: { repository, revision: "main" },
+    })
+  })
+
+  const resolveCanonicalCatalog = Effect.gen(function* () {
+    const repositories = [...new Set(LOCAL_MODEL_CATALOG_OVERLAY.models.flatMap((model) =>
+      model.artifacts.map((candidate) => candidate.repository)))]
+    const results = yield* Effect.forEach(
+      repositories,
+      (repository) => resolveHubRepository(repository).pipe(
+        Effect.map((snapshot) => [repository, snapshot] as const),
+        Effect.either,
+      ),
+      { concurrency: PREVIEW_REQUEST_CONCURRENCY },
+    )
+    const snapshots = new Map(results.flatMap((result) => result._tag === "Right" ? [result.right] : []))
+    const entries = LOCAL_MODEL_CATALOG_OVERLAY.models.flatMap((model) => model.artifacts.flatMap((candidate) => {
+      const snapshot = snapshots.get(candidate.repository)
+      if (!snapshot) return []
+      const entry = resolveCatalogArtifact(model, candidate, {
+        repository: snapshot.repository,
+        commit: snapshot.commit,
+        license: Option.getOrNull(snapshot.license),
+        license_url: Option.getOrNull(snapshot.license_url),
+        gguf_files: snapshot.gguf_files,
+      })
+      return entry ? [entry] : []
+    }))
+    yield* Ref.set(resolvedCatalog, new Map(entries.map((entry) => [entry.id, entry])))
+    return {
+      entries,
+      commits: [...snapshots.entries()].map(([repository, snapshot]) => `${repository}@${snapshot.commit}`).sort(),
+      failureCount: LOCAL_MODEL_CATALOG_OVERLAY.models.reduce((count, model) => count + model.artifacts.length, 0)
+        - entries.length,
+    } satisfies ResolvedCatalog
+  })
+
+  const previews = (hardware: Generated.HardwareSnapshotSchema, entries: readonly LocalModelCatalogEntry[]) => Effect.forEach(
+    entries,
     (entry) => {
       const contexts = PROFILE_CONTEXTS.filter((context) => entry.supportedContextTokens.includes(context))
       return client.models.previewModel({
@@ -312,16 +362,23 @@ export const LocalInferenceLive: Layer.Layer<
     onLoading: Effect.Effect<void, LocalInferenceError> = Effect.void,
   ) => Effect.gen(function* () {
     const hardware = yield* client.system.getHardware({})
+    yield* onLoading
+    const catalog = yield* resolveCanonicalCatalog
     const key = [
       hardware.native_build,
       hardware.topology_fingerprint,
       hardware.capacity_policy,
       hardware.assessment_policy,
+      ...catalog.commits,
     ].join(":")
     const cached = (yield* Ref.get(recommendationCache)).get(key)
     if (cached) return cached
-    yield* onLoading
-    const previewResults = yield* previews(hardware)
+    const totalStableCapacity = hardware.memory_domains.reduce(
+      (total, domain) => total + domain.stable_capacity_bytes,
+      0,
+    )
+    const plausibleEntries = catalog.entries.filter((entry) => entry.publishedWeightBytes <= totalStableCapacity)
+    const previewResults = yield* previews(hardware, plausibleEntries)
     const items = previewResults.flatMap((result) => result._tag === "Right" ? [result.right] : [])
     const candidates = items.flatMap(({ entry, preview }) => preview.assessments.flatMap((assessment) => {
       const value = recommendationFrom(entry, preview, assessment)
@@ -335,7 +392,7 @@ export const LocalInferenceLive: Layer.Layer<
     const recommendations = selectRecommendationPortfolio(candidates)
     const result = {
       recommendations,
-      failureCount: previewResults.length - items.length,
+      failureCount: catalog.failureCount + previewResults.length - items.length,
     }
     yield* Ref.update(recommendationCache, (current) => new Map(current).set(key, result))
     return result
@@ -348,7 +405,7 @@ export const LocalInferenceLive: Layer.Layer<
     )
     const recommendation = recommendationList.recommendations.find((item) => item.configurationId === selectionId || item.catalogModelId === selectionId)
     const catalogId = recommendation?.catalogModelId ?? config.selectedProfile?.catalogModelId
-    return catalogId ? LOCAL_MODEL_CATALOG.find((entry) => entry.id === catalogId) : undefined
+    return catalogId ? (yield* Ref.get(resolvedCatalog)).get(catalogId) : undefined
   })
 
   const resolveStoredModel = (selectionId: string) => Effect.gen(function* () {
@@ -544,18 +601,16 @@ export const LocalInferenceLive: Layer.Layer<
       ? current.recommendationState.recommendations.find((item) => item.configurationId === configurationId)
       : undefined
     if (!recommendation) return yield* localError("invalid_selection", "download local model", "The selected recommendation is no longer available.", false)
-    const entry = LOCAL_MODEL_CATALOG.find((candidate) => candidate.id === recommendation.catalogModelId)
-    if (!entry) return yield* localError("invalid_selection", "download local model", "Unknown catalog model.", false)
     yield* configuration.selectProfile({
       configurationId,
-      catalogModelId: entry.id,
+      catalogModelId: recommendation.catalogModelId,
       contextTokens: recommendation.contextTokens,
     }).pipe(Effect.mapError((cause) => localError("configuration_failed", "save local model selection", cause)))
     return yield* runAccepted(
-      acceptOperation(requestId, "download", { _tag: "configuration", configurationId }, ProviderModelIdSchema.make(entry.id)),
+      acceptOperation(requestId, "download", { _tag: "configuration", configurationId }, ProviderModelIdSchema.make(recommendation.catalogModelId)),
       (operation) => {
         const request: Generated.DownloadModelRequestSchema = {
-          source: { type: "hugging_face", repository: entry.repo, revision: entry.revision },
+          source: { type: "hugging_face", repository: recommendation.repo, revision: recommendation.revision },
           components: recommendation.files.map((file, index) => ({
             path: file.path,
             role: file.role,
@@ -571,8 +626,8 @@ export const LocalInferenceLive: Layer.Layer<
               : event.type === "checking_space" || event.type === "progress"
                 ? event.model_id
                 : event.type === "failed"
-                  ? Option.getOrNull(event.model_id) ?? entry.id
-                  : entry.id
+                  ? Option.getOrNull(event.model_id) ?? recommendation.catalogModelId
+                  : recommendation.catalogModelId
             const total = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.total_bytes : 0
             const completed = event.type === "checking_space" || event.type === "progress" || event.type === "failed" ? event.completed_bytes : 0
             return setOperation({

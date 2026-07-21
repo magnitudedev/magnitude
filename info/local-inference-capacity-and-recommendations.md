@@ -4,11 +4,20 @@ ICN is the only authority for inference hardware, artifact inspection, model fit
 downloads, and active runtime state. CLI and web actions call ACN RPCs; ACN translates those actions
 to the generated ICN client. ACN never treats its own host as the inference machine.
 
-The curated catalog contains product and source policy only: display/family identity, immutable
-repository source, primary artifact selector, context profiles to assess, quality ordering,
-fidelity guidance, and license policy. Artifact size, hashes, shard membership, architecture,
-parameter counts, quantization, maximum context, placement, and memory requirements come from
-`POST /v1/models/preview`.
+The versioned canonical catalog is a Magnitude metadata overlay. It groups quantized choices under
+stable checkpoint identities and records repository IDs, artifact selectors, product context
+profiles, reviewed performance and fidelity evidence, and license policy. It does not pin Hugging
+Face commits or copy filenames, shard lists, sizes, or hashes into source.
+
+ICN queries Hugging Face, resolves `main` to an immutable snapshot, and returns current files,
+sizes, identities, license data, and commit provenance. Preview and download then use that exact
+commit. ICN derives GGUF architecture, parameter counts, quantization, maximum context, placement,
+memory, and generation speed from artifact metadata. Arbitrary GGUF repositories use the same
+resolution and preview path but have no curated Magnitude quality or fidelity claims.
+
+Live discovery is cached by ICN: search results are brief, repository snapshots have a short TTL,
+and GGUF headers plus fit/performance assessments are content-addressed by immutable artifact and
+hardware evidence. No model weights are downloaded until the user chooses a model.
 
 For each usage choice ACN submits the applicable context and parallel-sequence profiles to preview,
 keeps only complete `Fits` results, and ranks them with the curated product policy. The UI continues

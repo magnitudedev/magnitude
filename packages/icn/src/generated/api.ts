@@ -124,6 +124,55 @@ export const previewModel = HttpApiEndpoint.post("previewModel", "/v1/models/pre
     { status: 500 },
   )
 
+export const resolveHuggingFaceRepository = HttpApiEndpoint.post(
+  "resolveHuggingFaceRepository",
+  "/v1/hugging-face/models/resolve",
+)
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.HuggingFaceRepositoryRequestSchema, Schemas.HuggingFaceRepositoryRequestSchemaEncoded> =>
+        Schemas.HuggingFaceRepositoryRequestSchema,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.HuggingFaceRepositorySnapshotSchema, Schemas.HuggingFaceRepositorySnapshotSchemaEncoded> =>
+        Schemas.HuggingFaceRepositorySnapshotSchema,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const searchHuggingFaceModels = HttpApiEndpoint.post("searchHuggingFaceModels", "/v1/hugging-face/models/search")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.HuggingFaceModelSearchRequestSchema, Schemas.HuggingFaceModelSearchRequestSchemaEncoded> =>
+        Schemas.HuggingFaceModelSearchRequestSchema,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.HuggingFaceModelSearchResultsSchema, Schemas.HuggingFaceModelSearchResultsSchemaEncoded> =>
+        Schemas.HuggingFaceModelSearchResultsSchema,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const unloadRuntimeModel = HttpApiEndpoint.del("unloadRuntimeModel", "/v1/runtime/model")
   .addSuccess(
     S.suspend(
@@ -142,6 +191,10 @@ export const unloadRuntimeModel = HttpApiEndpoint.del("unloadRuntimeModel", "/v1
 
 export const ChatGroup = HttpApiGroup.make("chat").add(applyChatTemplate)
 
+export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
+  .add(resolveHuggingFaceRepository)
+  .add(searchHuggingFaceModels)
+
 export const ModelsGroup = HttpApiGroup.make("models")
   .add(deleteModel)
   .add(getModel)
@@ -153,4 +206,9 @@ export const RuntimeGroup = HttpApiGroup.make("runtime").add(getRuntimeState).ad
 
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
-export const IcnApi = HttpApi.make("IcnApi").add(ChatGroup).add(ModelsGroup).add(RuntimeGroup).add(SystemGroup)
+export const IcnApi = HttpApi.make("IcnApi")
+  .add(ChatGroup)
+  .add(HuggingFaceGroup)
+  .add(ModelsGroup)
+  .add(RuntimeGroup)
+  .add(SystemGroup)

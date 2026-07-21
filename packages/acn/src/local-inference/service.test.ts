@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Schema } from "effect"
 import { Generated } from "@magnitudedev/icn"
 import type { LocalModelRecommendation } from "@magnitudedev/protocol"
-import { LOCAL_MODEL_CATALOG } from "./catalog"
+import { LOCAL_MODEL_CATALOG_OVERLAY } from "./catalog"
 import {
   hostToWire,
   selectRecommendationPortfolio,
@@ -128,7 +128,7 @@ describe("local inference hardware projection", () => {
 
 describe("local model recommendation policy", () => {
   it("assesses only 100K and 200K product contexts", () => {
-    expect(new Set(LOCAL_MODEL_CATALOG.flatMap((entry) => entry.supportedContextTokens)))
+    expect(new Set(LOCAL_MODEL_CATALOG_OVERLAY.models.flatMap((model) => model.productContextTokens)))
       .toEqual(new Set([100_000, 200_000]))
   })
 

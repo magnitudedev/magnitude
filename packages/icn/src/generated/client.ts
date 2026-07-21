@@ -16,6 +16,14 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         applyChatTemplate: makeHttpOperation(http, options, Operations.applyChatTemplateOperation),
         createChatCompletion: makeStreamOperation(http, options, Operations.createChatCompletionOperation),
       },
+      huggingFace: {
+        resolveHuggingFaceRepository: makeHttpOperation(
+          http,
+          options,
+          Operations.resolveHuggingFaceRepositoryOperation,
+        ),
+        searchHuggingFaceModels: makeHttpOperation(http, options, Operations.searchHuggingFaceModelsOperation),
+      },
       models: {
         deleteModel: makeHttpOperation(http, options, Operations.deleteModelOperation),
         getModel: makeHttpOperation(http, options, Operations.getModelOperation),
