@@ -1538,6 +1538,7 @@ mod tests {
                     enabled_backends: vec!["cpu".to_owned()],
                     topology_fingerprint: "topology".to_owned(),
                     memory_domains: Vec::new(),
+                    resident_memory: None,
                 })
             })
         }

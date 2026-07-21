@@ -79,6 +79,11 @@ There are three bounded flows:
 - each request's native-to-caller event channel bounds transport buffering;
 - each active request's small outbound queue decouples native scheduling from a briefly slow consumer.
 
+Read-only hardware observations share the bounded model command channel. They run between scheduler
+batches and may inspect backend device memory plus
+immutable generation allocation evidence. They cannot mutate model/context state, plan a load, or
+delay until all inference becomes idle. General native planning callbacks remain idle-only.
+
 This design avoids unbounded queues and makes overload explicit. It also means synchronous native work and current KV tier I/O can pause progress for all sequences owned by that executor.
 
 ## Request lifecycle
@@ -108,13 +113,14 @@ ordinary native execution option, not a prerequisite for a Magnitude-specific pa
 Each executor iteration performs a bounded amount of orchestration:
 
 1. Drain new commands.
-2. Run exclusive native tasks only if inference is idle.
-3. Clean up terminal or disconnected requests.
-4. Admit queued completions while sequences and KV capacity permit.
-5. Sample requests whose logits are ready and update committed sequence histories.
-6. Build and execute one decode/prefill batch.
-7. Flush outputs and clean up again.
-8. Poll for commands briefly when no native work ran.
+2. Service one read-only hardware observation when pending.
+3. Run exclusive native tasks only if inference is idle.
+4. Clean up terminal or disconnected requests.
+5. Admit queued completions while sequences and KV capacity permit.
+6. Sample requests whose logits are ready and update committed sequence histories.
+7. Build and execute one decode/prefill batch.
+8. Flush outputs and clean up again.
+9. Poll for commands briefly when no native work ran.
 
 The detailed admission and batching policy is in [scheduler.md](./scheduler.md). The important architectural property is that scheduling decisions and the KV mutations they depend on occur under the same single-owner loop.
 

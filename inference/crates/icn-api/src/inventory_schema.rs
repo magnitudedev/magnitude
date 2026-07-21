@@ -56,7 +56,9 @@ pub struct HardwareDeviceMemoryLimitSchema {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HardwareDeviceSchema {
     id: String,
+    native_index: usize,
     backend: String,
+    physical_id: Option<String>,
     name: String,
     description: String,
     kind: HardwareDeviceKindSchema,
@@ -81,6 +83,22 @@ pub struct HardwareSystemMemorySchema {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct ResidentMemoryDomainSchema {
+    memory_domain_id: String,
+    model_bytes: u64,
+    context_bytes: u64,
+    compute_bytes: u64,
+    auxiliary_bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResidentMemorySchema {
+    model_id: String,
+    runtime_generation: u64,
+    domains: Vec<ResidentMemoryDomainSchema>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HardwareSnapshotSchema {
     captured_at: u64,
     platform: String,
@@ -92,6 +110,7 @@ pub struct HardwareSnapshotSchema {
     enabled_backends: Vec<String>,
     topology_fingerprint: String,
     memory_domains: Vec<HardwareMemoryDomainSchema>,
+    resident_memory: Option<ResidentMemorySchema>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -306,6 +306,7 @@ test("recommendations show a human-readable detected hardware panel before model
       profile: {
         platform: "macos",
         architecture: "aarch64",
+        topologyFingerprint: "test",
         systemMemoryBytes: 64 * gib,
         cpuModel: "Apple M4 Max",
         logicalCores: 16,
@@ -320,6 +321,7 @@ test("recommendations show a human-readable detected hardware panel before model
           deviceNames: ["Apple M4 Max"],
           splitGroupId: null,
         }],
+        residentMemory: null,
       },
     },
     recommendationState: { _tag: "Ready", recommendations: [recommendedModel] },

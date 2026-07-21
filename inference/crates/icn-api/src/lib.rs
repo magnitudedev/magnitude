@@ -3286,6 +3286,7 @@ mod tests {
                     "native_build": "test-build",
                     "enabled_backends": ["cpu"],
                     "topology_fingerprint": "topology",
+                    "resident_memory": null,
                     "memory_domains": [{
                         "id": "system",
                         "kind": "system",
@@ -3295,7 +3296,9 @@ mod tests {
                         "shares_system_memory": true,
                         "devices": [{
                             "id": "cpu",
+                            "native_index": 0,
                             "backend": "cpu",
+                            "physical_id": null,
                             "name": "CPU",
                             "description": "Test CPU",
                             "kind": "cpu",

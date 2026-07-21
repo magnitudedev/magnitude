@@ -62,6 +62,11 @@ Command, event, and per-request outbound queues are bounded. Overload is explici
 temporarily stops only its own request from receiving native work while other runnable sequences
 continue. Exclusive native tasks run only while inference is idle.
 
+Hardware observation is a read-only command class on the existing bounded command stream. The
+scheduler performs at most one capture between native batches, and then continues ordinary request
+work. Observation cannot mutate request or context state and cannot be implemented as an exclusive
+task, because exclusive tasks intentionally wait until inference is idle.
+
 ## Current limitations
 
 - Queue admission is FIFO and can head-block; there are no priorities or deadlines.

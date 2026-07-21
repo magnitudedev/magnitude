@@ -45,6 +45,7 @@ export * from './utils/tool-summary-label'
 export * from './utils/file-panel-utils'
 export * from './utils/model-properties'
 export * from './utils/model-slots'
+export * from './utils/hardware-memory'
 export * from './attachments/images'
 
 // Commands

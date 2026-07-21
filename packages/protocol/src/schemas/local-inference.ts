@@ -3,6 +3,7 @@ import { ProviderModelAvailabilitySchema, ProviderModelIdSchema } from "@magnitu
 import { MirroredSnapshotSchema } from "./mirrored-state"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
+const NonNegativeInteger = Schema.Number.pipe(Schema.finite(), Schema.int(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
 
 export const LocalInferenceFitClass = Schema.Literal("full_accelerator", "hybrid", "cpu_or_unified", "unknown")
@@ -38,9 +39,26 @@ export const LocalInferenceWarning = Schema.Struct({
 })
 export type LocalInferenceWarning = Schema.Schema.Type<typeof LocalInferenceWarning>
 
+export const LocalInferenceResidentMemoryDomain = Schema.Struct({
+  memoryDomainId: Schema.String.pipe(Schema.minLength(1)),
+  modelBytes: NonNegativeInteger,
+  contextBytes: NonNegativeInteger,
+  computeBytes: NonNegativeInteger,
+  auxiliaryBytes: NonNegativeInteger,
+})
+export type LocalInferenceResidentMemoryDomain = Schema.Schema.Type<typeof LocalInferenceResidentMemoryDomain>
+
+export const LocalInferenceResidentMemory = Schema.Struct({
+  modelId: Schema.String.pipe(Schema.minLength(1)),
+  runtimeGeneration: NonNegativeInteger,
+  domains: Schema.Array(LocalInferenceResidentMemoryDomain),
+})
+export type LocalInferenceResidentMemory = Schema.Schema.Type<typeof LocalInferenceResidentMemory>
+
 export const LocalInferenceHostProfile = Schema.Struct({
   platform: Schema.String,
   architecture: Schema.String,
+  topologyFingerprint: Schema.String,
   systemMemoryBytes: NonNegativeNumber,
   cpuModel: Schema.NullOr(Schema.String),
   logicalCores: PositiveInteger,
@@ -55,6 +73,7 @@ export const LocalInferenceHostProfile = Schema.Struct({
     deviceNames: Schema.Array(Schema.String),
     splitGroupId: Schema.NullOr(Schema.String),
   })),
+  residentMemory: Schema.NullOr(LocalInferenceResidentMemory),
 })
 export type LocalInferenceHostProfile = Schema.Schema.Type<typeof LocalInferenceHostProfile>
 

@@ -73,6 +73,17 @@ describe("local inference hardware projection", () => {
       native_build: "test",
       enabled_backends: ["CPU", "MTL"],
       topology_fingerprint: "test",
+      resident_memory: {
+        model_id: "model",
+        runtime_generation: 3,
+        domains: [{
+          memory_domain_id: "system",
+          model_bytes: 20 * gib,
+          context_bytes: 4 * gib,
+          compute_bytes: 2 * gib,
+          auxiliary_bytes: 1 * gib,
+        }],
+      },
       memory_domains: [{
         id: "system",
         kind: "unified_memory",
@@ -82,14 +93,18 @@ describe("local inference hardware projection", () => {
         shares_system_memory: true,
         devices: [{
           id: "cpu",
+          native_index: 0,
           backend: "CPU",
+          physical_id: null,
           name: "CPU",
           description: "Apple M4 Max",
           kind: "cpu",
           memory_limit: null,
         }, {
           id: "metal",
+          native_index: 1,
           backend: "MTL",
+          physical_id: "metal-0",
           name: "MTL0",
           description: "Apple M4 Max",
           kind: "gpu",
@@ -106,6 +121,7 @@ describe("local inference hardware projection", () => {
     expect(hostToWire(hardware)).toEqual({
       platform: "macos",
       architecture: "aarch64",
+      topologyFingerprint: "test",
       systemMemoryBytes: 64 * gib,
       cpuModel: "Apple M4 Max",
       logicalCores: 16,
@@ -120,6 +136,17 @@ describe("local inference hardware projection", () => {
         deviceNames: ["Apple M4 Max"],
         splitGroupId: null,
       }],
+      residentMemory: {
+        modelId: "model",
+        runtimeGeneration: 3,
+        domains: [{
+          memoryDomainId: "system",
+          modelBytes: 20 * gib,
+          contextBytes: 4 * gib,
+          computeBytes: 2 * gib,
+          auxiliaryBytes: 1 * gib,
+        }],
+      },
     })
   })
 })

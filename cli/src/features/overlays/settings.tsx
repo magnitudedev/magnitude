@@ -7,13 +7,14 @@ import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
-import { reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
+import { deriveHardwareMemoryView, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
 import { ModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
 import { describeLocalHardware } from '../local-inference/view-model'
 import { writeTextToClipboard } from '../../utils/clipboard'
 import { BOX_CHARS } from '../../utils/ui-constants'
+import { HardwareMemoryDomain } from '../../components/hardware-memory-domain'
 
 const MAGNITUDE_CLOUD_URL = 'https://app.magnitude.dev'
 const SETTINGS_SECTION_WIDTH = 72
@@ -88,6 +89,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     state.host._tag === 'Available' ? Option.some(state.host.profile) : Option.none()
   )
   const hardware = Option.map(host, describeLocalHardware)
+  const hardwareMemory = Option.map(host, deriveHardwareMemoryView)
   const [mode, setMode] = useState<Mode>('view')
   const [inputValue, setInputValue] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -308,6 +310,20 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         </text>
       </box>
 
+      <scrollbox
+        scrollX={false}
+        scrollbarOptions={{ visible: false }}
+        verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }}
+        style={{
+          flexGrow: 1,
+          rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
+          wrapperOptions: { border: false, backgroundColor: 'transparent' },
+          viewportOptions: { backgroundColor: 'transparent' },
+          contentOptions: { flexDirection: 'column' },
+        }}
+      >
+        <box style={{ flexDirection: 'column', flexShrink: 0 }}>
+
       {/* Detected hardware */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
         <box style={{ flexDirection: 'row', paddingBottom: 1, width: '100%', maxWidth: SETTINGS_SECTION_WIDTH }}>
@@ -329,13 +345,17 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               maxWidth: SETTINGS_SECTION_WIDTH,
             }}>
               <text style={{ fg: theme.foreground }}><span attributes={TextAttributes.BOLD}>{detected.system.name}</span></text>
-              {detected.system.details.map((detail) => <text key={detail} style={{ fg: theme.muted }}>{detail}</text>)}
-              {detected.accelerators.map((accelerator) => (
-                <box key={`${accelerator.name}:${accelerator.details}`} style={{ flexDirection: 'column', paddingTop: 1 }}>
-                  <text style={{ fg: theme.foreground }}>{accelerator.name}</text>
-                  <text style={{ fg: theme.muted }}>{accelerator.details}</text>
-                </box>
-              ))}
+              <text style={{ fg: theme.muted }}>{detected.system.details[0]}</text>
+              {Option.getOrNull(Option.map(host, (profile) => {
+                const backends = [...new Set(profile.memoryDomains.flatMap((domain) => domain.backendNames))]
+                const gpuCount = profile.memoryDomains.filter((domain) => domain.kind === 'physical_device').length
+                return backends.length > 0
+                  ? <text style={{ fg: theme.muted }}>{backends.join(' + ')} acceleration{gpuCount > 1 ? ` · ${gpuCount} GPUs` : ''}</text>
+                  : null
+              }))}
+              {Option.getOrNull(Option.map(hardwareMemory, (memory) => memory.domains.map((domain) => (
+                <HardwareMemoryDomain key={domain.id} domain={domain} />
+              ))))}
               {detected.accelerators.length === 0 && Option.exists(host, (profile) => !profile.memoryDomains.some((domain) => domain.kind === 'unified_memory')) && (
                 <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
               )}
@@ -741,7 +761,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           </box>
         )}
       </box>
-
+        </box>
+      </scrollbox>
     </box>
   )
 })
