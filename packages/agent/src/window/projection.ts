@@ -562,13 +562,22 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
       const newMessages: WindowEntry[] = [...fork.messages]
       let turnEntryTokens = 0
 
-      if ((shouldCommitAssistantContent && hasContent) || feedback.length > 0) {
+      if (shouldCommitAssistantContent && hasContent) {
         turnEntryTokens = estimateTurnEntry(completedTurn)
         newMessages.push({
           type: 'assistant_turn',
           source: 'agent',
           turn: completedTurn,
           strategyId: event.strategyId,
+          estimatedTokens: turnEntryTokens,
+        })
+      } else if (feedback.length > 0) {
+        turnEntryTokens = estimateTurnEntry(completedTurn)
+        newMessages.push({
+          type: 'attempt_feedback',
+          source: 'agent',
+          turnId: event.turnId,
+          feedback,
           estimatedTokens: turnEntryTokens,
         })
       }

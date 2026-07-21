@@ -93,10 +93,6 @@ export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClient
 export type DesktopPlatform = "darwin" | "win32" | "linux"
 
 export interface DesktopApi {
-  /** Promise that resolves once main has ensured the daemon is reachable. */
-  readonly ready: Promise<void>
-  /** Promise that resolves with an error message if daemon connection fails. */
-  readonly daemonError: Promise<string>
   readonly platform: DesktopPlatform
   readonly daemon: {
     discover(): Promise<string | null>

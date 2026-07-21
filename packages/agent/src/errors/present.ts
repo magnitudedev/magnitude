@@ -141,8 +141,8 @@ function presentOverthinking(limit: number): ErrorPresentation {
 
 function presentStreamFailed(failure: ModelAttemptFailureSnapshot): ErrorPresentation {
   const message = failure.tag === 'StreamProviderCorrectnessViolation'
-    ? 'Provider stream contract violation'
-    : 'Model response stream failed'
+    ? failure.message
+    : failure.providerMessage?.trim() || failure.message
 
   return {
     surface: 'inline',

@@ -5,10 +5,8 @@
  * creates the AgentClient AtomRpc tag with the desktop DaemonSpawner, and mounts App
  * inside PlatformProvider + RegistryProvider + AgentClientProvider.
  *
- * Initial daemon readiness arrives asynchronously through the preload bridge.
- * We await it before mounting. If the daemon fails to start, preload surfaces
- * the main-process RPC error and we render the
- * DaemonConnectionError component instead of inline HTML (§10).
+ * Daemon discovery and spawn remain lazy. The SDK coordinator ensures an
+ * endpoint when the first ACN RPC consumer mounts.
  *
  * On window close, interrupts the renderer stream and notifies main (§5.6).
  */
@@ -81,8 +79,6 @@ window.addEventListener("beforeunload", () => {
 })
 
 renderLoading()
-desktopApi.ready.then(() => {
-  return renderApp()
-}).catch((error: Error) => {
+renderApp().catch((error: Error) => {
   renderDaemonError(error.message)
 })

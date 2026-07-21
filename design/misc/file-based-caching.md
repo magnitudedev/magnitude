@@ -57,9 +57,9 @@ default or discard invalid data at the smallest safe boundary. Unknown fields ar
 change therefore costs, at worst, recomputation of affected entries rather than a migration or a
 whole-cache reset.
 
-Content identities, algorithm fingerprints, native-build fingerprints, and policy identities are
-not schema versions. They are domain inputs to cache validity and belong in entry keys or evidence.
-An evidence mismatch invalidates only the entries whose computed result may have changed.
+Content identities, algorithm fingerprints, native-build fingerprints, and concrete configuration
+inputs are not schema versions. They are domain inputs to cache validity and belong in entry keys or
+evidence. An evidence mismatch invalidates only the entries whose computed result may have changed.
 
 Durable configuration should likewise evolve through tolerant decoding, optional fields, and
 defaults rather than a global format-version gate. If a historical configuration value has changed

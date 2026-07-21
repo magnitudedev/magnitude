@@ -1,4 +1,6 @@
 import * as HttpClient from "@effect/platform/HttpClient";
+import type * as HttpBody from "@effect/platform/HttpBody";
+import type * as HttpClientError from "@effect/platform/HttpClientError";
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
 import type * as HttpClientResponse from "@effect/platform/HttpClientResponse";
 import { Data, Effect, Option, ParseResult, Schema, Stream } from "effect";
@@ -101,6 +103,15 @@ export type HttpOperationInput<A extends HttpOperationDescriptor> =
 export type StreamOperationEvent<A extends StreamOperationDescriptor> =
   SchemaType<A["eventSchema"]>;
 
+export interface GeneratedStreamResponse<
+  Event,
+  Error,
+> {
+  readonly status: number;
+  readonly headers: HttpClientResponse.HttpClientResponse["headers"];
+  readonly events: Stream.Stream<Event, Error>;
+}
+
 export class GeneratedClientInputError extends Data.TaggedError(
   "GeneratedClientInputError"
 )<{
@@ -113,7 +124,10 @@ export class GeneratedClientTransportError extends Data.TaggedError(
   "GeneratedClientTransportError"
 )<{
   readonly operationId: string;
-  readonly cause: unknown;
+  readonly cause:
+    | HttpClientError.HttpClientError
+    | HttpBody.HttpBodyError
+    | Error;
 }> {}
 
 export class GeneratedClientRemoteError<
@@ -121,6 +135,7 @@ export class GeneratedClientRemoteError<
 > extends Data.TaggedError("GeneratedClientRemoteError")<{
   readonly operationId: string;
   readonly status: number;
+  readonly headers: HttpClientResponse.HttpClientResponse["headers"];
   readonly body: Body;
 }> {}
 
@@ -344,6 +359,7 @@ const remoteFailure = <A extends RequestOperationDescriptor>(
         new GeneratedClientRemoteError({
           operationId: operation.operationId,
           status: response.status,
+          headers: response.headers,
           body: body as ErrorBody<A>,
         })
       )
@@ -580,61 +596,67 @@ export const makeStreamOperation = <A extends StreamOperationDescriptor>(
   operation: A
 ): ((
   input: StreamOperationInput<A>
-) => Stream.Stream<StreamOperationEvent<A>, StreamOperationError<A>>) => {
+) => Effect.Effect<
+  GeneratedStreamResponse<StreamOperationEvent<A>, StreamOperationError<A>>,
+  StreamOperationError<A>
+>) => {
   const connection = makeGeneratedClientConnection(options);
   return (input) => {
     let lastEventId: string | undefined;
-    const execute = (): Stream.Stream<
-      StreamOperationEvent<A>,
+    const admit = (): Effect.Effect<
+      GeneratedStreamResponse<StreamOperationEvent<A>, StreamOperationError<A>>,
       StreamOperationError<A>
-    > =>
-      Stream.unwrap(
-        Effect.gen(function* () {
-          let request = yield* requestFor(operation, connection, input);
-          if (
-            operation.reconnect.type === "last-event-id" &&
-            lastEventId !== undefined
-          )
-            request = HttpClientRequest.setHeader(
-              request,
-              "last-event-id",
-              lastEventId
-            );
-          const response = yield* http.execute(request).pipe(
-            Effect.mapError(
-              (cause) =>
-                new GeneratedClientTransportError({
-                  operationId: operation.operationId,
-                  cause,
-                })
-            )
-          );
-          if (response.status !== operation.responseStatus)
-            return yield* remoteFailure(operation, response);
-          return responseStream(
-            operation,
-            connection,
-            response,
-            (id) => (lastEventId = id)
-          );
-        })
+    > => Effect.gen(function* () {
+      let request = yield* requestFor(operation, connection, input);
+      if (
+        operation.reconnect.type === "last-event-id" &&
+        lastEventId !== undefined
+      )
+        request = HttpClientRequest.setHeader(
+          request,
+          "last-event-id",
+          lastEventId
+        );
+      const response = yield* http.execute(request).pipe(
+        Effect.mapError(
+          (cause) =>
+            new GeneratedClientTransportError({
+              operationId: operation.operationId,
+              cause,
+            })
+        )
       );
-    const reconnect = (): Stream.Stream<
-      StreamOperationEvent<A>,
-      StreamOperationError<A>
-    > =>
-      execute().pipe(
+      if (response.status !== operation.responseStatus)
+        return yield* remoteFailure(operation, response);
+      const first = responseStream(
+        operation,
+        connection,
+        response,
+        (id) => (lastEventId = id)
+      );
+      const reconnect = (events: Stream.Stream<StreamOperationEvent<A>, StreamOperationError<A>>): Stream.Stream<
+        StreamOperationEvent<A>,
+        StreamOperationError<A>
+      > => events.pipe(
         Stream.catchAll((error) =>
           operation.reconnect.type === "last-event-id" &&
           (error instanceof GeneratedClientIncompleteStreamError ||
             error instanceof GeneratedClientTransportError)
             ? Stream.fromEffect(Effect.sleep("100 millis")).pipe(
                 Stream.drain,
-                Stream.concat(Stream.suspend(reconnect))
+                Stream.concat(Stream.unwrap(admit().pipe(
+                  Effect.map((next) => reconnect(next.events)),
+                )))
               )
             : Stream.fail(error)
         )
       );
-    return reconnect();
+      return {
+        status: response.status,
+        headers: response.headers,
+        events: reconnect(first),
+      };
+    });
+    return admit();
   };
 };

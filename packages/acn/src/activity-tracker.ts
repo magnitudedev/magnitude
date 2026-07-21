@@ -13,6 +13,7 @@ export interface AcnActivityTrackerApi {
   readonly changes: Stream.Stream<void>
   readonly hasActiveWork: Effect.Effect<boolean>
   readonly withActiveWork: <A, E, R>(label: string, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+  readonly acquireActiveWork: (label: string) => Effect.Effect<Effect.Effect<void>>
 }
 
 export class AcnActivityTracker extends Context.Tag("AcnActivityTracker")<
@@ -60,6 +61,13 @@ export const AcnActivityTrackerLive: Layer.Layer<AcnActivityTracker> =
           Effect.annotateLogs({ operation }),
         )
 
+      const acquire = (label: string) => Ref.update(activeWork, (count) => count + 1).pipe(
+        Effect.zipRight(touch(`active-work-started:${label}`)),
+      )
+      const release = (label: string) => Ref.update(activeWork, (count) => Math.max(0, count - 1)).pipe(
+        Effect.zipRight(touch(`active-work-finished:${label}`)),
+      )
+
       return {
         markCommand,
         touch,
@@ -67,14 +75,11 @@ export const AcnActivityTrackerLive: Layer.Layer<AcnActivityTracker> =
         changes: Stream.fromPubSub(changes).pipe(Stream.map(() => undefined)),
         hasActiveWork: Ref.get(activeWork).pipe(Effect.map((count) => count > 0)),
         withActiveWork: (label, effect) => Effect.acquireUseRelease(
-          Ref.update(activeWork, (count) => count + 1).pipe(
-            Effect.zipRight(touch(`active-work-started:${label}`)),
-          ),
+          acquire(label),
           () => effect,
-          () => Ref.update(activeWork, (count) => Math.max(0, count - 1)).pipe(
-            Effect.zipRight(touch(`active-work-finished:${label}`)),
-          ),
+          () => release(label),
         ),
+        acquireActiveWork: (label) => acquire(label).pipe(Effect.as(release(label))),
       }
     }),
   )

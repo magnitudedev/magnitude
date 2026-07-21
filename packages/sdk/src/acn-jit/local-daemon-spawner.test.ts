@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { FetchHttpClient } from "@effect/platform";
 import { BunContext } from "@effect/platform-bun";
 import { Effect } from "effect";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeLocalDaemonSpawner } from "./local-daemon-spawner";
 
@@ -127,8 +127,13 @@ describe("local daemon spawner rendezvous", () => {
     const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-foreign-election-"));
     const version = "test-foreign-election-version";
     const electionDirectory = join(dataDir, "acn", encodeURIComponent(version), "spawn-election");
-    await mkdir(electionDirectory, { recursive: true });
-    await writeFile(join(electionDirectory, "owner"), "foreign-owner");
+    await mkdir(dirname(electionDirectory), { recursive: true });
+    await writeFile(electionDirectory, JSON.stringify({
+      token: "foreign-owner",
+      pid: process.pid,
+    }));
+    const staleTimestamp = new Date(Date.now() - 120_000);
+    await utimes(electionDirectory, staleTimestamp, staleTimestamp);
 
     const attempt = makeLocalDaemonSpawner(
       () => ({ pid: 9999, exited: new Promise<number | null>(() => {}) }),
@@ -145,6 +150,45 @@ describe("local daemon spawner rendezvous", () => {
     );
 
     await expect(attempt).rejects.toThrow("Timed out waiting for ACN spawn election");
-    expect(await Bun.file(join(electionDirectory, "owner")).text()).toBe("foreign-owner");
+    expect(JSON.parse(await Bun.file(electionDirectory).text())).toEqual({
+      token: "foreign-owner",
+      pid: process.pid,
+    });
+  });
+
+  it("recovers a dead election within the current spawn wait budget", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-dead-election-"));
+    const version = "test-dead-election-version";
+    const electionDirectory = join(dataDir, "acn", encodeURIComponent(version), "spawn-election");
+    await mkdir(dirname(electionDirectory), { recursive: true });
+    await writeFile(electionDirectory, JSON.stringify({
+      token: "dead-owner",
+      pid: 2_147_483_647,
+    }));
+    const staleTimestamp = new Date(Date.now() - 1_000);
+    await utimes(electionDirectory, staleTimestamp, staleTimestamp);
+
+    let spawnCalls = 0;
+    const attempt = makeLocalDaemonSpawner(
+      () => {
+        spawnCalls++;
+        return { pid: 9999, exited: Promise.resolve(1) };
+      },
+      {
+        dataDir,
+        version,
+        spawnTimeoutMs: 100,
+        probeTimeoutMs: 20,
+      },
+    ).pipe(
+      Effect.flatMap((spawner) => spawner.spawn(["ignored"])),
+      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+      Effect.runPromise,
+    );
+
+    await expect(attempt).rejects.toThrow("No compatible ACN became healthy");
+    expect(spawnCalls).toBe(1);
+    expect(await Bun.file(electionDirectory).exists()).toBe(false);
+    expect((await stat(`${electionDirectory}.stale-dead-owner`)).isFile()).toBe(true);
   });
 });

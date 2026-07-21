@@ -9,6 +9,7 @@ encoding_rs.workspace = true
 getrandom.workspace = true
 icn-contracts.workspace = true
 icn-hardware.workspace = true
+icn-mtp.workspace = true
 icn-reasoning.workspace = true
 llama-cpp-2.workspace = true
 serde.workspace = true
@@ -21,8 +22,8 @@ libc = "0.2.180"
 
 [features]
 default = []
-cuda = ["llama-cpp-2/cuda", "icn-hardware/cuda"]
-metal = ["llama-cpp-2/metal", "icn-hardware/metal"]
+cuda = ["llama-cpp-2/cuda", "icn-hardware/cuda", "icn-mtp/cuda"]
+metal = ["llama-cpp-2/metal", "icn-hardware/metal", "icn-mtp/metal"]
 mtmd = ["llama-cpp-2/mtmd", "icn-hardware/mtmd"]
 parity-probe = []
-vulkan = ["llama-cpp-2/vulkan", "icn-hardware/vulkan"]
+vulkan = ["llama-cpp-2/vulkan", "icn-hardware/vulkan", "icn-mtp/vulkan"]

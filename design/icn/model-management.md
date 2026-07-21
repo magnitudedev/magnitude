@@ -26,13 +26,28 @@ Every model returned with `Available` status has a complete, current assessment.
 2. The artifacts are valid GGUF files accepted by the pinned ICN runtime.
 3. The exact effective chat template has been resolved with the same template-selection, fallback, BOS, EOS, and named-template behavior used when loading the model.
 4. Every reasoning control supported by ICN has been conclusively classified as `Supported` or `Unsupported`.
-5. The canonical product execution profile has been assessed against the current backend and hardware topology.
+5. One process-local serving configuration is active for the model and its exact profile has been
+   assessed against the current backend and hardware topology.
 6. Hardware has been conclusively classified as `Fits` or `DoesNotFit`.
 7. Any cached result matches every input that can affect the result.
 
 Consequently, a successful list response must not expose `Pending`, `Assessing`, `NotAssessed`, or a generic `Unknown` for an available model. Those values describe orchestration progress or an incomplete implementation, not durable model properties.
 
 Non-ready records, such as an in-progress or interrupted download, may still appear with their operation status. They are not `Available` models and are outside the completed-assessment invariant until their artifact set is ready.
+
+Availability, serving configuration, and residency are separate. Availability describes durable
+artifact usability. Serving configuration is caller-owned execution intent: ACN persists the user
+selection and rehydrates ICN's process-local value. Residency is
+a process-local projection of the runtime coordinator and is reset
+to not-resident during recovery. Loading, loaded, unloading, and load-failed never replace or erase
+artifact availability.
+
+Publishing a managed download validates and applies its selected serving configuration before the
+model becomes available in that process. An idempotent model-management operation may replace that
+configuration; it performs the same shared assessment and makes no change when the effective
+profile is already equal. Installation manifests and derived inventory caches never persist the
+selected context or sequence count. After restart, ACN reapplies durable product selection before
+publishing its local provider catalog.
 
 ## Authoritative reconciliation
 
@@ -57,7 +72,8 @@ phases:
    and derives the complete public model properties. Inspection produces either a complete available
    model or a typed invalid/incompatible artifact record.
 5. **Validate hardware evidence.** Reuse hardware results only when their independent evidence key
-   matches the current canonical execution profile, native build, backend, and hardware topology.
+   matches the current serving profile, internal resolver/capacity fingerprints,
+   native build, backend, and hardware topology.
    Assess only available models with missing or stale hardware evidence. Native assessment is
    serialized where required by process-global runtime state; other work remains concurrent.
 6. **Verify stability and publish.** Confirm that the discovered component identities still match
@@ -105,9 +121,16 @@ Hardware = Fits(profile, memory, recommendation)
 
 `DoesNotFit` is a complete and successful result. It is not an assessment failure.
 
-The profile fixes every execution input that can affect the result, including context length, sequence and batch sizing, KV types, acceleration and GPU-layer policy, projector or MTP selection, and capacity policy. The native planner reads model structure, enumerates devices, constructs the model and context plan, accounts for model, context, KV, compute, projector, and MTP memory, and evaluates the preferred and permitted fallback configurations.
+The profile fixes caller-owned context length and sequence count. ICN's versioned internal resolver
+fixes every remaining execution input that can affect the result, including batch sizing, KV types,
+acceleration and GPU-layer policy, projector or MTP selection, and capacity policy. The native
+planner reads model structure, enumerates devices, constructs the model and context plan, accounts
+for model, context, KV, compute, projector, and MTP memory, and evaluates the preferred and permitted
+fallback configurations.
 
-Inventory assessment is advisory for the canonical profile. Loading a model still performs an exact safety assessment for the execution plan actually requested. The loader must not rely on a cached inventory assessment when those plans differ.
+Inventory assessment is advisory for the configured profile. Loading a model still performs an
+exact safety assessment for the configured target it will realize. The loader must not
+rely on cached inventory evidence when any target or internal policy input differs.
 
 Native hardware assessment is serialized where required by process-global native-backend state. Other metadata and template work may use bounded concurrency. Implementation limits on concurrency do not weaken the completeness requirement.
 
@@ -231,7 +254,7 @@ A path existing in the cache is not evidence that its assessment remains valid. 
 - effective chat template, tokenizer, BOS/EOS tokens, or named-template selection;
 - the complete validated shape of each cached model and evidence entry;
 - pinned native-backend revision, native build, backend, or estimator fingerprint;
-- canonical execution profile or capacity-policy version;
+- serving configuration plus opaque execution/capacity policy fingerprints;
 - hardware and device topology relevant to planning.
 
 The inventory cache has no schema, format, or inspection-algorithm version. Its current decoder

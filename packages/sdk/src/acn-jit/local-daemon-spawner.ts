@@ -87,13 +87,19 @@ const registrationPath = (dataDir: string, version: string): string =>
 const spawnElectionPath = (dataDir: string, version: string): string =>
   NodePath.join(versionDirectory(dataDir, version), "spawn-election");
 
-const spawnElectionOwnerPath = (path: string): string =>
-  NodePath.join(path, "owner");
+const staleSpawnElectionPath = (path: string, token: string): string =>
+  `${path}.stale-${encodeURIComponent(token)}`;
 
 interface SpawnElectionClaim {
   readonly path: string;
   readonly token: string;
 }
+
+const SpawnElectionOwnerSchema = Schema.Struct({
+  token: Schema.String,
+  pid: Schema.Number,
+});
+type SpawnElectionOwner = typeof SpawnElectionOwnerSchema.Type;
 
 const platformErrorReason = (cause: unknown): string | undefined =>
   typeof cause === "object" && cause !== null && "reason" in cause
@@ -105,6 +111,26 @@ const electionFailure = (operation: string, cause: unknown) =>
     reason: `${operation}: ${String(cause)}`,
   });
 
+const readSpawnElectionOwner = (
+  path: string,
+  fs: FileSystem,
+): Effect.Effect<Option.Option<SpawnElectionOwner>> => fs.readFileString(path).pipe(
+  Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(SpawnElectionOwnerSchema))),
+  Effect.map(Option.some),
+  Effect.catchAll(() => Effect.succeed(Option.none())),
+);
+
+const processIsAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (cause) {
+    return !(cause instanceof Error && "code" in cause && cause.code === "ESRCH");
+  }
+};
+
+const SPAWN_ELECTION_PUBLICATION_GRACE_MS = 250;
+
 const tryAcquireSpawnElection = (
   path: string,
   staleAfterMs: number,
@@ -113,18 +139,22 @@ const tryAcquireSpawnElection = (
   yield* fs.makeDirectory(NodePath.dirname(path), { recursive: true }).pipe(
     Effect.mapError((cause) => electionFailure("Failed to create ACN registry directory", cause)),
   );
-  const acquired = yield* fs.makeDirectory(path).pipe(
+  const claim = { path, token: crypto.randomUUID() } satisfies SpawnElectionClaim;
+  const encodedOwner = yield* Schema.encode(
+    Schema.parseJson(SpawnElectionOwnerSchema),
+  )({ token: claim.token, pid: process.pid }).pipe(
+    Effect.mapError((cause) => electionFailure("Failed to encode ACN spawn election owner", cause)),
+  );
+  const publicationPath = `${path}.publishing-${encodeURIComponent(claim.token)}`;
+  const acquired = yield* fs.writeFileString(publicationPath, encodedOwner).pipe(
+    Effect.flatMap(() => fs.link(publicationPath, path)),
     Effect.as(true),
     Effect.catchAll((cause) => platformErrorReason(cause) === "AlreadyExists"
       ? Effect.succeed(false)
       : Effect.fail(electionFailure("Failed to acquire ACN spawn election", cause))),
+    Effect.ensuring(fs.remove(publicationPath, { force: true }).pipe(Effect.ignore)),
   );
   if (acquired) {
-    const claim = { path, token: crypto.randomUUID() } satisfies SpawnElectionClaim;
-    yield* fs.writeFileString(spawnElectionOwnerPath(path), claim.token).pipe(
-      Effect.mapError((cause) => electionFailure("Failed to record ACN spawn election owner", cause)),
-      Effect.onError(() => fs.remove(path, { recursive: true }).pipe(Effect.ignore)),
-    );
     return Option.some(claim);
   }
 
@@ -140,11 +170,38 @@ const tryAcquireSpawnElection = (
   if (Option.isSome(info)) {
     const modifiedAt = Option.getOrUndefined(info.value.mtime);
     if (modifiedAt && Date.now() - modifiedAt.getTime() > staleAfterMs) {
-      yield* fs.remove(path, { recursive: true }).pipe(
-        Effect.catchAll((cause) => platformErrorReason(cause) === "NotFound"
-          ? Effect.void
-          : Effect.fail(electionFailure("Failed to recover stale ACN spawn election", cause))),
-      );
+      const observedOwner = yield* readSpawnElectionOwner(path, fs);
+      if (Option.isSome(observedOwner) && !processIsAlive(observedOwner.value.pid)) {
+        const tombstone = staleSpawnElectionPath(path, observedOwner.value.token);
+        // Claim recovery by atomically hard-linking the exact owner record to
+        // its retained tombstone. Only one contender can publish that link.
+        // A later contender may finish removal if the winner crashed after
+        // linking, but the token checks prevent it from touching a new owner.
+        const linked = yield* fs.link(path, tombstone).pipe(
+          Effect.as(true),
+          Effect.catchAll((cause) => platformErrorReason(cause) === "AlreadyExists"
+            ? Effect.succeed(false)
+            : Effect.fail(electionFailure("Failed to quarantine stale ACN spawn election", cause))),
+        );
+        const quarantinedOwner = linked
+          ? observedOwner
+          : yield* readSpawnElectionOwner(tombstone, fs);
+        const currentOwner = yield* readSpawnElectionOwner(path, fs);
+        if (
+          Option.isSome(quarantinedOwner) &&
+          Option.isSome(currentOwner) &&
+          quarantinedOwner.value.token === observedOwner.value.token &&
+          quarantinedOwner.value.pid === observedOwner.value.pid &&
+          currentOwner.value.token === observedOwner.value.token &&
+          currentOwner.value.pid === observedOwner.value.pid
+        ) {
+          yield* fs.remove(path).pipe(
+            Effect.catchAll((cause) => platformErrorReason(cause) === "NotFound"
+              ? Effect.void
+              : Effect.fail(electionFailure("Failed to recover stale ACN spawn election", cause))),
+          );
+        }
+      }
     }
   }
   return Option.none();
@@ -153,10 +210,13 @@ const tryAcquireSpawnElection = (
 const releaseSpawnElection = (
   claim: SpawnElectionClaim,
   fs: FileSystem,
-): Effect.Effect<void> => fs.readFileString(spawnElectionOwnerPath(claim.path)).pipe(
-  Effect.flatMap((owner) => owner === claim.token
-    ? fs.remove(claim.path, { recursive: true })
-    : Effect.void),
+): Effect.Effect<void> => readSpawnElectionOwner(claim.path, fs).pipe(
+  Effect.flatMap(Option.match({
+    onNone: () => Effect.void,
+    onSome: (owner) => owner.token === claim.token
+      ? fs.remove(claim.path)
+      : Effect.void,
+  })),
   Effect.catchAll(() => Effect.void),
 );
 
@@ -166,7 +226,13 @@ const withSpawnElection = <A, E>(
   fs: FileSystem,
   effect: Effect.Effect<A, E, never>
 ): Effect.Effect<A, E | DaemonSpawnFailed, never> => {
-  const staleAfterMs = Math.max(60_000, timeoutMs * 2);
+  // Recovery must become eligible within this caller's own wait budget. The
+  // owner record and liveness proof protect a live claimant; the short age
+  // threshold only gives a newly acquired claim time to publish that record.
+  const staleAfterMs = Math.max(
+    1,
+    Math.min(SPAWN_ELECTION_PUBLICATION_GRACE_MS, Math.floor(timeoutMs / 2)),
+  );
   const retryCount = Math.max(1, Math.ceil(timeoutMs / 50));
   const acquire = tryAcquireSpawnElection(path, staleAfterMs, fs).pipe(
     Effect.filterOrFail(

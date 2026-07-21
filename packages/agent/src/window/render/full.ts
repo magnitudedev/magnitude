@@ -134,6 +134,17 @@ export function windowToPrompt(input: LeaderWindowPromptInput): Prompt {
         break
       }
 
+      case 'attempt_feedback': {
+        const feedbackParts = renderFeedback(msg.feedback)
+        if (feedbackParts.length > 0) {
+          messages.push({
+            _tag: 'UserMessage',
+            parts: feedbackParts,
+          })
+        }
+        break
+      }
+
       case 'advisor_response': {
         // Leader sees advisor responses as tool results within its own turns.
         break

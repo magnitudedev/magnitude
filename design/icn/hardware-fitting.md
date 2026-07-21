@@ -194,12 +194,10 @@ The response contains:
 - platform, native architecture, CPU identity, logical cores, total system memory, and current
   available system memory;
 - native build fingerprint and enabled backends;
-- the accepted model-assessment policy identity for preview requests;
 - runtime-visible logical devices with stable IDs where the backend supplies them, names, backend,
   device kind, physical-memory-domain membership, and any backend-reported device limit;
 - normalized memory domains with total capacity, stable capacity, current free memory,
-  host-memory-sharing semantics, and member devices;
-- the versioned capacity-policy identity used by fit assessment.
+  host-memory-sharing semantics, and member devices.
 
 Logical devices and memory domains are distinct. A device is a native execution target; a memory
 domain is a physical capacity pool. Multiple backend views of one physical GPU and unified host/GPU
@@ -219,8 +217,12 @@ allocations to fit within the Metal working-set limit. The API uses Rust's canon
 `aarch64` platform vocabulary; presentation layers may format those values but must not use a
 different vocabulary to decide topology.
 
-Current free memory is observational and volatile. Recommendation eligibility uses the versioned
-stable-capacity policy. The hardware response must make that distinction explicit.
+Current free memory is observational and volatile. Recommendation eligibility uses stable capacity.
+The hardware response must make that distinction explicit through the reported capacity values,
+without exposing ICN's internal capacity or planning implementation as a caller-selected identifier.
+Every behavior-changing execution resolver, capacity reserve, estimator, projector, MTP, and typed
+auxiliary policy still has an opaque ICN-owned fingerprint in assessment evidence and cache keys.
+Removing a caller-visible selector must never remove these internal invalidation inputs.
 
 A device-enumeration or normalization failure fails the request with an actionable diagnostic. An
 empty device list is valid only after successful enumeration establishes that no accelerator is
@@ -233,8 +235,9 @@ available inventory model carries a completed canonical hardware assessment as r
 [ICN model management](./model-management.md).
 
 Downloaded-model assessment reads the complete local component set and runs the pinned native
-planner. Loading independently reassesses the exact requested execution plan; an inventory result
-is advisory and cannot authorize a different load plan.
+planner for the model's current serving configuration. Loading independently reassesses the exact
+configured model and serving profile; an inventory result is advisory and cannot authorize a different load
+plan.
 
 There is no separate imperative “assess this downloaded model” endpoint. Inventory reconciliation
 performs and caches required assessment before returning an available model.
@@ -264,19 +267,18 @@ metadata. A future
 content-addressed fit-descriptor source may identify a Magnitude-published header bundle by URL,
 size, and digest. Arbitrary caller-controlled fetch URLs are not accepted.
 
-Each requested profile has a caller correlation ID, the ICN-published semantic policy identity, and
-the high-level variable inputs, such as context length and parallel sequence count. ICN rejects an
-unknown policy identity and resolves accepted inputs through the same execution-policy
-implementation used for loading. Callers do not assemble unchecked native flags. The returned
-execution-policy identity is supplied by the assessor, not echoed from unchecked caller data.
+Each requested profile has a caller correlation ID and high-level variable inputs such as context
+length and parallel sequence count. ICN resolves those inputs through the same planner used for
+loading. Callers do not select a planner implementation or assemble unchecked native flags, and no
+planner or capacity-policy identifier is part of the request or response contract.
 
 The response contains:
 
 - resolved immutable artifact and component identities;
 - artifact properties deterministically available from GGUF metadata;
 - one hardware assessment per requested profile;
-- the artifact, native-build, execution-policy, hardware-topology, and capacity-policy
-  fingerprints supporting each result.
+- the artifact, native-build, and hardware-topology fingerprints supporting each result, plus the
+  normalized execution facts in the assessment itself.
 
 Remote and downloaded models use the same `HardwareAssessment` contract. A completed result is
 `Fits`, `DoesNotFit`, `InvalidArtifact`, or `IncompatibleArtifact`. Invalid and incompatible
@@ -479,19 +481,19 @@ Fit results are cached by every input capable of changing the result, including:
 - complete component membership, identities, original sizes, and header digests;
 - pinned native-backend revision and ICN native-build fingerprint;
 - enabled backend set and relevant backend capability fingerprint;
-- resolved execution profile and execution-policy version;
+- resolved execution inputs and effective serving profile;
 - hardware topology and stable physical-capacity fingerprint;
-- capacity-policy and estimator-policy versions;
-- projector, draft, MTP, and typed-adjustment policy versions.
+- opaque versions of every execution resolver and capacity policy; and
+- projector, draft, MTP, and typed-adjustment inputs and policy versions that can change the result.
 
 The assessment key is shared by preview and available paths; it does not contain endpoint name,
 inventory membership, temporary path, or acquisition-adapter kind. A local downloaded artifact and
 a remote preview therefore reuse one result only when they resolve to the same canonical component
-identities and all runtime, profile, hardware, and policy inputs match.
+identities and all runtime, profile, hardware, and concrete planning inputs match.
 
-Volatile free memory may be captured in a report but is not part of a reusable stable-capacity result
-unless the requested policy explicitly uses it. Topology or stable-capacity changes invalidate
-affected assessments. Cache entries are committed only after complete successful assessment.
+Volatile free memory may be captured in a report but is not part of a reusable stable-capacity
+result. Topology or stable-capacity changes invalidate affected assessments. Cache entries are
+committed only after complete successful assessment.
 
 ## Failure semantics
 
@@ -567,7 +569,7 @@ The implementation conforms when:
   discrete-GPU, and supported multi-device profiles;
 - instrumentation verifies that metadata-only fitting retains and materializes only the exact GGUF
   header prefix and never performs a complete weights download;
-- changing any artifact, runtime, hardware, profile, component, or policy input invalidates the
+- changing any artifact, runtime, hardware, profile, component, or concrete planning input invalidates the
   relevant cached result;
 - deleting, corrupting, or making the model-derived cache unwritable causes only affected
   acquisition, inspection, or

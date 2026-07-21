@@ -56,7 +56,7 @@ const lifecycle = IcnLive(new IcnLifecycleConfig({
       "model_inventory",
       "model_preview",
       "model_download",
-      "runtime_model_control",
+      "model_load_control",
       "chat_streaming",
     ],
     allowBuildMismatch: false,
@@ -79,12 +79,16 @@ const lifecycle = IcnLive(new IcnLifecycleConfig({
 const supervision = Layer.scopedDiscard(Effect.gen(function* () {
   const icn = yield* IcnLifecycle
   yield* icn.unexpectedExit.pipe(
-    Effect.catchAll((cause) => Effect.logFatal("ICN exited unexpectedly; terminating ACN").pipe(
+    Effect.catchAll((cause) => Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
       Effect.annotateLogs({ cause: cause.message }),
-      Effect.zipRight(Effect.sync(() => process.exit(1))),
+      // BunRuntime translates SIGTERM into root interruption, so all scoped ACN and ICN
+      // finalizers run before the process exits.
+      Effect.zipRight(Effect.sync(() => process.kill(process.pid, "SIGTERM"))),
     )),
     Effect.forkScoped,
   )
 }))
 
-export const AcnIcnLive = Layer.provideMerge(supervision, lifecycle)
+const supervisedLifecycle = Layer.provideMerge(supervision, lifecycle)
+
+export const AcnIcnLive = supervisedLifecycle

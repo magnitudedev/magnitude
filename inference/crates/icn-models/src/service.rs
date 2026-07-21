@@ -6,8 +6,8 @@ use fs2::FileExt;
 use futures_util::future::BoxFuture;
 use icn_contracts::{
     DeletePlan, DeletedModel, DownloadEventStream, DownloadModelRequest, InventoryError,
-    InventoryModel, ModelId, ModelInventory, ModelLocation, ModelSource, ModelStatus,
-    ResolvedComponent, ResolvedModel,
+    InventoryModel, ModelAvailability, ModelId, ModelInventory, ModelLocation, ModelResidency,
+    ModelSource, ResolvedComponent, ResolvedModel, ServingProfile,
 };
 
 use crate::download::blob_key;
@@ -26,8 +26,8 @@ impl ModelInventory for ModelManager {
                 .cloned()
                 .collect::<Vec<_>>();
             models.sort_by(|left, right| {
-                status_rank(&left.status)
-                    .cmp(&status_rank(&right.status))
+                status_rank(left)
+                    .cmp(&status_rank(right))
                     .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
                     .then_with(|| left.id.cmp(&right.id))
             });
@@ -65,7 +65,7 @@ impl ModelInventory for ModelManager {
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
             ensure_deletable_status(&model)?;
-            if matches!(model.status, ModelStatus::Interrupted { .. }) {
+            if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
                 return plan_interrupted_delete(&self.config.root, &model);
             }
             match &model.location {
@@ -106,7 +106,7 @@ impl ModelInventory for ModelManager {
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
             ensure_deletable_status(&model)?;
-            if matches!(model.status, ModelStatus::Interrupted { .. }) {
+            if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
                 let plan = plan_interrupted_delete(&self.config.root, &model)?;
                 let freed_bytes = delete_interrupted(&self.config.root, &model)?;
                 drop(lock);
@@ -170,10 +170,7 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            if !matches!(
-                model.status,
-                ModelStatus::Available { .. } | ModelStatus::Loaded { .. }
-            ) {
+            if !matches!(model.availability, ModelAvailability::Available { .. }) {
                 return Err(InventoryError::NotReady(id.0.clone()));
             }
             let components = resolve_components(&self.config.root, &model)?;
@@ -181,10 +178,10 @@ impl ModelInventory for ModelManager {
         })
     }
 
-    fn update_status(
+    fn update_residency(
         &self,
         id: &ModelId,
-        status: ModelStatus,
+        residency: ModelResidency,
     ) -> BoxFuture<'_, Result<(), InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
@@ -195,18 +192,30 @@ impl ModelInventory for ModelManager {
             let model = models
                 .get_mut(&id)
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            model.status = status;
+            model.residency = residency;
             model.operations = operations_for(model);
             model.updated_at = now();
             Ok(())
         })
     }
+
+    fn configure_serving(
+        &self,
+        id: &ModelId,
+        profile: ServingProfile,
+    ) -> BoxFuture<'_, Result<InventoryModel, InventoryError>> {
+        let id = id.clone();
+        Box::pin(async move { self.configure_serving_model(&id, profile).await })
+    }
 }
 
 fn operations_for(model: &InventoryModel) -> Vec<icn_contracts::ModelOperation> {
     use icn_contracts::ModelOperation;
-    match model.status {
-        ModelStatus::Available { .. } | ModelStatus::LoadFailed { .. } => {
+    match (&model.availability, &model.residency) {
+        (
+            ModelAvailability::Available { .. },
+            ModelResidency::NotResident | ModelResidency::LoadFailed { .. },
+        ) => {
             let mut operations = vec![ModelOperation::Load];
             if matches!(
                 model.location,
@@ -216,9 +225,15 @@ fn operations_for(model: &InventoryModel) -> Vec<icn_contracts::ModelOperation> 
             }
             operations
         }
-        ModelStatus::Loaded { .. } => vec![ModelOperation::Unload],
-        ModelStatus::Interrupted { .. } => vec![ModelOperation::Delete],
-        ModelStatus::InvalidArtifact { .. } | ModelStatus::IncompatibleArtifact { .. } => {
+        (ModelAvailability::Available { .. }, ModelResidency::Loaded { .. }) => {
+            vec![ModelOperation::Unload]
+        }
+        (ModelAvailability::Interrupted { .. }, _) => vec![ModelOperation::Delete],
+        (
+            ModelAvailability::InvalidArtifact { .. }
+            | ModelAvailability::IncompatibleArtifact { .. },
+            _,
+        ) => {
             if matches!(
                 model.location,
                 ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. }
@@ -228,9 +243,11 @@ fn operations_for(model: &InventoryModel) -> Vec<icn_contracts::ModelOperation> 
                 Vec::new()
             }
         }
-        ModelStatus::Downloading { .. }
-        | ModelStatus::Loading { .. }
-        | ModelStatus::Unloading { .. } => Vec::new(),
+        (ModelAvailability::Downloading { .. }, _)
+        | (
+            ModelAvailability::Available { .. },
+            ModelResidency::Loading { .. } | ModelResidency::Unloading { .. },
+        ) => Vec::new(),
     }
 }
 
@@ -328,9 +345,11 @@ pub(crate) fn reconcile_tombstones(root: &Path) -> Result<(), InventoryError> {
             created: manifest.created_at,
             name: manifest.repository.clone(),
             supported_parameters: Vec::new(),
-            status: ModelStatus::Available {
+            serving_configuration: None,
+            availability: ModelAvailability::Available {
                 ready_at: manifest.ready_at,
             },
+            residency: ModelResidency::NotResident,
             source: ModelSource::HuggingFace {
                 repository: manifest.repository.clone(),
                 requested_revision: manifest.requested_revision.clone(),
@@ -433,29 +452,35 @@ fn finish_managed_tombstone(
     fs::remove_file(tombstone).map_err(io_error)
 }
 
-fn status_rank(status: &ModelStatus) -> u8 {
-    match status {
-        ModelStatus::Loaded { .. } => 0,
-        ModelStatus::Loading { .. } | ModelStatus::Unloading { .. } => 1,
-        ModelStatus::Downloading { .. } => 2,
-        ModelStatus::Interrupted { .. } => 3,
-        ModelStatus::Available { .. } => 4,
-        ModelStatus::InvalidArtifact { .. } | ModelStatus::IncompatibleArtifact { .. } => 5,
-        ModelStatus::LoadFailed { .. } => 6,
+fn status_rank(model: &InventoryModel) -> u8 {
+    match (&model.availability, &model.residency) {
+        (ModelAvailability::Available { .. }, ModelResidency::Loaded { .. }) => 0,
+        (
+            ModelAvailability::Available { .. },
+            ModelResidency::Loading { .. } | ModelResidency::Unloading { .. },
+        ) => 1,
+        (ModelAvailability::Downloading { .. }, _) => 2,
+        (ModelAvailability::Interrupted { .. }, _) => 3,
+        (ModelAvailability::Available { .. }, ModelResidency::NotResident) => 4,
+        (
+            ModelAvailability::InvalidArtifact { .. }
+            | ModelAvailability::IncompatibleArtifact { .. },
+            _,
+        ) => 5,
+        (ModelAvailability::Available { .. }, ModelResidency::LoadFailed { .. }) => 6,
     }
 }
 
 fn ensure_deletable_status(model: &InventoryModel) -> Result<(), InventoryError> {
-    match model.status {
-        ModelStatus::Downloading { .. } => Err(InventoryError::Busy(model.id.0.clone())),
-        ModelStatus::Loading { .. }
-        | ModelStatus::Loaded { .. }
-        | ModelStatus::Unloading { .. } => Err(InventoryError::Loaded(model.id.0.clone())),
-        ModelStatus::Interrupted { .. }
-        | ModelStatus::Available { .. }
-        | ModelStatus::InvalidArtifact { .. }
-        | ModelStatus::IncompatibleArtifact { .. }
-        | ModelStatus::LoadFailed { .. } => Ok(()),
+    match (&model.availability, &model.residency) {
+        (ModelAvailability::Downloading { .. }, _) => Err(InventoryError::Busy(model.id.0.clone())),
+        (
+            _,
+            ModelResidency::Loading { .. }
+            | ModelResidency::Loaded { .. }
+            | ModelResidency::Unloading { .. },
+        ) => Err(InventoryError::Loaded(model.id.0.clone())),
+        _ => Ok(()),
     }
 }
 

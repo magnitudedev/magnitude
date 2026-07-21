@@ -1,7 +1,8 @@
-import { Context, Effect, Layer, PubSub, Stream } from "effect"
+import { Context, Effect, Layer, PubSub, Ref, Stream } from "effect"
 
 export interface LocalModelInventoryChangesApi {
   readonly publish: Effect.Effect<void>
+  readonly revision: Effect.Effect<number>
   readonly stream: Stream.Stream<void>
 }
 
@@ -15,8 +16,13 @@ export const LocalModelInventoryChangesLive = Layer.effect(
   LocalModelInventoryChanges,
   Effect.gen(function* () {
     const pubsub = yield* PubSub.sliding<void>(1)
+    const revision = yield* Ref.make(0)
     return LocalModelInventoryChanges.of({
-      publish: PubSub.publish(pubsub, undefined).pipe(Effect.asVoid),
+      publish: Ref.update(revision, (value) => value + 1).pipe(
+        Effect.zipRight(PubSub.publish(pubsub, undefined)),
+        Effect.asVoid,
+      ),
+      revision: Ref.get(revision),
       stream: Stream.fromPubSub(pubsub),
     })
   }),

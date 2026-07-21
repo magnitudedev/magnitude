@@ -276,6 +276,8 @@ export interface ModelAttemptFailureSnapshot {
   readonly tag: ModelAttemptFailure["_tag"]
   readonly detailTag: string
   readonly message: string
+  /** Exact provider-authored message, when the failure carried a valid provider error envelope. */
+  readonly providerMessage?: string
   readonly call: ProviderCall
   readonly responseStatus: number | null
   readonly progress: StreamProgress | null
@@ -292,6 +294,11 @@ export function snapshotModelAttemptFailure(
     tag: failure._tag,
     detailTag: detailTag(failure),
     message: formatModelAttemptFailureMessage(failure),
+    ...(failure._tag === "StreamProviderError"
+      ? { providerMessage: failure.providerError.message }
+      : failure._tag === "StreamStartProviderRejection"
+        ? { providerMessage: failure.rejection.message }
+        : {}),
     call: failure.call,
     responseStatus: "response" in failure && failure.response !== null ? failure.response.status : null,
     progress: "progress" in failure ? failure.progress : null,

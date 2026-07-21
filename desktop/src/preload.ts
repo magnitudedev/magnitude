@@ -83,27 +83,9 @@ function makeDesktopRpcRuntime() {
 }
 
 function makeDesktopApi(): DesktopApi {
-  let daemonErrorResolve: ((message: string) => void) | null = null
-  const daemonErrorPromise = new Promise<string>((resolve) => {
-    daemonErrorResolve = resolve
-  })
   const desktopRpc = makeDesktopRpcRuntime()
-  const readyPromise = desktopRpc.run((client) => client.DaemonEnsure({}))
-    .then(() => undefined)
-    .catch((cause: unknown) => {
-      const message = errorMessage(cause)
-      daemonErrorResolve?.(message)
-      daemonErrorResolve = null
-      throw new Error(message)
-    })
 
   return {
-    get ready(): Promise<void> {
-      return readyPromise
-    },
-    get daemonError(): Promise<string> {
-      return daemonErrorPromise
-    },
     get platform(): DesktopPlatform {
       return process.platform as DesktopPlatform
     },
