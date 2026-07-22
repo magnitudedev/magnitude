@@ -543,20 +543,6 @@ pub fn resolve_memory_domain<'a>(
     }
 }
 
-pub fn discover(
-    policy: CapacityPolicy,
-    native_build: impl Into<String>,
-    enabled_backends: Vec<String>,
-) -> Result<HardwareSnapshot, EstimateError> {
-    let backend = LlamaBackend::init().map_err(EstimateError::Backend)?;
-    Ok(discover_hardware(
-        &backend,
-        policy,
-        native_build,
-        enabled_backends,
-    ))
-}
-
 /// The exact plan selected for loading plus its consumer-facing assessment.
 #[derive(Clone, Debug)]
 pub struct AssessedExecutionPlan {
@@ -863,15 +849,6 @@ fn mtp_includes_model(plan: &ExecutionIntent) -> bool {
             ..
         }
     )
-}
-
-/// Initialize the pinned backend and assess execution intent.
-pub fn assess(
-    requested: &ExecutionIntent,
-    policy: CapacityPolicy,
-) -> Result<AssessedExecutionPlan, AssessmentError> {
-    let backend = LlamaBackend::init().map_err(EstimateError::Backend)?;
-    assess_with_backend(&backend, requested, policy)
 }
 
 /// Assess a plan using an existing initialized llama.cpp backend.
@@ -2012,18 +1989,6 @@ fn fits_assessment(
         },
         recommendation,
     }
-}
-
-/// Initialize llama.cpp and estimate a model without allocating its tensor data.
-///
-/// # Errors
-///
-/// Returns [`EstimateError`] if validation, backend initialization, or native
-/// diagnostics fail. A native fit `Failure`/`Error` is still returned as a
-/// typed [`FitReport`] so callers can inspect its diagnostics.
-pub fn estimate(request: &FitRequest) -> Result<FitReport, EstimateError> {
-    let backend = LlamaBackend::init().map_err(EstimateError::Backend)?;
-    estimate_with_backend(&backend, request)
 }
 
 /// Estimate a model using an already initialized llama.cpp backend.

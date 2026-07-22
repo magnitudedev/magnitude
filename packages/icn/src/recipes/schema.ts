@@ -1,0 +1,69 @@
+import { Schema } from "effect"
+
+const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
+const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
+
+export const ModelRecipeFitClass = Schema.Literal(
+  "full_accelerator",
+  "hybrid",
+  "cpu_or_unified",
+  "unknown",
+)
+export type ModelRecipeFitClass = Schema.Schema.Type<typeof ModelRecipeFitClass>
+
+export const ModelRecipeQuantization = Schema.Struct({
+  format: Schema.String,
+  quantAwareCheckpoint: Schema.Boolean,
+  fidelityLabel: Schema.String,
+  fidelityEvidence: Schema.String,
+  fidelitySourceUrl: Schema.String,
+})
+export type ModelRecipeQuantization = Schema.Schema.Type<typeof ModelRecipeQuantization>
+
+export const ModelRecipeRecommendation = Schema.Struct({
+  configurationId: Schema.String,
+  catalogModelId: Schema.String,
+  badge: Schema.Literal("recommended", "lighter", "higher_fidelity", "alternative"),
+  displayName: Schema.String,
+  family: Schema.String,
+  architecture: Schema.Literal("dense", "moe"),
+  totalParametersBillions: Schema.optionalWith(NonNegativeNumber, { as: "Option", exact: true }),
+  activeParametersBillions: Schema.optionalWith(NonNegativeNumber, { as: "Option", exact: true }),
+  effectiveParametersBillions: Schema.optionalWith(NonNegativeNumber, { as: "Option", exact: true }),
+  quantization: ModelRecipeQuantization,
+  quantTag: Schema.String,
+  repo: Schema.String,
+  revision: Schema.String,
+  files: Schema.Array(Schema.Struct({
+    path: Schema.String,
+    role: Schema.Literal("weights", "shard", "projector", "auxiliary", "draft", "mtp"),
+    sizeBytes: NonNegativeNumber,
+    sha256: Schema.String,
+  })),
+  totalDownloadBytes: NonNegativeNumber,
+  sourcePageUrl: Schema.String,
+  license: Schema.Struct({
+    id: Schema.String,
+    url: Schema.String,
+    acknowledgementRequired: Schema.Boolean,
+  }),
+  contextTokens: PositiveInteger,
+  modelMaximumContextTokens: PositiveInteger,
+  estimatedRuntimeBytes: NonNegativeNumber,
+  stableCapacityBudgetBytes: NonNegativeNumber,
+  fitMarginBytes: Schema.Number.pipe(Schema.finite()),
+  fitClass: ModelRecipeFitClass,
+  constrainedContext: Schema.Boolean,
+  explanation: Schema.String,
+})
+export type ModelRecipeRecommendation = Schema.Schema.Type<typeof ModelRecipeRecommendation>
+
+export const ModelRecipesState = Schema.Union(
+  Schema.TaggedStruct("Loading", {}),
+  Schema.TaggedStruct("Ready", {
+    recommendations: Schema.Array(ModelRecipeRecommendation),
+    failureCount: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
+  }),
+  Schema.TaggedStruct("Failed", { message: Schema.String }),
+)
+export type ModelRecipesState = Schema.Schema.Type<typeof ModelRecipesState>

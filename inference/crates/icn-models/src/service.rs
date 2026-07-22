@@ -11,19 +11,24 @@ use icn_contracts::{
 };
 
 use crate::download::blob_key;
-use crate::inventory::{ModelManager, hf_repo_dir, now};
+use crate::inventory::{ModelManager, RuntimeResidency, hf_repo_dir, now};
 use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationManifest};
 
 impl ModelInventory for ModelManager {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>> {
         Box::pin(async move {
             self.ensure_model_inventory().await?;
+            let residencies = self
+                .residencies
+                .read()
+                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
+                .clone();
             let mut models = self
                 .models
                 .read()
                 .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
                 .values()
-                .cloned()
+                .map(|model| model_with_residency(model, residencies.get(&model.id)))
                 .collect::<Vec<_>>();
             models.sort_by(|left, right| {
                 status_rank(left)
@@ -38,12 +43,18 @@ impl ModelInventory for ModelManager {
     fn get(&self, id: &ModelId) -> BoxFuture<'_, Result<InventoryModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
-            self.models
+            let model = self
+                .models
                 .read()
                 .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
                 .get(&id)
                 .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))
+                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+            let residencies = self
+                .residencies
+                .read()
+                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?;
+            Ok(model_with_residency(&model, residencies.get(&id)))
         })
     }
 
@@ -64,6 +75,13 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+            let residency = self
+                .residencies
+                .read()
+                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
+                .get(&id)
+                .cloned();
+            let model = model_with_residency(&model, residency.as_ref());
             ensure_deletable_status(&model)?;
             if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
                 return plan_interrupted_delete(&self.config.root, &model);
@@ -105,6 +123,13 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+            let residency = self
+                .residencies
+                .read()
+                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
+                .get(&id)
+                .cloned();
+            let model = model_with_residency(&model, residency.as_ref());
             ensure_deletable_status(&model)?;
             if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
                 let plan = plan_interrupted_delete(&self.config.root, &model)?;
@@ -170,6 +195,11 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+            let residencies = self
+                .residencies
+                .read()
+                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?;
+            let model = model_with_residency(&model, residencies.get(&id));
             if !matches!(model.availability, ModelAvailability::Available { .. }) {
                 return Err(InventoryError::NotReady(id.0.clone()));
             }
@@ -185,16 +215,24 @@ impl ModelInventory for ModelManager {
     ) -> BoxFuture<'_, Result<(), InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
-            let mut models = self
+            if !self
                 .models
+                .read()
+                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+                .contains_key(&id)
+            {
+                return Err(InventoryError::NotFound(id.0));
+            }
+            self.residencies
                 .write()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?;
-            let model = models
-                .get_mut(&id)
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            model.residency = residency;
-            model.operations = operations_for(model);
-            model.updated_at = now();
+                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
+                .insert(
+                    id,
+                    RuntimeResidency {
+                        state: residency,
+                        updated_at: now(),
+                    },
+                );
             Ok(())
         })
     }
@@ -207,6 +245,21 @@ impl ModelInventory for ModelManager {
         let id = id.clone();
         Box::pin(async move { self.configure_serving_model(&id, profile).await })
     }
+}
+
+pub(crate) fn model_with_residency(
+    model: &InventoryModel,
+    residency: Option<&RuntimeResidency>,
+) -> InventoryModel {
+    let mut model = model.clone();
+    if let Some(residency) = residency {
+        model.residency = residency.state.clone();
+        model.updated_at = model.updated_at.max(residency.updated_at);
+    } else {
+        model.residency = ModelResidency::NotResident;
+    }
+    model.operations = operations_for(&model);
+    model
 }
 
 fn operations_for(model: &InventoryModel) -> Vec<icn_contracts::ModelOperation> {

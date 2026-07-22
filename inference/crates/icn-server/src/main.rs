@@ -24,8 +24,8 @@ use icn_contracts::{
     ModelResidency, ProjectorConfig, ResolvedModel, SplitMode, TemplateAssessment,
     TemplateAssessor,
 };
-use icn_engine::{LlamaCompletionBackend, ModelLoadError, MtpCandidateSelection};
-use icn_hardware::{CapacityPolicy, discover};
+use icn_engine::{LlamaCompletionBackend, ModelLoadError, MtpCandidateSelection, NativeBackend};
+use icn_hardware::CapacityPolicy;
 use icn_models::{InventoryConfig, ModelManager, ModelPreviewService};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Instrument as _;
@@ -184,6 +184,7 @@ struct ResidentNativeExecutor {
 
 struct NativeHardwareAssessor {
     defaults: RuntimePlanDefaults,
+    native_backend: NativeBackend,
     native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
     gate: tokio::sync::Mutex<()>,
     planning_slots: Arc<tokio::sync::Semaphore>,
@@ -430,7 +431,15 @@ fn unavailable_performance(
 fn assess_planning_request(
     request: PlanningWorkerRequest,
 ) -> anyhow::Result<PlanningWorkerResponse> {
-    let backend = llama_cpp_2::llama_backend::LlamaBackend::init()?;
+    let native_backend = NativeBackend::initialize()?;
+    assess_planning_request_with_backend(request, &native_backend)
+}
+
+fn assess_planning_request_with_backend(
+    request: PlanningWorkerRequest,
+    native_backend: &NativeBackend,
+) -> anyhow::Result<PlanningWorkerResponse> {
+    let backend = native_backend.as_llama_backend();
     let mut plans = request
         .defaults
         .into_iter()
@@ -447,7 +456,7 @@ fn assess_planning_request(
             match (request.calibration, request.calibration_unavailable) {
                 (Some(calibration), _) => Ok(calibration),
                 (None, Some(error)) => Err(error),
-                (None, None) => llama_cpp_2::model::params::fit::FitCalibration::measure(&backend)
+                (None, None) => llama_cpp_2::model::params::fit::FitCalibration::measure(backend)
                     .map_err(|error| error.to_string()),
             },
         )
@@ -455,7 +464,7 @@ fn assess_planning_request(
         None
     };
     let assess_without_performance = |code: &str, message: String| {
-        icn_hardware::assess_profiles_with_backend(&backend, &plans, CapacityPolicy::default()).map(
+        icn_hardware::assess_profiles_with_backend(backend, &plans, CapacityPolicy::default()).map(
             |assessments| {
                 assessments
                     .into_iter()
@@ -469,7 +478,7 @@ fn assess_planning_request(
     };
     let base = match calibration.as_ref() {
         Some(Ok(calibration)) => icn_hardware::assess_execution_profiles_with_backend(
-            &backend,
+            backend,
             &plans,
             CapacityPolicy::default(),
             calibration,
@@ -481,7 +490,7 @@ fn assess_planning_request(
             assess_without_performance("calibration_failed", calibration_error.clone())
         }
         None => {
-            icn_hardware::assess_profiles_with_backend(&backend, &plans, CapacityPolicy::default())
+            icn_hardware::assess_profiles_with_backend(backend, &plans, CapacityPolicy::default())
                 .map(|assessments| {
                     assessments
                         .into_iter()
@@ -501,7 +510,7 @@ fn assess_planning_request(
                 return Ok(base);
             }
             plan.mtp = icn_mtp::select_mtp_with_backend(
-                &backend,
+                backend,
                 plan,
                 icn_mtp::CandidatePolicy::Automatic(&request.mtp),
             )
@@ -510,7 +519,7 @@ fn assess_planning_request(
                 return Ok(base);
             }
             let hardware =
-                icn_hardware::assess_with_backend(&backend, plan, CapacityPolicy::default())?
+                icn_hardware::assess_with_backend(backend, plan, CapacityPolicy::default())?
                     .assessment;
             let performance = if matches!(hardware, HardwareAssessment::Fits { .. }) {
                 // Phase 1 intentionally estimates baseline target-model decode. MTP changes fit
@@ -535,9 +544,18 @@ fn assess_planning_request(
 }
 
 #[cfg(test)]
+fn test_native_backend() -> NativeBackend {
+    static BACKEND: std::sync::OnceLock<NativeBackend> = std::sync::OnceLock::new();
+    BACKEND
+        .get_or_init(|| NativeBackend::initialize().expect("initialize test native backend"))
+        .clone()
+}
+
+#[cfg(test)]
 fn run_isolated_planning(request: PlanningWorkerRequest) -> anyhow::Result<PlanningWorkerResponse> {
     icn_engine::disable_native_diagnostics();
-    assess_planning_request(request)
+    let native_backend = test_native_backend();
+    assess_planning_request_with_backend(request, &native_backend)
 }
 
 #[cfg(not(test))]
@@ -619,10 +637,20 @@ fn run_planning_worker() -> anyhow::Result<()> {
 
 fn inspect_template_request(request: TemplateWorkerRequest) -> anyhow::Result<TemplateAssessment> {
     icn_engine::disable_native_diagnostics();
-    let inspection =
-        icn_reasoning::inspect_template_inputs(&icn_contracts::EffectiveTemplateInputs {
+    let native_backend = NativeBackend::initialize()?;
+    inspect_template_request_with_backend(request, &native_backend)
+}
+
+fn inspect_template_request_with_backend(
+    request: TemplateWorkerRequest,
+    native_backend: &NativeBackend,
+) -> anyhow::Result<TemplateAssessment> {
+    let inspection = icn_reasoning::inspect_template_inputs_with_backend(
+        native_backend.as_llama_backend(),
+        &icn_contracts::EffectiveTemplateInputs {
             model_path: request.model_path,
-        })?;
+        },
+    )?;
     Ok(TemplateAssessment {
         capabilities: inspection.capabilities,
         reasoning: inspection.reasoning,
@@ -634,7 +662,8 @@ fn inspect_template_request(request: TemplateWorkerRequest) -> anyhow::Result<Te
 fn run_isolated_template_inspection(
     request: TemplateWorkerRequest,
 ) -> anyhow::Result<TemplateAssessment> {
-    inspect_template_request(request)
+    let native_backend = test_native_backend();
+    inspect_template_request_with_backend(request, &native_backend)
 }
 
 #[cfg(not(test))]
@@ -806,6 +835,7 @@ impl HardwareProvider for NativeHardwareAssessor {
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
+            let native_backend = self.native_backend.clone();
             let mut snapshot = spawn_blocking_traced(move || match native_executor {
                 Some(resident) => {
                     let snapshot = resident
@@ -819,8 +849,11 @@ impl HardwareProvider for NativeHardwareAssessor {
                         .map_err(|error| InventoryError::Internal(error.to_string()))?;
                     Ok(snapshot)
                 }
-                None => discover(CapacityPolicy::default(), native_build, enabled_backends)
-                    .map_err(|error| InventoryError::Internal(error.to_string())),
+                None => Ok(native_backend.discover_hardware(
+                    CapacityPolicy::default(),
+                    native_build,
+                    enabled_backends,
+                )),
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
@@ -855,6 +888,7 @@ impl HardwareProvider for NativeHardwareAssessor {
 struct NativeRuntimeController {
     backends: BackendRegistry,
     inventory: Arc<ModelManager>,
+    native_backend: NativeBackend,
     native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
     defaults: RuntimePlanDefaults,
     state: Arc<tokio::sync::RwLock<RuntimeState>>,
@@ -862,10 +896,35 @@ struct NativeRuntimeController {
     next_operation: Arc<AtomicU64>,
 }
 
+#[derive(Clone)]
+struct RuntimeFailure {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+    runtime_lost: bool,
+}
+
+impl RuntimeFailure {
+    fn new(
+        code: &'static str,
+        message: impl Into<String>,
+        retryable: bool,
+        runtime_lost: bool,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+            runtime_lost,
+        }
+    }
+}
+
 impl NativeRuntimeController {
     fn new(
         backends: BackendRegistry,
         inventory: Arc<ModelManager>,
+        native_backend: NativeBackend,
         native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
         defaults: RuntimePlanDefaults,
         initial: RuntimeState,
@@ -873,6 +932,7 @@ impl NativeRuntimeController {
         Self {
             backends,
             inventory,
+            native_backend,
             native_executor,
             defaults,
             state: Arc::new(tokio::sync::RwLock::new(initial)),
@@ -893,22 +953,18 @@ impl NativeRuntimeController {
         sender: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
         operation_id: String,
         model_id: String,
-        code: &str,
-        message: impl Into<String>,
-        retryable: bool,
-        runtime_lost: bool,
+        failure: RuntimeFailure,
     ) {
-        let message = message.into();
         tracing::error!(
             operation.id = %operation_id,
             model.id = %model_id,
-            error.code = code,
-            error.message = %message,
-            error.retryable = retryable,
-            runtime.lost = runtime_lost,
+            error.code = failure.code,
+            error.message = %failure.message,
+            error.retryable = failure.retryable,
+            runtime.lost = failure.runtime_lost,
             "runtime model operation failed"
         );
-        if runtime_lost {
+        if failure.runtime_lost {
             let generation = self.backends.generation();
             *self.state.write().await = RuntimeState {
                 generation,
@@ -920,9 +976,9 @@ impl NativeRuntimeController {
             ModelLoadEvent::Failed {
                 operation_id,
                 model_id,
-                code: code.to_owned(),
-                message,
-                retryable,
+                code: failure.code.to_owned(),
+                message: failure.message,
+                retryable: failure.retryable,
             },
         )
         .await;
@@ -935,11 +991,8 @@ impl NativeRuntimeController {
         stage: LoadStage,
         operation_id: String,
         model_id: String,
-        code: &str,
-        message: impl Into<String>,
-        retryable: bool,
+        failure: RuntimeFailure,
     ) {
-        let message = message.into();
         let _ = self
             .inventory
             .update_residency(
@@ -947,21 +1000,13 @@ impl NativeRuntimeController {
                 ModelResidency::LoadFailed {
                     attempted_at: unix_timestamp(),
                     stage,
-                    code: code.to_owned(),
-                    retryable,
+                    code: failure.code.to_owned(),
+                    message: failure.message.clone(),
+                    retryable: failure.retryable,
                 },
             )
             .await;
-        self.fail(
-            sender,
-            operation_id,
-            model_id,
-            code,
-            message,
-            retryable,
-            true,
-        )
-        .await;
+        self.fail(sender, operation_id, model_id, failure).await;
     }
 
     fn profile_defaults(
@@ -1031,10 +1076,7 @@ impl NativeRuntimeController {
                     &sender,
                     operation_id,
                     model_id,
-                    "model_unavailable",
-                    error.to_string(),
-                    false,
-                    false,
+                    RuntimeFailure::new("model_unavailable", error.to_string(), false, false),
                 )
                 .await;
                 return Err(InventoryError::NotReady(error.to_string()));
@@ -1066,6 +1108,7 @@ impl NativeRuntimeController {
                     operation_id: operation_id.clone(),
                     model_id: model_id.clone(),
                     stage,
+                    fraction: None,
                 },
             )
             .await;
@@ -1078,10 +1121,7 @@ impl NativeRuntimeController {
                     &sender,
                     operation_id,
                     model_id,
-                    "model_unavailable",
-                    error.to_string(),
-                    false,
-                    false,
+                    RuntimeFailure::new("model_unavailable", error.to_string(), false, false),
                 )
                 .await;
                 return Err(InventoryError::NotReady(error.to_string()));
@@ -1093,6 +1133,7 @@ impl NativeRuntimeController {
                 operation_id: operation_id.clone(),
                 model_id: model_id.clone(),
                 stage: ModelLoadStage::Assessing,
+                fraction: None,
             },
         )
         .await;
@@ -1109,6 +1150,7 @@ impl NativeRuntimeController {
                 operation_id: operation_id.clone(),
                 model_id: model_id.clone(),
                 stage: ModelLoadStage::Unloading,
+                fraction: None,
             },
         )
         .await;
@@ -1125,6 +1167,7 @@ impl NativeRuntimeController {
         }
         self.backends.clear();
 
+        let load_started_at = unix_timestamp();
         let _ = self
             .inventory
             .update_residency(
@@ -1132,7 +1175,8 @@ impl NativeRuntimeController {
                 ModelResidency::Loading {
                     load_id: operation_id.clone(),
                     stage: LoadStage::Opening,
-                    started_at: unix_timestamp(),
+                    started_at: load_started_at,
+                    fraction: None,
                 },
             )
             .await;
@@ -1142,36 +1186,68 @@ impl NativeRuntimeController {
                 operation_id: operation_id.clone(),
                 model_id: model_id.clone(),
                 stage: ModelLoadStage::Loading,
+                fraction: None,
             },
         )
         .await;
         let load_model_id = model_id.clone();
-        let backend = match spawn_blocking_traced(move || {
-            LlamaCompletionBackend::load(load_model_id, plan, mtp_selection)
-        })
-        .await
-        {
+        let native_backend = self.native_backend.clone();
+        let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let load_task = spawn_blocking_traced(move || {
+            let mut last_reported = -1.0_f32;
+            native_backend.load_with_progress(load_model_id, plan, mtp_selection, move |fraction| {
+                let fraction = fraction.clamp(0.0, 1.0);
+                if fraction >= 1.0 || fraction - last_reported >= 0.005 {
+                    last_reported = fraction;
+                    let _ = progress_sender.send(fraction);
+                }
+            })
+        });
+        tokio::pin!(load_task);
+        let load_result = loop {
+            tokio::select! {
+                result = &mut load_task => break result,
+                progress = progress_receiver.recv() => {
+                    let Some(fraction) = progress else {
+                        break load_task.await;
+                    };
+                    let _ = self.inventory.update_residency(
+                        &resolved.model.id,
+                        ModelResidency::Loading {
+                            load_id: operation_id.clone(),
+                            stage: LoadStage::Mapping,
+                            started_at: load_started_at,
+                            fraction: Some(fraction),
+                        },
+                    ).await;
+                    let _ = Self::emit(
+                        &sender,
+                        ModelLoadEvent::Progress {
+                            operation_id: operation_id.clone(),
+                            model_id: model_id.clone(),
+                            stage: ModelLoadStage::Loading,
+                            fraction: Some(fraction),
+                        },
+                    ).await;
+                }
+            }
+        };
+        let backend = match load_result {
             Ok(Ok(backend)) => Arc::new(backend),
             Ok(Err(error)) => {
                 let (code, retryable) = match &error {
                     ModelLoadError::InvalidConfiguration(_) => ("invalid_configuration", false),
                     ModelLoadError::MtpSelection(_) => ("incompatible_auxiliary", false),
                     ModelLoadError::Planning(_) => ("planner_failed", true),
-                    ModelLoadError::AssessmentRejected(HardwareAssessment::DoesNotFit {
-                        ..
-                    }) => ("does_not_fit", false),
-                    ModelLoadError::AssessmentRejected(HardwareAssessment::InvalidArtifact {
-                        ..
-                    }) => ("invalid_artifact", false),
-                    ModelLoadError::AssessmentRejected(
-                        HardwareAssessment::IncompatibleArtifact { .. },
-                    ) => ("incompatible_artifact", false),
-                    ModelLoadError::AssessmentRejected(HardwareAssessment::NotAssessed {
-                        ..
-                    }) => ("planner_failed", true),
-                    ModelLoadError::AssessmentRejected(HardwareAssessment::Fits { .. }) => {
-                        ("planner_invariant", false)
-                    }
+                    ModelLoadError::AssessmentRejected(assessment) => match assessment.as_ref() {
+                        HardwareAssessment::DoesNotFit { .. } => ("does_not_fit", false),
+                        HardwareAssessment::InvalidArtifact { .. } => ("invalid_artifact", false),
+                        HardwareAssessment::IncompatibleArtifact { .. } => {
+                            ("incompatible_artifact", false)
+                        }
+                        HardwareAssessment::NotAssessed { .. } => ("planner_failed", true),
+                        HardwareAssessment::Fits { .. } => ("planner_invariant", false),
+                    },
                     ModelLoadError::Backend(_) => ("backend_load_failed", true),
                 };
                 self.fail_load(
@@ -1180,9 +1256,7 @@ impl NativeRuntimeController {
                     LoadStage::Opening,
                     operation_id,
                     model_id,
-                    code,
-                    error.to_string(),
-                    retryable,
+                    RuntimeFailure::new(code, error.to_string(), retryable, true),
                 )
                 .await;
                 return Err(InventoryError::Internal(error.to_string()));
@@ -1194,9 +1268,7 @@ impl NativeRuntimeController {
                     LoadStage::Opening,
                     operation_id,
                     model_id,
-                    "load_task_failed",
-                    error.to_string(),
-                    true,
+                    RuntimeFailure::new("load_task_failed", error.to_string(), true, true),
                 )
                 .await;
                 return Err(InventoryError::Internal(error.to_string()));
@@ -1208,6 +1280,7 @@ impl NativeRuntimeController {
                 operation_id: operation_id.clone(),
                 model_id: model_id.clone(),
                 stage: ModelLoadStage::Verifying,
+                fraction: None,
             },
         )
         .await;
@@ -1220,9 +1293,7 @@ impl NativeRuntimeController {
                     LoadStage::Warming,
                     operation_id,
                     model_id,
-                    "verification_failed",
-                    error.to_string(),
-                    true,
+                    RuntimeFailure::new("verification_failed", error.to_string(), true, true),
                 )
                 .await;
                 return Err(InventoryError::Internal(error.to_string()));
@@ -1339,10 +1410,10 @@ impl RuntimeController for NativeRuntimeController {
                         .await?;
 
                     let state = runtime.state.read().await.clone();
-                    if !state
+                    if state
                         .resident
                         .as_ref()
-                        .is_some_and(|resident| resident.model_id == model_id)
+                        .is_none_or(|resident| resident.model_id != model_id)
                     {
                         return Err(InventoryError::Internal(
                             "runtime readiness completed without the requested target".into(),
@@ -1435,6 +1506,8 @@ async fn main() -> anyhow::Result<()> {
             inventory_config.model_sources.extend(model_sources);
             inventory_config.hf_cache_dirs.extend(hf_caches);
             let plan_defaults = runtime_plan_defaults();
+            let native_backend = NativeBackend::initialize()
+                .context("failed to initialize the process native backend")?;
             let inventory = Arc::new(
                 ModelManager::open_with_template_assessor(
                     inventory_config,
@@ -1446,6 +1519,7 @@ async fn main() -> anyhow::Result<()> {
             let native_executor_slot = Arc::new(RwLock::new(None));
             let inventory_hardware_assessor = Arc::new(NativeHardwareAssessor {
                 defaults: plan_defaults.clone(),
+                native_backend: native_backend.clone(),
                 native_executor: Arc::clone(&native_executor_slot),
                 gate: tokio::sync::Mutex::new(()),
                 planning_slots: Arc::new(tokio::sync::Semaphore::new(planner_concurrency())),
@@ -1478,6 +1552,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(NativeRuntimeController::new(
                     backends.clone(),
                     inventory.clone(),
+                    native_backend,
                     native_executor_slot,
                     plan_defaults,
                     RuntimeState {
@@ -1633,6 +1708,7 @@ mod tests {
     fn available_and_preview_cache_keys_share_resolved_profile_identity() {
         let assessor = NativeHardwareAssessor {
             defaults: parity_test_defaults(),
+            native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),
             planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1715,6 +1791,7 @@ mod tests {
 
         let assessor = Arc::new(NativeHardwareAssessor {
             defaults: parity_test_defaults(),
+            native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),
             planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),

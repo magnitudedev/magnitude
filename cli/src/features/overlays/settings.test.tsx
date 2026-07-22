@@ -3,7 +3,7 @@ import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { testRender } from "@opentui/react/test-utils"
 import { act } from "react"
-import type { LocalInferenceState } from "@magnitudedev/sdk"
+import type { LocalInferenceState } from "@magnitudedev/client-common"
 
 const gib = 1024 ** 3
 const textPosition = (frame: string, needle: string) => {
@@ -16,36 +16,33 @@ const textPosition = (frame: string, needle: string) => {
 const localInferenceState = {
   activeBinding: null,
   host: {
-    _tag: "Available",
-    profile: {
-      platform: "macos",
-      architecture: "aarch64",
-      topologyFingerprint: "test",
-      systemMemoryBytes: 64 * gib,
-      cpuModel: "Apple M4 Max",
-      logicalCores: 16,
-      memoryDomains: [{
-        id: "system",
-        kind: "unified_memory",
-        totalCapacityBytes: 64 * gib,
-        stableCapacityBytes: 51.2 * gib,
-        currentFreeBytes: 12 * gib,
-        sharesSystemMemory: true,
-        backendNames: ["Metal"],
-        deviceNames: ["Apple M4 Max"],
-        splitGroupId: null,
+    platform: "macos",
+    architecture: "aarch64",
+    topologyFingerprint: "test",
+    systemMemoryBytes: 64 * gib,
+    cpuModel: "Apple M4 Max",
+    logicalCores: 16,
+    memoryDomains: [{
+      id: "system",
+      kind: "unified_memory",
+      totalCapacityBytes: 64 * gib,
+      stableCapacityBytes: 51.2 * gib,
+      currentFreeBytes: 12 * gib,
+      sharesSystemMemory: true,
+      backendNames: ["Metal"],
+      deviceNames: ["Apple M4 Max"],
+      splitGroupId: null,
+    }],
+    residentMemory: {
+      modelId: "model",
+      runtimeGeneration: 1,
+      domains: [{
+        memoryDomainId: "system",
+        modelBytes: 27 * gib,
+        contextBytes: 6 * gib,
+        computeBytes: 1.5 * gib,
+        auxiliaryBytes: 0.5 * gib,
       }],
-      residentMemory: {
-        modelId: "model",
-        runtimeGeneration: 1,
-        domains: [{
-          memoryDomainId: "system",
-          modelBytes: 27 * gib,
-          contextBytes: 6 * gib,
-          computeBytes: 1.5 * gib,
-          auxiliaryBytes: 0.5 * gib,
-        }],
-      },
     },
   },
   choices: [],

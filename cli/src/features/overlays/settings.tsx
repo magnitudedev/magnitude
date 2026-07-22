@@ -85,9 +85,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const theme = useTheme()
   const localInferenceState = useLocalInferenceQuery()
   const localInferenceSnapshot = Result.value(localInferenceState)
-  const host = Option.flatMap(localInferenceSnapshot, (state) =>
-    state.host._tag === 'Available' ? Option.some(state.host.profile) : Option.none()
-  )
+  const host = Option.map(localInferenceSnapshot, (state) => state.host)
   const hardware = Option.map(host, describeLocalHardware)
   const hardwareMemory = Option.map(host, deriveHardwareMemoryView)
   const [mode, setMode] = useState<Mode>('view')

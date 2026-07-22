@@ -6,11 +6,15 @@ applies_to:
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
   - inference/native/llama-cpp-rs/**
-  - packages/acn/src/local-inference/**
+  - packages/icn/src/hardware/**
+  - packages/icn/src/recipes/**
+  - packages/acn/src/icn/**
   - packages/protocol/src/rpcs/local-inference.ts
   - packages/protocol/src/schemas/local-inference.ts
   - packages/client-common/src/hooks/use-local-inference-state.ts
+  - packages/client-common/src/types/local-inference.ts
   - packages/client-common/src/utils/hardware-memory.ts
+  - packages/client-common/src/utils/local-inference-view.ts
   - cli/src/features/local-inference/**
   - cli/src/features/overlays/settings.tsx
   - cli/src/components/hardware-memory-domain.tsx
@@ -21,8 +25,9 @@ applies_to:
 
 ICN is the sole authority for inference hardware discovery and model-memory fitting. It exposes the
 hardware visible to its pinned native runtime and uses one native planning path for both downloaded
-models and remote catalog artifacts. ACN retains catalog curation and product ranking, while clients
-only present ICN-derived facts.
+models and remote catalog artifacts. The ICN integration package owns recipe curation and product
+ranking through native preview, while ACN binds the results to mirrors and clients only present
+ICN-derived facts.
 
 The central parity guarantee is:
 
@@ -52,16 +57,25 @@ Its workload, calibration, confidence, and failure guarantees are defined in
 [generation-performance estimation](./performance-estimation.md). A performance failure never
 changes a hardware-fit result.
 
-ACN owns:
+The `@magnitudedev/icn` recipe service owns:
 
 - the curated set of recommended artifact identities;
 - product quality and quantization-fidelity policy;
 - the fixed product profiles to evaluate;
-- ranking successfully assessed candidates and projecting them into client RPC state.
+- ranking successfully assessed candidates.
+
+ACN owns exact mirror binding and application commands. It does not estimate fit, rank candidates,
+or reconstruct hardware state.
 
 Clients own formatting and interaction only. Bun and client code must not independently inspect the
 OS, invoke native-backend device commands, classify unified memory, reserve device capacity, or estimate
 model, KV, recurrent, graph, or compute memory.
+
+Client-common owns the presentation-oriented composition of the independent hardware, inventory,
+and recipe mirrors. That derived view is not a protocol schema or an additional mirrored state: it
+contains no authority, persistence, polling, or state transitions of its own. A failed mirror remains
+in the query result's error channel; the derived success type does not invent an "unavailable" domain
+variant for facts that ICN did not provide.
 
 ## One assessment pipeline
 
@@ -158,11 +172,13 @@ The transport-neutral contracts define one canonical hardware snapshot, executio
 canonical component identity, and `HardwareAssessment`. The available and preview APIs may
 use different request and envelope types, but they do not define separate assessment shapes.
 
-The hardware discovery service owns backend initialization, logical-device enumeration, physical
+The ICN composition root owns one process-lifetime native-backend capability. The hardware
+discovery service requires that capability and owns logical-device enumeration, physical
 memory-domain aliasing, stable capacity, volatile free-memory observation, and topology
-fingerprinting. Its result is reused within an operation and may be refreshed according to one
-service-owned policy. API state, inventory assessment, preview, and loading receive this service by
-dependency injection rather than constructing their own snapshots.
+fingerprinting. It never initializes or tears down a backend as part of an observation. Its result
+is reused within an operation and may be refreshed according to one service-owned policy. API
+state, inventory assessment, preview, and loading receive this service by dependency injection
+rather than constructing their own snapshots.
 
 The canonical artifact resolver owns component roles and relationships, exact identities, logical
 sizes, and metadata sources. Local and remote adapters implement acquisition only. The shared

@@ -89,6 +89,29 @@ export function useMirroredState<
   readonly snapshotSchema: Schema.Schema<Snapshot, SnapshotEncoded, SnapshotRequirements>
   readonly errorSchema: Schema.Schema<Error, ErrorEncoded, ErrorRequirements>
 }): Result.Result<Snapshot, Error | RpcClientError> {
+  const queryAtom = useMirroredStateAtom(definition)
+  return useAtomValue(queryAtom)
+}
+
+/**
+ * Returns the query atom for a mirrored state and keeps the shared invalidation
+ * watch resident. Consumers that compose multiple mirrors should derive one
+ * atom from these query atoms so React observes a single coherent value.
+ */
+export function useMirroredStateAtom<
+  const Id extends Rpc.Tag<MagnitudeRpc>,
+  Snapshot,
+  SnapshotEncoded,
+  SnapshotRequirements,
+  Error,
+  ErrorEncoded,
+  ErrorRequirements,
+>(definition: {
+  readonly id: Id
+  readonly getPayload: RpcPayload<Id>
+  readonly snapshotSchema: Schema.Schema<Snapshot, SnapshotEncoded, SnapshotRequirements>
+  readonly errorSchema: Schema.Schema<Error, ErrorEncoded, ErrorRequirements>
+}): Atom.Atom<Result.Result<Snapshot, Error | RpcClientError>> {
   const client = useAgentClient()
   const queryAtom = useMemo(
     () => client.query(definition.id, definition.getPayload, { reactivityKeys: [definition.id] }),
@@ -99,5 +122,5 @@ export function useMirroredState<
     [client, definition.id],
   )
   useAtomMount(watchAtom)
-  return useAtomValue(queryAtom)
+  return queryAtom
 }

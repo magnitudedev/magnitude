@@ -27,13 +27,8 @@ import { SessionDestroyerLive } from "./session-destroyer"
 import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
-import {
-  LocalInferenceLive,
-  LocalModelInventoryChangesLive,
-  LocalModelProviderSourceLive,
-  LocalModelConfigurationLive,
-} from "./local-inference"
-import { AcnIcnLive } from "./icn-layer"
+import { makeLocalModelConfigurationLayer } from "./model-configuration"
+import { makeAcnIcn, makeIcnCommands, makeIcnMirrors } from "./icn"
 import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
@@ -186,13 +181,13 @@ const makeAcnServicesBase = (debug: boolean) => {
 }
 
 const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {
-  const withChanges = Layer.provideMerge(LocalModelInventoryChangesLive, base)
-  const withIcn = Layer.provideMerge(AcnIcnLive, withChanges)
-  const withConfiguration = Layer.provideMerge(LocalModelConfigurationLive, withIcn)
-  const withOnboarding = Layer.provideMerge(OnboardingLive, withConfiguration)
-  const withBackend = Layer.provideMerge(LocalModelProviderSourceLive, withOnboarding)
-  const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withBackend)
-  return Layer.provideMerge(LocalInferenceLive, withProviderClients)
+  const withIcn = Layer.provideMerge(makeAcnIcn(), base)
+  const withIcnMirrors = Layer.provideMerge(makeIcnMirrors(), withIcn)
+  const withConfiguration = Layer.provideMerge(makeLocalModelConfigurationLayer(), withIcnMirrors)
+  const withIcnCommands = Layer.provideMerge(makeIcnCommands(), withConfiguration)
+  const withOnboarding = Layer.provideMerge(OnboardingLive, withIcnCommands)
+  const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withOnboarding)
+  return withProviderClients
 }
 
 const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {

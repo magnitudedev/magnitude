@@ -1455,6 +1455,7 @@ export type ModelListEncoded = S.Schema.Encoded<typeof ModelList>
 export const ModelLoadEvent = S.Union(
   S.extend(
     S.Struct({
+      fraction: S.optionalWith(S.Union(S.Number, S.Null), { exact: true, as: "Option" }),
       model_id: S.String,
       operation_id: S.String,
       stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
@@ -1649,6 +1650,7 @@ export const ModelResidencySchema = S.Union(
   ),
   S.extend(
     S.Struct({
+      fraction: S.optionalWith(S.Union(S.Number, S.Null), { exact: true, as: "Option" }),
       load_id: S.String,
       stage: S.suspend((): S.Schema<LoadStageSchema, LoadStageSchemaEncoded> => LoadStageSchema),
       started_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1678,6 +1680,7 @@ export const ModelResidencySchema = S.Union(
     S.Struct({
       attempted_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       code: S.String,
+      message: S.String,
       retryable: S.Boolean,
       stage: S.suspend((): S.Schema<LoadStageSchema, LoadStageSchemaEncoded> => LoadStageSchema),
       type: S.Literal("load_failed"),

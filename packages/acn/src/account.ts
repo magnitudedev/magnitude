@@ -57,8 +57,9 @@ import {
   ModelSlotsMirror,
 } from "@magnitudedev/protocol"
 import { SessionStore } from "./session-store"
-import { LocalModelProviderSource } from "./local-inference/provider-source"
-import { LocalModelConfiguration } from "./local-inference/model-configuration"
+import { IcnProvider } from "@magnitudedev/icn/provider"
+import { IcnInventory } from "@magnitudedev/icn/inventory"
+import { LocalModelConfiguration } from "./model-configuration"
 import { foldProviderCatalogOutcomes, type FoldedProviderCatalogs } from "./model-catalog-snapshot"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 
@@ -111,11 +112,11 @@ const noApiKey = (operation: string): SessionError =>
 const isSlotId = (value: unknown): value is SlotId =>
   value === "primary" || value === "secondary"
 
-const storedProviderId = (value: string | undefined) =>
-  value !== undefined && Schema.is(ProviderIdSchema)(value) ? value : undefined
+const storedProviderId = (value: Option.Option<string>): Option.Option<ProviderId> =>
+  Option.filter(value, Schema.is(ProviderIdSchema))
 
-const storedProviderModelId = (value: string | undefined) =>
-  value !== undefined && Schema.is(ProviderModelIdSchema)(value) ? value : undefined
+const storedProviderModelId = (value: Option.Option<string>): Option.Option<ProviderModelId> =>
+  Option.filter(value, Schema.is(ProviderModelIdSchema))
 
 const slotsForModel = (model: ProviderModel): readonly SlotId[] => {
   if (!("slots" in model) || !Array.isArray(model.slots)) return []
@@ -138,11 +139,16 @@ function toModelSummary(model: ProviderModel): ModelSummary {
     defaultReasoningEffort: model.defaultReasoningEffort,
     properties: model.properties,
     availability: model.availability,
-    pricing: model.pricing ? {
-      input: model.pricing.input,
-      output: model.pricing.output,
-      ...(model.pricing.cached_input !== null ? { cachedInput: model.pricing.cached_input } : {}),
-    } : undefined,
+    ...Option.match(Option.fromNullable(model.pricing), {
+      onNone: () => ({}),
+      onSome: (pricing) => ({
+        pricing: {
+          input: pricing.input,
+          output: pricing.output,
+          ...(pricing.cached_input !== null ? { cachedInput: pricing.cached_input } : {}),
+        },
+      }),
+    }),
   }
 }
 
@@ -186,8 +192,8 @@ function buildSlotState(
       slots: slotStatesFromModels(models, modelConfig),
       modelConfig: {
         slots: Object.fromEntries(Object.entries(modelConfig?.slots ?? {}).map(([slotId, slot]) => [slotId, {
-          ...(storedProviderId(slot?.providerId) ? { providerId: storedProviderId(slot?.providerId)! } : {}),
-          ...(storedProviderModelId(slot?.providerModelId) ? { providerModelId: storedProviderModelId(slot?.providerModelId)! } : {}),
+          ...Option.match(storedProviderId(Option.fromNullable(slot?.providerId)), { onNone: () => ({}), onSome: (providerId) => ({ providerId }) }),
+          ...Option.match(storedProviderModelId(Option.fromNullable(slot?.providerModelId)), { onNone: () => ({}), onSome: (providerModelId) => ({ providerModelId }) }),
           ...(slot?.reasoningEffort ? { reasoningEffort: slot.reasoningEffort } : {}),
         }])),
         localSlotIntent: modelConfig?.localSlotIntent ?? {},
@@ -217,47 +223,57 @@ export function slotStatesFromModels(
       : intent === "cloud"
         ? routableModels.filter((model) => model.providerId !== "local")
         : routableModels
-    const hasOverride = userSlotConfig?.providerId !== undefined && userSlotConfig.providerModelId !== undefined
-    const selected = hasOverride
-      ? routableModels.find((candidate) => candidate.providerId === userSlotConfig.providerId && candidate.providerModelId === userSlotConfig.providerModelId)
-      : eligibleModels.find((model) => model.availability._tag === "Available" && model.slots.includes(slotId))
-        ?? eligibleModels.find((model) => model.availability._tag === "Available")
-    if (!selected) {
+    const configuredProvider = Option.fromNullable(userSlotConfig?.providerId)
+    const configuredModel = Option.fromNullable(userSlotConfig?.providerModelId)
+    const override = Option.all({ providerId: configuredProvider, providerModelId: configuredModel })
+    const selected = Option.match(override, {
+      onSome: ({ providerId, providerModelId }) => Option.fromNullable(
+        routableModels.find((candidate) =>
+          candidate.providerId === providerId && candidate.providerModelId === providerModelId),
+      ),
+      onNone: () => Option.orElse(
+        Option.fromNullable(eligibleModels.find((model) =>
+          model.availability._tag === "Available" && model.slots.includes(slotId))),
+        () => Option.fromNullable(eligibleModels.find((model) => model.availability._tag === "Available")),
+      ),
+    })
+    if (Option.isNone(selected)) {
       states[slotId] = new SlotUnassigned({ slotId, reason: models.length === 0 ? "provider_unavailable" : "no_candidate" })
       continue
     }
+    const selectedModel = selected.value
     const requestedEffort = userSlotConfig?.reasoningEffort
       ? ReasoningEffortSchema.make(userSlotConfig.reasoningEffort)
-      : selected.defaultReasoningEffort
-    const reasoning = selected.properties.reasoning
+      : selectedModel.defaultReasoningEffort
+    const reasoning = selectedModel.properties.reasoning
     const hasKnownEfforts = reasoning._tag === "Cached" || reasoning._tag === "Resolved" || reasoning._tag === "Refreshing"
     const knownEfforts = hasKnownEfforts
       ? reasoning.value
       : []
-    const waitingForReasoning = requestedEffort !== selected.defaultReasoningEffort && !hasKnownEfforts
-    const reasoningEffort = requestedEffort === selected.defaultReasoningEffort
+    const waitingForReasoning = requestedEffort !== selectedModel.defaultReasoningEffort && !hasKnownEfforts
+    const reasoningEffort = requestedEffort === selectedModel.defaultReasoningEffort
       || knownEfforts.includes(requestedEffort)
       || waitingForReasoning
       ? requestedEffort
-      : selected.defaultReasoningEffort
+      : selectedModel.defaultReasoningEffort
     const selection = {
-      providerId: selected.providerId,
-      providerModelId: selected.providerModelId,
+      providerId: selectedModel.providerId,
+      providerModelId: selectedModel.providerModelId,
       reasoningEffort,
     }
-    const source = hasOverride ? "user" as const : "automatic" as const
-    if (selected.availability._tag === "Disabled") {
-      const reason = selected.availability.reason === "model_unavailable"
+    const source = Option.isSome(override) ? "user" as const : "automatic" as const
+    if (selectedModel.availability._tag === "Disabled") {
+      const reason = selectedModel.availability.reason === "model_unavailable"
         ? "model_unavailable" as const
-        : selected.availability.reason === "installation_unavailable"
+        : selectedModel.availability.reason === "installation_unavailable"
           ? "installation_unavailable" as const
-        : selected.availability.reason === "incompatible_runtime"
+        : selectedModel.availability.reason === "incompatible_runtime"
           ? "incompatible_runtime" as const
           : "invalid_configuration" as const
       states[slotId] = new SlotBlocked({ slotId, selection, source, reason })
       continue
     }
-    if (requestedEffort !== selected.defaultReasoningEffort && reasoning._tag === "Failed") {
+    if (requestedEffort !== selectedModel.defaultReasoningEffort && reasoning._tag === "Failed") {
       states[slotId] = new SlotBlocked({ slotId, selection, source, reason: "property_discovery_failed" })
       continue
     }
@@ -269,9 +285,9 @@ export function slotStatesFromModels(
       slotId,
       selection,
       source,
-      modelDisplayName: selected.displayName,
-      contextWindow: selected.contextWindow,
-      maxOutputTokens: selected.maxOutputTokens,
+      modelDisplayName: selectedModel.displayName,
+      contextWindow: selectedModel.contextWindow,
+      maxOutputTokens: selectedModel.maxOutputTokens,
     })
   }
   return states as SlotStates
@@ -303,7 +319,7 @@ function compatibilityProfiles(states: SlotStates): SlotProfiles {
 // Layer
 // =============================================================================
 
-export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | ProviderClientRegistry | LocalModelProviderSource | LocalModelConfiguration | MirroredStateChanges> =
+export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderClient | MagnitudeStorage | ProviderClientRegistry | IcnProvider | IcnInventory | LocalModelConfiguration | MirroredStateChanges> =
   Layer.scoped(
     Account,
     Effect.gen(function* () {
@@ -311,7 +327,8 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       const sharedClient = yield* ProviderClient
       const storage = yield* MagnitudeStorage
       const providerClients = yield* ProviderClientRegistry
-      const localModels = yield* LocalModelProviderSource
+      const localModels = yield* IcnProvider
+      const localInventory = yield* IcnInventory
       const modelConfiguration = yield* LocalModelConfiguration
       const scope = yield* Scope.Scope
       const snapshotLock = yield* Effect.makeSemaphore(1)
@@ -608,7 +625,7 @@ export const AccountLive: Layer.Layer<Account, never, SessionStore | ProviderCli
       ).pipe(Effect.asVoid)
 
       yield* refreshInBackground(false)
-      yield* Effect.forkIn(localModels.changes.pipe(
+      yield* Effect.forkIn(localInventory.changes.pipe(
         Stream.runForEach(() => observeResourceDefects("rebuild-local-model-resources", rebuildLocalSnapshots)),
       ), scope)
       yield* Effect.forkIn(modelConfiguration.changes.pipe(

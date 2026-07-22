@@ -4,8 +4,8 @@ ICN is the only authority for inference hardware, artifact inspection, model fit
 downloads, and active runtime state. CLI and web actions call ACN RPCs; ACN translates those actions
 to the generated ICN client. ACN never treats its own host as the inference machine.
 
-The versioned canonical catalog is a Magnitude metadata overlay. It groups quantized choices under
-stable checkpoint identities and records repository IDs, artifact selectors, product context
+The curated model recipes are Magnitude-owned metadata. They group quantized choices under
+stable checkpoint identities and record repositories, artifact selectors, product context
 profiles, reviewed performance and fidelity evidence, and license policy. It does not pin Hugging
 Face commits or copy filenames, shard lists, sizes, or hashes into source.
 
@@ -19,15 +19,15 @@ Live discovery is cached by ICN: search results are brief, repository snapshots 
 and GGUF headers plus fit/performance assessments are content-addressed by immutable artifact and
 hardware evidence. No model weights are downloaded until the user chooses a model.
 
-For each usage choice ACN submits the applicable context and parallel-sequence profiles to preview,
-keeps only complete `Fits` results, and ranks them with the curated product policy. The UI continues
+For each usage choice the ICN recipe service submits the applicable context and parallel-sequence
+profiles to preview, keeps only complete `Fits` results, and ranks them with the curated product policy. The UI continues
 to show recommendations, exact artifact details, hardware, download progress, downloaded models,
-activation, restart, unload, and deletion. Download and load progress are streamed from ICN and
-projected into the existing ACN state.
+activation, restart, unload, and deletion. Download and load progress update the ICN inventory
+snapshot, which ACN exposes through the ordinary mirrored-state contract.
 
-Downloaded artifacts live in ICN's configured model store. `GET /v1/models` is the inventory
-authority, `GET /v1/hardware` is the hardware authority, and `GET /v1/runtime/model` is the active
-runtime authority. ACN persists only user usage/profile and ordinary slot selections; it does not
+Downloaded artifacts live in ICN's configured model store. `GET /v1/models` is the inventory and
+residency authority, while `GET /v1/hardware` is the hardware and live memory authority. ACN persists
+only user usage/profile and ordinary slot selections; it does not
 persist a competing artifact index, endpoint binding, runtime installation, or active-model record.
 
 The local provider ID is `local`. Its model catalog is projected from ICN inventory, demand loading

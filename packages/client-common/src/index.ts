@@ -27,6 +27,7 @@ export * from './sync/index'
 export * from './types/store'
 export type { KeyEvent } from './types/key-event'
 export * from './types/menu-action'
+export * from './types/local-inference'
 
 // Utils
 export * from './utils/format-tokens'

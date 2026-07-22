@@ -19,6 +19,15 @@ export interface MirroredState<State> {
   ) => Effect.Effect<MirroredSnapshot<State>>
 }
 
+export interface MirroredStateSource<State> {
+  readonly get: Effect.Effect<MirroredSnapshot<State>>
+  readonly changes: Stream.Stream<MirroredSnapshot<State>>
+}
+
+export interface MirroredStateReader<State> {
+  readonly get: Effect.Effect<MirroredSnapshot<State>>
+}
+
 export interface MirroredStateChangesApi {
   readonly publish: (event: MirroredStateInvalidation) => Effect.Effect<void>
   readonly stream: Stream.Stream<MirroredStateInvalidation>
@@ -53,35 +62,62 @@ export const makeMirroredState = <const Id extends string, State, StateEncoded, 
     const state = yield* Ref.make<MirroredSnapshot<State>>({ revision: 0, state: initial })
     const lock = yield* Effect.makeSemaphore(1)
 
+    const commit = (previous: MirroredSnapshot<State>, nextState: State) => Effect.gen(function* () {
+      const next: MirroredSnapshot<State> = {
+        revision: previous.revision + 1,
+        state: nextState,
+      }
+      yield* Ref.set(state, next)
+      yield* stateChanges.publish({
+        _tag: "changed",
+        id: definition.id,
+        revision: next.revision,
+      })
+      return next
+    })
+
     const modify: MirroredState<State>["modify"] = (f) => lock.withPermits(1)(Effect.gen(function* () {
       const previous = yield* Ref.get(state)
       const transition = f(previous.state)
       if (transition.changed === false) return { snapshot: previous, result: transition.result }
-
-      const next: MirroredSnapshot<State> = {
-        revision: previous.revision + 1,
-        state: transition.state,
-      }
-      yield* Ref.set(state, next)
-      const invalidation: MirroredStateInvalidation = {
-        _tag: "changed",
-        id: definition.id,
-        revision: next.revision,
-      }
-      yield* stateChanges.publish(invalidation)
+      const next = yield* commit(previous, transition.state)
       return { snapshot: next, result: transition.result }
     }))
 
     return {
       get: Ref.get(state),
       modify,
-      update: (f) => modify((current) => ({ state: f(current), result: undefined })).pipe(
-        Effect.map(({ snapshot }) => snapshot),
-      ),
-      setIfChanged: (nextState, equivalent) => modify((current) => equivalent(current, nextState)
-        ? { state: current, result: undefined, changed: false }
-        : { state: nextState, result: undefined }).pipe(
-          Effect.map(({ snapshot }) => snapshot),
-        ),
+      update: (f) => lock.withPermits(1)(Effect.gen(function* () {
+        const previous = yield* Ref.get(state)
+        return yield* commit(previous, f(previous.state))
+      })),
+      setIfChanged: (nextState, equivalent) => lock.withPermits(1)(Effect.gen(function* () {
+        const previous = yield* Ref.get(state)
+        return equivalent(previous.state, nextState)
+          ? previous
+          : yield* commit(previous, nextState)
+      })),
     }
   })
+
+/**
+ * Exposes an already authoritative, versioned source through the ACN mirror
+ * invalidation channel without copying or re-versioning its state.
+ */
+export const bindMirroredState = <const Id extends string, State>(
+  definition: { readonly id: Id },
+  source: MirroredStateSource<State>,
+) => Effect.gen(function* () {
+  const stateChanges = yield* MirroredStateChanges
+  const initial = yield* source.get
+  yield* source.changes.pipe(
+    Stream.dropWhile((snapshot) => snapshot.revision <= initial.revision),
+    Stream.runForEach((snapshot) => stateChanges.publish({
+      _tag: "changed",
+      id: definition.id,
+      revision: snapshot.revision,
+    })),
+    Effect.forkScoped,
+  )
+  return { get: source.get } satisfies MirroredStateReader<State>
+})

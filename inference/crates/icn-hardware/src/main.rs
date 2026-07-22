@@ -185,7 +185,10 @@ fn main() -> anyhow::Result<()> {
         model: args.model,
         options,
     };
-    let report = icn_hardware::estimate(&request).context("model fit failed")?;
+    let backend = llama_cpp_2::llama_backend::LlamaBackend::init()
+        .context("failed to initialize llama.cpp")?;
+    let report =
+        icn_hardware::estimate_with_backend(&backend, &request).context("model fit failed")?;
     let output = Output {
         implementation: "magnitude-icn",
         estimator: "pinned_native_fit",

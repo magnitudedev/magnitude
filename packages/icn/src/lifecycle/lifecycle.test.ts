@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   IcnBinaryResolutionConfig,
   IcnBinaryResolver,
-  IcnBinaryResolverLive,
+  makeIcnBinaryResolver,
   IcnLifecycleConfig,
   IcnStorageConfig,
   icnReleaseAssetName,
@@ -119,7 +119,7 @@ describe("ICN managed launch", () => {
             );
           }).pipe(
             Effect.provide(
-              IcnBinaryResolverLive.pipe(
+              makeIcnBinaryResolver().pipe(
                 Layer.provideMerge(
                   Layer.merge(BunContext.layer, FetchHttpClient.layer)
                 )
@@ -200,7 +200,7 @@ describe("ICN managed launch", () => {
           return yield* resolver.resolve(releaseConfig);
         }).pipe(
           Effect.provide(
-            IcnBinaryResolverLive.pipe(
+            makeIcnBinaryResolver().pipe(
               Layer.provideMerge(
                 Layer.merge(BunContext.layer, FetchHttpClient.layer)
               )

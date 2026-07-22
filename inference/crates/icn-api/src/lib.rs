@@ -432,6 +432,8 @@ pub enum ModelLoadEvent {
         operation_id: String,
         model_id: String,
         stage: ModelLoadStage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fraction: Option<f32>,
     },
     Ready {
         operation_id: String,

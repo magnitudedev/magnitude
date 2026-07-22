@@ -3,11 +3,12 @@ import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Cause, Effect, Option } from "effect"
 import { Atom, Result as AtomResult, useAtomMount } from "@effect-atom/atom-react"
-import type {
-  LocalInferenceState,
-  LocalModelRecommendation,
-} from "@magnitudedev/sdk"
-import { useLocalInferenceState } from "@magnitudedev/client-common"
+import {
+  useLocalInferenceState,
+  type LocalInferenceState,
+  type LocalInferenceOperationProgress,
+  type LocalModelRecommendation,
+} from "@magnitudedev/client-common"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
@@ -43,6 +44,14 @@ const recommendationBadge = (badge: LocalModelRecommendation["badge"]): string =
   if (badge === "alternative") return "Alternative Option"
   return "Recommended"
 }
+
+const operationProgressPercent = (
+  progress: LocalInferenceOperationProgress,
+): number | null => "fraction" in progress
+  ? Math.round(progress.fraction * 100)
+  : progress.totalBytes > 0
+    ? Math.round(progress.completedBytes / progress.totalBytes * 100)
+    : null
 
 type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
 
@@ -103,11 +112,8 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     ...state.operations.filter((operation) => operation.status === "failed").slice(-3),
   ]
   const selectedOperation = selected && activeOperations.find((operation) =>
-    operation.target._tag === "configuration"
-      ? operation.target.configurationId === selected.id
-      : operation.target._tag === "model" && operation.target.selectionId === selected.id,
+    operation.selectionId === selected.id,
   )
-  const restartRunning = activeOperations.some((operation) => operation.kind === "restart")
 
   const activationCompletionAtom = useMemo(
     () => Atom.make(Effect.sync(() => {
@@ -123,12 +129,9 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   )
   useAtomMount(activationCompletionAtom)
 
-  const confirmSelection = useCallback((selection: LocalInferenceSelection | undefined) => {
-    if (!selection) return
+  const confirmSelection = useCallback((selection: LocalInferenceSelection) => {
     const hasActiveOperation = activeOperations.some((operation) =>
-      operation.target._tag === "configuration"
-        ? operation.target.configurationId === selection.id
-        : operation.target._tag === "model" && operation.target.selectionId === selection.id,
+      operation.selectionId === selection.id,
     )
     if (hasActiveOperation) return
     if (selection.kind === "running") {
@@ -155,7 +158,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   }, [activeOperations, local, onConfigured, state.activeBinding, state.choices])
 
   const confirmModel = useCallback(() => {
-    confirmSelection(selected)
+    if (selected) confirmSelection(selected)
   }, [confirmSelection, selected])
 
   useKeyboard(useCallback((key: KeyEvent) => {
@@ -171,7 +174,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       return
     }
     if (key.name === "d") { key.preventDefault(); setDetails((value) => !value); return }
-    if (key.name === "r" && state.activeBinding && !restartRunning) {
+    if (key.name === "r" && state.activeBinding && !local.pending.restart) {
       key.preventDefault(); local.restart(); return
     }
     if (key.name === "u" && state.activeBinding && !local.pending.disable) {
@@ -183,10 +186,10 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     if (key.name === "c" && state.activeBinding) { key.preventDefault(); onConfigured(); return }
     if (key.name === "return" || key.name === "enter") { key.preventDefault(); confirmModel(); return }
     if (key.name === "escape") { key.preventDefault(); onSkip() }
-  }, [confirmModel, local, onConfigured, onSkip, restartRunning, selected, selectedIndex, selectedOperation, selections, state.activeBinding]))
+  }, [confirmModel, local, onConfigured, onSkip, selected, selectedIndex, selectedOperation, selections, state.activeBinding]))
 
-  const host = state.host._tag === "Available" ? state.host.profile : null
-  const hardware = host ? describeLocalHardware(host) : null
+  const host = state.host
+  const hardware = describeLocalHardware(host)
   const firstRunningIndex = selections.findIndex((selection) => selection.kind === "running")
   const firstStoredIndex = selections.findIndex((selection) => selection.kind === "stored")
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
@@ -233,9 +236,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
             )}
           </box>
-        ) : (
-          <text style={{ fg: theme.muted }}>{state.host._tag === "Unavailable" ? state.host.message : "Hardware information is unavailable."}</text>
-        )}
+        ) : null}
       </box>
       <box style={{ flexDirection: "column" }}>
         {state.recommendationState._tag === "Ready" && selections.length === 0
@@ -243,13 +244,12 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           : selections.map((selection, index) => {
             const capacityWarning = selectionCapacityWarning(selection)
             const operation = activeOperations.find((candidate) =>
-              candidate.target._tag === "configuration"
-                ? candidate.target.configurationId === selection.id
-                : candidate.target._tag === "model" && candidate.target.selectionId === selection.id,
+              candidate.selectionId === selection.id,
             )
-            const operationProgress = operation?.progress && operation.progress.totalBytes > 0
-              ? ` · ${Math.round(operation.progress.completedBytes / operation.progress.totalBytes * 100)}%`
-              : ""
+            const progressPercent = operation
+              ? Option.match(operation.progress, { onNone: () => null, onSome: operationProgressPercent })
+              : null
+            const operationProgress = progressPercent === null ? "" : ` · ${progressPercent}%`
             const sectionLabel = index === firstRunningIndex ? "RUNNING NOW"
               : index === firstStoredIndex ? "DOWNLOADED"
               : index === firstRecommendationIndex ? (hasExistingModels ? "POSSIBLE DOWNLOADS" : "RECOMMENDED DOWNLOADS")
@@ -306,15 +306,23 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         )}
       </box>
       {visibleOperations.map((operation) => {
-        const progress = operation.progress && operation.progress.totalBytes > 0
-          ? ` · ${Math.round(operation.progress.completedBytes / operation.progress.totalBytes * 100)}% (${formatBytes(operation.progress.completedBytes)} / ${formatBytes(operation.progress.totalBytes)})`
-          : ""
+        const progressPercent = Option.match(operation.progress, {
+          onNone: () => null,
+          onSome: operationProgressPercent,
+        })
+        const operationProgress = Option.getOrNull(operation.progress)
+        const progress = progressPercent === null
+          ? ""
+          : operationProgress && "totalBytes" in operationProgress
+            ? ` · ${progressPercent}% (${formatBytes(operationProgress.completedBytes)} / ${formatBytes(operationProgress.totalBytes)})`
+            : ` · ${progressPercent}%`
         const label = operation.kind === "download" ? "Downloading local model"
-          : operation.kind === "activate" ? "Activating local model"
-          : "Restarting local inference"
+          : "Activating local model"
         return (
           <text key={operation.operationId} style={{ fg: operation.status === "failed" ? theme.error : theme.primary }}>
-            {label} · {operation.status === "failed" ? operation.failure?.message ?? "Failed" : operation.stage}{progress}
+            {label} · {operation.status === "failed"
+              ? Option.getOrElse(Option.map(operation.failure, (failure) => failure.message), () => "Failed")
+              : operation.stage}{progress}
           </text>
         )
       })}

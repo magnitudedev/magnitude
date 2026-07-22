@@ -9,8 +9,8 @@ import {
   type AuthStorageShape,
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
-import { LocalModelProviderSource } from "./local-inference/provider-source"
-import { LocalModelConfiguration } from "./local-inference/model-configuration"
+import { IcnProvider, createLocalProvider } from "@magnitudedev/icn/provider"
+import { LocalModelConfiguration } from "./model-configuration"
 
 const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,
@@ -106,12 +106,12 @@ export class ProviderClientRegistry extends Context.Tag("ProviderClientRegistry"
 export const ProviderClientRegistryLive: Layer.Layer<
   ProviderClientRegistry,
   never,
-  MagnitudeStorage | LocalModelProviderSource | LocalModelConfiguration
+  MagnitudeStorage | IcnProvider | LocalModelConfiguration
 > = Layer.effect(
   ProviderClientRegistry,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
-    const local = yield* LocalModelProviderSource
+    const local = createLocalProvider(yield* IcnProvider)
     const modelConfiguration = yield* LocalModelConfiguration
     const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
     const lock = yield* Effect.makeSemaphore(1)
@@ -121,22 +121,10 @@ export const ProviderClientRegistryLive: Layer.Layer<
       const client = createProviderClient({
         ...(apiKey ? { apiKey } : {}),
         ...(sessionId ? { sessionId } : {}),
-        local,
+        discoverableProviders: [local],
       })
-      const withLiveLocalModels = (models: readonly import("@magnitudedev/ai").ProviderModel[]) =>
-        local.catalog.list.pipe(
-          Effect.map((localModels) => [...models.filter((model) => model.providerId !== "local"), ...localModels]),
-        )
-      const catalog: ProviderClientShape["catalog"] = {
-        list: client.catalog.list.pipe(Effect.flatMap(withLiveLocalModels)),
-        refresh: client.catalog.refresh.pipe(Effect.flatMap(withLiveLocalModels)),
-        get: (providerId, providerModelId) => providerId === "local"
-          ? local.catalog.get(providerId, providerModelId)
-          : client.catalog.get(providerId, providerModelId),
-      }
       const fileBacked: ProviderClientShape = {
         ...client,
-        catalog,
         requestAttribution: (providerId, providerModelId, key) => ({
           requestStarted: providerId === "local" && (key === "primary" || key === "secondary")
             ? modelConfiguration.recordUse(key, providerModelId).pipe(Effect.ignore)

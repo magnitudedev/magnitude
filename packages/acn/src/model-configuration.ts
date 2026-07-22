@@ -1,4 +1,4 @@
-import { Context, Data, Effect, Layer, PubSub, Ref, Stream } from "effect"
+import { Context, Data, Effect, Layer, Option, PubSub, Ref, Stream } from "effect"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
@@ -13,17 +13,24 @@ import {
 export class ModelConfigurationError extends Data.TaggedError("ModelConfigurationError")<{
   readonly operation: string
   readonly reason: string
-  readonly cause?: unknown
+  readonly cause: unknown
 }> {}
+
+type ModelConfiguration = NonNullable<MagnitudeConfig["models"]>
+export type ModelSlotsConfiguration = NonNullable<ModelConfiguration["slots"]>
 
 export interface LocalModelConfigurationApi {
   readonly get: Effect.Effect<LocalInferenceConfig, ModelConfigurationError>
-  readonly getModels: Effect.Effect<MagnitudeConfig["models"], ModelConfigurationError>
+  readonly getModels: Effect.Effect<ModelConfiguration, ModelConfigurationError>
   readonly selectProfile: (profile: SelectedLocalModelProfile) => Effect.Effect<void, ModelConfigurationError>
   readonly updateSlots: (slots: Partial<Record<SlotId, SlotModelConfig>>) => Effect.Effect<void, ModelConfigurationError>
   readonly recordUse: (slotId: SlotId, providerModelId: ProviderModelId) => Effect.Effect<void>
   readonly revision: Effect.Effect<number>
-  readonly changes: Stream.Stream<void>
+  readonly changes: Stream.Stream<ModelConfigurationChange>
+}
+
+export interface ModelConfigurationChange {
+  readonly revision: number
 }
 
 export class LocalModelConfiguration extends Context.Tag("LocalModelConfiguration")<
@@ -38,13 +45,15 @@ const failure = (operation: string, cause: unknown) => new ModelConfigurationErr
 })
 
 type Storage = Pick<ConfigStorageShape, "getLocalInferenceConfig" | "getModelConfig" | "update">
+const EMPTY_MODEL_CONFIGURATION: ModelConfiguration = {}
+const EMPTY_MODEL_SLOTS: ModelSlotsConfiguration = {}
 
 export const makeLocalModelConfiguration = (storage: Storage): Effect.Effect<LocalModelConfigurationApi> =>
   Effect.gen(function* () {
-    const changes = yield* PubSub.unbounded<void>()
+    const changes = yield* PubSub.unbounded<ModelConfigurationChange>()
     const revision = yield* Ref.make(0)
-    const publish = Ref.update(revision, (value) => value + 1).pipe(
-      Effect.zipRight(PubSub.publish(changes, undefined)),
+    const publish = Ref.updateAndGet(revision, (value) => value + 1).pipe(
+      Effect.flatMap((nextRevision) => PubSub.publish(changes, { revision: nextRevision })),
       Effect.asVoid,
     )
     const mutate = (operation: string, update: (current: MagnitudeConfig) => MagnitudeConfig) =>
@@ -55,11 +64,14 @@ export const makeLocalModelConfiguration = (storage: Storage): Effect.Effect<Loc
       )
     return LocalModelConfiguration.of({
       get: storage.getLocalInferenceConfig().pipe(
-        Effect.map((value) => value ?? {}),
+        Effect.map((value) => Option.getOrElse(Option.fromNullable(value), () => ({}))),
         Effect.mapError((cause) => failure("read local inference configuration", cause)),
       ),
       getModels: storage.getModelConfig().pipe(
-        Effect.map((value) => value ?? {}),
+        Effect.map((value) => Option.getOrElse(
+          Option.fromNullable(value),
+          () => EMPTY_MODEL_CONFIGURATION,
+        )),
         Effect.mapError((cause) => failure("read model configuration", cause)),
       ),
       selectProfile: (selectedProfile) => mutate("select local model profile", (current) => ({
@@ -67,17 +79,29 @@ export const makeLocalModelConfiguration = (storage: Storage): Effect.Effect<Loc
         localInference: { ...current.localInference, selectedProfile },
       })),
       updateSlots: (updates) => mutate("update model slots", (current) => {
-        const models = current.models ?? {}
-        const slots = { ...(models.slots ?? {}) }
-        const localSlotIntent = { ...(models.localSlotIntent ?? {}) }
+        const models = Option.getOrElse(
+          Option.fromNullable(current.models),
+          () => EMPTY_MODEL_CONFIGURATION,
+        )
+        const slots = {
+          ...Option.getOrElse(Option.fromNullable(models.slots), () => EMPTY_MODEL_SLOTS),
+        }
+        const localSlotIntent = {
+          ...Option.getOrElse(Option.fromNullable(models.localSlotIntent), () => ({})),
+        }
         for (const slotId of ["primary", "secondary"] as const) {
-          const update = updates[slotId]
-          if (!update) continue
-          if (update.providerId || update.providerModelId || update.reasoningEffort) slots[slotId] = update
+          const update = Option.fromNullable(updates[slotId])
+          if (Option.isNone(update)) continue
+          const providerId = Option.fromNullable(update.value.providerId)
+          const hasConfiguration = Option.isSome(providerId)
+            || Option.isSome(Option.fromNullable(update.value.providerModelId))
+            || Option.isSome(Option.fromNullable(update.value.reasoningEffort))
+          if (hasConfiguration) slots[slotId] = update.value
           else delete slots[slotId]
-          if (update.providerId === "local") localSlotIntent[slotId] = "local"
-          else if (update.providerId) localSlotIntent[slotId] = "cloud"
-          else delete localSlotIntent[slotId]
+          Option.match(providerId, {
+            onNone: () => { delete localSlotIntent[slotId] },
+            onSome: (value) => { localSlotIntent[slotId] = value === "local" ? "local" : "cloud" },
+          })
         }
         return { ...current, models: { ...models, slots, localSlotIntent } }
       }),
@@ -87,7 +111,7 @@ export const makeLocalModelConfiguration = (storage: Storage): Effect.Effect<Loc
     })
   })
 
-export const LocalModelConfigurationLive: Layer.Layer<LocalModelConfiguration, never, MagnitudeStorage> =
+export const makeLocalModelConfigurationLayer = (): Layer.Layer<LocalModelConfiguration, never, MagnitudeStorage> =>
   Layer.effect(LocalModelConfiguration, Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
     return yield* makeLocalModelConfiguration(storage.config)

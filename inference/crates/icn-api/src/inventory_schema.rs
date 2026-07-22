@@ -418,6 +418,7 @@ pub enum ModelResidencySchema {
         load_id: String,
         stage: LoadStageSchema,
         started_at: u64,
+        fraction: Option<f32>,
     },
     Loaded {
         loaded_at: u64,
@@ -433,6 +434,7 @@ pub enum ModelResidencySchema {
         attempted_at: u64,
         stage: LoadStageSchema,
         code: String,
+        message: String,
         retryable: bool,
     },
 }

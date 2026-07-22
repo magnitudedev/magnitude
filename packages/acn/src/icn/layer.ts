@@ -5,10 +5,14 @@ import {
   IcnBinaryResolutionConfig,
   IcnLifecycleConfig,
   IcnLifecycle,
-  IcnLive,
+  makeIcn,
+  makeIcnHardware,
+  makeIcnInventory,
+  makeIcnProvider,
+  makeIcnRecipes,
   IcnStorageConfig,
 } from "@magnitudedev/icn"
-import { ACN_VERSION } from "./version"
+import { ACN_VERSION } from "../version"
 
 const platformKey = (): string => {
   if (process.platform === "darwin" && process.arch === "arm64") return "darwin-arm64"
@@ -28,8 +32,8 @@ const binarySource = () => {
     return {
       _tag: "DevelopmentSearch" as const,
       candidates: [
-        resolve(import.meta.dir, "../../../inference/target/debug/magnitude-icn"),
-        resolve(import.meta.dir, "../../../inference/target/release/magnitude-icn"),
+        resolve(import.meta.dir, "../../../../inference/target/debug/magnitude-icn"),
+        resolve(import.meta.dir, "../../../../inference/target/release/magnitude-icn"),
         resolve(process.cwd(), "inference/target/debug/magnitude-icn"),
         resolve(process.cwd(), "inference/target/release/magnitude-icn"),
       ] as const,
@@ -45,7 +49,7 @@ const binarySource = () => {
   }
 }
 
-const lifecycle = IcnLive(new IcnLifecycleConfig({
+const makeLifecycle = () => makeIcn(new IcnLifecycleConfig({
   binary: new IcnBinaryResolutionConfig({
     source: binarySource(),
     supportedApiVersion: 1,
@@ -76,7 +80,7 @@ const lifecycle = IcnLive(new IcnLifecycleConfig({
   parentPid: process.pid,
 })).pipe(Layer.orDie)
 
-const supervision = Layer.scopedDiscard(Effect.gen(function* () {
+const makeSupervision = () => Layer.scopedDiscard(Effect.gen(function* () {
   const icn = yield* IcnLifecycle
   yield* icn.unexpectedExit.pipe(
     Effect.catchAll((cause) => Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
@@ -89,6 +93,11 @@ const supervision = Layer.scopedDiscard(Effect.gen(function* () {
   )
 }))
 
-const supervisedLifecycle = Layer.provideMerge(supervision, lifecycle)
-
-export const AcnIcnLive = supervisedLifecycle
+export const makeAcnIcn = () => {
+  const lifecycle = makeLifecycle()
+  const supervisedLifecycle = Layer.provideMerge(makeSupervision(), lifecycle)
+  const withHardware = Layer.provideMerge(makeIcnHardware(), supervisedLifecycle)
+  const withInventory = Layer.provideMerge(makeIcnInventory(), withHardware)
+  const withRecipes = Layer.provideMerge(makeIcnRecipes(), withInventory)
+  return Layer.provideMerge(makeIcnProvider(), withRecipes).pipe(Layer.orDie)
+}
