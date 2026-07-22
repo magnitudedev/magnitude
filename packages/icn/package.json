@@ -8,16 +8,22 @@
   "exports": {
     ".": "./src/index.ts",
     "./generated": "./src/generated/index.ts",
-    "./lifecycle": "./src/lifecycle/index.ts"
+    "./lifecycle": "./src/lifecycle/index.ts",
+    "./hardware": "./src/hardware/index.ts",
+    "./inventory": "./src/inventory/index.ts",
+    "./recipes": "./src/recipes/index.ts",
+    "./provider": "./src/provider/index.ts"
   },
   "scripts": {
     "generate": "bun run scripts/generate.ts",
     "check-generated": "bun run scripts/generate.ts --check",
+    "recipes:validate": "bun run scripts/validate-model-recipes.ts",
     "typecheck": "tsc --noEmit",
     "test": "bunx --bun vitest run"
   },
   "dependencies": {
     "@effect/platform": "^0.96.0",
+    "@magnitudedev/ai": "workspace:*",
     "@magnitudedev/openapi-effect": "workspace:*",
     "@noble/hashes": "^2.2.0",
     "effect": "3.21.2"

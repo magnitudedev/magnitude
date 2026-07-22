@@ -47,7 +47,9 @@ export {
   ModelSlotConfigurationUnavailable,
   ModelCatalogMirror,
   ModelSlotsMirror,
-  LocalInferenceMirror,
+  IcnHardwareMirror,
+  IcnInventoryMirror,
+  ModelRecipesMirror,
 } from "@magnitudedev/protocol"
 
 export type {
@@ -160,10 +162,6 @@ export {
   type ProviderRegistryInfo,
   type ProviderRuntimeConfig,
   type ProviderCatalogOutcome,
-  type LocalProviderSource,
-  type LocalModelInfo,
-  LocalModelInfoSchema,
-  LocalProviderId,
   type ProviderRejection,
   type ProviderClientError,
   type BaseCallOptions,

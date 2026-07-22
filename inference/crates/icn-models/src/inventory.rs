@@ -49,6 +49,12 @@ type HydratedInventory = (
     BTreeMap<ModelId, CacheEvidence>,
 );
 
+#[derive(Clone)]
+pub(crate) struct RuntimeResidency {
+    pub(crate) state: ModelResidency,
+    pub(crate) updated_at: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
     pub root: PathBuf,
@@ -88,6 +94,7 @@ pub struct ModelManager {
     pub(crate) config: InventoryConfig,
     pub(crate) client: HFClient,
     pub(crate) models: Arc<RwLock<BTreeMap<ModelId, InventoryModel>>>,
+    pub(crate) residencies: Arc<RwLock<BTreeMap<ModelId, RuntimeResidency>>>,
     pub(crate) operations:
         Arc<tokio::sync::Mutex<BTreeMap<String, Arc<crate::download::DownloadOperation>>>>,
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
@@ -105,6 +112,7 @@ impl Clone for ModelManager {
             config: self.config.clone(),
             client: self.client.clone(),
             models: Arc::clone(&self.models),
+            residencies: Arc::clone(&self.residencies),
             operations: Arc::clone(&self.operations),
             download_slots: Arc::clone(&self.download_slots),
             template_assessor: self.template_assessor.clone(),
@@ -192,7 +200,16 @@ impl ModelManager {
             .write()
             .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? = models;
         self.ensure_generation.fetch_add(1, Ordering::Release);
-        Ok(updated)
+        let residency = self
+            .residencies
+            .read()
+            .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
+            .get(id)
+            .cloned();
+        Ok(crate::service::model_with_residency(
+            &updated,
+            residency.as_ref(),
+        ))
     }
 
     pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
@@ -222,6 +239,7 @@ impl ModelManager {
             config,
             client,
             models: Arc::new(RwLock::new(models)),
+            residencies: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             template_assessor,
             hardware_assessor: Arc::new(RwLock::new(None)),
@@ -416,11 +434,16 @@ impl ModelManager {
         };
 
         persist_inventory_index(&self.cache, &discovered, &next_evidence);
+        let published_ids = discovered.keys().cloned().collect::<BTreeSet<_>>();
         *self
             .models
             .write()
             .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? =
             discovered;
+        self.residencies
+            .write()
+            .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
+            .retain(|id, _| published_ids.contains(id));
         *self
             .cache_evidence
             .write()
@@ -608,6 +631,10 @@ impl ModelManager {
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
             .clone();
         models.remove(id);
+        self.residencies
+            .write()
+            .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
+            .remove(id);
         cache.remove(id);
         persist_inventory_index(&self.cache, &models, &cache);
         *self
@@ -725,6 +752,7 @@ fn persist_inventory_index(
         .map(|(id, model)| {
             let mut cached = model.clone();
             cached.serving_configuration = None;
+            cached.residency = ModelResidency::NotResident;
             (id.clone(), cached)
         })
         .collect();

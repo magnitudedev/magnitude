@@ -4013,6 +4013,13 @@
               "stage": {
                 "$ref": "#/components/schemas/ModelLoadStage"
               },
+              "fraction": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "float"
+              },
               "type": {
                 "type": "string",
                 "enum": [
@@ -4417,6 +4424,13 @@
                 "format": "int64",
                 "minimum": 0
               },
+              "fraction": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "float"
+              },
               "type": {
                 "type": "string",
                 "enum": [
@@ -4489,6 +4503,7 @@
               "attempted_at",
               "stage",
               "code",
+              "message",
               "retryable",
               "type"
             ],
@@ -4502,6 +4517,9 @@
                 "$ref": "#/components/schemas/LoadStageSchema"
               },
               "code": {
+                "type": "string"
+              },
+              "message": {
                 "type": "string"
               },
               "retryable": {

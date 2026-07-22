@@ -13,18 +13,29 @@ interface HardwareMemoryDomainProps {
   readonly width?: number
 }
 
+type CompleteHardwareMemoryDomain = HardwareMemoryDomainView & {
+  readonly usedBytes: number
+  readonly fixedBytes: number
+  readonly kvCacheBytes: number
+  readonly systemAndAppsBytes: number
+  readonly freeBytes: number
+}
+
+const isComplete = (domain: HardwareMemoryDomainView): domain is CompleteHardwareMemoryDomain =>
+  domain.fixedBytes !== null
+  && domain.kvCacheBytes !== null
+  && domain.systemAndAppsBytes !== null
+  && domain.freeBytes !== null
+  && domain.usedBytes !== null
+
 export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomainProps) => {
   const theme = useTheme()
-  const complete = domain.fixedBytes !== null
-    && domain.kvCacheBytes !== null
-    && domain.systemAndAppsBytes !== null
-    && domain.freeBytes !== null
-    && domain.usedBytes !== null
+  const complete = isComplete(domain)
   const barSegments = complete
     ? [
-        { value: domain.fixedBytes!, color: theme.foreground },
-        { value: domain.kvCacheBytes!, color: theme.primary },
-        { value: domain.systemAndAppsBytes!, color: theme.warning },
+        { value: domain.fixedBytes, color: theme.foreground },
+        { value: domain.kvCacheBytes, color: theme.primary },
+        { value: domain.systemAndAppsBytes, color: theme.warning },
       ]
     : domain.usedBytes !== null && domain.freeBytes !== null
       ? [
@@ -50,10 +61,10 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
       )}
       {complete ? (
         <box style={{ flexDirection: 'column' }}>
-          <text><span fg={theme.foreground}>■</span>{` Weights       ${formatMemoryBytes(domain.fixedBytes!)}`}</text>
-          <text><span fg={theme.primary}>■</span>{` KV cache      ${formatMemoryBytes(domain.kvCacheBytes!)}`}</text>
-          <text><span fg={theme.warning}>■</span>{` System & apps ${formatMemoryBytes(domain.systemAndAppsBytes!)}`}</text>
-          <text><span fg={theme.border}>□</span>{` Free          ${formatMemoryBytes(domain.freeBytes!)}`}</text>
+          <text><span fg={theme.foreground}>■</span>{` Weights       ${formatMemoryBytes(domain.fixedBytes)}`}</text>
+          <text><span fg={theme.primary}>■</span>{` KV cache      ${formatMemoryBytes(domain.kvCacheBytes)}`}</text>
+          <text><span fg={theme.warning}>■</span>{` System & apps ${formatMemoryBytes(domain.systemAndAppsBytes)}`}</text>
+          <text><span fg={theme.border}>□</span>{` Free          ${formatMemoryBytes(domain.freeBytes)}`}</text>
         </box>
       ) : domain.notice ? (
         <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>{domain.notice}</span></text>

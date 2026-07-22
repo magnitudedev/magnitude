@@ -42,6 +42,12 @@ a process-local projection of the runtime coordinator and is reset
 to not-resident during recovery. Loading, loaded, unloading, and load-failed never replace or erase
 artifact availability.
 
+The inventory implementation stores artifact/configuration observations and runtime residency in
+separate process-local state. Reconciliation may atomically replace the artifact observation, but
+it cannot publish, reset, or overwrite residency. Model listing composes the current values from
+both owners and derives available operations from that composition. Runtime residency is never
+written to the durable inventory index; an ICN restart begins with no resident model.
+
 Publishing a managed download validates and applies its selected serving configuration before the
 model becomes available in that process. An idempotent model-management operation may replace that
 configuration; it performs the same shared assessment and makes no change when the effective

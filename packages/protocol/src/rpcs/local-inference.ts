@@ -1,11 +1,22 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
-import { LocalInferenceState } from "../schemas/local-inference"
+import { HardwareSnapshotSchema, ModelList } from "@magnitudedev/icn/generated"
+import { ModelRecipesState } from "@magnitudedev/icn/recipes"
 import { defineMirroredState } from "./mirrored-state"
 
-export const LocalInferenceMirror = defineMirroredState("GetLocalInferenceState", {
-  stateSchema: LocalInferenceState,
+export const IcnHardwareMirror = defineMirroredState("GetIcnHardware", {
+  stateSchema: HardwareSnapshotSchema,
+  errorSchema: LocalInferenceError,
+})
+
+export const IcnInventoryMirror = defineMirroredState("GetIcnInventory", {
+  stateSchema: ModelList,
+  errorSchema: LocalInferenceError,
+})
+
+export const ModelRecipesMirror = defineMirroredState("GetModelRecipes", {
+  stateSchema: ModelRecipesState,
   errorSchema: LocalInferenceError,
 })
 

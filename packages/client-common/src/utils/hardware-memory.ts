@@ -1,4 +1,5 @@
-import type { LocalInferenceHostProfile } from "@magnitudedev/sdk"
+import { Option } from "effect"
+import type { LocalInferenceHostProfile } from "../types/local-inference"
 
 const MIB = 1024 ** 2
 
@@ -6,7 +7,6 @@ export type HardwareMemoryBreakdownStatus =
   | "complete"
   | "rounding_adjusted"
   | "inconsistent"
-  | "unavailable"
   | "missing_free"
 
 export interface HardwareMemoryDomainView {
@@ -87,17 +87,15 @@ export const deriveHardwareMemoryView = (
   let physicalOrdinal = 0
   const domains = host.memoryDomains.map((domain): HardwareMemoryDomainView => {
     if (domain.kind === "physical_device") physicalOrdinal += 1
-    const allocation = allocations.get(domain.id)
+    const allocation = Option.fromNullable(allocations.get(domain.id))
     const participatesInRuntime = fallbackRuntimeDomainIds.has(domain.id) || (
-      allocation !== undefined
-      && allocation.modelBytes + allocation.contextBytes + allocation.computeBytes + allocation.auxiliaryBytes > 0
+      Option.exists(allocation, (resident) =>
+        resident.modelBytes + resident.contextBytes + resident.computeBytes + resident.auxiliaryBytes > 0)
     )
     const freeBytes = domain.currentFreeBytes === null
       ? null
       : Math.min(domain.totalCapacityBytes, Math.max(0, domain.currentFreeBytes))
     const usedBytes = freeBytes === null ? null : domain.totalCapacityBytes - freeBytes
-    const attributionUnavailable = host.residentMemory === null
-
     if (freeBytes === null || usedBytes === null) {
       return {
         id: domain.id,
@@ -105,10 +103,11 @@ export const deriveHardwareMemoryView = (
         kind: domain.kind,
         totalBytes: domain.totalCapacityBytes,
         usedBytes: null,
-        fixedBytes: allocation
-          ? allocation.modelBytes + allocation.computeBytes + allocation.auxiliaryBytes
-          : null,
-        kvCacheBytes: allocation?.contextBytes ?? null,
+        fixedBytes: Option.match(allocation, {
+          onNone: () => 0,
+          onSome: (resident) => resident.modelBytes + resident.computeBytes + resident.auxiliaryBytes,
+        }),
+        kvCacheBytes: Option.match(allocation, { onNone: () => 0, onSome: (resident) => resident.contextBytes }),
         systemAndAppsBytes: null,
         freeBytes: null,
         status: "missing_free",
@@ -117,27 +116,11 @@ export const deriveHardwareMemoryView = (
       }
     }
 
-    if (attributionUnavailable) {
-      return {
-        id: domain.id,
-        label: domainLabel(host, domain, physicalOrdinal),
-        kind: domain.kind,
-        totalBytes: domain.totalCapacityBytes,
-        usedBytes,
-        fixedBytes: null,
-        kvCacheBytes: null,
-        systemAndAppsBytes: null,
-        freeBytes,
-        status: "unavailable",
-        notice: null,
-        participatesInRuntime,
-      }
-    }
-
-    const fixedBytes = allocation
-      ? allocation.modelBytes + allocation.computeBytes + allocation.auxiliaryBytes
-      : 0
-    const kvCacheBytes = allocation?.contextBytes ?? 0
+    const fixedBytes = Option.match(allocation, {
+      onNone: () => 0,
+      onSome: (resident) => resident.modelBytes + resident.computeBytes + resident.auxiliaryBytes,
+    })
+    const kvCacheBytes = Option.match(allocation, { onNone: () => 0, onSome: (resident) => resident.contextBytes })
     const ownedBytes = fixedBytes + kvCacheBytes
     const excessBytes = ownedBytes - usedBytes
     const toleranceBytes = Math.max(64 * MIB, domain.totalCapacityBytes * 0.001)

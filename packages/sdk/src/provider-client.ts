@@ -21,10 +21,9 @@ import type { ModelCatalog } from "@magnitudedev/ai"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
   createMagnitudeProvider,
-  createLocalProvider,
   makeProviderRegistry,
+  type DiscoverableProviderInstance,
   type MagnitudeProviderInstance,
-  type LocalProviderSource,
   type MagnitudeClientConfig,
   type MagnitudeCallOptions,
   type MagnitudeAdditionalOptions,
@@ -81,7 +80,7 @@ export type ProviderRegistryInfo = RegistryProviderInfo
 export type { ProviderCatalogOutcome } from "@magnitudedev/providers"
 
 export interface ProviderClientConfig extends MagnitudeClientConfig {
-  readonly local?: LocalProviderSource
+  readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
 }
 
 export type {
@@ -91,8 +90,6 @@ export type {
   MagnitudeCallOptions,
   MagnitudeAdditionalOptions,
 } from "@magnitudedev/providers"
-export type { LocalProviderSource, LocalModelInfo } from "@magnitudedev/providers"
-export { LocalModelInfoSchema, LocalProviderId } from "@magnitudedev/providers"
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/protocol"
@@ -181,11 +178,9 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
   const magnitudeInstance: MagnitudeProviderInstance = createMagnitudeProvider(config)
   const sessionId = config?.sessionId ?? null
 
-  const local = config?.local ? createLocalProvider(config.local) : null
-
   const registry = makeProviderRegistry({
     magnitude: magnitudeInstance,
-    discoverableProviders: local ? [local] : [],
+    discoverableProviders: config?.discoverableProviders ?? [],
   })
 
   return {

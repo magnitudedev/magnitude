@@ -2,7 +2,8 @@ import { beforeEach, expect, test, vi } from "vitest"
 import { Atom, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { testRender } from "@opentui/react/test-utils"
-import { ProviderModelIdSchema, type LocalInferenceState, type LocalModelRecommendation } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import type { LocalInferenceState, LocalModelRecommendation } from "@magnitudedev/client-common"
 import { act } from "react"
 
 const localInferenceActions = vi.hoisted(() => ({
@@ -11,7 +12,16 @@ const localInferenceActions = vi.hoisted(() => ({
 
 const emptyLocalInferenceState = {
   activeBinding: null,
-  host: { _tag: "Unavailable", message: "not needed" },
+  host: {
+    platform: "test",
+    architecture: "test",
+    topologyFingerprint: "test",
+    systemMemoryBytes: 0,
+    cpuModel: null,
+    logicalCores: 1,
+    memoryDomains: [],
+    residentMemory: null,
+  },
   choices: [],
   operations: [],
   recommendationState: { _tag: "Loading" },
@@ -25,6 +35,9 @@ const recommendedModel = {
   displayName: "Recommended Model",
   family: "test",
   architecture: "dense",
+  totalParametersBillions: Option.none(),
+  activeParametersBillions: Option.none(),
+  effectiveParametersBillions: Option.none(),
   quantization: {
     format: "UD-Q5_K_XL",
     quantAwareCheckpoint: false,
@@ -139,7 +152,7 @@ test("opens directly on hardware and model recommendations", async () => {
     await act(view.renderOnce)
     const frame = view.captureCharFrame()
     expect(frame).toContain("Choose what this machine should run")
-    expect(frame).toContain("HARDWARE DETECTION UNAVAILABLE")
+    expect(frame).toContain("HARDWARE DETECTED")
     expect(frame).toContain("No curated model currently fits")
     expect(frame).not.toContain("How many local coding sessions")
     expect(frame).not.toContain("See recommendations")
@@ -183,20 +196,20 @@ test("clicking an already running model continues setup with that model", async 
       choiceId: "running-model",
       displayName: "Qwen3.6 35B-A3B",
       providerModelId: ProviderModelIdSchema.make("running-provider-model"),
-      contextTokens: 200_000,
+      contextTokens: Option.some(200_000),
       fitClass: "cpu_or_unified",
       availability: { _tag: "Available" },
       fitAssessment: { _tag: "NotAssessed" },
       explanation: "Already running.",
       residency: "loaded",
-      quantization: {
+      quantization: Option.some({
         format: "UD-Q6_K_XL",
         quantAwareCheckpoint: false,
         fidelityLabel: "Very high fidelity",
         fidelityEvidence: "Catalog evidence.",
         fidelitySourceUrl: "https://example.invalid/model",
-      },
-      sizeBytes: 32_600_719_872,
+      }),
+      sizeBytes: Option.some(32_600_719_872),
     }],
   }
   const onComplete = vi.fn()
@@ -268,13 +281,13 @@ test("shows mirrored download progress without blocking navigation", async () =>
     recommendationState: { _tag: "Ready", recommendations: [recommendedModel] },
     operations: [{
       operationId: "operation-1",
-      requestId: "request-1",
       kind: "download",
-      target: { _tag: "configuration", configurationId: recommendedModel.configurationId },
+      selectionId: recommendedModel.configurationId,
       providerModelId: ProviderModelIdSchema.make("recommended-model-catalog"),
       status: "running",
       stage: "downloading",
-      progress: { completedBytes: 2_500, totalBytes: 10_000 },
+      progress: Option.some({ completedBytes: 2_500, totalBytes: 10_000 }),
+      failure: Option.none(),
       startedAt: "2026-07-20T00:00:00.000Z",
       updatedAt: "2026-07-20T00:00:01.000Z",
     }],
@@ -302,27 +315,24 @@ test("recommendations show a human-readable detected hardware panel before model
   localInferenceState = {
     ...emptyLocalInferenceState,
     host: {
-      _tag: "Available",
-      profile: {
-        platform: "macos",
-        architecture: "aarch64",
-        topologyFingerprint: "test",
-        systemMemoryBytes: 64 * gib,
-        cpuModel: "Apple M4 Max",
-        logicalCores: 16,
-        memoryDomains: [{
-          id: "system",
-          kind: "unified_memory",
-          totalCapacityBytes: 64 * gib,
-          stableCapacityBytes: 51.2 * gib,
-          currentFreeBytes: null,
-          sharesSystemMemory: true,
-          backendNames: ["Metal"],
-          deviceNames: ["Apple M4 Max"],
-          splitGroupId: null,
-        }],
-        residentMemory: null,
-      },
+      platform: "macos",
+      architecture: "aarch64",
+      topologyFingerprint: "test",
+      systemMemoryBytes: 64 * gib,
+      cpuModel: "Apple M4 Max",
+      logicalCores: 16,
+      memoryDomains: [{
+        id: "system",
+        kind: "unified_memory",
+        totalCapacityBytes: 64 * gib,
+        stableCapacityBytes: 51.2 * gib,
+        currentFreeBytes: null,
+        sharesSystemMemory: true,
+        backendNames: ["Metal"],
+        deviceNames: ["Apple M4 Max"],
+        splitGroupId: null,
+      }],
+      residentMemory: null,
     },
     recommendationState: { _tag: "Ready", recommendations: [recommendedModel] },
   }

@@ -1,11 +1,11 @@
-export type CatalogQuantBitsClass = "q4" | "q5" | "q6" | "q8" | "mxfp4" | "other"
+export type RecipeQuantBitsClass = "q4" | "q5" | "q6" | "q8" | "mxfp4" | "other"
 export type CatalogEvidenceScope =
   | "publisher_checkpoint"
   | "checkpoint_quantization"
   | "exact_artifact"
   | "cross_model_quant_tier"
 
-export interface CatalogBenchmarkEvidence {
+export interface RecipeBenchmarkEvidence {
   /** Scores with different methodology IDs must never be compared directly. */
   readonly benchmarkId: string
   readonly label: string
@@ -20,16 +20,16 @@ export interface CatalogBenchmarkEvidence {
 }
 
 /** A Magnitude review layered over the license reported by the live Hub repository. */
-export interface CatalogLicenseReview {
+export interface RecipeLicenseReview {
   readonly expectedId: string
   readonly name: string
   readonly url: string
   readonly acknowledgementRequired: boolean
 }
 
-export interface CatalogQuantizationEvidence {
+export interface RecipeQuantizationEvidence {
   readonly format: string
-  readonly bitsClass: CatalogQuantBitsClass
+  readonly bitsClass: RecipeQuantBitsClass
   readonly quantAwareCheckpoint: boolean
   readonly fidelityRank: number
   readonly fidelityLabel: string
@@ -42,15 +42,15 @@ export interface CatalogQuantizationEvidence {
  * A stable selector, not a file manifest. ICN resolves it against the current
  * repository snapshot and returns the immutable commit, files, sizes, and hashes.
  */
-export interface CanonicalArtifactOverlay {
+export interface ModelRecipeArtifact {
   readonly id: string
   readonly repository: string
   readonly filenameIncludes: string
-  readonly quantization: CatalogQuantizationEvidence
+  readonly quantization: RecipeQuantizationEvidence
 }
 
 /** Only Magnitude-owned product and evaluation metadata is checked in. */
-export interface CanonicalModelOverlay {
+export interface ModelRecipe {
   readonly id: string
   readonly family: string
   readonly displayName: string
@@ -60,23 +60,20 @@ export interface CanonicalModelOverlay {
   readonly productContextTokens: readonly (100_000 | 200_000)[]
   readonly performance: {
     readonly summary: string
-    readonly benchmarks: readonly CatalogBenchmarkEvidence[]
+    readonly benchmarks: readonly RecipeBenchmarkEvidence[]
   }
-  readonly licenseReview: CatalogLicenseReview
-  /** Compatibility input until the Phase-3 Pareto policy replaces scalar ranking. */
-  readonly legacyQualityRank: number
-  readonly artifacts: readonly CanonicalArtifactOverlay[]
+  readonly licenseReview: RecipeLicenseReview
+  readonly qualityRank: number
+  readonly artifacts: readonly ModelRecipeArtifact[]
 }
 
-export interface CanonicalModelCatalogOverlay {
-  readonly schemaVersion: 2
-  readonly catalogVersion: string
+export interface ModelRecipeRegistry {
   readonly reviewedAt: string
-  readonly models: readonly CanonicalModelOverlay[]
+  readonly models: readonly ModelRecipe[]
 }
 
 /** Runtime join of one overlay artifact with a live immutable Hub snapshot. */
-export interface LocalModelCatalogEntry {
+export interface ResolvedModelRecipe {
   readonly id: string
   readonly modelId: string
   readonly family: string

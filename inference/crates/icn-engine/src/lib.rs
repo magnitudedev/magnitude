@@ -53,6 +53,68 @@ pub fn disable_native_diagnostics() {
     llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default().with_logs_enabled(false));
 }
 
+/// Process-lifetime ownership of llama.cpp's global backend registration.
+///
+/// ICN constructs this capability once while entering its ready lifetime. Model executors and
+/// model-free hardware observations borrow the same registration through clones of this handle;
+/// neither operation can initialize or tear down the process-global backend independently.
+#[derive(Clone)]
+pub struct NativeBackend {
+    backend: Arc<LlamaBackend>,
+}
+
+impl NativeBackend {
+    /// Initialize the process-global native backend.
+    ///
+    /// This is a composition-root operation. Runtime operations accept an existing
+    /// [`NativeBackend`] and therefore cannot surface `BackendAlreadyInitialized` as an
+    /// operational model or hardware failure.
+    pub fn initialize() -> Result<Self, llama_cpp_2::LlamaCppError> {
+        LlamaBackend::init().map(|backend| Self {
+            backend: Arc::new(backend),
+        })
+    }
+
+    /// Observe model-free hardware through this process's initialized backend.
+    #[must_use]
+    pub fn discover_hardware(
+        &self,
+        policy: icn_hardware::CapacityPolicy,
+        native_build: impl Into<String>,
+        enabled_backends: Vec<String>,
+    ) -> HardwareSnapshot {
+        icn_hardware::discover_hardware(
+            self.backend.as_ref(),
+            policy,
+            native_build,
+            enabled_backends,
+        )
+    }
+
+    /// Borrow the initialized backend for isolated native planning within this process.
+    #[must_use]
+    pub fn as_llama_backend(&self) -> &LlamaBackend {
+        self.backend.as_ref()
+    }
+
+    /// Load a model while reporting llama.cpp's exact weight-loading fraction.
+    pub fn load_with_progress(
+        &self,
+        model_id: impl Into<String>,
+        config: ExecutionIntent,
+        mtp_selection: MtpCandidateSelection,
+        on_progress: impl FnMut(f32) + Send + 'static,
+    ) -> Result<LlamaCompletionBackend, ModelLoadError> {
+        LlamaCompletionBackend::load_with_progress(
+            Arc::clone(&self.backend),
+            model_id,
+            config,
+            mtp_selection,
+            on_progress,
+        )
+    }
+}
+
 #[cfg(feature = "parity-probe")]
 #[doc(hidden)]
 pub mod parity_probe;
@@ -243,7 +305,7 @@ pub enum ModelLoadError {
     InvalidConfiguration(String),
     MtpSelection(String),
     Planning(String),
-    AssessmentRejected(HardwareAssessment),
+    AssessmentRejected(Box<HardwareAssessment>),
     Backend(String),
 }
 
@@ -278,17 +340,12 @@ impl From<InferenceError> for ModelLoadError {
 }
 
 impl LlamaCompletionBackend {
-    /// Load a model and initialize its persistent context before returning.
-    #[tracing::instrument(
-        name = "icn.model.load",
-        skip_all,
-        fields(model.id = tracing::field::Empty),
-        err
-    )]
-    pub fn load(
+    fn load_with_progress(
+        backend: Arc<LlamaBackend>,
         model_id: impl Into<String>,
         config: ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
+        on_progress: impl FnMut(f32) + Send + 'static,
     ) -> Result<Self, ModelLoadError> {
         validate_model_config(&config).map_err(ModelLoadError::from)?;
         let model_id = model_id.into();
@@ -297,7 +354,16 @@ impl LlamaCompletionBackend {
         let (ready_sender, ready_receiver) = sync_channel(1);
         let executor = thread::Builder::new()
             .name(format!("icn-llama-{}", model_id))
-            .spawn(move || executor_main(config, mtp_selection, command_receiver, ready_sender))
+            .spawn(move || {
+                executor_main(
+                    backend,
+                    config,
+                    mtp_selection,
+                    command_receiver,
+                    ready_sender,
+                    Box::new(on_progress),
+                )
+            })
             .map_err(|error| ModelLoadError::Backend(error.to_string()))?;
 
         match ready_receiver.recv() {
@@ -459,23 +525,19 @@ impl Drop for LlamaCompletionBackend {
 }
 
 fn executor_main(
+    backend: Arc<LlamaBackend>,
     mut requested: ExecutionIntent,
     mtp_selection: MtpCandidateSelection,
     commands: Receiver<ExecutorCommand>,
     ready: SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
+    mut on_load_progress: Box<dyn FnMut(f32) + Send>,
 ) {
-    let backend = match LlamaBackend::init() {
-        Ok(backend) => backend,
-        Err(error) => {
-            let _ = ready.send(Err(ModelLoadError::Backend(error.to_string())));
-            return;
-        }
-    };
     let candidates = match &mtp_selection {
         MtpCandidateSelection::Automatic(paths) => icn_mtp::CandidatePolicy::Automatic(paths),
         MtpCandidateSelection::Explicit(path) => icn_mtp::CandidatePolicy::Explicit(path),
     };
-    requested.mtp = match icn_mtp::select_mtp_with_backend(&backend, &requested, candidates) {
+    requested.mtp = match icn_mtp::select_mtp_with_backend(backend.as_ref(), &requested, candidates)
+    {
         Ok(mtp) => mtp,
         Err(error) => {
             let _ = ready.send(Err(ModelLoadError::MtpSelection(error.to_string())));
@@ -483,7 +545,7 @@ fn executor_main(
         }
     };
     let planned = match icn_hardware::plan_load_with_backend(
-        &backend,
+        backend.as_ref(),
         &requested,
         icn_hardware::CapacityPolicy::default(),
     ) {
@@ -496,7 +558,9 @@ fn executor_main(
     let acceleration = match &planned.assessed.assessment {
         HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
         assessment => {
-            let _ = ready.send(Err(ModelLoadError::AssessmentRejected(assessment.clone())));
+            let _ = ready.send(Err(ModelLoadError::AssessmentRejected(Box::new(
+                assessment.clone(),
+            ))));
             return;
         }
     };
@@ -527,6 +591,12 @@ fn executor_main(
     let native_mtp = planned.native_mtp.map(|plan| plan.into_parts());
     let (model_path, model_params, context_params, threads, threads_batch) =
         planned.native.into_parts();
+    let model_params = Box::pin(
+        std::pin::Pin::into_inner(model_params).with_progress_callback(move |fraction| {
+            on_load_progress(fraction);
+            true
+        }),
+    );
     let threads = match nonzero_i32(threads, "threads") {
         Ok(value) => value,
         Err(error) => {
@@ -933,9 +1003,7 @@ fn resident_memory_state(
                 native_index: *native_index,
             },
         };
-        let Some(domain_id) = icn_hardware::resolve_memory_domain(snapshot, &location) else {
-            return None;
-        };
+        let domain_id = icn_hardware::resolve_memory_domain(snapshot, &location)?;
         let domain = domains
             .entry(domain_id.to_owned())
             .or_insert_with(|| ResidentMemoryDomain {
@@ -3895,8 +3963,8 @@ mod tests {
     #[test]
     fn resident_allocations_collapse_host_and_metal_into_unified_memory() {
         use icn_contracts::{
-            HardwareDevice, HardwareDeviceKind, HardwareMemoryDomain,
-            HardwareMemoryDomainKind, HardwareSystemMemory,
+            HardwareDevice, HardwareDeviceKind, HardwareMemoryDomain, HardwareMemoryDomainKind,
+            HardwareSystemMemory,
         };
 
         let snapshot = HardwareSnapshot {

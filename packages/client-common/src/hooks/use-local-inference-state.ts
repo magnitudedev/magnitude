@@ -1,18 +1,57 @@
 import { useCallback, useMemo } from "react"
-import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Atom, Result, useAtomSet, useAtomValue, type Atom as EffectAtom } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import { createId } from "@magnitudedev/generate-id"
 import {
-  LocalInferenceMirror,
+  IcnHardwareMirror,
+  IcnInventoryMirror,
+  ModelRecipesMirror,
   ModelCatalogMirror,
   ModelSlotsMirror,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { useMirroredState } from "./use-mirrored-state"
+import { useMirroredStateAtom } from "./use-mirrored-state"
+import { deriveLocalInferenceView } from "../utils/local-inference-view"
+
+type HardwareSnapshot = typeof IcnHardwareMirror.snapshotSchema.Type
+type InventorySnapshot = typeof IcnInventoryMirror.snapshotSchema.Type
+type RecipesSnapshot = typeof ModelRecipesMirror.snapshotSchema.Type
+
+const requireResultValue = <A, E>(
+  observed: Result.Result<A, E>,
+): Result.Result<A, E> => Option.match(Option.fromNullable(observed), {
+  onNone: () => Result.initial(true),
+  onSome: (result) => Result.isSuccess(result)
+    ? Option.match(Option.fromNullable(result.value), {
+        onNone: () => Result.initial(true),
+        onSome: () => result,
+      })
+    : result,
+})
+
+export const makeLocalInferenceQueryAtom = <E>(
+  hardware: EffectAtom.Atom<Result.Result<HardwareSnapshot, E>>,
+  inventory: EffectAtom.Atom<Result.Result<InventorySnapshot, E>>,
+  recipes: EffectAtom.Atom<Result.Result<RecipesSnapshot, E>>,
+) => Atom.make((get) => Result.map(Result.all({
+  hardware: requireResultValue(get(hardware)),
+  inventory: requireResultValue(get(inventory)),
+  recipes: requireResultValue(get(recipes)),
+}), (snapshots) => deriveLocalInferenceView(
+  snapshots.hardware.state,
+  snapshots.inventory.state,
+  snapshots.recipes.state,
+)))
 
 export function useLocalInferenceQuery() {
-  const snapshot = useMirroredState(LocalInferenceMirror)
-  return Result.map(snapshot, ({ state }) => state)
+  const hardware = useMirroredStateAtom(IcnHardwareMirror)
+  const inventory = useMirroredStateAtom(IcnInventoryMirror)
+  const recipes = useMirroredStateAtom(ModelRecipesMirror)
+  const state = useMemo(
+    () => makeLocalInferenceQueryAtom(hardware, inventory, recipes),
+    [hardware, inventory, recipes],
+  )
+  return useAtomValue(state)
 }
 
 export function useLocalInferenceState() {
@@ -53,24 +92,24 @@ export function useLocalInferenceState() {
   const disableMutation = useAtomSet(disableAtom)
 
   const downloadModel = useCallback((configurationId: string): void => {
-    downloadMutation({ payload: { configurationId, requestId: createId() }, reactivityKeys: [LocalInferenceMirror.id] })
+    downloadMutation({ payload: { configurationId, requestId: createId() }, reactivityKeys: [IcnInventoryMirror.id] })
   }, [downloadMutation])
   const activateModel = useCallback((selectionId: string): void => {
-    activateMutation({ payload: { selectionId, requestId: createId() }, reactivityKeys: [LocalInferenceMirror.id] })
+    activateMutation({ payload: { selectionId, requestId: createId() }, reactivityKeys: [IcnInventoryMirror.id] })
   }, [activateMutation])
   const deleteModel = useCallback((selectionId: string): void => {
     deleteMutation({
       payload: { selectionId },
-      reactivityKeys: [LocalInferenceMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
+      reactivityKeys: [IcnInventoryMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
     })
   }, [deleteMutation])
   const restart = useCallback((): void => {
-    restartMutation({ payload: { requestId: createId() }, reactivityKeys: [LocalInferenceMirror.id] })
+    restartMutation({ payload: { requestId: createId() }, reactivityKeys: [IcnInventoryMirror.id] })
   }, [restartMutation])
   const disable = useCallback((): void => {
     disableMutation({
       payload: {},
-      reactivityKeys: [LocalInferenceMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
+      reactivityKeys: [IcnInventoryMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
     })
   }, [disableMutation])
 

@@ -30,10 +30,10 @@ import {
   watchFile,
 } from "./ops";
 import type { AppEvent } from "@magnitudedev/agent";
-import { LocalInference } from "./local-inference";
-import { LocalModelProviderSource } from "./local-inference/provider-source";
+import { IcnCommands } from "./icn";
 import { Onboarding } from "./onboarding";
 import { MirroredStateChanges } from "./mirrored-state";
+import { IcnMirrors } from "./icn";
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
@@ -42,10 +42,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const account = yield* Account;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
-    const localInference = yield* LocalInference;
-    const localModelSource = yield* LocalModelProviderSource;
+    const localInference = yield* IcnCommands;
     const onboarding = yield* Onboarding;
     const mirroredStateChanges = yield* MirroredStateChanges;
+    const icnMirrors = yield* IcnMirrors;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -326,12 +326,14 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           })
         ),
 
-      // Local inference capability
-      GetLocalInferenceState: () =>
-        observeRpcDefects(
-          "GetLocalInferenceState",
-          localInference.state,
-        ),
+      GetIcnHardware: () =>
+        observeRpcDefects("GetIcnHardware", icnMirrors.hardware),
+
+      GetIcnInventory: () =>
+        observeRpcDefects("GetIcnInventory", icnMirrors.inventory),
+
+      GetModelRecipes: () =>
+        observeRpcDefects("GetModelRecipes", icnMirrors.recipes),
 
       WatchMirroredStates: () =>
         observeRpcStreamDefects(

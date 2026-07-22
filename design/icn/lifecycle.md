@@ -5,11 +5,11 @@ applies_to:
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
   - packages/acn/src/server.ts
-  - packages/acn/src/icn-layer.ts
+  - packages/acn/src/icn/**
   - packages/acn/src/serve.ts
   - packages/acn/src/binary.ts
   - packages/acn/src/daemon-lifecycle.ts
-  - packages/acn/src/local-inference/**
+  - packages/acn/src/model-configuration.ts
   - packages/acn/scripts/build-binary.ts
   - inference/scripts/build-binary.ts
   - scripts/build-release-artifacts.ts
@@ -53,19 +53,22 @@ The ICN package owns:
 - exposing one scoped generated client whose admitted streams preserve their response lifetime; and
 - supplying the generated client with the connection established by the managed child lifecycle.
 
-The package does not own product catalog curation, recommendation ranking, durable user selection,
-ACN RPC state, or provider routing. It does not inspect hardware, GGUF files, Hugging Face state, or
-native runtime installations in Bun. It contains no fallback implementation of an ICN operation and
-no hand-written HTTP client, SSE parser, wire schema, or endpoint-specific transport error mapper.
+The package owns curated model recipes, recommendation ranking through native preview, exact
+hardware and inventory observation, and the local provider adaptation because those capabilities
+compose the one generated ICN client. It does not own durable user selection, ACN RPC state, cloud
+provider routing, or client presentation. It does not independently inspect hardware or GGUF files
+in Bun; it obtains those facts through generated ICN operations. It contains no fallback
+implementation of an ICN operation and no hand-written HTTP client, SSE parser, wire schema, or
+endpoint-specific transport error mapper.
 
 The native ICN process owns hardware discovery, model acquisition and inventory, artifact
 inspection, model fitting, the pinned inference runtime, active-model state, and inference request
 execution. The native binary is acquired by `@magnitudedev/icn` from the matching Magnitude release;
 it is not downloaded from a model repository and is not selected from a user-installed runtime.
 
-ACN owns the parent scope and product policy. It supplies ICN's storage roots and supported binary
-identity, translates product choices into generated ICN requests, and maps canonical ICN results to
-its public RPC state without duplicating their mechanics.
+ACN owns the parent scope and application policy. It supplies ICN's storage roots and supported
+binary identity, translates persisted user choices into generated ICN requests, and binds canonical
+ICN observations to public mirrors without copying or reinterpreting their state.
 
 ## Generated API boundary
 
@@ -268,9 +271,11 @@ already-resident identical model and profile is idempotent. Concurrent identical
 serializes, rechecks residency, and performs at most one effective successful native load. Concurrent
 incompatible mutations are serialized by the native coordinator; they never race native
 process-global state or rely on ACN-side locking.
-The resident backend executor performs load-time planning and loading under one process-global
-native-backend initialization. Runtime orchestration must not perform a separate in-process native
-assessment before creating that executor.
+The ICN composition root creates one process-lifetime native-backend capability before readiness.
+The resident executor, load-time planning, and model-free hardware observation all require that
+same capability. Creating or dropping a model executor never initializes or tears down the native
+backend, and runtime orchestration has no operation-level initialization path. Isolated planner and
+template workers each own one separate backend for their complete private process lifetime.
 
 An ordinary chat request names an available inventory model directly. Under the same native
 admission boundary used by explicit load, ICN either leases an already-resident matching target or

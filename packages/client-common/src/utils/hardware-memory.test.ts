@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import type { LocalInferenceHostProfile } from "@magnitudedev/sdk"
+import type { LocalInferenceHostProfile } from "../types/local-inference"
 import { deriveHardwareMemoryView } from "./hardware-memory"
 
 const gib = 1024 ** 3
@@ -81,7 +81,7 @@ describe("hardware memory view", () => {
     })
   })
 
-  it("keeps a high-level accelerator aggregate when attribution is unavailable", () => {
+  it("shows zero model allocation and attributes observed use to the system when no model is resident", () => {
     const view = deriveHardwareMemoryView(host({
       memoryDomains: [{
         id: "gpu", kind: "physical_device", totalCapacityBytes: 24 * gib,
@@ -95,6 +95,12 @@ describe("hardware memory view", () => {
       residentMemory: null,
     }))
     expect(view.compact).toEqual({ usedBytes: 18 * gib, totalBytes: 24 * gib })
-    expect(view.domains[0]?.status).toBe("unavailable")
+    expect(view.domains[0]).toMatchObject({
+      status: "complete",
+      fixedBytes: 0,
+      kvCacheBytes: 0,
+      systemAndAppsBytes: 18 * gib,
+      freeBytes: 6 * gib,
+    })
   })
 })

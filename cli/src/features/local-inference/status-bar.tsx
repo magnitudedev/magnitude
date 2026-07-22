@@ -1,6 +1,6 @@
-import { deriveHardwareMemoryView } from '@magnitudedev/client-common'
-import type { LocalInferenceState } from '@magnitudedev/sdk'
+import { deriveHardwareMemoryView, type LocalInferenceState } from '@magnitudedev/client-common'
 import { TextAttributes } from '@opentui/core'
+import { Option } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { formatMemoryBytes } from '../../components/hardware-memory-domain'
@@ -16,11 +16,13 @@ const operationLabel = (operation: LocalInferenceState['operations'][number]): s
   if (operation.status === 'failed') {
     return `Failed · ${operation.stage.replaceAll('_', ' ')}`
   }
-  if (operation.kind === 'download' && operation.progress && operation.progress.totalBytes > 0) {
-    const percent = Math.round(operation.progress.completedBytes / operation.progress.totalBytes * 100)
+  const progress = Option.getOrNull(operation.progress)
+  if (operation.kind === 'download' && progress && 'totalBytes' in progress && progress.totalBytes > 0) {
+    const percent = Math.round(progress.completedBytes / progress.totalBytes * 100)
     return `Downloading ${percent}%`
   }
-  const action = operation.kind === 'restart' ? 'Restarting' : operation.kind === 'activate' ? 'Loading' : 'Downloading'
+  if (operation.kind === 'activate' && progress && 'fraction' in progress) return `Loading ${Math.round(progress.fraction * 100)}%`
+  const action = operation.kind === 'activate' ? 'Loading' : 'Downloading'
   return `${action} · ${operation.stage.replaceAll('_', ' ')}`
 }
 
@@ -32,11 +34,15 @@ const compactBarSegments = (
 ): readonly StackedBarSegment[] | null => {
   const participating = domains.filter((domain) => domain.participatesInRuntime && domain.usedBytes !== null)
   if (participating.length === 0) return null
-  const complete = participating.every((domain) =>
+  const complete = participating.filter((domain): domain is typeof domain & {
+    readonly fixedBytes: number
+    readonly kvCacheBytes: number
+    readonly systemAndAppsBytes: number
+  } =>
     domain.fixedBytes !== null
     && domain.kvCacheBytes !== null
     && domain.systemAndAppsBytes !== null)
-  if (!complete) {
+  if (complete.length !== participating.length) {
     return [{
       value: participating.reduce((sum, domain) => sum + (domain.usedBytes ?? 0), 0),
       color: colors.system,
@@ -44,15 +50,15 @@ const compactBarSegments = (
   }
   return [
     {
-      value: participating.reduce((sum, domain) => sum + domain.fixedBytes!, 0),
+      value: complete.reduce((sum, domain) => sum + domain.fixedBytes, 0),
       color: colors.fixed,
     },
     {
-      value: participating.reduce((sum, domain) => sum + domain.kvCacheBytes!, 0),
+      value: complete.reduce((sum, domain) => sum + domain.kvCacheBytes, 0),
       color: colors.kv,
     },
     {
-      value: participating.reduce((sum, domain) => sum + domain.systemAndAppsBytes!, 0),
+      value: complete.reduce((sum, domain) => sum + domain.systemAndAppsBytes, 0),
       color: colors.system,
     },
   ]
@@ -60,25 +66,34 @@ const compactBarSegments = (
 
 export const LocalRuntimeStatusBar = ({ state, width, onOpenHardware }: LocalRuntimeStatusBarProps) => {
   const theme = useTheme()
-  const latestOperation = state.operations.at(-1)
-  const operation = latestOperation?.status === 'completed' ? undefined : latestOperation
-  const running = state.choices.find((choice) => choice._tag === 'Running')
-  if (!operation && !running) return null
+  const operation = Option.fromNullable(state.operations.at(-1))
+  const running = Option.fromNullable(state.choices.find((choice) => choice._tag === 'Running'))
+  if (Option.isNone(operation) && Option.isNone(running)) return null
 
-  const choice = operation
-    ? state.choices.find((candidate) => candidate.providerModelId === operation.providerModelId)
-    : running
-  const modelName = choice?.displayName ?? operation?.providerModelId ?? running?.displayName ?? 'Local model'
-  const status = operation ? operationLabel(operation) : 'Ready'
-  const assessedDomainIds = choice?.fitAssessment._tag === 'Assessed'
-    ? choice.fitAssessment.domains.map((domain) => domain.memoryDomainId)
-    : []
-  const memoryView = state.host._tag === 'Available'
-    ? deriveHardwareMemoryView(state.host.profile, {
-        participatingDomainIds: assessedDomainIds,
-        fallbackToAccelerators: operation !== undefined,
-      })
-    : null
+  const choice = Option.orElse(
+    Option.flatMap(operation, (current) => Option.fromNullable(
+      state.choices.find((candidate) => candidate.providerModelId === current.providerModelId),
+    )),
+    () => running,
+  )
+  const modelName = Option.getOrElse(
+    Option.map(choice, (selected) => selected.displayName),
+    () => Option.getOrElse(
+      Option.map(operation, (current) => current.providerModelId),
+      () => 'Local model',
+    ),
+  )
+  const status = Option.match(operation, { onNone: () => 'Ready', onSome: operationLabel })
+  const assessedDomainIds = Option.match(choice, {
+    onNone: () => [],
+    onSome: (selected) => selected.fitAssessment._tag === 'Assessed'
+      ? selected.fitAssessment.domains.map((domain) => domain.memoryDomainId)
+      : [],
+  })
+  const memoryView = deriveHardwareMemoryView(state.host, {
+    participatingDomainIds: assessedDomainIds,
+    fallbackToAccelerators: Option.isSome(operation),
+  })
   const memory = memoryView?.compact ?? null
   const barSegments = memoryView
     ? compactBarSegments(memoryView.domains, {

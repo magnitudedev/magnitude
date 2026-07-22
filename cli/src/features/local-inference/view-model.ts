@@ -3,7 +3,8 @@ import type {
   LocalInferenceState,
   LocalModelChoice,
   LocalModelRecommendation,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/client-common"
+import { Option } from "effect"
 
 export type LocalInferenceSelection =
   | { readonly kind: "running" | "stored"; readonly id: string; readonly choice: LocalModelChoice }
@@ -132,17 +133,16 @@ export const selectionTitle = (selection: LocalInferenceSelection): string =>
 export const selectionMetadata = (selection: LocalInferenceSelection): string => {
   const quantization = selection.kind === "recommendation"
     ? selection.recommendation.quantization.format
-    : selection.choice.quantization?.format ?? "Quantization unavailable"
+    : Option.getOrElse(Option.map(selection.choice.quantization, (value) => value.format), () => "Quantization unavailable")
   const size = selection.kind === "recommendation"
     ? formatBytes(selection.recommendation.totalDownloadBytes)
-    : selection.choice.sizeBytes === undefined
-      ? "Size unavailable"
-      : formatBytes(selection.choice.sizeBytes)
+    : Option.match(selection.choice.sizeBytes, { onNone: () => "Size unavailable", onSome: formatBytes })
   const context = selection.kind === "recommendation"
     ? `${formatContext(selection.recommendation.contextTokens)} context`
-    : selection.choice.contextTokens === undefined
-      ? "Context unavailable"
-      : `${formatContext(selection.choice.contextTokens)} context`
+    : Option.match(selection.choice.contextTokens, {
+        onNone: () => "Context unavailable",
+        onSome: (tokens) => `${formatContext(tokens)} context`,
+      })
   return `${quantization} · ${size} · ${context}`
 }
 

@@ -26,8 +26,6 @@ pub enum CandidatePolicy<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SelectionError {
-    #[error("failed to initialize llama.cpp for MTP inspection: {0}")]
-    Backend(String),
     #[error("invalid native execution parameters: {0}")]
     InvalidExecution(String),
     #[error("bundled MTP failed native compatibility preflight: {0}")]
@@ -45,16 +43,6 @@ pub enum SelectionError {
 /// 1. Use executable MTP bundled in the target when native preflight succeeds.
 /// 2. Otherwise use the only separate candidate that native execution preflight accepts.
 /// 3. Disable MTP when none work, and reject ambiguity rather than guessing.
-pub fn select_mtp(
-    plan: &ExecutionIntent,
-    candidates: CandidatePolicy<'_>,
-) -> Result<MtpConfig, SelectionError> {
-    let backend =
-        LlamaBackend::init().map_err(|error| SelectionError::Backend(error.to_string()))?;
-    select_mtp_with_backend(&backend, plan, candidates)
-}
-
-/// Select MTP using an already initialized llama.cpp backend.
 ///
 /// Serving processes call this from their exclusive native executor. The backend reference is a
 /// lifetime proof for the process-global device state used by file inspection and linked graph

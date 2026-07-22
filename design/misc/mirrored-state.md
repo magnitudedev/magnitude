@@ -8,7 +8,7 @@ applies_to:
   - packages/acn/src/account.ts
   - packages/acn/src/handlers.ts
   - packages/acn/src/server.ts
-  - packages/acn/src/local-inference/service.ts
+  - packages/acn/src/icn/mirrors.ts
   - packages/client-common/src/hooks/use-mirrored-state.ts
   - packages/client-common/src/hooks/use-model-config.ts
   - packages/client-common/src/hooks/use-slot-profiles.ts
@@ -29,6 +29,11 @@ keys and endpoint-name configuration are forbidden. Protocol declarations, ACN s
 hooks consume the same definition so endpoint names, result types, and invalidation identities
 cannot drift independently.
 
+The encoded side of every mirror schema must be JSON-safe. Every optional domain value uses
+`Schema.optionalWith(valueSchema, { as: "Option", exact: true })`. This preserves `Option` in the
+decoded domain and omits `None` fields from the encoded object. `OptionFromSelf`, `OptionFromNullOr`,
+bare `Schema.optional`, and `UndefinedOr` are forbidden for optional domain values.
+
 All mirrors publish tagged invalidations through one shared watch RPC. Opening that watch requires
 no mirror-specific payload. Each changed event identifies the Get RPC tag and its new revision.
 Heartbeats and reconnects cause clients to invalidate every mirror they currently consume, so a
@@ -38,6 +43,11 @@ ACN serializes state transitions and revision increments. A transition that chan
 one invalidation after the new snapshot is stored. A no-op transition changes neither the revision
 nor the stream. Invalidation delivery is coalescing and bounded: a slow watcher may skip intermediate
 revisions because its next action is always to fetch the latest complete snapshot.
+
+When a backend service already owns a versioned replaying source, ACN binds that source directly.
+The Get RPC reads the source snapshot and its change stream publishes invalidations with the same
+revision. ACN does not copy the state into another `Ref`, assign a second revision, or run a second
+equality check. ICN hardware, inventory, and recipe mirrors use this source-backed form.
 
 Client-common owns one resident mirrored-state watch per client connection and all query
 invalidation. Screens consume query-backed state and do not open their own progress streams or make
@@ -49,10 +59,9 @@ client-provided request ID makes retries idempotent, while domain target identit
 active work. Unary mutation pending state describes only command acceptance and must never be used as
 a page-wide busy flag.
 
-An owning service may sample volatile observational input into one field of an existing mirror.
-Such a sampler must perform a narrow source-owned transition: a local-inference hardware tick, for
-example, may fetch hardware and replace the host field but must not list models, rebuild
-recommendations, or rewrite operations. Structurally unchanged samples are no-ops. A failed sample
-silently retains the last good value and retries; it does not create a user-visible failure state or
-erase unrelated authoritative fields. The sampler's lifetime belongs to the service scope and its
-activity does not become a client-owned polling loop.
+An owning service may continuously sample volatile observational input. Such a sampler updates only
+its own source: an ICN hardware tick refreshes the exact hardware snapshot and does not list models,
+rebuild recommendations, or rewrite inventory. Structurally unchanged samples are no-ops. A failed
+sample retains the last good value and retries; it does not create a user-visible failure state or
+erase unrelated authoritative fields. The sampler's lifetime belongs to the source service scope
+and its activity does not become ACN mirror logic or a client-owned polling loop.

@@ -35,13 +35,13 @@ pub struct TemplateInspection {
     pub profile: ReasoningProfile,
 }
 
-pub fn inspect_template_inputs(
+pub fn inspect_template_inputs_with_backend(
+    backend: &LlamaBackend,
     inputs: &EffectiveTemplateInputs,
 ) -> Result<TemplateInspection, InspectionError> {
-    let backend = LlamaBackend::init().map_err(native_error)?;
     let params = LlamaModelParams::default().with_no_alloc(true);
-    let model = LlamaModel::load_from_file(&backend, &inputs.model_path, &params)
-        .map_err(native_error)?;
+    let model =
+        LlamaModel::load_from_file(backend, &inputs.model_path, &params).map_err(native_error)?;
     let templates = CommonChatTemplates::from_model(&model).map_err(native_error)?;
     inspect_templates(&templates)
 }
@@ -60,8 +60,8 @@ pub fn inspect_template(
     bos_token: Option<&str>,
     eos_token: Option<&str>,
 ) -> Result<TemplateInspection, InspectionError> {
-    let templates = CommonChatTemplates::from_template(template, bos_token, eos_token)
-        .map_err(native_error)?;
+    let templates =
+        CommonChatTemplates::from_template(template, bos_token, eos_token).map_err(native_error)?;
     inspect_templates(&templates)
 }
 

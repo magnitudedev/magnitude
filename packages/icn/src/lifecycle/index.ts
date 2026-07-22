@@ -51,8 +51,8 @@ export class IcnBinaryResolutionConfig extends Schema.Class<IcnBinaryResolutionC
 )({
   source: IcnBinarySource,
   supportedApiVersion: PositiveInt,
-  expectedNativeBuild: Schema.OptionFromSelf(NonEmpty),
-  expectedTarget: Schema.OptionFromSelf(NonEmpty),
+  expectedNativeBuild: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
+  expectedTarget: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
   requiredCapabilities: Schema.Array(NonEmpty),
   allowBuildMismatch: Schema.Boolean,
   probeTimeout: Schema.DurationFromSelf.pipe(
@@ -66,7 +66,7 @@ export class IcnBinaryResolutionConfig extends Schema.Class<IcnBinaryResolutionC
 export class IcnStorageConfig extends Schema.Class<IcnStorageConfig>(
   "IcnStorageConfig"
 )({
-  modelStore: Schema.OptionFromSelf(NonEmpty),
+  modelStore: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
   modelSources: Schema.Array(NonEmpty),
   huggingFaceCaches: Schema.Array(NonEmpty),
 }) {}
@@ -436,7 +436,7 @@ export class IcnBinaryResolver extends Context.Tag(
   "@magnitudedev/icn/IcnBinaryResolver"
 )<IcnBinaryResolver, IcnBinaryResolverService>() {}
 
-export const IcnBinaryResolverLive = Layer.effect(
+export const makeIcnBinaryResolver = () => Layer.effect(
   IcnBinaryResolver,
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -811,7 +811,7 @@ export const renderIcnArguments = (
 
 const acquireIcn = (input: IcnLifecycleConfig) =>
   Effect.gen(function* () {
-    const config = yield* Schema.decodeUnknown(IcnLifecycleConfig)(input).pipe(
+    const config = yield* Schema.validate(IcnLifecycleConfig)(input).pipe(
       Effect.mapError((cause) =>
         lifecycleError(
           "resolve",
@@ -1126,7 +1126,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     };
   });
 
-export const IcnLive = (
+export const makeIcn = (
   config: IcnLifecycleConfig
 ): Layer.Layer<
   IcnApiClient | IcnLifecycle,
@@ -1144,4 +1144,4 @@ export const IcnLive = (
         )
       )
     )
-  ).pipe(Layer.provideMerge(IcnBinaryResolverLive));
+  ).pipe(Layer.provideMerge(makeIcnBinaryResolver()));

@@ -208,7 +208,7 @@ pub enum ModelAvailability {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelResidency {
     NotResident,
@@ -216,6 +216,8 @@ pub enum ModelResidency {
         load_id: String,
         stage: LoadStage,
         started_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fraction: Option<f32>,
     },
     Loaded {
         loaded_at: u64,
@@ -231,6 +233,7 @@ pub enum ModelResidency {
         attempted_at: u64,
         stage: LoadStage,
         code: String,
+        message: String,
         retryable: bool,
     },
 }
@@ -784,7 +787,7 @@ pub struct HuggingFaceRepositorySnapshot {
     pub gguf_files: Vec<HuggingFaceRepositoryFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryModel {
     pub id: ModelId,
@@ -817,7 +820,7 @@ pub struct ServingConfiguration {
     pub profile: ServingProfile,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedModel {
     pub model: InventoryModel,
     pub components: Vec<ResolvedComponent>,

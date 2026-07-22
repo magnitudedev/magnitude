@@ -39,15 +39,6 @@ export {
   ProviderRegistryLive,
 } from "./registry"
 export {
-  type LocalProviderInstance,
-  type LocalModelInfo,
-  LocalModelInfoSchema,
-  LocalProviderId,
-  type LocalProviderSource,
-  createLocalProvider,
-  PROVIDER_ID as LOCAL_PROVIDER_ID,
-} from "./local"
-export {
   makeAggregatedCatalog,
   inspectProviderCatalogs,
   type ProviderCatalogOutcome,

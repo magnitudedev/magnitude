@@ -3,10 +3,14 @@ applies_to:
   - packages/ai/src/provider/**
   - packages/ai/src/model/**
   - packages/ai/src/transport/**
-  - packages/providers/src/local/**
+  - packages/providers/src/registry.ts
   - packages/openapi-effect/**
   - packages/icn/**
-  - packages/acn/src/local-inference/**
+  - packages/icn/src/provider/**
+  - packages/icn/src/inventory/**
+  - packages/acn/src/icn/**
+  - packages/acn/src/shared-client.ts
+  - packages/acn/src/account.ts
   - packages/agent/src/window/**
   - packages/agent/src/observer/prompt.ts
   - inference/crates/icn-api/**
@@ -46,8 +50,9 @@ The local provider implements the ordinary provider contract:
 
 The agent, provider registry, and generic AI package see only `BoundModel<BaseCallOptions>`. They do
 not see load targets, runtime generations, hardware profiles, MTP choices, or ICN lifecycle types.
-The ACN local-provider adapter translates the generic prompt and call options to the generated ICN
-chat schema exactly once. It does not implement a second provider protocol.
+The `@magnitudedev/icn` provider translates the generic prompt and call options to the generated ICN
+chat schema exactly once. ACN registers that provider without implementing a second provider
+protocol.
 
 `POST /v1/chat/completions` is the only ICN inference operation. There is no runtime-chat endpoint,
 restart-chat endpoint, preflight endpoint, or state-check/load/chat sequence. The chat request names
@@ -130,7 +135,7 @@ successful `loaded` provider result.
 Both ordinary inference and explicit eager load call the same transport-independent operation:
 
 ```text
-ensureResident(model ID)
+acquire(model ID)
   -> read the model's serving profile
   -> resolve canonical artifact and auxiliary components
   -> assess and resolve the execution plan
@@ -145,7 +150,7 @@ native resources.
 
 The public model-residency operations are therefore limited to:
 
-- **load(model ID)**: eagerly run `ensureResident`; useful for user-requested warmup, but never a
+- **load(model ID)**: eagerly run the same acquisition transition; useful for user-requested warmup, but never a
   prerequisite for chat;
 - **unload(model ID)**: idempotently release that model when resident after its leases drain.
 
@@ -271,13 +276,16 @@ presentation displays it. A generic stream-failure label must not replace a know
 
 ## Ownership summary
 
-ACN owns product catalog curation, user selection, provider registration, generic prompt encoding,
-and projection into client RPC state. It translates a changed product choice into one generated
-ICN model-configuration request. It does not own runtime readiness or execution planning.
+`@magnitudedev/icn` owns recipe curation, the local provider catalog projection, generic prompt
+encoding for ICN, and generated chat failure mapping. ACN owns user selection, provider
+registration, catalog aggregation, and projection into client RPC state. It translates a changed
+user choice into one generated ICN model-configuration request. It does not own runtime readiness or
+execution planning.
 
-The generated ICN package owns typed requests, response admission, streaming transport, and exact
-error preservation. ACN uses its scoped generated client directly; no facade introduces an
-alternate operation vocabulary, HTTP implementation, or lifecycle cache.
+The generated ICN boundary owns typed requests, response admission, streaming transport, and exact
+error preservation. Authored ICN services may coordinate observation, recipes, or provider
+adaptation, but never rename generated operations or introduce an alternate HTTP implementation,
+runtime state machine, or lifecycle cache.
 
 ICN model management owns canonical artifact identity, serving configuration, inventory
 availability, inspection, and fitting. The ICN runtime coordinator owns target resolution,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
-import { Option } from "effect"
-import { ProviderModelIdSchema, type LocalInferenceState, type LocalModelRecommendation } from "@magnitudedev/sdk"
+import { Array as Arr, Option } from "effect"
+import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import type { LocalInferenceState, LocalModelRecommendation } from "@magnitudedev/client-common"
 import {
   buildLocalInferenceSelections,
   describeLocalHardware,
@@ -15,6 +16,9 @@ const recommendation: LocalModelRecommendation = {
   displayName: "Recommended model",
   family: "test",
   architecture: "dense",
+  totalParametersBillions: Option.none(),
+  activeParametersBillions: Option.none(),
+  effectiveParametersBillions: Option.none(),
   quantization: {
     format: "Q4_K_M",
     quantAwareCheckpoint: false,
@@ -41,7 +45,16 @@ const recommendation: LocalModelRecommendation = {
 
 const baseState = {
   activeBinding: null,
-  host: { _tag: "Unavailable", message: "not needed" },
+  host: {
+    platform: "test",
+    architecture: "test",
+    topologyFingerprint: "test",
+    systemMemoryBytes: 0,
+    cpuModel: null,
+    logicalCores: 1,
+    memoryDomains: [],
+    residentMemory: null,
+  },
   operations: [],
   warnings: [],
 } satisfies Omit<LocalInferenceState, "choices" | "recommendationState">
@@ -169,7 +182,9 @@ describe("local inference selection view model", () => {
         choiceId: recommendation.configurationId,
         displayName: recommendation.displayName,
         providerModelId: ProviderModelIdSchema.make("local-model"),
-        contextTokens: recommendation.contextTokens,
+        contextTokens: Option.some(recommendation.contextTokens),
+        quantization: Option.none(),
+        sizeBytes: Option.none(),
         fitClass: recommendation.fitClass,
         availability: { _tag: "Available" },
         fitAssessment: { _tag: "NotAssessed" },
@@ -193,20 +208,20 @@ describe("local inference selection view model", () => {
         choiceId: "external-choice",
         displayName: "External model",
         providerModelId: ProviderModelIdSchema.make("external-model"),
-        contextTokens: 48_000,
+        contextTokens: Option.some(48_000),
         fitClass: "unknown",
         availability: { _tag: "Available" },
         fitAssessment: { _tag: "NotAssessed" },
         explanation: "Observed read-only endpoint.",
         residency: "loaded",
-        quantization: {
+        quantization: Option.some({
           format: "UD-Q6_K_XL",
           quantAwareCheckpoint: false,
           fidelityLabel: "Very high fidelity with minimal quality loss",
           fidelityEvidence: "Catalog evidence.",
           fidelitySourceUrl: "https://example.invalid/model",
-        },
-        sizeBytes: 32_600_719_872,
+        }),
+        sizeBytes: Option.some(32_600_719_872),
       }],
       recommendationState: { _tag: "Ready", recommendations: [] },
     }
@@ -216,7 +231,7 @@ describe("local inference selection view model", () => {
       kind: "running",
       id: "external-choice",
     })])
-    expect(selectionMetadata(selections[0]!)).toBe("UD-Q6_K_XL · 30.4 GiB · 48K context")
+    expect(selectionMetadata(Option.getOrThrow(Arr.head(selections)))).toBe("UD-Q6_K_XL · 30.4 GiB · 48K context")
   })
 
   it("keeps a capacity-risk model actionable and exposes its warning", () => {
@@ -227,7 +242,9 @@ describe("local inference selection view model", () => {
         choiceId: "large-model",
         displayName: "Large model",
         providerModelId: ProviderModelIdSchema.make("large-model"),
-        contextTokens: 32_768,
+        contextTokens: Option.some(32_768),
+        quantization: Option.none(),
+        sizeBytes: Option.none(),
         fitClass: "cpu_or_unified",
         availability: { _tag: "Available" },
         fitAssessment: {
@@ -244,7 +261,7 @@ describe("local inference selection view model", () => {
 
     const selections = buildLocalInferenceSelections(state)
     expect(selections).toHaveLength(1)
-    expect(selectionCapacityWarning(selections[0]!)).toContain("estimated 24.0 GiB")
+    expect(selectionCapacityWarning(Option.getOrThrow(Arr.head(selections)))).toContain("estimated 24.0 GiB")
   })
 
   it("excludes a hard-disabled model independently of fit state", () => {
@@ -255,6 +272,9 @@ describe("local inference selection view model", () => {
         choiceId: "unavailable",
         displayName: "Unavailable model",
         providerModelId: ProviderModelIdSchema.make("unavailable"),
+        contextTokens: Option.none(),
+        quantization: Option.none(),
+        sizeBytes: Option.none(),
         fitClass: "unknown",
         availability: { _tag: "Disabled", reason: "installation_unavailable" },
         fitAssessment: { _tag: "NotAssessed" },

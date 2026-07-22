@@ -16,10 +16,7 @@ import type { LocalModelInfo } from "./contract"
 
 export const PROVIDER_ID = ProviderIdSchema.make("local")
 
-/**
- * ACN-owned local inference boundary. The source owns ICN communication and
- * returns a model whose stream is already backed by the generated ICN client.
- */
+/** Effect-native local provider source backed by the single managed ICN client. */
 export interface LocalProviderSource {
   readonly catalog: ModelCatalog<LocalModelInfo>
   readonly discoverModelProperties: (

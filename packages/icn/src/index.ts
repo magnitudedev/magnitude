@@ -1,6 +1,11 @@
 export * as Generated from "./generated/index.js";
 export * from "./generated/index.js";
 export * from "./lifecycle/index.js";
+export * from "./observed-state.js";
+export * from "./hardware/index.js";
+export * from "./inventory/index.js";
+export * from "./recipes/index.js";
+export * from "./provider/index.js";
 export {
   GeneratedClientIncompleteStreamError,
   GeneratedClientInputError,

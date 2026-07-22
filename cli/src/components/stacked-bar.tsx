@@ -29,12 +29,13 @@ const allocateEighths = (values: readonly number[], total: number, units: number
   const exact = bounded.map((value) => value / total * units)
   const allocated = exact.map(Math.floor)
   let remainingUnits = units - allocated.reduce((sum, value) => sum + value, 0)
-  const order = exact
-    .map((value, index) => ({ index, remainder: value - allocated[index]! }))
+  const order = Arr.zip(exact, allocated)
+    .map(([value, allocatedValue], index) => ({ index, remainder: value - allocatedValue }))
     .sort((left, right) => right.remainder - left.remainder || left.index - right.index)
   for (const candidate of order) {
     if (remainingUnits <= 0) break
-    allocated[candidate.index] = (allocated[candidate.index] ?? 0) + 1
+    const current = Option.getOrElse(Arr.get(allocated, candidate.index), () => 0)
+    allocated.splice(candidate.index, 1, current + 1)
     remainingUnits -= 1
   }
   return allocated
@@ -67,16 +68,22 @@ export const createStackedBarCells = (
   )
   const runs: AllocatedRun[] = []
   let cursor = 0
-  for (const [index, segment] of visibleSegments.entries()) {
-    const length = units[index] ?? 0
+  for (const [segment, length] of Arr.zip(visibleSegments, units)) {
     if (length === 0) continue
     runs.push({ ...segment, start: cursor, end: cursor + length })
     cursor += length
   }
   if (runs.length === 0) return []
 
-  const runAt = (unit: number): AllocatedRun =>
-    runs.find((run) => unit >= run.start && unit < run.end) ?? runs.at(-1)!
+  const runAt = (unit: number): AllocatedRun => {
+    return Option.getOrThrowWith(
+      Option.orElse(
+        Arr.findFirst(runs, (candidate) => unit >= candidate.start && unit < candidate.end),
+        () => Arr.last(runs),
+      ),
+      () => new Error('stacked bar has no allocated run'),
+    )
+  }
 
   return Array.from({ length: width }, (_, index): StackedBarCell => {
     const start = index * EIGHTHS_PER_CELL
@@ -90,8 +97,12 @@ export const createStackedBarCells = (
       }
     }
     const foregroundEighths = Math.max(1, Math.min(EIGHTHS_PER_CELL - 1, left.end - start))
+    const character = Option.getOrThrowWith(
+      Arr.get(PARTIAL_BLOCKS, foregroundEighths),
+      () => new Error(`invalid partial-block width: ${foregroundEighths}`),
+    )
     return {
-      character: PARTIAL_BLOCKS[foregroundEighths]!,
+      character,
       foreground: left.color,
       background: right.color,
     }
@@ -128,3 +139,4 @@ export const StackedBar = ({
     </text>
   )
 }
+import { Array as Arr, Option } from 'effect'
