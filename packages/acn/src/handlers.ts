@@ -1,6 +1,7 @@
 import {
   MagnitudeRpcs,
   SessionOperationFailed,
+  ModelSlotMutationRejected,
   STREAM_HEARTBEAT_INTERVAL_MS,
   type DisplayViewShape,
   type SessionError,
@@ -9,7 +10,10 @@ import {
 import { Cause, Chunk, Effect, Option, Schedule, Stream } from "effect";
 import { SessionCommands } from "./session-commands";
 import { SessionLifecycle } from "./session-lifecycle";
-import { Account } from "./account";
+import { ProviderCredentials } from "./provider-credentials";
+import { ProviderModelCatalog } from "./provider-model-catalog";
+import { ModelSlotCoordinator } from "./model-slot-coordinator";
+import { MagnitudeCloudUsage } from "./magnitude-cloud-usage";
 import { ActiveSessionStatusesService } from "./active-session-statuses";
 import { DisplayViewStreams } from "./display-view-streams";
 import { ACN_VERSION } from "./version";
@@ -30,43 +34,26 @@ import {
   watchFile,
 } from "./ops";
 import type { AppEvent } from "@magnitudedev/agent";
-import {
-  IcnHardware,
-  IcnInventory,
-  IcnRecipes,
-} from "@magnitudedev/icn";
-import {
-  activateLocalModel,
-  deleteLocalModel,
-  disableLocalInference,
-  downloadLocalModel,
-  restartLocalInference,
-} from "./icn";
 import { Onboarding } from "./onboarding";
-import { bindMirroredState, MirroredStateChanges } from "./mirrored-state";
-import {
-  IcnHardwareMirror,
-  IcnInventoryMirror,
-  ModelRecipesMirror,
-} from "@magnitudedev/protocol";
-import { localInferenceRpcError } from "./icn/rpc-error";
+import { MirroredStateChanges } from "./mirrored-state";
 import { AcnActivityTracker } from "./activity-tracker";
+import { LocalModelInventory } from "./local-model-inventory";
+import { LocalInferenceHardware } from "./local-inference-hardware";
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
-    const account = yield* Account;
+    const providerCredentials = yield* ProviderCredentials;
+    const providerModelCatalog = yield* ProviderModelCatalog;
+    const modelSlots = yield* ModelSlotCoordinator;
+    const cloudUsage = yield* MagnitudeCloudUsage;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
     const onboarding = yield* Onboarding;
     const mirroredStateChanges = yield* MirroredStateChanges;
-    const hardware = yield* IcnHardware;
-    const inventory = yield* IcnInventory;
-    const recipes = yield* IcnRecipes;
-    const hardwareMirror = yield* bindMirroredState(IcnHardwareMirror, hardware);
-    const inventoryMirror = yield* bindMirroredState(IcnInventoryMirror, inventory);
-    const recipesMirror = yield* bindMirroredState(ModelRecipesMirror, recipes);
+    const localModels = yield* LocalModelInventory;
+    const localHardware = yield* LocalInferenceHardware;
     const activity = yield* AcnActivityTracker;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
@@ -291,71 +278,54 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       UpdateProviderAuth: ({ providerId, auth }) =>
         observeRpcDefects(
           "UpdateProviderAuth",
-          account.updateProviderAuth(providerId, auth).pipe(Effect.as({}))
+          providerCredentials.update(providerId, auth).pipe(Effect.as({}))
         ),
 
       GetProviderAuth: ({ providerId }) =>
         observeRpcDefects(
           "GetProviderAuth",
-          account
-            .getProviderAuth(providerId)
-            .pipe(Effect.map((auth) => ({ auth: Option.fromNullable(auth) })))
+          providerCredentials.get(providerId).pipe(Effect.map((auth) => ({ auth })))
         ),
 
       ListProviderAuth: () =>
         observeRpcDefects(
           "ListProviderAuth",
-          account.listProviderAuth.pipe(Effect.map((auths) => ({ auths })))
+          providerCredentials.list.pipe(Effect.map((auths) => ({ auths: Object.fromEntries(auths) })))
         ),
 
-      ListPublicSlotProfiles: () =>
-        observeRpcDefects(
-          "ListPublicSlotProfiles",
-          account.listPublicSlotProfiles
-        ),
-
-      GetModelCatalog: () =>
-        observeRpcDefects("GetModelCatalog", account.modelCatalog),
+      GetProviderModelCatalog: () =>
+        observeRpcDefects("GetProviderModelCatalog", providerModelCatalog.snapshot),
 
       RefreshModelCatalog: ({ providerId }) =>
         observeRpcDefects(
           "RefreshModelCatalog",
-          account.refreshModelCatalog(providerId).pipe(Effect.as({})),
+          providerModelCatalog.refresh(providerId).pipe(Effect.as({})),
         ),
 
       GetModelSlots: () =>
-        observeRpcDefects("GetModelSlots", account.modelSlots),
+        observeRpcDefects("GetModelSlots", modelSlots.snapshot),
 
-      UpdateModelSlots: ({ slots }) =>
+      UpdateModelSlot: ({ slotId, selection }) =>
         observeRpcDefects(
-          "UpdateModelSlots",
-          account.updateModelSlots(slots ?? {}).pipe(
-            Effect.mapError((error) => new SessionOperationFailed({
-              operation: "operation" in error ? String(error.operation) : "select local model",
-              reason: "reason" in error ? String(error.reason) : String(error),
-            })),
-            Effect.as({}),
-          ),
+          "UpdateModelSlot",
+          modelSlots.updateModelSlot(slotId, selection).pipe(Effect.as({})),
         ),
 
       GetCloudUsage: (payload) =>
         observeRpcDefects(
           "GetCloudUsage",
-          account.getCloudUsage({
+          cloudUsage.get({
             ...(payload.period !== undefined ? { period: payload.period } : {}),
             ...(payload.days !== undefined ? { days: payload.days } : {}),
             ...(payload.tz !== undefined ? { tz: payload.tz } : {}),
           })
         ),
 
-      GetIcnHardware: () =>
-        observeRpcDefects("GetIcnHardware", hardwareMirror.get),
+      GetLocalInferenceHardware: () =>
+        observeRpcDefects("GetLocalInferenceHardware", localHardware.snapshot),
 
-      GetIcnInventory: () =>
-        observeRpcDefects("GetIcnInventory", inventoryMirror.get),
-
-      GetModelRecipes: () =>
-        observeRpcDefects("GetModelRecipes", recipesMirror.get),
+      GetLocalModelInventory: () =>
+        observeRpcDefects("GetLocalModelInventory", localModels.snapshot),
 
       WatchMirroredStates: () =>
         observeRpcStreamDefects(
@@ -363,57 +333,47 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           withHeartbeat(mirroredStateChanges.stream),
         ),
 
-      DownloadLocalModel: ({ configurationId }) =>
+      DownloadLocalModel: ({ localModelId }) =>
         observeRpcDefects(
           "DownloadLocalModel",
           activity.withActiveWork(
             "local-inference:download",
-            downloadLocalModel(configurationId).pipe(
-              Effect.mapError(localInferenceRpcError),
-              Effect.as({}),
-            ),
+            localModels.download(localModelId).pipe(Effect.as({})),
           ),
         ),
 
-      ActivateLocalModel: ({ modelId }) =>
+      LoadModelSlot: ({ slotId, selection }) =>
         observeRpcDefects(
-          "ActivateLocalModel",
+          "LoadModelSlot",
           activity.withActiveWork(
-            "local-inference:activate",
-            activateLocalModel(modelId).pipe(
-              Effect.mapError(localInferenceRpcError),
-              Effect.as({}),
-            ),
+            "local-inference:load",
+            modelSlots.loadModelSlot(slotId, selection).pipe(Effect.as({})),
           ),
         ),
 
-      DeleteLocalModel: ({ modelId }) =>
+      ReloadModelSlot: ({ slotId }) =>
+        observeRpcDefects(
+          "ReloadModelSlot",
+          activity.withActiveWork(
+            "local-inference:reload",
+            modelSlots.reloadModelSlot(slotId).pipe(Effect.as({})),
+          ),
+        ),
+
+      DeleteLocalModel: ({ localModelId }) =>
         observeRpcDefects(
           "DeleteLocalModel",
-          deleteLocalModel(modelId).pipe(
-            Effect.mapError(localInferenceRpcError),
+          modelSlots.deleteLocalModel(localModelId).pipe(
             Effect.as({}),
           ),
         ),
 
-      RestartLocalInference: () =>
+      UnloadModelSlot: ({ slotId }) =>
         observeRpcDefects(
-          "RestartLocalInference",
+          "UnloadModelSlot",
           activity.withActiveWork(
-            "local-inference:restart",
-            restartLocalInference.pipe(
-              Effect.mapError(localInferenceRpcError),
-              Effect.as({}),
-            ),
-          ),
-        ),
-
-      DisableLocalInference: () =>
-        observeRpcDefects(
-          "DisableLocalInference",
-          disableLocalInference.pipe(
-            Effect.mapError(localInferenceRpcError),
-            Effect.as({}),
+            "local-inference:unload",
+            modelSlots.unloadModelSlot(slotId).pipe(Effect.as({})),
           ),
         ),
 

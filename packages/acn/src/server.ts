@@ -16,7 +16,10 @@ import { HandlersLive } from "./handlers"
 import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
 import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
-import { AccountLive } from "./account"
+import { ProviderModelCatalogLive } from "./provider-model-catalog"
+import { ProviderCredentialsLive } from "./provider-credentials"
+import { ModelSlotCoordinatorLive } from "./model-slot-coordinator"
+import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
 import { ProviderClientRegistryLive, SharedProviderClientLive } from "./shared-client"
 import { ActiveSessionStatusesLive } from "./active-session-statuses"
 import { AcnActivityTrackerLive, AcnRpcCommandActivityLive } from "./activity-tracker"
@@ -27,8 +30,10 @@ import { SessionDestroyerLive } from "./session-destroyer"
 import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
-import { makeLocalModelConfigurationLayer } from "./model-configuration"
-import { makeAcnIcn, makeServingConfigurationReconciliation } from "./icn"
+import { makeModelConfigurationLayer } from "./model-configuration"
+import { makeAcnIcn } from "./icn"
+import { LocalModelInventoryLive } from "./local-model-inventory"
+import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
@@ -169,10 +174,13 @@ const makeAcnServicesBase = (debug: boolean) => {
   const withMirroredStateChanges = Layer.provideMerge(MirroredStateChangesLive, withActivity)
   const localServices = addLocalInferenceServices(withMirroredStateChanges)
   const withSharedClient = Layer.provideMerge(SharedProviderClientLive, localServices)
-  const withAccount = Layer.provideMerge(AccountLive, withSharedClient)
+  const withCatalog = Layer.provideMerge(ProviderModelCatalogLive, withSharedClient)
+  const withCredentials = Layer.provideMerge(ProviderCredentialsLive, withCatalog)
+  const withCloudUsage = Layer.provideMerge(MagnitudeCloudUsageLive, withCredentials)
+  const withModelSlots = Layer.provideMerge(ModelSlotCoordinatorLive, withCloudUsage)
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
-    withAccount,
+    withModelSlots,
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
@@ -182,12 +190,10 @@ const makeAcnServicesBase = (debug: boolean) => {
 
 const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {
   const withIcn = Layer.provideMerge(makeAcnIcn(), base)
-  const withConfiguration = Layer.provideMerge(makeLocalModelConfigurationLayer(), withIcn)
-  const withServingConfiguration = Layer.provideMerge(
-    makeServingConfigurationReconciliation().pipe(Layer.orDie),
-    withConfiguration,
-  )
-  const withOnboarding = Layer.provideMerge(OnboardingLive, withServingConfiguration)
+  const withConfiguration = Layer.provideMerge(makeModelConfigurationLayer(), withIcn)
+  const withHardware = Layer.provideMerge(LocalInferenceHardwareLive, withConfiguration)
+  const withInventory = Layer.provideMerge(LocalModelInventoryLive, withHardware)
+  const withOnboarding = Layer.provideMerge(OnboardingLive, withInventory)
   const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withOnboarding)
   return withProviderClients
 }
@@ -261,5 +267,5 @@ const makeAcnServerLayer = (options: AcnServerOptions, debug: boolean) => {
   )
 }
 
-export const AcnServerLayer = (options: AcnServerOptions = {}): Layer.Layer<never, never, never> =>
+export const AcnServerLayer = (options: AcnServerOptions = {}) =>
   makeAcnServerLayer(options, options.debug === true)

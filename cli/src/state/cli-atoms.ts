@@ -53,3 +53,4 @@ export const autopilotRetainedContentAtom = Atom.make<string | null>(null)
  * selectedFilePathAtom from client-common.
  */
 export const selectedFileSectionAtom = Atom.make<string | undefined>(undefined)
+

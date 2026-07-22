@@ -93,7 +93,7 @@ import { collectSessionContext } from './util/collect-session-context'
 import { AgentModelResolverLive } from './model/model-resolver'
 
 // Config & Auth
-import { ProviderClient, type ProviderClientShape } from '@magnitudedev/sdk'
+import { ProviderClient, SlotIdSchema, type ProviderClientShape } from '@magnitudedev/sdk'
 import type { DisplayViewShape, DisplayViewSnapshot } from '@magnitudedev/protocol'
 import type { ForkTurnState } from './projections/turn'
 import type { AgentLifecycleState } from './projections/agent-lifecycle'
@@ -570,11 +570,9 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           })
         )
 
-      // ──────────────────────────────────────────────────────────────────────
       // Self-heal: monitor turn_outcome events for ProviderNotReady/OutOfSync.
       // When a slot with a user override fails, clear the override and refresh
       // config so the next turn uses the default model. Per spec §9.6.
-      // ──────────────────────────────────────────────────────────────────────
       const selfHeal = Stream.runForEach(engine.events, (event) =>
         Effect.gen(function* () {
           if (event.type !== 'turn_outcome') return
@@ -582,7 +580,6 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           if (outcome._tag !== 'ProviderNotReady') return
           if (outcome.detail._tag !== 'OutOfSync') return
 
-          // Look up the slot for this fork
           const agentState = yield* agentLifecycleProjection.get
           const forkInfo = getForkInfo(agentState, event.forkId)
           if (!forkInfo || !forkInfo.roleId) return
@@ -591,12 +588,9 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           const configState = ambientService.getValue(ConfigAmbient)
           const slotConfig = getSlotConfig(configState, slotId)
           if (!slotConfig || !slotConfig.isUserOverride) return
-          // Local selection is reconciled against runtime/catalog state by ACN.
-          // Never erase local intent and silently cross the cloud boundary.
           if (slotConfig.providerId === 'local') return
 
-          // Clear the stale override and refresh config
-          yield* options.storage.config.updateModelConfig({ [slotId]: {} }).pipe(
+          yield* options.storage.config.updateModelSlot(SlotIdSchema.make(slotId), Option.none()).pipe(
             Effect.catchAll(() =>
               Effect.logWarning(`Self-heal: failed to clear override for slot ${slotId}`)
             ),

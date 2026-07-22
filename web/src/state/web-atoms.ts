@@ -14,13 +14,11 @@ import {
   composerTextAtom,
   composerAttachmentsAtom,
   composerHistoryIndexAtom,
-  apiKeyVerifiedAtom,
   messageHistoryAtom,
   bashModeAtom,
   nextEscWillKillAllAtom,
   composerHasContentAtom,
   pendingUserSubmitAtom,
-  sessionActivationPromiseAtom,
   bashOutputsAtom,
 } from "@magnitudedev/client-common"
 
@@ -33,13 +31,11 @@ export {
   composerTextAtom,
   composerAttachmentsAtom,
   composerHistoryIndexAtom,
-  apiKeyVerifiedAtom,
   messageHistoryAtom,
   bashModeAtom,
   nextEscWillKillAllAtom,
   composerHasContentAtom,
   pendingUserSubmitAtom,
-  sessionActivationPromiseAtom,
   bashOutputsAtom,
 }
 
@@ -49,6 +45,7 @@ export {
  * Sidebar width in pixels.
  */
 export const sidebarWidthAtom = Atom.make(260)
+export const apiKeyVerifiedAtom = Atom.make(false)
 
 /**
  * Sidebar visibility for responsive overlay mode (≤640px).

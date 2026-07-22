@@ -1,4 +1,4 @@
-import type { ModelSummary, ReasoningEffort } from "@magnitudedev/sdk"
+import type { ProviderModelCatalogEntry, ReasoningEffort } from "@magnitudedev/sdk"
 
 export interface ReasoningEffortOption {
   readonly value: ReasoningEffort
@@ -15,42 +15,19 @@ export function formatReasoningEffort(effort: ReasoningEffort): string {
     .replace(/\b\w/g, (character) => character.toUpperCase())
 }
 
-export function reasoningEffortControl(model: ModelSummary): ReasoningEffortControl {
-  const property = model.properties.reasoning
-  switch (property._tag) {
-    case "Cached":
-    case "Resolved":
-    case "Refreshing":
-      return {
+export function reasoningEffortControl(model: ProviderModelCatalogEntry): ReasoningEffortControl {
+  return model.capabilities.reasoning.supported
+    ? {
         _tag: "Available",
-        options: property.value.map((value) => ({ value, label: formatReasoningEffort(value) })),
+        options: model.capabilities.reasoning.efforts.map((value) => ({ value, label: formatReasoningEffort(value) })),
       }
-    case "Deferred": return { _tag: "Unavailable", label: "Load to inspect" }
-    case "Discovering": return { _tag: "Unavailable", label: property.phase === "loading" ? "Loading…" : "Inspecting…" }
-    case "Failed": return { _tag: "Unavailable", label: "Inspection failed" }
-  }
+    : { _tag: "Unavailable", label: "Reasoning not supported" }
 }
 
-export function reasoningPropertyLabel(model: ModelSummary): string {
-  const property = model.properties.reasoning
-  switch (property._tag) {
-    case "Deferred": return "Reasoning options available after loading"
-    case "Discovering": return property.phase === "loading" ? "Loading to discover reasoning options" : "Inspecting reasoning options"
-    case "Cached": return "Reasoning options cached; they will be verified when used"
-    case "Resolved": return "Reasoning options verified"
-    case "Refreshing": return "Refreshing reasoning options; cached options remain available"
-    case "Failed": return `Reasoning discovery failed: ${property.error.message}`
-  }
+export function reasoningPropertyLabel(model: ProviderModelCatalogEntry): string {
+  return model.capabilities.reasoning.supported ? "Reasoning supported" : "Reasoning not supported"
 }
 
-export function visionPropertyLabel(model: ModelSummary): string {
-  const property = model.properties.vision
-  switch (property._tag) {
-    case "Deferred": return "Vision capability available after loading"
-    case "Discovering": return property.phase === "loading" ? "Loading to discover vision capability" : "Inspecting vision capability"
-    case "Cached": return property.value ? "Vision supported (cached)" : "Vision not supported (cached)"
-    case "Resolved": return property.value ? "Vision supported" : "Vision not supported"
-    case "Refreshing": return property.value ? "Vision supported (refreshing)" : "Vision not supported (refreshing)"
-    case "Failed": return `Vision discovery failed: ${property.error.message}`
-  }
+export function visionPropertyLabel(model: ProviderModelCatalogEntry): string {
+  return model.capabilities.vision ? "Vision supported" : "Vision not supported"
 }

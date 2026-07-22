@@ -1,4 +1,6 @@
-import type { ProviderCatalogFailure } from '@magnitudedev/sdk'
+import { ProviderIdSchema, type ProviderCatalogFailure } from '@magnitudedev/sdk'
+
+const MAGNITUDE_PROVIDER_ID = ProviderIdSchema.make('magnitude')
 
 export interface CatalogFailureNotice {
   readonly message: string
@@ -6,7 +8,8 @@ export interface CatalogFailureNotice {
 }
 
 const isMissingCloudAuthentication = (failure: ProviderCatalogFailure): boolean =>
-  failure.providerId === 'magnitude'
+  failure._tag === 'ProviderFailure'
+  && failure.providerId === MAGNITUDE_PROVIDER_ID
   && failure.message === 'Magnitude authentication is not configured'
 
 export function getCatalogFailureNotice(

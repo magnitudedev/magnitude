@@ -1,5 +1,5 @@
 import { Schema } from 'effect'
-import { ReasoningEffortSchema } from '@magnitudedev/ai'
+import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/ai'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {
@@ -23,7 +23,7 @@ export interface ContextLimitPolicy extends Omit<Schema.Schema.Type<typeof Conte
  * from @magnitudedev/roles. Kept in sync with
  * `packages/roles/src/types.ts`.
  */
-export const SlotIdSchema = Schema.Literal('primary', 'secondary')
+export const SlotIdSchema = Schema.Literal('primary', 'secondary').pipe(Schema.brand('SlotId'))
 export type SlotId = Schema.Schema.Type<typeof SlotIdSchema>
 
 /**
@@ -31,19 +31,23 @@ export type SlotId = Schema.Schema.Type<typeof SlotIdSchema>
  * Kept in sync with `packages/providers/src/magnitude/contract.ts`.
  */
 export const SlotModelConfigSchema = Schema.Struct({
-  providerId: Schema.optional(Schema.String),
-  providerModelId: Schema.optional(Schema.String),
-  reasoningEffort: Schema.optional(ReasoningEffortSchema),
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
+  reasoningEffort: ReasoningEffortSchema,
 })
 export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
 
 export const ModelConfigSchema = Schema.Struct({
-  slots: Schema.optional(
-    Schema.partial(Schema.Record({ key: SlotIdSchema, value: SlotModelConfigSchema }))
-  ),
-  localSlotIntent: Schema.optional(
-    Schema.partial(Schema.Record({ key: SlotIdSchema, value: Schema.Literal('local', 'cloud') }))
-  ),
+  slots: Schema.Struct({
+    primary: Schema.optionalWith(SlotModelConfigSchema, { as: 'Option', exact: true }),
+    secondary: Schema.optionalWith(SlotModelConfigSchema, { as: 'Option', exact: true }),
+  }),
+  localModelRecency: Schema.optionalWith(Schema.Struct({
+    primary: Schema.Array(ProviderModelIdSchema),
+    secondary: Schema.Array(ProviderModelIdSchema),
+  }), {
+    default: () => ({ primary: [], secondary: [] }),
+  }),
 })
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 
@@ -63,24 +67,10 @@ export const OnboardingConfigSchema = Schema.Struct({
 })
 export type OnboardingConfig = Schema.Schema.Type<typeof OnboardingConfigSchema>
 
-export const SelectedLocalModelProfileSchema = Schema.Struct({
-  configurationId: Schema.String,
-  catalogModelId: Schema.String,
-  contextTokens: Schema.Number.pipe(Schema.int(), Schema.positive()),
-  providerModelId: Schema.optional(Schema.String),
-})
-export type SelectedLocalModelProfile = Schema.Schema.Type<typeof SelectedLocalModelProfileSchema>
-
-export const LocalInferenceConfigSchema = Schema.Struct({
-  selectedProfile: Schema.optional(SelectedLocalModelProfileSchema),
-})
-export type LocalInferenceConfig = Schema.Schema.Type<typeof LocalInferenceConfigSchema>
-
 export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   models: Schema.optional(ModelConfigSchema),
   onboarding: Schema.optional(OnboardingConfigSchema),
-  localInference: Schema.optional(LocalInferenceConfigSchema),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

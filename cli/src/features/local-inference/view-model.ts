@@ -1,47 +1,44 @@
-import type {
-  LocalInferenceHostProfile,
-  LocalInferenceState,
-  LocalModelChoice,
-  LocalModelRecommendation,
-} from "@magnitudedev/client-common"
 import { Option } from "effect"
+import {
+  ProviderIdSchema,
+  type LocalModelId,
+  type LocalInferenceHardware,
+  type LocalInferenceMemoryDomainId,
+  type LocalModelInventoryEntry,
+} from "@magnitudedev/sdk"
+import type { LocalInferenceView } from "@magnitudedev/client-common"
 
-export type LocalInferenceSelection =
-  | { readonly kind: "running" | "stored"; readonly id: string; readonly choice: LocalModelChoice }
-  | { readonly kind: "recommendation"; readonly id: string; readonly recommendation: LocalModelRecommendation }
+const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
+
+export type LocalInferenceSelection = {
+  readonly kind: "running" | "stored" | "recommendation"
+  readonly entry: LocalModelInventoryEntry
+}
 
 export const buildLocalInferenceSelections = (
-  state: LocalInferenceState,
-): LocalInferenceSelection[] => {
-  const choices = state.choices
-    .filter((choice) => choice.availability._tag === "Available")
-    .map((choice): LocalInferenceSelection => ({
-      kind: choice._tag === "Running" ? "running" : "stored",
-      id: choice.choiceId,
-      choice,
-    }))
-  const recommendations = state.recommendationState._tag === "Ready"
-    ? state.recommendationState.recommendations
-    : []
-  return [
-    ...choices,
-    ...recommendations
-      .filter((recommendation) => Option.isNone(recommendation.modelId))
-      .map((recommendation): LocalInferenceSelection => ({
-        kind: "recommendation",
-        id: recommendation.configurationId,
-        recommendation,
-      })),
-  ]
+  view: LocalInferenceView,
+): readonly LocalInferenceSelection[] => {
+  if (view.inventory._tag !== "Ready") return []
+  const running = new Set([view.slots.slots.primary, view.slots.slots.secondary].flatMap((slot) =>
+    slot._tag === "Ready" && slot.selection.providerId === LOCAL_PROVIDER_ID
+      ? [slot.selection.providerModelId]
+      : []))
+  return view.inventory.entries.map((entry) => ({
+    kind: entry._tag === "Downloaded"
+      ? running.has(entry.model.providerModelId) ? "running" : "stored"
+      : "recommendation",
+    entry,
+  }))
 }
 
 export const selectedInferenceIndex = (
   selections: readonly LocalInferenceSelection[],
-  selectedId: string | null,
+  selectedId: Option.Option<LocalModelId>,
 ): number => {
-  const index = selectedId === null
-    ? -1
-    : selections.findIndex((selection) => selection.id === selectedId)
+  const index = Option.match(selectedId, {
+    onNone: () => -1,
+    onSome: (id) => selections.findIndex(({ entry }) => entry.model.localModelId === id),
+  })
   return index >= 0 ? index : 0
 }
 
@@ -57,101 +54,53 @@ export const formatContext = (tokens: number): string => tokens < 1_000
     : `${Math.round(tokens / 1_000)}K`
 
 export interface LocalHardwarePresentation {
-  readonly system: {
-    readonly name: string
-    readonly details: readonly string[]
-  }
-  readonly accelerators: readonly {
-    readonly name: string
-    readonly details: string
-  }[]
-}
-
-const platformLabel = (platform: string): string => {
-  if (platform === "darwin" || platform === "macos") return "macOS"
-  if (platform === "linux") return "Linux"
-  if (platform === "win32") return "Windows"
-  return platform
-}
-
-const architectureLabel = (architecture: string): string => {
-  if (architecture === "arm64" || architecture === "aarch64") return "ARM64"
-  if (architecture === "x64" || architecture === "x86_64") return "x86-64"
-  return architecture
+  readonly system: { readonly name: string; readonly details: readonly string[] }
+  readonly accelerators: readonly { readonly name: string; readonly details: string }[]
 }
 
 const unique = (values: readonly string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))]
 
-const accelerationLabel = (backends: readonly string[]): string =>
-  unique(backends).length > 0
-    ? `${unique(backends).join(" + ")} GPU acceleration`
-    : "GPU acceleration"
-
 export const describeLocalHardware = (
-  host: LocalInferenceHostProfile,
+  hardware: LocalInferenceHardware,
 ): LocalHardwarePresentation => {
-  const accelerators = host.memoryDomains.filter((domain) => domain.kind !== "system")
-  const unified = accelerators.filter((domain) =>
-    domain.kind === "unified_memory" && domain.sharesSystemMemory
-  )
-  const discrete = accelerators.filter((domain) => domain.kind === "physical_device")
-  const applePlatform = host.platform === "darwin" || host.platform === "macos"
-  const appleArchitecture = host.architecture === "arm64" || host.architecture === "aarch64"
-  const appleSilicon = applePlatform && appleArchitecture
-  const hasUnifiedMemory = unified.length > 0
-  const systemName = host.cpuModel?.trim() || (
-    appleSilicon
-      ? "Apple Silicon"
-      : "CPU"
-  )
-  const systemDetails = [
-    `${platformLabel(host.platform)} · ${appleSilicon ? "Apple Silicon" : architectureLabel(host.architecture)} · ${host.logicalCores} logical CPU core${host.logicalCores === 1 ? "" : "s"}`,
-    `${formatBytes(host.systemMemoryBytes)} ${hasUnifiedMemory ? "unified" : "system"} memory${hasUnifiedMemory ? ` · ${accelerationLabel(unified.flatMap((domain) => domain.backendNames))}` : ""}`,
-  ]
-
+  const unified = hardware.memoryDomains.filter((domain) =>
+    domain.kind === "UnifiedMemory" && domain.sharesSystemMemory)
+  const discrete = hardware.memoryDomains.filter((domain) => domain.kind === "PhysicalDevice")
+  const name = Option.getOrElse(hardware.processor, () =>
+    hardware.platform === "MacOS" && hardware.architecture === "Arm64" ? "Apple Silicon" : "CPU")
+  const backendsFor = (memoryDomainId: LocalInferenceMemoryDomainId) => unique(hardware.accelerators
+    .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
+    .map((accelerator) => accelerator.backend))
+  const namesFor = (memoryDomainId: LocalInferenceMemoryDomainId) => unique(hardware.accelerators
+    .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
+    .map((accelerator) => accelerator.name))
+  const unifiedBackends = unique(unified.flatMap((domain) => backendsFor(domain.memoryDomainId)))
   return {
-    system: { name: systemName, details: systemDetails },
+    system: {
+      name,
+      details: [
+        `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
+        `${formatBytes(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
+      ],
+    },
     accelerators: discrete.map((domain) => {
-      const names = unique(domain.deviceNames)
-      const backends = unique(domain.backendNames)
-      const name = names.length > 0
-        ? names.join(" + ")
-        : `${backends[0] ?? "Local"} GPU`
+      const names = namesFor(domain.memoryDomainId)
+      const backends = backendsFor(domain.memoryDomainId)
       return {
-        name,
-        details: `${formatBytes(domain.totalCapacityBytes)} VRAM · ${accelerationLabel(backends)}`,
+        name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
+        details: `${formatBytes(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
       }
     }),
   }
 }
 
-export const selectionTitle = (selection: LocalInferenceSelection): string =>
-  selection.kind === "recommendation" ? selection.recommendation.displayName : selection.choice.displayName
+export const selectionTitle = ({ entry }: LocalInferenceSelection): string => entry.model.displayName
 
-export const selectionMetadata = (selection: LocalInferenceSelection): string => {
-  const quantization = selection.kind === "recommendation"
-    ? selection.recommendation.quantization.format
-    : Option.getOrElse(Option.map(selection.choice.quantization, (value) => value.format), () => "Quantization unavailable")
-  const size = selection.kind === "recommendation"
-    ? formatBytes(selection.recommendation.totalDownloadBytes)
-    : Option.match(selection.choice.sizeBytes, { onNone: () => "Size unavailable", onSome: formatBytes })
-  const context = selection.kind === "recommendation"
-    ? `${formatContext(selection.recommendation.contextTokens)} context`
-    : Option.match(selection.choice.contextTokens, {
-        onNone: () => "Context unavailable",
-        onSome: (tokens) => `${formatContext(tokens)} context`,
-      })
-  return `${quantization} · ${size} · ${context}`
-}
+export const selectionMetadata = ({ entry }: LocalInferenceSelection): string =>
+  `${entry.model.quantization} · ${formatBytes(entry.model.downloadBytes)} · ${formatContext(entry.model.contextWindow)} context`
 
-export const selectionCapacityWarning = (selection: LocalInferenceSelection): string | null => {
-  if (selection.kind === "recommendation") return null
-  const fit = selection.choice.fitAssessment
-  if (fit._tag !== "Assessed" || fit.result !== "does_not_fit") return null
-  const constrained = fit.domains.filter(({ marginBytes }) => marginBytes < 0)
-  const capacity = constrained.reduce((total, domain) => total + domain.stableCapacityBytes, 0)
-  return capacity > 0
-    ? `Memory warning: estimated ${formatBytes(fit.requiredTotalBytes)}; constrained hardware capacity ${formatBytes(capacity)}. Loading may fail or affect system performance.`
-    : `Memory warning: estimated ${formatBytes(fit.requiredTotalBytes)} may exceed this machine's stable capacity.`
-}
+export const selectionCapacityWarning = ({ entry }: LocalInferenceSelection): string | null =>
+  entry.model.fit._tag === "DoesNotFit"
+    ? `Memory warning: estimated ${formatBytes(entry.model.fit.requiredBytes)}; constrained hardware capacity ${formatBytes(entry.model.fit.availableBytes)}. Loading may fail or affect system performance.`
+    : null

@@ -9,7 +9,11 @@ import { useState, useCallback, type ReactNode } from "react"
 import { Loader2, ArrowRight } from "lucide-react"
 import { Option } from "effect"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
-import { useAgentClient, apiKeyVerifiedAtom } from "@magnitudedev/client-common"
+import { useAgentClient } from "@magnitudedev/client-common"
+import { ProviderIdSchema } from "@magnitudedev/sdk"
+import { apiKeyVerifiedAtom } from "../state/web-atoms"
+
+const MAGNITUDE_PROVIDER_ID = ProviderIdSchema.make("magnitude")
 
 export function LoginScreen(): ReactNode {
   const client = useAgentClient()
@@ -29,7 +33,7 @@ export function LoginScreen(): ReactNode {
     setSubmitting(true)
     setError(null)
     try {
-      await updateProviderAuth({ payload: { providerId: "magnitude", auth: { type: "api", key: trimmed } } })
+      await updateProviderAuth({ payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: trimmed } } })
       setVerified(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to connect. Please check your key.")

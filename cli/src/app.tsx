@@ -28,7 +28,7 @@ import {
   useFileWatchBridge,
   useLocalInferenceQuery,
 } from '@magnitudedev/client-common'
-import { ModelSlotsLifecycle, type SessionOptions } from '@magnitudedev/sdk'
+import { PRIMARY_SLOT_ID, type SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
 import { useSessionStartup, type SessionStart } from './hooks/use-session-startup'
 import { useTerminalBgDetection } from './hooks/use-terminal-bg-detection'
@@ -49,13 +49,12 @@ import { ComposerContainer } from './features/composer/container'
 import { WorkingTimerContainer, TaskListContainer } from './features/agent-status/container'
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
-import { LocalRuntimeStatusBar } from './features/local-inference/status-bar'
+import { LocalInferenceStatusBar } from './features/local-inference/status-bar'
 import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/sessions/container'
 import {
   ModelSetupScreen,
   PreparingModelSetupScreen,
 } from './features/model-setup'
-import { blockingModelSlotsFailure } from './features/model-setup/model-slots-gate'
 import { registerCliCommands } from './commands/register'
 
 registerCliCommands()
@@ -178,25 +177,8 @@ function OnboardingGate(
     return <PreparingModelSetupScreen />
   }
 
-  const slotsState = slotsSnapshot.value.state
-  if (ModelSlotsLifecycle.is(slotsState, 'loading')) {
-    return <PreparingModelSetupScreen />
-  }
-
-  if (ModelSlotsLifecycle.is(slotsState, 'unavailable')) {
-    const blockingFailure = blockingModelSlotsFailure(slotsState)
-    if (blockingFailure) {
-      return (
-        <FatalErrorScreen
-          error={`Failed to load model configuration: ${blockingFailure}`}
-          onRetry={retryProfiles}
-          onQuit={props.onExitApp}
-        />
-      )
-    }
-  }
-
-  const modelsConfigured = Boolean(profiles?.primary)
+  const primary = slotsSnapshot.value.state.slots.primary
+  const modelsConfigured = primary.slotId === PRIMARY_SLOT_ID && primary._tag !== 'Unassigned'
 
   return (
     <CliAppContent
@@ -286,7 +268,7 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
         >
           <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
             {Option.getOrNull(Option.map(localInferenceSnapshot, (snapshot) => (
-              <LocalRuntimeStatusBar
+              <LocalInferenceStatusBar
                 state={snapshot}
                 width={chatColumnWidth}
                 onOpenHardware={() => setSettingsOpen(true)}

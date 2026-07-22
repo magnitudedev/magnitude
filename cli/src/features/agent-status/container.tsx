@@ -10,8 +10,10 @@ import {
   getFork,
   useSlotProfiles,
   useDisplayViewController,
+  findSlotProfile,
 } from '@magnitudedev/client-common'
-import { ROLE_TO_SLOT } from '@magnitudedev/sdk'
+import { PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID } from '@magnitudedev/sdk'
+import { Option } from 'effect'
 import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
 import { WorkingTimer } from './working-timer'
 import { TaskList } from './task-list'
@@ -37,11 +39,15 @@ export function WorkingTimerContainer(): ReactNode {
 
   // Map advisor role to its slot (primary) for model display
   const advisorSlot = ROLE_TO_SLOT.advisor
+  const advisorSlotId = advisorSlot === 'primary' ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
+  const advisorProfile = profiles
+    ? Option.getOrNull(findSlotProfile(profiles, advisorSlotId))
+    : null
   return (
     <WorkingTimer
       work={rootActor?.work ?? null}
       interruptedMessage={interrupted}
-      advisorModelName={profiles?.[advisorSlot]?.modelDisplayName ?? null}
+      advisorModelName={advisorProfile?.modelDisplayName ?? null}
     />
   )
 }

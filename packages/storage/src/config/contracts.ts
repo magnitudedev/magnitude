@@ -1,9 +1,9 @@
 import type { PlatformError } from '@effect/platform/Error'
-import { Context, Effect } from 'effect'
+import { Context, Effect, Option } from 'effect'
 
 import type { JsonError } from '../io/storage'
 import type { ResolvedContextLimitPolicy } from '../types/config'
-import type { ContextLimitPolicy, LocalInferenceConfig, MagnitudeConfig, ModelConfig, OnboardingConfig, OnboardingFlowId, SlotId, SlotModelConfig } from '../types'
+import type { ContextLimitPolicy, MagnitudeConfig, OnboardingConfig, OnboardingFlowId, SlotId, SlotModelConfig } from '../types'
 
 export interface ConfigStorageShape {
   readonly load: () => Effect.Effect<MagnitudeConfig, PlatformError | JsonError>
@@ -17,13 +17,12 @@ export interface ConfigStorageShape {
     policy: ContextLimitPolicy
   ) => Effect.Effect<void, PlatformError | JsonError>
 
-  readonly getModelConfig: () => Effect.Effect<ModelConfig | null, PlatformError | JsonError>
-  readonly updateModelConfig: (
-    slots: Partial<Record<SlotId, SlotModelConfig>>
+  readonly updateModelSlot: (
+    slotId: SlotId,
+    selection: Option.Option<SlotModelConfig>,
   ) => Effect.Effect<void, PlatformError | JsonError>
 
   readonly getOnboardingConfig: () => Effect.Effect<OnboardingConfig | null, PlatformError | JsonError>
-  readonly getLocalInferenceConfig: () => Effect.Effect<LocalInferenceConfig | null, PlatformError | JsonError>
   readonly completeOnboardingFlow: (
     flowId: OnboardingFlowId,
     version: number,

@@ -1,5 +1,5 @@
 import { Context, Effect, Layer } from 'effect'
-import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
+import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, SlotIdSchema, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import type { RoleId } from '../agents/role-validation'
 import { ConfigAmbient, getSlotConfig, getSlotConfigForRole, type SlotConfig } from '../ambient/config-ambient'
@@ -67,15 +67,16 @@ export const AgentModelResolverLive = (
 
           const providerId = ProviderIdSchema.make(slotConfig.providerId)
           const providerModelId = ProviderModelIdSchema.make(slotConfig.providerModelId)
+          const slotId = SlotIdSchema.make(slotConfig.slotId)
           const rawModel = yield* client.resolveModel(providerId, providerModelId, {
             defaults,
             requestAttribution: client.requestAttribution(
               providerId,
               providerModelId,
-              slotConfig.slotId,
+              slotId,
             ),
             reasoningEffortFallback: (requested, fallback) => applyReasoningEffortFallback({
-              slotId: slotConfig.slotId,
+              slotId,
               providerId,
               providerModelId,
               requested,

@@ -74,3 +74,4 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
 }
 
 export { formatMemoryBytes }
+

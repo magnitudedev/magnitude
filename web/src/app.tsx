@@ -42,7 +42,6 @@ import {
   selectedFilePathAtom,
   settingsOpenAtom,
   usageOpenAtom,
-  apiKeyVerifiedAtom,
   bashModeAtom,
   nextEscWillKillAllAtom,
 } from "@magnitudedev/client-common"
@@ -50,6 +49,7 @@ import {
   sidebarSearchAtom,
   sidebarCwdFilterAtom,
   sidebarVisibleAtom,
+  apiKeyVerifiedAtom,
 } from "./state/web-atoms"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
@@ -62,9 +62,15 @@ import {
   useSlotProfiles,
   useModelConfig,
   findSlotProfile,
+  type SlotProfile,
+  type SlotProfiles,
 } from "@magnitudedev/client-common"
 import {
+  isRoleId,
+  PRIMARY_SLOT_ID,
+  ProviderIdSchema,
   ROLE_TO_SLOT,
+  SECONDARY_SLOT_ID,
   SLOT_DISPLAY_NAMES,
   SLOT_DESCRIPTIONS,
 } from "@magnitudedev/sdk"
@@ -73,8 +79,6 @@ import type {
   DisplayActor,
   ListSessionsResult,
   ReadFileResult,
-  SlotProfile,
-  SlotProfiles,
   SessionCwdSummary,
   SessionMetadata,
   UsagePeriod,
@@ -82,6 +86,7 @@ import type {
 import type { SlotId, ProviderAuth } from "@magnitudedev/sdk"
 
 const SESSION_PAGE_SIZE = 50
+const MAGNITUDE_PROVIDER_ID = ProviderIdSchema.make("magnitude")
 
 type SessionPageState = {
   sessions: SessionMetadata[]
@@ -117,10 +122,9 @@ function findSlotProfileForRole(
   profiles: SlotProfiles | null,
   role: string | null | undefined,
 ): SlotProfile | null {
-  if (!profiles || !role) return null
-  const slotId = ROLE_TO_SLOT[role as keyof typeof ROLE_TO_SLOT] ?? null
-  if (!slotId) return null
-  return findSlotProfile(profiles, slotId)
+  if (!profiles || !role || !isRoleId(role)) return null
+  const slotId = ROLE_TO_SLOT[role] === "primary" ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
+  return Option.getOrNull(findSlotProfile(profiles, slotId))
 }
 
 function useRootSlotProfile(
@@ -231,7 +235,7 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
   const sessionsLoading = Result.isInitial(firstPageResult) && sessionPage.sessions.length === 0
   const sessions = sessionPage.sessions
   const apiKeyResult = useAtomValue(
-    client.query("GetProviderAuth", { providerId: "magnitude" }, { reactivityKeys: ["apiKey"] }),
+    client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
   )
   const accountState = Result.match(apiKeyResult, {
     onInitial: () => ({ label: "Account", subLabel: null as string | null }),
@@ -458,7 +462,7 @@ function SettingsPanelContainer({
 
   // ── API key state ──
   const apiKeyResult = useAtomValue(
-    client.query("GetProviderAuth", { providerId: "magnitude" }, { reactivityKeys: ["apiKey"] }),
+    client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
   )
   const apiKeyState: ApiKeyState = Result.match(apiKeyResult, {
     onInitial: () => ({ status: "none" } as ApiKeyState),
@@ -479,24 +483,24 @@ function SettingsPanelContainer({
     { mode: "promise" },
   )
   const handleSave = async (key: string) => {
-    await updateProviderAuth({ payload: { providerId: "magnitude", auth: { type: "api", key } }, reactivityKeys: ["apiKey"] })
+    await updateProviderAuth({ payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key } }, reactivityKeys: ["apiKey"] })
   }
   const handleDisconnect = async () => {
-    await updateProviderAuth({ payload: { providerId: "magnitude", auth: { type: "api", key: "" } }, reactivityKeys: ["apiKey"] })
+    await updateProviderAuth({ payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: "" } }, reactivityKeys: ["apiKey"] })
     setApiKeyVerified(false)
   }
 
   // ── Slots ──
   const slots = useMemo(() => {
     return ([
-      "primary",
+      PRIMARY_SLOT_ID,
       // "secondary", // Secondary model settings are temporarily hidden.
     ] as const).map((slotId) => ({
       slotId,
-      label: SLOT_DISPLAY_NAMES[slotId],
-      description: SLOT_DESCRIPTIONS[slotId],
-      modelDisplayName: slotProfiles?.[slotId]?.modelDisplayName ?? "—",
-      contextWindow: slotProfiles?.[slotId]?.contextWindow ?? null,
+      label: SLOT_DISPLAY_NAMES.primary,
+      description: SLOT_DESCRIPTIONS.primary,
+      modelDisplayName: slotProfiles?.primary?.modelDisplayName ?? "—",
+      contextWindow: slotProfiles?.primary?.contextWindow ?? null,
     }))
   }, [slotProfiles])
 
@@ -785,7 +789,7 @@ function AppInner(): ReactNode {
   // (after the user submits a key). Here we gate purely on the query result.
   const client = useAgentClient()
   const apiKeyResult = useAtomValue(
-    client.query("GetProviderAuth", { providerId: "magnitude" }, { reactivityKeys: ["apiKey"] }),
+    client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
   )
 
   // Distinguish loading from failure:

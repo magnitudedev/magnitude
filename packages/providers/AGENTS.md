@@ -12,10 +12,11 @@ Provider system spans three packages:
 `BaseCallOptions`: `maxTokens`, `toolChoice`, `reasoningEffort`, `generateToolCallId`. Provider-specific options are baked at `bindModel` time via `wrapAsBaseModel` — consumers only see `BoundModel<BaseCallOptions>`.
 
 Catalog eligibility is provider-specific. Hosted catalogs may exclude models
-they do not support. The local provider is owned by `@magnitudedev/icn`: it
-adapts ICN inventory and acquisition into the provider contract without routing
-those responsibilities through ACN or this package. Unavailable local models
-remain visible with a typed disabled reason.
+they do not support. The ICN binding adapter is owned by `@magnitudedev/icn`,
+but it does not publish the product's selectable local catalog. ACN derives
+local provider catalog entries exclusively from downloaded product
+`LocalModelInventory` entries and may retain non-selectable entries with a
+typed disabled reason.
 
 ## Model Family Classification
 
@@ -31,7 +32,7 @@ Rules:
 
 ## New Provider Steps
 
-Hosted providers generally use files under `packages/providers/src/<name>/`: `contract.ts`, `catalog.ts`, `models.ts`, `errors.ts`, `provider.ts`, `index.ts`. The ICN runtime provider belongs in `packages/icn/src/provider/`, beside the inventory and lifecycle services it adapts.
+Hosted providers generally use files under `packages/providers/src/<name>/`: `contract.ts`, `catalog.ts`, `models.ts`, `errors.ts`, `provider.ts`, `index.ts`. The ICN inference adapter belongs in `packages/icn/src/provider/`, beside the private inventory and lifecycle services it binds.
 
 1. `contract.ts` — Effect Schema-derived serializable model info, option types, and error shapes. The local model is transport-independent; ICN runtime facts remain owned by ICN services.
 2. `catalog.ts` — `ModelCatalog<TModel>`: fetch endpoint, classify with `classifyModelFamily`, filter unclassified, TTL cache. Use `makeFileBackedModelCatalog` for cross-process cache.

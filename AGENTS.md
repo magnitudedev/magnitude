@@ -101,3 +101,47 @@ When working with client-side state (CLI, web, or client-common), read `packages
 ## Effect Language Service
 
 Use `bun els overview --file <path>` to list Effect exports (services, layers, errors) and `bun els layerinfo --file <path>` for layer dependency info. Example: `bun els overview --file packages/agent/src/index.ts`.
+
+# Engineering invariants
+
+## Principles
+
+The following general engineering principles should always be followed.
+
+### Form meaningful abstractions
+
+The only way to produce sustainable and understandable long-term code is to choose and maintain the correct abstractions.
+This does not mean creating indirection or unnecessary abstractions. It means identify the key behaviors of the system, the pieces at play, and the optimal way in which those compose into clean abstractions that also follow code patterns and architecture idiomatically.
+
+### Do not overengineer / no patchwork code
+
+Do not engineer for cases that will not happen. Do not add complex solutions for problems that are solvable by stepping back and addressing the root problem precisely. Be wary of tacking on changes to other imperfect changes, as this is a clear indication of patchwork code. Be self-aware in such scenarios and refactor to cleaner and more meaningful abstractions.
+
+### No unnecessary backwards compatibility
+
+Unless the user explicitly asked for it, do not add backwards compatibility shims or retain "legacy" code. Such code is unnecessary and will only pollute the codebase unless it is part of an explicitly user-designed, justified mechanism.
+
+## Effect usage
+
+This codebase is Effect-TS native.
+- New code must be Effect-TS native
+- Any TS code that touches effect code must remain or become effectful
+- Code may be freely effectified, and never the opposite
+
+### Effect patterns
+
+Follow established Effect conventions in the project, while referring to the following when relevant.
+
+#### Effect DI
+
+Always use the effect DI system where appropraite. Break abstractions into services.
+Services should be a Context.Tag, with an interface of the same name as the tag.
+
+### Effect Schemas
+
+For any data that must be serializable, introspected, or validated, it must be represented as an Effect Schema.
+Any optional values must use `Schema.optionalWith(Schema.String, { as: 'Option', exact: true })` to ensure that (1) these values serialize to exactly existing or not existing (`undefined` is not serializable) and (2) so that the idiomatic Option is used in the decoded side.
+
+### Branded types
+
+Use Effect branded types for any string values that have semantic attribution to a particular type of ID or other value.

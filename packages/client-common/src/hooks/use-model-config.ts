@@ -1,106 +1,113 @@
-/**
- * Model config hook — shared between web, desktop, and CLI.
- *
- * Composes the independent mirrored model-catalog and model-slot state.
- */
 import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
+import {
+  ModelSlotsMirror,
+  PRIMARY_SLOT_ID,
+  ProviderModelCatalogLifecycle,
+  ProviderModelCatalogMirror,
+  ReasoningEffortSchema,
+  SECONDARY_SLOT_ID,
+  type ModelSlotsState,
+  type ProviderId,
+  type ProviderModelId,
+  type ReasoningEffort,
+  type SlotId,
+  type SlotSelection,
+} from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { ModelCatalogMirror, ModelSlotsLifecycle, ModelSlotsMirror, type SlotId } from "@magnitudedev/sdk"
 import { useMirroredState } from "./use-mirrored-state"
+
+const selectionAt = (state: ModelSlotsState, slotId: SlotId): Option.Option<SlotSelection> => {
+  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
+  return slot._tag === "Unassigned" ? Option.none() : Option.some(slot.selection)
+}
 
 export function useModelConfig() {
   const client = useAgentClient()
-  const catalogResult = useMirroredState(ModelCatalogMirror)
-  const slotsResult = useMirroredState(ModelSlotsMirror)
+  const catalog = useMirroredState(ProviderModelCatalogMirror)
+  const slots = useMirroredState(ModelSlotsMirror)
+  const updateAtom = useMemo(() => client.mutation("UpdateModelSlot"), [client])
+  const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
+  const slotUpdate = useAtomValue(updateAtom)
+  const catalogRefresh = useAtomValue(refreshAtom)
+  const update = useAtomSet(updateAtom)
+  const refresh = useAtomSet(refreshAtom)
 
-  const slotConfiguration = Option.flatMap(Result.value(slotsResult), ({ state }) => ModelSlotsLifecycle.match(state, {
-    loading: () => Option.none(),
-    ready: ({ config }) => Option.some(config),
-    refreshing: ({ config }) => Option.some(config),
-    degraded: ({ config }) => Option.some(config),
-    unavailable: ({ config }) => Option.some(config),
+  const selections = Option.map(Result.value(slots), ({ state }) => ({
+    primary: selectionAt(state, PRIMARY_SLOT_ID),
+    secondary: selectionAt(state, SECONDARY_SLOT_ID),
   }))
 
-  // ── Mutations ──
+  const catalogModels = Option.flatMap(Result.value(catalog), ({ state }) =>
+    ProviderModelCatalogLifecycle.match(state, {
+      Loading: () => Option.none(),
+      Ready: ({ models }) => Option.some(models),
+      Refreshing: ({ models }) => Option.some(models),
+      Degraded: ({ models }) => Option.some(models),
+      Unavailable: () => Option.none(),
+    }))
 
-  const updateConfigAtom = useMemo(() => client.mutation("UpdateModelSlots"), [client])
-  const refreshMutationAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
-  const updateConfigResult = useAtomValue(updateConfigAtom)
-  const refreshMutationResult = useAtomValue(refreshMutationAtom)
-  const updateConfig = useAtomSet(updateConfigAtom)
-  const refreshMutation = useAtomSet(refreshMutationAtom)
+  const commit = useMemo(() => (
+    slotId: SlotId,
+    selection: Option.Option<SlotSelection>,
+  ): void => update({
+    payload: { slotId, selection },
+    reactivityKeys: [ModelSlotsMirror.id],
+  }), [update])
 
-  const updateSlotModel = useMemo(
-    () => (slotId: SlotId, providerId: string | null, providerModelId: string | null): void => {
-      const current = Option.flatMap(slotConfiguration, (config) => Option.fromNullable(config.slots[slotId]))
-      updateConfig({
-        payload: {
-          slots: {
-            [slotId]: {
-              providerId: providerId ?? undefined,
-              providerModelId: providerModelId ?? undefined,
-              reasoningEffort: Option.getOrUndefined(Option.map(current, (entry) => entry.reasoningEffort)),
-            },
-          },
-        },
-        reactivityKeys: [ModelSlotsMirror.id],
-      })
-    },
-    [updateConfig, slotConfiguration],
-  )
+  const selectionFor = useMemo(() => (
+    slotId: SlotId,
+    providerId: ProviderId,
+    providerModelId: ProviderModelId,
+  ): SlotSelection => {
+    const current = Option.flatMap(selections, (values) => slotId === PRIMARY_SLOT_ID ? values.primary : values.secondary)
+    const model = Option.flatMap(catalogModels, (models) => Option.fromNullable(models.find((candidate) =>
+      candidate.providerId === providerId && candidate.providerModelId === providerModelId)))
+    const currentEffort = Option.filter(current, (value) => value.providerId === providerId
+      && value.providerModelId === providerModelId)
+    const reasoningEffort = Option.match(currentEffort, {
+      onSome: (value) => value.reasoningEffort,
+      onNone: () => Option.getOrElse(Option.flatMap(model, (value) => value.capabilities.reasoning.defaultEffort),
+        () => ReasoningEffortSchema.make("none")),
+    })
+    return {
+      providerId,
+      providerModelId,
+      reasoningEffort,
+    }
+  }, [catalogModels, selections])
 
-  const updateSlotReasoning = useMemo(
-    () => (slotId: SlotId, effort: string | null): void => {
-      const current = Option.flatMap(slotConfiguration, (config) => Option.fromNullable(config.slots[slotId]))
-      updateConfig({
-        payload: {
-          slots: {
-            [slotId]: {
-              providerId: Option.getOrUndefined(Option.map(current, (entry) => entry.providerId)),
-              providerModelId: Option.getOrUndefined(Option.map(current, (entry) => entry.providerModelId)),
-              reasoningEffort: effort ?? undefined,
-            },
-          },
-        },
-        reactivityKeys: [ModelSlotsMirror.id],
-      })
-    },
-    [updateConfig, slotConfiguration],
-  )
+  const updateSlotModel = useMemo(() => (
+    slotId: SlotId,
+    providerId: ProviderId,
+    providerModelId: ProviderModelId,
+  ): void => commit(slotId, Option.some(selectionFor(slotId, providerId, providerModelId))), [commit, selectionFor])
 
-  const resetToDefaults = useMemo(
-    () => (): void => {
-      updateConfig({
-        payload: {
-          slots: {},
-        },
-        reactivityKeys: [ModelSlotsMirror.id],
-      })
-    },
-    [updateConfig],
-  )
+  const clearSlot = useMemo(() => (slotId: SlotId) => commit(slotId, Option.none()), [commit])
 
-  const refreshModels = useMemo(
-    () => (): void => {
-      refreshMutation({
-        payload: { providerId: Option.none() },
-        reactivityKeys: [ModelCatalogMirror.id, ModelSlotsMirror.id],
-      })
-    },
-    [refreshMutation],
-  )
+  const updateSlotReasoning = useMemo(() => (slotId: SlotId, effort: ReasoningEffort): void => {
+    const current = Option.flatMap(selections, (values) => slotId === PRIMARY_SLOT_ID ? values.primary : values.secondary)
+    if (Option.isNone(current)) return
+    commit(slotId, Option.some({ ...current.value, reasoningEffort: effort }))
+  }, [commit, selections])
 
   return {
-    catalog: catalogResult,
-    slots: slotsResult,
-    slotUpdate: updateConfigResult,
-    catalogRefresh: refreshMutationResult,
+    catalog,
+    slots,
+    slotUpdate,
+    catalogRefresh,
     updateSlotModel,
+    clearSlot,
     updateSlotReasoning,
-    resetToDefaults,
-    refreshModels,
+    resetToDefaults: () => {
+      clearSlot(PRIMARY_SLOT_ID)
+      clearSlot(SECONDARY_SLOT_ID)
+    },
+    refreshModels: () => refresh({
+      payload: { providerId: Option.none() },
+      reactivityKeys: [ProviderModelCatalogMirror.id, ModelSlotsMirror.id],
+    }),
   }
 }
 

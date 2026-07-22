@@ -176,3 +176,4 @@ describe('ChatController submit slash behavior', () => {
     act(() => renderer?.unmount())
   })
 })
+

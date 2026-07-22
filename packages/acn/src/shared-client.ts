@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Ref } from "effect"
+import { Context, Effect, Layer, Ref, Schema } from "effect"
 import {
   ProviderClient,
   createProviderClient,
@@ -10,7 +10,8 @@ import {
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
 import { IcnProvider, createLocalProvider } from "@magnitudedev/icn/provider"
-import { LocalModelConfiguration } from "./model-configuration"
+import { SlotIdSchema } from "@magnitudedev/protocol"
+import { ModelConfiguration } from "./model-configuration"
 
 const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,
@@ -106,13 +107,13 @@ export class ProviderClientRegistry extends Context.Tag("ProviderClientRegistry"
 export const ProviderClientRegistryLive: Layer.Layer<
   ProviderClientRegistry,
   never,
-  MagnitudeStorage | IcnProvider | LocalModelConfiguration
+  MagnitudeStorage | IcnProvider | ModelConfiguration
 > = Layer.effect(
   ProviderClientRegistry,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
     const local = createLocalProvider(yield* IcnProvider)
-    const modelConfiguration = yield* LocalModelConfiguration
+    const modelConfiguration = yield* ModelConfiguration
     const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
     const lock = yield* Effect.makeSemaphore(1)
 
@@ -123,15 +124,19 @@ export const ProviderClientRegistryLive: Layer.Layer<
         ...(sessionId ? { sessionId } : {}),
         discoverableProviders: [local],
       })
-      const fileBacked: ProviderClientShape = {
+      return {
         ...client,
-        requestAttribution: (providerId, providerModelId, key) => ({
-          requestStarted: providerId === "local" && (key === "primary" || key === "secondary")
-            ? modelConfiguration.recordUse(key, providerModelId).pipe(Effect.ignore)
-            : Effect.void,
-        }),
-      }
-      return fileBacked
+        requestAttribution: (providerId, providerModelId, key) => {
+          const attribution = client.requestAttribution(providerId, providerModelId, key)
+          return {
+            requestStarted: attribution.requestStarted.pipe(Effect.zipRight(
+              providerId === "local" && Schema.is(SlotIdSchema)(key)
+                ? modelConfiguration.recordUse(key, providerModelId).pipe(Effect.ignore)
+                : Effect.void,
+            )),
+          }
+        },
+      } satisfies ProviderClientShape
     })
 
     const makeEntry = (sessionId: string | null) => Effect.gen(function* () {

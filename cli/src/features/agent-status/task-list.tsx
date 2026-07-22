@@ -1,7 +1,7 @@
 import { TextAttributes } from '@opentui/core'
-import { blue, red, slate, subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import { blue, red, slate, subscribeAnimationTick, getAnimationTickSnapshot, findSlotProfile, type SlotProfiles } from '@magnitudedev/client-common'
 import { Atom, useAtomMount } from '@effect-atom/atom-react'
-import { Effect } from 'effect'
+import { Effect, Option } from 'effect'
 import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useTheme } from '../../hooks/use-theme'
 import { useLocalWidth } from '../../hooks/use-local-width'
@@ -18,9 +18,8 @@ import {
   findOwningRootIndex,
 } from '@magnitudedev/client-common'
 import type { TaskAssignee, TaskDisplayRow } from '@magnitudedev/client-common'
-import type { DisplayActor, DisplayTasks, SlotProfile } from '@magnitudedev/sdk'
-import type { SlotId } from '@magnitudedev/sdk'
-import { isRoleId, ROLE_TO_SLOT } from '@magnitudedev/sdk'
+import type { DisplayActor, DisplayTasks } from '@magnitudedev/sdk'
+import { isRoleId, PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID } from '@magnitudedev/sdk'
 
 const COLLAPSED_ROWS = 6
 const EXPANDED_ROWS = 25
@@ -39,7 +38,7 @@ type Props = {
   actors?: Record<string, DisplayActor>
   taskSummary?: DisplayTasks['summary']
   pushForkOverlay: (forkId: string) => void
-  slotProfiles: Partial<Record<SlotId, SlotProfile>> | null
+  slotProfiles: SlotProfiles | null
   scrollRefOverride?: { current: { scrollTo: (offset: number) => void } | null }
 }
 
@@ -55,7 +54,7 @@ type TaskRowProps = {
   taskNameWidth: number
   columnGap: number
   agentIdWidth: number
-  slotProfiles: Partial<Record<SlotId, SlotProfile>> | null
+  slotProfiles: SlotProfiles | null
 }
 
 type WorkerPresentation = {
@@ -279,8 +278,11 @@ function TaskRow({
   const workerTokens = actor && actor.context.tokenEstimate > 0 ? actor.context.tokenEstimate : null
   const workerRole = actor?.role ?? null
   const workerSlot = workerRole && isRoleId(workerRole) ? ROLE_TO_SLOT[workerRole] : null
-  const modelDisplayName = workerSlot
-    ? (slotProfiles?.[workerSlot]?.modelDisplayName ?? null)
+  const workerSlotId = workerSlot === null
+    ? null
+    : workerSlot === 'primary' ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
+  const modelDisplayName = workerSlotId && slotProfiles
+    ? Option.getOrNull(Option.map(findSlotProfile(slotProfiles, workerSlotId), ({ modelDisplayName }) => modelDisplayName))
     : null
   const tokensLabel = workerTokens != null ? formatTokensCompact(workerTokens) : null
 
@@ -458,7 +460,12 @@ export function TaskList({
               const stickyActor = stickyAssignee.kind === 'actor' ? actors[stickyAssignee.actorKey] : null
               const stickyRole = stickyActor?.role ?? null
               const stickySlot = stickyRole && isRoleId(stickyRole) ? ROLE_TO_SLOT[stickyRole] : null
-              const stickyModel = stickySlot ? (slotProfiles?.[stickySlot]?.modelDisplayName ?? null) : null
+              const stickySlotId = stickySlot === null
+                ? null
+                : stickySlot === 'primary' ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
+              const stickyModel = stickySlotId && slotProfiles
+                ? Option.getOrNull(Option.map(findSlotProfile(slotProfiles, stickySlotId), ({ modelDisplayName }) => modelDisplayName))
+                : null
               const labelText = getAssigneeLabel(stickyAssignee, actors)
               const expandWidth = (expanded ? 'Collapse all ▼  ' : 'Expand all ▲  ').length
               const availableWidth = Math.max(0, agentIdWidth - expandWidth)

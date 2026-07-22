@@ -62,6 +62,7 @@ const providerClient = (label: string): ProviderClientShape => ({
       contextWindow: 1,
       maxOutputTokens: 1,
       defaultReasoningEffort: ReasoningEffortSchema.make("none"),
+      servingCapabilities: { tools: true, structuredOutput: false },
       properties: {
         vision: new VisionProperty.states.Resolved({ value: false }),
         reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make("none")] }),

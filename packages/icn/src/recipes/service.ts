@@ -1,4 +1,5 @@
 import { Context, Duration, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
+import { ReasoningEffortSchema, type ReasoningEffort } from "@magnitudedev/ai"
 import { IcnClient } from "../client.js"
 import type * as Generated from "../generated/schemas.js"
 import { IcnHardware } from "../hardware/index.js"
@@ -11,6 +12,13 @@ import {
 } from "./catalog.js"
 import { ModelRecipesState, type ModelRecipeRecommendation } from "./schema.js"
 import type { ResolvedModelRecipe } from "./types.js"
+import {
+  ModelArtifactFingerprintSchema,
+  ModelRecipeCatalogModelIdSchema,
+  ModelRecipeConfigurationIdSchema,
+  NativeIcnModelIdSchema,
+  type ModelRecipeConfigurationId,
+} from "../provider/model-identity.js"
 
 const PREVIEW_REQUEST_CONCURRENCY = 12
 const PROFILE_CONTEXTS = [200_000, 100_000] as const
@@ -36,7 +44,7 @@ export interface RankedRecommendationCandidate {
 }
 
 export interface IcnRecipesService extends IcnObservedState<ModelRecipesState, never> {
-  readonly resolve: (configurationId: string) => Effect.Effect<Option.Option<ModelRecipeRecommendation>>
+  readonly resolve: (configurationId: ModelRecipeConfigurationId) => Effect.Effect<Option.Option<ModelRecipeRecommendation>>
 }
 
 export class IcnRecipes extends Context.Tag("@magnitudedev/icn/IcnRecipes")<
@@ -75,21 +83,25 @@ const recommendationFrom = (
   const properties = preview.properties.type === "inspected"
     ? Option.some(preview.properties)
     : Option.none<InspectedInventoryProperties>()
+  if (Option.isNone(properties)) return Option.none()
   const profile = assessment.assessment.profile
   const memory = assessment.assessment.memory
   const nonNullProperty = <A>(read: (value: InspectedInventoryProperties) => Option.Option<A | null>) =>
     Option.flatMap(properties, (value) => Option.filter(read(value), (candidate): candidate is A => candidate !== null))
   const quantization = nonNullProperty((value) => value.quantization)
   const architectureName = nonNullProperty((value) => value.architecture)
-  const trainingContext = nonNullProperty((value) => value.training_context_length)
   const totalParameters = nonNullProperty((value) => value.parameter_count)
   const activeParameters = nonNullProperty((value) => value.active_parameter_count)
   if (!preview.assessments.some((candidate) => candidate.profile_id === assessment.profile_id)) return Option.none()
   const matchedContext = Option.flatMap(
     Option.fromNullable(assessment.profile_id.match(/:ctx(\d+)$/)),
-    (match) => Option.flatMap(Option.fromNullable(match.at(1)), (value) => Option.liftPredicate(Number(value), Number.isSafeInteger)),
+    (match) => Option.flatMap(
+      Option.fromNullable(match.at(1)),
+      (value) => Option.liftPredicate(Number(value), (candidate) => Number.isSafeInteger(candidate) && candidate > 0),
+    ),
   )
-  const contextTokens = Option.getOrElse(Option.orElse(matchedContext, () => trainingContext), () => 1)
+  if (Option.isNone(matchedContext)) return Option.none()
+  const contextWindow = matchedContext.value
   const acceleration = profile.acceleration.toLowerCase()
   const fitClass = acceleration.includes("hybrid")
     ? "hybrid"
@@ -97,16 +109,44 @@ const recommendationFrom = (
       ? "cpu_or_unified"
       : "full_accelerator"
   const totalDownloadBytes = preview.components.reduce((total, component) => total + component.size_bytes, 0)
+  const reasoning = properties.value.reasoning
+  const reasoningEfforts: readonly ReasoningEffort[] = (reasoning.type === "unsupported"
+    ? []
+    : reasoning.control.type === "effort" || reasoning.control.type === "effort_and_budget"
+      ? [...new Set(reasoning.control.levels)]
+      : reasoning.control.type === "toggle"
+        ? ["none", "medium"]
+        : ["medium"]).map((effort) => ReasoningEffortSchema.make(effort))
+  const requestedDefault = reasoning.type === "unsupported"
+    ? Option.none<ReasoningEffort>()
+    : reasoning.control.type === "effort"
+      ? Option.map(Option.filter(reasoning.control.default, (value): value is string => value !== null), ReasoningEffortSchema.make)
+      : reasoning.control.type === "effort_and_budget"
+        ? Option.map(Option.filter(reasoning.control.default_effort, (value): value is string => value !== null), ReasoningEffortSchema.make)
+        : reasoning.control.type === "toggle"
+          ? Option.some(ReasoningEffortSchema.make(reasoning.control.default ? "medium" : "none"))
+          : Option.some(ReasoningEffortSchema.make("medium"))
+  const defaultReasoningEffort = Option.orElse(
+    Option.filter(requestedDefault, (effort) => reasoningEfforts.includes(effort)),
+    () => Option.fromNullable(reasoningEfforts[0]),
+  )
 
   return Option.some({
-    configurationId: assessment.profile_id,
-    catalogModelId: entry.id,
-    artifactFingerprint: assessment.artifact_fingerprint,
+    configurationId: ModelRecipeConfigurationIdSchema.make(assessment.profile_id),
+    catalogModelId: ModelRecipeCatalogModelIdSchema.make(entry.id),
+    artifactFingerprint: ModelArtifactFingerprintSchema.make(assessment.artifact_fingerprint),
     modelId: Option.none(),
     badge: "alternative",
     displayName: entry.displayName,
     family: entry.family,
     architecture: Option.exists(architectureName, (name) => name.toLowerCase().includes("moe")) ? "moe" : "dense",
+    capabilities: {
+      vision: properties.value.modalities.includes("vision"),
+      tools: properties.value.tools.type === "supported",
+      structuredOutput: properties.value.structured_output.type === "supported",
+      reasoningEfforts,
+      defaultReasoningEffort,
+    },
     totalParametersBillions: Option.map(totalParameters, (value) => value / 1_000_000_000),
     activeParametersBillions: Option.map(activeParameters, (value) => value / 1_000_000_000),
     effectiveParametersBillions: Option.none(),
@@ -129,14 +169,13 @@ const recommendationFrom = (
     totalDownloadBytes,
     sourcePageUrl: recipeSourcePageUrl(entry),
     license: entry.license,
-    contextTokens,
-    modelMaximumContextTokens: Option.getOrElse(trainingContext, () => contextTokens),
+    contextWindow,
     estimatedRuntimeBytes: memory.required_bytes,
     stableCapacityBudgetBytes: memory.available_bytes,
     fitMarginBytes: memory.headroom_bytes,
     fitClass,
     constrainedContext: assessment.assessment.recommendation === "constrained",
-    explanation: `${entry.quantization.fidelityLabel}; ${profile.acceleration} placement at ${Math.round(contextTokens / 1_000)}K context.`,
+    explanation: `${entry.quantization.fidelityLabel}; ${profile.acceleration} placement at ${Math.round(contextWindow / 1_000)}K context.`,
   })
 }
 
@@ -144,7 +183,7 @@ const compareConfiguration = (
   left: RankedRecommendationCandidate,
   right: RankedRecommendationCandidate,
 ): number => right.fidelityRank - left.fidelityRank
-  || right.value.contextTokens - left.value.contextTokens
+  || right.value.contextWindow - left.value.contextWindow
   || right.value.fitMarginBytes - left.value.fitMarginBytes
 
 const compareProductRank = (
@@ -152,7 +191,7 @@ const compareProductRank = (
   right: RankedRecommendationCandidate,
 ): number => right.modelQualityRank - left.modelQualityRank
   || right.fidelityRank - left.fidelityRank
-  || right.value.contextTokens - left.value.contextTokens
+  || right.value.contextWindow - left.value.contextWindow
   || right.value.fitMarginBytes - left.value.fitMarginBytes
 
 export const selectRecommendationPortfolio = (
@@ -303,7 +342,7 @@ export const makeIcnRecipes = (
                 `${model.source.repository}:${model.source.commit}:${value}`
                   === recommendation.artifactFingerprint)
           })),
-          (model) => model.id,
+          (model) => NativeIcnModelIdSchema.make(model.id),
         ),
       })),
       failureCount: result.failureCount,

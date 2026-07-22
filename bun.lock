@@ -305,7 +305,6 @@
         "@effect/platform": "^0.96.0",
         "@effect/rpc": "0.75.1",
         "@magnitudedev/ai": "workspace:*",
-        "@magnitudedev/icn": "workspace:*",
         "@magnitudedev/storage": "workspace:*",
         "@magnitudedev/utils": "workspace:*",
         "effect": "^3.21.2",

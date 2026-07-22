@@ -1,11 +1,5 @@
-import { PlatformError } from "@effect/platform/Error"
-import {
-  JsonParseError,
-  SchemaDecodeError,
-  SchemaEncodeError,
-} from "@magnitudedev/storage"
-import { ErrorResponse } from "@magnitudedev/icn/generated"
 import { Schema } from "effect"
+import { LocalModelIdSchema, SlotIdSchema } from "./schemas/model-state"
 
 export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
   "SessionNotFound",
@@ -47,77 +41,49 @@ export const SessionError = Schema.Union(
 )
 export type SessionError = Schema.Schema.Type<typeof SessionError>
 
-export class IcnRequestEncodingFailed extends Schema.TaggedError<IcnRequestEncodingFailed>()(
-  "IcnRequestEncodingFailed",
+export class LocalModelNotFound extends Schema.TaggedError<LocalModelNotFound>()(
+  "LocalModelNotFound",
+  { localModelId: LocalModelIdSchema },
+) {}
+
+export class LocalModelMutationFailed extends Schema.TaggedError<LocalModelMutationFailed>()(
+  "LocalModelMutationFailed",
   {
-    operationId: Schema.String,
-    location: Schema.Literal("path", "query", "headers", "payload"),
+    code: Schema.String,
+    message: Schema.String,
+    retryable: Schema.Boolean,
+  },
+) {}
+
+export class ModelSlotMutationRejected extends Schema.TaggedError<ModelSlotMutationRejected>()(
+  "ModelSlotMutationRejected",
+  {
+    slotId: SlotIdSchema,
     message: Schema.String,
   },
 ) {}
 
-export class IcnTransportFailed extends Schema.TaggedError<IcnTransportFailed>()(
-  "IcnTransportFailed",
-  { operationId: Schema.String, message: Schema.String },
-) {}
-
-export class IcnRemoteRejected extends Schema.TaggedError<IcnRemoteRejected>()(
-  "IcnRemoteRejected",
+export class ModelSlotMutationFailed extends Schema.TaggedError<ModelSlotMutationFailed>()(
+  "ModelSlotMutationFailed",
   {
-    operationId: Schema.String,
-    status: Schema.Number,
-    body: ErrorResponse,
-  },
-) {}
-
-export class IcnInvalidResponse extends Schema.TaggedError<IcnInvalidResponse>()(
-  "IcnInvalidResponse",
-  {
-    operationId: Schema.String,
-    status: Schema.Number,
+    slotId: SlotIdSchema,
+    code: Schema.String,
     message: Schema.String,
+    retryable: Schema.Boolean,
   },
 ) {}
 
-export class IcnIncompleteStream extends Schema.TaggedError<IcnIncompleteStream>()(
-  "IcnIncompleteStream",
-  {
-    operationId: Schema.String,
-    termination: Schema.Literal("sentinel", "long-lived"),
-  },
-) {}
-
-export class LocalModelRecipeNotFound extends Schema.TaggedError<LocalModelRecipeNotFound>()(
-  "LocalModelRecipeNotFound",
-  { configurationId: Schema.String },
-) {}
-
-export class LocalInventoryModelNotFound extends Schema.TaggedError<LocalInventoryModelNotFound>()(
-  "LocalInventoryModelNotFound",
-  { modelId: Schema.String },
-) {}
-
-export class LocalConfigurationFailed extends Schema.TaggedError<LocalConfigurationFailed>()(
-  "LocalConfigurationFailed",
-  {
-    failure: Schema.Union(
-      PlatformError,
-      JsonParseError,
-      SchemaDecodeError,
-      SchemaEncodeError,
-    ),
-  },
-) {}
+export const ModelSlotUpdateError = Schema.Union(
+  ModelSlotMutationRejected,
+  ModelSlotMutationFailed,
+)
+export type ModelSlotUpdateError = Schema.Schema.Type<typeof ModelSlotUpdateError>
 
 export const LocalInferenceError = Schema.Union(
-  IcnRequestEncodingFailed,
-  IcnTransportFailed,
-  IcnRemoteRejected,
-  IcnInvalidResponse,
-  IcnIncompleteStream,
-  LocalModelRecipeNotFound,
-  LocalInventoryModelNotFound,
-  LocalConfigurationFailed,
+  LocalModelNotFound,
+  LocalModelMutationFailed,
+  ModelSlotMutationRejected,
+  ModelSlotMutationFailed,
 )
 export type LocalInferenceError = Schema.Schema.Type<typeof LocalInferenceError>
 

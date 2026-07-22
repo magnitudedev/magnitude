@@ -6,9 +6,11 @@ import {
   getTickSnapshot,
   subscribeNoop,
   subscribeTick,
+  type SlotProfile,
+  type SlotProfiles,
 } from "@magnitudedev/client-common"
-import type { DisplayActor, DisplayTasks, SlotProfile, SlotProfiles, SlotId, TaskAssignee, TaskDisplayRow } from "@magnitudedev/sdk"
-import { ROLE_TO_SLOT } from "@magnitudedev/sdk"
+import type { DisplayActor, DisplayTasks, TaskAssignee, TaskDisplayRow } from "@magnitudedev/sdk"
+import { isRoleId, ROLE_TO_SLOT } from "@magnitudedev/sdk"
 import { ContextUsageIndicator } from "./context-usage-indicator"
 
 export interface WorkStatusBarProps {
@@ -23,10 +25,8 @@ function findSlotProfileForRole(
   profiles: SlotProfiles | null | undefined,
   role: string | null | undefined,
 ): SlotProfile | null {
-  if (!profiles || !role) return null
-  const slotId = ROLE_TO_SLOT[role as keyof typeof ROLE_TO_SLOT] ?? null
-  if (!slotId) return null
-  return profiles[slotId as SlotId] ?? null
+  if (!profiles || !role || !isRoleId(role)) return null
+  return ROLE_TO_SLOT[role] === "primary" ? profiles.primary ?? null : profiles.secondary ?? null
 }
 
 function rowsFromTasks(tasks: DisplayTasks | null): TaskDisplayRow[] {

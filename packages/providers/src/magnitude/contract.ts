@@ -9,6 +9,7 @@ import type { RoleId } from "./roles"
 import type { SlotId } from "@magnitudedev/roles"
 import type { ProviderModel, ReasoningEffort, ModelPricingInfo } from "@magnitudedev/ai"
 import { Schema } from "effect"
+import { ProviderModelIdSchema } from "@magnitudedev/ai"
 
 export type { ReasoningEffort, ModelPricingInfo } from "@magnitudedev/ai"
 export type { ProviderModelCapabilities as ModelCapabilities } from "@magnitudedev/ai"
@@ -40,22 +41,25 @@ const MagnitudeSlotIdSchema: Schema.Schema<SlotId> = Schema.Literal("primary", "
 
 /** Validated raw model shape returned by Magnitude model-list endpoints. */
 export const MagnitudeRawModelSchema = Schema.Struct({
-  id: Schema.String,
+  id: ProviderModelIdSchema,
   object: Schema.Literal("model"),
   owned_by: Schema.String,
   displayName: Schema.String,
   roles: Schema.Array(MagnitudeRoleIdSchema),
   slots: Schema.Array(MagnitudeSlotIdSchema),
-  tiers: Schema.optional(Schema.Array(Schema.String)),
-  type: Schema.optional(Schema.Literal("utility")),
+  tiers: Schema.optionalWith(Schema.Array(Schema.String), { as: "Option", exact: true }),
+  type: Schema.optionalWith(Schema.Literal("utility"), { as: "Option", exact: true }),
   contextWindow: Schema.Number,
   maxOutputTokens: Schema.Number,
-  capabilities: Schema.optional(Schema.Struct({ vision: Schema.Boolean })),
-  pricing: Schema.optional(Schema.Struct({
+  capabilities: Schema.optionalWith(Schema.Struct({
+    vision: Schema.Boolean,
+    structuredOutput: Schema.optionalWith(Schema.Boolean, { as: "Option", exact: true }),
+  }), { as: "Option", exact: true }),
+  pricing: Schema.optionalWith(Schema.Struct({
     input: Schema.Number,
     output: Schema.Number,
     cached_input: Schema.NullOr(Schema.Number),
-  })),
+  }), { as: "Option", exact: true }),
 })
 export type MagnitudeRawModel = Schema.Schema.Type<typeof MagnitudeRawModelSchema>
 

@@ -12,3 +12,4 @@ export function allowProviderMessageSend(
   showToast(NO_PROVIDERS_CONFIGURED_MESSAGE)
   return false
 }
+
