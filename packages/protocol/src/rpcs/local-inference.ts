@@ -1,51 +1,51 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
-import { HardwareSnapshotSchema, ModelList } from "@magnitudedev/icn/generated"
-import { ModelRecipesState } from "@magnitudedev/icn/recipes"
+import {
+  LocalInferenceHardwareSchema,
+  LocalModelIdSchema,
+  LocalModelInventoryStateSchema,
+  SlotSelectionSchema,
+  SlotIdSchema,
+} from "../schemas/model-state"
 import { defineMirroredState } from "./mirrored-state"
 
-export const IcnHardwareMirror = defineMirroredState("GetIcnHardware", {
-  stateSchema: HardwareSnapshotSchema,
-  errorSchema: LocalInferenceError,
+export const LocalInferenceHardwareMirror = defineMirroredState("GetLocalInferenceHardware", {
+  stateSchema: LocalInferenceHardwareSchema,
+  errorSchema: Schema.Never,
 })
 
-export const IcnInventoryMirror = defineMirroredState("GetIcnInventory", {
-  stateSchema: ModelList,
-  errorSchema: LocalInferenceError,
-})
-
-export const ModelRecipesMirror = defineMirroredState("GetModelRecipes", {
-  stateSchema: ModelRecipesState,
-  errorSchema: LocalInferenceError,
+export const LocalModelInventoryMirror = defineMirroredState("GetLocalModelInventory", {
+  stateSchema: LocalModelInventoryStateSchema,
+  errorSchema: Schema.Never,
 })
 
 export const DownloadLocalModel = Rpc.make("DownloadLocalModel", {
-  payload: Schema.Struct({ configurationId: Schema.String }),
-  success: Schema.Struct({}),
-  error: LocalInferenceError,
-})
-
-export const ActivateLocalModel = Rpc.make("ActivateLocalModel", {
-  payload: Schema.Struct({ modelId: Schema.String }),
+  payload: Schema.Struct({ localModelId: LocalModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const DeleteLocalModel = Rpc.make("DeleteLocalModel", {
-  payload: Schema.Struct({ modelId: Schema.String }),
+  payload: Schema.Struct({ localModelId: LocalModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
-export const RestartLocalInference = Rpc.make("RestartLocalInference", {
-  payload: Schema.Struct({}),
+export const LoadModelSlot = Rpc.make("LoadModelSlot", {
+  payload: Schema.Struct({ slotId: SlotIdSchema, selection: SlotSelectionSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
-export const DisableLocalInference = Rpc.make("DisableLocalInference", {
-  payload: Schema.Struct({}),
+export const ReloadModelSlot = Rpc.make("ReloadModelSlot", {
+  payload: Schema.Struct({ slotId: SlotIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+})
+
+export const UnloadModelSlot = Rpc.make("UnloadModelSlot", {
+  payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })

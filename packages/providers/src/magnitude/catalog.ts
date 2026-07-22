@@ -2,7 +2,7 @@ import { Effect, Option, Schema } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import { MagnitudeModelListResponseSchema, type MagnitudeModelInfo, type MagnitudeRawModel } from "./contract"
-import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty, type AuthApplicator, type ModelCatalog, type ModelFamilyId } from "@magnitudedev/ai"
+import { AVAILABLE_PROVIDER_MODEL, ModelCatalogError, ModelFamilyIdSchema, ProviderIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty, type AuthApplicator, type ModelCatalog, type ModelFamilyId } from "@magnitudedev/ai"
 
 type MagnitudeModelWithoutFamily = Omit<MagnitudeModelInfo, "modelFamilyId">
 
@@ -16,23 +16,33 @@ const MAGNITUDE_DEFAULT_REASONING_EFFORT = ReasoningEffortSchema.make("high")
  */
 export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWithoutFamily {
   return {
-    providerModelId: ProviderModelIdSchema.make(raw.id),
+    providerModelId: raw.id,
     providerId: ProviderIdSchema.make("magnitude"),
     displayName: raw.displayName,
     contextWindow: raw.contextWindow,
     maxOutputTokens: raw.maxOutputTokens,
     defaultReasoningEffort: MAGNITUDE_DEFAULT_REASONING_EFFORT,
     properties: {
-      vision: new VisionProperty.states.Resolved({ value: raw.capabilities?.vision ?? false }),
+      vision: new VisionProperty.states.Resolved({ value: Option.match(raw.capabilities, {
+        onNone: () => false,
+        onSome: ({ vision }) => vision,
+      }) }),
       reasoning: new ReasoningProperty.states.Resolved({ value: MAGNITUDE_REASONING_EFFORTS }),
     },
+    servingCapabilities: {
+      tools: true,
+      structuredOutput: Option.match(raw.capabilities, {
+        onNone: () => false,
+        onSome: ({ structuredOutput }) => Option.getOrElse(structuredOutput, () => false),
+      }),
+    },
     availability: AVAILABLE_PROVIDER_MODEL,
-    pricing: raw.pricing ?? { input: 0, output: 0, cached_input: null },
+    pricing: Option.getOrElse(raw.pricing, () => ({ input: 0, output: 0, cached_input: null })),
     object: raw.object,
     owned_by: raw.owned_by,
     roles: raw.roles,
     slots: raw.slots,
-    ...(raw.type !== undefined ? { type: raw.type } : {}),
+    ...Option.match(raw.type, { onNone: () => ({}), onSome: (type) => ({ type }) }),
   }
 }
 

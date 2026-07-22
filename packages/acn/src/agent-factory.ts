@@ -12,7 +12,7 @@ import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
 import { ProviderClientRegistry } from "./shared-client"
-import { Account } from "./account"
+import { ModelSlotCoordinator } from "./model-slot-coordinator"
 
 export interface AgentFactoryApi {
   readonly createSession: (input: {
@@ -32,13 +32,13 @@ export class AgentFactory extends Context.Tag("AgentFactory")<
 export const AgentFactoryLive = (options: {
   readonly debug: boolean
   readonly version: string
-}): Layer.Layer<AgentFactory, never, MagnitudeStorage | ProviderClientRegistry | Account> =>
+}): Layer.Layer<AgentFactory, never, MagnitudeStorage | ProviderClientRegistry | ModelSlotCoordinator> =>
   Layer.effect(
     AgentFactory,
     Effect.gen(function* () {
       const storage = yield* MagnitudeStorage
       const providerClients = yield* ProviderClientRegistry
-      const account = yield* Account
+      const modelSlots = yield* ModelSlotCoordinator
 
       return {
         createSession: Effect.fn("acn.agent-factory.create-session")(function* (input) {
@@ -71,8 +71,7 @@ export const AgentFactoryLive = (options: {
             sessionContext: prepared.sessionContext,
             sessionId: input.sessionId,
             providerClient: prepared.providerClient,
-            modelConfigurations: account.agentModelConfigurations,
-            applyReasoningEffortFallback: account.applyReasoningEffortFallback,
+            modelConfigurations: modelSlots.agentModelConfigurations,
             disableShellSafeguards: input.options.disableShellSafeguards,
             disableCwdSafeguards: input.options.disableCwdSafeguards,
             atifPath: input.options.atifPath ?? undefined,

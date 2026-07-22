@@ -2,7 +2,7 @@ import * as FileSystem from "@effect/platform/FileSystem";
 import * as Path from "@effect/platform/Path";
 import { type PlatformError } from "@effect/platform/Error";
 import { randomUUID } from "node:crypto";
-import { Effect, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 
 import {
   makeStorageIo,
@@ -25,6 +25,22 @@ import {
 import type { ConfigStorageShape } from "./contracts";
 
 const DEFAULT_CONFIG = Schema.decodeUnknownSync(MagnitudeConfigSchema)({});
+
+const discardRemovedModelConfiguration = (config: MagnitudeConfig): {
+  readonly value: MagnitudeConfig;
+  readonly changed: boolean;
+} => {
+  const models = config.models === undefined ? undefined : {
+    slots: config.models.slots,
+    localModelRecency: config.models.localModelRecency,
+  };
+  const removedModelFields = config.models !== undefined
+    && Reflect.ownKeys(config.models).some((key) => key !== "slots" && key !== "localModelRecency");
+  const value = models === undefined ? { ...config } : { ...config, models };
+  const removedLocalInference = Reflect.has(value, "localInference");
+  if (removedLocalInference) Reflect.deleteProperty(value, "localInference");
+  return { value, changed: removedModelFields || removedLocalInference };
+};
 
 const safeRecoveryMessage = (message: string): string =>
   message.replace(/, actual[\s\S]*$/, "").slice(0, 500);
@@ -95,11 +111,14 @@ export function makeConfigStorage(): Effect.Effect<
           );
           return DEFAULT_CONFIG;
         }
+        const cleaned = discardRemovedModelConfiguration(result.value);
+        const backupPath = result.recovery.recovered && result.recovery.resetRoot
+          ? yield* preserveCorruptOriginal(result.originalText)
+          : undefined;
+        if (result.recovery.recovered || cleaned.changed) {
+          yield* writeConfigUnlocked(cleaned.value);
+        }
         if (result.recovery.recovered) {
-          const backupPath = result.recovery.resetRoot
-            ? yield* preserveCorruptOriginal(result.originalText)
-            : undefined;
-          yield* writeConfigUnlocked(result.value);
           yield* Effect.logWarning("Recovered invalid Magnitude config values").pipe(
             Effect.annotateLogs({
               path: g.configFile,
@@ -118,7 +137,7 @@ export function makeConfigStorage(): Effect.Effect<
             })
           );
         }
-        return result.value;
+        return cleaned.value;
       });
 
     const readConfig = (): Effect.Effect<MagnitudeConfig, PlatformError | JsonError> =>
@@ -159,35 +178,20 @@ export function makeConfigStorage(): Effect.Effect<
           })
         ),
 
-      getModelConfig: () =>
-        readConfig().pipe(Effect.map((config) => config.models ?? null)),
-
-      updateModelConfig: (slots) =>
+      updateModelSlot: (slotId, selection) =>
         io.withPathLock(
           g.configFile,
           Effect.gen(function* () {
             const current = yield* readConfigUnlocked();
-            // Merge provided slots into existing; drop slots with no overrides.
-            const existingSlots = current.models?.slots ?? {};
-            const merged = { ...existingSlots };
-            for (const slotId of ["primary", "secondary"] as const) {
-              const slotConfig = slots[slotId];
-              if (!slotConfig) continue;
-              if (
-                slotConfig.providerId ||
-                slotConfig.providerModelId ||
-                slotConfig.reasoningEffort
-              ) {
-                merged[slotId] = slotConfig;
-              } else {
-                delete merged[slotId];
-              }
-            }
+            const existingModels = current.models ?? {
+              slots: { primary: Option.none(), secondary: Option.none() },
+              localModelRecency: { primary: [], secondary: [] },
+            };
             yield* writeConfigUnlocked({
               ...current,
               models: {
-                ...current.models,
-                slots: merged,
+                ...existingModels,
+                slots: { ...existingModels.slots, [slotId]: selection },
               },
             });
           })
@@ -196,8 +200,6 @@ export function makeConfigStorage(): Effect.Effect<
       getOnboardingConfig: () =>
         readConfig().pipe(Effect.map((config) => config.onboarding ?? null)),
 
-      getLocalInferenceConfig: () =>
-        readConfig().pipe(Effect.map((config) => config.localInference ?? null)),
 
       completeOnboardingFlow: (flowId, version, completedAt) =>
         io.withPathLock(

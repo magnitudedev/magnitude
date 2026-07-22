@@ -1,17 +1,18 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
-import { SessionError } from "../errors"
+import { ModelSlotUpdateError, SessionError } from "../errors"
 import {
   CloudUsageResponse,
   UsagePeriod,
-  SlotId,
-  SlotProfiles,
-  SlotModelConfigSchema,
-  ModelCatalogStateSchema,
+} from "../schemas/cloud-usage"
+import { ProviderAuthSchema } from "../schemas/provider-auth"
+import {
+  SlotSelectionSchema,
+  SlotIdSchema,
+  ProviderModelCatalogStateSchema,
   ModelSlotsStateSchema,
-  ProviderAuthSchema,
-} from "../schemas/account"
+} from "../schemas/model-state"
 import { defineMirroredState } from "./mirrored-state"
 
 export const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
@@ -36,7 +37,7 @@ export const GetProviderAuth = Rpc.make("GetProviderAuth", {
 export const ListProviderAuth = Rpc.make("ListProviderAuth", {
   payload: Schema.Struct({}),
   success: Schema.Struct({
-    auths: Schema.Record({ key: Schema.String, value: ProviderAuthSchema }),
+    auths: Schema.Record({ key: ProviderIdSchema, value: ProviderAuthSchema }),
   }),
   error: SessionError
 })
@@ -53,15 +54,9 @@ export const GetCloudUsage = Rpc.make("GetCloudUsage", {
 
 // ── Slot-based model configuration ──
 
-export const ListPublicSlotProfiles = Rpc.make("ListPublicSlotProfiles", {
-  payload: Schema.Struct({}),
-  success: Schema.NullOr(SlotProfiles),
-  error: SessionError
-})
-
-export const ModelCatalogMirror = defineMirroredState("GetModelCatalog", {
-  stateSchema: ModelCatalogStateSchema,
-  errorSchema: SessionError,
+export const ProviderModelCatalogMirror = defineMirroredState("GetProviderModelCatalog", {
+  stateSchema: ProviderModelCatalogStateSchema,
+  errorSchema: Schema.Never,
 })
 
 export const RefreshModelCatalog = Rpc.make("RefreshModelCatalog", {
@@ -69,18 +64,19 @@ export const RefreshModelCatalog = Rpc.make("RefreshModelCatalog", {
     providerId: Schema.optionalWith(ProviderIdSchema, { as: "Option", exact: true }),
   }),
   success: Schema.Struct({}),
-  error: SessionError,
+  error: Schema.Never,
 })
 
 export const ModelSlotsMirror = defineMirroredState("GetModelSlots", {
   stateSchema: ModelSlotsStateSchema,
-  errorSchema: SessionError,
+  errorSchema: Schema.Never,
 })
 
-export const UpdateModelSlots = Rpc.make("UpdateModelSlots", {
+export const UpdateModelSlot = Rpc.make("UpdateModelSlot", {
   payload: Schema.Struct({
-    slots: Schema.partial(Schema.Record({ key: SlotId, value: SlotModelConfigSchema })),
+    slotId: SlotIdSchema,
+    selection: Schema.optionalWith(SlotSelectionSchema, { as: "Option", exact: true }),
   }),
   success: Schema.Struct({}),
-  error: SessionError,
+  error: ModelSlotUpdateError,
 })

@@ -1,47 +1,38 @@
 import { Option } from "effect"
 import {
-  ModelCatalogLifecycle,
-  ModelSlotsLifecycle,
-  type ModelCatalogState,
+  PRIMARY_SLOT_ID,
+  ProviderModelCatalogLifecycle,
+  type ModelSlot,
   type ModelSlotsState,
-  type ModelSummary,
+  type ProviderModelCatalogEntry,
+  type ProviderModelCatalogState,
   type SlotId,
-  type SlotState,
 } from "@magnitudedev/sdk"
 
-type AssignedSlotState = Exclude<SlotState, { readonly _tag: "Unassigned" }>
+type AssignedSlot = Exclude<ModelSlot, { readonly _tag: "Unassigned" }>
 
 export interface SelectedSlotModel {
-  readonly model: ModelSummary
-  readonly slot: AssignedSlotState
+  readonly model: ProviderModelCatalogEntry
+  readonly slot: AssignedSlot
 }
 
-/** Join catalog details to ACN's authoritative slot selection. */
 export function selectedSlotModel(
-  catalog: ModelCatalogState,
+  catalog: ProviderModelCatalogState,
   slots: ModelSlotsState,
   slotId: SlotId,
 ): Option.Option<SelectedSlotModel> {
-  const models = ModelCatalogLifecycle.match(catalog, {
-    loading: () => Option.none<readonly ModelSummary[]>(),
-    ready: ({ models }) => Option.some(models),
-    refreshing: ({ models }) => Option.some(models),
-    degraded: ({ models }) => Option.some(models),
-    unavailable: () => Option.none<readonly ModelSummary[]>(),
+  const models = ProviderModelCatalogLifecycle.match(catalog, {
+    Loading: () => Option.none<readonly ProviderModelCatalogEntry[]>(),
+    Ready: ({ models }) => Option.some(models),
+    Refreshing: ({ models }) => Option.some(models),
+    Degraded: ({ models }) => Option.some(models),
+    Unavailable: () => Option.none<readonly ProviderModelCatalogEntry[]>(),
   })
-  const slot = ModelSlotsLifecycle.match(slots, {
-    loading: () => Option.none<SlotState>(),
-    ready: ({ slots }) => Option.some(slots[slotId]),
-    refreshing: ({ slots }) => Option.some(slots[slotId]),
-    degraded: ({ slots }) => Option.some(slots[slotId]),
-    unavailable: ({ slots }) => Option.some(slots[slotId]),
-  })
-  return Option.flatMap(slot, (selected) => {
-    if (selected._tag === "Unassigned") return Option.none()
-    return Option.flatMap(models, (catalogModels) => Option.map(
-      Option.fromNullable(catalogModels.find((model) => model.providerId === selected.selection.providerId
-        && model.providerModelId === selected.selection.providerModelId)),
-      (model) => ({ model, slot: selected }),
-    ))
-  })
+  const slot = slots.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
+  if (slot._tag === "Unassigned") return Option.none()
+  return Option.flatMap(models, (catalogModels) => Option.map(
+    Option.fromNullable(catalogModels.find((model) => model.providerId === slot.selection.providerId
+      && model.providerModelId === slot.selection.providerModelId)),
+    (model) => ({ model, slot }),
+  ))
 }

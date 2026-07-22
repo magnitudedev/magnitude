@@ -64,3 +64,4 @@ export type ComposerProps = {
   selectedFileOpen: boolean
   onCloseFilePanel: () => void
 }
+

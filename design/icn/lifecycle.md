@@ -10,6 +10,11 @@ applies_to:
   - packages/acn/src/binary.ts
   - packages/acn/src/daemon-lifecycle.ts
   - packages/acn/src/model-configuration.ts
+  - packages/acn/src/provider-model-catalog.ts
+  - packages/acn/src/local-model-inventory.ts
+  - packages/acn/src/model-slot-coordinator.ts
+  - packages/acn/src/local-inference-hardware.ts
+  - packages/protocol/src/schemas/model-state.ts
   - packages/acn/scripts/build-binary.ts
   - inference/scripts/build-binary.ts
   - scripts/build-release-artifacts.ts
@@ -67,8 +72,9 @@ execution. The native binary is acquired by `@magnitudedev/icn` from the matchin
 it is not downloaded from a model repository and is not selected from a user-installed runtime.
 
 ACN owns the parent scope and application policy. It supplies ICN's storage roots and supported
-binary identity, translates persisted user choices into generated ICN requests, and binds canonical
-ICN observations to public mirrors without copying or reinterpreting their state.
+binary identity and translates private ICN observations into product-owned inventory, hardware,
+catalog, and slot mirrors. Raw ICN schemas and terminology remain private; ACN does not expose
+source-backed ICN mirrors to clients.
 
 ## Generated API boundary
 
@@ -290,9 +296,10 @@ mutations serialize behind protected inference leases. Serving-configuration
 changes invalidate target identity; subsequent completions realize the new revision. Restart is
 composition of unload and load when a caller truly needs it, not a separate ICN API.
 
-Runtime transitions are projected into model inventory. Listing models exposes loading, loaded,
-load-failed, and available state from the same authoritative coordinator, including transitions
-caused implicitly by a completion request.
+Runtime transitions remain visible in private ICN model listing. ACN projects their product
+consequence only into matching `ModelSlot` FSMs, including transitions caused implicitly by a
+completion request. Acquisition state remains in `LocalModelInventory`; no independent public
+runtime or residency resource exists.
 
 Replacing a model must not claim the new model is ready until its backend is usable. Failure leaves
 the runtime in an explicitly reported state and must not make requests route to a half-loaded

@@ -1,54 +1,47 @@
 import { useCallback, useMemo } from "react"
 import { Atom, Result, useAtomSet, useAtomValue, type Atom as EffectAtom } from "@effect-atom/atom-react"
-import { Cause, Option } from "effect"
 import {
-  IcnHardwareMirror,
-  IcnInventoryMirror,
-  ModelRecipesMirror,
-  ModelCatalogMirror,
+  LocalInferenceHardwareMirror,
+  LocalModelInventoryMirror,
   ModelSlotsMirror,
+  type LocalModelId,
+  type SlotId,
+  type SlotSelection,
 } from "@magnitudedev/sdk"
+import { Option } from "effect"
 import { useAgentClient } from "../state/agent-client-context"
-import { useMirroredStateAtom } from "./use-mirrored-state"
-import { deriveLocalInferenceView } from "../utils/local-inference-view"
+import type { LocalInferenceView } from "../types/local-inference"
+import { useMirroredState, useMirroredStateAtom } from "./use-mirrored-state"
 
-type HardwareSnapshot = typeof IcnHardwareMirror.snapshotSchema.Type
-type InventorySnapshot = typeof IcnInventoryMirror.snapshotSchema.Type
-type RecipesSnapshot = typeof ModelRecipesMirror.snapshotSchema.Type
-
-const requireResultValue = <A, E>(
-  observed: Result.Result<A, E>,
-): Result.Result<A, E> => Option.match(Option.fromNullable(observed), {
-  onNone: () => Result.initial(true),
-  onSome: (result) => Result.isSuccess(result)
-    ? Option.match(Option.fromNullable(result.value), {
-        onNone: () => Result.initial(true),
-        onSome: () => result,
-      })
-    : result,
-})
+type HardwareSnapshot = typeof LocalInferenceHardwareMirror.snapshotSchema.Type
+type InventorySnapshot = typeof LocalModelInventoryMirror.snapshotSchema.Type
+type SlotsSnapshot = typeof ModelSlotsMirror.snapshotSchema.Type
 
 export const makeLocalInferenceQueryAtom = <E>(
   hardware: EffectAtom.Atom<Result.Result<HardwareSnapshot, E>>,
   inventory: EffectAtom.Atom<Result.Result<InventorySnapshot, E>>,
-  recipes: EffectAtom.Atom<Result.Result<RecipesSnapshot, E>>,
+  slots: EffectAtom.Atom<Result.Result<SlotsSnapshot, E>>,
 ) => Atom.make((get) => Result.map(Result.all({
-  hardware: requireResultValue(get(hardware)),
-  inventory: requireResultValue(get(inventory)),
-  recipes: requireResultValue(get(recipes)),
-}), (snapshots) => deriveLocalInferenceView(
-  snapshots.hardware.state,
-  snapshots.inventory.state,
-  snapshots.recipes.state,
-)))
+  hardware: get(hardware),
+  inventory: get(inventory),
+  slots: get(slots),
+}), ({ hardware, inventory, slots }): LocalInferenceView => ({
+  hardware: hardware.state,
+  inventory: inventory.state,
+  slots: slots.state,
+})))
+
+export const useLocalInferenceHardware = () => useMirroredState(LocalInferenceHardwareMirror)
+export const useLocalModelInventory = () => useMirroredState(LocalModelInventoryMirror)
+export const useModelSlots = () => useMirroredState(ModelSlotsMirror)
 
 export function useLocalInferenceQuery() {
-  const hardware = useMirroredStateAtom(IcnHardwareMirror)
-  const inventory = useMirroredStateAtom(IcnInventoryMirror)
-  const recipes = useMirroredStateAtom(ModelRecipesMirror)
+  const hardware = useMirroredStateAtom(LocalInferenceHardwareMirror)
+  const inventory = useMirroredStateAtom(LocalModelInventoryMirror)
+  const slots = useMirroredStateAtom(ModelSlotsMirror)
   const state = useMemo(
-    () => makeLocalInferenceQueryAtom(hardware, inventory, recipes),
-    [hardware, inventory, recipes],
+    () => makeLocalInferenceQueryAtom(hardware, inventory, slots),
+    [hardware, inventory, slots],
   )
   return useAtomValue(state)
 }
@@ -56,71 +49,45 @@ export function useLocalInferenceQuery() {
 export function useLocalInferenceState() {
   const client = useAgentClient()
   const state = useLocalInferenceQuery()
-
   const downloadAtom = useMemo(() => client.mutation("DownloadLocalModel"), [client])
-  const activateAtom = useMemo(() => client.mutation("ActivateLocalModel"), [client])
   const deleteAtom = useMemo(() => client.mutation("DeleteLocalModel"), [client])
-  const restartAtom = useMemo(() => client.mutation("RestartLocalInference"), [client])
-  const disableAtom = useMemo(() => client.mutation("DisableLocalInference"), [client])
-
-  const mutationResults = [
-    useAtomValue(downloadAtom),
-    useAtomValue(activateAtom),
-    useAtomValue(deleteAtom),
-    useAtomValue(restartAtom),
-    useAtomValue(disableAtom),
-  ] as const
-  const pending = {
-    download: Result.isWaiting(mutationResults[0]),
-    activate: Result.isWaiting(mutationResults[1]),
-    delete: Result.isWaiting(mutationResults[2]),
-    restart: Result.isWaiting(mutationResults[3]),
-    disable: Result.isWaiting(mutationResults[4]),
-  } as const
-  const mutationFailure = mutationResults.reduce(
-    (failure, result) => Option.isSome(failure) || !Result.isFailure(result)
-      ? failure
-      : Option.some(Cause.pretty(result.cause)),
-    Option.none<string>(),
-  )
-
-  const downloadMutation = useAtomSet(downloadAtom)
-  const activateMutation = useAtomSet(activateAtom)
-  const deleteMutation = useAtomSet(deleteAtom)
-  const restartMutation = useAtomSet(restartAtom)
-  const disableMutation = useAtomSet(disableAtom)
-
-  const downloadModel = useCallback((configurationId: string): void => {
-    downloadMutation({ payload: { configurationId }, reactivityKeys: [IcnInventoryMirror.id] })
-  }, [downloadMutation])
-  const activateModel = useCallback((modelId: string): void => {
-    activateMutation({ payload: { modelId }, reactivityKeys: [IcnInventoryMirror.id] })
-  }, [activateMutation])
-  const deleteModel = useCallback((modelId: string): void => {
-    deleteMutation({
-      payload: { modelId },
-      reactivityKeys: [IcnInventoryMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
-    })
-  }, [deleteMutation])
-  const restart = useCallback((): void => {
-    restartMutation({ payload: {}, reactivityKeys: [IcnInventoryMirror.id] })
-  }, [restartMutation])
-  const disable = useCallback((): void => {
-    disableMutation({
-      payload: {},
-      reactivityKeys: [IcnInventoryMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
-    })
-  }, [disableMutation])
-
+  const loadAtom = useMemo(() => client.mutation("LoadModelSlot"), [client])
+  const unloadAtom = useMemo(() => client.mutation("UnloadModelSlot"), [client])
+  const reloadAtom = useMemo(() => client.mutation("ReloadModelSlot"), [client])
+  const downloadResult = useAtomValue(downloadAtom)
+  const deleteResult = useAtomValue(deleteAtom)
+  const loadResult = useAtomValue(loadAtom)
+  const unloadResult = useAtomValue(unloadAtom)
+  const reloadResult = useAtomValue(reloadAtom)
+  const download = useAtomSet(downloadAtom)
+  const remove = useAtomSet(deleteAtom)
+  const load = useAtomSet(loadAtom)
+  const unload = useAtomSet(unloadAtom)
+  const reload = useAtomSet(reloadAtom)
   return {
     state,
-    mutationResults,
-    pending,
-    mutationFailure,
-    downloadModel,
-    activateModel,
-    deleteModel,
-    restart,
-    disable,
+    mutationFailure: Option.fromNullable(
+      [downloadResult, deleteResult, loadResult, unloadResult, reloadResult].find(Result.isFailure),
+    ),
+    downloadModel: useCallback((localModelId: LocalModelId) => download({
+      payload: { localModelId },
+      reactivityKeys: [LocalModelInventoryMirror.id],
+    }), [download]),
+    deleteModel: useCallback((localModelId: LocalModelId) => remove({
+      payload: { localModelId },
+      reactivityKeys: [LocalModelInventoryMirror.id, ModelSlotsMirror.id],
+    }), [remove]),
+    loadSlot: useCallback((slotId: SlotId, selection: SlotSelection) => load({
+      payload: { slotId, selection },
+      reactivityKeys: [ModelSlotsMirror.id],
+    }), [load]),
+    unloadSlot: useCallback((slotId: SlotId) => unload({
+      payload: { slotId },
+      reactivityKeys: [ModelSlotsMirror.id],
+    }), [unload]),
+    reloadSlot: useCallback((slotId: SlotId) => reload({
+      payload: { slotId },
+      reactivityKeys: [ModelSlotsMirror.id],
+    }), [reload]),
   }
 }

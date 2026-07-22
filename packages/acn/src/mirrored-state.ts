@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, PubSub, Ref, Schema, Stream } from "effect"
+import { Context, Effect, Layer, PubSub, Schema, Stream, SubscriptionRef } from "effect"
 import type { MirroredSnapshot, MirroredStateInvalidation } from "@magnitudedev/protocol"
 
 export interface MirroredStateTransition<State, Result> {
@@ -9,6 +9,7 @@ export interface MirroredStateTransition<State, Result> {
 
 export interface MirroredState<State> {
   readonly get: Effect.Effect<MirroredSnapshot<State>>
+  readonly changes: Stream.Stream<MirroredSnapshot<State>>
   readonly modify: <Result>(
     f: (state: State) => MirroredStateTransition<State, Result>,
   ) => Effect.Effect<{ readonly snapshot: MirroredSnapshot<State>; readonly result: Result }>
@@ -59,25 +60,25 @@ export const makeMirroredState = <const Id extends string, State, StateEncoded, 
 ): Effect.Effect<MirroredState<State>, never, MirroredStateChanges> =>
   Effect.gen(function* () {
     const stateChanges = yield* MirroredStateChanges
-    const state = yield* Ref.make<MirroredSnapshot<State>>({ revision: 0, state: initial })
+    const state = yield* SubscriptionRef.make<MirroredSnapshot<State>>({ revision: 0, state: initial })
     const lock = yield* Effect.makeSemaphore(1)
 
-    const commit = (previous: MirroredSnapshot<State>, nextState: State) => Effect.gen(function* () {
+    const commit = (previous: MirroredSnapshot<State>, nextState: State) => Effect.uninterruptible(Effect.gen(function* () {
       const next: MirroredSnapshot<State> = {
         revision: previous.revision + 1,
         state: nextState,
       }
-      yield* Ref.set(state, next)
+      yield* SubscriptionRef.set(state, next)
       yield* stateChanges.publish({
         _tag: "changed",
         id: definition.id,
         revision: next.revision,
       })
       return next
-    })
+    }))
 
     const modify: MirroredState<State>["modify"] = (f) => lock.withPermits(1)(Effect.gen(function* () {
-      const previous = yield* Ref.get(state)
+      const previous = yield* SubscriptionRef.get(state)
       const transition = f(previous.state)
       if (transition.changed === false) return { snapshot: previous, result: transition.result }
       const next = yield* commit(previous, transition.state)
@@ -85,14 +86,15 @@ export const makeMirroredState = <const Id extends string, State, StateEncoded, 
     }))
 
     return {
-      get: Ref.get(state),
+      get: SubscriptionRef.get(state),
+      changes: state.changes,
       modify,
       update: (f) => lock.withPermits(1)(Effect.gen(function* () {
-        const previous = yield* Ref.get(state)
+        const previous = yield* SubscriptionRef.get(state)
         return yield* commit(previous, f(previous.state))
       })),
       setIfChanged: (nextState, equivalent) => lock.withPermits(1)(Effect.gen(function* () {
-        const previous = yield* Ref.get(state)
+        const previous = yield* SubscriptionRef.get(state)
         return equivalent(previous.state, nextState)
           ? previous
           : yield* commit(previous, nextState)

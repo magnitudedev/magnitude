@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
-  ProviderCatalogUnavailable,
   ProviderIdSchema,
+  type ProviderCatalogFailure,
 } from '@magnitudedev/sdk'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
 
-const failure = (providerId: string, message: string) => new ProviderCatalogUnavailable({
+const failure = (providerId: string, message: string): ProviderCatalogFailure => ({
+  _tag: 'ProviderFailure',
   providerId: ProviderIdSchema.make(providerId),
   message,
 })

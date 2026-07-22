@@ -1,4 +1,11 @@
 import { Schema } from "effect"
+import { ReasoningEffortSchema } from "@magnitudedev/ai"
+import {
+  ModelArtifactFingerprintSchema,
+  ModelRecipeCatalogModelIdSchema,
+  ModelRecipeConfigurationIdSchema,
+  NativeIcnModelIdSchema,
+} from "../provider/model-identity.js"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
@@ -21,14 +28,21 @@ export const ModelRecipeQuantization = Schema.Struct({
 export type ModelRecipeQuantization = Schema.Schema.Type<typeof ModelRecipeQuantization>
 
 export const ModelRecipeRecommendation = Schema.Struct({
-  configurationId: Schema.String,
-  catalogModelId: Schema.String,
-  artifactFingerprint: Schema.String,
-  modelId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  configurationId: ModelRecipeConfigurationIdSchema,
+  catalogModelId: ModelRecipeCatalogModelIdSchema,
+  artifactFingerprint: ModelArtifactFingerprintSchema,
+  modelId: Schema.optionalWith(NativeIcnModelIdSchema, { as: "Option", exact: true }),
   badge: Schema.Literal("recommended", "lighter", "higher_fidelity", "alternative"),
   displayName: Schema.String,
   family: Schema.String,
   architecture: Schema.Literal("dense", "moe"),
+  capabilities: Schema.Struct({
+    vision: Schema.Boolean,
+    tools: Schema.Boolean,
+    structuredOutput: Schema.Boolean,
+    reasoningEfforts: Schema.Array(ReasoningEffortSchema),
+    defaultReasoningEffort: Schema.optionalWith(ReasoningEffortSchema, { as: "Option", exact: true }),
+  }),
   totalParametersBillions: Schema.optionalWith(NonNegativeNumber, { as: "Option", exact: true }),
   activeParametersBillions: Schema.optionalWith(NonNegativeNumber, { as: "Option", exact: true }),
   effectiveParametersBillions: Schema.optionalWith(NonNegativeNumber, { as: "Option", exact: true }),
@@ -49,8 +63,7 @@ export const ModelRecipeRecommendation = Schema.Struct({
     url: Schema.String,
     acknowledgementRequired: Schema.Boolean,
   }),
-  contextTokens: PositiveInteger,
-  modelMaximumContextTokens: PositiveInteger,
+  contextWindow: PositiveInteger,
   estimatedRuntimeBytes: NonNegativeNumber,
   stableCapacityBudgetBytes: NonNegativeNumber,
   fitMarginBytes: Schema.Number.pipe(Schema.finite()),

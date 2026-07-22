@@ -1,11 +1,8 @@
-import { Array as Arr, Cause, Context, Effect, Layer, Match, Option, Predicate, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Match, Option, Schema, Stream } from "effect"
 import {
-  AVAILABLE_PROVIDER_MODEL,
   ModelCatalogError,
   ModelDiscoveryOperationIdSchema,
   ProviderModelIdSchema,
-  ReasoningEffortSchema,
-  ReasoningProperty,
   StreamClientCorrectnessViolation,
   StreamOperationalFailure,
   StreamProviderCorrectnessViolation,
@@ -13,7 +10,6 @@ import {
   StreamStartClientCorrectnessViolation,
   StreamStartOperationalFailure,
   StreamStartProviderCorrectnessViolation,
-  VisionProperty,
   acceptedHttpResponse,
   payloadSample,
   rejectedHttpResponse,
@@ -21,7 +17,7 @@ import {
   toCauseInfo,
   nativeChatCompletionsCodec,
   type BaseCallOptions,
-  type ChatCompletionsStreamChunk,
+  ChatCompletionsStreamChunk,
   type ProviderModelBindOptions,
   type ProviderId,
   type ProviderModelId,
@@ -33,13 +29,19 @@ import {
 } from "@magnitudedev/ai"
 import { IcnClient, type IcnClientService } from "../client.js"
 import * as Generated from "../generated/schemas.js"
-import type { GeneratedClientError } from "@magnitudedev/openapi-effect/client-runtime"
+import {
+  GeneratedClientInvalidResponseError,
+  type GeneratedClientError,
+} from "@magnitudedev/openapi-effect/client-runtime"
 import { IcnInventory } from "../inventory/index.js"
-import { LocalModelInfoSchema, LocalProviderId, type LocalModelInfo } from "./contract.js"
+import { IcnRecipes } from "../recipes/service.js"
 import type { LocalProviderSource } from "./provider.js"
-
-const PROVIDER_ID = LocalProviderId.make("local")
-const ZERO_PRICING = { input: 0, output: 0, cached_input: null } as const
+import {
+  NativeIcnModelIdSchema,
+  candidateLocalModelId,
+  localProviderModelId,
+  nativeLocalModelId,
+} from "./model-identity.js"
 
 const catalogError = <Cause>(
   message: string,
@@ -48,77 +50,6 @@ const catalogError = <Cause>(
   onNone: () => new ModelCatalogError({ message }),
   onSome: (value) => new ModelCatalogError({ message, cause: value }),
 })
-
-const isProviderReadyStatus = (availability: Generated.ModelAvailabilitySchema): boolean =>
-  availability.type === "available"
-
-const reasoningFor = (properties: Generated.InventoryPropertiesSchema) => {
-  if (properties.type !== "inspected" || properties.reasoning.type !== "supported") {
-    const effort = ReasoningEffortSchema.make("none")
-    return { defaultEffort: effort, property: new ReasoningProperty.states.Resolved({ value: [effort] }) }
-  }
-  const control = properties.reasoning.control
-  if (control.type === "effort" && control.levels.length > 0) {
-    const efforts = control.levels.map((level) => ReasoningEffortSchema.make(level))
-    const requested = Option.filter(
-      Option.map(Option.filter(control.default, Predicate.isNotNull), ReasoningEffortSchema.make),
-      (effort) => efforts.includes(effort),
-    )
-    const fallback = Option.getOrElse(
-      Arr.head(efforts),
-      () => ReasoningEffortSchema.make("none"),
-    )
-    const defaultEffort = Option.getOrElse(requested, () => fallback)
-    return { defaultEffort, property: new ReasoningProperty.states.Resolved({ value: efforts }) }
-  }
-  const efforts = ["none", "medium"].map((level) => ReasoningEffortSchema.make(level))
-  const defaultEffort = Option.getOrElse(
-    Arr.get(efforts, control.type === "toggle" && !control.default ? 0 : 1),
-    () => ReasoningEffortSchema.make("none"),
-  )
-  return { defaultEffort, property: new ReasoningProperty.states.Resolved({ value: efforts }) }
-}
-
-export const icnModelToProviderModel = (model: Generated.Model): LocalModelInfo => {
-  const inspected = model.properties.type === "inspected"
-    ? Option.some(model.properties)
-    : Option.none<Generated.InventoryPropertiesSchema & { readonly type: "inspected" }>()
-  const reasoning = reasoningFor(model.properties)
-  const serving = Option.filter(model.serving_configuration, Predicate.isNotNull)
-  const contextWindow = Option.getOrElse(
-    Option.orElse(
-      Option.map(serving, (configuration) => configuration.profile.context_length),
-      () => Option.flatMap(inspected, (properties) =>
-        Option.filter(properties.training_context_length, Predicate.isNotNull)),
-    ),
-    () => 131_072,
-  )
-  const displayName = Option.getOrElse(
-    Option.filter(
-      Option.map(Option.filter(model.name, Predicate.isNotNull), (name) => name.trim()),
-      (name) => name.length > 0,
-    ),
-    () => model.id,
-  )
-  return LocalModelInfoSchema.make({
-    providerId: PROVIDER_ID,
-    providerModelId: ProviderModelIdSchema.make(model.id),
-    displayName,
-    contextWindow: Math.max(1, contextWindow),
-    maxOutputTokens: Math.max(1, Math.min(32_768, contextWindow)),
-    defaultReasoningEffort: reasoning.defaultEffort,
-    properties: {
-      vision: new VisionProperty.states.Resolved({
-        value: Option.exists(inspected, (properties) => properties.modalities.includes("vision")),
-      }),
-      reasoning: reasoning.property,
-    },
-    availability: Option.isSome(serving) && isProviderReadyStatus(model.availability) && model.hardware.type === "fits"
-      ? AVAILABLE_PROVIDER_MODEL
-      : { _tag: "Disabled", reason: model.hardware.type === "does_not_fit" ? "insufficient_resources" : "model_unavailable" },
-    pricing: ZERO_PRICING,
-  })
-}
 
 type IcnClientError = GeneratedClientError<Generated.ErrorResponse>
 
@@ -241,6 +172,7 @@ const generatedBodyFailure = (
 const bindIcnModel = (
   client: IcnClientService,
   providerModelId: ProviderModelId,
+  contextWindow: number,
   bindOptions?: ProviderModelBindOptions,
 ) => Effect.succeed({
   stream: (prompt: Prompt, tools: readonly ToolDefinition[], requestOptions?: BaseCallOptions & { generateToolCallId?: () => ToolCallId }) => {
@@ -269,6 +201,10 @@ const bindIcnModel = (
         message: "Unable to encode the ICN chat request",
         evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
       })),
+      Effect.tap(() => client.models.configureModelServing({
+        path: { model_id: providerModelId },
+        payload: { context_length: contextWindow, parallel_sequences: 1 },
+      }).pipe(Effect.mapError((cause) => generatedStartFailure(call, cause)))),
       Effect.tap(() => bindOptions?.requestAttribution?.requestStarted ?? Effect.void),
       Effect.flatMap((payload) =>
         client.chat.createChatCompletion({ payload }).pipe(
@@ -276,7 +212,15 @@ const bindIcnModel = (
             Effect.map(({ status, headers, events }) => {
               const response = acceptedHttpResponse(status, headers)
               const chunks = events.pipe(
-                Stream.map((chunk) => Schema.encodeSync(Generated.ChatCompletionChunk)(chunk) as ChatCompletionsStreamChunk),
+                Stream.mapEffect((chunk) => Schema.encode(Generated.ChatCompletionChunk)(chunk).pipe(
+                  Effect.flatMap(Schema.decodeUnknown(ChatCompletionsStreamChunk)),
+                  Effect.mapError((cause) => new GeneratedClientInvalidResponseError({
+                    operationId: "createChatCompletion",
+                    status,
+                    message: "ICN chat chunk did not match the provider-neutral chat schema",
+                    cause: Option.some(cause),
+                  })),
+                )),
               )
               const decoded = nativeChatCompletionsCodec.decode(chunks, {
                 tools,
@@ -295,6 +239,27 @@ const bindIcnModel = (
   },
 })
 
+const bindMissingIcnModel = (providerModelId: ProviderModelId) => Effect.succeed({
+  stream: () => Effect.fail(new StreamStartClientCorrectnessViolation({
+    call: {
+      provider: "local",
+      model: providerModelId,
+      method: "POST",
+      url: `icn://chat/${encodeURIComponent(providerModelId)}`,
+    },
+    component: "request_builder",
+    message: `No native ICN identity is associated with local provider model ${providerModelId}`,
+    evidence: {
+      _tag: "UnexpectedDefectCaught",
+      cause: {
+        _tag: "ErrorCause",
+        name: "LocalModelIdentityNotFound",
+        message: `No native ICN identity is associated with ${providerModelId}`,
+      },
+    },
+  })),
+})
+
 export interface IcnProviderService extends LocalProviderSource {}
 
 export class IcnProvider extends Context.Tag("@magnitudedev/icn/IcnProvider")<
@@ -305,15 +270,36 @@ export class IcnProvider extends Context.Tag("@magnitudedev/icn/IcnProvider")<
 export const makeIcnProvider = (): Layer.Layer<
   IcnProvider,
   never,
-  IcnClient | IcnInventory
+  IcnClient | IcnInventory | IcnRecipes
 > => Layer.effect(
   IcnProvider,
   Effect.gen(function* () {
     const client = yield* IcnClient
     const inventory = yield* IcnInventory
-    const list = inventory.get.pipe(
-      Effect.map(({ state }) => state.data.map(icnModelToProviderModel)),
-    )
+    const recipes = yield* IcnRecipes
+    const associations = Effect.all({ inventory: inventory.get, recipes: recipes.get }).pipe(Effect.map(({ inventory, recipes }) => {
+      const recommendations = recipes.state._tag === "Ready" ? recipes.state.recommendations : []
+      const recommendationByNativeId = new Map(recommendations.flatMap((recommendation) => Option.match(
+        recommendation.modelId,
+        { onNone: () => [], onSome: (modelId) => [[modelId, recommendation] as const] },
+      )))
+      return inventory.state.data.flatMap((model) => {
+        const recommendation = recommendationByNativeId.get(NativeIcnModelIdSchema.make(model.id))
+        const contextWindow = recommendation?.contextWindow ?? (model.properties.type === "inspected"
+          ? Option.getOrUndefined(Option.filter(
+              Option.flatMap(model.properties.training_context_length, Option.fromNullable),
+              (value) => value > 0,
+            ))
+          : undefined)
+        if (contextWindow === undefined) return []
+        const localModelId = recommendation
+          ? candidateLocalModelId(recommendation)
+          : nativeLocalModelId(NativeIcnModelIdSchema.make(model.id))
+        const publicId = localProviderModelId(localModelId)
+        return [{ model, publicId, contextWindow }]
+      })
+    }))
+    const list = Effect.succeed([])
     const refresh = inventory.refresh.pipe(
       Effect.mapError((cause) => catalogError("Unable to refresh local models from ICN", cause)),
       Effect.zipRight(list),
@@ -321,19 +307,25 @@ export const makeIcnProvider = (): Layer.Layer<
     const catalog = {
       list,
       refresh,
-      get: (providerId: ProviderId, providerModelId: ProviderModelId) =>
-        providerId !== PROVIDER_ID
-          ? Effect.fail(catalogError(`Unknown local provider ${providerId}`))
-          : list.pipe(Effect.flatMap((models) => {
-            const model = models.find((candidate) => candidate.providerModelId === providerModelId)
-            return model
-              ? Effect.succeed(model)
-              : Effect.fail(catalogError(`Unknown local model ${providerModelId}`))
-          })),
+      get: (providerId: ProviderId, providerModelId: ProviderModelId) => Effect.fail(
+        catalogError(`Local provider catalog is product-owned; cannot look up ${providerId}/${providerModelId}`),
+      ),
     }
     return IcnProvider.of({
       catalog,
-      bindModel: (providerModelId, options) => bindIcnModel(client, providerModelId, options),
+      bindModel: (providerModelId, options) => associations.pipe(
+        Effect.flatMap((values) => {
+          const association = values.find((value) => value.publicId === providerModelId)
+          return association
+            ? bindIcnModel(
+                client,
+                ProviderModelIdSchema.make(association.model.id),
+                association.contextWindow,
+                options,
+              )
+            : bindMissingIcnModel(providerModelId)
+        }),
+      ),
       discoverModelProperties: () => Effect.succeed(ModelDiscoveryOperationIdSchema.make("icn-authoritative")),
       status: client.system.health({}).pipe(
         Effect.mapError(generatedClientErrorMessage),

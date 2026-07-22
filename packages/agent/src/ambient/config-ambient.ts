@@ -1,7 +1,7 @@
 import { Ambient } from '@magnitudedev/event-core'
 import { Effect } from 'effect'
 
-import type { ModelSummary, SlotStates } from '@magnitudedev/sdk'
+import type { ModelSlotsState, ProviderModelCatalogEntry } from '@magnitudedev/sdk'
 import { type SlotId } from '@magnitudedev/roles'
 import { type ReasoningEffort } from '@magnitudedev/ai'
 import {
@@ -83,36 +83,38 @@ export const ConfigAmbient = Ambient.define<ConfigState, never>({
 })
 
 export function buildConfigStateFromSlots(
-  catalogModels: readonly ModelSummary[],
-  slots: SlotStates,
+  catalogModels: readonly ProviderModelCatalogEntry[],
+  slots: ModelSlotsState['slots'],
   policy: ResolvedContextLimitPolicy,
   revision = 0,
 ): ConfigState {
   const buildSlot = (slotId: SlotId): AgentSlotState => {
     const slot = slots[slotId]
-    if (slot._tag !== 'Ready') {
+    if (slot._tag === 'Unassigned') {
       return { _tag: 'Unavailable', slotId, reason: slot._tag }
     }
-    const hardCap = slot.contextWindow - OUTPUT_TOKEN_RESERVE
-    const { softCap } = computeContextLimits(hardCap, policy)
     const selectedModel = catalogModels.find((model) => model.providerId === slot.selection.providerId
       && model.providerModelId === slot.selection.providerModelId)
-    const visionProperty = selectedModel?.properties.vision
-    const vision = visionProperty?._tag === 'Cached' || visionProperty?._tag === 'Resolved' || visionProperty?._tag === 'Refreshing'
-      ? visionProperty.value
-      : undefined
+    if (!selectedModel) {
+      return { _tag: 'Unavailable', slotId, reason: 'catalog_model_missing' }
+    }
+    const hardCap = selectedModel.contextWindow - OUTPUT_TOKEN_RESERVE
+    const { softCap } = computeContextLimits(hardCap, policy)
     return {
       _tag: 'Ready',
       config: {
         slotId,
         providerId: slot.selection.providerId,
         providerModelId: slot.selection.providerModelId,
-        profile: { contextWindow: slot.contextWindow, maxOutputTokens: slot.maxOutputTokens },
-        vision,
+        profile: {
+          contextWindow: selectedModel.contextWindow,
+          maxOutputTokens: selectedModel.maxOutputTokens,
+        },
+        vision: selectedModel.capabilities.vision,
         hardCap,
         softCap,
         reasoningEffort: slot.selection.reasoningEffort,
-        isUserOverride: slot.source === 'user',
+        isUserOverride: true,
         isFallback: false,
       },
     }

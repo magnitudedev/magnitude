@@ -48,6 +48,7 @@ describe("aggregated model catalog", () => {
         vision: new VisionProperty.states.Resolved({ value: false }),
         reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make("none")] }),
       },
+      servingCapabilities: { tools: true, structuredOutput: false },
       availability: { _tag: "Available" },
       pricing: { input: 0, output: 0, cached_input: null },
     }

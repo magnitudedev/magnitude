@@ -8,7 +8,7 @@ import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
 import { deriveHardwareMemoryView, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
-import { ModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type SlotId } from '@magnitudedev/sdk'
+import { PRIMARY_SLOT_ID, ProviderModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
 import { describeLocalHardware } from '../local-inference/view-model'
@@ -44,13 +44,17 @@ type DropdownTarget =
   | { slotId: SlotId; field: 'thinking' }
   | null
 
+type DropdownItem =
+  | { readonly kind: 'model'; readonly id: ProviderModelId; readonly providerId: ProviderId; readonly label: string; readonly disabled: boolean }
+  | { readonly kind: 'reasoning'; readonly id: ReasoningEffort; readonly label: string }
+
 function formatContextWindow(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
   if (tokens >= 1_000) return `${Math.round(tokens / 1000)}K`
   return `${tokens}`
 }
 
-function formatPricing(pricing: { input: number; output: number; cachedInput?: number }): string {
+function formatPricing(pricing: { input: number; output: number }): string {
   return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
 }
 
@@ -85,9 +89,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const theme = useTheme()
   const localInferenceState = useLocalInferenceQuery()
   const localInferenceSnapshot = Result.value(localInferenceState)
-  const host = Option.map(localInferenceSnapshot, (state) => state.host)
-  const hardware = Option.map(host, describeLocalHardware)
-  const hardwareMemory = Option.map(host, deriveHardwareMemoryView)
+  const hardwareState = Option.map(localInferenceSnapshot, (state) => state.hardware)
+  const hardware = Option.map(hardwareState, describeLocalHardware)
+  const hardwareMemory = Option.map(hardwareState, deriveHardwareMemoryView)
   const [mode, setMode] = useState<Mode>('view')
   const [inputValue, setInputValue] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -96,40 +100,40 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
   const catalogSnapshot = modelConfig ? Result.value(modelConfig.catalog) : Option.none()
   const catalogState = Option.map(catalogSnapshot, ({ state }) => state)
-  const models = Option.getOrNull(Option.flatMap(catalogState, (state) => ModelCatalogLifecycle.match(state, {
-    loading: () => Option.none(),
-    ready: ({ models }) => Option.some(models),
-    refreshing: ({ models }) => Option.some(models),
-    degraded: ({ models }) => Option.some(models),
-    unavailable: () => Option.none(),
+  const models = Option.getOrNull(Option.flatMap(catalogState, (state) => ProviderModelCatalogLifecycle.match(state, {
+    Loading: () => Option.none(),
+    Ready: ({ models }) => Option.some(models),
+    Refreshing: ({ models }) => Option.some(models),
+    Degraded: ({ models }) => Option.some(models),
+    Unavailable: () => Option.none(),
   })))
-  const providers = Option.getOrNull(Option.flatMap(catalogState, (state) => ModelCatalogLifecycle.match(state, {
-    loading: () => Option.none(),
-    ready: ({ providers }) => Option.some(providers),
-    refreshing: ({ providers }) => Option.some(providers),
-    degraded: ({ providers }) => Option.some(providers),
-    unavailable: ({ providers }) => Option.some(providers),
+  const providers = Option.getOrNull(Option.flatMap(catalogState, (state) => ProviderModelCatalogLifecycle.match(state, {
+    Loading: () => Option.none(),
+    Ready: ({ providers }) => Option.some(providers),
+    Refreshing: ({ providers }) => Option.some(providers),
+    Degraded: ({ providers }) => Option.some(providers),
+    Unavailable: ({ providers }) => Option.some(providers),
   })))
-  const catalogFailures = Option.getOrElse(Option.map(catalogState, (state) => ModelCatalogLifecycle.match(state, {
-    loading: () => [] as readonly ProviderCatalogFailure[],
-    ready: () => [] as readonly ProviderCatalogFailure[],
-    refreshing: ({ failures }) => failures,
-    degraded: ({ failures }) => failures,
-    unavailable: ({ failures }) => failures,
+  const catalogFailures = Option.getOrElse(Option.map(catalogState, (state) => ProviderModelCatalogLifecycle.match(state, {
+    Loading: () => [] as readonly ProviderCatalogFailure[],
+    Ready: () => [] as readonly ProviderCatalogFailure[],
+    Refreshing: ({ failures }) => failures,
+    Degraded: ({ failures }) => failures,
+    Unavailable: ({ failures }) => failures,
   })), () => [] as readonly ProviderCatalogFailure[])
   const slotsSnapshot = modelConfig ? Result.value(modelConfig.slots) : Option.none()
   const slotsState = Option.map(slotsSnapshot, ({ state }) => state)
   const catalogLoading = Option.match(catalogState, {
     onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
-    onSome: (state) => ModelCatalogLifecycle.is(state, 'loading'),
+    onSome: (state) => ProviderModelCatalogLifecycle.is(state, 'Loading'),
   })
   const catalogRefreshing = modelConfig !== undefined && (
     Result.isWaiting(modelConfig.catalogRefresh)
-    || Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, 'refreshing'))
+    || Option.exists(catalogState, (state) => ProviderModelCatalogLifecycle.is(state, 'Refreshing'))
   )
   const catalogUnavailable = Option.exists(
     catalogState,
-    (state) => ModelCatalogLifecycle.is(state, 'unavailable'),
+    (state) => ProviderModelCatalogLifecycle.is(state, 'Unavailable'),
   )
   const catalogFailureNotice = getCatalogFailureNotice(catalogFailures, catalogUnavailable)
   const noModelsConfigured = slots.every((slot) => slot.modelDisplayName === null)
@@ -217,13 +221,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     ({ catalog, slots }) => selectedSlotModel(catalog, slots, slotId),
   ), [catalogState, slotsState])
 
-  const dropdownItems = useMemo(() => {
+  const dropdownItems = useMemo<readonly DropdownItem[]>(() => {
     if (!dropdownTarget) return []
     if (dropdownTarget.field === 'model') {
       return (models ?? []).map(m => ({
+        kind: 'model' as const,
         id: m.providerModelId,
         providerId: m.providerId,
-        label: `${m.displayName} · ${formatContextWindow(m.contextWindow)} ctx${m.pricing ? ` · ${formatPricing(m.pricing)}` : ''}${m.availability._tag === 'Disabled' ? ` · ${disabledReasonLabel(m.availability.reason)}` : ''}`,
+        label: `${m.displayName} · ${formatContextWindow(m.contextWindow)} ctx${Option.match(m.pricing, { onNone: () => '', onSome: (pricing) => ` · ${formatPricing(pricing)}` })}${m.availability._tag === 'Disabled' ? ` · ${disabledReasonLabel(m.availability.reason)}` : ''}`,
         disabled: m.availability._tag === 'Disabled',
       }))
     }
@@ -232,7 +237,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       onSome: ({ model }) => {
         const control = reasoningEffortControl(model)
         return control._tag === 'Available'
-          ? control.options.map((option) => ({ id: option.value, label: option.label }))
+          ? control.options.map((option) => ({ kind: 'reasoning' as const, id: option.value, label: option.label }))
           : []
       },
     })
@@ -255,14 +260,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       void modelConfig.updateSlotModel(dropdownTarget.slotId, model.providerId, model.providerModelId)
     } else {
       const option = dropdownItems[index]
-      if (!option) return
+      if (!option || option.kind !== 'reasoning') return
       void modelConfig.updateSlotReasoning(dropdownTarget.slotId, option.id)
     }
     closeDropdown()
   }, [dropdownItems, dropdownTarget, modelConfig, models, closeDropdown])
 
   const unavailableProviders = providers?.filter((provider) =>
-    provider.status && provider.status !== 'ok'
+    provider.availability._tag !== 'Available'
   ) ?? []
 
   useKeyboard(useCallback((key: KeyEvent) => {
@@ -344,9 +349,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             }}>
               <text style={{ fg: theme.foreground }}><span attributes={TextAttributes.BOLD}>{detected.system.name}</span></text>
               <text style={{ fg: theme.muted }}>{detected.system.details[0]}</text>
-              {Option.getOrNull(Option.map(host, (profile) => {
-                const backends = [...new Set(profile.memoryDomains.flatMap((domain) => domain.backendNames))]
-                const gpuCount = profile.memoryDomains.filter((domain) => domain.kind === 'physical_device').length
+              {Option.getOrNull(Option.map(hardwareState, (profile) => {
+                const backends = [...new Set(profile.accelerators.map((accelerator) => accelerator.backend))]
+                const gpuCount = profile.memoryDomains.filter((domain) => domain.kind === 'PhysicalDevice').length
                 return backends.length > 0
                   ? <text style={{ fg: theme.muted }}>{backends.join(' + ')} acceleration{gpuCount > 1 ? ` · ${gpuCount} GPUs` : ''}</text>
                   : null
@@ -354,7 +359,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               {Option.getOrNull(Option.map(hardwareMemory, (memory) => memory.domains.map((domain) => (
                 <HardwareMemoryDomain key={domain.id} domain={domain} />
               ))))}
-              {detected.accelerators.length === 0 && Option.exists(host, (profile) => !profile.memoryDomains.some((domain) => domain.kind === 'unified_memory')) && (
+              {detected.accelerators.length === 0 && Option.exists(hardwareState, (profile) => !profile.memoryDomains.some((domain) => domain.kind === 'UnifiedMemory')) && (
                 <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
               )}
             </box>
@@ -547,13 +552,15 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       {/* Slot cards with inline dropdowns */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
         {unavailableProviders.map((provider) => (
-          <box key={provider.id} style={{ paddingBottom: 1 }}>
-            <text style={{ fg: provider.status === 'error' ? theme.error : theme.warning }}>
-              {provider.status === 'not_found'
-                ? `${provider.displayName} not detected.${provider.hint ? ` ${provider.hint}` : ''}`
-                : provider.status === 'loading'
-                  ? provider.message ?? `${provider.displayName} is loading models...`
-                  : `${provider.displayName}: ${provider.message ?? 'Unknown provider error'}`}
+          <box key={provider.providerId} style={{ paddingBottom: 1 }}>
+            <text style={{ fg: provider.availability._tag === 'Failed' ? theme.error : theme.warning }}>
+              {provider.availability._tag === 'NotFound'
+                ? `${provider.displayName} not detected.${Option.match(provider.availability.hint, { onNone: () => '', onSome: (hint) => ` ${hint}` })}`
+                : provider.availability._tag === 'Loading'
+                  ? Option.getOrElse(provider.availability.message, () => `${provider.displayName} is loading models...`)
+                  : provider.availability._tag === 'Failed'
+                    ? `${provider.displayName}: ${provider.availability.message}`
+                    : ''}
             </text>
           </box>
         ))}
@@ -591,11 +598,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           </box>
         )}
         {([
-          'primary',
+          PRIMARY_SLOT_ID,
           // 'secondary', // Secondary model settings are temporarily hidden.
         ] as const).map((slotId) => {
-          const label = SLOT_DISPLAY_NAMES[slotId]
-          const description = SLOT_DESCRIPTIONS[slotId]
+          const slotName = slotId === PRIMARY_SLOT_ID ? 'primary' : 'secondary'
+          const label = SLOT_DISPLAY_NAMES[slotName]
+          const description = SLOT_DESCRIPTIONS[slotName]
           const selected = selectedForSlot(slotId)
           const modelLabel = Option.match(selected, { onNone: () => '—', onSome: ({ model }) => model.displayName })
           const thinkingLabel = Option.match(selected, {
@@ -659,9 +667,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                             </text>
                           ) : dropdownItems.map((item, index) => {
                             const sel = index === dropdownIndex
-                            const itemDisabled = 'disabled' in item && item.disabled
+                            const itemDisabled = item.kind === 'model' && item.disabled
                             return (
-                              <Button key={`${'providerId' in item ? item.providerId : 'model'}:${item.id}`} onClick={() => { if (!itemDisabled) selectDropdownItem(index) }} onMouseOver={() => setDropdownIndex(index)}
+                              <Button key={`${item.kind === 'model' ? item.providerId : 'reasoning'}:${item.id}`} onClick={() => { if (!itemDisabled) selectDropdownItem(index) }} onMouseOver={() => setDropdownIndex(index)}
                                 style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.terminalDetectedBg }}>
                                 <text style={{ fg: itemDisabled ? theme.muted : sel ? theme.primary : theme.foreground, overflow: 'hidden' }}>
                                   {sel ? '▸ ' : '  '}{item.label.length > maxLen - 2 ? item.label.slice(0, maxLen - 3) + '…' : item.label}

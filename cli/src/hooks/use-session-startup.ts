@@ -240,3 +240,4 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   )
   useAtomMount(initialWorkAtom)
 }
+

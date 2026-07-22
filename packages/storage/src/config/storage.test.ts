@@ -3,10 +3,18 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option } from "effect"
+import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/ai"
+import { SlotIdSchema } from "../types/config"
 import { makeGlobalStoragePaths } from "../paths"
 import { GlobalStorage } from "../services"
 import { makeConfigStorage } from "./storage"
+
+const selection = (providerId: string, providerModelId: string) => ({
+  providerId: ProviderIdSchema.make(providerId),
+  providerModelId: ProviderModelIdSchema.make(providerModelId),
+  reasoningEffort: ReasoningEffortSchema.make("high"),
+})
 
 describe("config storage onboarding state", () => {
   let root: string
@@ -33,35 +41,28 @@ describe("config storage onboarding state", () => {
         ...current,
         models: {
           slots: {
-            primary: { providerId: "local", providerModelId: "model" },
-            secondary: { providerId: "local", providerModelId: "model" },
+            primary: Option.some(selection("local", "model")),
+            secondary: Option.some(selection("local", "model")),
           },
+          localModelRecency: { primary: [], secondary: [] },
         },
-        localInference: {
-          selectedProfile: {
-            configurationId: "configuration",
-            catalogModelId: "catalog-model",
-            contextTokens: 100_000,
-          },
-        },
+        futureDomain: { enabled: true },
       }))
       yield* config.completeOnboardingFlow("model_setup", 2, "2026-07-14T22:00:00.000Z")
       return yield* config.load()
     }).pipe(Effect.provide(base)))
 
-    expect(result.models?.slots?.primary).toEqual({ providerId: "local", providerModelId: "model" })
-    expect(result.localInference?.selectedProfile).toEqual({
-      configurationId: "configuration",
-      catalogModelId: "catalog-model",
-      contextTokens: 100_000,
-    })
+    expect(Option.getOrThrow(Option.flatMap(Option.fromNullable(result.models), (models) =>
+      models.slots.primary))).toEqual(selection("local", "model"))
+    const persisted = await Bun.file(makeGlobalStoragePaths(root).configFile).json()
+    expect(persisted.futureDomain).toEqual({ enabled: true })
     expect(result.onboarding?.completions?.model_setup).toEqual({
       version: 2,
       completedAt: "2026-07-14T22:00:00.000Z",
     })
   })
 
-  test("recovers stale onboarding without replacing valid sibling domains", async () => {
+  test("recovers stale onboarding and discards incomplete canonical selections", async () => {
     const paths = makeGlobalStoragePaths(root)
     await Bun.write(paths.configFile, JSON.stringify({
       models: {
@@ -74,9 +75,6 @@ describe("config storage onboarding state", () => {
           model_setup: { completedAt: "2026-07-14T22:00:00.000Z" },
         },
       },
-      localInference: {
-        usage: { sessionConcurrency: "one" },
-      },
       futureDomain: { enabled: true },
     }))
 
@@ -88,40 +86,35 @@ describe("config storage onboarding state", () => {
     }).pipe(Effect.provide(makeBase())))
 
     expect(result.onboarding?.completions?.model_setup).toBeUndefined()
-    expect(result.loaded.models?.slots?.primary).toEqual({
-      providerId: "local",
-      providerModelId: "model",
-    })
-    // Unknown legacy fields remain round-trippable even though runtime code no longer reads them.
-    expect(result.loaded.localInference).toEqual({
-      usage: { sessionConcurrency: "one" },
-    })
-
+    expect(Option.flatMap(Option.fromNullable(result.loaded.models), (models) =>
+      models.slots.primary)).toEqual(Option.none())
     const persisted = await Bun.file(paths.configFile).json()
     expect(persisted.onboarding?.completions?.model_setup).toBeUndefined()
     expect(persisted.futureDomain).toEqual({ enabled: true })
   })
 
-  test("recovers an invalid model-slot leaf without replacing sibling slots", async () => {
+  test("discards an invalid model-slot leaf without replacing a valid sibling slot", async () => {
     const paths = makeGlobalStoragePaths(root)
     await Bun.write(paths.configFile, JSON.stringify({
       models: {
         slots: {
           primary: { providerId: 42, providerModelId: "primary-model" },
-          secondary: { providerId: "cloud", providerModelId: "secondary-model" },
+          secondary: { providerId: "cloud", providerModelId: "secondary-model", reasoningEffort: "high" },
         },
       },
     }))
 
     const models = await Effect.runPromise(Effect.gen(function* () {
       const config = yield* makeConfigStorage()
-      return yield* config.getModelConfig()
+      return (yield* config.load()).models ?? null
     }).pipe(Effect.provide(makeBase())))
 
-    expect(models?.slots?.primary).toEqual({ providerModelId: "primary-model" })
-    expect(models?.slots?.secondary).toEqual({
+    expect(Option.flatMap(Option.fromNullable(models), (value) => value.slots.primary)).toEqual(Option.none())
+    expect(Option.getOrThrow(Option.flatMap(Option.fromNullable(models), (value) =>
+      value.slots.secondary))).toEqual({
       providerId: "cloud",
       providerModelId: "secondary-model",
+      reasoningEffort: "high",
     })
   })
 
@@ -129,7 +122,11 @@ describe("config storage onboarding state", () => {
     const paths = makeGlobalStoragePaths(root)
     await Bun.write(paths.configFile, JSON.stringify({
       onboarding: { completions: { model_setup: { completedAt: "old" } } },
-      models: { localSlotIntent: { primary: "local" } },
+      models: { slots: { primary: {
+        providerId: "local",
+        providerModelId: "local:model",
+        reasoningEffort: "high",
+      } } },
     }))
 
     const loaded = await Effect.runPromise(Effect.gen(function* () {
@@ -142,7 +139,8 @@ describe("config storage onboarding state", () => {
       version: 3,
       completedAt: "2026-07-15T23:00:00.000Z",
     })
-    expect(loaded.models?.localSlotIntent?.primary).toBe("local")
+    expect(Option.getOrThrow(Option.flatMap(Option.fromNullable(loaded.models), (models) =>
+      models.slots.primary)).providerModelId).toBe("local:model")
   })
 
   test("backs up malformed JSON and resets to the root default", async () => {
@@ -187,14 +185,39 @@ describe("config storage onboarding state", () => {
 
     await Effect.runPromise(Effect.gen(function* () {
       const config = yield* makeConfigStorage()
-      yield* config.updateModelConfig({
-        primary: { providerId: "local", providerModelId: "model" },
-      })
+      yield* config.updateModelSlot(
+        SlotIdSchema.make("primary"),
+        Option.some(selection("local", "model")),
+      )
     }).pipe(Effect.provide(makeBase())))
 
     const persisted = await Bun.file(paths.configFile).json()
     expect(persisted.futureDomain).toEqual({ value: 42 })
     expect(persisted.models.slots.primary.providerModelId).toBe("model")
+  })
+
+  test("discards removed model configuration without erasing unrelated unknown fields", async () => {
+    const paths = makeGlobalStoragePaths(root)
+    await Bun.write(paths.configFile, JSON.stringify({
+      futureDomain: { value: 42 },
+      localInference: { selectedProfile: { configurationId: "legacy" } },
+      models: {
+        slots: {},
+        localSlotIntent: { primary: "local" },
+        localModelRecency: { primary: ["local:recent"], secondary: [] },
+      },
+    }))
+
+    await Effect.runPromise(Effect.gen(function* () {
+      const config = yield* makeConfigStorage()
+      yield* config.load()
+    }).pipe(Effect.provide(makeBase())))
+
+    const persisted = await Bun.file(paths.configFile).json()
+    expect(persisted).not.toHaveProperty("localInference")
+    expect(persisted.models).not.toHaveProperty("localSlotIntent")
+    expect(persisted.models.localModelRecency).toEqual({ primary: ["local:recent"], secondary: [] })
+    expect(persisted.futureDomain).toEqual({ value: 42 })
   })
 
   test("serializes concurrent recovery-capable config updates", async () => {

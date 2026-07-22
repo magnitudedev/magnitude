@@ -1,11 +1,12 @@
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { PromptBuilder, ProviderModelIdSchema } from "@magnitudedev/ai"
-import { Effect, Either, Layer } from "effect"
+import { Effect, Exit, Layer, Option, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { IcnClient } from "../client.js"
 import { makeIcnApiClient } from "../generated/client.js"
 import { IcnInventory, makeIcnInventory } from "../inventory/index.js"
+import { IcnRecipes } from "../recipes/service.js"
 import { IcnProvider, makeIcnProvider } from "./source.js"
 
 const TEST_BASE_URL = "http://icn.test"
@@ -19,7 +20,13 @@ const makeTestLayer = (http: HttpClient.HttpClient) => {
   const inventoryLayer = makeIcnInventory({
     refreshInterval: "1 hour",
   }).pipe(Layer.provide(clientLayer))
-  const dependencies = Layer.merge(clientLayer, inventoryLayer)
+  const recipesLayer = Layer.succeed(IcnRecipes, IcnRecipes.of({
+    get: Effect.succeed({ revision: 0, state: { _tag: "Loading" } }),
+    changes: Stream.empty,
+    refresh: Effect.void,
+    resolve: () => Effect.succeed(Option.none()),
+  }))
+  const dependencies = Layer.mergeAll(clientLayer, inventoryLayer, recipesLayer)
 
   return makeIcnProvider().pipe(
     Layer.provide(dependencies),
@@ -57,33 +64,21 @@ describe("ICN local provider", () => {
     }).pipe(Effect.provide(makeTestLayer(http))))
   })
 
-  it("preserves an ICN HTTP rejection as a stream-start provider rejection", async () => {
-    const http = HttpClient.make((request) => Effect.succeed(
-      request.url.endsWith("/v1/chat/completions")
-        ? jsonResponse(
-          request,
-          JSON.stringify({
-            error: {
-              message: "assistant messages require content, reasoning_content, or tool_calls",
-              type: "invalid_request_error",
-              code: "invalid_request",
-            },
-          }),
-          400,
-        )
-        : jsonResponse(request, '{"object":"list","data":[]}'),
-    ))
+  it("fails before inference when a public model has no native association", async () => {
+    let chatRequests = 0
+    const http = HttpClient.make((request) => {
+      if (request.url.endsWith("/v1/chat/completions")) chatRequests += 1
+      return Effect.succeed(jsonResponse(request, '{"object":"list","data":[]}'))
+    })
     const modelId = ProviderModelIdSchema.make("mdl_test")
-    const prompt = PromptBuilder.empty().user("hello").build()
 
-    const result = await Effect.runPromise(Effect.gen(function* () {
+    const result = await Effect.runPromiseExit(Effect.gen(function* () {
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId)
-      return yield* bound.stream(prompt, []).pipe(Effect.either)
+      return yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
     }).pipe(Effect.provide(makeTestLayer(http))))
 
-    expect(Either.isLeft(result)).toBe(true)
-    if (Either.isRight(result)) return
-    expect(result.left._tag).toBe("StreamStartProviderRejection")
+    expect(Exit.isFailure(result)).toBe(true)
+    expect(chatRequests).toBe(0)
   })
 })

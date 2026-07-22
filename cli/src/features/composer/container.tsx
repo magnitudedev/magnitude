@@ -27,7 +27,6 @@ import {
   type CommandContext,
 } from '@magnitudedev/client-common'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
-import { ROLE_TO_SLOT } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
 import { cloudModelsOpenAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
@@ -96,7 +95,7 @@ export function ComposerContainer({
   }
 
   const { interrupt, interruptAll } = useInterruptActions()
-  const { profiles, rootRoleLabel, rootProfile } = useSlotProfiles()
+  const { rootRoleLabel, rootProfile } = useSlotProfiles()
 
   const rootTimeline = useDisplayState((state) => getFork(state, null) ?? null)
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
@@ -105,9 +104,7 @@ export function ComposerContainer({
     [rootTimeline?.messages],
   )
   const context = rootActor?.context ?? null
-  // Leader maps to primary slot
-  const primarySlot = ROLE_TO_SLOT.leader
-  const contextHardCap = profiles?.[primarySlot]?.contextWindow ?? null
+  const contextHardCap = rootProfile?.contextWindow ?? null
   const tokenUsage = context && context.tokenEstimate > 0 ? context.tokenEstimate : null
 
   // Reserve footer width so attachments don't reflow when hints appear.

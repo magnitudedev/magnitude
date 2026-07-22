@@ -3,9 +3,9 @@ import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { testRender } from "@opentui/react/test-utils"
 import { act } from "react"
-import type { LocalInferenceState } from "@magnitudedev/client-common"
+import { LocalInferenceAcceleratorIdSchema, LocalInferenceMemoryDomainIdSchema } from "@magnitudedev/sdk"
+import { GIB, makeHardware, makeView } from "../local-inference/test-fixtures"
 
-const gib = 1024 ** 3
 const textPosition = (frame: string, needle: string) => {
   const lines = frame.split("\n")
   const y = lines.findIndex((line) => line.includes(needle))
@@ -13,43 +13,41 @@ const textPosition = (frame: string, needle: string) => {
   return { x: lines[y]!.indexOf(needle), y }
 }
 
-const localInferenceState = {
-  activeBinding: null,
-  host: {
-    platform: "macos",
-    architecture: "aarch64",
-    topologyFingerprint: "test",
-    systemMemoryBytes: 64 * gib,
-    cpuModel: "Apple M4 Max",
-    logicalCores: 16,
-    memoryDomains: [{
-      id: "system",
-      kind: "unified_memory",
-      totalCapacityBytes: 64 * gib,
-      stableCapacityBytes: 51.2 * gib,
-      currentFreeBytes: 12 * gib,
-      sharesSystemMemory: true,
-      backendNames: ["Metal"],
-      deviceNames: ["Apple M4 Max"],
-      splitGroupId: null,
+const memoryDomainId = LocalInferenceMemoryDomainIdSchema.make("system")
+const localInferenceState = makeView({
+  entries: [],
+  ready: false,
+  hardware: makeHardware({
+    platform: "MacOS",
+    architecture: "Arm64",
+    processor: Option.some("Apple M4 Max"),
+    totalSystemMemoryBytes: 64 * GIB,
+    availableSystemMemoryBytes: Option.some(12 * GIB),
+    accelerators: [{
+      acceleratorId: LocalInferenceAcceleratorIdSchema.make("metal"),
+      name: "Apple M4 Max",
+      backend: "Metal",
+      memoryDomainId,
     }],
-    residentMemory: {
-      modelId: "model",
-      runtimeGeneration: 1,
+    memoryDomains: [{
+      memoryDomainId,
+      kind: "UnifiedMemory",
+      totalBytes: 64 * GIB,
+      stableCapacityBytes: 51.2 * GIB,
+      availableBytes: Option.some(12 * GIB),
+      sharesSystemMemory: true,
+    }],
+    residentMemory: Option.some({
       domains: [{
-        memoryDomainId: "system",
-        modelBytes: 27 * gib,
-        contextBytes: 6 * gib,
-        computeBytes: 1.5 * gib,
-        auxiliaryBytes: 0.5 * gib,
+        memoryDomainId,
+        modelBytes: 27 * GIB,
+        contextBytes: 6 * GIB,
+        computeBytes: 1.5 * GIB,
+        auxiliaryBytes: 0.5 * GIB,
       }],
-    },
-  },
-  choices: [],
-  operations: [],
-  recommendationState: { _tag: "Ready", recommendations: [] },
-  warnings: [],
-} as const satisfies LocalInferenceState
+    }),
+  }),
+})
 
 vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   ...await importOriginal<typeof import("@magnitudedev/client-common")>(),

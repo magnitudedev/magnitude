@@ -16,8 +16,10 @@ import {
   useDisplayViewController,
   selectedCwdAtom,
   useTimelineStatus,
+  findSlotProfile,
 } from '@magnitudedev/client-common'
-import { forkIdToKey, ROLE_TO_SLOT, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, type SlotId } from '@magnitudedev/sdk'
+import { forkIdToKey, PRIMARY_SLOT_ID, ROLE_TO_SLOT, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, isRoleId, SECONDARY_SLOT_ID, type SlotId } from '@magnitudedev/sdk'
+import { Option } from 'effect'
 import { showRecentChatsOverlayAtom, authSourceAtom, cloudModelsOpenAtom, modelSetupRouteAtom } from '../../state/cli-atoms'
 import type { ActionId } from '../../types/ui-actions'
 import { deriveSettingsAuthInfo, type AuthInfo } from './auth-display'
@@ -93,13 +95,15 @@ export function AppOverlaysContainer({
 
   const slots = useMemo(() => {
     return ([
-      'primary',
+      PRIMARY_SLOT_ID,
       // 'secondary', // Secondary model settings are temporarily hidden.
     ] as const).map((slotId) => ({
       slotId,
-      label: SLOT_DISPLAY_NAMES[slotId],
-      description: SLOT_DESCRIPTIONS[slotId],
-      modelDisplayName: profiles?.[slotId]?.modelDisplayName ?? null,
+      label: SLOT_DISPLAY_NAMES[slotId === PRIMARY_SLOT_ID ? 'primary' : 'secondary'],
+      description: SLOT_DESCRIPTIONS[slotId === PRIMARY_SLOT_ID ? 'primary' : 'secondary'],
+      modelDisplayName: profiles
+        ? Option.getOrNull(Option.map(findSlotProfile(profiles, slotId), ({ modelDisplayName }) => modelDisplayName))
+        : null,
     }))
   }, [profiles])
 
@@ -147,10 +151,16 @@ export function AppOverlaysContainer({
   }
 
   // Fork detail
-  const forkSlot: SlotId | null = forkActor && isRoleId(forkActor.role) ? ROLE_TO_SLOT[forkActor.role] : null
+  const forkSlotName = forkActor && isRoleId(forkActor.role) ? ROLE_TO_SLOT[forkActor.role] : null
+  const forkSlot: SlotId | null = forkSlotName === null
+    ? null
+    : forkSlotName === 'primary' ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
+  const forkProfile = forkSlot && profiles
+    ? Option.getOrNull(findSlotProfile(profiles, forkSlot))
+    : null
   const roleLabel = forkActor?.role ? forkActor.role.charAt(0).toUpperCase() + forkActor.role.slice(1) : ''
   const modelSummary = forkSlot
-    ? { role: roleLabel, model: profiles?.[forkSlot]?.modelDisplayName ?? '-' }
+    ? { role: roleLabel, model: forkProfile?.modelDisplayName ?? '-' }
     : null
 
   return (
@@ -165,7 +175,7 @@ export function AppOverlaysContainer({
       onForkExpand={pushFork}
       onErrorAction={dispatchErrorAction}
       modelSummary={modelSummary}
-      contextHardCap={forkSlot ? profiles?.[forkSlot]?.contextWindow ?? null : null}
+      contextHardCap={forkProfile?.contextWindow ?? null}
       cwd={selectedCwd}
       projectRoot={process.cwd()}
     />

@@ -1,71 +1,58 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
-  ModelCatalogReady,
-  ModelSlotsReady,
+  ModelSlotUnassigned,
+  ModelSlotUnloadedLocalModel,
+  PRIMARY_SLOT_ID,
   ProviderIdSchema,
+  ProviderModelCatalogReady,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
-  ReasoningProperty,
-  SlotPending,
-  SlotUnassigned,
-  VisionProperty,
-  type ModelSummary,
+  SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
 import { selectedSlotModel } from "./model-slots"
 
-const defaultEffort = ReasoningEffortSchema.make("high")
-
-const model = (id: string): ModelSummary => ({
+const selection = {
   providerId: ProviderIdSchema.make("local"),
-  providerModelId: ProviderModelIdSchema.make(id),
-  displayName: id,
-  contextWindow: 32_768,
-  maxOutputTokens: 8_192,
-  defaultReasoningEffort: defaultEffort,
-  properties: {
-    reasoning: new ReasoningProperty.states.Resolved({ value: [defaultEffort] }),
-    vision: new VisionProperty.states.Deferred({}),
-  },
-  availability: { _tag: "Available" },
-})
+  providerModelId: ProviderModelIdSchema.make("local:model"),
+  reasoningEffort: ReasoningEffortSchema.make("high"),
+}
 
-const slots = (primary: SlotPending | SlotUnassigned) => new ModelSlotsReady({
-  config: { slots: {}, localSlotIntent: {} },
-  slots: {
-    primary,
-    secondary: new SlotUnassigned({ slotId: "secondary", reason: "no_candidate" }),
-  },
-})
+const unloaded = new ModelSlotUnloadedLocalModel({ slotId: PRIMARY_SLOT_ID, selection })
 
-describe("authoritative slot model", () => {
-  it("uses the selected provider and model instead of catalog order", () => {
-    const selected = model("selected")
-    const view = selectedSlotModel(
-      new ModelCatalogReady({ models: [model("first"), selected], providers: [] }),
-      slots(new SlotPending({
-        slotId: "primary",
-        selection: {
-          providerId: selected.providerId,
-          providerModelId: selected.providerModelId,
-          reasoningEffort: defaultEffort,
+describe("model slot selection", () => {
+  it("joins an unloaded local selection to its catalog model", () => {
+    const catalogModel = {
+      providerId: selection.providerId,
+      providerModelId: selection.providerModelId,
+      modelFamilyId: Option.none(),
+      displayName: "Local model",
+      supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
+      contextWindow: 4096,
+      maxOutputTokens: 1024,
+      capabilities: {
+        vision: false,
+        tools: true,
+        structuredOutput: true,
+        reasoning: {
+          supported: true,
+          efforts: [selection.reasoningEffort],
+          defaultEffort: Option.some(selection.reasoningEffort),
         },
-        source: "automatic",
-        waitingFor: ["reasoning"],
-      })),
-      "primary",
+      },
+      availability: { _tag: "Available" as const },
+      pricing: Option.none(),
+    }
+    const result = selectedSlotModel(
+      new ProviderModelCatalogReady({ providers: [], models: [catalogModel] }),
+      {
+        slots: {
+          primary: unloaded,
+          secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
+        },
+      },
+      PRIMARY_SLOT_ID,
     )
-
-    expect(Option.getOrThrow(view).model.providerModelId).toBe(selected.providerModelId)
-  })
-
-  it("returns none for an unassigned slot", () => {
-    const view = selectedSlotModel(
-      new ModelCatalogReady({ models: [model("first")], providers: [] }),
-      slots(new SlotUnassigned({ slotId: "primary", reason: "no_candidate" })),
-      "primary",
-    )
-
-    expect(Option.isNone(view)).toBe(true)
+    expect(Option.getOrThrow(result)).toMatchObject({ model: catalogModel, slot: unloaded })
   })
 })

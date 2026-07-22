@@ -263,3 +263,4 @@ test('shows a single no-provider label instead of model and reasoning effort', (
   expect(html).not.toContain('>model<')
   expect(html).not.toContain('>high<')
 })
+

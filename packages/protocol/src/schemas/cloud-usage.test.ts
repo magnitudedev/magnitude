@@ -1,9 +1,9 @@
 import { describe, expect, test } from "vitest"
 import { Schema } from "effect"
-import { CloudUsageResponse } from "./account"
+import { CloudUsageResponse } from "./cloud-usage"
 
 describe("cloud usage response schema", () => {
-  test("accepts an account without a Pro subscription", () => {
+  test("accepts usage without a Pro subscription", () => {
     const value = {
       data: {
         meta: { generatedAt: "2026-07-15T00:00:00.000Z", autumnConfigured: true },

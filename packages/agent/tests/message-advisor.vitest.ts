@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Effect, Layer, Stream, Option } from 'effect'
 import { FetchHttpClient } from '@effect/platform'
-import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty } from '@magnitudedev/ai'
+import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/ai'
 import { AmbientServiceTag, Fork, type AmbientService } from '@magnitudedev/event-core'
 import {
   ModelStreamTerminal,
@@ -18,9 +18,14 @@ import {
 import type {
   BaseCallOptions,
   ProviderRejection,
-  MagnitudeModelInfo,
 } from '@magnitudedev/sdk'
-import { SlotReady, type SlotStates } from '@magnitudedev/sdk'
+import {
+  ModelSlotReady,
+  PRIMARY_SLOT_ID,
+  SECONDARY_SLOT_ID,
+  type ModelSlotsState,
+  type ProviderModelCatalogEntry,
+} from '@magnitudedev/sdk'
 import type { JsonValue } from '@magnitudedev/ai'
 import { advisorWindowToPrompt } from '../src/window/render'
 import type { ForkWindowState, WindowEntry } from '../src/window'
@@ -337,13 +342,40 @@ describe('message_advisor execution', () => {
 
 describe('messageAdvisor toolkit registration', () => {
   it('keeps static advisor registration but removes it from effective toolkits while disabled', () => {
-    const catalogModels: readonly MagnitudeModelInfo[] = [
-      { providerModelId: ProviderModelIdSchema.make('primary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' }, defaultReasoningEffort: ReasoningEffortSchema.make('none'), properties: { vision: new VisionProperty.states.Resolved({ value: true }), reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make('none')] }) }, slots: ['primary'] as readonly ("primary" | "secondary")[], displayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
-      { providerModelId: ProviderModelIdSchema.make('secondary-model'), providerId: ProviderIdSchema.make('magnitude'), modelFamilyId: ModelFamilyIdSchema.make('unknown'), availability: { _tag: 'Available' }, defaultReasoningEffort: ReasoningEffortSchema.make('none'), properties: { vision: new VisionProperty.states.Resolved({ value: true }), reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make('none')] }) }, slots: ['secondary'] as readonly ("primary" | "secondary")[], displayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384, object: 'model' as const, owned_by: 'magnitude', roles: [], pricing: { input: 0, output: 0, cached_input: null } },
-    ]
-    const slots: SlotStates = {
-      primary: new SlotReady({ slotId: 'primary', selection: { providerId: catalogModels[0]!.providerId, providerModelId: catalogModels[0]!.providerModelId, reasoningEffort: catalogModels[0]!.defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Primary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
-      secondary: new SlotReady({ slotId: 'secondary', selection: { providerId: catalogModels[1]!.providerId, providerModelId: catalogModels[1]!.providerModelId, reasoningEffort: catalogModels[1]!.defaultReasoningEffort }, source: 'automatic', modelDisplayName: 'Secondary', contextWindow: 200_000, maxOutputTokens: 16_384 }),
+    const providerId = ProviderIdSchema.make('magnitude')
+    const reasoningEffort = ReasoningEffortSchema.make('none')
+    const catalogModel = (
+      providerModelId: string,
+      displayName: string,
+      slotId: typeof PRIMARY_SLOT_ID | typeof SECONDARY_SLOT_ID,
+    ): ProviderModelCatalogEntry => ({
+      providerId,
+      providerModelId: ProviderModelIdSchema.make(providerModelId),
+      modelFamilyId: Option.some(ModelFamilyIdSchema.make('unknown')),
+      displayName,
+      supportedSlots: [slotId],
+      contextWindow: 200_000,
+      maxOutputTokens: 16_384,
+      capabilities: {
+        vision: true,
+        tools: true,
+        structuredOutput: true,
+        reasoning: {
+          supported: true,
+          efforts: [reasoningEffort],
+          defaultEffort: Option.some(reasoningEffort),
+        },
+      },
+      availability: { _tag: 'Available' },
+      pricing: Option.none(),
+    })
+    const catalogModels = [
+      catalogModel('primary-model', 'Primary', PRIMARY_SLOT_ID),
+      catalogModel('secondary-model', 'Secondary', SECONDARY_SLOT_ID),
+    ] as const satisfies readonly ProviderModelCatalogEntry[]
+    const slots: ModelSlotsState['slots'] = {
+      primary: new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection: { providerId, providerModelId: catalogModels[0].providerModelId, reasoningEffort } }),
+      secondary: new ModelSlotReady({ slotId: SECONDARY_SLOT_ID, selection: { providerId, providerModelId: catalogModels[1].providerModelId, reasoningEffort } }),
     }
     const config = buildConfigStateFromSlots(catalogModels, slots, {
       softCapRatio: 0.9,

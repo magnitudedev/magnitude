@@ -19,3 +19,4 @@ describe("allowProviderMessageSend", () => {
     expect(showToast).not.toHaveBeenCalled()
   })
 })
+

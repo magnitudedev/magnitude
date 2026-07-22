@@ -719,3 +719,4 @@ export function Composer(props: ComposerProps) {
     </>
   )
 }
+

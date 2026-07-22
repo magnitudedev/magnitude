@@ -121,7 +121,8 @@ export type {
 } from "./errors/failure"
 
 // Wire types
-export type { ChatCompletionsRequest, ChatCompletionsStreamChunk, ChatToolChoice, ChatNamedFunctionToolChoice, ChatAllowedToolsToolChoice } from "./wire/chat-completions"
+export { ChatCompletionsStreamChunk } from "./wire/chat-completions"
+export type { ChatCompletionsRequest, ChatToolChoice, ChatNamedFunctionToolChoice, ChatAllowedToolsToolChoice } from "./wire/chat-completions"
 
 // Codec
 export type { Codec } from "./codec/codec"

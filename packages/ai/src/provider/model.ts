@@ -108,6 +108,10 @@ export const ProviderModelFields = {
     vision: VisionProperty.Schema,
     reasoning: ReasoningProperty.Schema,
   }),
+  servingCapabilities: Schema.Struct({
+    tools: Schema.Boolean,
+    structuredOutput: Schema.Boolean,
+  }),
   availability: ProviderModelAvailabilitySchema,
   pricing: ModelPricingInfoSchema,
 } as const

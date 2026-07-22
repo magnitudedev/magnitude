@@ -10,7 +10,10 @@ applies_to:
   - packages/icn/src/inventory/**
   - packages/acn/src/icn/**
   - packages/acn/src/shared-client.ts
-  - packages/acn/src/account.ts
+  - packages/acn/src/provider-model-catalog.ts
+  - packages/acn/src/local-model-inventory.ts
+  - packages/acn/src/model-slot-coordinator.ts
+  - packages/protocol/src/schemas/model-state.ts
   - packages/agent/src/window/**
   - packages/agent/src/observer/prompt.ts
   - inference/crates/icn-api/**
@@ -39,7 +42,9 @@ chat, and provider errors that appear after an unrelated readiness transition.
 
 The local provider implements the ordinary provider contract:
 
-1. Its catalog lists ICN inventory models and their provider capabilities.
+1. Its private binding adapter resolves a product `ProviderModelId` to one ICN inventory model.
+   It does not publish a second selectable catalog; ACN derives local catalog entries exclusively
+   from downloaded `LocalModelInventory` entries.
 2. Binding a model captures only its provider model ID and ordinary provider defaults. Binding is
    cheap, has no runtime side effect, and succeeds independently of current residency.
 3. Calling the bound model submits one ordinary streamed chat-completion request naming that model.
@@ -71,9 +76,10 @@ paths during a provider call.
 ### Serving configuration
 
 Every callable inventory model has one authoritative serving configuration in the running ICN.
-The durable user choice remains in ACN configuration; it is not artifact metadata and is not
-written to installation manifests or derived inventory caches. The minimum caller-owned
-configuration is:
+The durable product choice is only the explicit slot selection; a selected local profile,
+repository identity, raw ICN model ID, and local-slot-intent flag are not persisted. The ICN
+serving configuration is private native execution input established from the complete inventory
+entry. Its minimum shape is:
 
 ```text
 ServingConfiguration
@@ -88,21 +94,10 @@ the canonical artifact.
 An available model always has a valid default serving configuration. Publishing or reconciling a
 model establishes that default using the canonical product profile that was assessed for the
 artifact; a process launch default such as 4096 tokens is not a model serving configuration.
-Product selection may replace the configuration through the idempotent generated operation
-`PUT /v1/models/{model_id}/serving-configuration`.
-ACN owns the product choice and installs one scoped reconciliation process over its durable
-configuration and ICN's authoritative inventory. The initial reconciliation completes before ACN
-publishes its local services; subsequent configuration and inventory changes invoke the same
-idempotent selection-to-serving-configuration function serially. Explicit activation invokes that
-function directly before loading. These paths contain no separate profile logic. ICN validates the
-result with the same assessment pipeline used by preview and load and projects it from model
-listing for the current process lifetime.
-
-Managed download requests carry the selected serving profile so publication can establish the
-current process configuration before availability. On a later ICN start, and whenever either side
-changes thereafter, ACN reapplies its durable selection. ICN may derive a temporary default for
-standalone inventory use, but that default is not persisted as user intent and cannot override
-ACN's selection.
+Managed download requests carry the assessed serving profile so publication establishes a valid
+native configuration before availability. ACN does not maintain a parallel selected-profile state
+or a background selection-to-serving reconciliation process. ICN may derive its own valid default
+for standalone inventory use; that default is native execution policy, never user selection.
 
 Changing serving configuration is distinct from loading. It does not require the caller to issue a
 load before the next completion. If the model is resident under an older configuration, the next
@@ -278,11 +273,11 @@ presentation displays it. A generic stream-failure label must not replace a know
 
 ## Ownership summary
 
-`@magnitudedev/icn` owns recipe curation, the local provider catalog projection, generic prompt
-encoding for ICN, and generated chat failure mapping. ACN owns user selection, provider
-registration, catalog aggregation, and projection into client RPC state. It translates a changed
-user choice into one generated ICN model-configuration request. It does not own runtime readiness or
-execution planning.
+`@magnitudedev/icn` owns recipe curation, private product-to-native identity resolution, generic
+prompt encoding, and generated chat failure mapping. ACN owns user selection, the product local
+inventory, local-provider catalog projection, catalog aggregation, and slot residency projection.
+It observes native residency but does not duplicate the native coordinator, readiness algorithm,
+or execution planning.
 
 The generated ICN boundary owns typed requests, response admission, streaming transport, and exact
 error preservation. Authored ICN services may coordinate observation, recipes, or provider
@@ -298,7 +293,7 @@ native executor owns the resolved model, projector, MTP/draft runtime, scheduler
 
 A conforming implementation has none of the following:
 
-- an ACN state-check followed by load and chat;
+- an ACN state-check followed by load and chat for ordinary completion demand;
 - an ACN runtime-target resolver, profile fallback, component matcher, or active-model cache;
 - a second runtime-specific completion endpoint;
 - different load implementations for explicit load and completion;
@@ -322,8 +317,8 @@ The provider design conforms when:
 - catalog context, fit assessment, loaded context, and request capacity all use the same serving
   profile;
 - a 100K or 200K configured model is never implicitly loaded at a 4096-token process default;
-- ACN startup reconciles its selected product profile before the local provider catalog advertises
-  that model's context capacity;
+- local provider catalog properties are copied from the complete downloaded inventory entry and
+  contain no property-discovery state;
 - concurrent incompatible calls never overlap native mutation and an active response never changes
   generation;
 - model listing exposes availability and residency without ACN inference or polling;

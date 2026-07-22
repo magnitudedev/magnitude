@@ -8,27 +8,28 @@
 import { useState, useCallback, type ReactNode } from "react"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceState, visionPropertyLabel } from "@magnitudedev/client-common"
+import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
-import type { CloudUsageResponse, UsagePeriod, SlotId, ReasoningEffort, LocalModelChoice } from "@magnitudedev/sdk"
-import { ModelCatalogLifecycle } from "@magnitudedev/sdk"
+import type { CloudUsageResponse, UsagePeriod, SlotId, LocalModelInventoryEntry, ProviderModelCatalogEntry } from "@magnitudedev/sdk"
+import { ProviderIdSchema, ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
 import type { UseModelConfigResult } from "@magnitudedev/client-common"
 
 export type { UsagePeriod } from "@magnitudedev/sdk"
 
 type Tab = "settings" | "usage"
+const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 
 const catalogStateOf = (modelConfig: UseModelConfigResult) =>
   Option.map(Result.value(modelConfig.catalog), ({ state }) => state)
 
 const catalogModelsOf = (modelConfig: UseModelConfigResult) => Option.flatMap(
   catalogStateOf(modelConfig),
-  (state) => ModelCatalogLifecycle.match(state, {
-    loading: () => Option.none(),
-    ready: ({ models }) => Option.some(models),
-    refreshing: ({ models }) => Option.some(models),
-    degraded: ({ models }) => Option.some(models),
-    unavailable: () => Option.none(),
+  (state) => ProviderModelCatalogLifecycle.match(state, {
+    Loading: () => Option.none(),
+    Ready: ({ models }) => Option.some(models),
+    Refreshing: ({ models }) => Option.some(models),
+    Degraded: ({ models }) => Option.some(models),
+    Unavailable: () => Option.none(),
   }),
 )
 
@@ -174,20 +175,20 @@ function SettingsTab({
   const [inputKey, setInputKey] = useState("")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const localInference = useLocalInferenceState()
-  const localSnapshot = Result.value(localInference.state)
-  const localChoices = Option.match(localSnapshot, {
+  const localInference = useLocalInferenceQuery()
+  const localSnapshot = Result.value(localInference)
+  const localEntries = Option.match(localSnapshot, {
     onNone: () => [] as const,
-    onSome: ({ choices }) => choices,
+    onSome: ({ inventory }) => inventory._tag === "Ready" ? inventory.entries : [],
   })
   const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
   const catalogLoading = Option.match(catalogState, {
     onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
-    onSome: (state) => ModelCatalogLifecycle.is(state, "loading"),
+    onSome: (state) => ProviderModelCatalogLifecycle.is(state, "Loading"),
   })
   const catalogRefreshing = modelConfig !== undefined && (
     Result.isWaiting(modelConfig.catalogRefresh)
-    || Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, "refreshing"))
+    || Option.exists(catalogState, (state) => ProviderModelCatalogLifecycle.is(state, "Refreshing"))
   )
 
   const handleSave = useCallback(async () => {
@@ -336,7 +337,7 @@ function SettingsTab({
               key={entry.slotId}
               entry={entry}
               modelConfig={modelConfig}
-              localChoices={localChoices}
+              localEntries={localEntries}
               isLast={i === slots.length - 1}
             />
           ))}
@@ -643,12 +644,12 @@ function formatMemoryGiB(bytes: number): string {
 function SlotCard({
   entry,
   modelConfig,
-  localChoices,
+  localEntries,
   isLast,
 }: {
   entry: SlotEntry
   modelConfig?: UseModelConfigResult
-  localChoices: readonly LocalModelChoice[]
+  localEntries: readonly LocalModelInventoryEntry[]
   isLast: boolean
 }): ReactNode {
   const slotId = entry.slotId
@@ -665,12 +666,17 @@ function SlotCard({
   const transportHasSnapshot = modelConfig !== undefined && Option.isSome(Result.value(modelConfig.catalog))
   const loading = Option.match(catalogState, {
     onNone: () => modelConfig !== undefined && !transportFailed,
-    onSome: (state) => ModelCatalogLifecycle.is(state, "loading"),
+    onSome: (state) => ProviderModelCatalogLifecycle.is(state, "Loading"),
   })
 
+  const catalogModels = Option.getOrElse(models, () => [] as readonly ProviderModelCatalogEntry[])
   const effectiveModelKey = Option.match(selected, {
     onNone: () => "",
-    onSome: ({ model }) => `${model.providerId}\0${model.providerModelId}`,
+    onSome: ({ model }) => {
+      const index = catalogModels.findIndex((candidate) => candidate.providerId === model.providerId
+        && candidate.providerModelId === model.providerModelId)
+      return index < 0 ? "" : String(index)
+    },
   })
   const effortControl = Option.match(selected, {
     onNone: () => ({ _tag: "Unavailable", label: "Unassigned" } as const),
@@ -682,42 +688,34 @@ function SlotCard({
     onSome: ({ slot }) => slot.selection.reasoningEffort,
   })
   const capacityRisk = Option.flatMap(selected, ({ model }) => {
-    if (model.providerId !== "local") return Option.none()
-    const choice = localChoices.find((candidate) => candidate.providerModelId === model.providerModelId)
-    if (choice?.fitAssessment._tag !== "Assessed" || choice.fitAssessment.result !== "does_not_fit") return Option.none()
-    return Option.some(choice.fitAssessment)
+    if (model.providerId !== LOCAL_PROVIDER_ID) return Option.none()
+    const inventoryEntry = localEntries.find((candidate) => candidate.model.providerModelId === model.providerModelId)
+    return inventoryEntry?.model.fit._tag === "DoesNotFit"
+      ? Option.some(inventoryEntry.model.fit)
+      : Option.none()
   })
 
   const handleModelChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
-      const [providerId, providerModelId] = e.target.value.split("\0")
       if (modelConfig) {
-        if (!providerId || !providerModelId) {
-          void modelConfig.updateSlotModel(slotId, null, null)
+        if (e.target.value === "") {
+          void modelConfig.clearSlot(slotId)
         } else {
-          const model = Option.flatMap(models, (catalogModels) => Option.fromNullable(
-            catalogModels.find((candidate) => candidate.providerId === providerId
-              && candidate.providerModelId === providerModelId),
-          ))
-          if (Option.isSome(model)) {
-            void modelConfig.updateSlotModel(slotId, model.value.providerId, model.value.providerModelId)
-          }
+          const model = catalogModels[Number(e.target.value)]
+          if (model) void modelConfig.updateSlotModel(slotId, model.providerId, model.providerModelId)
         }
       }
     },
-    [modelConfig, slotId, models],
+    [catalogModels, modelConfig, slotId],
   )
 
   const handleEffortChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
       if (!modelConfig || Option.isNone(selected)) return
-      const value = e.target.value as ReasoningEffort
-      void modelConfig.updateSlotReasoning(
-        slotId,
-        value === selected.value.model.defaultReasoningEffort ? null : value,
-      )
+      const option = effortOptions.find((candidate) => candidate.value === e.target.value)
+      if (option) void modelConfig.updateSlotReasoning(slotId, option.value)
     },
-    [modelConfig, selected, slotId],
+    [effortOptions, modelConfig, selected, slotId],
   )
 
   return (
@@ -736,7 +734,7 @@ function SlotCard({
       </div>
 
       {(transportFailed && !transportHasSnapshot)
-        || Option.exists(catalogState, (state) => ModelCatalogLifecycle.is(state, "unavailable")) ? (
+        || Option.exists(catalogState, (state) => ProviderModelCatalogLifecycle.is(state, "Unavailable")) ? (
         <div style={{ marginBottom: 4 }}>
           <span style={{ fontSize: 13, color: "var(--accent-error)" }}>
             Unable to load available models
@@ -760,8 +758,8 @@ function SlotCard({
             </div>
           )}
           {Option.exists(catalogState, (state) =>
-            ModelCatalogLifecycle.is(state, "degraded")
-            || (ModelCatalogLifecycle.is(state, "refreshing") && state.failures.length > 0)) && (
+            ProviderModelCatalogLifecycle.is(state, "Degraded")
+            || (ProviderModelCatalogLifecycle.is(state, "Refreshing") && state.failures.length > 0)) && (
             <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-error)" }}>
               Some model providers are unavailable; showing available or last known models.
             </div>
@@ -786,13 +784,12 @@ function SlotCard({
           >
             {Option.isNone(selected) && <option value="" disabled>Unassigned</option>}
             {Option.isSome(models) && models.value.length > 0 ? (
-              models.value.map((model) => (
-                <option key={`${model.providerId}:${model.providerModelId}`} value={`${model.providerId}\0${model.providerModelId}`}>
+              models.value.map((model, index) => (
+                <option key={JSON.stringify([model.providerId, model.providerModelId])} value={String(index)}>
                   {model.displayName} — {formatContextWindowCompact(model.contextWindow)} ctx
-                  {model.pricing ? ` — ${formatPricing(model.pricing)}` : ""}
-                  {model.providerId === "local" && localChoices.some((choice) => choice.providerModelId === model.providerModelId
-                    && choice.fitAssessment._tag === "Assessed"
-                    && choice.fitAssessment.result === "does_not_fit") ? " — memory warning" : ""}
+                  {Option.match(model.pricing, { onNone: () => "", onSome: (pricing) => ` — ${formatPricing(pricing)}` })}
+                  {model.providerId === LOCAL_PROVIDER_ID && localEntries.some((inventoryEntry) => inventoryEntry.model.providerModelId === model.providerModelId
+                    && inventoryEntry.model.fit._tag === "DoesNotFit") ? " — memory warning" : ""}
                 </option>
               ))
             ) : (
@@ -829,7 +826,7 @@ function SlotCard({
           </div>
           {Option.isSome(capacityRisk) && (
             <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-warning)" }}>
-              Estimated memory use is {formatMemoryGiB(capacityRisk.value.requiredTotalBytes)}, above this machine&apos;s stable capacity. Loading may fail or affect system performance.
+              Estimated memory use is {formatMemoryGiB(capacityRisk.value.requiredBytes)}, above this machine&apos;s stable capacity. Loading may fail or affect system performance.
             </div>
           )}
           {Option.isSome(selected) && (

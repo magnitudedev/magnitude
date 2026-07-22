@@ -9,15 +9,14 @@ applies_to:
   - packages/icn/src/hardware/**
   - packages/icn/src/recipes/**
   - packages/acn/src/icn/**
+  - packages/acn/src/local-model-inventory.ts
+  - packages/acn/src/local-inference-hardware.ts
+  - packages/acn/src/provider-model-catalog.ts
   - packages/protocol/src/rpcs/local-inference.ts
-  - packages/protocol/src/schemas/local-inference.ts
+  - packages/protocol/src/schemas/model-state.ts
   - packages/client-common/src/hooks/use-local-inference-state.ts
-  - packages/client-common/src/types/local-inference.ts
-  - packages/client-common/src/utils/hardware-memory.ts
-  - packages/client-common/src/utils/local-inference-view.ts
   - cli/src/features/local-inference/**
   - cli/src/features/overlays/settings.tsx
-  - cli/src/components/hardware-memory-domain.tsx
   - cli/src/components/stacked-bar.tsx
 ---
 
@@ -64,18 +63,24 @@ The `@magnitudedev/icn` recipe service owns:
 - the fixed product profiles to evaluate;
 - ranking successfully assessed candidates.
 
-ACN owns exact mirror binding and application commands. It does not estimate fit, rank candidates,
-or reconstruct hardware state.
+ACN owns the product projection and application commands. It joins private ICN recipes, inventory,
+and hardware into `LocalModelInventory`, projects `LocalInferenceHardware`, and derives the local
+provider catalog only from downloaded inventory entries. It preserves ICN assessments and does not
+independently estimate fit or inspect the host.
 
 Clients own formatting and interaction only. Bun and client code must not independently inspect the
 OS, invoke native-backend device commands, classify unified memory, reserve device capacity, or estimate
 model, KV, recurrent, graph, or compute memory.
 
-Client-common owns the presentation-oriented composition of the independent hardware, inventory,
-and recipe mirrors. That derived view is not a protocol schema or an additional mirrored state: it
-contains no authority, persistence, polling, or state transitions of its own. A failed mirror remains
-in the query result's error channel; the derived success type does not invent an "unavailable" domain
-variant for facts that ICN did not provide.
+Clients read product-owned inventory and hardware mirrors directly. They may derive layout and
+formatting values, but do not join raw ICN mirrors, reconstruct acquisition/residency, or create a
+second local-inference lifecycle.
+
+Each inventory model exposes one authoritative context window. Curated models take it from the
+selected catalog profile; independently discovered local models take it from inspected model
+properties. A currently loaded serving configuration is not an alternate catalog context window,
+and ACN never substitutes it for the authoritative value. A missing authoritative value is a
+projection failure; there is no fallback value.
 
 ## One assessment pipeline
 
@@ -476,13 +481,12 @@ Downloaded ICN models and remote recommendations therefore display the same asse
 Every local model presented by the product is an ICN inventory model or ICN preview result; there is
 no external-server product route.
 
-Local inference is exposed as one coherent mirrored product projection. Downloads, activations, and
-runtime restarts acknowledge with an operation ID after acceptance and continue under ACN ownership.
-Their stage, byte progress where applicable, and terminal outcome are stored in the projection's
-operation collection. Clients observe that collection through the ordinary get/watch mirror and do
-not keep a page-local progress stream. Progress updates modify the existing projection directly;
-they must not recompute hardware, inventory, or recommendations. Terminal transitions reconcile the
-affected ICN inventory or runtime facts and publish the resulting state atomically.
+Local inference is exposed through separate product resources with non-overlapping meanings.
+Download progress and failure live on the addressed `LocalModelInventoryEntry`; load, ready, and
+unload consequences live on `ModelSlot`; hardware is observational. Commands acknowledge with an
+empty result and never return operation IDs. There is no operation collection or independent
+residency resource. Progress holds the applicable FSM state, while terminal native observations are
+reconciled through legal FSM transitions and published atomically.
 
 ## Cache validity
 

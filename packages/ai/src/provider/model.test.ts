@@ -29,6 +29,7 @@ describe("provider identity brands", () => {
         vision: { _tag: "Resolved", value: false },
         reasoning: { _tag: "Resolved", value: ["none"] },
       },
+      servingCapabilities: { tools: true, structuredOutput: false },
       availability: { _tag: "Available" },
       pricing: { input: 0, output: 0, cached_input: null },
     })

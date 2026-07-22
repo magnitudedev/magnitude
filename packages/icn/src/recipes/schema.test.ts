@@ -1,18 +1,31 @@
 import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { ModelRecipesState } from "./schema.js"
+import { ReasoningEffortSchema } from "@magnitudedev/ai"
+import {
+  ModelArtifactFingerprintSchema,
+  ModelRecipeCatalogModelIdSchema,
+  ModelRecipeConfigurationIdSchema,
+} from "../provider/model-identity.js"
 
 describe("ModelRecipesState wire schema", () => {
   it("encodes Option values as JSON-safe nullable fields", () => {
     const recommendation = {
-      configurationId: "configuration",
-      catalogModelId: "model",
-      artifactFingerprint: "owner/repo:commit:content",
-      modelId: Option.none<string>(),
+      configurationId: ModelRecipeConfigurationIdSchema.make("configuration"),
+      catalogModelId: ModelRecipeCatalogModelIdSchema.make("model"),
+      artifactFingerprint: ModelArtifactFingerprintSchema.make("owner/repo:commit:content"),
+      modelId: Option.none(),
       badge: "recommended" as const,
       displayName: "Model",
       family: "family",
       architecture: "moe" as const,
+      capabilities: {
+        vision: false,
+        tools: true,
+        structuredOutput: true,
+        reasoningEfforts: [ReasoningEffortSchema.make("high")],
+        defaultReasoningEffort: Option.some(ReasoningEffortSchema.make("high")),
+      },
       totalParametersBillions: Option.some(35),
       activeParametersBillions: Option.some(3),
       effectiveParametersBillions: Option.none<number>(),
@@ -30,8 +43,7 @@ describe("ModelRecipesState wire schema", () => {
       totalDownloadBytes: 1,
       sourcePageUrl: "https://example.com",
       license: { id: "test", url: "https://example.com", acknowledgementRequired: false },
-      contextTokens: 1,
-      modelMaximumContextTokens: 1,
+      contextWindow: 1,
       estimatedRuntimeBytes: 1,
       stableCapacityBudgetBytes: 1,
       fitMarginBytes: 0,
