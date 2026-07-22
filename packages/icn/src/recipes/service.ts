@@ -1,14 +1,15 @@
-import { Context, Duration, Effect, Layer, Option, Ref } from "effect"
-import { IcnApiClient } from "../generated/client.js"
+import { Context, Duration, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
+import { IcnClient } from "../client.js"
 import type * as Generated from "../generated/schemas.js"
 import { IcnHardware } from "../hardware/index.js"
+import { IcnInventory } from "../inventory/index.js"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
 import {
   MODEL_RECIPE_REGISTRY,
   recipeSourcePageUrl,
   resolveModelRecipeArtifact,
 } from "./catalog.js"
-import type { ModelRecipeRecommendation, ModelRecipesState } from "./schema.js"
+import { ModelRecipesState, type ModelRecipeRecommendation } from "./schema.js"
 import type { ResolvedModelRecipe } from "./types.js"
 
 const PREVIEW_REQUEST_CONCURRENCY = 12
@@ -100,6 +101,8 @@ const recommendationFrom = (
   return Option.some({
     configurationId: assessment.profile_id,
     catalogModelId: entry.id,
+    artifactFingerprint: assessment.artifact_fingerprint,
+    modelId: Option.none(),
     badge: "alternative",
     displayName: entry.displayName,
     family: entry.family,
@@ -194,11 +197,12 @@ export const selectRecommendationPortfolio = (
 
 export const makeIcnRecipes = (
   options: IcnRecipesOptions = {},
-): Layer.Layer<IcnRecipes, never, IcnApiClient | IcnHardware> => Layer.scoped(
+): Layer.Layer<IcnRecipes, never, IcnClient | IcnHardware | IcnInventory> => Layer.scoped(
   IcnRecipes,
   Effect.gen(function* () {
-    const client = yield* IcnApiClient
+    const client = yield* IcnClient
     const hardware = yield* IcnHardware
+    const inventory = yield* IcnInventory
     const cache = yield* Ref.make<ReadonlyMap<string, RecommendationResult>>(new Map())
 
     const resolveRecipes = Effect.gen(function* () {
@@ -281,15 +285,40 @@ export const makeIcnRecipes = (
       return result
     })
 
-    const read = readRecommendations.pipe(
-      Effect.map((result): ModelRecipesState => ({
-        _tag: "Ready",
-        recommendations: result.recommendations,
-        failureCount: result.failureCount,
+    const read = Effect.all({
+      result: readRecommendations,
+      inventory: inventory.get,
+    }).pipe(Effect.map(({ result, inventory }): ModelRecipesState => ({
+      _tag: "Ready",
+      recommendations: result.recommendations.map((recommendation) => ({
+        ...recommendation,
+        modelId: Option.map(
+          Option.fromNullable(inventory.state.data.find((model) => {
+            const contentId = Option.flatMap(
+              model.content_id,
+              Option.fromNullable,
+            )
+            return model.source.type === "hugging_face"
+              && Option.exists(contentId, (value) =>
+                `${model.source.repository}:${model.source.commit}:${value}`
+                  === recommendation.artifactFingerprint)
+          })),
+          (model) => model.id,
+        ),
       })),
+      failureCount: result.failureCount,
+    })))
+    const observed = yield* makeIcnObservedState<ModelRecipesState, never>(
+      { _tag: "Loading" },
+      read,
+      Schema.equivalence(ModelRecipesState),
     )
-    const observed = yield* makeIcnObservedState<ModelRecipesState, never>({ _tag: "Loading" }, read)
     yield* observed.refresh.pipe(Effect.forkScoped)
+    yield* inventory.changes.pipe(
+      Stream.drop(1),
+      Stream.runForEach(() => observed.refresh),
+      Effect.forkScoped,
+    )
     yield* observed.refresh.pipe(
       Effect.delay(options.refreshInterval ?? "1 hour"),
       Effect.forever,

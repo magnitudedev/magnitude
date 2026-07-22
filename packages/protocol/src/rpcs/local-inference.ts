@@ -21,26 +21,26 @@ export const ModelRecipesMirror = defineMirroredState("GetModelRecipes", {
 })
 
 export const DownloadLocalModel = Rpc.make("DownloadLocalModel", {
-  payload: Schema.Struct({ configurationId: Schema.String, requestId: Schema.String }),
-  success: Schema.Struct({ operationId: Schema.String }),
+  payload: Schema.Struct({ configurationId: Schema.String }),
+  success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const ActivateLocalModel = Rpc.make("ActivateLocalModel", {
-  payload: Schema.Struct({ selectionId: Schema.String, requestId: Schema.String }),
-  success: Schema.Struct({ operationId: Schema.String }),
+  payload: Schema.Struct({ modelId: Schema.String }),
+  success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const DeleteLocalModel = Rpc.make("DeleteLocalModel", {
-  payload: Schema.Struct({ selectionId: Schema.String }),
+  payload: Schema.Struct({ modelId: Schema.String }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const RestartLocalInference = Rpc.make("RestartLocalInference", {
-  payload: Schema.Struct({ requestId: Schema.String }),
-  success: Schema.Struct({ operationId: Schema.String }),
+  payload: Schema.Struct({}),
+  success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 

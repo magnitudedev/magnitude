@@ -31,6 +31,8 @@ const emptyLocalInferenceState = {
 const recommendedModel = {
   configurationId: "recommended-model",
   catalogModelId: "recommended-model-catalog",
+  artifactFingerprint: "example/recommended-model:revision:content",
+  modelId: Option.none(),
   badge: "recommended",
   displayName: "Recommended Model",
   family: "test",

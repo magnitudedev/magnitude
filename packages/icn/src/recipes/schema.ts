@@ -23,6 +23,8 @@ export type ModelRecipeQuantization = Schema.Schema.Type<typeof ModelRecipeQuant
 export const ModelRecipeRecommendation = Schema.Struct({
   configurationId: Schema.String,
   catalogModelId: Schema.String,
+  artifactFingerprint: Schema.String,
+  modelId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   badge: Schema.Literal("recommended", "lighter", "higher_fidelity", "alternative"),
   displayName: Schema.String,
   family: Schema.String,

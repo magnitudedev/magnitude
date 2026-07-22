@@ -20,14 +20,13 @@ export const buildLocalInferenceSelections = (
       id: choice.choiceId,
       choice,
     }))
-  const choiceIds = new Set(choices.map((choice) => choice.id))
   const recommendations = state.recommendationState._tag === "Ready"
     ? state.recommendationState.recommendations
     : []
   return [
     ...choices,
     ...recommendations
-      .filter((recommendation) => !choiceIds.has(recommendation.configurationId))
+      .filter((recommendation) => Option.isNone(recommendation.modelId))
       .map((recommendation): LocalInferenceSelection => ({
         kind: "recommendation",
         id: recommendation.configurationId,

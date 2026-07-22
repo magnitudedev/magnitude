@@ -581,17 +581,18 @@ resident executor between scheduler batches and combines current backend-device 
 generation's immutable allocation evidence. It does not wait for inference to become idle and does
 not replace idle-only native planning.
 
-Resident attribution is optional. An unresolved device, runtime-generation race, or unsupported
-allocation source omits only attribution; accurate
-topology and total/free capacity remain usable. Allocated bytes and physically resident mmap pages
-can differ on shared memory, so consumers must not fabricate a negative residual category.
+Resident attribution is required before a loaded runtime may be published. Failure to capture the
+native allocation report fails model loading with its typed binding error. Failure to resolve a
+reported native location to an exact physical memory domain fails the hardware observation; it is
+never represented as absent attribution. Allocated bytes and physically resident mmap pages can
+differ on shared memory, so consumers must not fabricate a negative residual category.
 
 CLI memory bars use one reusable stacked-bar renderer in both the detailed hardware view and the
 compact chat status. Segment boundaries are quantized to eighths of a terminal cell and rendered
 with a partial-block foreground over the following segment's background, preserving a contiguous
 bar without whole-cell rounding. Weights/fixed cost, KV cache, system/apps, and free capacity use
-distinct semantic theme colors; incomplete attribution falls back to used versus free without
-fabricating categories.
+distinct semantic theme colors. A model-free runtime displays used versus free; a loaded runtime
+never silently falls back because resident attribution is part of successful load publication.
 
 ## Conformance and acceptance criteria
 

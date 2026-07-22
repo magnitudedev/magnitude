@@ -1,3 +1,10 @@
+import { PlatformError } from "@effect/platform/Error"
+import {
+  JsonParseError,
+  SchemaDecodeError,
+  SchemaEncodeError,
+} from "@magnitudedev/storage"
+import { ErrorResponse } from "@magnitudedev/icn/generated"
 import { Schema } from "effect"
 
 export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
@@ -40,31 +47,79 @@ export const SessionError = Schema.Union(
 )
 export type SessionError = Schema.Schema.Type<typeof SessionError>
 
-export class LocalInferenceError extends Schema.TaggedError<LocalInferenceError>()(
-  "LocalInferenceError",
+export class IcnRequestEncodingFailed extends Schema.TaggedError<IcnRequestEncodingFailed>()(
+  "IcnRequestEncodingFailed",
   {
-    code: Schema.Literal(
-      "icn_unavailable",
-      "unsupported_platform",
-      "invalid_selection",
-      "artifact_unavailable",
-      "license_required",
-      "insufficient_disk_space",
-      "integrity_failed",
-      "operation_conflict",
-      "operation_not_found",
-      "artifact_active",
-      "context_mismatch",
-      "runtime_start_failed",
-      "configuration_failed",
-      "runtime_probe_failed",
-      "cancelled",
-    ),
-    operation: Schema.String,
+    operationId: Schema.String,
+    location: Schema.Literal("path", "query", "headers", "payload"),
     message: Schema.String,
-    retryable: Schema.Boolean,
   },
 ) {}
+
+export class IcnTransportFailed extends Schema.TaggedError<IcnTransportFailed>()(
+  "IcnTransportFailed",
+  { operationId: Schema.String, message: Schema.String },
+) {}
+
+export class IcnRemoteRejected extends Schema.TaggedError<IcnRemoteRejected>()(
+  "IcnRemoteRejected",
+  {
+    operationId: Schema.String,
+    status: Schema.Number,
+    body: ErrorResponse,
+  },
+) {}
+
+export class IcnInvalidResponse extends Schema.TaggedError<IcnInvalidResponse>()(
+  "IcnInvalidResponse",
+  {
+    operationId: Schema.String,
+    status: Schema.Number,
+    message: Schema.String,
+  },
+) {}
+
+export class IcnIncompleteStream extends Schema.TaggedError<IcnIncompleteStream>()(
+  "IcnIncompleteStream",
+  {
+    operationId: Schema.String,
+    termination: Schema.Literal("sentinel", "long-lived"),
+  },
+) {}
+
+export class LocalModelRecipeNotFound extends Schema.TaggedError<LocalModelRecipeNotFound>()(
+  "LocalModelRecipeNotFound",
+  { configurationId: Schema.String },
+) {}
+
+export class LocalInventoryModelNotFound extends Schema.TaggedError<LocalInventoryModelNotFound>()(
+  "LocalInventoryModelNotFound",
+  { modelId: Schema.String },
+) {}
+
+export class LocalConfigurationFailed extends Schema.TaggedError<LocalConfigurationFailed>()(
+  "LocalConfigurationFailed",
+  {
+    failure: Schema.Union(
+      PlatformError,
+      JsonParseError,
+      SchemaDecodeError,
+      SchemaEncodeError,
+    ),
+  },
+) {}
+
+export const LocalInferenceError = Schema.Union(
+  IcnRequestEncodingFailed,
+  IcnTransportFailed,
+  IcnRemoteRejected,
+  IcnInvalidResponse,
+  IcnIncompleteStream,
+  LocalModelRecipeNotFound,
+  LocalInventoryModelNotFound,
+  LocalConfigurationFailed,
+)
+export type LocalInferenceError = Schema.Schema.Type<typeof LocalInferenceError>
 
 export class OnboardingError extends Schema.TaggedError<OnboardingError>()(
   "OnboardingError",

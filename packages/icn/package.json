@@ -7,7 +7,7 @@
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./generated": "./src/generated/index.ts",
+    "./generated": "./src/generated/schemas.ts",
     "./lifecycle": "./src/lifecycle/index.ts",
     "./hardware": "./src/hardware/index.ts",
     "./inventory": "./src/inventory/index.ts",

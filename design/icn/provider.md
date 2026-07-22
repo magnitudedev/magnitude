@@ -90,17 +90,19 @@ model establishes that default using the canonical product profile that was asse
 artifact; a process launch default such as 4096 tokens is not a model serving configuration.
 Product selection may replace the configuration through the idempotent generated operation
 `PUT /v1/models/{model_id}/serving-configuration`.
-ACN owns the product choice and reconciles that durable selection before publishing its local
-provider catalog, as well as when an explicit activation applies the choice. Both paths invoke one
-idempotent selection-to-serving-configuration translation; they do not maintain separate profile
-logic. This startup reconciliation rehydrates the process-local ICN state before the catalog can
-advertise the model. ICN validates it with the same assessment pipeline used by preview and load
-and projects it from model listing for the current process lifetime.
+ACN owns the product choice and installs one scoped reconciliation process over its durable
+configuration and ICN's authoritative inventory. The initial reconciliation completes before ACN
+publishes its local services; subsequent configuration and inventory changes invoke the same
+idempotent selection-to-serving-configuration function serially. Explicit activation invokes that
+function directly before loading. These paths contain no separate profile logic. ICN validates the
+result with the same assessment pipeline used by preview and load and projects it from model
+listing for the current process lifetime.
 
 Managed download requests carry the selected serving profile so publication can establish the
-current process configuration before availability. On a later ICN start, ACN reapplies its durable
-selection. ICN may derive a temporary default for standalone inventory use, but that default is not
-persisted as user intent and cannot override ACN's selection.
+current process configuration before availability. On a later ICN start, and whenever either side
+changes thereafter, ACN reapplies its durable selection. ICN may derive a temporary default for
+standalone inventory use, but that default is not persisted as user intent and cannot override
+ACN's selection.
 
 Changing serving configuration is distinct from loading. It does not require the caller to issue a
 load before the next completion. If the model is resident under an older configuration, the next

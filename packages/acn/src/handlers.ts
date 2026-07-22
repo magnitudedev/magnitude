@@ -30,10 +30,27 @@ import {
   watchFile,
 } from "./ops";
 import type { AppEvent } from "@magnitudedev/agent";
-import { IcnCommands } from "./icn";
+import {
+  IcnHardware,
+  IcnInventory,
+  IcnRecipes,
+} from "@magnitudedev/icn";
+import {
+  activateLocalModel,
+  deleteLocalModel,
+  disableLocalInference,
+  downloadLocalModel,
+  restartLocalInference,
+} from "./icn";
 import { Onboarding } from "./onboarding";
-import { MirroredStateChanges } from "./mirrored-state";
-import { IcnMirrors } from "./icn";
+import { bindMirroredState, MirroredStateChanges } from "./mirrored-state";
+import {
+  IcnHardwareMirror,
+  IcnInventoryMirror,
+  ModelRecipesMirror,
+} from "@magnitudedev/protocol";
+import { localInferenceRpcError } from "./icn/rpc-error";
+import { AcnActivityTracker } from "./activity-tracker";
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
@@ -42,10 +59,15 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const account = yield* Account;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
-    const localInference = yield* IcnCommands;
     const onboarding = yield* Onboarding;
     const mirroredStateChanges = yield* MirroredStateChanges;
-    const icnMirrors = yield* IcnMirrors;
+    const hardware = yield* IcnHardware;
+    const inventory = yield* IcnInventory;
+    const recipes = yield* IcnRecipes;
+    const hardwareMirror = yield* bindMirroredState(IcnHardwareMirror, hardware);
+    const inventoryMirror = yield* bindMirroredState(IcnInventoryMirror, inventory);
+    const recipesMirror = yield* bindMirroredState(ModelRecipesMirror, recipes);
+    const activity = yield* AcnActivityTracker;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -327,13 +349,13 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         ),
 
       GetIcnHardware: () =>
-        observeRpcDefects("GetIcnHardware", icnMirrors.hardware),
+        observeRpcDefects("GetIcnHardware", hardwareMirror.get),
 
       GetIcnInventory: () =>
-        observeRpcDefects("GetIcnInventory", icnMirrors.inventory),
+        observeRpcDefects("GetIcnInventory", inventoryMirror.get),
 
       GetModelRecipes: () =>
-        observeRpcDefects("GetModelRecipes", icnMirrors.recipes),
+        observeRpcDefects("GetModelRecipes", recipesMirror.get),
 
       WatchMirroredStates: () =>
         observeRpcStreamDefects(
@@ -341,34 +363,58 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           withHeartbeat(mirroredStateChanges.stream),
         ),
 
-      DownloadLocalModel: ({ configurationId, requestId }) =>
+      DownloadLocalModel: ({ configurationId }) =>
         observeRpcDefects(
           "DownloadLocalModel",
-          localInference.downloadModel(configurationId, requestId),
+          activity.withActiveWork(
+            "local-inference:download",
+            downloadLocalModel(configurationId).pipe(
+              Effect.mapError(localInferenceRpcError),
+              Effect.as({}),
+            ),
+          ),
         ),
 
-      ActivateLocalModel: ({ selectionId, requestId }) =>
+      ActivateLocalModel: ({ modelId }) =>
         observeRpcDefects(
           "ActivateLocalModel",
-          localInference.activateModel(selectionId, requestId),
+          activity.withActiveWork(
+            "local-inference:activate",
+            activateLocalModel(modelId).pipe(
+              Effect.mapError(localInferenceRpcError),
+              Effect.as({}),
+            ),
+          ),
         ),
 
-      DeleteLocalModel: ({ selectionId }) =>
+      DeleteLocalModel: ({ modelId }) =>
         observeRpcDefects(
           "DeleteLocalModel",
-          localInference.deleteModel(selectionId).pipe(Effect.as({})),
+          deleteLocalModel(modelId).pipe(
+            Effect.mapError(localInferenceRpcError),
+            Effect.as({}),
+          ),
         ),
 
-      RestartLocalInference: ({ requestId }) =>
+      RestartLocalInference: () =>
         observeRpcDefects(
           "RestartLocalInference",
-          localInference.restart(requestId),
+          activity.withActiveWork(
+            "local-inference:restart",
+            restartLocalInference.pipe(
+              Effect.mapError(localInferenceRpcError),
+              Effect.as({}),
+            ),
+          ),
         ),
 
       DisableLocalInference: () =>
         observeRpcDefects(
           "DisableLocalInference",
-          localInference.disable.pipe(Effect.as({})),
+          disableLocalInference.pipe(
+            Effect.mapError(localInferenceRpcError),
+            Effect.as({}),
+          ),
         ),
 
       // Generic onboarding completion, independent of local inference

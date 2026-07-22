@@ -1,15 +1,12 @@
-import { Context, Duration, Effect, Layer } from "effect"
-import {
-  IcnApiClient,
-  type IcnApiClient as IcnApiClientService,
-} from "../generated/client.js"
-import type { HardwareSnapshotSchema } from "../generated/schemas.js"
+import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
+import { IcnClient, type IcnClientService } from "../client.js"
+import { HardwareSnapshotSchema } from "../generated/schemas.js"
 import {
   makeIcnObservedState,
   type IcnObservedState,
 } from "../observed-state.js"
 
-type HardwareReadError = Effect.Effect.Error<ReturnType<IcnApiClientService["system"]["getHardware"]>>
+type HardwareReadError = Effect.Effect.Error<ReturnType<IcnClientService["system"]["getHardware"]>>
 
 export interface IcnHardwareService extends IcnObservedState<HardwareSnapshotSchema, HardwareReadError> {}
 
@@ -24,19 +21,24 @@ export interface IcnHardwareOptions {
 
 export const makeIcnHardware = (
   options: IcnHardwareOptions = {},
-): Layer.Layer<IcnHardware, HardwareReadError, IcnApiClient> =>
+): Layer.Layer<IcnHardware, HardwareReadError, IcnClient> =>
   Layer.scoped(
     IcnHardware,
     Effect.gen(function* () {
-      const client = yield* IcnApiClient
+      const client = yield* IcnClient
       const read = client.system.getHardware({})
       const initial = yield* read
-      const observed = yield* makeIcnObservedState(initial, read)
+      const observed = yield* makeIcnObservedState(
+        initial,
+        read,
+        Schema.equivalence(HardwareSnapshotSchema),
+      )
 
       yield* observed.refresh.pipe(
-        Effect.catchAll((cause) => Effect.logWarning("Unable to refresh ICN hardware snapshot").pipe(
-          Effect.annotateLogs({ cause: String(cause) }),
+        Effect.tapError((error) => Effect.logWarning("Unable to refresh ICN hardware snapshot").pipe(
+          Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
         )),
+        Effect.option,
         Effect.delay(options.refreshInterval ?? "2 seconds"),
         Effect.forever,
         Effect.forkScoped,

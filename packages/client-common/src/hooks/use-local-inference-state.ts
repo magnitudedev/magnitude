@@ -1,7 +1,6 @@
 import { useCallback, useMemo } from "react"
 import { Atom, Result, useAtomSet, useAtomValue, type Atom as EffectAtom } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
-import { createId } from "@magnitudedev/generate-id"
 import {
   IcnHardwareMirror,
   IcnInventoryMirror,
@@ -92,19 +91,19 @@ export function useLocalInferenceState() {
   const disableMutation = useAtomSet(disableAtom)
 
   const downloadModel = useCallback((configurationId: string): void => {
-    downloadMutation({ payload: { configurationId, requestId: createId() }, reactivityKeys: [IcnInventoryMirror.id] })
+    downloadMutation({ payload: { configurationId }, reactivityKeys: [IcnInventoryMirror.id] })
   }, [downloadMutation])
-  const activateModel = useCallback((selectionId: string): void => {
-    activateMutation({ payload: { selectionId, requestId: createId() }, reactivityKeys: [IcnInventoryMirror.id] })
+  const activateModel = useCallback((modelId: string): void => {
+    activateMutation({ payload: { modelId }, reactivityKeys: [IcnInventoryMirror.id] })
   }, [activateMutation])
-  const deleteModel = useCallback((selectionId: string): void => {
+  const deleteModel = useCallback((modelId: string): void => {
     deleteMutation({
-      payload: { selectionId },
+      payload: { modelId },
       reactivityKeys: [IcnInventoryMirror.id, ModelCatalogMirror.id, ModelSlotsMirror.id],
     })
   }, [deleteMutation])
   const restart = useCallback((): void => {
-    restartMutation({ payload: { requestId: createId() }, reactivityKeys: [IcnInventoryMirror.id] })
+    restartMutation({ payload: {}, reactivityKeys: [IcnInventoryMirror.id] })
   }, [restartMutation])
   const disable = useCallback((): void => {
     disableMutation({

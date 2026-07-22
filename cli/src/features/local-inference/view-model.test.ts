@@ -12,6 +12,8 @@ import {
 const recommendation: LocalModelRecommendation = {
   configurationId: "configuration-1",
   catalogModelId: "catalog-1",
+  artifactFingerprint: "example/model:revision:content",
+  modelId: Option.none(),
   badge: "recommended",
   displayName: "Recommended model",
   family: "test",
@@ -179,7 +181,7 @@ describe("local inference selection view model", () => {
       ...baseState,
       choices: [{
         _tag: "Stored",
-        choiceId: recommendation.configurationId,
+        choiceId: "local-model",
         displayName: recommendation.displayName,
         providerModelId: ProviderModelIdSchema.make("local-model"),
         contextTokens: Option.some(recommendation.contextTokens),
@@ -191,12 +193,15 @@ describe("local inference selection view model", () => {
         explanation: "Stored and ready.",
         residency: "unloaded",
       }],
-      recommendationState: { _tag: "Ready", recommendations: [recommendation] },
+      recommendationState: {
+        _tag: "Ready",
+        recommendations: [{ ...recommendation, modelId: Option.some("local-model") }],
+      },
     }
 
     expect(buildLocalInferenceSelections(state)).toEqual([expect.objectContaining({
       kind: "stored",
-      id: recommendation.configurationId,
+      id: "local-model",
     })])
   })
 

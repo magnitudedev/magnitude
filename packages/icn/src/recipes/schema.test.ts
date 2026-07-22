@@ -7,6 +7,8 @@ describe("ModelRecipesState wire schema", () => {
     const recommendation = {
       configurationId: "configuration",
       catalogModelId: "model",
+      artifactFingerprint: "owner/repo:commit:content",
+      modelId: Option.none<string>(),
       badge: "recommended" as const,
       displayName: "Model",
       family: "family",

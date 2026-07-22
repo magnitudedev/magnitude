@@ -4,8 +4,9 @@ import { Duration, Effect, Layer, Option } from "effect"
 import {
   IcnBinaryResolutionConfig,
   IcnLifecycleConfig,
-  IcnLifecycle,
-  makeIcn,
+  IcnProcess,
+  makeIcnClient,
+  makeIcnProcess,
   makeIcnHardware,
   makeIcnInventory,
   makeIcnProvider,
@@ -49,7 +50,7 @@ const binarySource = () => {
   }
 }
 
-const makeLifecycle = () => makeIcn(new IcnLifecycleConfig({
+const makeProcess = () => makeIcnProcess(new IcnLifecycleConfig({
   binary: new IcnBinaryResolutionConfig({
     source: binarySource(),
     supportedApiVersion: 1,
@@ -81,10 +82,10 @@ const makeLifecycle = () => makeIcn(new IcnLifecycleConfig({
 })).pipe(Layer.orDie)
 
 const makeSupervision = () => Layer.scopedDiscard(Effect.gen(function* () {
-  const icn = yield* IcnLifecycle
-  yield* icn.unexpectedExit.pipe(
-    Effect.catchAll((cause) => Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
-      Effect.annotateLogs({ cause: cause.message }),
+  const icnProcess = yield* IcnProcess
+  yield* icnProcess.unexpectedExit.pipe(
+    Effect.catchAll((error) => Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
+      Effect.annotateLogs({ cause: error.message }),
       // BunRuntime translates SIGTERM into root interruption, so all scoped ACN and ICN
       // finalizers run before the process exits.
       Effect.zipRight(Effect.sync(() => process.kill(process.pid, "SIGTERM"))),
@@ -94,9 +95,10 @@ const makeSupervision = () => Layer.scopedDiscard(Effect.gen(function* () {
 }))
 
 export const makeAcnIcn = () => {
-  const lifecycle = makeLifecycle()
-  const supervisedLifecycle = Layer.provideMerge(makeSupervision(), lifecycle)
-  const withHardware = Layer.provideMerge(makeIcnHardware(), supervisedLifecycle)
+  const process = makeProcess()
+  const supervisedProcess = Layer.provideMerge(makeSupervision(), process)
+  const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess)
+  const withHardware = Layer.provideMerge(makeIcnHardware(), withClient)
   const withInventory = Layer.provideMerge(makeIcnInventory(), withHardware)
   const withRecipes = Layer.provideMerge(makeIcnRecipes(), withInventory)
   return Layer.provideMerge(makeIcnProvider(), withRecipes).pipe(Layer.orDie)
