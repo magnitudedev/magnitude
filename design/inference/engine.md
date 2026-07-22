@@ -88,6 +88,11 @@ batches and may inspect backend device memory plus
 immutable generation allocation evidence. They cannot mutate model/context state, plan a load, or
 delay until all inference becomes idle. General native planning callbacks remain idle-only.
 
+Resident allocation capture is part of model-load success. The binding returns an exhaustive typed
+capture error; the engine fails the load rather than retaining an unavailable-evidence sentinel.
+Every captured native location must resolve to one physical memory domain before a loaded runtime's
+hardware snapshot is published.
+
 This design avoids unbounded queues and makes overload explicit. It also means synchronous native work and current KV tier I/O can pause progress for all sequences owned by that executor.
 
 ## Request lifecycle

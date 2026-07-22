@@ -3,7 +3,8 @@ import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { PromptBuilder, ProviderModelIdSchema } from "@magnitudedev/ai"
 import { Effect, Either, Layer } from "effect"
 import { describe, expect, it } from "vitest"
-import { IcnApiClient, makeIcnApiClient } from "../generated/client.js"
+import { IcnClient } from "../client.js"
+import { makeIcnApiClient } from "../generated/client.js"
 import { IcnInventory, makeIcnInventory } from "../inventory/index.js"
 import { IcnProvider, makeIcnProvider } from "./source.js"
 
@@ -12,11 +13,11 @@ const TEST_BASE_URL = "http://icn.test"
 const makeTestLayer = (http: HttpClient.HttpClient) => {
   const httpLayer = Layer.succeed(HttpClient.HttpClient, http)
   const clientLayer = Layer.effect(
-    IcnApiClient,
+    IcnClient,
     makeIcnApiClient({ baseUrl: TEST_BASE_URL }),
   ).pipe(Layer.provide(httpLayer))
   const inventoryLayer = makeIcnInventory({
-    idleRefreshInterval: "1 hour",
+    refreshInterval: "1 hour",
   }).pipe(Layer.provide(clientLayer))
   const dependencies = Layer.merge(clientLayer, inventoryLayer)
 

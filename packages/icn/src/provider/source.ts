@@ -1,4 +1,4 @@
-import { Array as Arr, Context, Effect, Layer, Match, Option, Predicate, Schema, Stream } from "effect"
+import { Array as Arr, Cause, Context, Effect, Layer, Match, Option, Predicate, Schema, Stream } from "effect"
 import {
   AVAILABLE_PROVIDER_MODEL,
   ModelCatalogError,
@@ -31,17 +31,23 @@ import {
   type ToolCallId,
   type ToolDefinition,
 } from "@magnitudedev/ai"
-import { IcnApiClient } from "../generated/client.js"
+import { IcnClient, type IcnClientService } from "../client.js"
 import * as Generated from "../generated/schemas.js"
 import type { GeneratedClientError } from "@magnitudedev/openapi-effect/client-runtime"
-import { IcnInventory, type IcnInventoryService } from "../inventory/index.js"
+import { IcnInventory } from "../inventory/index.js"
 import { LocalModelInfoSchema, LocalProviderId, type LocalModelInfo } from "./contract.js"
 import type { LocalProviderSource } from "./provider.js"
 
 const PROVIDER_ID = LocalProviderId.make("local")
 const ZERO_PRICING = { input: 0, output: 0, cached_input: null } as const
 
-const catalogError = (message: string, cause?: unknown) => new ModelCatalogError({ message, cause })
+const catalogError = <Cause>(
+  message: string,
+  ...cause: readonly [] | readonly [Cause]
+) => Option.match(Option.fromIterable(cause), {
+  onNone: () => new ModelCatalogError({ message }),
+  onSome: (value) => new ModelCatalogError({ message, cause: value }),
+})
 
 const isProviderReadyStatus = (availability: Generated.ModelAvailabilitySchema): boolean =>
   availability.type === "available"
@@ -115,6 +121,18 @@ export const icnModelToProviderModel = (model: Generated.Model): LocalModelInfo 
 }
 
 type IcnClientError = GeneratedClientError<Generated.ErrorResponse>
+
+const generatedClientErrorMessage = (error: IcnClientError): string => Match.value(error).pipe(
+  Match.tag("GeneratedClientRemoteError", (remote) => remote.body.error.message),
+  Match.tag("GeneratedClientTransportError", (transport) =>
+    Cause.pretty(Cause.fail(transport.cause))),
+  Match.tag("GeneratedClientInputError", (input) =>
+    `Invalid ICN request input at ${input.location}`),
+  Match.tag("GeneratedClientInvalidResponseError", (invalid) => invalid.message),
+  Match.tag("GeneratedClientIncompleteStreamError", (incomplete) =>
+    `ICN stream ended without a terminal event (${incomplete.termination})`),
+  Match.exhaustive,
+)
 
 const generatedStartFailure = (
   call: { provider: string; model: string; method: "POST"; url: string },
@@ -221,8 +239,7 @@ const generatedBodyFailure = (
 )
 
 const bindIcnModel = (
-  client: IcnApiClient,
-  inventory: IcnInventoryService,
+  client: IcnClientService,
   providerModelId: ProviderModelId,
   bindOptions?: ProviderModelBindOptions,
 ) => Effect.succeed({
@@ -253,13 +270,12 @@ const bindIcnModel = (
         evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
       })),
       Effect.tap(() => bindOptions?.requestAttribution?.requestStarted ?? Effect.void),
-      Effect.flatMap((payload) => inventory.observeChatAdmission(
+      Effect.flatMap((payload) =>
         client.chat.createChatCompletion({ payload }).pipe(
             Effect.mapError((cause) => generatedStartFailure(call, cause)),
             Effect.map(({ status, headers, events }) => {
               const response = acceptedHttpResponse(status, headers)
               const chunks = events.pipe(
-                Stream.ensuring(inventory.refresh.pipe(Effect.ignore)),
                 Stream.map((chunk) => Schema.encodeSync(Generated.ChatCompletionChunk)(chunk) as ChatCompletionsStreamChunk),
               )
               const decoded = nativeChatCompletionsCodec.decode(chunks, {
@@ -274,8 +290,7 @@ const bindIcnModel = (
                 requestId: response.requestId,
               }
             }),
-        ),
-      )),
+        )),
     )
   },
 })
@@ -290,11 +305,11 @@ export class IcnProvider extends Context.Tag("@magnitudedev/icn/IcnProvider")<
 export const makeIcnProvider = (): Layer.Layer<
   IcnProvider,
   never,
-  IcnApiClient | IcnInventory
+  IcnClient | IcnInventory
 > => Layer.effect(
   IcnProvider,
   Effect.gen(function* () {
-    const client = yield* IcnApiClient
+    const client = yield* IcnClient
     const inventory = yield* IcnInventory
     const list = inventory.get.pipe(
       Effect.map(({ state }) => state.data.map(icnModelToProviderModel)),
@@ -318,13 +333,16 @@ export const makeIcnProvider = (): Layer.Layer<
     }
     return IcnProvider.of({
       catalog,
-      bindModel: (providerModelId, options) => bindIcnModel(client, inventory, providerModelId, options),
+      bindModel: (providerModelId, options) => bindIcnModel(client, providerModelId, options),
       discoverModelProperties: () => Effect.succeed(ModelDiscoveryOperationIdSchema.make("icn-authoritative")),
       status: client.system.health({}).pipe(
-        Effect.map((health) => health.ready
-          ? { status: "ok" as const }
-          : { status: "loading" as const, message: health.status }),
-        Effect.catchAll((cause) => Effect.succeed({ status: "error" as const, message: String(cause) })),
+        Effect.mapError(generatedClientErrorMessage),
+        Effect.match({
+          onFailure: (message) => ({ status: "error" as const, message }),
+          onSuccess: (health) => health.ready
+            ? { status: "ok" as const }
+            : { status: "loading" as const, message: health.status },
+        }),
       ),
     })
   }),

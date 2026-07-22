@@ -1,6 +1,7 @@
-export * as Generated from "./generated/index.js";
-export * from "./generated/index.js";
+export * as Generated from "./generated/schemas.js";
+export * from "./generated/schemas.js";
 export * from "./lifecycle/index.js";
+export * from "./client.js";
 export * from "./observed-state.js";
 export * from "./hardware/index.js";
 export * from "./inventory/index.js";

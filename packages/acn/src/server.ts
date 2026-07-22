@@ -28,7 +28,7 @@ import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { makeLocalModelConfigurationLayer } from "./model-configuration"
-import { makeAcnIcn, makeIcnCommands, makeIcnMirrors } from "./icn"
+import { makeAcnIcn, makeServingConfigurationReconciliation } from "./icn"
 import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
@@ -182,10 +182,12 @@ const makeAcnServicesBase = (debug: boolean) => {
 
 const addLocalInferenceServices = <A, E, R>(base: Layer.Layer<A, E, R>) => {
   const withIcn = Layer.provideMerge(makeAcnIcn(), base)
-  const withIcnMirrors = Layer.provideMerge(makeIcnMirrors(), withIcn)
-  const withConfiguration = Layer.provideMerge(makeLocalModelConfigurationLayer(), withIcnMirrors)
-  const withIcnCommands = Layer.provideMerge(makeIcnCommands(), withConfiguration)
-  const withOnboarding = Layer.provideMerge(OnboardingLive, withIcnCommands)
+  const withConfiguration = Layer.provideMerge(makeLocalModelConfigurationLayer(), withIcn)
+  const withServingConfiguration = Layer.provideMerge(
+    makeServingConfigurationReconciliation().pipe(Layer.orDie),
+    withConfiguration,
+  )
+  const withOnboarding = Layer.provideMerge(OnboardingLive, withServingConfiguration)
   const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withOnboarding)
   return withProviderClients
 }

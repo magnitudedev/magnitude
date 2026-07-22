@@ -10,6 +10,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import {
   Context,
+  Cause,
   Data,
   Deferred,
   Duration,
@@ -24,9 +25,7 @@ import {
   Stream,
 } from "effect";
 import {
-  IcnApiClient,
   makeIcnApiClient,
-  type IcnApiClient as IcnApiClientService,
 } from "../generated/client.js";
 
 const PositiveInt = Schema.Int.pipe(Schema.greaterThan(0));
@@ -146,21 +145,21 @@ export class IcnLifecycleError extends Data.TaggedError("IcnLifecycleError")<{
   readonly reason: IcnLifecycleFailureReason;
   readonly message: string;
   readonly diagnostic: Option.Option<string>;
-  readonly cause?: unknown;
 }> {}
 
-const lifecycleError = (
+const lifecycleError = <CauseValue>(
   operation: IcnLifecycleOperation,
   reason: IcnLifecycleFailureReason,
   message: string,
-  cause?: unknown
+  ...cause: readonly [] | readonly [CauseValue]
 ) =>
   new IcnLifecycleError({
     operation,
     reason,
     message,
-    diagnostic: Option.none(),
-    cause,
+    diagnostic: Option.fromIterable(cause).pipe(
+      Option.map((value) => Cause.pretty(Cause.fail(value))),
+    ),
   });
 
 const ReleaseManifest = Schema.Struct({
@@ -392,7 +391,7 @@ const resolveCandidate = (
       Effect.ensuring(
         fs
           .remove(archive, { force: true })
-          .pipe(Effect.catchAll(() => Effect.void))
+          .pipe(Effect.option, Effect.asVoid)
       )
     );
     if (extracted !== 0)
@@ -446,7 +445,7 @@ export const makeIcnBinaryResolver = () => Layer.effect(
     return IcnBinaryResolver.of({
       resolve: (config) =>
         Effect.suspend(() => {
-          let stagingToClean: string | undefined;
+          let stagingToClean = Option.none<string>();
           return Effect.gen(function* () {
             const candidate = yield* resolveCandidate(
               config.source,
@@ -457,7 +456,7 @@ export const makeIcnBinaryResolver = () => Layer.effect(
               config.downloadTimeout
             );
             if (Option.isSome(candidate.install))
-              stagingToClean = candidate.install.value.staging;
+              stagingToClean = Option.some(candidate.install.value.staging);
             const exists = yield* fs
               .exists(candidate.path)
               .pipe(Effect.orElseSucceed(() => false));
@@ -599,11 +598,12 @@ export const makeIcnBinaryResolver = () => Layer.effect(
             const missing = config.requiredCapabilities.find(
               (capability) => !identity.capabilities.includes(capability)
             );
-            if (missing !== undefined)
+            const missingCapability = Option.fromNullable(missing);
+            if (Option.isSome(missingCapability))
               return yield* lifecycleError(
                 "verify",
                 "missing-capability",
-                `ICN binary does not provide required capability ${missing}`
+                `ICN binary does not provide required capability ${missingCapability.value}`
               );
             let published = canonical;
             if (Option.isSome(candidate.install)) {
@@ -688,7 +688,7 @@ export const makeIcnBinaryResolver = () => Layer.effect(
                   )
                 );
               }
-              stagingToClean = undefined;
+              stagingToClean = Option.none();
               published = yield* fs
                 .realPath(
                   path.join(
@@ -710,11 +710,12 @@ export const makeIcnBinaryResolver = () => Layer.effect(
             return { path: published, identity };
           }).pipe(
             Effect.onError(() =>
-              stagingToClean === undefined
-                ? Effect.void
-                : fs
-                    .remove(stagingToClean, { recursive: true, force: true })
-                    .pipe(Effect.catchAll(() => Effect.void))
+              Option.match(stagingToClean, {
+                onNone: () => Effect.void,
+                onSome: (staging) => fs
+                  .remove(staging, { recursive: true, force: true })
+                  .pipe(Effect.option, Effect.asVoid),
+              })
             )
           );
         }),
@@ -738,9 +739,10 @@ export interface IcnExit {
   readonly diagnostic: string;
 }
 
-export interface IcnLifecycleService {
+export interface IcnProcessService {
   readonly pid: number;
   readonly origin: URL;
+  readonly clientOptions: Parameters<typeof makeIcnApiClient>[0];
   readonly instanceId: string;
   readonly binary: ResolvedIcnBinary;
   readonly startup: IcnStartupRecord;
@@ -750,9 +752,9 @@ export interface IcnLifecycleService {
   readonly shutdownResult: Effect.Effect<void, IcnLifecycleError>;
 }
 
-export class IcnLifecycle extends Context.Tag("@magnitudedev/icn/IcnLifecycle")<
-  IcnLifecycle,
-  IcnLifecycleService
+export class IcnProcess extends Context.Tag("@magnitudedev/icn/IcnProcess")<
+  IcnProcess,
+  IcnProcessService
 >() {}
 
 const appendBounded = (ref: Ref.Ref<string>, chunk: string, limit: number) =>
@@ -771,8 +773,12 @@ const withDiagnostic = (error: IcnLifecycleError, output: Ref.Ref<string>) =>
       Effect.fail(
         new IcnLifecycleError({
           ...error,
-          diagnostic:
-            diagnostic.trim() === "" ? Option.none() : Option.some(diagnostic),
+          diagnostic: diagnostic.trim() === ""
+            ? error.diagnostic
+            : Option.some(Option.match(error.diagnostic, {
+                onNone: () => diagnostic,
+                onSome: (cause) => `${cause}\n${diagnostic}`,
+              })),
         })
       )
     )
@@ -848,7 +854,8 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
             Effect.flatMap((running) =>
               running ? process.kill("SIGTERM") : Effect.void
             ),
-            Effect.catchAll(() => Effect.void)
+            Effect.option,
+            Effect.asVoid,
           )
         );
         return process;
@@ -905,7 +912,8 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       Stream.runForEach((chunk) =>
         appendBounded(output, chunk, config.outputLimitBytes)
       ),
-      Effect.catchAll(() => Effect.void),
+      Effect.option,
+      Effect.asVoid,
       Effect.forkScoped
     );
     yield* process.exitCode.pipe(
@@ -996,7 +1004,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       baseUrl: origin,
       headers: { authorization: `Bearer ${authorization}` },
     });
-    const health = yield* client.system.health({}).pipe(
+    yield* client.system.health({}).pipe(
       Effect.flatMap((value) =>
         value.ready &&
         value.instanceId === instanceId &&
@@ -1087,17 +1095,20 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     });
     yield* Effect.addFinalizer(() =>
       shutdown.pipe(
-        Effect.tap(() => Deferred.succeed(shutdownResult, undefined)),
+        Effect.tap(() => Deferred.complete(shutdownResult, Effect.void)),
         Effect.catchAll((error) => Deferred.fail(shutdownResult, error)),
         Effect.asVoid
       )
     );
     const exit = Deferred.await(exited);
     return {
-      client,
-      lifecycle: IcnLifecycle.of({
+      process: IcnProcess.of({
         pid: Number(process.pid),
         origin,
+        clientOptions: {
+          baseUrl: origin,
+          headers: { authorization: `Bearer ${authorization}` },
+        },
         instanceId,
         binary,
         startup,
@@ -1122,26 +1133,22 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         ),
         shutdownResult: Deferred.await(shutdownResult),
       }),
-      health,
     };
   });
 
-export const makeIcn = (
+export const makeIcnProcess = (
   config: IcnLifecycleConfig
 ): Layer.Layer<
-  IcnApiClient | IcnLifecycle,
+  IcnProcess,
   IcnLifecycleError,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | HttpClient.HttpClient
   | Path.Path
 > =>
-  Layer.scopedContext(
+  Layer.scoped(
+    IcnProcess,
     acquireIcn(config).pipe(
-      Effect.map(({ client, lifecycle }) =>
-        Context.make(IcnApiClient, client as IcnApiClientService).pipe(
-          Context.add(IcnLifecycle, lifecycle)
-        )
-      )
+      Effect.map(({ process }) => process)
     )
   ).pipe(Layer.provideMerge(makeIcnBinaryResolver()));

@@ -8,7 +8,6 @@ applies_to:
   - packages/acn/src/account.ts
   - packages/acn/src/handlers.ts
   - packages/acn/src/server.ts
-  - packages/acn/src/icn/mirrors.ts
   - packages/client-common/src/hooks/use-mirrored-state.ts
   - packages/client-common/src/hooks/use-model-config.ts
   - packages/client-common/src/hooks/use-slot-profiles.ts
@@ -53,11 +52,13 @@ Client-common owns one resident mirrored-state watch per client connection and a
 invalidation. Screens consume query-backed state and do not open their own progress streams or make
 operation state local to the component that started the work.
 
-Long-running commands acknowledge after validation and state acceptance, then continue in a
-service-owned scope. Their progress and terminal result live in the applicable mirrored state. A
-client-provided request ID makes retries idempotent, while domain target identity coalesces duplicate
-active work. Unary mutation pending state describes only command acceptance and must never be used as
-a page-wide busy flag.
+Long-running mutation functions consume the generated ICN stream through its terminal event. Their
+progress and native terminal result live in the applicable mirrored state. When completion also
+requires a fallible durable application write, the RPC remains pending through that write so its
+failure cannot be lost after early acknowledgement. Domain idempotency and serialization belong to
+the native ICN model manager and runtime coordinator; ACN must not add request IDs, request history,
+target maps, or another admission/submission system. Unary mutation pending state must never be
+used as the source of model, hardware, or page-wide operation state.
 
 An owning service may continuously sample volatile observational input. Such a sampler updates only
 its own source: an ICN hardware tick refreshes the exact hardware snapshot and does not list models,

@@ -1,4 +1,4 @@
-import { Effect, Ref, Stream, SubscriptionRef } from "effect"
+import { Effect, Equivalence, Ref, Stream, SubscriptionRef } from "effect"
 
 export interface IcnObservedSnapshot<A> {
   readonly revision: number
@@ -11,12 +11,10 @@ export interface IcnObservedState<A, E> {
   readonly refresh: Effect.Effect<void, E>
 }
 
-const equivalent = (left: unknown, right: unknown): boolean =>
-  JSON.stringify(left) === JSON.stringify(right)
-
 export const makeIcnObservedState = <A, E>(
   initial: A,
   read: Effect.Effect<A, E>,
+  equivalent: Equivalence.Equivalence<A>,
 ): Effect.Effect<IcnObservedState<A, E>> =>
   Effect.gen(function* () {
     const current = yield* SubscriptionRef.make<IcnObservedSnapshot<A>>({

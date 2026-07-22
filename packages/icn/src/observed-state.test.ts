@@ -6,7 +6,11 @@ describe("ICN observed state", () => {
   it("replays the current snapshot and revisions only structurally changed reads", async () => {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const source = yield* Ref.make({ value: 1 })
-      const observed = yield* makeIcnObservedState({ value: 1 }, Ref.get(source))
+      const observed = yield* makeIcnObservedState(
+        { value: 1 },
+        Ref.get(source),
+        (left, right) => left.value === right.value,
+      )
       const snapshots = yield* observed.changes.pipe(Stream.take(2), Stream.runCollect, Effect.fork)
       yield* Effect.yieldNow()
 
@@ -25,7 +29,11 @@ describe("ICN observed state", () => {
 
   it("does not emit an equal refresh", async () => {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const observed = yield* makeIcnObservedState({ value: 1 }, Effect.succeed({ value: 1 }))
+      const observed = yield* makeIcnObservedState(
+        { value: 1 },
+        Effect.succeed({ value: 1 }),
+        (left, right) => left.value === right.value,
+      )
       const initial = yield* Stream.runHead(observed.changes)
       const next = yield* Effect.fork(observed.changes.pipe(Stream.drop(1), Stream.runHead))
 

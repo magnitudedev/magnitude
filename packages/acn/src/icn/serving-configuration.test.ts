@@ -1,12 +1,20 @@
+import * as HttpClient from "@effect/platform/HttpClient"
+import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { describe, expect, it } from "vitest"
-import { Effect, Option, Ref, Schema } from "effect"
-import { Generated } from "@magnitudedev/icn"
-import type { MagnitudeConfig, SelectedLocalModelProfile } from "@magnitudedev/storage"
-import { makeLocalModelConfiguration } from "../model-configuration"
+import { Effect, Option, Ref, Schema, Stream } from "effect"
 import {
-  reconcileSelectedServingConfiguration,
-  type ServingConfigurationInventory,
-} from "./serving-configuration"
+  Generated,
+  IcnClient,
+  IcnInventory,
+} from "@magnitudedev/icn"
+import { makeIcnApiClient } from "../../../icn/src/generated/client"
+import type { MagnitudeConfig, SelectedLocalModelProfile } from "@magnitudedev/storage"
+import {
+  LocalModelConfiguration,
+  makeLocalModelConfiguration,
+  type LocalModelConfigurationApi,
+} from "../model-configuration"
+import { reconcileSelectedServingConfiguration } from "./serving-configuration"
 
 const model = (contextLength: number): Generated.Model => Schema.decodeUnknownSync(Generated.Model)({
   id: "model-1",
@@ -54,29 +62,49 @@ const selectedProfile: SelectedLocalModelProfile = {
   providerModelId: "model-1",
 }
 
-const makeInventory = (
+const provideServices = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
   current: Generated.Model,
-  configure: ServingConfigurationInventory["configureModelServing"],
-): ServingConfigurationInventory => ({
-  get: Effect.succeed({
-    revision: 0,
-    state: { object: "list", data: [current] },
-  }),
-  configureModelServing: configure,
-})
+  configuration: LocalModelConfigurationApi,
+  configureCalls: Ref.Ref<number>,
+) => Effect.gen(function* () {
+    const snapshot = {
+      revision: 0,
+      state: { object: "list", data: [current] },
+    } as const
+    const encoded = yield* Schema.encode(Generated.Model)(model(200_000))
+    const http = HttpClient.make((request) => Ref.update(configureCalls, (count) => count + 1).pipe(
+      Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify(encoded), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }))),
+    ))
+    const client = yield* makeIcnApiClient({ baseUrl: "http://icn.test" }).pipe(
+      Effect.provideService(HttpClient.HttpClient, http),
+    )
+    const inventory = IcnInventory.of({
+      get: Effect.succeed(snapshot),
+      changes: Stream.succeed(snapshot),
+      refresh: Effect.void,
+    })
+    return yield* effect.pipe(
+      Effect.provideService(IcnClient, client),
+      Effect.provideService(IcnInventory, inventory),
+      Effect.provideService(LocalModelConfiguration, configuration),
+    )
+  })
 
 describe("selected local serving configuration", () => {
   it("reconciles the durable selected context before exposing inventory", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const configureCalls = yield* Ref.make(0)
       const configuration = yield* makeConfiguration(selectedProfile)
-      const inventory = makeInventory(
+      const models = yield* provideServices(
+        reconcileSelectedServingConfiguration(),
         model(4_096),
-        ({ payload }) => Ref.update(configureCalls, (count) => count + 1).pipe(
-          Effect.as(model(payload.context_length)),
-        ),
+        configuration,
+        configureCalls,
       )
-      const models = yield* reconcileSelectedServingConfiguration(inventory, configuration)
       return { models, configureCalls: yield* Ref.get(configureCalls) }
     }))
 
@@ -95,11 +123,12 @@ describe("selected local serving configuration", () => {
     const configureCalls = await Effect.runPromise(Effect.gen(function* () {
       const calls = yield* Ref.make(0)
       const configuration = yield* makeConfiguration(selectedProfile)
-      const inventory = makeInventory(
+      yield* provideServices(
+        reconcileSelectedServingConfiguration(),
         model(200_000),
-        () => Ref.update(calls, (count) => count + 1).pipe(Effect.as(model(200_000))),
+        configuration,
+        calls,
       )
-      yield* reconcileSelectedServingConfiguration(inventory, configuration)
       return yield* Ref.get(calls)
     }))
 
@@ -114,11 +143,12 @@ describe("selected local serving configuration", () => {
         catalogModelId: "catalog",
         contextTokens: 200_000,
       })
-      const inventory = makeInventory(
+      yield* provideServices(
+        reconcileSelectedServingConfiguration(),
         model(4_096),
-        () => Ref.update(calls, (count) => count + 1).pipe(Effect.as(model(200_000))),
+        configuration,
+        calls,
       )
-      yield* reconcileSelectedServingConfiguration(inventory, configuration)
       return yield* Ref.get(calls)
     }))
 

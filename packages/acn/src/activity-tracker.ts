@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, PubSub, Ref, Stream } from "effect"
+import { Context, Effect, Layer, Ref, Stream, SubscriptionRef } from "effect"
 import { AcnRpcCommandActivity } from "@magnitudedev/protocol"
 
 export interface AcnActivityState {
@@ -33,23 +33,20 @@ export const AcnActivityTrackerLive: Layer.Layer<AcnActivityTracker> =
     AcnActivityTracker,
     Effect.gen(function* () {
       const startedAt = now()
-      const state = yield* Ref.make<ActivityState>({
+      const state = yield* SubscriptionRef.make<ActivityState>({
         lastCommandAt: 0,
         lastActivityAt: startedAt,
       })
-      const changes = yield* PubSub.unbounded<void>()
       const activeWork = yield* Ref.make(0)
 
-      const publishChange = PubSub.publish(changes, undefined).pipe(Effect.asVoid)
-
       const touch = (_reason: string) =>
-        Ref.update(state, (current) => ({
+        SubscriptionRef.update(state, (current) => ({
           ...current,
           lastActivityAt: now(),
-        })).pipe(Effect.zipRight(publishChange))
+        }))
 
       const markCommand = (operation: string) =>
-        Ref.update(state, (current) => {
+        SubscriptionRef.update(state, (current) => {
           const timestamp = now()
           return {
             ...current,
@@ -57,7 +54,6 @@ export const AcnActivityTrackerLive: Layer.Layer<AcnActivityTracker> =
             lastActivityAt: timestamp,
           }
         }).pipe(
-          Effect.zipRight(publishChange),
           Effect.annotateLogs({ operation }),
         )
 
@@ -71,8 +67,11 @@ export const AcnActivityTrackerLive: Layer.Layer<AcnActivityTracker> =
       return {
         markCommand,
         touch,
-        current: Ref.get(state),
-        changes: Stream.fromPubSub(changes).pipe(Stream.map(() => undefined)),
+        current: SubscriptionRef.get(state),
+        changes: state.changes.pipe(
+          Stream.drop(1),
+          Stream.mapEffect(() => Effect.void),
+        ),
         hasActiveWork: Ref.get(activeWork).pipe(Effect.map((count) => count > 0)),
         withActiveWork: (label, effect) => Effect.acquireUseRelease(
           acquire(label),

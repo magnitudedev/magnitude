@@ -53,7 +53,8 @@ model becomes available in that process. An idempotent model-management operatio
 configuration; it performs the same shared assessment and makes no change when the effective
 profile is already equal. Installation manifests and derived inventory caches never persist the
 selected context or sequence count. After restart, ACN reapplies durable product selection before
-publishing its local provider catalog.
+publishing its local services, then keeps that selection reconciled from durable-configuration and
+authoritative-inventory changes for the lifetime of the ACN scope.
 
 ## Authoritative reconciliation
 

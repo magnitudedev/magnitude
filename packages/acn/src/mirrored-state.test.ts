@@ -80,7 +80,11 @@ describe("mirrored state", () => {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const changes = yield* MirroredStateChanges
       const sourceValue = yield* Ref.make({ count: 0 })
-      const source = yield* makeIcnObservedState({ count: 0 }, Ref.get(sourceValue))
+      const source = yield* makeIcnObservedState(
+        { count: 0 },
+        Ref.get(sourceValue),
+        (left, right) => left.count === right.count,
+      )
       const events = yield* changes.stream.pipe(Stream.take(1), Stream.runCollect, Effect.fork)
       yield* Effect.yieldNow()
       const mirror = yield* bindMirroredState(CountMirror, source)

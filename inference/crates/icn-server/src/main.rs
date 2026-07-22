@@ -920,6 +920,52 @@ impl RuntimeFailure {
     }
 }
 
+struct RuntimeTransitionFailure {
+    source: InventoryError,
+    event: RuntimeFailure,
+}
+
+impl RuntimeTransitionFailure {
+    fn new(source: InventoryError, event: RuntimeFailure) -> Self {
+        Self { source, event }
+    }
+
+    fn into_inventory_error(self) -> InventoryError {
+        self.source
+    }
+}
+
+impl From<InventoryError> for RuntimeTransitionFailure {
+    fn from(error: InventoryError) -> Self {
+        let message = error.to_string();
+        Self::new(
+            error,
+            RuntimeFailure::new("runtime_transition_failed", message, true, true),
+        )
+    }
+}
+
+struct RuntimeTransitionReady {
+    generation: u64,
+}
+
+struct RuntimeProgress {
+    sender: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
+    operation_id: String,
+    model_id: String,
+}
+
+impl RuntimeProgress {
+    fn emit(&self, stage: ModelLoadStage, fraction: Option<f32>) {
+        let _ = self.sender.send(ModelLoadEvent::Progress {
+            operation_id: self.operation_id.clone(),
+            model_id: self.model_id.clone(),
+            stage,
+            fraction,
+        });
+    }
+}
+
 impl NativeRuntimeController {
     fn new(
         backends: BackendRegistry,
@@ -984,16 +1030,14 @@ impl NativeRuntimeController {
         .await;
     }
 
-    async fn fail_load(
+    async fn record_load_failure(
         &self,
-        sender: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
         resolved_id: &ModelId,
         stage: LoadStage,
-        operation_id: String,
-        model_id: String,
+        source: InventoryError,
         failure: RuntimeFailure,
-    ) {
-        let _ = self
+    ) -> RuntimeTransitionFailure {
+        match self
             .inventory
             .update_residency(
                 resolved_id,
@@ -1005,8 +1049,17 @@ impl NativeRuntimeController {
                     retryable: failure.retryable,
                 },
             )
-            .await;
-        self.fail(sender, operation_id, model_id, failure).await;
+            .await
+        {
+            Ok(()) => RuntimeTransitionFailure::new(source, failure),
+            Err(error) => {
+                let message = error.to_string();
+                RuntimeTransitionFailure::new(
+                    error,
+                    RuntimeFailure::new("inventory_update_failed", message, true, true),
+                )
+            }
+        }
     }
 
     fn profile_defaults(
@@ -1060,26 +1113,23 @@ impl NativeRuntimeController {
     #[tracing::instrument(
         name = "icn.runtime.load.operation",
         skip_all,
-        fields(operation.id = %operation_id, model.id = %model_id)
+        fields(operation.id = %progress.operation_id, model.id = %progress.model_id)
     )]
     async fn perform_transition(
         self,
-        model_id: String,
-        operation_id: String,
-        sender: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
-    ) -> Result<(), InventoryError> {
+        progress: RuntimeProgress,
+    ) -> Result<RuntimeTransitionReady, RuntimeTransitionFailure> {
+        let model_id = progress.model_id.clone();
+        let operation_id = progress.operation_id.clone();
         let existing = self.state.read().await.clone();
         let profile = match self.load_profile(&model_id).await {
             Ok(profile) => profile,
             Err(error) => {
-                self.fail(
-                    &sender,
-                    operation_id,
-                    model_id,
-                    RuntimeFailure::new("model_unavailable", error.to_string(), false, false),
-                )
-                .await;
-                return Err(InventoryError::NotReady(error.to_string()));
+                let message = error.to_string();
+                return Err(RuntimeTransitionFailure::new(
+                    error,
+                    RuntimeFailure::new("model_unavailable", message, false, false),
+                ));
             }
         };
 
@@ -1088,55 +1138,27 @@ impl NativeRuntimeController {
             .as_ref()
             .is_some_and(|resident| resident.model_id == model_id && resident.profile == profile)
         {
-            let _ = Self::emit(
-                &sender,
-                ModelLoadEvent::Ready {
-                    operation_id,
-                    model_id,
-                    generation: existing.generation,
-                },
-            )
-            .await;
-            return Ok(());
+            return Ok(RuntimeTransitionReady {
+                generation: existing.generation,
+            });
         };
         let _backend_mutation = self.backends.begin_mutation().await;
 
         for stage in [ModelLoadStage::Queued, ModelLoadStage::Resolving] {
-            let _ = Self::emit(
-                &sender,
-                ModelLoadEvent::Progress {
-                    operation_id: operation_id.clone(),
-                    model_id: model_id.clone(),
-                    stage,
-                    fraction: None,
-                },
-            )
-            .await;
+            progress.emit(stage, None);
         }
 
         let (resolved, plan, mtp_selection) = match self.resolved_load(&model_id, &profile).await {
             Ok(value) => value,
             Err(error) => {
-                self.fail(
-                    &sender,
-                    operation_id,
-                    model_id,
-                    RuntimeFailure::new("model_unavailable", error.to_string(), false, false),
-                )
-                .await;
-                return Err(InventoryError::NotReady(error.to_string()));
+                let message = error.to_string();
+                return Err(RuntimeTransitionFailure::new(
+                    error,
+                    RuntimeFailure::new("model_unavailable", message, false, false),
+                ));
             }
         };
-        let _ = Self::emit(
-            &sender,
-            ModelLoadEvent::Progress {
-                operation_id: operation_id.clone(),
-                model_id: model_id.clone(),
-                stage: ModelLoadStage::Assessing,
-                fraction: None,
-            },
-        )
-        .await;
+        progress.emit(ModelLoadStage::Assessing, None);
 
         let generation = self.backends.generation();
         *self.state.write().await = RuntimeState {
@@ -1144,23 +1166,13 @@ impl NativeRuntimeController {
             resident: None,
         };
 
-        let _ = Self::emit(
-            &sender,
-            ModelLoadEvent::Progress {
-                operation_id: operation_id.clone(),
-                model_id: model_id.clone(),
-                stage: ModelLoadStage::Unloading,
-                fraction: None,
-            },
-        )
-        .await;
+        progress.emit(ModelLoadStage::Unloading, None);
         if let Some(resident) = &existing.resident
             && let Ok(id) = ModelId::parse(resident.model_id.clone())
         {
-            let _ = self
-                .inventory
+            self.inventory
                 .update_residency(&id, ModelResidency::NotResident)
-                .await;
+                .await?;
         }
         if let Ok(mut slot) = self.native_executor.write() {
             *slot = None;
@@ -1168,8 +1180,7 @@ impl NativeRuntimeController {
         self.backends.clear();
 
         let load_started_at = unix_timestamp();
-        let _ = self
-            .inventory
+        self.inventory
             .update_residency(
                 &resolved.model.id,
                 ModelResidency::Loading {
@@ -1179,17 +1190,8 @@ impl NativeRuntimeController {
                     fraction: None,
                 },
             )
-            .await;
-        let _ = Self::emit(
-            &sender,
-            ModelLoadEvent::Progress {
-                operation_id: operation_id.clone(),
-                model_id: model_id.clone(),
-                stage: ModelLoadStage::Loading,
-                fraction: None,
-            },
-        )
-        .await;
+            .await?;
+        progress.emit(ModelLoadStage::Loading, None);
         let load_model_id = model_id.clone();
         let native_backend = self.native_backend.clone();
         let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1207,11 +1209,11 @@ impl NativeRuntimeController {
         let load_result = loop {
             tokio::select! {
                 result = &mut load_task => break result,
-                progress = progress_receiver.recv() => {
-                    let Some(fraction) = progress else {
+                load_progress = progress_receiver.recv() => {
+                    let Some(fraction) = load_progress else {
                         break load_task.await;
                     };
-                    let _ = self.inventory.update_residency(
+                    if let Err(error) = self.inventory.update_residency(
                         &resolved.model.id,
                         ModelResidency::Loading {
                             load_id: operation_id.clone(),
@@ -1219,16 +1221,19 @@ impl NativeRuntimeController {
                             started_at: load_started_at,
                             fraction: Some(fraction),
                         },
-                    ).await;
-                    let _ = Self::emit(
-                        &sender,
-                        ModelLoadEvent::Progress {
-                            operation_id: operation_id.clone(),
-                            model_id: model_id.clone(),
-                            stage: ModelLoadStage::Loading,
-                            fraction: Some(fraction),
-                        },
-                    ).await;
+                    ).await {
+                        let message = error.to_string();
+                        return Err(RuntimeTransitionFailure::new(
+                            error,
+                            RuntimeFailure::new(
+                                "inventory_update_failed",
+                                message,
+                                true,
+                                true,
+                            ),
+                        ));
+                    }
+                    progress.emit(ModelLoadStage::Loading, Some(fraction));
                 }
             }
         };
@@ -1248,60 +1253,69 @@ impl NativeRuntimeController {
                         HardwareAssessment::NotAssessed { .. } => ("planner_failed", true),
                         HardwareAssessment::Fits { .. } => ("planner_invariant", false),
                     },
+                    ModelLoadError::MemoryAttribution(_) => {
+                        ("memory_attribution_failed", true)
+                    }
                     ModelLoadError::Backend(_) => ("backend_load_failed", true),
                 };
-                self.fail_load(
-                    &sender,
+                let source = InventoryError::Internal(error.to_string());
+                let failure = self.record_load_failure(
                     &resolved.model.id,
                     LoadStage::Opening,
-                    operation_id,
-                    model_id,
+                    source,
                     RuntimeFailure::new(code, error.to_string(), retryable, true),
                 )
                 .await;
-                return Err(InventoryError::Internal(error.to_string()));
+                return Err(failure);
             }
             Err(error) => {
-                self.fail_load(
-                    &sender,
+                let source = InventoryError::Internal(error.to_string());
+                let failure = self.record_load_failure(
                     &resolved.model.id,
                     LoadStage::Opening,
-                    operation_id,
-                    model_id,
+                    source,
                     RuntimeFailure::new("load_task_failed", error.to_string(), true, true),
                 )
                 .await;
-                return Err(InventoryError::Internal(error.to_string()));
+                return Err(failure);
             }
         };
-        let _ = Self::emit(
-            &sender,
-            ModelLoadEvent::Progress {
-                operation_id: operation_id.clone(),
-                model_id: model_id.clone(),
-                stage: ModelLoadStage::Verifying,
-                fraction: None,
-            },
-        )
-        .await;
+        progress.emit(ModelLoadStage::Verifying, None);
         let properties = match backend.properties() {
             Ok(properties) => properties,
             Err(error) => {
-                self.fail_load(
-                    &sender,
+                let source = InventoryError::Internal(error.to_string());
+                let failure = self.record_load_failure(
                     &resolved.model.id,
                     LoadStage::Warming,
-                    operation_id,
-                    model_id,
+                    source,
                     RuntimeFailure::new("verification_failed", error.to_string(), true, true),
                 )
                 .await;
-                return Err(InventoryError::Internal(error.to_string()));
+                return Err(failure);
             }
         };
         let execution_backend = backend.acceleration().to_owned();
         let mut aliases = std::collections::BTreeSet::new();
         aliases.insert(resolved.model.name.clone());
+        let execution: std::collections::BTreeMap<_, _> =
+            serde_json::to_value(&properties.execution.resolved)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        self.inventory
+            .update_residency(
+                &resolved.model.id,
+                ModelResidency::Loaded {
+                    loaded_at: unix_timestamp(),
+                    backend: execution_backend,
+                    context_length: properties.context_tokens,
+                    execution,
+                },
+            )
+            .await?;
         let generation = self
             .backends
             .replace(Arc::clone(&backend) as Arc<dyn CompletionBackend>, aliases);
@@ -1312,25 +1326,6 @@ impl NativeRuntimeController {
                 backend: Arc::clone(&backend),
             });
         }
-        let execution: std::collections::BTreeMap<_, _> =
-            serde_json::to_value(&properties.execution.resolved)
-                .ok()
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-        let _ = self
-            .inventory
-            .update_residency(
-                &resolved.model.id,
-                ModelResidency::Loaded {
-                    loaded_at: unix_timestamp(),
-                    backend: execution_backend,
-                    context_length: properties.context_tokens,
-                    execution,
-                },
-            )
-            .await;
         let state = RuntimeState {
             generation,
             resident: Some(ResidentTarget {
@@ -1339,17 +1334,8 @@ impl NativeRuntimeController {
             }),
         };
         *self.state.write().await = state.clone();
-        let _ = Self::emit(
-            &sender,
-            ModelLoadEvent::Ready {
-                operation_id,
-                model_id,
-                generation,
-            },
-        )
-        .await;
         tracing::info!("runtime model ready");
-        Ok(())
+        Ok(RuntimeTransitionReady { generation })
     }
 
     async fn load_profile(
@@ -1380,10 +1366,42 @@ impl RuntimeController for NativeRuntimeController {
         tokio::spawn(
             async move {
                 let _guard = runtime.mutation.lock().await;
-                let _ = runtime
+                let failure_runtime = runtime.clone();
+                let failure_sender = sender.clone();
+                let failure_operation_id = operation_id.clone();
+                let failure_model_id = model_id.clone();
+                let progress = RuntimeProgress {
+                    sender,
+                    operation_id: operation_id.clone(),
+                    model_id: model_id.clone(),
+                };
+                match runtime
                     .clone()
-                    .perform_transition(model_id, operation_id, sender)
-                    .await;
+                    .perform_transition(progress)
+                    .await
+                {
+                    Ok(ready) => {
+                        let _ = Self::emit(
+                            &failure_sender,
+                            ModelLoadEvent::Ready {
+                                operation_id: failure_operation_id,
+                                model_id: failure_model_id,
+                                generation: ready.generation,
+                            },
+                        )
+                        .await;
+                    }
+                    Err(failure) => {
+                        failure_runtime
+                            .fail(
+                                &failure_sender,
+                                failure_operation_id,
+                                failure_model_id,
+                                failure.event,
+                            )
+                            .await;
+                    }
+                }
             }
             .in_current_span(),
         );
@@ -1404,10 +1422,16 @@ impl RuntimeController for NativeRuntimeController {
                         runtime.next_operation.fetch_add(1, Ordering::Relaxed)
                     );
                     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+                    let progress = RuntimeProgress {
+                        sender,
+                        operation_id,
+                        model_id: model_id.clone(),
+                    };
                     runtime
                         .clone()
-                        .perform_transition(model_id.clone(), operation_id, sender)
-                        .await?;
+                        .perform_transition(progress)
+                        .await
+                        .map_err(RuntimeTransitionFailure::into_inventory_error)?;
 
                     let state = runtime.state.read().await.clone();
                     if state

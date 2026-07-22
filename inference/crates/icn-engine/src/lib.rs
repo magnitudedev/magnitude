@@ -34,7 +34,9 @@ use llama_cpp_2::common_sampling::{
     CommonSamplerConfig, ReasoningBudgetLimit,
 };
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::{LlamaMemoryBreakdown, LlamaMemoryLocation};
+use llama_cpp_2::context::{
+    LlamaMemoryBreakdown, LlamaMemoryBreakdownError, LlamaMemoryLocation,
+};
 use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
@@ -155,14 +157,28 @@ struct HardwareObservationRequest {
     policy: icn_hardware::CapacityPolicy,
     native_build: String,
     enabled_backends: Vec<String>,
-    response: SyncSender<HardwareSnapshot>,
+    response: SyncSender<Result<HardwareSnapshot, HardwareObservationError>>,
 }
 
-#[derive(Clone)]
-enum ResidentAllocationEvidence {
-    Available(Vec<ResidentAllocation>),
-    CaptureFailed,
+#[derive(Debug)]
+pub enum HardwareObservationError {
+    ExecutorStopped,
+    MemoryDomainUnresolved { location: String },
 }
+
+impl std::fmt::Display for HardwareObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecutorStopped => formatter.write_str("inference executor stopped"),
+            Self::MemoryDomainUnresolved { location } => write!(
+                formatter,
+                "resident allocation location does not map to a hardware memory domain: {location}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HardwareObservationError {}
 
 #[derive(Clone)]
 struct ResidentAllocation {
@@ -306,6 +322,7 @@ pub enum ModelLoadError {
     MtpSelection(String),
     Planning(String),
     AssessmentRejected(Box<HardwareAssessment>),
+    MemoryAttribution(LlamaMemoryBreakdownError),
     Backend(String),
 }
 
@@ -321,6 +338,9 @@ impl std::fmt::Display for ModelLoadError {
                 formatter,
                 "native load assessment rejected the model: {assessment:?}"
             ),
+            Self::MemoryAttribution(error) => {
+                write!(formatter, "resident-memory attribution failed: {error}")
+            }
             Self::Backend(message) => {
                 write!(formatter, "native backend initialization failed: {message}")
             }
@@ -425,7 +445,7 @@ impl LlamaCompletionBackend {
         policy: icn_hardware::CapacityPolicy,
         native_build: String,
         enabled_backends: Vec<String>,
-    ) -> Result<HardwareSnapshot, InferenceError> {
+    ) -> Result<HardwareSnapshot, HardwareObservationError> {
         let (response, receiver) = sync_channel(1);
         self.commands
             .send(ExecutorCommand::ObserveHardware(
@@ -438,8 +458,10 @@ impl LlamaCompletionBackend {
                     response,
                 },
             ))
-            .map_err(|_| InferenceError::ExecutorStopped)?;
-        receiver.recv().map_err(|_| InferenceError::ExecutorStopped)
+            .map_err(|_| HardwareObservationError::ExecutorStopped)?;
+        receiver
+            .recv()
+            .map_err(|_| HardwareObservationError::ExecutorStopped)?
     }
 }
 
@@ -907,12 +929,18 @@ fn run_initialized_executor<'model>(
         let _ = ready.send(Err(error.into()));
         return;
     }
-    let resident_allocations = capture_resident_allocations(
+    let resident_allocations = match capture_resident_allocations(
         context,
         draft_context.as_deref(),
         draft_has_separate_model,
         auxiliary_allocations,
-    );
+    ) {
+        Ok(allocations) => allocations,
+        Err(error) => {
+            let _ = ready.send(Err(ModelLoadError::MemoryAttribution(error)));
+            return;
+        }
+    };
     let modalities = multimodal
         .as_ref()
         .map_or_else(ModelModalities::default, multimodal_modalities);
@@ -952,18 +980,14 @@ fn capture_resident_allocations(
     draft_context: Option<&LlamaContext<'_>>,
     draft_has_separate_model: bool,
     auxiliary_allocations: &[ResidentAllocation],
-) -> ResidentAllocationEvidence {
-    let Ok(target) = context.memory_breakdown() else {
-        return ResidentAllocationEvidence::CaptureFailed;
-    };
+) -> Result<Vec<ResidentAllocation>, LlamaMemoryBreakdownError> {
+    let target = context.memory_breakdown()?;
     let mut allocations = target
         .into_iter()
         .map(ResidentAllocation::from)
         .collect::<Vec<_>>();
     if let Some(draft_context) = draft_context {
-        let Ok(draft) = draft_context.memory_breakdown() else {
-            return ResidentAllocationEvidence::CaptureFailed;
-        };
+        let draft = draft_context.memory_breakdown()?;
         let mut draft = draft
             .into_iter()
             .map(ResidentAllocation::from)
@@ -976,18 +1000,15 @@ fn capture_resident_allocations(
         allocations.extend(draft);
     }
     allocations.extend_from_slice(auxiliary_allocations);
-    ResidentAllocationEvidence::Available(allocations)
+    Ok(allocations)
 }
 
 fn resident_memory_state(
     snapshot: &HardwareSnapshot,
-    evidence: &ResidentAllocationEvidence,
+    allocations: &[ResidentAllocation],
     model_id: String,
     runtime_generation: u64,
-) -> Option<ResidentMemory> {
-    let ResidentAllocationEvidence::Available(allocations) = evidence else {
-        return None;
-    };
+) -> Result<ResidentMemory, HardwareObservationError> {
     let mut domains = BTreeMap::<String, ResidentMemoryDomain>::new();
     for allocation in allocations {
         let location = match &allocation.location {
@@ -1003,7 +1024,11 @@ fn resident_memory_state(
                 native_index: *native_index,
             },
         };
-        let domain_id = icn_hardware::resolve_memory_domain(snapshot, &location)?;
+        let domain_id = icn_hardware::resolve_memory_domain(snapshot, &location).ok_or_else(|| {
+            HardwareObservationError::MemoryDomainUnresolved {
+                location: format!("{location:?}"),
+            }
+        })?;
         let domain = domains
             .entry(domain_id.to_owned())
             .or_insert_with(|| ResidentMemoryDomain {
@@ -1024,7 +1049,7 @@ fn resident_memory_state(
             .auxiliary_bytes
             .saturating_add(allocation.auxiliary_bytes);
     }
-    Some(ResidentMemory {
+    Ok(ResidentMemory {
         model_id,
         runtime_generation,
         domains: domains.into_values().collect(),
@@ -1044,7 +1069,7 @@ fn run_scheduler<'model>(
     mut mtp: Option<&mut MtpOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
-    resident_allocations: ResidentAllocationEvidence,
+    resident_allocations: Vec<ResidentAllocation>,
 ) {
     let mut sequence_pool = SequencePool::new(config.max_sequences);
     let mut planner = BatchPlanner::new(config.prefill_quantum as usize);
@@ -1076,13 +1101,17 @@ fn run_scheduler<'model>(
                 observation.native_build,
                 observation.enabled_backends,
             );
-            snapshot.resident_memory = resident_memory_state(
+            let observed = resident_memory_state(
                 &snapshot,
                 &resident_allocations,
                 observation.model_id,
                 observation.runtime_generation,
-            );
-            let _ = observation.response.try_send(snapshot);
+            )
+            .map(|resident_memory| {
+                snapshot.resident_memory = Some(resident_memory);
+                snapshot
+            });
+            let _ = observation.response.try_send(observed);
         }
 
         if active.is_empty()
@@ -4000,7 +4029,7 @@ mod tests {
             }],
             resident_memory: None,
         };
-        let evidence = ResidentAllocationEvidence::Available(vec![
+        let evidence = vec![
             ResidentAllocation {
                 location: LlamaMemoryLocation::Host,
                 model_bytes: 3,
@@ -4019,7 +4048,7 @@ mod tests {
                 compute_bytes: 3,
                 auxiliary_bytes: 2,
             },
-        ]);
+        ];
 
         let resident = resident_memory_state(&snapshot, &evidence, "model".to_owned(), 7)
             .expect("exact device identities resolve");
