@@ -749,6 +749,7 @@ export interface IcnProcessService {
   readonly diagnosticTail: Effect.Effect<string>;
   readonly exit: Effect.Effect<IcnExit, IcnLifecycleError>;
   readonly unexpectedExit: Effect.Effect<never, IcnLifecycleError>;
+  readonly shutdown: Effect.Effect<void, IcnLifecycleError>;
   readonly shutdownResult: Effect.Effect<void, IcnLifecycleError>;
 }
 
@@ -1047,8 +1048,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       Effect.catchAll((error) => withDiagnostic(error, output))
     );
 
-    const shutdown = Effect.gen(function* () {
-      if (yield* Ref.getAndSet(stopping, true)) return;
+    const performShutdown = Effect.gen(function* () {
       const alreadyExited = yield* Deferred.isDone(exited);
       if (!alreadyExited) {
         yield* process
@@ -1093,12 +1093,16 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         }
       }
     });
+    const shutdown = Effect.gen(function* () {
+      const alreadyStopping = yield* Ref.getAndSet(stopping, true);
+      if (alreadyStopping) return yield* Deferred.await(shutdownResult);
+
+      const result = yield* performShutdown.pipe(Effect.exit);
+      yield* Deferred.done(shutdownResult, result);
+      return yield* Deferred.await(shutdownResult);
+    });
     yield* Effect.addFinalizer(() =>
-      shutdown.pipe(
-        Effect.tap(() => Deferred.complete(shutdownResult, Effect.void)),
-        Effect.catchAll((error) => Deferred.fail(shutdownResult, error)),
-        Effect.asVoid
-      )
+      shutdown.pipe(Effect.ignore)
     );
     const exit = Deferred.await(exited);
     return {
@@ -1131,6 +1135,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
             )
           )
         ),
+        shutdown,
         shutdownResult: Deferred.await(shutdownResult),
       }),
     };

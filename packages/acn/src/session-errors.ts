@@ -77,6 +77,8 @@ export function sessionErrorMessage(error: SessionError): string {
       return error.reason
     case "SessionOperationFailed":
       return `${error.operation}: ${error.reason}`
+    case "DisplayViewNotOpen":
+      return `Display view not open: ${error.viewId}`
     case "InvalidSessionPath":
       return `Invalid session path: ${error.path}`
   }

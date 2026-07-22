@@ -2,12 +2,10 @@ import {
   MagnitudeRpcs,
   SessionOperationFailed,
   ModelSlotMutationRejected,
-  STREAM_HEARTBEAT_INTERVAL_MS,
   type DisplayViewShape,
   type SessionError,
-  type StreamHeartbeat,
 } from "@magnitudedev/protocol";
-import { Cause, Chunk, Effect, Option, Schedule, Stream } from "effect";
+import { Cause, Chunk, Effect, Option, Stream } from "effect";
 import { SessionCommands } from "./session-commands";
 import { SessionLifecycle } from "./session-lifecycle";
 import { ProviderCredentials } from "./provider-credentials";
@@ -36,7 +34,6 @@ import {
 import type { AppEvent } from "@magnitudedev/agent";
 import { Onboarding } from "./onboarding";
 import { MirroredStateChanges } from "./mirrored-state";
-import { AcnActivityTracker } from "./activity-tracker";
 import { LocalModelInventory } from "./local-model-inventory";
 import { LocalInferenceHardware } from "./local-inference-hardware";
 
@@ -54,7 +51,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const mirroredStateChanges = yield* MirroredStateChanges;
     const localModels = yield* LocalModelInventory;
     const localHardware = yield* LocalInferenceHardware;
-    const activity = yield* AcnActivityTracker;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -99,22 +95,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       sessionLifecycle
         .getSessionExecutionContext(sessionId)
         .pipe(Effect.flatMap((context) => run(context)));
-    // Liveness heartbeats: every long-lived stream emits one at a fixed
-    // cadence so clients can distinguish "daemon dead" from "no events".
-    // Consumers filter them when they need only domain events. Halts when the
-    // source stream halts; source errors propagate untouched.
-    const heartbeatEvent: StreamHeartbeat = { _tag: "heartbeat" };
-    const withHeartbeat = <A, E, R>(
-      stream: Stream.Stream<A, E, R>
-    ): Stream.Stream<A | StreamHeartbeat, E, R> =>
-      Stream.merge(
-        stream,
-        Stream.repeatEffectWithSchedule(
-          Effect.succeed(heartbeatEvent),
-          Schedule.spaced(`${STREAM_HEARTBEAT_INTERVAL_MS} millis`)
-        ),
-        { haltStrategy: "left" }
-      );
 
     const observeDisplayViewStream = <A, E, R>(
       sessionId: string,
@@ -145,12 +125,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       Option.match(displayViewIntrospector, {
         onNone: () => Effect.void,
         onSome: (introspector) => introspector.resync(sessionId, viewId),
-      });
-
-    const recordDisplayViewClose = (sessionId: string, viewId: string) =>
-      Option.match(displayViewIntrospector, {
-        onNone: () => Effect.void,
-        onSome: (introspector) => introspector.closeView(sessionId, viewId),
       });
 
     return {
@@ -218,8 +192,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           sessionLifecycle.listSessionCwds()
         ),
 
-      StreamActiveSessionStatuses: () =>
-        withHeartbeat(activeSessionStatuses.stream),
+      StreamActiveSessionStatuses: () => activeSessionStatuses.stream,
 
       GetSession: ({ sessionId }: { sessionId: string }) =>
         observeRpcDefects(
@@ -330,34 +303,25 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       WatchMirroredStates: () =>
         observeRpcStreamDefects(
           "WatchMirroredStates",
-          withHeartbeat(mirroredStateChanges.stream),
+          mirroredStateChanges.stream,
         ),
 
       DownloadLocalModel: ({ localModelId }) =>
         observeRpcDefects(
           "DownloadLocalModel",
-          activity.withActiveWork(
-            "local-inference:download",
-            localModels.download(localModelId).pipe(Effect.as({})),
-          ),
+          localModels.download(localModelId).pipe(Effect.as({})),
         ),
 
       LoadModelSlot: ({ slotId, selection }) =>
         observeRpcDefects(
           "LoadModelSlot",
-          activity.withActiveWork(
-            "local-inference:load",
-            modelSlots.loadModelSlot(slotId, selection).pipe(Effect.as({})),
-          ),
+          modelSlots.loadModelSlot(slotId, selection).pipe(Effect.as({})),
         ),
 
       ReloadModelSlot: ({ slotId }) =>
         observeRpcDefects(
           "ReloadModelSlot",
-          activity.withActiveWork(
-            "local-inference:reload",
-            modelSlots.reloadModelSlot(slotId).pipe(Effect.as({})),
-          ),
+          modelSlots.reloadModelSlot(slotId).pipe(Effect.as({})),
         ),
 
       DeleteLocalModel: ({ localModelId }) =>
@@ -371,10 +335,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       UnloadModelSlot: ({ slotId }) =>
         observeRpcDefects(
           "UnloadModelSlot",
-          activity.withActiveWork(
-            "local-inference:unload",
-            modelSlots.unloadModelSlot(slotId).pipe(Effect.as({})),
-          ),
+          modelSlots.unloadModelSlot(slotId).pipe(Effect.as({})),
         ),
 
       // Generic onboarding completion, independent of local inference
@@ -403,7 +364,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       WatchFile: ({ cwd, path }) =>
         observeRpcStreamDefects(
           "WatchFile",
-          withHeartbeat(watchFile(cwd, path))
+          watchFile(cwd, path)
         ),
 
       ResolvePath: ({ cwd, path, checkExists }) =>
@@ -477,12 +438,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       StreamDisplayView: ({ sessionId, viewId, shape }) =>
         observeRpcStreamDefects(
           "StreamDisplayView",
-          withHeartbeat(
-            observeDisplayViewStream(
-              sessionId,
-              viewId,
-              displayStreams.getDisplayViewStream(sessionId, viewId, shape)
-            )
+          observeDisplayViewStream(
+            sessionId,
+            viewId,
+            displayStreams.getDisplayViewStream(sessionId, viewId, shape)
           )
         ),
 
@@ -491,7 +450,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           "ResyncDisplayView",
           displayStreams.requestDisplayViewSnapshot(sessionId, viewId).pipe(
             Effect.tap(() => recordDisplayViewResync(sessionId, viewId)),
-            Effect.map((): "ok" => "ok")
           )
         ),
 
@@ -505,15 +463,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
             )
         ),
 
-      CloseDisplayView: ({ sessionId, viewId }) =>
-        observeRpcDefects(
-          "CloseDisplayView",
-          displayStreams
-            .closeDisplayView(sessionId, viewId)
-            .pipe(Effect.tap(() => recordDisplayViewClose(sessionId, viewId)))
-        ),
-
-      StreamEvents: () => Stream.empty,
     };
   })
 );

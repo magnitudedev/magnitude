@@ -5,7 +5,8 @@ export const AcnRegistrationSchema = Schema.Struct({
   version: Schema.String,
   url: Schema.String,
   pid: Schema.Number,
-  timestamp: Schema.Number
+  timestamp: Schema.Number,
+  shutdownToken: Schema.optional(Schema.String),
 })
 export type AcnRegistration = Schema.Schema.Type<typeof AcnRegistrationSchema>
 
@@ -16,7 +17,3 @@ export const AcnVersionRegistrySchema = Schema.Struct({
 export type AcnVersionRegistry = Schema.Schema.Type<typeof AcnVersionRegistrySchema>
 
 export const AcnVersionRegistryJson = Schema.parseJson(AcnVersionRegistrySchema)
-
-export function versionPathSegment(version: string): string {
-  return encodeURIComponent(version)
-}

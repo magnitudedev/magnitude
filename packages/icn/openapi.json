@@ -766,6 +766,38 @@
           }
         }
       }
+    },
+    "/v1/runtime/changes": {
+      "get": {
+        "tags": [
+          "runtime"
+        ],
+        "operationId": "observeRuntimeChanges",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current or next runtime inventory revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeChangesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5044,6 +5076,20 @@
             }
           }
         ]
+      },
+      "RuntimeChangesResponse": {
+        "type": "object",
+        "required": [
+          "revision"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "ServingConfigurationSchema": {
         "type": "object",

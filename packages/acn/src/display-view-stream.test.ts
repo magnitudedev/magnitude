@@ -107,7 +107,13 @@ describe("makeDisplayViewStream", () => {
     expect(stateEvent).toMatchObject({ shape })
     expect(patchEvent).toEqual({
       _tag: "patch",
-      ops: [{ op: "add", path: "/state/tasks/byId/root/parentId", value: "parent" }],
+      ops: [
+        {
+          op: "replace",
+          path: ["state", "tasks", "byId", "root", "parentId"],
+          value: "parent",
+        },
+      ],
     })
     expect(Schema.encodeSync(StreamEventSchema)(patchEvent)).toEqual(patchEvent)
   })
@@ -146,11 +152,17 @@ describe("makeDisplayViewStream", () => {
     // Shape change arrives as a generic patch on the snapshot's /shape subtree
     expect(events[1]).toEqual({
       _tag: "patch",
-      ops: [{ op: "replace", path: "/shape/timelines/root/limit", value: 50 }],
+      ops: [{ op: "replace", path: ["shape", "timelines", "root", "limit"], value: 50 }],
     })
     expect(events[2]).toEqual({
       _tag: "patch",
-      ops: [{ op: "add", path: "/state/tasks/byId/root/parentId", value: "parent" }],
+      ops: [
+        {
+          op: "replace",
+          path: ["state", "tasks", "byId", "root", "parentId"],
+          value: "parent",
+        },
+      ],
     })
   })
 
@@ -223,13 +235,13 @@ describe("makeDisplayViewStream", () => {
     }
     expect(events[1].ops).toEqual(expect.arrayContaining([
       {
-        op: "add",
-        path: "/shape/timelines/worker-1",
+        op: "replace",
+        path: ["shape", "timelines", "worker-1"],
         value: { kind: "tail", limit: 200, live: true, presentation: "default" },
       },
       {
-        op: "add",
-        path: "/state/timelines/worker-1",
+        op: "replace",
+        path: ["state", "timelines", "worker-1"],
         value: {
           mode: "idle",
           messages: {

@@ -1,11 +1,27 @@
-import { Context, Deferred, Effect, Layer, Ref, Scope, Exit, PubSub, Stream, Option } from "effect"
-import { DEFAULT_CHAT_NAME } from "@magnitudedev/agent"
+import {
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  ExecutionStrategy,
+  Exit,
+  Layer,
+  Option,
+  PubSub,
+  Ref,
+  Scope,
+  Stream,
+} from "effect"
+import { DEFAULT_CHAT_NAME, type SessionWorkStatus } from "@magnitudedev/agent"
 import {
   SessionNotFound,
+  SessionOperationFailed,
   type SessionError,
 } from "@magnitudedev/protocol"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
+import { AcnActivityTracker } from "./activity-tracker"
 import { AgentFactory } from "./agent-factory"
+import { makeResourceUseGate, ResourceRetired, type ResourceUseGate } from "./resource-use-gate"
 import { SessionStore } from "./session-store"
 import {
   SessionRuntimeOptionsStore,
@@ -13,300 +29,574 @@ import {
   type SessionRuntimeOptions,
 } from "./session-runtime-options"
 import type { RuntimeEntry } from "./session-types"
-import type { CloseableScope } from "effect/Scope"
 
 export interface RuntimeStartRequest {
   readonly sessionId: string
   readonly cwd: string
   readonly options: SessionRuntimeOptions
   readonly visibility: StoredSessionMeta["visibility"]
-  readonly scope: Option.Option<CloseableScope>
+}
+
+export interface ResidentSessionSnapshot {
+  readonly sessionId: string
+  readonly generation: number
+  readonly title: string
+  readonly cwd: string
+  readonly scratchpadPath: string
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly residentSince: number
+  readonly workStatus: SessionWorkStatus
+}
+
+export interface SessionRetirementObserver {
+  readonly retire: (input: {
+    readonly sessionId: string
+    readonly generation: number
+  }) => Effect.Effect<void>
 }
 
 export interface AgentRuntimeApi {
-  readonly getLive: (sessionId: string) => Effect.Effect<RuntimeEntry | null>
-  readonly getAllEntries: () => Effect.Effect<ReadonlyArray<RuntimeEntry>>
-  readonly getOrStart: (request: RuntimeStartRequest) => Effect.Effect<RuntimeEntry, SessionError>
-  readonly requireOrStart: (sessionId: string) => Effect.Effect<RuntimeEntry, SessionError>
+  readonly withSession: <A, E, R>(
+    sessionId: string,
+    label: string,
+    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | SessionError, R>
+  readonly withSessionRequest: <A, E, R>(
+    request: RuntimeStartRequest,
+    label: string,
+    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | SessionError, R>
+  readonly tryWithResident: <A, E, R>(
+    sessionId: string,
+    label: string,
+    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<Option.Option<A>, E | SessionError, R>
+  readonly tryWithBusyResident: <A, E, R>(
+    sessionId: string,
+    label: string,
+    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<Option.Option<A>, E | SessionError, R>
+  readonly residentSessions: Effect.Effect<ReadonlyArray<ResidentSessionSnapshot>>
   readonly dispose: (sessionId: string) => Effect.Effect<void>
-  readonly disposeAll: () => Effect.Effect<void>
-  readonly touchEntry: (sessionId: string) => Effect.Effect<void>
-  readonly retainEntry: (sessionId: string) => Effect.Effect<void>
-  readonly releaseEntry: (sessionId: string) => Effect.Effect<void>
-  readonly evictIdleSessions: () => Effect.Effect<void>
-  readonly hasActiveWork: Effect.Effect<boolean>
-  readonly count: Effect.Effect<number>
+  readonly deleteSession: <R>(
+    sessionId: string,
+    removeDurableState: Effect.Effect<void, SessionError, R>,
+  ) => Effect.Effect<void, SessionError, R>
+  readonly registerRetirementObserver: (
+    observer: SessionRetirementObserver,
+  ) => Effect.Effect<Effect.Effect<void>>
   readonly changes: Stream.Stream<void>
 }
 
-const SESSION_EVICT_GRACE_MS = 120_000
+export class AgentRuntime extends Context.Tag("AgentRuntime")<AgentRuntime, AgentRuntimeApi>() {}
 
-export class AgentRuntime extends Context.Tag("AgentRuntime")<
-  AgentRuntime,
-  AgentRuntimeApi
->() {}
+interface ResidentGeneration {
+  readonly generation: number
+  readonly entry: RuntimeEntry
+  readonly gate: ResourceUseGate
+  readonly scope: Scope.CloseableScope
+  readonly residentSince: number
+  readonly workStatus: Ref.Ref<SessionWorkStatus>
+  readonly reconcileWork: Effect.Effect<void>
+}
 
-type RuntimeStartDeferred = Deferred.Deferred<RuntimeEntry, SessionError>
+type StartDeferred = Deferred.Deferred<ResidentGeneration, SessionError>
 
-type RuntimeStartClaim =
-  | { readonly _tag: "owner"; readonly deferred: RuntimeStartDeferred }
-  | { readonly _tag: "joiner"; readonly deferred: RuntimeStartDeferred }
+type StartClaim =
+  | { readonly _tag: "owner"; readonly deferred: StartDeferred }
+  | { readonly _tag: "joiner"; readonly deferred: StartDeferred }
 
-export const AgentRuntimeLive: Layer.Layer<AgentRuntime, never, AgentFactory | SessionStore | SessionRuntimeOptionsStore> =
+type DeleteDeferred = Deferred.Deferred<void, SessionError>
+
+type DeleteClaim =
+  | { readonly _tag: "owner"; readonly deferred: DeleteDeferred }
+  | { readonly _tag: "joiner"; readonly deferred: DeleteDeferred }
+
+export interface AgentRuntimeOptions {
+  readonly idleTimeout?: Duration.DurationInput
+}
+
+export const makeAgentRuntimeLive = (
+  options: AgentRuntimeOptions = {},
+): Layer.Layer<AgentRuntime, never, AgentFactory | SessionStore | SessionRuntimeOptionsStore> =>
   Layer.scoped(
     AgentRuntime,
     Effect.gen(function* () {
       const factory = yield* AgentFactory
       const store = yield* SessionStore
       const runtimeOptions = yield* SessionRuntimeOptionsStore
-      const entries = yield* Ref.make(new Map<string, RuntimeEntry>())
-      const retains = yield* Ref.make(new Map<string, number>())
-      const starts = yield* Ref.make(new Map<string, RuntimeStartDeferred>())
+      const rootActivity = yield* Effect.serviceOption(AcnActivityTracker)
+      const managerScope = yield* Effect.scope
+      const entries = yield* Ref.make(new Map<string, ResidentGeneration>())
+      const starts = yield* Ref.make(new Map<string, StartDeferred>())
+      const deletions = yield* Ref.make(new Map<string, DeleteDeferred>())
+      const admissionLock = yield* Effect.makeSemaphore(1)
+      const generations = yield* Ref.make(new Map<string, number>())
+      const observers = yield* Ref.make(new Set<SessionRetirementObserver>())
       const changes = yield* PubSub.unbounded<void>()
 
       const publishChange = PubSub.publish(changes, undefined).pipe(Effect.asVoid)
 
-      const getLive = Effect.fn("acn.agent-runtime.get-live")(function* (sessionId: string) {
-        return (yield* Ref.get(entries)).get(sessionId) ?? null
-      })
-
-      const touchEntryNow = (sessionId: string) =>
-        Ref.modify(entries, (map): readonly [RuntimeEntry | null, Map<string, RuntimeEntry>] => {
-          const entry = map.get(sessionId)
-          if (!entry) return [null, map]
-
-          const touched = { ...entry, updatedAt: Date.now() }
-          return [touched, new Map(map).set(sessionId, touched)]
+      const nextGeneration = (sessionId: string) =>
+        Ref.modify(generations, (current) => {
+          const generation = (current.get(sessionId) ?? 0) + 1
+          return [generation, new Map(current).set(sessionId, generation)] as const
         })
 
-      const touchEntry = Effect.fn("acn.agent-runtime.touch-entry")(function* (sessionId: string) {
-        yield* touchEntryNow(sessionId)
-      })
-
-      const retainEntry = Effect.fn("acn.agent-runtime.retain-entry")(function* (sessionId: string) {
-        const entry = yield* getLive(sessionId)
-        if (!entry) return
-
-        yield* Ref.update(retains, (map) => {
-          const next = new Map(map)
-          next.set(sessionId, (next.get(sessionId) ?? 0) + 1)
-          return next
-        })
-        yield* touchEntry(sessionId)
-      })
-
-      const releaseEntry = Effect.fn("acn.agent-runtime.release-entry")(function* (sessionId: string) {
-        yield* Ref.update(retains, (map) => {
-          const current = map.get(sessionId) ?? 0
-          if (current <= 0) return map
-
-          const next = new Map(map)
-          if (current === 1) next.delete(sessionId)
-          else next.set(sessionId, current - 1)
-          return next
-        })
-        yield* touchEntry(sessionId)
-      })
-
-      const claimStart = Effect.fn("acn.agent-runtime.claim-start")(function* (sessionId: string) {
-        const deferred = yield* Deferred.make<RuntimeEntry, SessionError>()
-        return yield* Ref.modify(starts, (map): readonly [RuntimeStartClaim, Map<string, RuntimeStartDeferred>] => {
-          const current = map.get(sessionId)
-          if (current) return [{ _tag: "joiner", deferred: current }, map]
-
-          const next = new Map(map)
-          next.set(sessionId, deferred)
-          return [{ _tag: "owner", deferred }, next]
-        })
-      })
-
-      const clearStart = (
-        sessionId: string,
-        deferred: RuntimeStartDeferred,
-      ): Effect.Effect<void> =>
-        Ref.update(starts, (map) => {
-          if (map.get(sessionId) !== deferred) return map
-          const next = new Map(map)
+      const removeExact = (sessionId: string, generation: number) =>
+        Ref.modify(entries, (current) => {
+          const resident = current.get(sessionId)
+          if (!resident || resident.generation !== generation) {
+            return [false, current] as const
+          }
+          const next = new Map(current)
           next.delete(sessionId)
-          return next
+          return [true, next] as const
         })
 
-      const awaitStartedEntry = Effect.fn("acn.agent-runtime.await-started-entry")(function* (
-        sessionId: string,
-        deferred: RuntimeStartDeferred,
-      ) {
-        const entry = yield* Deferred.await(deferred)
-        return (yield* touchEntryNow(sessionId)) ?? entry
-      })
+      let retireGeneration = (_sessionId: string, _generation: number): Effect.Effect<boolean> =>
+        Effect.succeed(true)
 
-      const startEntry = Effect.fn("acn.agent-runtime.start-entry")(function* (request: RuntimeStartRequest) {
-        const providedScope = Option.getOrUndefined(request.scope)
-        const scope = providedScope ?? (yield* Scope.make())
+      const acquireContinuingLease = (
+        sessionId: string,
+        generation: number,
+        gate: ResourceUseGate,
+      ): Effect.Effect<Effect.Effect<void>> =>
+        Effect.gen(function* () {
+          const rootLease = yield* Option.match(rootActivity, {
+            onNone: () => Effect.succeed(Option.none<Effect.Effect<void>>()),
+            onSome: (activity) =>
+              activity.gate
+                .joinIfBusy(`session-work:${sessionId}:${generation}`)
+                .pipe(
+                  Effect.catchTag("ResourceRetired", () =>
+                    Effect.die(new Error("ACN retired while session work started")),
+                  ),
+                ),
+          })
+          if (Option.isSome(rootActivity) && Option.isNone(rootLease)) {
+            return yield* Effect.die(
+              new Error(`Session ${sessionId} became working without ACN demand`),
+            )
+          }
+
+          const sessionLease = yield* gate
+            .joinIfBusy(`continuing-work:${sessionId}:${generation}`)
+            .pipe(
+              Effect.catchTag("ResourceRetired", () =>
+                Effect.die(new Error(`Retired session ${sessionId} became working`)),
+              ),
+            )
+          if (Option.isNone(sessionLease)) {
+            if (Option.isSome(rootLease)) yield* rootLease.value
+            return yield* Effect.die(
+              new Error(`Session ${sessionId} became working without admitted session use`),
+            )
+          }
+
+          return yield* Effect.succeed(
+            sessionLease.value.pipe(
+              Effect.zipRight(Option.isSome(rootLease) ? rootLease.value : Effect.void),
+            ),
+          )
+        })
+
+      const makeWorkBridge = (
+        sessionId: string,
+        generation: number,
+        entry: RuntimeEntry,
+        gate: ResourceUseGate,
+        generationScope: Scope.CloseableScope,
+      ) =>
+        Effect.gen(function* () {
+          const workStatus = yield* Ref.make<SessionWorkStatus>({
+            _tag: "Quiescent",
+            workerCount: 0,
+          })
+          const continuingRelease = yield* Ref.make<Effect.Effect<void> | null>(null)
+          const serialize = yield* Effect.makeSemaphore(1)
+
+          const reconcileWork = serialize.withPermits(1)(
+            Effect.gen(function* () {
+              const next = yield* entry.session.state.work.get()
+              yield* Ref.set(workStatus, next)
+              const release = yield* Ref.get(continuingRelease)
+              if (next._tag === "Working" && release === null) {
+                const acquired = yield* acquireContinuingLease(sessionId, generation, gate)
+                yield* Ref.set(continuingRelease, acquired)
+                yield* publishChange
+                return
+              }
+              if (next._tag === "Quiescent" && release !== null) {
+                yield* Ref.set(continuingRelease, null)
+                yield* release
+                yield* publishChange
+              }
+            }),
+          )
+
+          yield* reconcileWork
+          yield* Effect.forkIn(
+            entry.session.state.work.subscribe.pipe(
+              Stream.runForEach(() => reconcileWork),
+              Effect.ensuring(
+                Ref.getAndSet(continuingRelease, null).pipe(
+                  Effect.flatMap((release) => release ?? Effect.void),
+                ),
+              ),
+            ),
+            generationScope,
+          )
+          return { workStatus, reconcileWork }
+        })
+
+      const startResident = Effect.fn("acn.agent-runtime.start")(function* (
+        request: RuntimeStartRequest,
+      ) {
+        const generation = yield* nextGeneration(request.sessionId)
+        const generationScope = yield* Scope.fork(managerScope, ExecutionStrategy.sequential)
+        const gate = yield* makeResourceUseGate({
+          resource: `session:${request.sessionId}`,
+          generation,
+          idleTimeout: options.idleTimeout ?? "2 minutes",
+          retire: () => retireGeneration(request.sessionId, generation),
+        }).pipe(Effect.provideService(Scope.Scope, managerScope))
+        const releaseStartup = yield* gate.acquire("session-start").pipe(Effect.orDie)
+
         return yield* Effect.gen(function* () {
           const requestedCwd = yield* store.validateCwd(request.cwd)
           yield* runtimeOptions.write(request.sessionId, request.options)
           const session = yield* factory.createSession({
             sessionId: request.sessionId,
             cwd: requestedCwd,
-            scope,
+            scope: generationScope,
             options: request.options,
             visibility: request.visibility,
           })
-          const now = Date.now()
+          const residentSince = Date.now()
           const storedMeta = yield* store.readMeta(request.sessionId)
-          const createdAt = storedMeta ? Date.parse(storedMeta.created) || now : now
+          const createdAt = storedMeta
+            ? Date.parse(storedMeta.created) || residentSince
+            : residentSince
           const scratchpadPath = yield* store.getScratchpadPath(request.sessionId)
           const entry: RuntimeEntry = {
             id: request.sessionId,
             createdAt,
-            updatedAt: now,
+            updatedAt: residentSince,
             title: storedMeta?.chatName ?? DEFAULT_CHAT_NAME,
             cwd: requestedCwd,
             scratchpadPath,
             session,
-            scope,
+            scope: generationScope,
           }
-          yield* Ref.update(entries, (map) => new Map(map).set(request.sessionId, entry))
+          const bridge = yield* makeWorkBridge(
+            request.sessionId,
+            generation,
+            entry,
+            gate,
+            generationScope,
+          )
+          const resident: ResidentGeneration = {
+            generation,
+            entry,
+            gate,
+            scope: generationScope,
+            residentSince,
+            ...bridge,
+          }
+          yield* Ref.update(entries, (current) => new Map(current).set(request.sessionId, resident))
           yield* publishChange
-          return entry
+          return { resident, releaseStartup }
         }).pipe(
           Effect.onExit((exit) =>
-            Exit.isSuccess(exit) || Option.isSome(request.scope)
+            Exit.isSuccess(exit)
               ? Effect.void
-              : Scope.close(scope, Exit.void)
+              : releaseStartup.pipe(Effect.zipRight(Scope.close(generationScope, Exit.void))),
           ),
         )
       })
 
-      const completeStart = (
-        sessionId: string,
-        deferred: RuntimeStartDeferred,
-      ) =>
-        Effect.onExit((exit: Exit.Exit<RuntimeEntry, SessionError>) =>
-          clearStart(sessionId, deferred).pipe(
-            Effect.zipRight(Deferred.done(deferred, exit))
+      const claimStart = (sessionId: string) =>
+        Effect.gen(function* () {
+          const deferred = yield* Deferred.make<ResidentGeneration, SessionError>()
+          return yield* Ref.modify(
+            starts,
+            (current): readonly [StartClaim, Map<string, StartDeferred>] => {
+              const existing = current.get(sessionId)
+              if (existing) return [{ _tag: "joiner", deferred: existing }, current]
+              return [{ _tag: "owner", deferred }, new Map(current).set(sessionId, deferred)]
+            },
           )
-        )
-
-      const getOrStart = Effect.fn("acn.agent-runtime.get-or-start")(function* (request: RuntimeStartRequest) {
-        const existing = yield* getLive(request.sessionId)
-        if (existing) {
-          const touched = yield* touchEntryNow(request.sessionId)
-          return touched ?? existing
-        }
-
-        const claim = yield* claimStart(request.sessionId)
-        if (claim._tag === "joiner") {
-          return yield* awaitStartedEntry(request.sessionId, claim.deferred)
-        }
-
-        return yield* startEntry(request).pipe(
-          completeStart(request.sessionId, claim.deferred),
-        )
-      })
-
-      const requireOrStart = Effect.fn("acn.agent-runtime.require-or-start")(function* (sessionId: string) {
-        const existing = yield* getLive(sessionId)
-        if (existing) {
-          return (yield* touchEntryNow(sessionId)) ?? existing
-        }
-
-        const meta = yield* store.readMeta(sessionId)
-        if (!meta) return yield* new SessionNotFound({ sessionId })
-
-        const stored = yield* runtimeOptions.read(sessionId)
-        const options = stored ?? normalizeSessionRuntimeOptions()
-        return yield* getOrStart({
-          sessionId,
-          cwd: meta.workingDirectory,
-          options,
-          visibility: meta.visibility,
-          scope: Option.none(),
         })
-      })
 
-      const dispose = Effect.fn("acn.agent-runtime.dispose")(function* (sessionId: string) {
-        const entry = yield* Ref.modify(entries, (map): readonly [RuntimeEntry | null, Map<string, RuntimeEntry>] => {
-          const current = map.get(sessionId) ?? null
-          if (!current) return [null, map]
-
-          const next = new Map(map)
-          next.delete(sessionId)
-          return [current, next]
-        })
-        if (!entry) return
-        yield* Ref.update(retains, (map) => {
-          if (!map.has(sessionId)) return map
-          const next = new Map(map)
+      const clearStart = (sessionId: string, deferred: StartDeferred) =>
+        Ref.update(starts, (current) => {
+          if (current.get(sessionId) !== deferred) return current
+          const next = new Map(current)
           next.delete(sessionId)
           return next
         })
-        yield* publishChange
-        yield* Scope.close(entry.scope, Exit.void)
+
+      const requestForStoredSession = Effect.fn("acn.agent-runtime.request-for-stored-session")(
+        function* (sessionId: string) {
+          const meta = yield* store.readMeta(sessionId)
+          if (!meta) return yield* new SessionNotFound({ sessionId })
+          return {
+            sessionId,
+            cwd: meta.workingDirectory,
+            options: (yield* runtimeOptions.read(sessionId)) ?? normalizeSessionRuntimeOptions(),
+            visibility: meta.visibility,
+          } satisfies RuntimeStartRequest
+        },
+      )
+
+      /** Resolve a generation and acquire the caller lease atomically. */
+      const acquireResident = (
+        request: RuntimeStartRequest,
+        label: string,
+      ): Effect.Effect<
+        readonly [ResidentGeneration, Effect.Effect<void>],
+        SessionError | ResourceRetired
+      > =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const deleting = () =>
+              new SessionOperationFailed({
+                operation: `session ${request.sessionId}`,
+                reason: "Session is being deleted",
+              })
+            const resolved = yield* restore(
+              admissionLock.withPermits(1)(
+                Effect.gen(function* () {
+                  if ((yield* Ref.get(deletions)).has(request.sessionId)) {
+                    return yield* deleting()
+                  }
+                  const existing = (yield* Ref.get(entries)).get(request.sessionId)
+                  if (existing) {
+                    const release = yield* existing.gate.acquire(label)
+                    return { _tag: "resident" as const, resident: existing, release }
+                  }
+                  return { _tag: "start" as const, claim: yield* claimStart(request.sessionId) }
+                }),
+              ),
+            )
+            if (resolved._tag === "resident") {
+              return [resolved.resident, resolved.release] as const
+            }
+
+            const claim = resolved.claim
+            if (claim._tag === "joiner") {
+              const resident = yield* restore(Deferred.await(claim.deferred))
+              const release = yield* restore(
+                admissionLock.withPermits(1)(
+                  Effect.gen(function* () {
+                    if ((yield* Ref.get(deletions)).has(request.sessionId)) {
+                      return yield* deleting()
+                    }
+                    return yield* resident.gate.acquire(label)
+                  }),
+                ),
+              )
+              return [resident, release] as const
+            }
+
+            const result = yield* restore(startResident(request)).pipe(Effect.exit)
+            if (Exit.isFailure(result)) {
+              yield* Deferred.failCause(claim.deferred, result.cause)
+              yield* clearStart(request.sessionId, claim.deferred)
+              return yield* Effect.failCause(result.cause)
+            }
+
+            const { resident, releaseStartup } = result.value
+            const release = yield* resident.gate.acquire(label).pipe(Effect.orDie)
+            yield* Deferred.succeed(claim.deferred, resident)
+            yield* clearStart(request.sessionId, claim.deferred)
+            yield* releaseStartup
+            return [resident, release] as const
+          }),
+        )
+
+      const useResident = <A, E, R>(
+        resident: ResidentGeneration,
+        label: string,
+        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | ResourceRetired, R> =>
+        resident.gate.withUse(
+          label,
+          use(resident.entry, resident.generation).pipe(Effect.ensuring(resident.reconcileWork)),
+        )
+
+      const withRequest = <A, E, R>(
+        request: RuntimeStartRequest,
+        label: string,
+        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | SessionError, R> =>
+        Effect.suspend(() =>
+          acquireResident(request, label).pipe(
+            Effect.flatMap(([resident, release]) =>
+              use(resident.entry, resident.generation).pipe(
+                Effect.ensuring(resident.reconcileWork),
+                Effect.ensuring(release),
+              ),
+            ),
+            Effect.catchTag("ResourceRetired", () => withRequest(request, label, use)),
+          ),
+        )
+
+      const withSession = <A, E, R>(
+        sessionId: string,
+        label: string,
+        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | SessionError, R> =>
+        requestForStoredSession(sessionId).pipe(
+          Effect.flatMap((request) => withRequest(request, label, use)),
+        )
+
+      const tryWithResident = <A, E, R>(
+        sessionId: string,
+        label: string,
+        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+      ): Effect.Effect<Option.Option<A>, E | SessionError, R> =>
+        Effect.suspend(() =>
+          Effect.gen(function* () {
+            const resident = (yield* Ref.get(entries)).get(sessionId)
+            if (!resident) return Option.none<A>()
+            return yield* useResident(resident, label, use).pipe(
+              Effect.map(Option.some),
+              Effect.catchTag("ResourceRetired", () => tryWithResident(sessionId, label, use)),
+            )
+          }),
+        )
+
+      const tryWithBusyResident = <A, E, R>(
+        sessionId: string,
+        label: string,
+        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+      ): Effect.Effect<Option.Option<A>, E | SessionError, R> =>
+        Effect.suspend(() =>
+          Effect.gen(function* () {
+            const resident = (yield* Ref.get(entries)).get(sessionId)
+            if (!resident) return Option.none<A>()
+            return yield* resident.gate
+              .withBusyUse(label, use(resident.entry, resident.generation))
+              .pipe(
+                Effect.catchTag("ResourceRetired", () =>
+                  tryWithBusyResident(sessionId, label, use),
+                ),
+              )
+          }),
+        )
+
+      retireGeneration = (sessionId, generation) =>
+        Effect.gen(function* () {
+          const resident = (yield* Ref.get(entries)).get(sessionId)
+          if (!resident || resident.generation !== generation) return true
+
+          for (const observer of yield* Ref.get(observers)) {
+            yield* observer.retire({ sessionId, generation }).pipe(
+              Effect.catchAllCause((cause) =>
+                Effect.logWarning("Session retirement observer failed").pipe(
+                  Effect.annotateLogs({
+                    sessionId,
+                    generation,
+                    cause: String(cause),
+                  }),
+                ),
+              ),
+            )
+          }
+          yield* Scope.close(resident.scope, Exit.void)
+          const removed = yield* removeExact(sessionId, generation)
+          if (removed) {
+            yield* publishChange
+            yield* Effect.logInfo("Evicted idle session").pipe(
+              Effect.annotateLogs({ sessionId, generation }),
+            )
+          }
+          return true
+        })
+
+      const dispose = Effect.fn("acn.agent-runtime.dispose")(function* (sessionId: string) {
+        const resident = (yield* Ref.get(entries)).get(sessionId)
+        if (!resident) return
+        yield* resident.gate.retireNow("explicit-dispose")
       })
 
-      const evictIdleSessions = Effect.fn("acn.agent-runtime.evict-idle")(function* () {
-        const liveEntries = [...(yield* Ref.get(entries)).values()]
-        const retainSnapshot = yield* Ref.get(retains)
-        for (const entry of liveEntries) {
-          if ((retainSnapshot.get(entry.id) ?? 0) > 0) continue
+      const deleteSession: AgentRuntimeApi["deleteSession"] = (sessionId, removeDurableState) =>
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            const candidate = yield* Deferred.make<void, SessionError>()
+            const claim = yield* admissionLock.withPermits(1)(
+              Ref.modify(
+                deletions,
+                (current): readonly [DeleteClaim, Map<string, DeleteDeferred>] => {
+                const existing = current.get(sessionId)
+                  if (existing) return [{ _tag: "joiner", deferred: existing }, current]
+                return [
+                    { _tag: "owner", deferred: candidate },
+                  new Map(current).set(sessionId, candidate),
+                ] as const
+                },
+              ),
+            )
+            if (claim._tag === "joiner") return yield* Deferred.await(claim.deferred)
 
-          const rootTurn = yield* entry.session.state.turn.getFork(null)
-          if (rootTurn._tag === "active" || rootTurn._tag === "interrupting") {
-            yield* touchEntry(entry.id)
-            continue
-          }
-
-          const agentStatus = yield* entry.session.state.agentStatus.get()
-          if ([...agentStatus.agents.values()].some((a) => a.status === "working")) {
-            yield* touchEntry(entry.id)
-            continue
-          }
-
-          const idleMs = Date.now() - entry.updatedAt
-          if (idleMs >= SESSION_EVICT_GRACE_MS) {
-            yield* dispose(entry.id)
-            yield* Effect.logInfo("Evicted idle session", { sessionId: entry.id, idleMs })
-          }
-        }
-      })
-
-      const disposeAll = Effect.fn("acn.agent-runtime.dispose-all")(function* () {
-        const ids = [...(yield* Ref.get(entries)).keys()]
-        yield* Effect.forEach(ids, dispose, { discard: true })
-      })
-      yield* Effect.addFinalizer(() => disposeAll())
-
+            const result = yield* Effect.gen(function* () {
+              const pendingStart = (yield* Ref.get(starts)).get(sessionId)
+              if (pendingStart) yield* Deferred.await(pendingStart).pipe(Effect.exit)
+              yield* dispose(sessionId)
+              yield* removeDurableState
+            }).pipe(Effect.exit)
+            yield* Deferred.done(candidate, result)
+            yield* admissionLock.withPermits(1)(
+              Ref.update(deletions, (current) => {
+                if (current.get(sessionId) !== candidate) return current
+                const next = new Map(current)
+                next.delete(sessionId)
+                return next
+              }),
+            )
+            return yield* Deferred.await(candidate)
+          }),
+        )
       return {
-        getLive,
-        getAllEntries: Effect.fn("acn.agent-runtime.get-all-entries")(function* () {
-          return [...(yield* Ref.get(entries)).values()]
-        }),
-        getOrStart,
-        requireOrStart,
-        dispose,
-        touchEntry,
-        retainEntry,
-        releaseEntry,
-        evictIdleSessions,
-        disposeAll,
-        hasActiveWork: Effect.gen(function* () {
-          const liveEntries = [...(yield* Ref.get(entries)).values()]
-          for (const entry of liveEntries) {
-            const rootTurn = yield* entry.session.state.turn.getFork(null)
-            if (rootTurn._tag === "active" || rootTurn._tag === "interrupting") {
-              return true
-            }
-
-            const agentStatus = yield* entry.session.state.agentStatus.get()
-            if ([...agentStatus.agents.values()].some((agent) => agent.status === "working")) {
-              return true
-            }
+        withSession,
+        withSessionRequest: withRequest,
+        tryWithResident,
+        tryWithBusyResident,
+        residentSessions: Effect.gen(function* () {
+          const result: ResidentSessionSnapshot[] = []
+          for (const resident of (yield* Ref.get(entries)).values()) {
+            result.push({
+              sessionId: resident.entry.id,
+              generation: resident.generation,
+              title: resident.entry.title,
+              cwd: resident.entry.cwd,
+              scratchpadPath: resident.entry.scratchpadPath,
+              createdAt: resident.entry.createdAt,
+              updatedAt: resident.entry.updatedAt,
+              residentSince: resident.residentSince,
+              workStatus: yield* Ref.get(resident.workStatus),
+            })
           }
-          return false
+          return result
         }),
-        count: Ref.get(entries).pipe(Effect.map((map) => map.size)),
+        dispose,
+        deleteSession,
+        registerRetirementObserver: (observer) =>
+          Ref.update(observers, (current) => new Set(current).add(observer)).pipe(
+            Effect.as(
+              Ref.update(observers, (current) => {
+                const next = new Set(current)
+                next.delete(observer)
+                return next
+              }),
+            ),
+          ),
         changes: Stream.fromPubSub(changes).pipe(Stream.map(() => undefined)),
-      }
+      } satisfies AgentRuntimeApi
     }),
   )
+
+export const AgentRuntimeLive = makeAgentRuntimeLive()

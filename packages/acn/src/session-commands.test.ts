@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
-import { Effect, Layer, Ref, Scope, Stream } from "effect"
-import type { AgentLifecycleState, AppEvent, CodingAgentSession, ForkTurnState } from "@magnitudedev/agent"
+import { Effect, Layer, Option, Ref, Scope, Stream } from "effect"
+import type {
+  AgentLifecycleState,
+  AppEvent,
+  CodingAgentSession,
+  ForkTurnState,
+} from "@magnitudedev/agent"
 import { AgentRuntime, type AgentRuntimeApi } from "./agent-runtime"
 import { SessionCommands, SessionCommandsLive } from "./session-commands"
 import type { RuntimeEntry } from "./session-types"
@@ -35,6 +40,13 @@ const makeSession = (send: CodingAgentSession["send"]): CodingAgentSession => ({
     restoreQueuedMessages: Stream.never,
   },
   state: {
+    work: {
+      get: () => Effect.succeed({ _tag: "Quiescent" as const, workerCount: 0 as const }),
+      subscribe: Stream.succeed({
+        _tag: "Quiescent" as const,
+        workerCount: 0 as const,
+      }),
+    },
     turn: {
       getFork: () => Effect.succeed(idleTurnState),
       subscribeFork: () => Stream.succeed(idleTurnState),
@@ -77,59 +89,55 @@ const makeEntry = Effect.fn("test.make-session-command-entry")(function* (
 
 const makeLayer = (runtime: AgentRuntimeApi) =>
   SessionCommandsLive.pipe(
-    Layer.provide(Layer.mergeAll(
-      Layer.succeed(AgentRuntime, runtime),
-      BunFileSystem.layer,
-      BunPath.layer,
-    )),
+    Layer.provide(
+      Layer.mergeAll(Layer.succeed(AgentRuntime, runtime), BunFileSystem.layer, BunPath.layer),
+    ),
   )
 
 describe("SessionCommands", () => {
   it("sendUserMessage starts an evicted runtime before sending", async () => {
-    await Effect.runPromise(Effect.gen(function* () {
-      const sentEvents = yield* Ref.make<ReadonlyArray<AppEvent>>([])
-      const requireOrStartCalls = yield* Ref.make(0)
-      const entry = yield* makeEntry(
-        "session-a",
-        makeSession((event) => Ref.update(sentEvents, (events) => [...events, event])),
-      )
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const sentEvents = yield* Ref.make<ReadonlyArray<AppEvent>>([])
+        const withSessionCalls = yield* Ref.make(0)
+        const entry = yield* makeEntry(
+          "session-a",
+          makeSession((event) => Ref.update(sentEvents, (events) => [...events, event])),
+        )
 
-      const runtime: AgentRuntimeApi = {
-        getLive: () => Effect.succeed(null),
-        getAllEntries: () => Effect.succeed([]),
-        getOrStart: () => Effect.die("unused"),
-        requireOrStart: (sessionId) =>
-          Ref.update(requireOrStartCalls, (count) => count + 1).pipe(
-            Effect.as({ ...entry, id: sessionId }),
-          ),
-        dispose: () => Effect.void,
-        disposeAll: () => Effect.void,
-        touchEntry: () => Effect.void,
-        retainEntry: () => Effect.void,
-        releaseEntry: () => Effect.void,
-        evictIdleSessions: () => Effect.void,
-        hasActiveWork: Effect.succeed(false),
-        count: Effect.succeed(0),
-        changes: Stream.never,
-      }
+        const runtime: AgentRuntimeApi = {
+          withSession: (sessionId, _label, use) =>
+            Ref.update(withSessionCalls, (count) => count + 1).pipe(
+              Effect.zipRight(use({ ...entry, id: sessionId }, 1)),
+            ),
+          withSessionRequest: () => Effect.die("unused"),
+          tryWithResident: () => Effect.succeed(Option.none()),
+          tryWithBusyResident: () => Effect.succeed(Option.none()),
+          residentSessions: Effect.succeed([]),
+          dispose: () => Effect.void,
+          deleteSession: (_sessionId, remove) => remove,
+          registerRetirementObserver: () => Effect.succeed(Effect.void),
+          changes: Stream.never,
+        }
 
-      yield* Effect.gen(function* () {
-        const commands = yield* SessionCommands
-        yield* commands.sendUserMessage({
-          sessionId: "session-a",
-          content: "hello after eviction",
-          taskMode: false,
-          imageAttachments: [],
-          mentions: [],
-        })
-      }).pipe(Effect.provide(makeLayer(runtime)))
+        yield* Effect.gen(function* () {
+          const commands = yield* SessionCommands
+          yield* commands.sendUserMessage({
+            sessionId: "session-a",
+            content: "hello after eviction",
+            taskMode: false,
+            imageAttachments: [],
+            mentions: [],
+          })
+        }).pipe(Effect.provide(makeLayer(runtime)))
 
-      const calls = yield* Ref.get(requireOrStartCalls)
-      const events = yield* Ref.get(sentEvents)
+        const calls = yield* Ref.get(withSessionCalls)
+        const events = yield* Ref.get(sentEvents)
 
-      expect(calls).toBe(1)
-      expect(events).toHaveLength(1)
-      expect(events[0]?.type).toBe("user_message")
-    }))
+        expect(calls).toBe(1)
+        expect(events).toHaveLength(1)
+        expect(events[0]?.type).toBe("user_message")
+      }),
+    )
   })
 })

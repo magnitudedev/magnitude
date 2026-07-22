@@ -312,6 +312,28 @@ export const loadModelOperation = {
   ],
 } as const
 
+export const observeRuntimeChangesOperation = {
+  operationId: "observeRuntimeChanges",
+  transport: "http",
+  method: "GET",
+  path: "/v1/runtime/changes",
+  group: "runtime",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.RuntimeChangesResponse, Schemas.RuntimeChangesResponseEncoded> =>
+          Schemas.RuntimeChangesResponse,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [],
+  queryParameters: S.Struct({
+    after: S.optionalWith(S.NumberFromString.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  }),
+} as const
+
 export const previewModelOperation = {
   operationId: "previewModel",
   transport: "http",

@@ -6,7 +6,6 @@ import {
   MagnitudeRpcs,
   type ActiveSessionStatus,
   type ActiveSessionStatuses,
-  type ActiveSessionStatusesWireEvent,
 } from "@magnitudedev/sdk"
 import type { Layer } from "effect"
 import { usePlatform } from "../platform/platform-context"
@@ -20,9 +19,6 @@ interface ActiveSessionStatusCallbacks {
 }
 
 let currentFiber: Fiber.RuntimeFiber<void, unknown> | null = null
-
-const isSnapshot = (event: ActiveSessionStatusesWireEvent): event is ActiveSessionStatuses =>
-  !("_tag" in event && event._tag === "heartbeat")
 
 const toStatusById = (snapshot: ActiveSessionStatuses): ActiveSessionStatusById => {
   const byId: Record<string, ActiveSessionStatus> = {}
@@ -46,7 +42,6 @@ export function subscribeActiveSessionStatuses(
   const effect = Effect.gen(function* () {
     const client = yield* RpcClient.make(MagnitudeRpcs)
     yield* client.StreamActiveSessionStatuses({}).pipe(
-      Stream.filter(isSnapshot),
       Stream.tap((snapshot) => Effect.sync(() => callbacks.onSnapshot(snapshot))),
       Stream.runDrain,
     )

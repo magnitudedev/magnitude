@@ -6,7 +6,7 @@
  */
 import { Effect, Layer, Option } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { DaemonSpawnFailed, DaemonSpawnerTag, makeRecoveringProtocolLayer, type DaemonSpawner } from "@magnitudedev/sdk"
+import { DaemonSpawnFailed, DaemonSpawnerTag, makeAcnJitRuntime, type DaemonSpawner } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
 
@@ -75,11 +75,10 @@ function createDesktopDaemonSpawner(desktopApi: DesktopApi): DaemonSpawner {
 export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Platform> {
   api = desktopApi
   const spawner = createDesktopDaemonSpawner(desktopApi)
-  const protocolLayer = (await Effect.runPromise(
-    makeRecoveringProtocolLayer().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
-  )).pipe(
-    Layer.provide(FetchHttpClient.layer),
+  const acn = await Effect.runPromise(
+    makeAcnJitRuntime().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
   )
+  const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
   return {
     id: "desktop",
     protocolLayer,

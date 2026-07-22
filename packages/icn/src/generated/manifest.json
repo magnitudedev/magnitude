@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "1fd46dda1921af0f6009edaaca27539e857cca4b0173e777890eef2c0098009e",
+  "protocolHash": "23e8e52e0060a95c12771d77bdbfc582ff3ed3ecbdc794a055b1917b7b6efca5",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",
@@ -23,6 +23,7 @@
     "health",
     "listModels",
     "loadModel",
+    "observeRuntimeChanges",
     "previewModel",
     "resolveHuggingFaceRepository",
     "searchHuggingFaceModels",

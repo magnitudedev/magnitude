@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest"
-import { Deferred, Duration, Effect, Fiber, Layer, Queue, Scope, Stream } from "effect"
+import { Effect, Fiber, Layer, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import type { AgentLifecycleState, CodingAgentSession, ForkTurnState } from "@magnitudedev/agent"
 import { type DisplayState, type DisplayViewShape } from "@magnitudedev/protocol"
-import { AgentRuntime, type AgentRuntimeApi } from "./agent-runtime"
+import {
+  AgentRuntime,
+  type AgentRuntimeApi,
+  type SessionRetirementObserver,
+} from "./agent-runtime"
 import { DisplayViewStreams, DisplayViewStreamsLive } from "./display-view-streams"
+import { AcnSubscriptionsLive } from "./acn-subscriptions"
 import type { RuntimeEntry } from "./session-types"
 
 const rootShape: DisplayViewShape = {
@@ -12,44 +17,25 @@ const rootShape: DisplayViewShape = {
   },
 }
 
-const workerShape: DisplayViewShape = {
+const compactShape: DisplayViewShape = {
   timelines: {
-    root: { kind: "tail", limit: 100, live: true, presentation: "default" },
-    "worker:one": { kind: "tail", limit: 50, live: true, presentation: "default" },
+    root: { kind: "tail", limit: 20, live: true, presentation: "default" },
   },
 }
 
-const state: DisplayState = {
-  session: { sessionId: "s1", title: null, cwd: "/tmp" },
-  timelines: {
-    root: {
-      mode: "idle",
-      messages: { byId: {}, order: [] },
-      streamingMessageId: null,
-      window: {
-        start: 0,
-        end: 0,
-        totalCount: 0,
-        hasMoreBefore: false,
-        hasMoreAfter: false,
-      },
-      presentation: {
-        mode: "default",
-        entries: [],
-        statusSlot: { kind: "none" },
-      },
-    },
-  },
+const displayState = (title: string): DisplayState => ({
+  session: { sessionId: "s1", title, cwd: "/tmp" },
+  timelines: {},
   agents: {},
   actors: {},
-  tasks: { byId: {}, order: [], summary: { totalCount: 0, completedCount: 0, incompleteCount: 0 } },
-}
+  tasks: {
+    byId: {},
+    order: [],
+    summary: { totalCount: 0, completedCount: 0, incompleteCount: 0 },
+  },
+})
 
-const noSessionEvents = {
-  restoreQueuedMessages: Stream.empty,
-}
-
-const idleTurnState: ForkTurnState = {
+const idleTurn: ForkTurnState = {
   _tag: "idle",
   completedTurns: 0,
   triggers: [],
@@ -58,7 +44,7 @@ const idleTurnState: ForkTurnState = {
   connectionRetryCount: 0,
 }
 
-const idleAgentStatus: AgentLifecycleState = {
+const idleAgents: AgentLifecycleState = {
   agents: new Map(),
   agentByForkId: new Map(),
   rootWork: {
@@ -73,19 +59,32 @@ const idleAgentStatus: AgentLifecycleState = {
   },
 }
 
-const makeCodingAgentSession = (displayView: CodingAgentSession["displayView"]): CodingAgentSession => ({
-  on: noSessionEvents,
+const makeSession = (
+  title: string,
+  closed: Ref.Ref<string[]>,
+  shapes: Ref.Ref<DisplayViewShape[]>,
+): CodingAgentSession => ({
+  on: { restoreQueuedMessages: Stream.never },
   state: {
+    work: {
+      get: () => Effect.succeed({ _tag: "Quiescent" as const, workerCount: 0 }),
+      subscribe: Stream.succeed({ _tag: "Quiescent" as const, workerCount: 0 }),
+    },
     turn: {
-      getFork: () => Effect.succeed(idleTurnState),
-      subscribeFork: () => Stream.succeed(idleTurnState),
+      getFork: () => Effect.succeed(idleTurn),
+      subscribeFork: () => Stream.succeed(idleTurn),
     },
     agentStatus: {
-      get: () => Effect.succeed(idleAgentStatus),
-      subscribe: Stream.succeed(idleAgentStatus),
+      get: () => Effect.succeed(idleAgents),
+      subscribe: Stream.succeed(idleAgents),
     },
   },
-  displayView,
+  displayView: {
+    stream: () => Stream.succeed({ shape: rootShape, state: displayState(title) }).pipe(Stream.concat(Stream.never)),
+    snapshot: () => Effect.succeed({ shape: rootShape, state: displayState(title) }),
+    setShape: (_viewId, shape) => Ref.update(shapes, (all) => [...all, shape]),
+    close: (viewId) => Ref.update(closed, (all) => [...all, viewId]),
+  },
   send: () => Effect.void,
   interrupt: () => Effect.void,
   publishInitialTask: () => Effect.void,
@@ -94,161 +93,214 @@ const makeCodingAgentSession = (displayView: CodingAgentSession["displayView"]):
   subscribeIntrospection: () => Stream.never,
 })
 
-const makeRuntimeLayer = (displayView: CodingAgentSession["displayView"]) => {
-  return Layer.effect(
-    AgentRuntime,
-    Effect.gen(function* () {
-      const scope = yield* Scope.make()
-      const entry: RuntimeEntry = {
-        id: "s1",
-        createdAt: 1,
-        updatedAt: 1,
-        title: "Session",
-        cwd: "/tmp",
-        scratchpadPath: "/tmp/scratchpad.md",
-        session: makeCodingAgentSession(displayView),
-        scope,
-      }
-      return {
-        getLive: () => Effect.succeed(entry),
-        getAllEntries: () => Effect.succeed([entry]),
-        getOrStart: () => Effect.succeed(entry),
-        requireOrStart: () => Effect.succeed(entry),
-        dispose: () => Effect.void,
-        touchEntry: () => Effect.void,
-        retainEntry: () => Effect.void,
-        releaseEntry: () => Effect.void,
-        evictIdleSessions: () => Effect.void,
-        disposeAll: () => Effect.void,
-        hasActiveWork: Effect.succeed(false),
-        count: Effect.succeed(1),
-        changes: Stream.never,
-      } satisfies AgentRuntimeApi
-    }),
-  )
-}
+const makeSetup = Effect.gen(function* () {
+  const closed = yield* Ref.make<string[]>([])
+  const shapes = yield* Ref.make<DisplayViewShape[]>([])
+  const generation = yield* Ref.make(1)
+  const entry = yield* Ref.make<RuntimeEntry | null>(null)
+  const busy = yield* Ref.make(false)
+  const observers = yield* Ref.make(new Set<SessionRetirementObserver>())
+  const changes = yield* PubSub.unbounded<void>()
+  const withSessionCalls = yield* Ref.make(0)
+  const makeEntry = Effect.fn("test.display-entry")(function* (title: string) {
+    const scope = yield* Scope.make()
+    return {
+      id: "s1",
+      createdAt: 1,
+      updatedAt: 1,
+      title,
+      cwd: "/tmp",
+      scratchpadPath: "/tmp/scratchpad.md",
+      session: makeSession(title, closed, shapes),
+      scope,
+    } satisfies RuntimeEntry
+  })
+  yield* Ref.set(entry, yield* makeEntry("generation-1"))
 
-const provideStreams = (displayView: CodingAgentSession["displayView"]) =>
-  DisplayViewStreamsLive.pipe(
-    Layer.provideMerge(makeRuntimeLayer(displayView)),
+  const runtime: AgentRuntimeApi = {
+    withSession: (_sessionId, _label, use) =>
+      Effect.gen(function* () {
+        yield* Ref.update(withSessionCalls, (count) => count + 1)
+        const current = yield* Ref.get(entry)
+        if (!current) return yield* Effect.die("missing fake resident")
+        yield* Ref.set(busy, true)
+        return yield* use(current, yield* Ref.get(generation)).pipe(
+          Effect.ensuring(Ref.set(busy, false)),
+        )
+      }),
+    withSessionRequest: () => Effect.die("unused"),
+    tryWithResident: (_sessionId, _label, use) =>
+      Effect.gen(function* () {
+        const current = yield* Ref.get(entry)
+        return current
+          ? Option.some(yield* use(current, yield* Ref.get(generation)))
+          : Option.none()
+      }),
+    tryWithBusyResident: (_sessionId, _label, use) =>
+      Effect.gen(function* () {
+        const current = yield* Ref.get(entry)
+        if (!current || !(yield* Ref.get(busy))) return Option.none()
+        return Option.some(yield* use(current, yield* Ref.get(generation)))
+      }),
+    residentSessions: Effect.succeed([]),
+    dispose: () => Effect.void,
+    deleteSession: (_sessionId, remove) => remove,
+    registerRetirementObserver: (observer) =>
+      Ref.update(observers, (all) => new Set(all).add(observer)).pipe(
+        Effect.as(
+          Ref.update(observers, (all) => {
+            const next = new Set(all)
+            next.delete(observer)
+            return next
+          }),
+        ),
+      ),
+    changes: Stream.fromPubSub(changes),
+  }
+
+  const layer = DisplayViewStreamsLive.pipe(
+    Layer.provide(Layer.mergeAll(
+      Layer.succeed(AgentRuntime, runtime),
+      AcnSubscriptionsLive,
+    )),
   )
+  return {
+    layer,
+    closed,
+    shapes,
+    entry,
+    generation,
+    observers,
+    changes,
+    withSessionCalls,
+    makeEntry,
+  }
+})
 
 describe("DisplayViewStreams", () => {
-  it("StreamDisplayView opens the semantic view from its shape", async () => {
-    const calls: Array<{ readonly kind: "setShape" | "stream"; readonly viewId: string; readonly shape?: DisplayViewShape }> = []
-    const displayView: CodingAgentSession["displayView"] = {
-      stream: (viewId) =>
-        Stream.fromIterable([{ shape: rootShape, state }]).pipe(
-          Stream.tap(() => Effect.sync(() => calls.push({ kind: "stream", viewId })))
-        ),
-      snapshot: () => Effect.succeed({ shape: rootShape, state }),
-      setShape: (viewId, shape) =>
-        Effect.sync(() => calls.push({ kind: "setShape", viewId, shape })),
-      close: () => Effect.void,
-    }
-
-    await Effect.runPromise(Effect.gen(function* () {
-      const streams = yield* DisplayViewStreams
-      yield* streams.getDisplayViewStream("s1", "view-a", rootShape).pipe(Stream.take(1), Stream.runCollect)
-    }).pipe(Effect.provide(provideStreams(displayView))))
-
-    expect(calls).toEqual([
-      { kind: "setShape", viewId: "view-a", shape: rootShape },
-      { kind: "stream", viewId: "view-a" },
-    ])
+  it("keeps a passive outer stream without materializing an idle runtime", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      yield* Effect.gen(function* () {
+        const streams = yield* DisplayViewStreams
+        const fiber = yield* streams
+          .getDisplayViewStream("s1", "view-a", rootShape)
+          .pipe(Stream.runDrain, Effect.fork)
+        yield* Effect.yieldNow()
+        expect(yield* Ref.get(setup.withSessionCalls)).toBe(0)
+        yield* Fiber.interrupt(fiber)
+      }).pipe(Effect.provide(setup.layer))
+    })
+    await Effect.runPromise(program)
   })
 
-  it("SetDisplayViewShape opens the semantic view and stream attaches read-only", async () => {
-    const calls: Array<{ readonly kind: "setShape" | "stream"; readonly viewId: string; readonly shape?: DisplayViewShape }> = []
-    const displayView: CodingAgentSession["displayView"] = {
-      stream: (viewId) =>
-        Stream.fromIterable([{ shape: rootShape, state }]).pipe(
-          Stream.tap(() => Effect.sync(() => calls.push({ kind: "stream", viewId })))
-        ),
-      snapshot: () => Effect.succeed({ shape: rootShape, state }),
-      setShape: (viewId, shape) =>
-        Effect.sync(() => calls.push({ kind: "setShape", viewId, shape })),
-      close: () => Effect.void,
-    }
-
-    await Effect.runPromise(Effect.gen(function* () {
-      const streams = yield* DisplayViewStreams
-      yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
-      yield* streams.getDisplayViewStream("s1", "view-a", rootShape).pipe(Stream.take(1), Stream.runCollect)
-    }).pipe(Effect.provide(provideStreams(displayView))))
-
-    expect(calls).toEqual([
-      { kind: "setShape", viewId: "view-a", shape: rootShape },
-      { kind: "stream", viewId: "view-a" },
-    ])
+  it("materializes shape demand and returns the authoritative full state", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      const event = yield* Effect.gen(function* () {
+        const streams = yield* DisplayViewStreams
+        return yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
+      }).pipe(Effect.provide(setup.layer))
+      expect(event._tag).toBe("state")
+      expect(event.state.session.title).toBe("generation-1")
+      expect(yield* Ref.get(setup.withSessionCalls)).toBe(1)
+    })
+    await Effect.runPromise(program)
   })
 
-  it("updates shape without reopening the shared stream", async () => {
-    const setShapes: DisplayViewShape[] = []
-    let streamFactoryCalls = 0
-    const displayView: CodingAgentSession["displayView"] = {
-      stream: () => {
-        streamFactoryCalls += 1
-        return Stream.fromIterable([{ shape: rootShape, state }]).pipe(Stream.concat(Stream.never))
-      },
-      snapshot: () => Effect.succeed({ shape: workerShape, state }),
-      setShape: (_viewId, shape) =>
-        Effect.sync(() => {
-          setShapes.push(shape)
-        }),
-      close: () => Effect.void,
-    }
-
-    await Effect.runPromise(Effect.gen(function* () {
-      const streams = yield* DisplayViewStreams
-      const events = yield* Queue.unbounded<unknown>()
-      yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
-      const fiber = yield* streams.getDisplayViewStream("s1", "view-a", rootShape).pipe(
-        Stream.tap((event) => Queue.offer(events, event)),
-        Stream.runDrain,
-        Effect.fork,
-      )
-      yield* Queue.take(events)
-      yield* streams.setDisplayViewShape("s1", "view-a", workerShape)
-      yield* Fiber.interrupt(fiber)
-    }).pipe(Effect.provide(provideStreams(displayView))))
-
-    expect(streamFactoryCalls).toBe(1)
-    expect(setShapes).toEqual([rootShape, workerShape])
+  it("does not let a passive reconnect mutate the desired shape", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      yield* Effect.gen(function* () {
+        const streams = yield* DisplayViewStreams
+        yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
+        const reconnect = yield* streams
+          .getDisplayViewStream("s1", "view-a", compactShape)
+          .pipe(Stream.runDrain, Effect.fork)
+        yield* Effect.yieldNow()
+        yield* streams.requestDisplayViewSnapshot("s1", "view-a")
+        const shapes = yield* Ref.get(setup.shapes)
+        expect(shapes.at(-1)).toEqual(rootShape)
+        yield* Fiber.interrupt(reconnect)
+      }).pipe(Effect.provide(setup.layer))
+    })
+    await Effect.runPromise(program)
   })
 
-  it("stream detach closes the view when refCount reaches 0", async () => {
-    const closed: string[] = []
-    const displayView: CodingAgentSession["displayView"] = {
-      stream: () => Stream.fromIterable([{ shape: rootShape, state }]).pipe(Stream.concat(Stream.never)),
-      snapshot: () => Effect.succeed({ shape: rootShape, state }),
-      setShape: () => Effect.void,
-      close: (viewId) => Effect.sync(() => closed.push(viewId)),
-    }
+  it("detaches on eviction without clearing the outer stream, then reattaches a new generation", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      yield* Effect.gen(function* () {
+        const streams = yield* DisplayViewStreams
+        yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
+        const received = yield* Queue.unbounded<string | null>()
+        const streamFiber = yield* streams.getDisplayViewStream("s1", "view-a", rootShape).pipe(
+          Stream.tap((event) =>
+            event._tag === "state"
+              ? Queue.offer(received, event.state.session.title)
+              : Effect.void,
+          ),
+          Stream.runDrain,
+          Effect.fork,
+        )
+        expect(yield* Queue.take(received)).toBe("generation-1")
 
-    await Effect.runPromise(Effect.gen(function* () {
-      const streams = yield* DisplayViewStreams
-      const events = yield* Queue.unbounded<unknown>()
-      const drained = yield* Deferred.make<void>()
+        for (const observer of yield* Ref.get(setup.observers)) {
+          yield* observer.retire({ sessionId: "s1", generation: 1 })
+        }
+        expect(yield* Ref.get(setup.closed)).toEqual([])
 
-      yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
-      const fiber = yield* streams.getDisplayViewStream("s1", "view-a", rootShape).pipe(
-        Stream.tap((event) => Queue.offer(events, event)),
-        Stream.runDrain,
-        Effect.ensuring(Deferred.succeed(drained, undefined)),
-        Effect.fork,
-      )
+        yield* Ref.set(setup.generation, 2)
+        yield* Ref.set(setup.entry, yield* setup.makeEntry("generation-2"))
+        yield* streams.requestDisplayViewSnapshot("s1", "view-a")
+        expect(yield* Queue.take(received)).toBe("generation-2")
+        yield* Fiber.interrupt(streamFiber)
+      }).pipe(Effect.provide(setup.layer))
+    })
+    await Effect.runPromise(program)
+  })
 
-      yield* Queue.take(events)
-      yield* Fiber.interrupt(fiber)
-      yield* Deferred.await(drained).pipe(
-        Effect.timeoutFail({
-          duration: Duration.millis(100),
-          onTimeout: () => "display stream did not detach",
-        })
-      )
-    }).pipe(Effect.provide(provideStreams(displayView))))
+  it("retains a shared registration until the final subscriber leaves", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      yield* Effect.gen(function* () {
+        const streams = yield* DisplayViewStreams
+        yield* streams.setDisplayViewShape("s1", "shared", rootShape)
+        const subscribed = yield* Queue.unbounded<void>()
+        const observeSubscription = (shape: DisplayViewShape) =>
+          streams.getDisplayViewStream("s1", "shared", shape).pipe(
+            Stream.tap(() => Queue.offer(subscribed, undefined)),
+            Stream.runDrain,
+            Effect.fork,
+          )
+        const first = yield* streams
+          .getDisplayViewStream("s1", "shared", rootShape)
+          .pipe(
+            Stream.tap(() => Queue.offer(subscribed, undefined)),
+            Stream.runDrain,
+            Effect.fork,
+          )
+        const second = yield* observeSubscription(rootShape)
+        yield* Queue.take(subscribed)
+        yield* Queue.take(subscribed)
 
-    expect(closed).toEqual(["view-a"])
+        yield* Fiber.interrupt(first)
+        const whileShared = yield* observeSubscription(compactShape)
+        yield* Queue.take(subscribed)
+        yield* streams.requestDisplayViewSnapshot("s1", "shared")
+        expect((yield* Ref.get(setup.shapes)).at(-1)).toEqual(rootShape)
+
+        yield* Fiber.interrupt(second)
+        yield* Fiber.interrupt(whileShared)
+        const successor = yield* streams
+          .getDisplayViewStream("s1", "shared", compactShape)
+          .pipe(Stream.runDrain, Effect.fork)
+        yield* Effect.sleep("1 millis")
+        yield* streams.requestDisplayViewSnapshot("s1", "shared")
+        expect((yield* Ref.get(setup.shapes)).at(-1)).toEqual(compactShape)
+        yield* Fiber.interrupt(successor)
+      }).pipe(Effect.provide(setup.layer))
+    })
+    await Effect.runPromise(program)
   })
 })

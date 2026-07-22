@@ -24,4 +24,5 @@ utoipa.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true

@@ -6,10 +6,10 @@ export type { DaemonSpawner } from "./daemon-spawner"
 export { makeLocalDaemonSpawner, type SpawnProcess, type LocalSpawnerOptions } from "./local-spawner"
 export { makeRemoteDaemonSpawner } from "./remote-spawner"
 export {
-  makeRecoveringAcnClient,
-  makeRecoveringProtocolLayer,
-  type RecoveringClientOptions,
-} from "./recovering-client"
+  makeAcnJitRuntime,
+  type AcnJitRuntime,
+  type AcnJitRuntimeOptions,
+} from "./acn-jit/acn-recovering-client"
 
 export { TracingLayer, makeTracingLayer, type MakeTracingLayerOptions } from "./tracing"
 

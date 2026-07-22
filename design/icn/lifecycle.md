@@ -148,6 +148,10 @@ does not reach directly into Bun globals, Node port-probing APIs, environment va
 user's home directory. A Bun composition layer may translate process environment and packaged
 paths into the typed configuration.
 
+ACN-owned ICN shutdown is bounded to one second: ICN receives `SIGTERM` and 500 milliseconds to
+exit, then receives `SIGKILL` and has another 500 milliseconds to be reaped. Model loading,
+inference, and model-resource release do not extend this deadline.
+
 ## Binary resolution and compatibility
 
 Production releases publish ICN as its own target-specific artifact. The ICN package owns release
@@ -236,29 +240,27 @@ before readiness or during `Ready` is still unexpected.
 
 ### Shutdown
 
-Normal ACN shutdown first stops admitting work and disposes agent/provider sessions. It then closes
-the ICN layer. Scope finalization, rather than `process.exit`, owns this sequence:
+ACN first closes root demand admission and finalizes ICN request producers and observers. Explicit
+shutdown and scope finalization use the same idempotent child operation. ACN ownership remains held
+until that operation finishes.
 
-1. Mark ICN stopping and reject new calls.
-2. Interrupt and await tracked HTTP requests and streams.
-3. Send the platform's graceful termination signal once.
-4. Wait a bounded grace period for ICN to stop accepting work, cancel operations, flush safe
+1. Mark ICN stopping so exit is no longer classified as dependency loss.
+2. Send the platform's graceful termination signal once.
+3. Wait a bounded grace period for ICN to stop accepting work, cancel operations, flush safe
    inventory state, close its listener, and exit.
-5. If the deadline expires, send a forceful termination signal, wait a second bounded period, and
+4. If the deadline expires, send a forceful termination signal, wait a second bounded period, and
    reap the child.
-6. Close output fibers and emit the final lifecycle result.
+5. Finalize process-output observers and publish the terminal lifecycle result.
 
 The native server must handle both interrupt and termination signals with the same idempotent
 graceful-shutdown path. Repeated shutdown requests do not send overlapping signal sequences.
 Finalization is uninterruptible around signal delivery and child reaping, while both waits remain
 bounded. Cleanup errors are logged and classified; they never leave an unobserved child handle.
 
-An uncatchable parent crash cannot run Effect finalizers. Normal signals and recoverable registry
-ownership loss must interrupt the ACN root Effect fiber and unwind its layers; they must not call
-`process.exit` before ICN cleanup completes. The spawned child therefore also receives
-parent identity and uses platform process containment where available plus a portable parent-liveness
-watchdog. It terminates itself when its owning ACN disappears. This is a backstop, not a mechanism
-for adopting or sharing children.
+Signals and recoverable ownership loss use ACN's common coordinator; they do not call `process.exit`
+before cleanup. For abrupt death, ICN watches parent-PID liveness and EOF on a private inherited
+stdin pipe. The EOF wait runs on a detached OS thread, not Tokio's blocking pool. These are crash
+backstops, not child adoption or sharing.
 
 ## Runtime model lifecycle
 
@@ -307,6 +309,15 @@ backend. Unload is idempotent, closes mutation admission and waits for protected
 to drain, and returns only after native resources are released. Chat requests bind
 to the active runtime generation they began with and cannot silently continue on a replacement.
 
+Every inference request holds an exact backend-generation lease through stream end or cancellation.
+Final release starts a 30-minute monotonic idle interval; automatic unload requires that complete
+interval with zero leases. Same-model load also holds a lease and starts a fresh interval on release.
+There is no separate touch timestamp.
+
+Inference, load, replacement, explicit unload, and idle unload share backend admission and mutation
+authority. Idle unload records generation/activity revision, waits without holding inference
+admission, then revalidates generation, revision, leases, and elapsed time under mutation authority.
+
 ICN's pinned runtime is part of the ICN build, so ACN has no separate native-runtime install,
 discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
 
@@ -341,10 +352,9 @@ stdout/stderr is bounded, line-framed, level-mapped where possible, and correlat
 instance ID. A diagnostic tail is retained for failures without becoming an unbounded in-memory
 log store.
 
-Health checks used for lifecycle do not count as ACN user activity. ICN model downloads, loads, and
-inference do count through an ACN-owned active-work lease for their full lifetime, including after
-the initiating RPC has acknowledged. The idle checker considers both agent work and these leases;
-ICN does not independently decide the ACN idle policy.
+Health, inventory, hardware, and runtime-revision observation are not ACN demand. ACN/session leases
+cover accepted user operations and inference; ICN backend leases cover native admission and response
+streams. These are composed resource gates, not shared activity timestamps.
 
 ## Conformance criteria
 
@@ -365,12 +375,15 @@ The lifecycle conforms when:
   ordinary generated chat client rather than an endpoint URL adapter;
 - direct completion of an available model and explicit load share one ensure coordinator, perform
   at most one compatible native load, and project the same lifecycle state into model listing;
+- a resident model unloads after 30 idle minutes, never during admitted inference, and a
+  last-moment admission or same-model load receives a complete fresh interval;
+- idle unload, replacement, load, and explicit unload serialize through native mutation authority;
 - product model-download, activation, deletion, hardware, and fit operations reach ICN only through
   the generated client, with no alternate model-repository or host-inspection path in ACN;
 - interrupting a consumer stream closes its response without terminating ICN;
 - an unexpected child exit causes the owning ACN to fail closed without an in-process restart;
-- normal ACN shutdown drains higher-level work, gracefully terminates ICN, escalates on deadline,
-  and reaps it;
+- normal ACN shutdown cancels higher-level work, gives ICN only a short graceful termination window,
+  escalates on deadline, and reaps it;
 - termination and interrupt signals both activate native graceful shutdown;
 - abrupt parent death cannot leave an ICN indefinitely orphaned;
 - lifecycle and transport failures remain typed and retain bounded, redacted diagnostics; and

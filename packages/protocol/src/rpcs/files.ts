@@ -10,8 +10,9 @@ import {
   SearchMentionsPayload,
   SearchMentionsResult,
   WatchFilePayload,
-  WatchFileWireEvent
+  WatchFileEvent
 } from "../schemas/files"
+import { makeAcnSubscriptionRpc } from "./subscription"
 import { SessionError } from "../errors"
 
 export const UploadAttachment = Rpc.make("UploadAttachment", {
@@ -50,11 +51,10 @@ export const CheckFileExists = Rpc.make("CheckFileExists", {
   error: SessionError
 })
 
-export const WatchFile = Rpc.make("WatchFile", {
+export const WatchFile = makeAcnSubscriptionRpc("WatchFile", {
   payload: WatchFilePayload,
-  success: WatchFileWireEvent,
+  success: WatchFileEvent,
   error: SessionError,
-  stream: true
 })
 
 export const ResolvePath = Rpc.make("ResolvePath", {

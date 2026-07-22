@@ -20,7 +20,7 @@
  *   5. All cleanup runs in Effect.uninterruptible.
  */
 
-import { Context, Effect, Layer, Deferred, Scope, Cause, Option, Exit, Queue, Stream } from 'effect'
+import { Context, Effect, Layer, Deferred, Scope, Cause, Option, Exit, Queue, Stream, SubscriptionRef, Runtime } from 'effect'
 import type { ReadableSubprocess, FileSink } from 'bun'
 import { DetachedShellRegistry, type DetachedShellRegistryService, type ExecuteDetachedOutput, type ShellOutputChunk } from './detached-process-registry'
 import type { WorkerBusService } from '@magnitudedev/event-core'
@@ -202,11 +202,16 @@ function spawnDetachedShell(
 
 // ── Implementation ──────────────────────────────────────────────────
 
-export function makeDetachedShellRegistryService(): DetachedShellRegistryService {
+export const makeDetachedShellRegistryService: Effect.Effect<DetachedShellRegistryService> = Effect.gen(function* () {
   const processes = new Map<number, TrackedProcess>()
   const byFork = new Map<string | null, Set<number>>()
   const timersByPid = new Map<number, ProcessTimers>()
   let bus: WorkerBusService<AppEvent> | null = null
+  const activeCount = yield* SubscriptionRef.make(0)
+  const runtime = yield* Effect.runtime<never>()
+  const publishActiveCount = Effect.sync(() => processes.size).pipe(
+    Effect.flatMap((count) => SubscriptionRef.set(activeCount, count)),
+  )
 
   // ── Event Publishing ───────────────────────────────────────────────
 
@@ -215,7 +220,7 @@ export function makeDetachedShellRegistryService(): DetachedShellRegistryService
       logger.warn({ type: event.type }, '[DetachedShellRegistry] Bus not bound, dropping event')
       return
     }
-    Effect.runFork(
+    Runtime.runFork(runtime)(
       bus.publish(event).pipe(
         Effect.tapErrorCause((cause) =>
           Effect.sync(() =>
@@ -251,6 +256,7 @@ export function makeDetachedShellRegistryService(): DetachedShellRegistryService
       // 2. Delete from tracking maps immediately — prevents re-kill races
       processes.delete(proc.pid)
       byFork.get(proc.forkId)?.delete(proc.pid)
+      yield* publishActiveCount
 
       // 3. Flush + close file sinks so all buffered data is on disk
       yield* Effect.all(
@@ -401,6 +407,7 @@ export function makeDetachedShellRegistryService(): DetachedShellRegistryService
           stdoutWriter,
           stderrWriter,
         })
+        yield* publishActiveCount
 
         // ── Scope finalizer for child lifecycle ────────────────
         // Runs when closeableScope is closed. If Deferred resolved
@@ -416,6 +423,7 @@ export function makeDetachedShellRegistryService(): DetachedShellRegistryService
             } else {
               processes.delete(pid)
               byFork.get(params.forkId)?.delete(pid)
+              yield* publishActiveCount
             }
 
             // Kill the child if still running
@@ -451,6 +459,7 @@ export function makeDetachedShellRegistryService(): DetachedShellRegistryService
           // from calling finalize on a process we're handling here.
           processes.delete(pid)
           byFork.get(params.forkId)?.delete(pid)
+          yield* publishActiveCount
 
           const [stdout, stderr] = yield* Effect.all(
             [
@@ -583,5 +592,7 @@ export function makeDetachedShellRegistryService(): DetachedShellRegistryService
           if (proc) yield* performKill(proc)
         }
       }),
+    activeCount: SubscriptionRef.get(activeCount),
+    changes: activeCount.changes,
   }
-}
+})

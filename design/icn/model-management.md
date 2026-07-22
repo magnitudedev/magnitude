@@ -99,6 +99,20 @@ Hugging Face hub is contained within that store. Default configuration does not 
 host user's global Hugging Face cache, and ACN does not supply external cache or directory roots.
 Explicit read-only roots remain an ICN deployment input, not an ACN-side discovery mechanism.
 
+## Runtime residency projection
+
+ICN is authoritative for process-local residency. Backend generation and observable runtime revision
+are distinct. Load, replacement, unload, failed-load cleanup, and idle unload publish terminal
+inventory state before incrementing runtime revision. Transitional notifications are allowed, but a
+notification alone never implies terminal state.
+
+Runtime changes use bounded long-poll from the caller's last revision. An unchanged revision polls
+again without listing; a changed revision fetches authoritative inventory.
+
+ACN projects inventory residency into the matching product model slot. It has no native-residency
+idle timer or optimistic residency state; autonomous unload becomes visible only through ICN
+inventory.
+
 ## Reasoning discovery
 
 Reasoning discovery describes the mechanical controls exposed by the effective chat template and
@@ -311,6 +325,9 @@ The implementation satisfies this design when:
 - deleting or making the complete cache unwritable does not change computed results or fail an
   otherwise successful operation;
 - simultaneous lists share one ensure operation;
+- runtime-change observation is bounded, and a changed revision causes authoritative list refresh
+  rather than optimistic state synthesis;
+- automatic idle unload becomes visible as terminal not-resident inventory before ACN projects it;
 - adding, changing, regrouping, or removing artifacts invalidates exactly the affected entries;
 - no successful response contains unresolved properties for an available model;
 - missing template metadata follows runtime fallback semantics;

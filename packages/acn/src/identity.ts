@@ -2,6 +2,8 @@ import { createId } from "@magnitudedev/generate-id";
 
 /** Stable for the lifetime of this ACN process and unique across candidates. */
 export const ACN_OWNER_ID = createId();
+/** Private capability published only in the mode-0600 local registry. */
+export const ACN_SHUTDOWN_TOKEN = crypto.randomUUID();
 
 export interface HealthResponse {
   readonly service: "magnitude-acn";

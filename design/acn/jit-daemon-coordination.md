@@ -4,8 +4,9 @@ applies_to:
   - packages/sdk/src/acn-jit/**
   - packages/sdk/src/daemon-spawner.ts
   - packages/sdk/src/local-spawner.ts
-  - packages/sdk/src/recovering-client.ts
   - packages/sdk/src/remote-spawner.ts
+  - packages/sdk/src/binary.ts
+  - packages/protocol/src/acn-registry.ts
   - cli/src/platform/**
   - desktop/src/platform.ts
   - desktop/src/main.ts
@@ -17,138 +18,91 @@ applies_to:
   - web/scripts/dev-server.ts
   - packages/acn/src/daemon-lifecycle.ts
   - packages/acn/src/daemon-registration.ts
-  - packages/acn/src/agent-runtime.ts
+  - packages/acn/src/machine-ownership.ts
+  - packages/acn/src/identity.ts
+  - packages/acn/src/server.ts
 ---
 
-# JIT ACN coordination and daemon election
+# Shared ACN startup and upgrades
 
-Clients reach ACN through one process-local, lazy coordination authority. Constructing that
-authority performs no daemon discovery or spawn. The first RPC demand ensures an endpoint, and all
-RPC consumers in the application process share that same ensure state even when they build
-independent protocol layers or run in independent Effect runtimes.
+All clients using the same data root share one ACN. That ACN owns one private ICN.
 
-The coordinator preserves just-in-time daemon lifecycle while preventing AtomRPC, display streams,
-status streams, file watches, and other consumers from independently spawning ACNs.
+## Connecting from a client
 
-## Ownership
+Each client process creates one `AcnJitRuntime`. All RPC consumers share its protocol layer,
+coordinator, and cached endpoint. Runtime construction ensures ACN once; concurrent recovery also
+shares one discovery or spawn attempt.
 
-The generic JIT RPC layer owns:
+Cached endpoints are generation-specific. A failed request can invalidate only the endpoint it used,
+not a newer endpoint discovered by another request. Domain errors and caller cancellation do not
+invalidate ACN.
 
-- process-local endpoint caching;
-- single-flight discovery and spawn;
-- endpoint-specific invalidation after transport failure; and
-- reconnecting RPC transport behavior.
+## Finding the current ACN
 
-The ACN JIT adapter owns:
+The data root contains one canonical registration with ACN identity, version, URL, PID, and a private
+shutdown token. Registration is atomically published as mode `0600` under a mode-`0700` directory.
 
-- construction of one coordinator from the `DaemonSpawner` service;
-- ACN RPC path, resident-stream policy, and infrastructure-error mapping; and
-- a reusable protocol layer that closes over the already constructed coordinator.
+A client reuses the registration only when `/health` reports the same service, owner, version, and
+PID. Missing, invalid, unhealthy, or mismatched registration is stale.
 
-The local daemon spawner owns version-scoped registry discovery, health verification, binary
-resolution, cross-process spawn election, and waiting for the canonical winner. Remote spawners
-delegate those operations to their authoritative host.
+## Starting one ACN
 
-Clients own application composition. Each client platform acquires its spawner and coordinator
-once during startup and supplies the resulting reusable protocol layer to every consumer.
-`client-common` does not discover, spawn, or elect daemons.
+Before spawning, a client acquires a global spawn election and then checks registration again. This
+prevents a client that waited for the election from acting on an earlier observation.
 
-ACN owns its canonical registration, orderly server shutdown, session disposal, and exactly one
-private ICN child for the ACN scope.
+The ACN process separately acquires machine ownership before starting HTTP or ICN. This prevents
+duplicate ICNs even after direct launch, client crash, or election failure. Ownership remains held
+until ACN finalization and ICN reaping finish.
 
-## Process-local coordinator
+Election and ownership records contain a PID and unique identity. Stale recovery requires proof that
+the PID is dead and removal of the exact observed record; timeout alone cannot steal a live record
+or remove its successor.
 
-The coordinator is an ordinary Effect-created service value. Its mutable state and synchronization
-are allocated through Effect primitives; they are not module globals, unsafe constructors, or
-mutable closure caches hidden inside a Layer recipe.
+## Version policy
 
-Its logical state is:
+| Client relative to healthy ACN | Result |
+| --- | --- |
+| Same version | Reuse |
+| Older | Reuse the newer ACN |
+| Newer | Replace through authenticated shutdown |
+| Same SemVer precedence with different build identities | Naturally order the build identities |
+| Arbitrary non-SemVer identities | Naturally order the complete identities |
 
-```text
-Unresolved --ensure--> Ensuring --success--> Resolved(endpoint)
-     ^                    |                       |
-     |                    +--failure-------------+
-     |                                            |
-     +--------- invalidate matching endpoint ----+
-```
+The same comparison is used during discovery, after election, before shutdown, and while waiting for
+a spawned candidate. Magnitude development identities have the form
+`<version>+dev.<commit>.<timestamp>` and are naturally ordered, including numeric timestamp ordering.
+A published release outranks a development build with the same SemVer base. Every distinct identity
+has a deterministic order, so version comparison cannot produce an unorderable conflict.
 
-Required behavior:
+A replacement client revalidates the incumbent and requests shutdown with its registered token.
+Shutdown immediately cancels resident work. If the authenticated owner does not exit within a short
+cooperative window, replacement escalates through `SIGTERM` and `SIGKILL` with bounded waits before
+starting its candidate. Signals are never sent before authenticated shutdown acceptance. The
+candidate must acquire machine ownership. If a newer candidate won meanwhile, the client uses that
+winner instead.
 
-- concurrent ensure callers perform one discovery/spawn sequence;
-- successful discovery or spawn is cached before waiters resume;
-- a failed ensure restores the unresolved state;
-- an invalidation clears only the endpoint used by the failed attempt;
-- a delayed failure from an older endpoint cannot clear a newer endpoint;
-- domain RPC failures and caller cancellation do not invalidate ACN; and
-- coordinator construction itself performs no daemon I/O.
+The old ACN has a hard five-second retirement budget measured from authenticated shutdown
+acceptance:
 
-The recovering protocol consumes an existing coordinator. It never constructs or memoizes one.
-Independent builds of the reusable protocol layer may allocate request/transport resources, but
-they all use the same coordinator value.
+1. three seconds for cooperative cancellation, persistence flush, child cleanup, and normal exit;
+2. one additional second after `SIGTERM`;
+3. `SIGKILL` at four seconds if the process is still alive; and
+4. one final second to confirm that the process was reaped.
 
-Effect Layer memoization is scoped to a Layer build and is not the daemon-sharing mechanism.
-Passing the same unbuilt Layer recipe to independent runtimes does not establish shared mutable
-state.
+Failure to reap the exact incumbent PID within that fifth second fails takeover. Candidate startup
+has a separate ten-second registration-and-health deadline and does not extend the old ACN's
+retirement budget.
 
-## Cross-process election
+## Recovery and compatibility
 
-Separate application processes can observe an absent registration concurrently. Before spawning,
-the local spawner acquires an exclusive claim scoped to the expected ACN compatibility/version key.
-After acquiring the claim it must re-read and re-probe the registry. If another process published a
-healthy compatible ACN while this caller waited, the caller returns that owner without spawning.
+Transport loss invalidates the failed endpoint and may start ACN. A subscription receiving
+`terminated` waits for another registered ACN without starting one. Protocol errors are surfaced
+without invalidation, spawn, or downgrade. Recovery from retirement does not immediately reconnect
+to the draining URL.
 
-The winner holds the claim until a canonical healthy registration is observable or startup fails.
-Other contenders wait for the claim and then repeat the mandatory health recheck. They do not spawn
-speculative candidates.
+Forward reuse requires newer ACNs to preserve released request and response meanings plus the
+registration, health, and subscription fields used by older clients. Breaking wire changes require
+explicit compatibility negotiation.
 
-The claim is a complete owner record containing an opaque token plus the owning process identity.
-It is published atomically by hard-linking a fully written private file to the well-known election
-path, so observers can never see a claim without its owner identity. Stale-claim recovery is bounded
-by age but must also prove that the recorded owner process is dead; elapsed time alone never permits
-stealing a live claim. Recovery hard-links the exact dead claim to a token-specific retained
-tombstone before removing the election path. The retained link elects one recovery winner, allows a
-later contender to finish an interrupted recovery, and prevents a delayed contender from removing a
-newer owner. Claim release and stale recovery operate only on the exact per-version claim path. A
-claim contains no credentials or session data.
-
-The age bound is a short owner-record publication grace and is always shorter than one contender's
-spawn-election wait budget. It is not a crash-recovery delay. Once the grace has elapsed, a recorded
-dead owner is recoverable during the current ensure attempt; a recorded live owner remains
-ineligible regardless of claim age.
-
-A healthy compatible registration is never intentionally replaced by a new candidate. ACN's
-ownership watchdog is defensive corruption/failure detection, not the election algorithm.
-
-## Recovery
-
-RPC transport failure invalidates the endpoint used by that attempt. The next ensure first performs
-authoritative discovery. It reuses a healthy registered ACN when available and enters election only
-when no healthy compatible owner exists.
-
-Resident streams reconnect independently through the coordinator. Sharing coordination does not
-merge streams, pin one HTTP connection, serialize RPC traffic, or make ACN eager.
-
-## Shutdown
-
-BunRuntime signal handling interrupts the root Effect fiber. Normal SIGTERM/SIGINT and recoverable
-ownership loss therefore unwind the ACN Layer scope.
-
-Agent runtime scope finalization disposes all live sessions. ICN lifecycle finalization cancels its
-requests, sends bounded graceful termination, escalates if required, and reaps the child. ACN must
-not call `process.exit` on a normal or recoverable ownership-loss path because immediate process
-exit skips those finalizers.
-
-ICN parent-liveness monitoring remains a crash backstop for an ACN that cannot run cleanup. It is
-not a substitute for scoped shutdown.
-
-## Acceptance criteria
-
-- Mounting every RPC consumer in one client process against an empty registry spawns one ACN.
-- Independently built protocol layers from one platform perform one shared discovery/spawn.
-- Concurrent client processes for one compatibility key spawn at most one winning candidate and
-  converge on its registration.
-- A contender that waited for election rechecks health and does not replace the winner.
-- Killing the resolved ACN causes one coordinated recovery and a stable replacement endpoint.
-- A healthy ACN is never replaced merely because another caller observed stale registry state.
-- SIGTERM, SIGINT, idle shutdown, and ownership-loss shutdown unwind ACN scope and reap its ICN.
-- One ACN owns one ICN throughout its ready lifetime.
+Downloaded ACN binaries use immutable version/platform paths. ACN receives the same data root used
+for registration, election, ownership, storage, and ICN storage.

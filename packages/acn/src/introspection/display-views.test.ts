@@ -40,32 +40,7 @@ describe("AcnDisplayViewIntrospector", () => {
     expect(result.during[0].shape).toEqual(rootShape)
     expect(result.during[0].openedAt).toBeGreaterThan(0)
     expect(result.afterOneClose[0].subscriberCount).toBe(1)
-    expect(result.afterAllClosed).toHaveLength(1)
-    expect(result.afterAllClosed[0].subscriberCount).toBe(0)
-    expect(result.afterAllClosed[0].shape).toEqual(rootShape)
-  })
-
-  it("keeps shape state until the view is closed", async () => {
-    const program = Effect.gen(function* () {
-      const introspector = yield* AcnDisplayViewIntrospector
-
-      yield* introspector.setShape("session-a", "view-main", rootShape)
-      yield* introspector.resync("session-a", "view-main")
-      const beforeClose = yield* introspector.current("session-a")
-
-      yield* introspector.closeView("session-a", "view-main")
-      const afterClose = yield* introspector.current("session-a")
-
-      return { beforeClose, afterClose }
-    }).pipe(Effect.provide(AcnDisplayViewIntrospectorLive))
-
-    const result = await Effect.runPromise(program)
-
-    expect(result.beforeClose).toHaveLength(1)
-    expect(result.beforeClose[0].shape).toEqual(rootShape)
-    expect(result.beforeClose[0].resyncCount).toBe(1)
-    expect(result.beforeClose[0].shapeUpdatedAt).toBeGreaterThan(0)
-    expect(result.afterClose).toHaveLength(0)
+    expect(result.afterAllClosed).toHaveLength(0)
   })
 
   it("filters current views by session", async () => {

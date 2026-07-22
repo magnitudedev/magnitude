@@ -97,6 +97,7 @@ import { ProviderClient, SlotIdSchema, type ProviderClientShape } from '@magnitu
 import type { DisplayViewShape, DisplayViewSnapshot } from '@magnitudedev/protocol'
 import type { ForkTurnState } from './projections/turn'
 import type { AgentLifecycleState } from './projections/agent-lifecycle'
+import { deriveSessionWorkStatus, type SessionWorkStatus } from './session-work-status'
 
 import { MagnitudeStorage, type MagnitudeStorageShape } from '@magnitudedev/storage'
 import { initLogger, logger } from '@magnitudedev/logger'
@@ -295,6 +296,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
       const turnProjection = yield* TurnProjection.Tag
       const windowProjection = yield* WindowProjection.Tag
       const compactionProjection = yield* CompactionProjection.Tag
+      const detachedProcessProjection = yield* DetachedProcessProjection.Tag
       const conversationProjection = yield* ConversationProjection.Tag
       const displayTimelineProjection = yield* DisplayTimelineProjection.Tag
       const harnessStateProjection = yield* HarnessStateProjection.Tag
@@ -552,6 +554,22 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           })
         }
 
+        // A new runtime generation cannot adopt operating-system processes
+        // from persisted PIDs. Reconcile replayed running records before the
+        // hydrated session is exposed.
+        for (const [forkId, state] of yield* detachedProcessProjection.getAllForks()) {
+          for (const process of state.processes.values()) {
+            if (process.status !== 'running') continue
+            yield* engine.send({
+              type: 'shell_process_exited',
+              forkId,
+              pid: process.pid,
+              command: process.command,
+              exitCode: 143,
+            })
+          }
+        }
+
       }, Effect.orDie)
 
       const introspectionChanges = (forkId: string | null) =>
@@ -635,6 +653,10 @@ export interface CodingAgentSession {
     }>
   }
   readonly state: {
+    readonly work: {
+      readonly get: () => Effect.Effect<SessionWorkStatus>
+      readonly subscribe: Stream.Stream<SessionWorkStatus>
+    }
     readonly turn: {
       readonly getFork: (forkId: string | null) => Effect.Effect<ForkTurnState>
       readonly subscribeFork: (forkId: string | null) => Stream.Stream<ForkTurnState>
@@ -724,12 +746,51 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     appLayer
   )
 
+  const readWorkStatus = Effect.gen(function* () {
+    const turn = yield* TurnProjection.Tag
+    const agents = yield* AgentLifecycleProjection.Tag
+    const compaction = yield* CompactionProjection.Tag
+    const execution = yield* ExecutionManager
+    return deriveSessionWorkStatus({
+      turns: yield* turn.getAllForks(),
+      agents: yield* agents.get,
+      compactions: yield* compaction.getAllForks(),
+      detachedProcessCount: yield* execution.detachedProcessCount,
+    })
+  })
+
+  const workStatusChanges = Stream.unwrap(
+    Effect.gen(function* () {
+      const turn = yield* TurnProjection.Tag
+      const agents = yield* AgentLifecycleProjection.Tag
+      const compaction = yield* CompactionProjection.Tag
+      const execution = yield* ExecutionManager
+      return Stream.mergeAll([
+        turn.state.changes.pipe(Stream.map(() => undefined)),
+        agents.state.changes.pipe(Stream.map(() => undefined)),
+        compaction.state.changes.pipe(Stream.map(() => undefined)),
+        execution.detachedProcessChanges.pipe(Stream.map(() => undefined)),
+      ], { concurrency: 'unbounded' }).pipe(
+        Stream.mapEffect(() => readWorkStatus),
+        Stream.changesWith((left, right) =>
+          left._tag === right._tag && left.workerCount === right.workerCount
+        ),
+      )
+    })
+  )
+
   return yield* Surface.effectClient(Surface.host({
     layer: runtimeLayer,
     on: {
       restoreQueuedMessages: Surface.signal(DisplayTimelineProjection.signals.restoreQueuedMessages),
     },
     state: {
+      work: {
+        get: Surface.command(() => readWorkStatus),
+        subscribe: Surface.signal(
+          Stream.concat(Stream.fromEffect(readWorkStatus), workStatusChanges)
+        ),
+      },
       turn: Surface.state(TurnProjection),
       agentStatus: Surface.state(AgentLifecycleProjection),
     },

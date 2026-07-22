@@ -1,10 +1,33 @@
 import { describe, expect, it } from "vitest"
-import { Deferred, Effect, Fiber, Layer, Option, Ref, Scope, Stream } from "effect"
-import type { AgentLifecycleState, CodingAgentSession, ForkTurnState } from "@magnitudedev/agent"
+import {
+  Deferred,
+  Effect,
+  Either,
+  Fiber,
+  Layer,
+  Option,
+  PubSub,
+  Ref,
+  Scope,
+  Stream,
+  TestClock,
+  TestContext,
+} from "effect"
+import type {
+  AgentLifecycleState,
+  CodingAgentSession,
+  ForkTurnState,
+  SessionWorkStatus,
+} from "@magnitudedev/agent"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
 import { SessionOperationFailed } from "@magnitudedev/protocol"
 import { AgentFactory, type AgentFactoryApi } from "./agent-factory"
-import { AgentRuntime, AgentRuntimeLive, type RuntimeStartRequest } from "./agent-runtime"
+import {
+  AgentRuntime,
+  makeAgentRuntimeLive,
+  type AgentRuntimeApi,
+  type RuntimeStartRequest,
+} from "./agent-runtime"
 import { SessionStore, type SessionStoreApi } from "./session-store"
 import {
   normalizeSessionRuntimeOptions,
@@ -37,11 +60,13 @@ const idleAgentStatus: AgentLifecycleState = {
   },
 }
 
-const unusedCodingAgentSession: CodingAgentSession = {
-  on: {
-    restoreQueuedMessages: Stream.never,
-  },
+const idleSession: CodingAgentSession = {
+  on: { restoreQueuedMessages: Stream.never },
   state: {
+    work: {
+      get: () => Effect.succeed({ _tag: "Quiescent" as const, workerCount: 0 }),
+      subscribe: Stream.succeed({ _tag: "Quiescent" as const, workerCount: 0 }),
+    },
     turn: {
       getFork: () => Effect.succeed(idleTurnState),
       subscribeFork: () => Stream.succeed(idleTurnState),
@@ -52,24 +77,20 @@ const unusedCodingAgentSession: CodingAgentSession = {
     },
   },
   displayView: {
-    stream: () => Stream.die("unused test session displayView.stream"),
-    snapshot: () => Effect.die("unused test session displayView.snapshot"),
-    setShape: () => Effect.die("unused test session displayView.setShape"),
+    stream: () => Stream.never,
+    snapshot: () => Effect.die("unused"),
+    setShape: () => Effect.die("unused"),
     close: () => Effect.void,
   },
-  send: () => Effect.die("unused test session send"),
-  interrupt: () => Effect.die("unused test session interrupt"),
+  send: () => Effect.die("unused"),
+  interrupt: () => Effect.die("unused"),
   publishInitialTask: () => Effect.void,
   onEvent: Stream.never,
   onError: Stream.never,
   subscribeIntrospection: () => Stream.never,
 }
 
-const makeMeta = (
-  sessionId: string,
-  cwd: string,
-  visibility: StoredSessionMeta["visibility"],
-): StoredSessionMeta => {
+const makeMeta = (sessionId: string, cwd = "/repo"): StoredSessionMeta => {
   const now = new Date().toISOString()
   return {
     sessionId,
@@ -77,7 +98,7 @@ const makeMeta = (
     updated: now,
     chatName: "Session",
     workingDirectory: cwd,
-    visibility,
+    visibility: "visible",
     initialVersion: "0.0.1",
     lastActiveVersion: "0.0.1",
     gitBranch: null,
@@ -87,289 +108,384 @@ const makeMeta = (
   }
 }
 
+const request = (sessionId: string): RuntimeStartRequest => ({
+  sessionId,
+  cwd: "/repo",
+  options: normalizeSessionRuntimeOptions(),
+  visibility: "visible",
+})
+
+const residentCount = (runtime: AgentRuntimeApi) =>
+  runtime.residentSessions.pipe(Effect.map((sessions) => sessions.length))
+
 const makeLayer = (input: {
   readonly factory: AgentFactoryApi
   readonly storedSessions?: ReadonlyArray<StoredSessionMeta>
   readonly storedRuntimeOptions?: ReadonlyMap<string, SessionRuntimeOptions>
-}) =>
-  AgentRuntimeLive.pipe(
-    Layer.provide(Layer.mergeAll(
-      Layer.succeed(AgentFactory, input.factory),
-      Layer.effect(
-        SessionStore,
-        Effect.gen(function* () {
-          const metas = yield* Ref.make(new Map<string, StoredSessionMeta>())
-          for (const meta of input.storedSessions ?? []) {
-            yield* Ref.update(metas, (map) => new Map(map).set(meta.sessionId, meta))
-          }
-
-          return {
-            createId: Effect.die("unused"),
-            readMeta: (sessionId) =>
-              Ref.get(metas).pipe(Effect.map((map) => map.get(sessionId) ?? null)),
-            readProtocolMeta: () => Effect.die("unused"),
-            promoteDraft: () => Effect.die("unused"),
-            listDraftSessionIds: () => Effect.die("unused"),
-            listProtocolMetas: () => Effect.die("unused"),
-            listSessionCwds: () => Effect.die("unused"),
-            deleteSessionFiles: () => Effect.die("unused"),
-            validateCwd: (cwd) => Effect.succeed(cwd),
-            getScratchpadPath: (sessionId) => Effect.succeed(`/tmp/${sessionId}/scratchpad`),
-            getExecutionContext: () => Effect.die("unused"),
-
-          } satisfies SessionStoreApi
-        }),
-      ),
-      Layer.effect(
-        SessionRuntimeOptionsStore,
-        Effect.gen(function* () {
-          const runtimeOptions = yield* Ref.make(new Map(input.storedRuntimeOptions ?? []))
-          const api: SessionRuntimeOptionsStoreApi = {
-            normalize: normalizeSessionRuntimeOptions,
-            read: (sessionId) =>
-              Ref.get(runtimeOptions).pipe(
-                Effect.map((map) => map.get(sessionId) ?? null),
-              ),
-            write: (sessionId, options) =>
-              Ref.update(runtimeOptions, (map) => new Map(map).set(sessionId, options)),
-          }
-          return api
-        }),
-      ),
-    )),
+}) => {
+  const dependencies = Layer.mergeAll(
+    Layer.succeed(AgentFactory, input.factory),
+    Layer.effect(
+      SessionStore,
+      Effect.gen(function* () {
+        const metas = yield* Ref.make(
+          new Map((input.storedSessions ?? []).map((meta) => [meta.sessionId, meta])),
+        )
+        return {
+          createId: Effect.die("unused"),
+          readMeta: (sessionId) =>
+            Ref.get(metas).pipe(Effect.map((all) => all.get(sessionId) ?? null)),
+          readProtocolMeta: () => Effect.die("unused"),
+          promoteDraft: () => Effect.die("unused"),
+          listDraftSessionIds: () => Effect.die("unused"),
+          listProtocolMetas: () => Effect.die("unused"),
+          listSessionCwds: () => Effect.die("unused"),
+          deleteSessionFiles: () => Effect.die("unused"),
+          validateCwd: Effect.succeed,
+          getScratchpadPath: (sessionId) => Effect.succeed(`/tmp/${sessionId}/scratchpad`),
+          getExecutionContext: () => Effect.die("unused"),
+        } satisfies SessionStoreApi
+      }),
+    ),
+    Layer.effect(
+      SessionRuntimeOptionsStore,
+      Effect.gen(function* () {
+        const values = yield* Ref.make(new Map(input.storedRuntimeOptions ?? []))
+        return {
+          normalize: normalizeSessionRuntimeOptions,
+          read: (sessionId) =>
+            Ref.get(values).pipe(Effect.map((all) => all.get(sessionId) ?? null)),
+          write: (sessionId, options) =>
+            Ref.update(values, (all) => new Map(all).set(sessionId, options)),
+        } satisfies SessionRuntimeOptionsStoreApi
+      }),
+    ),
   )
+  return makeAgentRuntimeLive({ idleTimeout: "2 seconds" }).pipe(
+    Layer.provide(dependencies),
+    Layer.provideMerge(TestContext.TestContext),
+  )
+}
 
 describe("AgentRuntime", () => {
-  it("single-flights concurrent getOrStart calls for the same session", async () => {
-    await Effect.runPromise(Effect.gen(function* () {
-      const createCalls = yield* Ref.make(0)
+  it("single-flights startup and publishes one generation", async () => {
+    const program = Effect.gen(function* () {
+      const calls = yield* Ref.make(0)
       const entered = yield* Deferred.make<void>()
-      const release = yield* Deferred.make<void>()
-      const factory: AgentFactoryApi = {
-        createSession: () =>
-          Effect.gen(function* () {
-            yield* Ref.update(createCalls, (count) => count + 1)
-            yield* Deferred.succeed(entered, undefined)
-            yield* Deferred.await(release)
-            return unusedCodingAgentSession
-          }),
-      }
-      const layer = makeLayer({ factory })
-
-      yield* Effect.gen(function* () {
-        const runtime = yield* AgentRuntime
-        const request: RuntimeStartRequest = {
-          sessionId: "session-a",
-          cwd: "/repo",
-          options: normalizeSessionRuntimeOptions(),
-          visibility: "visible",
-          scope: Option.none(),
-        }
-
-        const first = yield* Effect.fork(runtime.getOrStart(request))
-        yield* Deferred.await(entered)
-        const second = yield* Effect.fork(runtime.getOrStart(request))
-        yield* Deferred.succeed(release, undefined)
-
-        const firstEntry = yield* Fiber.join(first)
-        const secondEntry = yield* Fiber.join(second)
-        const calls = yield* Ref.get(createCalls)
-        const count = yield* runtime.count
-
-        expect(firstEntry.id).toBe("session-a")
-        expect(secondEntry.id).toBe("session-a")
-        expect(firstEntry.session).toBe(secondEntry.session)
-        expect(calls).toBe(1)
-        expect(count).toBe(1)
-      }).pipe(Effect.provide(layer))
-    }))
-  })
-
-  it("single-flights concurrent requireOrStart calls for a persisted session", async () => {
-    await Effect.runPromise(Effect.gen(function* () {
-      const createCalls = yield* Ref.make(0)
-      const entered = yield* Deferred.make<void>()
-      const release = yield* Deferred.make<void>()
-      const factory: AgentFactoryApi = {
-        createSession: () =>
-          Effect.gen(function* () {
-            yield* Ref.update(createCalls, (count) => count + 1)
-            yield* Deferred.succeed(entered, undefined)
-            yield* Deferred.await(release)
-            return unusedCodingAgentSession
-          }),
-      }
+      const resume = yield* Deferred.make<void>()
       const layer = makeLayer({
-        factory,
-        storedSessions: [makeMeta("session-b", "/repo", "visible")],
-        storedRuntimeOptions: new Map([[
-          "session-b",
-          normalizeSessionRuntimeOptions({
-            disableShellSafeguards: false,
-            disableCwdSafeguards: false,
-            solo: true,
-            headless: true,
-          }),
-        ]]),
+        factory: {
+          createSession: () =>
+            Ref.update(calls, (value) => value + 1).pipe(
+              Effect.zipRight(Deferred.succeed(entered, undefined)),
+              Effect.zipRight(Deferred.await(resume)),
+              Effect.as(idleSession),
+            ),
+        },
       })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        const first = yield* runtime
+          .withSessionRequest(request("single"), "first", (_, generation) =>
+            Effect.succeed(generation),
+          )
+          .pipe(Effect.fork)
+        yield* Deferred.await(entered)
+        const second = yield* runtime
+          .withSessionRequest(request("single"), "second", (_, generation) =>
+            Effect.succeed(generation),
+          )
+          .pipe(Effect.fork)
+        yield* Deferred.succeed(resume, undefined)
+        expect(yield* Fiber.join(first)).toBe(1)
+        expect(yield* Fiber.join(second)).toBe(1)
+        expect(yield* Ref.get(calls)).toBe(1)
+        expect(yield* residentCount(runtime)).toBe(1)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("holds in-flight work, then evicts at the exact post-release deadline", async () => {
+    const program = Effect.gen(function* () {
+      const latch = yield* Deferred.make<void>()
+      const layer = makeLayer({ factory: { createSession: () => Effect.succeed(idleSession) } })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        const inFlight = yield* runtime
+          .withSessionRequest(request("deadline"), "blocked", () => Deferred.await(latch))
+          .pipe(Effect.fork)
+        yield* Effect.yieldNow()
+        yield* TestClock.adjust("1 hour")
+        expect(yield* residentCount(runtime)).toBe(1)
+        yield* Deferred.succeed(latch, undefined)
+        yield* Fiber.join(inFlight)
+        yield* TestClock.adjust("1999 millis")
+        expect(yield* residentCount(runtime)).toBe(1)
+        yield* TestClock.adjust("1 millis")
+        yield* Effect.yieldNow()
+        expect(yield* residentCount(runtime)).toBe(0)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("holds continuing session work and starts a fresh idle interval at quiescence", async () => {
+    const program = Effect.gen(function* () {
+      const status = yield* Ref.make<SessionWorkStatus>({
+        _tag: "Quiescent",
+        workerCount: 0,
+      })
+      const changes = yield* PubSub.unbounded<SessionWorkStatus>()
+      const working: SessionWorkStatus = { _tag: "Working", workerCount: 1 }
+      const quiescent: SessionWorkStatus = { _tag: "Quiescent", workerCount: 0 }
+      const session: CodingAgentSession = {
+        ...idleSession,
+        state: {
+          ...idleSession.state,
+          work: {
+            get: () => Ref.get(status),
+            subscribe: Stream.fromPubSub(changes),
+          },
+        },
+      }
+      const layer = makeLayer({ factory: { createSession: () => Effect.succeed(session) } })
 
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        const first = yield* Effect.fork(runtime.requireOrStart("session-b"))
-        yield* Deferred.await(entered)
-        const second = yield* Effect.fork(runtime.requireOrStart("session-b"))
-        yield* Deferred.succeed(release, undefined)
-
-        const firstEntry = yield* Fiber.join(first)
-        const secondEntry = yield* Fiber.join(second)
-        const calls = yield* Ref.get(createCalls)
-        const count = yield* runtime.count
-
-        expect(firstEntry.id).toBe("session-b")
-        expect(secondEntry.id).toBe("session-b")
-        expect(firstEntry.session).toBe(secondEntry.session)
-        expect(calls).toBe(1)
-        expect(count).toBe(1)
-      }).pipe(Effect.provide(layer))
-    }))
-  })
-
-  it("starts persisted sessions with stored runtime options", async () => {
-    await Effect.runPromise(Effect.gen(function* () {
-      const storedOptions = normalizeSessionRuntimeOptions({
-        disableShellSafeguards: true,
-        disableCwdSafeguards: true,
-        atifPath: "/tmp/atif.md",
-        solo: true,
-        systemPromptOverride: "system",
-        headless: true,
-      })
-      const seenOptions = yield* Ref.make<SessionRuntimeOptions | null>(null)
-      const factory: AgentFactoryApi = {
-        createSession: (input) =>
-          Ref.set(seenOptions, input.options).pipe(
-            Effect.as(unusedCodingAgentSession),
+        yield* runtime.withSessionRequest(request("continuing"), "start-work", () =>
+          Ref.set(status, working).pipe(
+            Effect.zipRight(PubSub.publish(changes, working)),
           ),
-      }
-      const layer = makeLayer({
-        factory,
-        storedSessions: [makeMeta("session-options", "/repo", "visible")],
-        storedRuntimeOptions: new Map([["session-options", storedOptions]]),
-      })
+        )
+        yield* Effect.yieldNow()
+        yield* TestClock.adjust("1 hour")
+        expect(yield* residentCount(runtime)).toBe(1)
 
-      yield* Effect.gen(function* () {
-        const runtime = yield* AgentRuntime
-        const entry = yield* runtime.requireOrStart("session-options")
-        const options = yield* Ref.get(seenOptions)
-
-        expect(entry.id).toBe("session-options")
-        expect(options).toEqual(storedOptions)
+        yield* Ref.set(status, quiescent)
+        yield* PubSub.publish(changes, quiescent)
+        yield* Effect.yieldNow()
+        yield* TestClock.adjust("1999 millis")
+        expect(yield* residentCount(runtime)).toBe(1)
+        yield* TestClock.adjust("1 millis")
+        yield* Effect.yieldNow()
+        expect(yield* residentCount(runtime)).toBe(0)
       }).pipe(Effect.provide(layer))
-    }))
+    })
+    await Effect.runPromise(program)
   })
 
-  it("clears failed starts so later calls can retry", async () => {
-    await Effect.runPromise(Effect.gen(function* () {
-      const createCalls = yield* Ref.make(0)
-      const failEntered = yield* Deferred.make<void>()
-      const failRelease = yield* Deferred.make<void>()
-      const failed = new SessionOperationFailed({
-        operation: "test-start",
-        reason: "boom",
+  it("rehydrates with a new generation after eviction", async () => {
+    const program = Effect.gen(function* () {
+      const layer = makeLayer({
+        factory: { createSession: () => Effect.succeed(idleSession) },
+        storedSessions: [makeMeta("rehydrate")],
       })
-      const factory: AgentFactoryApi = {
-        createSession: () =>
-          Effect.gen(function* () {
-            const call = yield* Ref.updateAndGet(createCalls, (count) => count + 1)
-            if (call === 1) {
-              yield* Deferred.succeed(failEntered, undefined)
-              yield* Deferred.await(failRelease)
-              return yield* failed
-            }
-            return unusedCodingAgentSession
-          }),
-      }
-      const layer = makeLayer({ factory })
-
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        const request: RuntimeStartRequest = {
-          sessionId: "session-c",
-          cwd: "/repo",
-          options: normalizeSessionRuntimeOptions(),
-          visibility: "visible",
-          scope: Option.none(),
-        }
-
-        const first = yield* Effect.fork(Effect.flip(runtime.getOrStart(request)))
-        yield* Deferred.await(failEntered)
-        const second = yield* Effect.fork(Effect.flip(runtime.getOrStart(request)))
-        yield* Deferred.succeed(failRelease, undefined)
-
-        const firstError = yield* Fiber.join(first)
-        const secondError = yield* Fiber.join(second)
-        const retried = yield* runtime.getOrStart(request)
-        const calls = yield* Ref.get(createCalls)
-
-        expect(firstError).toStrictEqual(failed)
-        expect(secondError).toStrictEqual(failed)
-        expect(retried.id).toBe("session-c")
-        expect(calls).toBe(2)
+        expect(yield* runtime.withSession("rehydrate", "one", (_, generation) => Effect.succeed(generation))).toBe(1)
+        yield* TestClock.adjust("2 seconds")
+        yield* Effect.yieldNow()
+        expect(yield* residentCount(runtime)).toBe(0)
+        expect(yield* runtime.withSession("rehydrate", "two", (_, generation) => Effect.succeed(generation))).toBe(2)
       }).pipe(Effect.provide(layer))
-    }))
+    })
+    await Effect.runPromise(program)
   })
 
-  it("removes disposed sessions before waiting on scope finalizers", async () => {
-    await Effect.runPromise(Effect.gen(function* () {
-      const createCalls = yield* Ref.make(0)
-      const closeStarted = yield* Deferred.make<void>()
-      const releaseClose = yield* Deferred.make<void>()
-      const firstSession: CodingAgentSession = { ...unusedCodingAgentSession }
-      const secondSession: CodingAgentSession = { ...unusedCodingAgentSession }
-      const factory: AgentFactoryApi = {
-        createSession: (input) =>
-          Effect.gen(function* () {
-            const call = yield* Ref.updateAndGet(createCalls, (count) => count + 1)
-            if (call === 1) {
-              yield* Scope.addFinalizer(
-                input.scope,
-                Deferred.succeed(closeStarted, undefined).pipe(
-                  Effect.zipRight(Deferred.await(releaseClose)),
-                ),
-              )
-            }
-            return call === 1 ? firstSession : secondSession
-          }),
-      }
+  it("does not let passive busy-joins revive or prolong an idle generation", async () => {
+    const program = Effect.gen(function* () {
+      const layer = makeLayer({ factory: { createSession: () => Effect.succeed(idleSession) } })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        yield* runtime.withSessionRequest(request("passive"), "demand", () => Effect.void)
+        yield* TestClock.adjust("1 second")
+        const observed = yield* runtime.tryWithBusyResident(
+          "passive",
+          "ambient",
+          () => Effect.succeed("unexpected"),
+        )
+        expect(Option.isNone(observed)).toBe(true)
+        yield* TestClock.adjust("1 second")
+        yield* Effect.yieldNow()
+        expect(yield* residentCount(runtime)).toBe(0)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("clears a failed startup so a later request can retry", async () => {
+    const program = Effect.gen(function* () {
+      const calls = yield* Ref.make(0)
+      const failure = new SessionOperationFailed({ operation: "start", reason: "boom" })
       const layer = makeLayer({
-        factory,
-        storedSessions: [makeMeta("session-d", "/repo", "visible")],
+        factory: {
+          createSession: () =>
+            Ref.updateAndGet(calls, (value) => value + 1).pipe(
+              Effect.flatMap((call) => (call === 1 ? Effect.fail(failure) : Effect.succeed(idleSession))),
+            ),
+        },
+      })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        const failed = yield* Effect.either(
+          runtime.withSessionRequest(request("retry"), "first", () => Effect.void),
+        )
+        expect(Either.isLeft(failed)).toBe(true)
+        expect(yield* runtime.withSessionRequest(request("retry"), "second", (_, generation) => Effect.succeed(generation))).toBe(2)
+        expect(yield* Ref.get(calls)).toBe(2)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("clears an interrupted startup so a later request can retry", async () => {
+    const program = Effect.gen(function* () {
+      const calls = yield* Ref.make(0)
+      const entered = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const layer = makeLayer({
+        factory: {
+          createSession: () =>
+            Ref.updateAndGet(calls, (value) => value + 1).pipe(
+              Effect.flatMap((call) =>
+                call === 1
+                  ? Deferred.succeed(entered, undefined).pipe(
+                      Effect.zipRight(Deferred.await(resume)),
+                      Effect.as(idleSession),
+                    )
+                  : Effect.succeed(idleSession),
+              ),
+            ),
+        },
       })
 
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        const request: RuntimeStartRequest = {
-          sessionId: "session-d",
-          cwd: "/repo",
-          options: normalizeSessionRuntimeOptions(),
-          visibility: "visible",
-          scope: Option.none(),
-        }
-
-        const first = yield* runtime.getOrStart(request)
-        const disposing = yield* Effect.fork(runtime.dispose("session-d"))
-        yield* Deferred.await(closeStarted)
-
-        const restarted = yield* runtime.requireOrStart("session-d")
-        const calls = yield* Ref.get(createCalls)
-
-        expect(first.session).toBe(firstSession)
-        expect(restarted.session).toBe(secondSession)
-        expect(calls).toBe(2)
-
-        yield* Deferred.succeed(releaseClose, undefined)
-        yield* Fiber.join(disposing)
+        const first = yield* runtime
+          .withSessionRequest(request("interrupted"), "first", () => Effect.void)
+          .pipe(Effect.fork)
+        yield* Deferred.await(entered)
+        yield* Fiber.interrupt(first)
+        expect(
+          yield* runtime.withSessionRequest(
+            request("interrupted"),
+            "second",
+            (_, generation) => Effect.succeed(generation),
+          ),
+        ).toBe(2)
+        expect(yield* Ref.get(calls)).toBe(2)
       }).pipe(Effect.provide(layer))
-    }))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("runs generation finalizers before publishing retirement", async () => {
+    const program = Effect.gen(function* () {
+      const finalized = yield* Ref.make(false)
+      const layer = makeLayer({
+        factory: {
+          createSession: ({ scope }) =>
+            Scope.addFinalizer(scope, Ref.set(finalized, true)).pipe(Effect.as(idleSession)),
+        },
+      })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        yield* runtime.withSessionRequest(request("finalize"), "use", () => Effect.void)
+        yield* runtime.dispose("finalize")
+        expect(yield* Ref.get(finalized)).toBe(true)
+        expect(yield* residentCount(runtime)).toBe(0)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("closes a working session when the runtime scope closes", async () => {
+    const finalized = await Effect.runPromise(
+      Effect.gen(function* () {
+        const finalized = yield* Ref.make(false)
+        const workingSession: CodingAgentSession = {
+          ...idleSession,
+          state: {
+            ...idleSession.state,
+            work: {
+              get: () => Effect.succeed({ _tag: "Working" as const, workerCount: 1 }),
+              subscribe: Stream.never,
+            },
+          },
+        }
+        const layer = makeLayer({
+          factory: {
+            createSession: ({ scope }) =>
+              Scope.addFinalizer(scope, Ref.set(finalized, true)).pipe(Effect.as(workingSession)),
+          },
+        })
+
+        yield* Effect.gen(function* () {
+          const runtime = yield* AgentRuntime
+          yield* runtime.withSessionRequest(request("working-shutdown"), "start", () => Effect.void)
+        }).pipe(Effect.provide(layer))
+
+        return yield* Ref.get(finalized)
+      }),
+    )
+
+    expect(finalized).toBe(true)
+  })
+
+  it("excludes new admission while deletion drains and finalizes the resident generation", async () => {
+    const program = Effect.gen(function* () {
+      const useEntered = yield* Deferred.make<void>()
+      const releaseUse = yield* Deferred.make<void>()
+      const removalEntered = yield* Deferred.make<void>()
+      const allowRemoval = yield* Deferred.make<void>()
+      const finalized = yield* Ref.make(false)
+      const finalizedBeforeRemoval = yield* Ref.make(false)
+      const layer = makeLayer({
+        factory: {
+          createSession: ({ scope }) =>
+            Scope.addFinalizer(scope, Ref.set(finalized, true)).pipe(Effect.as(idleSession)),
+        },
+        storedSessions: [makeMeta("delete")],
+      })
+
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        const inFlight = yield* runtime
+          .withSession("delete", "in-flight", () =>
+            Deferred.succeed(useEntered, undefined).pipe(
+              Effect.zipRight(Deferred.await(releaseUse)),
+            ),
+          )
+          .pipe(Effect.fork)
+        yield* Deferred.await(useEntered)
+        const deletion = yield* runtime
+          .deleteSession(
+            "delete",
+            Ref.get(finalized).pipe(
+              Effect.tap((value) => Ref.set(finalizedBeforeRemoval, value)),
+              Effect.zipRight(Deferred.succeed(removalEntered, undefined)),
+              Effect.zipRight(Deferred.await(allowRemoval)),
+            ),
+          )
+          .pipe(Effect.fork)
+        yield* Effect.yieldNow()
+
+        const rejected = yield* Effect.either(
+          runtime.withSession("delete", "too-late", () => Effect.void),
+        )
+        expect(Either.isLeft(rejected)).toBe(true)
+        if (Either.isLeft(rejected)) expect(rejected.left._tag).toBe("SessionOperationFailed")
+
+        yield* Deferred.succeed(releaseUse, undefined)
+        yield* Fiber.join(inFlight)
+        yield* Deferred.await(removalEntered)
+        expect(yield* Ref.get(finalizedBeforeRemoval)).toBe(true)
+        expect(yield* residentCount(runtime)).toBe(0)
+        yield* Deferred.succeed(allowRemoval, undefined)
+        yield* Fiber.join(deletion)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
   })
 })

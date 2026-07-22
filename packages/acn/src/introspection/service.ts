@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Ref, Stream } from "effect"
+import { Context, Effect, Layer, Option, Stream } from "effect"
 import { SessionNotFound, SessionOperationFailed, type SessionError } from "@magnitudedev/protocol"
 import type { AgentIntrospection } from "@magnitudedev/agent"
 import { AgentRuntime } from "../agent-runtime"
@@ -29,14 +29,14 @@ export class AcnIntrospector extends Context.Tag("AcnIntrospector")<
 >() {}
 
 const runtimeEntryToSession = (entry: {
-  readonly id: string
+  readonly sessionId: string
   readonly title: string
   readonly cwd: string
   readonly scratchpadPath: string
   readonly createdAt: number
   readonly updatedAt: number
 }): AcnIntrospectionSession => ({
-  sessionId: entry.id,
+  sessionId: entry.sessionId,
   title: entry.title,
   cwd: entry.cwd,
   scratchpadPath: entry.scratchpadPath,
@@ -54,113 +54,100 @@ export const AcnIntrospectorLive: Layer.Layer<
   AcnIntrospector,
   never,
   AgentRuntime | AcnActivityTracker
-> =
-  Layer.effect(
-    AcnIntrospector,
-    Effect.gen(function* () {
-      const runtime = yield* AgentRuntime
-      const activity = yield* AcnActivityTracker
-      const displayViewIntrospector = yield* Effect.serviceOption(AcnDisplayViewIntrospector)
+> = Layer.effect(
+  AcnIntrospector,
+  Effect.gen(function* () {
+    const runtime = yield* AgentRuntime
+    const activity = yield* AcnActivityTracker
+    const displayViewIntrospector = yield* Effect.serviceOption(AcnDisplayViewIntrospector)
 
-      const currentDisplayViews = (sessionId: string) =>
-        Option.match(displayViewIntrospector, {
-          onNone: () => Effect.succeed([]),
-          onSome: (introspector) => introspector.current(sessionId),
-        })
+    const currentDisplayViews = (sessionId: string) =>
+      Option.match(displayViewIntrospector, {
+        onNone: () => Effect.succeed([]),
+        onSome: (introspector) => introspector.current(sessionId),
+      })
 
-      const displayViewChanges = (sessionId: string): Stream.Stream<void> =>
-        Option.match(displayViewIntrospector, {
-          onNone: () => Stream.never as Stream.Stream<void>,
-          onSome: (introspector) => introspector.changes(sessionId),
-        })
+    const displayViewChanges = (sessionId: string): Stream.Stream<void> =>
+      Option.match(displayViewIntrospector, {
+        onNone: () => Stream.never as Stream.Stream<void>,
+        onSome: (introspector) => introspector.changes(sessionId),
+      })
 
-      const currentSessionPayload = (
-        session: AcnIntrospectionSession,
-        introspection: AgentIntrospection | null,
-      ) =>
-        Effect.gen(function* () {
-          return {
-            schemaVersion: 1,
-            timestamp: Date.now(),
-            session,
-            activity: yield* activity.current,
-            displayViews: yield* currentDisplayViews(session.sessionId),
-            introspection,
-          } satisfies AcnSessionIntrospection
-        })
-
-      const currentOverview = Effect.gen(function* () {
-        const entries = yield* runtime.getAllEntries()
+    const currentSessionPayload = (
+      session: AcnIntrospectionSession,
+      introspection: AgentIntrospection | null,
+    ) =>
+      Effect.gen(function* () {
         return {
           schemaVersion: 1,
           timestamp: Date.now(),
-          sessions: entries.map(runtimeEntryToSession),
+          session,
           activity: yield* activity.current,
-        } satisfies AcnIntrospectionOverview
+          displayViews: yield* currentDisplayViews(session.sessionId),
+          introspection,
+        } satisfies AcnSessionIntrospection
       })
 
-      const sessionChanges = (
-        sessionId: string,
-        forkId: string | null = null,
-      ): Stream.Stream<AcnSessionIntrospection, SessionError> =>
-        Stream.unwrap(
-          Effect.gen(function* () {
-            const entry = yield* runtime.getLive(sessionId)
-            if (!entry) return yield* new SessionNotFound({ sessionId })
-            const session = runtimeEntryToSession(entry)
-            const latestIntrospection = yield* Ref.make<AgentIntrospection | null>(null)
-
-            const sampleLatest = Ref.get(latestIntrospection).pipe(
-              Effect.flatMap((introspection) =>
-                introspection
-                  ? currentSessionPayload(session, introspection).pipe(Effect.map(Option.some))
-                  : Effect.succeed(Option.none<AcnSessionIntrospection>())
-              ),
-            )
-
-            const agentChanges = entry.session.subscribeIntrospection(forkId).pipe(
-              Stream.mapError((cause) => introspectionFailure(sessionId, cause)),
-              Stream.mapEffect((introspection) =>
-                Ref.set(latestIntrospection, introspection).pipe(
-                  Effect.zipRight(currentSessionPayload(session, introspection)),
-                )
-              ),
-            )
-
-            const displayChanges = displayViewChanges(sessionId).pipe(
-              Stream.mapEffect(() => sampleLatest),
-              Stream.filterMap((payload) => payload),
-            )
-
-            const activityChanges = activity.changes.pipe(
-              Stream.mapEffect(() => sampleLatest),
-              Stream.filterMap((payload) => payload),
-            )
-
-            return Stream.mergeAll(
-              [agentChanges, displayChanges, activityChanges],
-              { concurrency: "unbounded" },
-            )
-          })
-        )
-
-      const currentSession = Effect.fn("acn.introspector.current-session")(function* (
-        sessionId: string,
-        forkId: string | null = null,
-      ) {
-        const introspection = yield* sessionChanges(sessionId, forkId).pipe(
-          Stream.take(1),
-          Stream.runHead,
-          Effect.map((option) => Option.getOrNull(option)),
-        )
-        if (introspection) return introspection
-        return yield* introspectionFailure(sessionId, "introspection stream ended before emitting")
-      })
-
+    const currentOverview = Effect.gen(function* () {
+      const entries = yield* runtime.residentSessions
       return {
-        currentOverview,
-        currentSession,
-        sessionChanges,
-      } satisfies AcnIntrospectorApi
-    }),
-  )
+        schemaVersion: 1,
+        timestamp: Date.now(),
+        sessions: entries.map(runtimeEntryToSession),
+        activity: yield* activity.current,
+      } satisfies AcnIntrospectionOverview
+    })
+
+    const sampleSession = Effect.fn("acn.introspector.sample-session")(function* (
+      sessionId: string,
+      forkId: string | null,
+    ) {
+      const resident = (yield* runtime.residentSessions).find(
+        (candidate) => candidate.sessionId === sessionId,
+      )
+      if (!resident) return yield* new SessionNotFound({ sessionId })
+
+      // Introspection is ambient. It may join an already-busy generation to
+      // obtain a fresh agent snapshot, but it never creates or prolongs one.
+      const sampled = yield* runtime.tryWithBusyResident(
+        sessionId,
+        "introspection-sample",
+        (entry) =>
+          entry.session.subscribeIntrospection(forkId).pipe(
+            Stream.take(1),
+            Stream.runHead,
+            Effect.map((value) => Option.getOrNull(value)),
+            Effect.mapError((cause) => introspectionFailure(sessionId, cause)),
+          ),
+      )
+      return yield* currentSessionPayload(
+        runtimeEntryToSession(resident),
+        Option.getOrNull(sampled),
+      )
+    })
+
+    const sessionChanges = (
+      sessionId: string,
+      forkId: string | null = null,
+    ): Stream.Stream<AcnSessionIntrospection, SessionError> =>
+      Stream.concat(
+        Stream.fromEffect(sampleSession(sessionId, forkId)),
+        Stream.merge(runtime.changes, displayViewChanges(sessionId)).pipe(
+          Stream.mapEffect(() => sampleSession(sessionId, forkId)),
+        ),
+      )
+
+    const currentSession = Effect.fn("acn.introspector.current-session")(function* (
+      sessionId: string,
+      forkId: string | null = null,
+    ) {
+      return yield* sampleSession(sessionId, forkId)
+    })
+
+    return {
+      currentOverview,
+      currentSession,
+      sessionChanges,
+    } satisfies AcnIntrospectorApi
+  }),
+)

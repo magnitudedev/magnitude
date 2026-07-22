@@ -52,6 +52,8 @@ export interface DetachedShellRegistryService {
   readonly killAll: (forkId: string | null) => Effect.Effect<void>
   readonly interruptAll: (forkId: string | null) => Effect.Effect<void>
   readonly bindBus: (bus: WorkerBusService<AppEvent>) => Effect.Effect<void>
+  readonly activeCount: Effect.Effect<number>
+  readonly changes: Stream.Stream<number>
 }
 
 export class DetachedShellRegistry extends Context.Tag('DetachedShellRegistry')<

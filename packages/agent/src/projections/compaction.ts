@@ -263,6 +263,16 @@ export const CompactionProjection = Projection.defineForked<AppEvent>()({
       return nextState
     },
 
+    compaction_declined: ({ event, fork, emit }) => {
+      if (fork._tag !== 'idle') return fork
+      const nextState = withAmbient(fork, {
+        contextLimitBlocked: false,
+        shouldCompact: false,
+      })
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
+    },
+
     interrupt: ({ event, fork, emit }) => {
       if (fork._tag === 'idle') {
         if (!fork.contextLimitBlocked) return fork

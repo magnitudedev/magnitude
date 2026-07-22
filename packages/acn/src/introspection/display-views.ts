@@ -17,7 +17,6 @@ export interface AcnDisplayViewIntrospectorApi {
   readonly closeStream: (sessionId: string, viewId: string) => Effect.Effect<void>
   readonly setShape: (sessionId: string, viewId: string, shape: DisplayViewShape) => Effect.Effect<void>
   readonly resync: (sessionId: string, viewId: string) => Effect.Effect<void>
-  readonly closeView: (sessionId: string, viewId: string) => Effect.Effect<void>
   readonly current: (sessionId?: string | null) => Effect.Effect<readonly AcnDisplayViewIntrospection[]>
   readonly changes: (sessionId?: string | null) => Stream.Stream<void>
 }
@@ -27,10 +26,6 @@ export class AcnDisplayViewIntrospector extends Context.Tag("AcnDisplayViewIntro
   AcnDisplayViewIntrospectorApi
 >() {}
 
-interface DisplayViewIntrospectionState extends AcnDisplayViewIntrospection {
-  readonly retainShape: boolean
-}
-
 const now = () => Date.now()
 const viewKey = (sessionId: string, viewId: string) => `${sessionId}\u0000${viewId}`
 
@@ -38,7 +33,7 @@ const emptyView = (
   sessionId: string,
   viewId: string,
   timestamp: number,
-): DisplayViewIntrospectionState => ({
+): AcnDisplayViewIntrospection => ({
   sessionId,
   viewId,
   subscriberCount: 0,
@@ -47,31 +42,25 @@ const emptyView = (
   shape: null,
   shapeUpdatedAt: null,
   resyncCount: 0,
-  retainShape: false,
 })
 
-const shouldKeep = (view: DisplayViewIntrospectionState): boolean =>
-  view.subscriberCount > 0 || view.retainShape
-
-const toIntrospection = ({
-  retainShape: _retainShape,
-  ...view
-}: DisplayViewIntrospectionState): AcnDisplayViewIntrospection => view
+const shouldKeep = (view: AcnDisplayViewIntrospection): boolean =>
+  view.subscriberCount > 0 || view.shape !== null
 
 export const AcnDisplayViewIntrospectorLive: Layer.Layer<AcnDisplayViewIntrospector> =
   Layer.effect(
     AcnDisplayViewIntrospector,
     Effect.gen(function* () {
-      const state = yield* Ref.make<ReadonlyMap<string, DisplayViewIntrospectionState>>(new Map())
+      const state = yield* Ref.make<ReadonlyMap<string, AcnDisplayViewIntrospection>>(new Map())
       const changes = yield* PubSub.unbounded<string>()
 
       const modifyView = (
         sessionId: string,
         viewId: string,
         f: (
-          view: DisplayViewIntrospectionState | null,
+          view: AcnDisplayViewIntrospection | null,
           timestamp: number,
-        ) => DisplayViewIntrospectionState | null,
+        ) => AcnDisplayViewIntrospection | null,
       ) =>
         Ref.update(state, (current) => {
           const timestamp = now()
@@ -102,10 +91,10 @@ export const AcnDisplayViewIntrospectorLive: Layer.Layer<AcnDisplayViewIntrospec
           modifyView(sessionId, viewId, (view, timestamp) => {
             if (!view) return null
             const subscriberCount = Math.max(0, view.subscriberCount - 1)
+            if (subscriberCount === 0) return null
             return {
               ...view,
               subscriberCount,
-              shape: subscriberCount > 0 || view.retainShape ? view.shape : null,
               lastActivityAt: timestamp,
             }
           }),
@@ -115,7 +104,6 @@ export const AcnDisplayViewIntrospectorLive: Layer.Layer<AcnDisplayViewIntrospec
             shape,
             shapeUpdatedAt: timestamp,
             lastActivityAt: timestamp,
-            retainShape: true,
           })),
         resync: (sessionId, viewId) =>
           modifyView(sessionId, viewId, (view, timestamp) =>
@@ -127,8 +115,6 @@ export const AcnDisplayViewIntrospectorLive: Layer.Layer<AcnDisplayViewIntrospec
                 }
               : null
           ),
-        closeView: (sessionId, viewId) =>
-          modifyView(sessionId, viewId, () => null),
         current: (sessionId) =>
           Ref.get(state).pipe(
             Effect.map((current) =>
@@ -138,8 +124,7 @@ export const AcnDisplayViewIntrospectorLive: Layer.Layer<AcnDisplayViewIntrospec
                   left.sessionId === right.sessionId
                     ? left.viewId.localeCompare(right.viewId)
                     : left.sessionId.localeCompare(right.sessionId)
-                )
-                .map(toIntrospection),
+                ),
             ),
           ),
         changes: (sessionId) =>

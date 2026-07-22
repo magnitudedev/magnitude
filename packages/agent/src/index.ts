@@ -14,6 +14,7 @@ export {
   type CodingAgentSession,
   type CodingAgentClient,
 } from './coding-agent'
+export { deriveSessionWorkStatus, type SessionWorkSnapshot, type SessionWorkStatus } from './session-work-status'
 export type { CreateClientOptions } from './coding-agent'
 
 // Errors

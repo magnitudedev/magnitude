@@ -1919,6 +1919,12 @@ export const ResponseFormatRequest = S.Union(
 export type ResponseFormatRequest = S.Schema.Type<typeof ResponseFormatRequest>
 export type ResponseFormatRequestEncoded = S.Schema.Encoded<typeof ResponseFormatRequest>
 
+export const RuntimeChangesResponse = S.Struct({
+  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type RuntimeChangesResponse = S.Schema.Type<typeof RuntimeChangesResponse>
+export type RuntimeChangesResponseEncoded = S.Schema.Encoded<typeof RuntimeChangesResponse>
+
 export const ServingConfigurationSchema = S.Struct({
   profile: S.suspend((): S.Schema<ServingProfileSchema, ServingProfileSchemaEncoded> => ServingProfileSchema),
 })

@@ -5,7 +5,7 @@
  */
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { DaemonSpawnerTag, makeRemoteDaemonSpawner, makeRecoveringProtocolLayer } from "@magnitudedev/sdk"
+import { DaemonSpawnerTag, makeAcnJitRuntime, makeRemoteDaemonSpawner } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 
 // Experimental File System Access API — only available in Chromium browsers.
@@ -112,11 +112,10 @@ export async function createBrowserPlatform(proxyUrl: string = ""): Promise<Plat
   const spawner = await Effect.runPromise(
     makeRemoteDaemonSpawner(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
   )
-  const protocolLayer = (await Effect.runPromise(
-    makeRecoveringProtocolLayer().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
-  )).pipe(
-    Layer.provide(FetchHttpClient.layer),
+  const acn = await Effect.runPromise(
+    makeAcnJitRuntime().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
   )
+  const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
   return {
     id: "web",
     protocolLayer,

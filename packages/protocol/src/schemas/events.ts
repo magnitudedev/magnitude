@@ -65,29 +65,3 @@ export const StreamEvent = Schema.Union(
   DisplayViewRestoreQueuedMessagesEvent
 )
 export type StreamEvent = Schema.Schema.Type<typeof StreamEvent>
-
-/**
- * Transport-level liveness heartbeat. Every long-lived server stream emits one
- * at a fixed cadence so clients can distinguish "daemon dead" from "no events".
- * The SDK filters heartbeats out before events reach consumers — `StreamEvent`
- * (without heartbeat) stays the consumer-facing type; the `*Wire*` unions are
- * what actually crosses the RPC boundary.
- */
-export const StreamHeartbeat = Schema.TaggedStruct("heartbeat", {})
-export type StreamHeartbeat = Schema.Schema.Type<typeof StreamHeartbeat>
-
-export const StreamWireEvent = Schema.Union(
-  DisplayViewStateEvent,
-  DisplayViewPatchEvent,
-  DisplayViewRestoreQueuedMessagesEvent,
-  StreamHeartbeat
-)
-export type StreamWireEvent = Schema.Schema.Type<typeof StreamWireEvent>
-
-/** Cadence at which the ACN emits heartbeats on open streams. */
-export const STREAM_HEARTBEAT_INTERVAL_MS = 5000
-/**
- * A client that sees no stream data (heartbeat or otherwise) for this long
- * treats the stream as dead and recovers. 3× the heartbeat cadence.
- */
-export const STREAM_LIVENESS_TIMEOUT_MS = 15000

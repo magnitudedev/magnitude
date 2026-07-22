@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -13,8 +14,8 @@ use futures_util::{
     stream::{BoxStream, StreamExt},
 };
 use icn_api::{
-    AppState, BackendRegistry, FakeBackend, ModelLoadEvent, ModelLoadStage, RuntimeController,
-    ServerIdentity, app,
+    AppState, BackendMutationGuard, BackendRegistry, FakeBackend, ModelLoadEvent, ModelLoadStage,
+    RuntimeController, ServerIdentity, app,
 };
 use icn_contracts::{
     CacheType, CompletionBackend, ComponentRole, ExecutionConfig, ExecutionIntent, FlashAttention,
@@ -32,6 +33,8 @@ use tracing::Instrument as _;
 
 mod build_identity;
 mod telemetry;
+
+const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -113,7 +116,6 @@ struct ResidentTarget {
 
 #[derive(Debug, Clone)]
 struct RuntimeState {
-    generation: u64,
     resident: Option<ResidentTarget>,
 }
 
@@ -1011,11 +1013,7 @@ impl NativeRuntimeController {
             "runtime model operation failed"
         );
         if failure.runtime_lost {
-            let generation = self.backends.generation();
-            *self.state.write().await = RuntimeState {
-                generation,
-                resident: None,
-            };
+            *self.state.write().await = RuntimeState { resident: None };
         }
         let _ = Self::emit(
             sender,
@@ -1051,7 +1049,10 @@ impl NativeRuntimeController {
             )
             .await
         {
-            Ok(()) => RuntimeTransitionFailure::new(source, failure),
+            Ok(()) => {
+                self.backends.notify_runtime_changed();
+                RuntimeTransitionFailure::new(source, failure)
+            }
             Err(error) => {
                 let message = error.to_string();
                 RuntimeTransitionFailure::new(
@@ -1138,9 +1139,11 @@ impl NativeRuntimeController {
             .as_ref()
             .is_some_and(|resident| resident.model_id == model_id && resident.profile == profile)
         {
-            return Ok(RuntimeTransitionReady {
-                generation: existing.generation,
-            });
+            if let Some(lease) = self.backends.lease() {
+                let generation = lease.generation();
+                drop(lease);
+                return Ok(RuntimeTransitionReady { generation });
+            }
         };
         let _backend_mutation = self.backends.begin_mutation().await;
 
@@ -1160,11 +1163,7 @@ impl NativeRuntimeController {
         };
         progress.emit(ModelLoadStage::Assessing, None);
 
-        let generation = self.backends.generation();
-        *self.state.write().await = RuntimeState {
-            generation,
-            resident: None,
-        };
+        *self.state.write().await = RuntimeState { resident: None };
 
         progress.emit(ModelLoadStage::Unloading, None);
         if let Some(resident) = &existing.resident
@@ -1253,30 +1252,30 @@ impl NativeRuntimeController {
                         HardwareAssessment::NotAssessed { .. } => ("planner_failed", true),
                         HardwareAssessment::Fits { .. } => ("planner_invariant", false),
                     },
-                    ModelLoadError::MemoryAttribution(_) => {
-                        ("memory_attribution_failed", true)
-                    }
+                    ModelLoadError::MemoryAttribution(_) => ("memory_attribution_failed", true),
                     ModelLoadError::Backend(_) => ("backend_load_failed", true),
                 };
                 let source = InventoryError::Internal(error.to_string());
-                let failure = self.record_load_failure(
-                    &resolved.model.id,
-                    LoadStage::Opening,
-                    source,
-                    RuntimeFailure::new(code, error.to_string(), retryable, true),
-                )
-                .await;
+                let failure = self
+                    .record_load_failure(
+                        &resolved.model.id,
+                        LoadStage::Opening,
+                        source,
+                        RuntimeFailure::new(code, error.to_string(), retryable, true),
+                    )
+                    .await;
                 return Err(failure);
             }
             Err(error) => {
                 let source = InventoryError::Internal(error.to_string());
-                let failure = self.record_load_failure(
-                    &resolved.model.id,
-                    LoadStage::Opening,
-                    source,
-                    RuntimeFailure::new("load_task_failed", error.to_string(), true, true),
-                )
-                .await;
+                let failure = self
+                    .record_load_failure(
+                        &resolved.model.id,
+                        LoadStage::Opening,
+                        source,
+                        RuntimeFailure::new("load_task_failed", error.to_string(), true, true),
+                    )
+                    .await;
                 return Err(failure);
             }
         };
@@ -1285,13 +1284,14 @@ impl NativeRuntimeController {
             Ok(properties) => properties,
             Err(error) => {
                 let source = InventoryError::Internal(error.to_string());
-                let failure = self.record_load_failure(
-                    &resolved.model.id,
-                    LoadStage::Warming,
-                    source,
-                    RuntimeFailure::new("verification_failed", error.to_string(), true, true),
-                )
-                .await;
+                let failure = self
+                    .record_load_failure(
+                        &resolved.model.id,
+                        LoadStage::Warming,
+                        source,
+                        RuntimeFailure::new("verification_failed", error.to_string(), true, true),
+                    )
+                    .await;
                 return Err(failure);
             }
         };
@@ -1327,7 +1327,6 @@ impl NativeRuntimeController {
             });
         }
         let state = RuntimeState {
-            generation,
             resident: Some(ResidentTarget {
                 model_id: model_id.clone(),
                 profile,
@@ -1353,6 +1352,121 @@ impl NativeRuntimeController {
             parallel_sequences: configuration.profile.parallel_sequences,
         })
     }
+
+    async fn unload_resident_with_admission_closed(
+        &self,
+        model_id: &str,
+        _backend_mutation: BackendMutationGuard,
+    ) -> Result<bool, InventoryError> {
+        let previous = self.state.read().await.clone();
+        let resident = previous
+            .resident
+            .as_ref()
+            .filter(|resident| resident.model_id == model_id)
+            .and_then(|resident| ModelId::parse(resident.model_id.clone()).ok());
+        let Some(id) = resident else {
+            return Ok(false);
+        };
+
+        let load_id = format!(
+            "runtime-{}",
+            self.next_operation.fetch_add(1, Ordering::Relaxed)
+        );
+        self.inventory
+            .update_residency(
+                &id,
+                ModelResidency::Unloading {
+                    load_id,
+                    started_at: unix_timestamp(),
+                },
+            )
+            .await?;
+
+        if let Ok(mut slot) = self.native_executor.write() {
+            *slot = None;
+        }
+        self.backends.clear();
+        *self.state.write().await = RuntimeState { resident: None };
+        self.inventory
+            .update_residency(&id, ModelResidency::NotResident)
+            .await?;
+        self.backends.notify_runtime_changed();
+        Ok(true)
+    }
+
+    async fn unload_resident_locked(&self, model_id: &str) -> Result<bool, InventoryError> {
+        let backend_mutation = self.backends.begin_mutation().await;
+        self.unload_resident_with_admission_closed(model_id, backend_mutation)
+            .await
+    }
+
+    async fn unload_if_idle(
+        &self,
+        generation: u64,
+        activity_revision: u64,
+        idle_timeout: Duration,
+    ) -> Result<bool, InventoryError> {
+        let _guard = self.mutation.lock().await;
+        let Some(backend_mutation) =
+            self.backends
+                .try_begin_idle_mutation(generation, activity_revision, idle_timeout)
+        else {
+            return Ok(false);
+        };
+        let Some(model_id) = self
+            .state
+            .read()
+            .await
+            .resident
+            .as_ref()
+            .map(|resident| resident.model_id.clone())
+        else {
+            return Ok(false);
+        };
+        self.unload_resident_with_admission_closed(&model_id, backend_mutation)
+            .await
+    }
+
+    async fn run_idle_unloader(self: Arc<Self>, idle_timeout: Duration) {
+        loop {
+            let activity_revision = self.backends.activity_revision();
+            let generation = self.backends.generation();
+            let resident = self.state.read().await.resident.is_some();
+            if !resident {
+                self.backends
+                    .activity_changed_since(activity_revision)
+                    .await;
+                continue;
+            }
+            if self.backends.active_leases() > 0 {
+                self.backends
+                    .activity_changed_since(activity_revision)
+                    .await;
+                continue;
+            }
+
+            let deadline = self.backends.idle_since() + idle_timeout;
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = self.backends.activity_changed_since(activity_revision) => continue,
+            }
+
+            match self
+                .unload_if_idle(generation, activity_revision, idle_timeout)
+                .await
+            {
+                Ok(true) => tracing::info!(
+                    idle_timeout_seconds = idle_timeout.as_secs(),
+                    "automatically unloaded idle runtime model"
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to unload idle runtime model");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
 }
 
 impl RuntimeController for NativeRuntimeController {
@@ -1375,11 +1489,7 @@ impl RuntimeController for NativeRuntimeController {
                     operation_id: operation_id.clone(),
                     model_id: model_id.clone(),
                 };
-                match runtime
-                    .clone()
-                    .perform_transition(progress)
-                    .await
-                {
+                match runtime.clone().perform_transition(progress).await {
                     Ok(ready) => {
                         let _ = Self::emit(
                             &failure_sender,
@@ -1461,43 +1571,7 @@ impl RuntimeController for NativeRuntimeController {
     fn unload(&self, model_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
         Box::pin(async move {
             let _guard = self.mutation.lock().await;
-            let previous = self.state.read().await.clone();
-            let resident = previous
-                .resident
-                .as_ref()
-                .filter(|resident| resident.model_id == model_id)
-                .and_then(|resident| ModelId::parse(resident.model_id.clone()).ok());
-            let Some(id) = resident else {
-                return Ok(());
-            };
-            {
-                let load_id = format!(
-                    "runtime-{}",
-                    self.next_operation.fetch_add(1, Ordering::Relaxed)
-                );
-                self.inventory
-                    .update_residency(
-                        &id,
-                        ModelResidency::Unloading {
-                            load_id,
-                            started_at: unix_timestamp(),
-                        },
-                    )
-                    .await?;
-            }
-            let _backend_mutation = self.backends.begin_mutation().await;
-            if let Ok(mut slot) = self.native_executor.write() {
-                *slot = None;
-            }
-            let generation = self.backends.clear();
-            self.inventory
-                .update_residency(&id, ModelResidency::NotResident)
-                .await?;
-            let state = RuntimeState {
-                generation,
-                resident: None,
-            };
-            *self.state.write().await = state.clone();
+            self.unload_resident_locked(&model_id).await?;
             Ok(())
         })
     }
@@ -1579,11 +1653,11 @@ async fn main() -> anyhow::Result<()> {
                     native_backend,
                     native_executor_slot,
                     plan_defaults,
-                    RuntimeState {
-                        generation: backends.generation(),
-                        resident: None,
-                    },
+                    RuntimeState { resident: None },
                 ))
+            });
+            let idle_unloader = runtime.as_ref().map(|runtime| {
+                tokio::spawn(Arc::clone(runtime).run_idle_unloader(MODEL_IDLE_TIMEOUT))
             });
             let mut state = AppState::model_free(backends)
                 .with_inventory(inventory)
@@ -1626,9 +1700,14 @@ async fn main() -> anyhow::Result<()> {
                     .make_span_with(telemetry::http_request_span)
                     .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
             );
-            axum::serve(listener, app)
+            let serve_result = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal(parent_pid))
-                .await?;
+                .await;
+            if let Some(task) = idle_unloader {
+                task.abort();
+                let _ = task.await;
+            }
+            serve_result?;
             tracing::info!("ICN server stopped");
         }
         Command::Doctor => println!("ICN runtime and native backend loaded successfully"),
@@ -1649,7 +1728,32 @@ async fn shutdown_signal(parent_pid: Option<u32>) {
     tokio::select! {
         _ = interrupt_signal() => {},
         _ = parent_watchdog(parent_pid), if parent_pid.is_some() => {},
+        _ = parent_stdin_eof(), if parent_pid.is_some() => {},
     }
+}
+
+async fn parent_stdin_eof() {
+    // Tokio implements stdin reads on its blocking pool. A pending read then
+    // prevents Runtime::drop from completing during an ordinary SIGTERM while
+    // the parent still owns the pipe, creating a parent/child shutdown cycle.
+    // A detached OS thread has the desired semantics: EOF wakes the async
+    // watchdog after abrupt parent death, while orderly process exit does not
+    // wait for the read to finish.
+    let (eof, observed) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+
+        let mut stdin = std::io::stdin().lock();
+        let mut buffer = [0_u8; 1];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = eof.send(());
+    });
+    let _ = observed.await;
 }
 
 #[cfg(unix)]

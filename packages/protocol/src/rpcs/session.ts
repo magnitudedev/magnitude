@@ -3,13 +3,14 @@ import { Schema } from "effect"
 import {
   CreateSessionInitial,
   CreateSessionResult,
-  ActiveSessionStatusesWireEvent,
+  ActiveSessionStatuses,
   ListSessionsResult,
   PreloadSessionResult,
   SessionCwdSummary,
   SessionMetadata,
   SessionOptions,
 } from "../schemas/session"
+import { makeAcnSubscriptionRpc } from "./subscription"
 import { SessionError } from "../errors"
 
 const ListSessionsPayloadFields = {
@@ -31,11 +32,10 @@ export const ListSessionCwds = Rpc.make("ListSessionCwds", {
   error: SessionError
 })
 
-export const StreamActiveSessionStatuses = Rpc.make("StreamActiveSessionStatuses", {
+export const StreamActiveSessionStatuses = makeAcnSubscriptionRpc("StreamActiveSessionStatuses", {
   payload: Schema.Struct({}),
-  success: ActiveSessionStatusesWireEvent,
+  success: ActiveSessionStatuses,
   error: SessionError,
-  stream: true
 })
 
 export const CreateSession = Rpc.make("CreateSession", {

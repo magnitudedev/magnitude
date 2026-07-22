@@ -43,6 +43,8 @@ Multiple design documents may apply to the same path. In that case all matching 
 
 `AGENTS.md` files are repository instructions and do not require `applies_to` front matter.
 
+applies_to should have no more than ~10 patterns. If the number of patterns becomes large consolidate to broader patterns even if less precise.
+
 ## Required workflow
 
 Before changing a file, identify and read every design document whose `applies_to` pattern matches that project-root-relative path. Follow all applicable invariants and acceptance criteria.
