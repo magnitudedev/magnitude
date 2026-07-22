@@ -1,5 +1,5 @@
 export * from "./acn-recovering-client"
-export * from "./acn-stream-policy"
+export * from "./acn-subscription-protocol"
 export * from "./daemon-spawner"
 export * from "./errors"
 export * from "./local-daemon-spawner"

@@ -590,6 +590,14 @@ export interface CompactionFailed {
   readonly presentation: ErrorPresentation | null
 }
 
+/** A policy trigger that could not start compaction and has been consumed. */
+export interface CompactionDeclined {
+  readonly type: 'compaction_declined'
+  readonly forkId: string | null
+  readonly reason: string
+  readonly ephemeral: true
+}
+
 /** Context limit hit — LLM returned a context-length error */
 export interface ContextLimitHit {
   readonly type: 'context_limit_hit'
@@ -730,6 +738,7 @@ export type AppEvent =
   | CompactionPrepared
   | CompactionInjected
   | CompactionFailed
+  | CompactionDeclined
   | ContextLimitHit
   | ToolApproved
   | ToolRejected

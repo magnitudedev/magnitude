@@ -29,7 +29,7 @@ opentelemetry_sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util"] }
 tokio-stream.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

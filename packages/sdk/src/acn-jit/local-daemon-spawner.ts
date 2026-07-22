@@ -19,7 +19,6 @@ import { readStructuredFile } from "@magnitudedev/storage";
 import {
   AcnVersionRegistrySchema,
   type AcnRegistration,
-  versionPathSegment,
 } from "@magnitudedev/protocol";
 import {
   DaemonCrashed,
@@ -31,6 +30,7 @@ import {
 import { resolveBinaryCommand, defaultDataDir } from "../binary";
 import { SDK_VERSION } from "../version";
 import type { DaemonSpawner } from "./daemon-spawner";
+import { compareReleaseVersions } from "./release-precedence";
 
 /**
  * Function that spawns a detached process. Provided by the consumer —
@@ -76,16 +76,35 @@ const debugLog = (
     ? Effect.logDebug(message).pipe(Effect.annotateLogs(fields ?? {}))
     : Effect.void;
 
+const UPGRADE_GRACE_MS = 3_000;
+const UPGRADE_TERM_MS = 1_000;
+const UPGRADE_KILL_MS = 1_000;
+
+const awaitProcessExit = (pid: number, timeoutMs: number): Effect.Effect<boolean> => {
+  const attempts = Math.max(1, Math.ceil(timeoutMs / 25));
+  return Effect.sync(() => processIsAlive(pid)).pipe(
+    Effect.filterOrFail((alive) => !alive, () => new NoDaemon()),
+    Effect.retry({
+      schedule: Schedule.spaced("25 millis").pipe(Schedule.intersect(Schedule.recurs(attempts))),
+      while: (error) => error._tag === "NoDaemon",
+    }),
+    Effect.as(true),
+    Effect.catchTag("NoDaemon", () => Effect.succeed(false)),
+  );
+};
+
+const signalProcess = (pid: number, signal: NodeJS.Signals): Effect.Effect<void> =>
+  Effect.sync(() => process.kill(pid, signal)).pipe(Effect.catchAllCause(() => Effect.void));
+
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
-const versionDirectory = (dataDir: string, version: string): string =>
-  NodePath.join(dataDir, "acn", versionPathSegment(version));
+const acnDirectory = (dataDir: string): string => NodePath.join(dataDir, "acn");
 
-const registrationPath = (dataDir: string, version: string): string =>
-  NodePath.join(versionDirectory(dataDir, version), "registry.json");
+const registrationPath = (dataDir: string): string =>
+  NodePath.join(acnDirectory(dataDir), "registry.json");
 
-const spawnElectionPath = (dataDir: string, version: string): string =>
-  NodePath.join(versionDirectory(dataDir, version), "spawn-election");
+const spawnElectionPath = (dataDir: string): string =>
+  NodePath.join(acnDirectory(dataDir), "spawn-election");
 
 const staleSpawnElectionPath = (path: string, token: string): string =>
   `${path}.stale-${encodeURIComponent(token)}`;
@@ -139,6 +158,7 @@ const tryAcquireSpawnElection = (
   yield* fs.makeDirectory(NodePath.dirname(path), { recursive: true }).pipe(
     Effect.mapError((cause) => electionFailure("Failed to create ACN registry directory", cause)),
   );
+  yield* fs.chmod(NodePath.dirname(path), 0o700).pipe(Effect.ignore);
   const claim = { path, token: crypto.randomUUID() } satisfies SpawnElectionClaim;
   const encodedOwner = yield* Schema.encode(
     Schema.parseJson(SpawnElectionOwnerSchema),
@@ -146,7 +166,7 @@ const tryAcquireSpawnElection = (
     Effect.mapError((cause) => electionFailure("Failed to encode ACN spawn election owner", cause)),
   );
   const publicationPath = `${path}.publishing-${encodeURIComponent(claim.token)}`;
-  const acquired = yield* fs.writeFileString(publicationPath, encodedOwner).pipe(
+  const acquired = yield* fs.writeFileString(publicationPath, encodedOwner, { mode: 0o600 }).pipe(
     Effect.flatMap(() => fs.link(publicationPath, path)),
     Effect.as(true),
     Effect.catchAll((cause) => platformErrorReason(cause) === "AlreadyExists"
@@ -316,6 +336,78 @@ const probeHealth = (
     return health;
   });
 
+/**
+ * Retire a healthy ACN owned by another release and wait for the owning
+ * process to finish all scoped cleanup (including ICN reaping) before a new
+ * candidate may be spawned. The global spawn election serializes this handoff.
+ */
+const retireIncumbent = (
+  owner: AcnRegistration,
+  options: {
+    readonly dataDir: string;
+    readonly probeTimeoutMs: number;
+    readonly debug: boolean;
+  },
+  deps: { readonly fs: FileSystem; readonly client: HttpClient.HttpClient }
+): Effect.Effect<boolean, DaemonError, never> =>
+  Effect.gen(function* () {
+    const current = yield* readRegistration(registrationPath(options.dataDir), deps.fs);
+    if (Option.isNone(current)) return false;
+    const registration = current.value;
+    if (
+      registration.id !== owner.id ||
+      registration.pid !== owner.pid ||
+      registration.version !== owner.version ||
+      registration.url !== owner.url
+    ) return false;
+
+    const health = yield* probeHealth(owner.url, options.probeTimeoutMs, deps.client).pipe(
+      Effect.option,
+    );
+    if (
+      Option.isNone(health) ||
+      health.value.id !== owner.id ||
+      health.value.pid !== owner.pid ||
+      health.value.version !== owner.version
+    ) return false;
+
+    if (owner.shutdownToken === undefined) {
+      return yield* new DaemonSpawnFailed({
+        reason: `ACN ${owner.pid} cannot be replaced without an authenticated shutdown capability`,
+      });
+    }
+
+    yield* debugLog(options.debug, "retiring ACN before global ownership handoff", {
+      pid: owner.pid,
+      currentVersion: owner.version,
+    });
+    const response = yield* deps.client.execute(
+      HttpClientRequest.post(`${owner.url}/shutdown`).pipe(
+        HttpClientRequest.bearerToken(owner.shutdownToken),
+      ),
+    ).pipe(
+      Effect.mapError((cause) => new DaemonSpawnFailed({
+        reason: `Failed to request authenticated shutdown from ACN ${owner.pid}: ${String(cause)}`,
+      })),
+    );
+    if (response.status !== 202) {
+      return yield* new DaemonSpawnFailed({
+        reason: `ACN ${owner.pid} rejected authenticated shutdown with HTTP ${response.status}`,
+      });
+    }
+
+    if (yield* awaitProcessExit(owner.pid, UPGRADE_GRACE_MS)) return true;
+    yield* signalProcess(owner.pid, "SIGTERM");
+    if (yield* awaitProcessExit(owner.pid, UPGRADE_TERM_MS)) return true;
+    yield* signalProcess(owner.pid, "SIGKILL");
+    if (!(yield* awaitProcessExit(owner.pid, UPGRADE_KILL_MS))) {
+      return yield* new DaemonSpawnFailed({
+        reason: `ACN ${owner.pid} did not exit after authenticated shutdown and signal escalation`,
+      });
+    }
+    return true;
+  });
+
 // ─── Spawn daemon (wait-for-registration pipeline) ───────────────────────────
 
 const spawnDaemon = (
@@ -347,7 +439,7 @@ const spawnDaemon = (
 
     yield* debugLog(options.debug, "ACN process spawned", { pid: proc.pid });
 
-    const regPath = registrationPath(options.dataDir, options.version);
+    const regPath = registrationPath(options.dataDir);
 
     const checkHealthyRegistration: Effect.Effect<
       AcnRegistration,
@@ -360,13 +452,14 @@ const spawnDaemon = (
       const registration = registrationOption.value;
       const health = yield* probeHealth(registration.url, 500, client);
       if (
-        health.version !== options.version ||
+        health.version !== registration.version ||
         health.id !== registration.id ||
         health.pid !== registration.pid
       ) {
         return yield* new NoDaemon();
       }
-      return registration;
+      if (compareReleaseVersions(options.version, registration.version) <= 0) return registration;
+      return yield* new NoDaemon();
     });
 
     const awaitHealthyRegistration = checkHealthyRegistration.pipe(
@@ -438,22 +531,24 @@ const spawnDaemon = (
 
 export type DaemonAction =
   | {
-      readonly type: "connect";
+      readonly type: "reuse";
       readonly url: string;
-      readonly reason: "same-version";
+      readonly reason: "same-release" | "newer-release";
     }
-  | { readonly type: "spawn"; readonly reason: "missing" | "stale" };
+  | { readonly type: "replace"; readonly owner: AcnRegistration }
+  | { readonly type: "unavailable"; readonly reason: "missing" | "stale" };
 
 export const decideDaemonAction = (input: {
+  readonly candidateVersion: string;
   readonly registration: Option.Option<AcnRegistration>;
   readonly health: Option.Option<HealthResponse>;
 }): DaemonAction => {
   if (Option.isNone(input.registration)) {
-    return { type: "spawn", reason: "missing" };
+    return { type: "unavailable", reason: "missing" };
   }
 
   if (Option.isNone(input.health)) {
-    return { type: "spawn", reason: "stale" };
+    return { type: "unavailable", reason: "stale" };
   }
 
   if (
@@ -461,11 +556,14 @@ export const decideDaemonAction = (input: {
     input.health.value.id !== input.registration.value.id ||
     input.health.value.pid !== input.registration.value.pid
   ) {
-    return { type: "spawn", reason: "stale" };
+    return { type: "unavailable", reason: "stale" };
   }
 
-  const url = input.registration.value.url;
-  return { type: "connect", url, reason: "same-version" };
+  const owner = input.registration.value;
+  const comparison = compareReleaseVersions(input.candidateVersion, owner.version);
+  if (comparison === 0) return { type: "reuse", url: owner.url, reason: "same-release" };
+  if (comparison < 0) return { type: "reuse", url: owner.url, reason: "newer-release" };
+  return { type: "replace", owner };
 };
 
 // ─── discover helper ─────────────────────────────────────────────────────────
@@ -474,7 +572,7 @@ export const decideDaemonAction = (input: {
  * Reads the registration file, health-checks the daemon, returns the URL if
  * it's alive and matches the target version.
  */
-const discoverUrl = (
+const inspectDaemon = (
   options: {
     readonly dataDir: string;
     readonly version: string;
@@ -485,9 +583,9 @@ const discoverUrl = (
     readonly fs: FileSystem;
     readonly client: HttpClient.HttpClient;
   }
-): Effect.Effect<Option.Option<string>, DaemonError, never> =>
+): Effect.Effect<DaemonAction, DaemonError, never> =>
   Effect.gen(function* () {
-    const regPath = registrationPath(options.dataDir, options.version);
+    const regPath = registrationPath(options.dataDir);
     const registration = yield* readRegistration(regPath, deps.fs);
     yield* debugLog(
       options.debug,
@@ -508,13 +606,7 @@ const discoverUrl = (
       onNone: () => Effect.succeed(Option.none<HealthResponse>()),
       onSome: (reg) =>
         probeHealth(reg.url, options.probeTimeoutMs, deps.client).pipe(
-          Effect.flatMap((h) =>
-            h.version === options.version &&
-            h.id === reg.id &&
-            h.pid === reg.pid
-              ? Effect.succeed(Option.some(h))
-              : Effect.succeed(Option.none<HealthResponse>())
-          ),
+          Effect.map(Option.some),
           Effect.catchAll(() => Effect.succeed(Option.none<HealthResponse>()))
         ),
     });
@@ -527,11 +619,32 @@ const discoverUrl = (
       })
     );
 
-    const action = decideDaemonAction({ registration, health });
-    return action.type === "connect"
-      ? Option.some(action.url)
-      : Option.none<string>();
+    const action = decideDaemonAction({
+      candidateVersion: options.version,
+      registration,
+      health,
+    });
+    return action;
   });
+
+const discoverUrl = (
+  options: {
+    readonly dataDir: string;
+    readonly version: string;
+    readonly probeTimeoutMs: number;
+    readonly debug: boolean;
+  },
+  deps: {
+    readonly fs: FileSystem;
+    readonly client: HttpClient.HttpClient;
+  },
+): Effect.Effect<Option.Option<string>, DaemonError, never> =>
+  inspectDaemon(options, deps).pipe(
+    Effect.flatMap((action) => {
+      if (action.type === "reuse") return Effect.succeed(Option.some(action.url));
+      return Effect.succeed(Option.none<string>());
+    }),
+  );
 
 // ─── Public factory ──────────────────────────────────────────────────────────
 
@@ -589,25 +702,49 @@ export const makeLocalDaemonSpawner = (
 
       spawn: (command) =>
         withSpawnElection(
-          spawnElectionPath(dataDir, targetVersion),
+          spawnElectionPath(dataDir),
           spawnTimeoutMs,
           fs,
           Effect.gen(function* () {
-            // Mandatory post-election recheck: the observation that caused this
-            // caller to enter the election may already be stale.
-            const existing = yield* discoverUrl(
-              { dataDir, version: targetVersion, probeTimeoutMs, debug },
-              deps
-            );
-            if (Option.isSome(existing)) {
-              return existing.value;
-            }
+            // Mandatory post-election convergence. Every observation is
+            // classified by the same release-policy function; a contender
+            // never acts on the stale state that caused it to enter election.
+            const settleIncumbent: Effect.Effect<Option.Option<string>, DaemonError> =
+              Effect.suspend(() =>
+                inspectDaemon(
+                  { dataDir, version: targetVersion, probeTimeoutMs, debug },
+                  deps,
+                ).pipe(
+                  Effect.flatMap((action) => {
+                    switch (action.type) {
+                      case "reuse":
+                        return Effect.succeed(Option.some(action.url));
+                      case "unavailable":
+                        return Effect.succeed(Option.none<string>());
+                      case "replace":
+                        return retireIncumbent(
+                          action.owner,
+                          {
+                            dataDir,
+                            probeTimeoutMs,
+                            debug,
+                          },
+                          deps,
+                        ).pipe(Effect.zipRight(settleIncumbent));
+                    }
+                  }),
+                ),
+              );
+
+            const existing = yield* settleIncumbent;
+            if (Option.isSome(existing)) return existing.value;
 
             const resolvedCommand =
               command ??
               (yield* resolveBinaryCommand({
                 binaryPath: options.binaryPath,
                 version: targetVersion,
+                dataDir,
               }).pipe(
                 Effect.provideService(FileSystem, fs),
                 Effect.provideService(HttpClient.HttpClient, client),

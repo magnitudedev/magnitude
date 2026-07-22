@@ -2,8 +2,9 @@ import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import {
   MirroredSnapshotSchema,
-  MirroredStateWatchEventSchema,
+  MirroredStateInvalidationSchema,
 } from "../schemas/mirrored-state"
+import { makeAcnSubscriptionRpc } from "./subscription"
 
 /** Defines the complete RPC contract and client reactivity identity for mirrored state. */
 export const defineMirroredState = <
@@ -33,9 +34,8 @@ export const defineMirroredState = <
   }
 }
 
-export const WatchMirroredStates = Rpc.make("WatchMirroredStates", {
+export const WatchMirroredStates = makeAcnSubscriptionRpc("WatchMirroredStates", {
   payload: Schema.Struct({}),
-  success: MirroredStateWatchEventSchema,
+  success: MirroredStateInvalidationSchema,
   error: Schema.Never,
-  stream: true,
 })

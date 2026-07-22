@@ -38,8 +38,8 @@ describe("daemon registration", () => {
 
   it("writes and reads registration atomically", async () => {
     const dir = await mkdtemp(join(tmpdir(), "magnitude-acn-"));
-    const path = registrationPath(dir, "1.0.0");
-    expect(path).toContain(join("acn", "1.0.0", "registry.json"));
+    const path = registrationPath(dir);
+    expect(path).toContain(join("acn", "registry.json"));
 
     await run(writeRegistrationAtomic(path, registration("owner-1")));
 
@@ -52,7 +52,7 @@ describe("daemon registration", () => {
 
   it("treats invalid registration content as absent without defects", async () => {
     const dir = await mkdtemp(join(tmpdir(), "magnitude-acn-"));
-    const path = registrationPath(dir, "1.0.0");
+    const path = registrationPath(dir);
 
     await Bun.write(path, "{");
     expect(await run(readRegistration(path))).toBeNull();
@@ -68,29 +68,13 @@ describe("daemon registration", () => {
     const dir = await mkdtemp(join(tmpdir(), "magnitude-acn-"));
     await run(
       writeRegistrationAtomic(
-        registrationPath(dir, "1.0.0"),
+        registrationPath(dir),
         registration("owner-1")
       )
     );
-    await run(
-      writeRegistrationAtomic(registrationPath(dir, "2.0.0"), {
-        ...registration("owner-2"),
-        version: "2.0.0",
-        pid: 5678,
-      })
-    );
-
     const registrations = await run(listRegisteredAcns(dir));
 
-    expect(registrations.map((entry) => entry.registration.id).sort()).toEqual([
-      "owner-1",
-      "owner-2",
-    ]);
-    expect(registrations.map((entry) => entry.path)).toEqual(
-      expect.arrayContaining([
-        registrationPath(dir, "1.0.0"),
-        registrationPath(dir, "2.0.0"),
-      ])
-    );
+    expect(registrations.map((entry) => entry.registration.id)).toEqual(["owner-1"]);
+    expect(registrations.map((entry) => entry.path)).toEqual([registrationPath(dir)]);
   });
 });

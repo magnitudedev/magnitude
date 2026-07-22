@@ -1,4 +1,4 @@
-import { Cause, Effect, Fiber, Layer, Queue, Ref, Scope, Schedule, Stream } from "effect"
+import { Cause, Effect, Fiber, Layer, Queue, Stream } from "effect"
 import { RpcClient } from "@effect/rpc"
 import {
   forkIdToKey,
@@ -7,7 +7,6 @@ import {
   type DisplayViewShape,
   type StreamDisplayViewFailure,
   type StreamEvent,
-  type StreamWireEvent,
 } from "@magnitudedev/sdk"
 import {
   applyStreamEvent,
@@ -33,10 +32,26 @@ export type DisplayViewConnectionPhase =
 export type TimelineStatus =
   | { readonly _tag: "none" }
   | { readonly _tag: "pending"; readonly forkId: string | null }
-  | { readonly _tag: "ready"; readonly forkId: string | null; readonly timeline: DisplayTimeline }
-  | { readonly _tag: "empty"; readonly forkId: string | null; readonly timeline: DisplayTimeline }
-  | { readonly _tag: "unavailable"; readonly forkId: string | null; readonly reason: string }
-  | { readonly _tag: "error"; readonly forkId: string | null; readonly message: string }
+  | {
+      readonly _tag: "ready"
+      readonly forkId: string | null
+      readonly timeline: DisplayTimeline
+    }
+  | {
+      readonly _tag: "empty"
+      readonly forkId: string | null
+      readonly timeline: DisplayTimeline
+    }
+  | {
+      readonly _tag: "unavailable"
+      readonly forkId: string | null
+      readonly reason: string
+    }
+  | {
+      readonly _tag: "error"
+      readonly forkId: string | null
+      readonly message: string
+    }
 
 export interface DisplayConnectionError {
   readonly message: string
@@ -64,8 +79,20 @@ export interface DisplayViewControllerOptions {
 type Listener = () => void
 
 type Command =
-  | { readonly _tag: "set-shape"; readonly sessionId: string; readonly viewId: string; readonly shape: DisplayViewShape; readonly generation: number; readonly requestId: number }
-  | { readonly _tag: "resync"; readonly sessionId: string; readonly viewId: string; readonly generation: number }
+  | {
+      readonly _tag: "set-shape"
+      readonly sessionId: string
+      readonly viewId: string
+      readonly shape: DisplayViewShape
+      readonly generation: number
+      readonly requestId: number
+    }
+  | {
+      readonly _tag: "resync"
+      readonly sessionId: string
+      readonly viewId: string
+      readonly generation: number
+    }
 
 const viewIdForSession = (sessionId: string): string => `main:${sessionId}`
 
@@ -76,7 +103,8 @@ const sameTimelineShape = (
   left: DisplayViewShape["timelines"][string],
   right: DisplayViewShape["timelines"][string],
 ): boolean => {
-  if (left.kind !== right.kind || left.live !== right.live || left.limit !== right.limit) return false
+  if (left.kind !== right.kind || left.live !== right.live || left.limit !== right.limit)
+    return false
   if ((left.presentation ?? "default") !== (right.presentation ?? "default")) return false
   if (left.kind === "tail") return true
   return right.kind === "range" && left.start === right.start
@@ -89,7 +117,11 @@ export const sameDisplayShape = (left: DisplayViewShape, right: DisplayViewShape
   return leftKeys.every((key) => {
     const leftShape = left.timelines[key]
     const rightShape = right.timelines[key]
-    return leftShape !== undefined && rightShape !== undefined && sameTimelineShape(leftShape, rightShape)
+    return (
+      leftShape !== undefined &&
+      rightShape !== undefined &&
+      sameTimelineShape(leftShape, rightShape)
+    )
   })
 }
 
@@ -136,10 +168,6 @@ export class DisplayViewControllerCore {
     this.commandFiber = Effect.runFork(this.runCommandLoop())
   }
 
-  /** Create an RpcClient from the shared protocol layer. */
-  private makeClient = (): Effect.Effect<DisplayRpcClient, unknown, Scope.Scope> =>
-    RpcClient.make(MagnitudeRpcs).pipe(Effect.provide(this.protocolLayer))
-
   /**
    * Single fiber drains the command queue serially — same serialization
    * semantics as the old Promise commandChain, but proper Effect. One
@@ -149,7 +177,7 @@ export class DisplayViewControllerCore {
   private runCommandLoop = (): Effect.Effect<void, never, never> =>
     Effect.scoped(
       Effect.gen(this, function* () {
-        const client = yield* RpcClient.make(MagnitudeRpcs).pipe(Effect.provide(this.protocolLayer))
+        const client = yield* makeClient()
         yield* Stream.fromQueue(this.commandQueue).pipe(
           Stream.runForEach((cmd) =>
             this.executeCommand(client, cmd).pipe(
@@ -174,25 +202,43 @@ export class DisplayViewControllerCore {
       switch (cmd._tag) {
         case "set-shape": {
           if (!this.isCurrent(cmd.generation, cmd.sessionId)) return
-          if (this.snapshot.phase !== "open" || cmd.requestId !== this.shapeRequestId) return
-          yield* client.SetDisplayViewShape({ sessionId: cmd.sessionId, viewId: cmd.viewId, shape: cmd.shape }).pipe(
-            Effect.catchAll((error) =>
-              Effect.gen(this, function* () {
-                if (!this.isCurrent(cmd.generation, cmd.sessionId) || cmd.requestId !== this.shapeRequestId) return
-                yield* Effect.logWarning(
-                  `Failed to set display view shape; reopening display stream: ${
-                    error instanceof Error ? error.message : String(error)
-                  }`,
-                )
-                this.reopenStream(cmd.sessionId, "reconnecting")
-              }),
-            ),
-          )
+          if (cmd.requestId !== this.shapeRequestId) return
+          const event = yield* client
+            .SetDisplayViewShape({
+              sessionId: cmd.sessionId,
+              viewId: cmd.viewId,
+              shape: cmd.shape,
+            })
+            .pipe(
+              Effect.catchAll((error) =>
+                Effect.gen(this, function* () {
+                  if (
+                    !this.isCurrent(cmd.generation, cmd.sessionId) ||
+                    cmd.requestId !== this.shapeRequestId
+                  )
+                    return null
+                  yield* Effect.logWarning(
+                    `Failed to set display view shape; reopening display stream: ${
+                      error instanceof Error ? error.message : String(error)
+                    }`,
+                  )
+                  this.reopenStream(cmd.sessionId, "reconnecting")
+                  return null
+                }),
+              ),
+            )
+          if (event === null || !this.isCurrent(cmd.generation, cmd.sessionId)) return
+          yield* this.acceptMaterializedState(cmd.generation, cmd.sessionId, cmd.viewId, event)
           return
         }
         case "resync": {
           if (!this.isCurrent(cmd.generation, cmd.sessionId)) return
-          yield* client.ResyncDisplayView({ sessionId: cmd.sessionId, viewId: cmd.viewId })
+          const event = yield* client.ResyncDisplayView({
+            sessionId: cmd.sessionId,
+            viewId: cmd.viewId,
+          })
+          if (!this.isCurrent(cmd.generation, cmd.sessionId)) return
+          yield* this.acceptMaterializedState(cmd.generation, cmd.sessionId, cmd.viewId, event)
           return
         }
       }
@@ -278,7 +324,12 @@ export class DisplayViewControllerCore {
     const generation = this.streamGeneration
     if (!selectedSessionId || !viewId) return
     Effect.runFork(
-      Queue.offer(this.commandQueue, { _tag: "resync", sessionId: selectedSessionId, viewId, generation }),
+      Queue.offer(this.commandQueue, {
+        _tag: "resync",
+        sessionId: selectedSessionId,
+        viewId,
+        generation,
+      }),
     )
   }
 
@@ -317,21 +368,26 @@ export class DisplayViewControllerCore {
     })
     this.onRestoreQueuedInputText?.(null)
     this.resetAcceptedStore()
-    this.startStream(sessionId, "opening")
+    this.startStream(sessionId)
   }
 
   private reopenStream(sessionId: string, phase: "opening" | "reconnecting"): void {
-    this.closeActiveView({ closeRemote: false })
+    this.closeActiveView()
     this.setSnapshot({
       ...this.snapshot,
       selectedSessionId: sessionId,
       viewId: viewIdForSession(sessionId),
       phase,
-      connectionError: phase === "reconnecting"
-        ? { message: "Reconnecting to daemon...", reconnecting: true, invariantViolation: false }
-        : null,
+      connectionError:
+        phase === "reconnecting"
+          ? {
+              message: "Reconnecting to daemon...",
+              reconnecting: true,
+              invariantViolation: false,
+            }
+          : null,
     })
-    this.startStream(sessionId, phase)
+    this.startStream(sessionId)
   }
 
   private updateIntent(update: {
@@ -366,8 +422,8 @@ export class DisplayViewControllerCore {
   }
 
   private syncDesiredShape(): void {
-    const { selectedSessionId, viewId, phase } = this.snapshot
-    if (!selectedSessionId || !viewId || phase !== "open") return
+    const { selectedSessionId, viewId } = this.snapshot
+    if (!selectedSessionId || !viewId) return
 
     const shape = desiredShapeForSnapshot(this.snapshot)
     if (sameDisplayShape(this.lastRequestedShape, shape)) return
@@ -388,18 +444,14 @@ export class DisplayViewControllerCore {
     )
   }
 
-  private startStream(sessionId: string, phase: "opening" | "reconnecting"): void {
+  private startStream(sessionId: string): void {
     if (this.disposed) return
     this.interruptStream()
 
     const generation = ++this.streamGeneration
     const viewId = viewIdForSession(sessionId)
-    const isDisplayEvent = (event: StreamWireEvent): event is StreamEvent =>
-      event._tag !== "heartbeat"
-
     const streamEffect = Effect.gen(this, function* () {
-      const wasReconnecting = yield* Ref.make(phase === "reconnecting")
-      let hasReceivedEvent = false
+      const client = yield* makeClient()
 
       const resync = (sid: string, targetViewId: string): void => {
         if (!this.isCurrent(generation, sessionId)) return
@@ -413,93 +465,50 @@ export class DisplayViewControllerCore {
         )
       }
 
-      const buildStream = () =>
-        Stream.unwrap(
+      const shape = desiredShapeForSnapshot(this.snapshot)
+      this.lastRequestedShape = shape
+      const initial = yield* client.SetDisplayViewShape({
+        sessionId,
+        viewId,
+        shape,
+      })
+      if (!this.isCurrent(generation, sessionId)) return
+      yield* this.acceptMaterializedState(generation, sessionId, viewId, initial)
+
+      yield* client.StreamDisplayView({ sessionId, viewId, shape }).pipe(
+        Stream.tap((event) =>
           Effect.gen(this, function* () {
-            if (!this.isCurrent(generation, sessionId)) return Stream.empty
-            const shape = desiredShapeForSnapshot(this.snapshot)
-            this.lastRequestedShape = shape
-            const client = yield* this.makeClient()
-            return client.StreamDisplayView({ sessionId, viewId, shape }).pipe(
-              Stream.filter(isDisplayEvent),
-              Stream.tap((event) =>
-                Effect.gen(this, function* () {
-                  if (!this.isCurrent(generation, sessionId)) return
+            if (!this.isCurrent(generation, sessionId)) return
+            if (
+              this.snapshot.phase !== "open" ||
+              !this.snapshot.hasReceivedDisplay ||
+              this.snapshot.connectionError !== null
+            ) {
+              this.setSnapshot({
+                ...this.snapshot,
+                phase: "open",
+                hasReceivedDisplay: true,
+                connectionError: null,
+              })
+            }
 
-                  hasReceivedEvent = true
-                  const wasRecon = yield* Ref.getAndSet(wasReconnecting, false)
-                  if (
-                    wasRecon ||
-                    this.snapshot.phase !== "open" ||
-                    !this.snapshot.hasReceivedDisplay ||
-                    this.snapshot.connectionError !== null
-                  ) {
-                    this.setSnapshot({
-                      ...this.snapshot,
-                      phase: "open",
-                      hasReceivedDisplay: true,
-                      connectionError: null,
-                    })
-                  }
-
-                  yield* applyStreamEvent(
-                    this.displaySync,
-                    event,
-                    resync,
-                    sessionId,
-                    viewId,
-                    (payload) => {
-                      if (!this.isCurrent(generation, sessionId)) return
-                      if (payload.forkId !== null || payload.messages.length === 0) return
-                      this.restoreQueuedMessages(payload.messages.map((message) => message.content).join("\n"))
-                    },
-                  )
-
-                  this.syncDesiredShape()
-                }),
-              ),
-            )
-          }),
-        )
-
-      const reconnectSchedule = Schedule.exponential("100 millis").pipe(
-        Schedule.upTo("5 seconds"),
-        Schedule.jittered,
-      )
-
-      yield* buildStream().pipe(
-        Stream.retry(
-          reconnectSchedule.pipe(
-            Schedule.tapInput(() =>
-              Effect.gen(this, function* () {
+            yield* applyStreamEvent(
+              this.displaySync,
+              event,
+              resync,
+              sessionId,
+              viewId,
+              (payload) => {
                 if (!this.isCurrent(generation, sessionId)) return
-                yield* Ref.set(wasReconnecting, true)
-                this.setSnapshot({
-                  ...this.snapshot,
-                  phase: hasReceivedEvent ? "reconnecting" : "opening",
-                  hasReceivedDisplay: hasReceivedEvent || this.snapshot.hasReceivedDisplay,
-                  connectionError: { message: "Reconnecting to daemon...", reconnecting: true, invariantViolation: false },
-                })
-              }),
-            ),
-          ),
-        ),
-        Stream.catchAllCause((cause) =>
-          Cause.isInterruptedOnly(cause)
-            ? Stream.empty
-            : Stream.unwrap(
-                Effect.gen(this, function* () {
-                  if (!this.isCurrent(generation, sessionId)) return Stream.empty
-                  yield* Ref.set(wasReconnecting, true)
-                  this.setSnapshot({
-                    ...this.snapshot,
-                    phase: hasReceivedEvent ? "reconnecting" : "opening",
-                    hasReceivedDisplay: hasReceivedEvent || this.snapshot.hasReceivedDisplay,
-                    connectionError: { message: "Reconnecting to daemon...", reconnecting: true, invariantViolation: false },
-                  })
-                  return buildStream().pipe(Stream.retry(reconnectSchedule))
-                }),
-              ),
+                if (payload.forkId !== null || payload.messages.length === 0) return
+                this.restoreQueuedMessages(
+                  payload.messages.map((message) => message.content).join("\n"),
+                )
+              },
+            )
+
+            this.syncDesiredShape()
+          }),
         ),
         Stream.runDrain,
       )
@@ -532,26 +541,49 @@ export class DisplayViewControllerCore {
     this.onRestoreQueuedInputText?.(text)
   }
 
-  private closeActiveView(options: { readonly closeRemote?: boolean } = {}): void {
-    const closeRemote = options.closeRemote ?? true
-    const { selectedSessionId, viewId } = this.snapshot
+  private acceptMaterializedState(
+    generation: number,
+    sessionId: string,
+    viewId: string,
+    event: StreamEvent,
+  ): Effect.Effect<void> {
+    return applyStreamEvent(
+      this.displaySync,
+      event,
+      (sid, targetViewId) => {
+        if (!this.isCurrent(generation, sessionId)) return
+        Effect.runFork(
+          Queue.offer(this.commandQueue, {
+            _tag: "resync",
+            sessionId: sid,
+            viewId: targetViewId,
+            generation,
+          }),
+        )
+      },
+      sessionId,
+      viewId,
+      () => {},
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (!this.isCurrent(generation, sessionId)) return
+          this.setSnapshot({
+            ...this.snapshot,
+            phase: "open",
+            hasReceivedDisplay: true,
+            connectionError: null,
+          })
+        }),
+      ),
+    )
+  }
+
+  private closeActiveView(): void {
     this.interruptStream()
     this.streamGeneration++
     this.shapeRequestId++
     this.lastRequestedShape = EMPTY_DISPLAY_VIEW_SHAPE
-    if (!closeRemote || !selectedSessionId || !viewId) return
-    // Fire-and-forget — the stream is already interrupted and the generation
-    // bumped, so this doesn't need to be serialized with other commands.
-    Effect.runFork(
-      Effect.scoped(
-        Effect.gen(this, function* () {
-          const client = yield* this.makeClient()
-          yield* client.CloseDisplayView({ sessionId: selectedSessionId, viewId }).pipe(
-            Effect.catchAll(() => Effect.void),
-          )
-        }),
-      ).pipe(Effect.provide(this.protocolLayer)),
-    )
   }
 
   private interruptStream(): void {
@@ -561,7 +593,10 @@ export class DisplayViewControllerCore {
   }
 
   private resetAcceptedStore(): void {
-    this.displaySync.resetAccepted({ shape: EMPTY_DISPLAY_VIEW_SHAPE, state: EMPTY_DISPLAY_STATE })
+    this.displaySync.resetAccepted({
+      shape: EMPTY_DISPLAY_VIEW_SHAPE,
+      state: EMPTY_DISPLAY_STATE,
+    })
   }
 
   private isCurrent(generation: number, sessionId: string): boolean {
@@ -583,13 +618,21 @@ export const timelineStatusEqual = (left: TimelineStatus, right: TimelineStatus)
     case "pending":
       return right._tag === "pending" && left.forkId === right.forkId
     case "ready":
-      return right._tag === "ready" && left.forkId === right.forkId && left.timeline === right.timeline
+      return (
+        right._tag === "ready" && left.forkId === right.forkId && left.timeline === right.timeline
+      )
     case "empty":
-      return right._tag === "empty" && left.forkId === right.forkId && left.timeline === right.timeline
+      return (
+        right._tag === "empty" && left.forkId === right.forkId && left.timeline === right.timeline
+      )
     case "unavailable":
-      return right._tag === "unavailable" && left.forkId === right.forkId && left.reason === right.reason
+      return (
+        right._tag === "unavailable" && left.forkId === right.forkId && left.reason === right.reason
+      )
     case "error":
-      return right._tag === "error" && left.forkId === right.forkId && left.message === right.message
+      return (
+        right._tag === "error" && left.forkId === right.forkId && left.message === right.message
+      )
   }
 }
 

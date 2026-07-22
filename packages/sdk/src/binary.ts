@@ -1,10 +1,10 @@
-import { Effect, Option, Schedule } from "effect"
+import { Effect, Schedule } from "effect"
 import { FileSystem } from "@effect/platform/FileSystem"
 import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { homedir } from "node:os"
 import {
   BinaryNotFound,
@@ -29,10 +29,11 @@ export const defaultDataDir = (): string => join(homedir(), ".magnitude")
 export const defaultBinaryPath = (dataDir: string = defaultDataDir()): string =>
   `${dataDir}/bin/magnitude-acn`
 
-export const cachedBinaryPath = (dataDir: string): string => defaultBinaryPath(dataDir)
+export const immutableBinaryPath = (dataDir: string, version: string): string =>
+  join(dataDir, "bin", "acn", encodeURIComponent(version), platformArchTriple(), acnExecutableName())
 
-export const cachedVersionPath = (dataDir: string): string =>
-  `${dataDir}/bin/magnitude-acn.version`
+export const cachedBinaryPath = (dataDir: string, version?: string): string =>
+  version === undefined ? defaultBinaryPath(dataDir) : immutableBinaryPath(dataDir, version)
 
 function isWindows(): boolean {
   return process.platform === "win32"
@@ -136,9 +137,16 @@ export const downloadAcn = (
     const url = acnDownloadUrl(version)
     const binDir = join(dataDir, "bin")
     const tmpDir = join(dataDir, "downloads")
-    const tmpFile = join(tmpDir, `magnitude-acn-${version}.tar.gz.tmp`)
-    const extractDir = join(binDir, `.tmp-${yield* Effect.sync(() => crypto.randomUUID())}`)
-    const finalPath = join(binDir, acnExecutableName())
+    const publicationId = yield* Effect.sync(() => crypto.randomUUID())
+    const tmpFile = join(tmpDir, `magnitude-acn-${publicationId}.tar.gz.tmp`)
+    const extractDir = join(binDir, `.tmp-${publicationId}`)
+    const finalPath = immutableBinaryPath(dataDir, version)
+
+    const existing = yield* fs.exists(finalPath).pipe(Effect.mapError(fsError(url)))
+    if (existing) {
+      yield* validateBinaryVersion(finalPath, version)
+      return finalPath
+    }
 
     yield* fs.makeDirectory(tmpDir, { recursive: true }).pipe(Effect.mapError(fsError(url)))
     yield* fs.makeDirectory(extractDir, { recursive: true }).pipe(Effect.mapError(fsError(url)))
@@ -171,16 +179,18 @@ export const downloadAcn = (
 
       yield* validateBinaryVersion(extractedPath, version)
 
-      const finalExists = yield* fs.exists(finalPath).pipe(Effect.mapError(fsError(url)))
-      if (finalExists) {
-        yield* fs.remove(finalPath, { force: true }).pipe(Effect.mapError(fsError(url)))
-      }
-
-      yield* fs.rename(extractedPath, finalPath).pipe(Effect.mapError(fsError(url)))
-      yield* fs.remove(extractDir, { recursive: true, force: true }).pipe(Effect.mapError(fsError(url)))
-      yield* fs.writeFileString(join(dataDir, "bin", "magnitude-acn.version"), version).pipe(
-        Effect.mapError(fsError(url))
+      yield* fs.makeDirectory(dirname(finalPath), { recursive: true }).pipe(
+        Effect.mapError(fsError(url)),
       )
+      const publication = yield* fs
+        .link(extractedPath, finalPath)
+        .pipe(Effect.mapError(fsError(url)), Effect.either)
+      if (publication._tag === "Left") {
+        const published = yield* fs.exists(finalPath).pipe(Effect.mapError(fsError(url)))
+        if (!published) return yield* publication.left
+        yield* validateBinaryVersion(finalPath, version)
+      }
+      yield* fs.remove(extractDir, { recursive: true, force: true }).pipe(Effect.mapError(fsError(url)))
 
       return finalPath
     } finally {
@@ -191,20 +201,6 @@ export const downloadAcn = (
 
 const fsError = (url: string) => (error: { readonly message: string }): DownloadFailed =>
   new DownloadFailed({ url, status: 0, reason: error.message })
-
-export const readVersionMarker = (dataDir: string): Effect.Effect<Option.Option<string>, never, FileSystem> =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem
-    const path = cachedVersionPath(dataDir)
-    const exists = yield* fs.exists(path).pipe(Effect.catchAll(() => Effect.succeed(false)))
-    if (!exists) return Option.none()
-
-    const text = yield* fs.readFileString(path).pipe(
-      Effect.catchAll(() => Effect.succeed(""))
-    )
-    if (text.trim() === "") return Option.none()
-    return Option.some(text.trim())
-  })
 
 export const resolveBinaryCommand = (
   options?: ResolveBinaryOptions
@@ -223,31 +219,30 @@ export const resolveBinaryCommand = (
         yield* validateBinaryVersion(options.binaryPath, expectedVersion)
       }
       return {
-        command: [options.binaryPath, "serve", "--register"],
+        command: [options.binaryPath, "serve", "--register", "--data-dir", dataDir],
         needsDownload: false
       }
     }
 
-    const cachedPath = cachedBinaryPath(dataDir)
+    const cachedPath = cachedBinaryPath(dataDir, expectedVersion)
     const cachedExists = yield* fs.exists(cachedPath).pipe(Effect.catchAll(() => Effect.succeed(false)))
 
     if (expectedVersion) {
-      const marker = yield* readVersionMarker(dataDir)
-      if (Option.isSome(marker) && marker.value === expectedVersion && cachedExists) {
+      if (cachedExists) {
         const cacheValid = yield* validateBinaryVersion(cachedPath, expectedVersion).pipe(
           Effect.as(true),
           Effect.catchAll(() => Effect.succeed(false))
         )
         if (cacheValid) {
           return {
-            command: [cachedPath, "serve", "--register"],
+            command: [cachedPath, "serve", "--register", "--data-dir", dataDir],
             needsDownload: false
           }
         }
       }
     } else if (cachedExists) {
       return {
-        command: [cachedPath, "serve", "--register"],
+        command: [cachedPath, "serve", "--register", "--data-dir", dataDir],
         needsDownload: false
       }
     }
@@ -258,7 +253,7 @@ export const resolveBinaryCommand = (
 
     const downloadedPath = yield* downloadAcn(expectedVersion, dataDir)
     return {
-      command: [downloadedPath, "serve", "--register"],
+      command: [downloadedPath, "serve", "--register", "--data-dir", dataDir],
       needsDownload: true
     }
   })

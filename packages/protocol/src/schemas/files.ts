@@ -1,5 +1,4 @@
 import { Schema } from "effect"
-import { StreamHeartbeat } from "./events"
 
 export const ReadFileFormat = Schema.Literal("text", "base64")
 export type ReadFileFormat = Schema.Schema.Type<typeof ReadFileFormat>
@@ -37,10 +36,6 @@ export const WatchFileEvent = Schema.Struct({
   path: Schema.String
 })
 export type WatchFileEvent = Schema.Schema.Type<typeof WatchFileEvent>
-
-/** Wire union including liveness heartbeats — filtered out by the SDK. */
-export const WatchFileWireEvent = Schema.Union(WatchFileEvent, StreamHeartbeat)
-export type WatchFileWireEvent = Schema.Schema.Type<typeof WatchFileWireEvent>
 
 export const WatchFilePayload = Schema.Struct({
   cwd: Schema.String,

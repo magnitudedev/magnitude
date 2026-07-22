@@ -11,7 +11,6 @@ import {
   AcnVersionRegistrySchema,
   type AcnRegistration,
   type AcnVersionRegistry,
-  versionPathSegment,
 } from "@magnitudedev/protocol";
 
 export type { AcnRegistration, AcnVersionRegistry };
@@ -21,11 +20,8 @@ export interface RegisteredAcn {
   readonly registration: AcnRegistration;
 }
 
-export const versionDirectory = (dataDir: string, version: string): string =>
-  NodePath.join(dataDir, "acn", versionPathSegment(version));
-
-export const registrationPath = (dataDir: string, version: string): string =>
-  NodePath.join(versionDirectory(dataDir, version), "registry.json");
+export const registrationPath = (dataDir: string): string =>
+  NodePath.join(dataDir, "acn", "registry.json");
 
 export const registrationIsOwnedBy = (
   registration: AcnRegistration | null,
@@ -82,19 +78,7 @@ export const listRegisteredAcns = (
   FileSystem.FileSystem
 > =>
   Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const acnDir = NodePath.join(dataDir, "acn");
-    const exists = yield* fs.exists(acnDir);
-    if (!exists) return [];
-
-    const versions = yield* fs.readDirectory(acnDir);
-    const entries = yield* Effect.forEach(versions, (versionDir) =>
-      Effect.gen(function* () {
-        const path = NodePath.join(acnDir, versionDir, "registry.json");
-        const registration = yield* readRegistration(path);
-        return registration ? [{ path, registration }] : [];
-      })
-    );
-
-    return entries.flat();
+    const path = registrationPath(dataDir);
+    const registration = yield* readRegistration(path);
+    return registration ? [{ path, registration }] : [];
   });

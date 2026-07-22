@@ -1,4 +1,4 @@
-export { AcnServerLayer } from "./server"
+export { launchAcnServer } from "./server"
 export { HandlersLive } from "./handlers"
 export { ProviderCredentials, ProviderCredentialsLive } from "./provider-credentials"
 export { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
@@ -18,6 +18,10 @@ export {
   type AcnIntrospectionSession,
   type AcnSessionIntrospection,
 } from "./introspection"
-export { makeDisplayViewStream, type DisplayViewStreamInput, type DisplayViewStreamHandle } from "./display-view-stream"
+export {
+  makeDisplayViewStream,
+  type DisplayViewStreamInput,
+  type DisplayViewStreamHandle,
+} from "./display-view-stream"
 export { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
 export { registrationPath, readRegistration, type AcnRegistration } from "./daemon-registration"

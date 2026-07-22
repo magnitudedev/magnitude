@@ -1,99 +1,78 @@
-import { Context, Effect, Layer, Ref, Stream, SubscriptionRef } from "effect"
-import { AcnRpcCommandActivity } from "@magnitudedev/protocol"
-
-export interface AcnActivityState {
-  readonly lastCommandAt: number
-  readonly lastActivityAt: number
-}
+import { Context, Duration, Effect, Layer } from "effect"
+import { AcnRpcDemand } from "@magnitudedev/protocol"
+import { AcnShutdown } from "./acn-shutdown"
+import {
+  makeResourceUseGate,
+  type ResourceUseGate,
+  type ResourceUseGateSnapshot,
+  type ResourceRetired,
+} from "./resource-use-gate"
 
 export interface AcnActivityTrackerApi {
-  readonly markCommand: (operation: string) => Effect.Effect<void>
-  readonly touch: (reason: string) => Effect.Effect<void>
-  readonly current: Effect.Effect<AcnActivityState>
-  readonly changes: Stream.Stream<void>
-  readonly hasActiveWork: Effect.Effect<boolean>
-  readonly withActiveWork: <A, E, R>(label: string, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
-  readonly acquireActiveWork: (label: string) => Effect.Effect<Effect.Effect<void>>
+  readonly withUse: <A, E, R>(
+    label: string,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | ResourceRetired, R>
+  readonly acquire: (label: string) => Effect.Effect<Effect.Effect<void>, ResourceRetired>
+  /** Ends the bootstrap lease; idempotent. The idle allowance starts here. */
+  readonly ready: Effect.Effect<void>
+  readonly gate: ResourceUseGate
+  readonly current: Effect.Effect<ResourceUseGateSnapshot>
 }
+export type AcnActivityState = ResourceUseGateSnapshot
 
+/** ACN-root demand authority. Observation never touches this service. */
 export class AcnActivityTracker extends Context.Tag("AcnActivityTracker")<
   AcnActivityTracker,
   AcnActivityTrackerApi
 >() {}
 
-interface ActivityState {
-  readonly lastCommandAt: number
-  readonly lastActivityAt: number
-}
-
-const now = () => Date.now()
-
-export const AcnActivityTrackerLive: Layer.Layer<AcnActivityTracker> =
-  Layer.effect(
+export const AcnActivityTrackerLive = (
+  idleTimeout: Duration.DurationInput = "30 minutes",
+  initiallyReady = true,
+): Layer.Layer<AcnActivityTracker, never, AcnShutdown> =>
+  Layer.scoped(
     AcnActivityTracker,
     Effect.gen(function* () {
-      const startedAt = now()
-      const state = yield* SubscriptionRef.make<ActivityState>({
-        lastCommandAt: 0,
-        lastActivityAt: startedAt,
+      const shutdown = yield* AcnShutdown
+      const gate = yield* makeResourceUseGate({
+        resource: "acn",
+        generation: 1,
+        idleTimeout,
+        retire: () =>
+          shutdown.request({ reason: "idle" }).pipe(
+            Effect.tap(() => Effect.logInfo("ACN demand idle deadline reached; shutting down")),
+            Effect.as(true),
+          ),
       })
-      const activeWork = yield* Ref.make(0)
-
-      const touch = (_reason: string) =>
-        SubscriptionRef.update(state, (current) => ({
-          ...current,
-          lastActivityAt: now(),
-        }))
-
-      const markCommand = (operation: string) =>
-        SubscriptionRef.update(state, (current) => {
-          const timestamp = now()
-          return {
-            ...current,
-            lastCommandAt: timestamp,
-            lastActivityAt: timestamp,
-          }
-        }).pipe(
-          Effect.annotateLogs({ operation }),
-        )
-
-      const acquire = (label: string) => Ref.update(activeWork, (count) => count + 1).pipe(
-        Effect.zipRight(touch(`active-work-started:${label}`)),
-      )
-      const release = (label: string) => Ref.update(activeWork, (count) => Math.max(0, count - 1)).pipe(
-        Effect.zipRight(touch(`active-work-finished:${label}`)),
-      )
-
+      const releaseBootstrap = initiallyReady
+        ? Effect.void
+        : yield* gate.acquire("acn-startup").pipe(Effect.orDie)
       return {
-        markCommand,
-        touch,
-        current: SubscriptionRef.get(state),
-        changes: state.changes.pipe(
-          Stream.drop(1),
-          Stream.mapEffect(() => Effect.void),
-        ),
-        hasActiveWork: Ref.get(activeWork).pipe(Effect.map((count) => count > 0)),
-        withActiveWork: (label, effect) => Effect.acquireUseRelease(
-          acquire(label),
-          () => effect,
-          () => release(label),
-        ),
-        acquireActiveWork: (label) => acquire(label).pipe(Effect.as(release(label))),
+        gate,
+        acquire: gate.acquire,
+        withUse: gate.withUse,
+        ready: releaseBootstrap,
+        current: gate.snapshot,
       }
     }),
   )
 
-export const AcnRpcCommandActivityLive: Layer.Layer<
-  AcnRpcCommandActivity,
-  never,
-  AcnActivityTracker
-> = Layer.effect(
-  AcnRpcCommandActivity,
-  Effect.map(AcnActivityTracker, (activity) =>
-    ({ rpc, next }) =>
-      activity.markCommand(rpc._tag).pipe(
-        Effect.zipRight(next),
-        Effect.tap(() => activity.touch("command-completed")),
-      ),
+const withDemand = <A, E, R>(
+  activity: AcnActivityTrackerApi,
+  tag: string,
+  next: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  activity
+    .withUse(`rpc:${tag}`, next)
+    .pipe(Effect.catchTag("ResourceRetired", () => Effect.interrupt))
+
+export const AcnRpcDemandLive: Layer.Layer<AcnRpcDemand, never, AcnActivityTracker> = Layer.effect(
+  AcnRpcDemand,
+  Effect.map(
+    AcnActivityTracker,
+    (activity) =>
+      ({ rpc, next }) =>
+        withDemand(activity, rpc._tag, next),
   ),
 )

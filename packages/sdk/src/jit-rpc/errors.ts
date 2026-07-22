@@ -4,10 +4,9 @@ import { RpcClientError } from "@effect/rpc"
 const { RpcClientError: TransportError } = RpcClientError
 
 // ─── Typed protocol errors ──────────────────────────────────────────────────
-// Each distinct failure mode in the recovering protocol gets its own
-// `Schema.TaggedError`. These flow as the `cause` inside `RpcClientError`
-// (the Effect RPC channel type), so callers can distinguish failure modes
-// via `error.cause instanceof TransportRequestFailed`, etc.
+// These are not all transport errors. Some are HTTP failures and others are
+// violations of the RPC or subscription wire protocol. Authoritative
+// lifecycle controls are successful outcomes and never enter this channel.
 
 /** Serialization failed on the request side. */
 export class RequestEncodeFailed extends Schema.TaggedError<RequestEncodeFailed>()(
@@ -39,9 +38,9 @@ export class UnrecognizedMessage extends Schema.TaggedError<UnrecognizedMessage>
   { message: Schema.String },
 ) {}
 
-/** Clean/interrupt exit on a resident stream — daemon relinquished it. */
-export class ResidentStreamRelinquished extends Schema.TaggedError<ResidentStreamRelinquished>()(
-  "ResidentStreamRelinquished",
+/** A subscription ended without the wrapping protocol's terminal control. */
+export class SubscriptionProtocolViolation extends Schema.TaggedError<SubscriptionProtocolViolation>()(
+  "SubscriptionProtocolViolation",
   { message: Schema.String },
 ) {}
 
@@ -57,32 +56,32 @@ export class StreamEndedWithoutExit extends Schema.TaggedError<StreamEndedWithou
   { message: Schema.String },
 ) {}
 
-/** Retry limit hit — too many consecutive failures without progress. */
-export class TransportExhausted extends Schema.TaggedError<TransportExhausted>()(
-  "TransportExhausted",
+/** Recovery limit hit after consecutive failed attempts without progress. */
+export class RecoveryExhausted extends Schema.TaggedError<RecoveryExhausted>()(
+  "RecoveryExhausted",
   { attempts: Schema.Number },
 ) {}
 
-export type JitRpcTransportError =
+export type JitRpcAttemptFailure =
   | RequestEncodeFailed
   | TransportRequestFailed
   | BadResponseStatus
   | ResponseDecodeFailed
   | UnrecognizedMessage
-  | ResidentStreamRelinquished
+  | SubscriptionProtocolViolation
   | StreamLivenessTimeout
   | StreamEndedWithoutExit
-  | TransportExhausted
+  | RecoveryExhausted
 
 // ─── Lifters ─────────────────────────────────────────────────────────────────
 
-const toReason = (error: JitRpcTransportError): "Protocol" | "Unknown" =>
-  error instanceof TransportRequestFailed || error instanceof TransportExhausted
+const toReason = (error: JitRpcAttemptFailure): "Protocol" | "Unknown" =>
+  error instanceof TransportRequestFailed || error instanceof RecoveryExhausted
     ? "Unknown"
     : "Protocol"
 
-/** Lift a typed protocol error into the `RpcClientError` channel. */
-export const toRpcClientError = (error: JitRpcTransportError): RpcClientError.RpcClientError =>
+/** Lift a typed attempt failure into the `RpcClientError` channel. */
+export const toRpcClientError = (error: JitRpcAttemptFailure): RpcClientError.RpcClientError =>
   new TransportError({
     reason: toReason(error),
     message: error._tag,

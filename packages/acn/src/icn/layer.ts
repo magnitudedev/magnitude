@@ -14,6 +14,7 @@ import {
   IcnStorageConfig,
 } from "@magnitudedev/icn"
 import { ACN_VERSION } from "../version"
+import { AcnShutdown } from "../acn-shutdown"
 
 const platformKey = (): string => {
   if (process.platform === "darwin" && process.arch === "arm64") return "darwin-arm64"
@@ -24,9 +25,9 @@ const platformKey = (): string => {
   throw new Error(`Unsupported ICN platform: ${process.platform} ${process.arch}`)
 }
 
-const dataDir = join(homedir(), ".magnitude")
+const defaultDataDir = () => join(homedir(), ".magnitude")
 
-const binarySource = () => {
+const binarySource = (dataDir: string) => {
   const explicit = process.env.MAGNITUDE_ICN_PATH?.trim()
   if (explicit) return { _tag: "Explicit" as const, path: explicit }
   if (ACN_VERSION.includes("+dev.")) {
@@ -45,57 +46,68 @@ const binarySource = () => {
     version: ACN_VERSION,
     platformKey: platformKey(),
     dataDir,
-    releaseBaseUrl: (process.env.MAGNITUDE_RELEASE_BASE_URL
-      ?? "https://github.com/magnitudedev/magnitude/releases/download").replace(/\/+$/, ""),
+    releaseBaseUrl: (
+      process.env.MAGNITUDE_RELEASE_BASE_URL ??
+      "https://github.com/magnitudedev/magnitude/releases/download"
+    ).replace(/\/+$/, ""),
   }
 }
 
-const makeProcess = () => makeIcnProcess(new IcnLifecycleConfig({
-  binary: new IcnBinaryResolutionConfig({
-    source: binarySource(),
-    supportedApiVersion: 1,
-    expectedNativeBuild: Option.none(),
-    expectedTarget: Option.none(),
-    requiredCapabilities: [
-      "hardware",
-      "model_inventory",
-      "model_preview",
-      "model_download",
-      "model_load_control",
-      "chat_streaming",
-    ],
-    allowBuildMismatch: false,
-    probeTimeout: Duration.seconds(10),
-    downloadTimeout: Duration.minutes(10),
-  }),
-  storage: new IcnStorageConfig({
-    modelStore: Option.some(join(dataDir, "models")),
-    modelSources: [],
-    huggingFaceCaches: [],
-  }),
-  host: "127.0.0.1",
-  startupTimeout: Duration.seconds(30),
-  gracefulShutdownTimeout: Duration.seconds(15),
-  forceShutdownTimeout: Duration.seconds(5),
-  outputLimitBytes: 256 * 1024,
-  parentPid: process.pid,
-})).pipe(Layer.orDie)
+const makeProcess = (dataDir: string) =>
+  makeIcnProcess(
+    new IcnLifecycleConfig({
+      binary: new IcnBinaryResolutionConfig({
+        source: binarySource(dataDir),
+        supportedApiVersion: 1,
+        expectedNativeBuild: Option.none(),
+        expectedTarget: Option.none(),
+        requiredCapabilities: [
+          "hardware",
+          "model_inventory",
+          "model_preview",
+          "model_download",
+          "model_load_control",
+          "chat_streaming",
+        ],
+        allowBuildMismatch: false,
+        probeTimeout: Duration.seconds(10),
+        downloadTimeout: Duration.minutes(10),
+      }),
+      storage: new IcnStorageConfig({
+        modelStore: Option.some(join(dataDir, "models")),
+        modelSources: [],
+        huggingFaceCaches: [],
+      }),
+      host: "127.0.0.1",
+      startupTimeout: Duration.seconds(30),
+      gracefulShutdownTimeout: Duration.millis(500),
+      forceShutdownTimeout: Duration.millis(500),
+      outputLimitBytes: 256 * 1024,
+      parentPid: process.pid,
+    }),
+  ).pipe(Layer.orDie)
 
-const makeSupervision = () => Layer.scopedDiscard(Effect.gen(function* () {
-  const icnProcess = yield* IcnProcess
-  yield* icnProcess.unexpectedExit.pipe(
-    Effect.catchAll((error) => Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
-      Effect.annotateLogs({ cause: error.message }),
-      // BunRuntime translates SIGTERM into root interruption, so all scoped ACN and ICN
-      // finalizers run before the process exits.
-      Effect.zipRight(Effect.sync(() => process.kill(process.pid, "SIGTERM"))),
-    )),
-    Effect.forkScoped,
+const makeSupervision = () =>
+  Layer.scopedDiscard(
+    Effect.gen(function* () {
+      const icnProcess = yield* IcnProcess
+      const shutdown = yield* AcnShutdown
+      yield* icnProcess.unexpectedExit.pipe(
+        Effect.catchAll((error) =>
+          Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
+            Effect.annotateLogs({ cause: error.message }),
+            Effect.zipRight(
+              shutdown.request({ reason: "icn-exited", detail: error.message }),
+            ),
+          ),
+        ),
+        Effect.forkScoped,
+      )
+    }),
   )
-}))
 
-export const makeAcnIcn = () => {
-  const process = makeProcess()
+export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
+  const process = makeProcess(dataDir)
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process)
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess)
   const withHardware = Layer.provideMerge(makeIcnHardware(), withClient)

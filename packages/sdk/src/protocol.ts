@@ -3,7 +3,7 @@
  *
  * This module is browser-safe: it builds HTTP RPC transports only and does
  * not spawn or discover daemons. Consumers that need the operation contract
- * use `makeRecoveringAcnClient` from `recovering-client.ts`.
+ * use `makeAcnJitRuntime` from the SDK entrypoint.
  */
 import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"

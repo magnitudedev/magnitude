@@ -1,23 +1,23 @@
-import { FetchHttpClient } from "@effect/platform"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { RpcClient, RpcClientError } from "@effect/rpc"
 import { Effect, Layer } from "effect"
-import type { Scope } from "effect/Scope"
-import { MagnitudeRpcs } from "@magnitudedev/protocol"
 import {
+  isInterruptedExit,
   makeJitDaemonCoordinator,
   recoveringProtocolLayer as jitRecoveringProtocolLayer,
 } from "../jit-rpc"
-import type { AcnClient } from "../protocol"
 import { DaemonSpawnerTag, toJitDaemonProvider } from "./daemon-spawner"
 import type { DaemonError } from "./errors"
-import { acnResidentStreamPolicy, isEncodedHeartbeat } from "./acn-stream-policy"
+import { acnSubscriptionProtocol } from "./acn-subscription-protocol"
 
-export { isEncodedHeartbeat }
-
-export interface RecoveringClientOptions {
+export interface AcnJitRuntimeOptions {
   /** Explicit ACN spawn command; when omitted the spawner resolves the binary. */
   readonly spawnCommand?: string[]
+}
+
+/** One process-local ACN runtime shared by every RPC consumer. */
+export interface AcnJitRuntime {
+  readonly protocolLayer: Layer.Layer<RpcClient.Protocol, never, HttpClient.HttpClient>
 }
 
 const { RpcClientError: TransportError } = RpcClientError
@@ -30,42 +30,27 @@ const unavailableError = (cause: DaemonError): RpcClientError.RpcClientError =>
   })
 
 /**
- * ACN binding for generic executable-backed JIT RPC recovery.
- *
- * This layer supplies only Magnitude-specific facts: the daemon provider,
- * `/rpc` path, ACN resident-stream policy, and ACN infrastructure error
- * mapping. The recovery mechanics live in `jit-rpc`.
+ * The sole ACN JIT composition entrypoint. It creates one coordinator,
+ * performs startup demand once, and returns one protocol layer for every RPC
+ * consumer. Subscription framing remains inside the ACN adapter.
  */
-export const makeRecoveringProtocolLayer = (
-  options?: RecoveringClientOptions,
-): Effect.Effect<
-  Layer.Layer<RpcClient.Protocol, never, HttpClient.HttpClient>,
-  never,
-  DaemonSpawnerTag
-> => Effect.gen(function* () {
+export const makeAcnJitRuntime = (
+  options?: AcnJitRuntimeOptions,
+): Effect.Effect<AcnJitRuntime, RpcClientError.RpcClientError, DaemonSpawnerTag> =>
+  Effect.gen(function* () {
     const spawner = yield* DaemonSpawnerTag
     const coordinator = yield* makeJitDaemonCoordinator(
       toJitDaemonProvider(spawner, options?.spawnCommand),
     )
-    return jitRecoveringProtocolLayer({
-      coordinator,
-      rpcPath: "/rpc",
-      streamPolicy: acnResidentStreamPolicy,
-      classifyInfraError: unavailableError,
-    })
-  })
+    yield* coordinator.ensure.pipe(Effect.mapError(unavailableError))
 
-/**
- * An `AcnClient` with the operation contract built in: fire commands and trust
- * that an ACN will exist. Operations fail only with domain errors or fatal
- * infrastructure errors surfaced as `RpcClientError`.
- */
-export const makeRecoveringAcnClient = (
-  options?: RecoveringClientOptions,
-): Effect.Effect<AcnClient, never, Scope | DaemonSpawnerTag> =>
-  Effect.gen(function* () {
-    const protocol = yield* makeRecoveringProtocolLayer(options)
-    return yield* RpcClient.make(MagnitudeRpcs).pipe(
-      Effect.provide(protocol.pipe(Layer.provide(FetchHttpClient.layer))),
-    )
+    return {
+      protocolLayer: jitRecoveringProtocolLayer({
+        coordinator,
+        rpcPath: "/rpc",
+        streamProtocol: acnSubscriptionProtocol,
+        isEndpointRetirementExit: isInterruptedExit,
+        classifyInfraError: unavailableError,
+      }),
+    }
   })

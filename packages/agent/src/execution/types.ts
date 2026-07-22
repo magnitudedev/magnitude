@@ -5,7 +5,7 @@
  * and the ExecutionManager Effect service tag.
  */
 
-import { Effect, Context, Layer } from 'effect'
+import { Effect, Context, Layer, Stream } from 'effect'
 import type { AttemptCommitPolicy, TurnOutcome } from '../events'
 import type { ResponseUsage } from '@magnitudedev/ai'
 import type { Projection, WorkerBusService } from '@magnitudedev/event-core'
@@ -115,6 +115,9 @@ export interface ExecutionManagerService {
    * context for the native paradigm.
    */
   readonly getForkLayer: (forkId: string | null) => ForkLayer | undefined
+
+  readonly detachedProcessCount: Effect.Effect<number>
+  readonly detachedProcessChanges: Stream.Stream<number>
 
   readonly fork: (params: {
     parentForkId: string | null

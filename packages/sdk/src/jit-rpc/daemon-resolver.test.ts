@@ -109,4 +109,30 @@ describe("makeJitDaemonCoordinator", () => {
       expect(yield* Ref.get(spawnCalls)).toBe(1)
     }))
   })
+
+  it("parks after authoritative termination without spawning until a successor appears", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      const endpoint = yield* Ref.make<Option.Option<{ readonly url: string }>>(
+        Option.some({ url: "http://retiring" }),
+      )
+      const spawnCalls = yield* Ref.make(0)
+      const provider: JitDaemonProvider<never> = {
+        discover: () => Ref.get(endpoint),
+        spawn: () => Ref.update(spawnCalls, (count) => count + 1).pipe(
+          Effect.as({ url: "http://unexpected" }),
+        ),
+      }
+      const coordinator = yield* makeJitDaemonCoordinator(provider)
+
+      const retiring = yield* coordinator.ensure
+      yield* Ref.set(endpoint, Option.none())
+      const observer = yield* Effect.fork(coordinator.awaitSuccessor(retiring))
+      yield* Effect.sleep("50 millis")
+      expect(yield* Ref.get(spawnCalls)).toBe(0)
+
+      yield* Ref.set(endpoint, Option.some({ url: "http://successor" }))
+      expect((yield* Fiber.join(observer)).endpoint.url).toBe("http://successor")
+      expect(yield* Ref.get(spawnCalls)).toBe(0)
+    }))
+  })
 })

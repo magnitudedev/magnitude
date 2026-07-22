@@ -203,7 +203,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
   // Create the detached shell registry — one per execution manager lifecycle.
   // Provided in fork layers so the shell tool can access it via Effect context.
-  const detachedShellRegistryService = makeDetachedShellRegistryService()
+  const detachedShellRegistryService = yield* makeDetachedShellRegistryService
 
   // VCS layer — built once per execution manager (session scope).
   // All forks in a session share the same working directory and shadow VCS repo.
@@ -236,6 +236,8 @@ const makeExecutionManager = Effect.gen(function* () {
   }
 
   const service: ExecutionManagerService = {
+    detachedProcessCount: detachedShellRegistryService.activeCount,
+    detachedProcessChanges: detachedShellRegistryService.changes,
     initFork: (forkId, roleId) => (Effect.gen(function* () {
       yield* WorkerBusTag<AppEvent>()
 

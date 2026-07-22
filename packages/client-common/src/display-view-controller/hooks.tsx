@@ -20,7 +20,11 @@ import {
   type DisplayViewStore,
 } from "../sync/index"
 import { DisplayReaderContext, DisplaySpeculatorContext } from "../sync/use-display-view"
-import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom } from "../state/session-atoms"
+import {
+  composerTextAtom,
+  composerAttachmentsAtom,
+  composerHistoryIndexAtom,
+} from "../state/session-atoms"
 import { EMPTY_DISPLAY_STATE } from "../state/empty-display-state"
 import {
   DisplayViewControllerCore,
@@ -51,10 +55,7 @@ export function DisplayViewControllerProvider({
   const setComposerText = useAtomSet(composerTextAtom)
   const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
   const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
-  const store = useMemo(
-    () => createDisplayViewStore(initial, EMPTY_DISPLAY_VIEW_SHAPE),
-    [initial],
-  )
+  const store = useMemo(() => createDisplayViewStore(initial, EMPTY_DISPLAY_VIEW_SHAPE), [initial])
   const controller = useMemo(
     () =>
       new DisplayViewControllerCore({
@@ -72,7 +73,13 @@ export function DisplayViewControllerProvider({
           }
         },
       }),
-    [platform.protocolLayer, setComposerText, setComposerAttachments, setComposerHistoryIndex, store],
+    [
+      platform.protocolLayer,
+      setComposerText,
+      setComposerAttachments,
+      setComposerHistoryIndex,
+      store,
+    ],
   )
 
   const lifecycleAtom = useMemo(
@@ -154,12 +161,7 @@ export function useDisplayControllerSelector<T>(
   isEqual?: (left: T, right: T) => boolean,
 ): T {
   const controller = useDisplayViewControllerCore()
-  return useSelectedExternalStore(
-    controller.subscribe,
-    controller.getSnapshot,
-    selector,
-    isEqual,
-  )
+  return useSelectedExternalStore(controller.subscribe, controller.getSnapshot, selector, isEqual)
 }
 
 export function useDisplayState<T>(
@@ -198,10 +200,13 @@ export function useDisplayViewController(): DisplayViewController {
   const desiredShape = useMemo(() => desiredShapeForSnapshot(snapshot), [snapshot])
   const topForkId = snapshot.expandedForkStack[snapshot.expandedForkStack.length - 1] ?? null
 
-  const selectSession = useCallback((sessionId: string) => {
-    speculator.clear()
-    controller.selectSession(sessionId)
-  }, [controller, speculator])
+  const selectSession = useCallback(
+    (sessionId: string) => {
+      speculator.clear()
+      controller.selectSession(sessionId)
+    },
+    [controller, speculator],
+  )
 
   const clearSession = useCallback(() => {
     speculator.clear()
@@ -229,7 +234,15 @@ export function useDisplayViewController(): DisplayViewController {
       resync: controller.resync,
       stop: controller.stop,
     }),
-    [clearSession, controller, desiredShape, hasReceivedDisplay, selectSession, snapshot, topForkId],
+    [
+      clearSession,
+      controller,
+      desiredShape,
+      hasReceivedDisplay,
+      selectSession,
+      snapshot,
+      topForkId,
+    ],
   )
 }
 

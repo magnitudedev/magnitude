@@ -26,14 +26,13 @@ export type AgentClientInstance = ReturnType<typeof createAgentClient>
  * display controller, file-watch, session-statuses — share one resolver,
  * one endpoint cache, one transport.
  */
-export function createAgentClient(protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>) {
-  const tag = AtomRpc.Tag<AgentClient>()("AgentClient", {
+export function createAgentClient(
+  protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
+) {
+  const client = AtomRpc.Tag<AgentClient>()("AgentClient", {
     group: MagnitudeRpcs,
     protocol: protocolLayer,
   })
-
-  // Register the tag's layer as a global layer so all atoms can access it
-  Atom.runtime.addGlobalLayer(tag.layer)
-
-  return tag
+  Atom.runtime.addGlobalLayer(client.layer)
+  return client
 }

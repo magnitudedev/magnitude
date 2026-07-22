@@ -8,12 +8,11 @@ import type { RpcClientError } from "@effect/rpc/RpcClientError"
 import type {
   MagnitudeRpcs,
   MirroredStateInvalidation,
-  StreamHeartbeat,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 
 type MagnitudeRpc = RpcGroup.Rpcs<typeof MagnitudeRpcs>
-type WatchEvent = MirroredStateInvalidation | StreamHeartbeat
+type WatchEvent = MirroredStateInvalidation
 type RpcPayload<Tag extends Rpc.Tag<MagnitudeRpc>> = Rpc.PayloadConstructor<Rpc.ExtractTag<MagnitudeRpc, Tag>>
 type AgentClientInstance = ReturnType<typeof useAgentClient>
 
@@ -37,9 +36,7 @@ const runInvalidationWatch = <R>(
     const stream = yield* connect
     yield* Effect.logDebug("Mirrored state watch connected")
     yield* invalidateMountedMirrors()
-    return stream.pipe(Stream.tap((event) => event._tag === "changed"
-      ? Reactivity.invalidate([event.id])
-      : invalidateMountedMirrors()))
+    return stream.pipe(Stream.tap((event) => Reactivity.invalidate([event.id])))
   }))
   return watch.pipe(
     Stream.tapErrorCause((cause) => Cause.isInterruptedOnly(cause)
@@ -114,7 +111,10 @@ export function useMirroredStateAtom<
 }): Atom.Atom<Result.Result<Snapshot, Error | RpcClientError>> {
   const client = useAgentClient()
   const queryAtom = useMemo(
-    () => client.query(definition.id, definition.getPayload, { reactivityKeys: [definition.id] }),
+    () =>
+      client.query(definition.id, definition.getPayload, {
+        reactivityKeys: [definition.id],
+      }),
     [client, definition],
   )
   const watchAtom = useMemo(

@@ -118,6 +118,20 @@ export const listModels = HttpApiEndpoint.get("listModels", "/v1/models").addSuc
   { status: 200 },
 )
 
+export const observeRuntimeChanges = HttpApiEndpoint.get("observeRuntimeChanges", "/v1/runtime/changes")
+  .setUrlParams(
+    S.Struct({
+      after: S.optionalWith(S.NumberFromString.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+    }),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.RuntimeChangesResponse, Schemas.RuntimeChangesResponseEncoded> =>
+        Schemas.RuntimeChangesResponse,
+    ),
+    { status: 200 },
+  )
+
 export const previewModel = HttpApiEndpoint.post("previewModel", "/v1/models/preview")
   .setPayload(
     S.suspend(
@@ -220,6 +234,13 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(previewModel)
   .add(unloadModel)
 
+export const RuntimeGroup = HttpApiGroup.make("runtime").add(observeRuntimeChanges)
+
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
-export const IcnApi = HttpApi.make("IcnApi").add(ChatGroup).add(HuggingFaceGroup).add(ModelsGroup).add(SystemGroup)
+export const IcnApi = HttpApi.make("IcnApi")
+  .add(ChatGroup)
+  .add(HuggingFaceGroup)
+  .add(ModelsGroup)
+  .add(RuntimeGroup)
+  .add(SystemGroup)

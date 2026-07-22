@@ -10,7 +10,7 @@ import type { PatchApplyError } from '../index'
 import type { CompiledMap, DecodedPatchOp, DecodedValue, Path } from '../index'
 import { DisplayViewSnapshot } from '../../../../protocol/src/schemas/display'
 import type { DisplayViewSnapshot as DVS } from '../../../../protocol/src/schemas/display'
-import { StreamWireEvent } from '../../../../protocol/src/schemas/events'
+import { StreamEvent } from '../../../../protocol/src/schemas/events'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -36,11 +36,11 @@ function assertRoundTrip(
   return ops
 }
 
-/** Assert that a set of ops can be encoded and decoded through StreamWireEvent. */
+/** Assert that a set of ops can be encoded and decoded through StreamEvent. */
 function assertWireRoundTrip(ops: readonly DecodedPatchOp[]): void {
   const wireEvent = { _tag: 'patch' as const, ops }
-  const encoded = Schema.encodeSync(StreamWireEvent)(wireEvent)
-  const decoded = Schema.decodeUnknownSync(StreamWireEvent)(encoded)
+  const encoded = Schema.encodeSync(StreamEvent)(wireEvent)
+  const decoded = Schema.decodeUnknownSync(StreamEvent)(encoded)
   expect(decoded).toEqual(wireEvent)
 }
 
@@ -332,7 +332,7 @@ describe('Group 1: undefined values (FC1, FC7)', () => {
     }
   })
 
-  it('6. wire round-trip: diff ops encode through StreamWireEvent without error', () => {
+  it('6. wire round-trip: diff ops encode through StreamEvent without error', () => {
     const prev = makeOuter({ optionField: Option.some('val1'), title: 'A' })
     const nextDecoded = Schema.decodeSync(OuterSchema)({
       id: '1',
@@ -1415,7 +1415,7 @@ describe('Group 9: Error cases', () => {
 // Group 10: Wire schema invariant
 // ===========================================================================
 
-describe('Group 10: Wire schema invariant — all ops encode through StreamWireEvent', () => {
+describe('Group 10: Wire schema invariant — all ops encode through StreamEvent', () => {
   // Re-run key scenarios and verify every op batch wire-encodes
 
   it('all op types wire-encode (replace, remove, add, move)', () => {

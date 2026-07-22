@@ -72,18 +72,33 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
       Effect.gen(function* () {
         if (!value.shouldCompact) return
         const forkId = value.forkId
+        const decline = (reason: string) => publish({
+          type: 'compaction_declined',
+          forkId,
+          reason,
+          ephemeral: true,
+        })
 
         // 1. Guard: only compact from idle
         const compactionState = yield* read(CompactionProjection, forkId)
-        if (!compactionState || compactionState._tag !== 'idle') return
+        if (!compactionState || compactionState._tag !== 'idle') {
+          yield* decline('compaction state is not idle')
+          return
+        }
 
         // 2. Read window and config
         const windowState = yield* read(WindowProjection, forkId)
-        if (!windowState || windowState.messages.length <= 1) return
+        if (!windowState || windowState.messages.length <= 1) {
+          yield* decline('window has insufficient messages')
+          return
+        }
 
         const agentState = yield* read(AgentLifecycleProjection)
         const forkInfo = getForkInfo(agentState, forkId)
-        if (!forkInfo) return
+        if (!forkInfo) {
+          yield* decline('fork metadata is unavailable')
+          return
+        }
 
         const { roleId } = forkInfo
         const ambientService = yield* AmbientServiceTag
@@ -95,7 +110,10 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
           windowState.messages,
           roleConfig.softCap,
         )
-        if (compactedMessageCount === 0) return
+        if (compactedMessageCount === 0) {
+          yield* decline('compaction sizing selected no messages')
+          return
+        }
 
         // 4. Emit compaction_started (freezes count)
         yield* publish({

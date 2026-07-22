@@ -1,6 +1,5 @@
 import { RpcMiddleware } from "@effect/rpc"
 
-export class AcnRpcCommandActivity extends RpcMiddleware.Tag<AcnRpcCommandActivity>()(
-  "AcnRpcCommandActivity",
-  { wrap: true },
-) {}
+export class AcnRpcDemand extends RpcMiddleware.Tag<AcnRpcDemand>()("AcnRpcDemand", {
+  wrap: true,
+}) {}

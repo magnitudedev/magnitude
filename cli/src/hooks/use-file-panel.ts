@@ -56,7 +56,7 @@ export function useFilePanel({
   projectRoot,
 }: UseFilePanelParams): UseFilePanelResult {
   const atomClient = useAgentClient()
-  const runtimeResult = useAtomValue(atomClient.runtime)
+  const observationRuntimeResult = useAtomValue(atomClient.runtime)
   const resolvePathMutation = useAtomSet(atomClient.mutation('ResolvePath'), { mode: 'promise' })
   const readFileMutation = useAtomSet(atomClient.mutation('ReadFile'), { mode: 'promise' })
 
@@ -138,7 +138,7 @@ export function useFilePanel({
       })
 
       // Set up file watch via streaming RPC
-      if (Result.isSuccess(runtimeResult)) {
+      if (Result.isSuccess(observationRuntimeResult)) {
         const watchEffect = Effect.gen(function* () {
           const c = yield* atomClient
           yield* c('WatchFile', { cwd: watchCwd, path }).pipe(
@@ -160,9 +160,9 @@ export function useFilePanel({
                   logger.error({ path, error: message }, 'File watch error')
                 })
           ),
-          Effect.provide(runtimeResult.value),
+          Effect.provide(observationRuntimeResult.value),
         )
-        watchFiberRef.current = Runtime.runFork(runtimeResult.value)(watchEffect)
+        watchFiberRef.current = Runtime.runFork(observationRuntimeResult.value)(watchEffect)
       }
     }
   }

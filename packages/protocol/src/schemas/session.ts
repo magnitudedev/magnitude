@@ -1,5 +1,4 @@
 import { Schema } from "effect"
-import { StreamHeartbeat } from "./events"
 import { RawImageAttachment, RawMentionOccurrence } from "./attachments"
 export {
   RawClipboardImageAttachment,
@@ -108,9 +107,3 @@ export const ActiveSessionStatuses = Schema.Struct({
   sessions: Schema.Array(ActiveSessionStatus)
 })
 export type ActiveSessionStatuses = Schema.Schema.Type<typeof ActiveSessionStatuses>
-
-export const ActiveSessionStatusesWireEvent = Schema.Union(
-  ActiveSessionStatuses,
-  StreamHeartbeat
-)
-export type ActiveSessionStatusesWireEvent = Schema.Schema.Type<typeof ActiveSessionStatusesWireEvent>

@@ -1,4 +1,4 @@
-import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Option, Schema } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
 import { ModelList } from "../generated/schemas.js"
 import {
@@ -16,7 +16,7 @@ export class IcnInventory extends Context.Tag("@magnitudedev/icn/IcnInventory")<
 >() {}
 
 export interface IcnInventoryOptions {
-  readonly refreshInterval?: Duration.DurationInput
+  readonly reconnectDelay?: Duration.DurationInput
 }
 
 export const makeIcnInventory = (
@@ -33,16 +33,32 @@ export const makeIcnInventory = (
         read,
         Schema.equivalence(ModelList),
       )
-      const refreshObservedState = observed.refresh.pipe(
-        Effect.tapError((error) => Effect.logWarning("Unable to refresh ICN model inventory").pipe(
-          Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
-        )),
-        Effect.option,
-        Effect.asVoid,
-      )
+      // Fetch-backed requests are not reliably interruptible on every runtime.
+      // Disconnect the bounded long-poll so layer shutdown never waits on the
+      // transport before it can reap the ICN process.
+      const observeRevision = (after: Option.Option<number>) =>
+        client.runtime
+          .observeRuntimeChanges({ urlParams: { after } })
+          .pipe(Effect.disconnect)
+      const observeChanges = Effect.gen(function* () {
+        let revision = (yield* observeRevision(Option.none())).revision
+        while (true) {
+          const nextRevision = (yield* observeRevision(Option.some(revision))).revision
+          if (nextRevision === revision) continue
+          revision = nextRevision
+          yield* observed.refresh
+        }
+      })
 
-      yield* refreshObservedState.pipe(
-        Effect.delay(options.refreshInterval ?? "150 millis"),
+      yield* observeChanges.pipe(
+        Effect.catchAll((error) =>
+          Effect.logWarning("ICN runtime change observation disconnected; retrying").pipe(
+            Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
+            Effect.zipRight(
+              Effect.sleep(options.reconnectDelay ?? "250 millis"),
+            ),
+          ),
+        ),
         Effect.forever,
         Effect.forkScoped,
       )

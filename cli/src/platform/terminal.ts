@@ -9,8 +9,8 @@ import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
   DaemonSpawnerTag,
+  makeAcnJitRuntime,
   makeLocalDaemonSpawner,
-  makeRecoveringProtocolLayer,
   type DaemonSpawner,
   type SpawnProcess,
 } from "@magnitudedev/sdk"
@@ -104,11 +104,11 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions = 
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
     ),
   )
-  const protocolLayer = (await Effect.runPromise(
-    makeRecoveringProtocolLayer().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
-  )).pipe(
-    Layer.provide(Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)),
+  const acn = await Effect.runPromise(
+    makeAcnJitRuntime().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
   )
+  const transport = Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)
+  const protocolLayer = acn.protocolLayer.pipe(Layer.provide(transport))
 
   return {
     id: "terminal",
