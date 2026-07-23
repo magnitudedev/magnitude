@@ -13,7 +13,7 @@ import type {
 const QUANT_STUDY = "https://arxiv.org/abs/2606.19558"
 const TERMINAL_BENCH_SOURCE = "https://artificialanalysis.ai/evaluations/terminalbench-v2-1"
 const TERMINAL_BENCH_ID = "terminal-bench-v2.1"
-const TERMINAL_BENCH_METHODOLOGY = "artificial-analysis-terminus-2-e2b-pass-at-1-3-repeats"
+const TERMINAL_BENCH_METHODOLOGY = "terminal-bench-v2.1-percent-success"
 const APACHE: RecipeLicenseReview = {
   expectedId: "apache-2.0",
   name: "Apache License 2.0",
@@ -104,7 +104,7 @@ const terminalBench = (
   unit: "percent",
   higherIsBetter: true,
   methodologyId: TERMINAL_BENCH_METHODOLOGY,
-  mode: "terminus-2",
+  mode: "agentic-coding",
   evidenceScope: "independent_checkpoint",
   provenance,
   sourceUrl,
@@ -115,6 +115,19 @@ const terminalBench = (
 })
 
 const source = (repository: string): string => `https://huggingface.co/${repository}`
+const publisherTerminalBench = (
+  score: number,
+  repository: string,
+): RecipeBenchmarkEvidence => ({
+  ...terminalBench(
+    score,
+    "measured_terminal_bench_2.1",
+    "Measured Terminal-Bench v2.1 result published by the checkpoint developer; checkpoint-level evidence, not an exact GGUF quantization measurement.",
+    source(repository),
+  ),
+  evidenceScope: "publisher_checkpoint",
+  notes: "Publisher-measured checkpoint result; not an exact GGUF quantization measurement.",
+})
 const qwenFormats = ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"] as const
 
 const qwenModels: readonly ModelRecipe[] = [
@@ -212,6 +225,25 @@ const largeModel = (input: {
 })
 
 const largeModels: readonly ModelRecipe[] = [
+  {
+    id: "laguna-s-2.1",
+    family: "laguna",
+    displayName: "Laguna S 2.1 118B-A8B",
+    developer: "Poolside",
+    description: "High-capability MoE model designed for agentic coding and long-horizon software work.",
+    modelRepository: "poolside/Laguna-S-2.1",
+    productContextTokens: [100_000, 200_000],
+    performance: {
+      summary: "Poolside's high-capability Laguna tier, with 8B active parameters per token.",
+      benchmarks: [publisherTerminalBench(70.2, "poolside/Laguna-S-2.1")],
+    },
+    licenseReview: OPEN_MDW,
+    artifacts: quantArtifacts(
+      "laguna-s-2.1",
+      "poolside/Laguna-S-2.1-GGUF",
+      ["Q4_K_M", "Q8_0"],
+    ),
+  },
   largeModel({ id: "qwen3.5-122b-a10b", family: "qwen3.5", displayName: "Qwen3.5 122B-A10B", developer: "Qwen", description: "Workstation-class MoE model with a large knowledge footprint and moderate active compute.", modelRepository: "Qwen/Qwen3.5-122B-A10B", artifactRepository: "unsloth/Qwen3.5-122B-A10B-GGUF", format: "UD-Q4_K_XL", score: 47.6, licenseReview: APACHE }),
   largeModel({ id: "nemotron-3-super-120b-a12b", family: "nemotron-3", displayName: "NVIDIA Nemotron 3 Super 120B-A12B", developer: "NVIDIA", description: "Workstation-class hybrid MoE model designed for agentic workflows and efficient low-precision execution.", modelRepository: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", artifactRepository: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF", format: "MXFP4_MOE", score: 38.6, licenseReview: NEMOTRON, fidelity: { bitsClass: "mxfp4", quantAwareCheckpoint: true, fidelityRank: 58, fidelityLabel: "Near-original fidelity in benchmark comparisons", evidenceScope: "checkpoint_quantization", summary: "NVIDIA reports near-BF16 benchmark results for its low-precision checkpoint; the GGUF conversion itself is not directly benchmarked.", sourceUrl: source("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16") } }),
   largeModel({ id: "deepseek-v4-flash", family: "deepseek-v4", displayName: "DeepSeek V4 Flash 284B-A13B", developer: "DeepSeek", description: "Frontier MoE model with a very large weight footprint but low active compute relative to its size.", modelRepository: "deepseek-ai/DeepSeek-V4-Flash", artifactRepository: "unsloth/DeepSeek-V4-Flash-GGUF", format: "UD-Q8_K_XL", score: 61.8, licenseReview: MIT }),
@@ -220,7 +252,7 @@ const largeModels: readonly ModelRecipe[] = [
 ]
 
 export const MODEL_RECIPE_REGISTRY: ModelRecipeRegistry = {
-  reviewedAt: "2026-07-22",
+  reviewedAt: "2026-07-23",
   models: [...qwenModels, ...gemmaModels, ...largeModels],
 }
 
@@ -256,6 +288,7 @@ export const validateModelRecipeRegistry = (catalog: ModelRecipeRegistry): reado
         issues.push(`${model.id} has inconsistent Terminal-Bench v2.1 methodology`)
       }
       if (evidence.provenance === "measured_terminal_bench_2.1"
+        && evidence.evidenceScope === "independent_checkpoint"
         && evidence.sourceUrl !== TERMINAL_BENCH_SOURCE) {
         issues.push(`${model.id} has measured Terminal-Bench evidence without the canonical source`)
       }
