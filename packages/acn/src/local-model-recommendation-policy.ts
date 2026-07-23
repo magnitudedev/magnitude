@@ -8,8 +8,8 @@ import {
 } from "@magnitudedev/protocol"
 
 export const RECOMMENDATION_POLICY_VERSION =
-  "local-model-multicriteria-v7-workstation-intents"
-export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 15
+  "local-model-multicriteria-v8-ten-token-floor"
+export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 10
 
 const MAX_RECOMMENDATIONS = 4
 const SPEED_UTILITY_CEILING = 60
@@ -55,6 +55,9 @@ const capabilityScore = (candidate: RecommendationCandidate): number | undefined
 const measuredCapability = (candidate: RecommendationCandidate): boolean =>
   candidate.capability?.provenance === "measured_terminal_bench_2.1"
 
+const meetsUsabilityFloor = (tokensPerSecond: number): boolean =>
+  Math.round(tokensPerSecond * 10) / 10 >= MINIMUM_EXPECTED_TOKENS_PER_SECOND
+
 const stableCompare = (
   left: RecommendationCandidate,
   right: RecommendationCandidate,
@@ -67,7 +70,7 @@ const usable = (candidate: RecommendationCandidate): boolean => {
   const generation = generationFor(candidate)
   return generation !== undefined
     && generation.contextTokens === candidate.profile.contextLength
-    && generation.estimatedTokensPerSecond >= MINIMUM_EXPECTED_TOKENS_PER_SECOND
+    && meetsUsabilityFloor(generation.estimatedTokensPerSecond)
     && (candidate.profile.contextLength === 100_000
       || candidate.profile.contextLength === 200_000)
 }

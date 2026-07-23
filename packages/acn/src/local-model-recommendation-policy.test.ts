@@ -154,7 +154,7 @@ describe("local model multicriteria recommendation policy", () => {
   it("falls back to 100K when the 200K profile misses the speed floor", () => {
     const recommendations = selectRecommendationPortfolio([
       candidate({ id: "model-100", checkpoint: "model", artifact: "model:q6", score: 50, context: 100_000, expected: 30 }),
-      candidate({ id: "model-200", checkpoint: "model", artifact: "model:q6", score: 50, context: 200_000, expected: 14 }),
+      candidate({ id: "model-200", checkpoint: "model", artifact: "model:q6", score: 50, context: 200_000, expected: 9 }),
     ])
     expect(byIntent(recommendations, "balanced")?.configuration.profile.contextLength).toBe(100_000)
   })
@@ -173,7 +173,18 @@ describe("local model multicriteria recommendation policy", () => {
     expect(selectRecommendationPortfolio([slow, missing])).toEqual([])
   })
 
-  it("builds a useful 64 GiB-class portfolio without the slow dense extreme", () => {
+  it("applies the floor at the same one-decimal precision shown to users", () => {
+    const recommendations = selectRecommendationPortfolio([
+      candidate({
+        id: "rounded-baseline",
+        expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.049,
+      }),
+    ])
+
+    expect(byIntent(recommendations, "balanced")?.displayName).toBe("rounded-baseline")
+  })
+
+  it("builds a useful 64 GiB-class portfolio with a usable dense quality option", () => {
     const recommendations = selectRecommendationPortfolio([
       candidate({ id: "qwen27", score: 60.7, fidelity: 40, expected: 11.7, context: 100_000, runtimeGiB: 35, downloadGiB: 33 }),
       candidate({ id: "qwen35-q6", checkpoint: "qwen35", artifact: "qwen35:q6", score: 44.9, fidelity: 60, expected: 35.2, runtimeGiB: 34, downloadGiB: 29.7, architecture: "moe" }),
@@ -183,7 +194,7 @@ describe("local model multicriteria recommendation policy", () => {
     ])
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
       ["qwen35-q6", "balanced"],
-      ["qwen35-q8", "best_quality"],
+      ["qwen27", "best_quality"],
       ["gemma26-100", "fastest"],
       ["qwen4", "lightweight"],
     ])
@@ -199,7 +210,7 @@ describe("local model multicriteria recommendation policy", () => {
     ])
 
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
-      ["laguna-100", "balanced"],
+      ["laguna-200", "balanced"],
       ["gemma26", "fastest"],
       ["qwen4", "lightweight"],
     ])
