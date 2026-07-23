@@ -19,7 +19,7 @@ use crate::capabilities::model_capabilities;
 use crate::inventory::ModelManager;
 use crate::package_service::{offering_target_id, package_from_resolved};
 
-const CATALOG_RESOLUTION_REVISION: &str = "recommendable-model-catalog-v1";
+const CATALOG_RESOLUTION_REVISION: &str = "recommendable-model-catalog-v2-native-template";
 
 #[derive(Clone, Copy, Serialize)]
 struct CatalogModel {
@@ -263,14 +263,12 @@ impl NativeRecommendableCatalog {
         format: &str,
         snapshot: &HuggingFaceRepositorySnapshot,
     ) -> Result<RecommendableModel, InventoryError> {
-        let evidence = serde_json::to_string(&(
-            CATALOG_RESOLUTION_REVISION,
+        let evidence = catalog_resolution_evidence(
             declaration,
             format,
-            snapshot.repository.as_str(),
-            snapshot.commit.as_str(),
-        ))
-        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            snapshot,
+            self.models.template_assessment_cache_identity()?,
+        )?;
         if let Some(model) = self
             .models
             .cache
@@ -348,6 +346,23 @@ impl NativeRecommendableCatalog {
             .write_index(ModelIndexKind::RecommendableModelCatalog, &evidence, &model);
         Ok(model)
     }
+}
+
+fn catalog_resolution_evidence(
+    declaration: CatalogModel,
+    format: &str,
+    snapshot: &HuggingFaceRepositorySnapshot,
+    template_assessment_identity: &str,
+) -> Result<String, InventoryError> {
+    serde_json::to_string(&(
+        CATALOG_RESOLUTION_REVISION,
+        template_assessment_identity,
+        declaration,
+        format,
+        snapshot.repository.as_str(),
+        snapshot.commit.as_str(),
+    ))
+    .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
 fn is_first_shard(name: &str) -> bool {
@@ -503,5 +518,35 @@ mod tests {
         );
         assert_eq!(formats("deepseek-v4-flash"), &["UD-Q3_K_M"]);
         assert_eq!(formats("glm-5.2"), &["BF16"]);
+    }
+
+    #[test]
+    fn catalog_cache_evidence_tracks_native_template_identity() {
+        let declaration = CATALOG_MODELS
+            .iter()
+            .find(|model| model.id == "laguna-s-2.1")
+            .copied()
+            .expect("Laguna declaration");
+        let snapshot = HuggingFaceRepositorySnapshot {
+            repository: declaration.repository.to_owned(),
+            commit: "commit".to_owned(),
+            last_modified: None,
+            downloads: None,
+            likes: None,
+            gated: false,
+            private: false,
+            license: None,
+            license_url: None,
+            base_models: Vec::new(),
+            tags: Vec::new(),
+            gguf_files: Vec::new(),
+        };
+
+        assert_ne!(
+            catalog_resolution_evidence(declaration, "Q4_K_M", &snapshot, "native-a")
+                .expect("cache evidence"),
+            catalog_resolution_evidence(declaration, "Q4_K_M", &snapshot, "native-b")
+                .expect("cache evidence"),
+        );
     }
 }

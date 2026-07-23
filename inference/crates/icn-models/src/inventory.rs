@@ -268,6 +268,15 @@ impl ModelManager {
             .read_index(ModelIndexKind::ArtifactInspection, &evidence)
     }
 
+    pub(crate) fn template_assessment_cache_identity(&self) -> Result<&str, InventoryError> {
+        self.template_assessor
+            .as_deref()
+            .map(TemplateAssessor::cache_identity)
+            .ok_or_else(|| {
+                InventoryError::Internal("the model inventory has no template assessor".to_owned())
+            })
+    }
+
     pub async fn ensure_model_inventory(&self) -> Result<(), InventoryError> {
         let observed_generation = self.ensure_generation.load(Ordering::Acquire);
         let _guard = self.ensure_gate.lock().await;
