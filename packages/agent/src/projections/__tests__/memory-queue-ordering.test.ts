@@ -7,7 +7,7 @@ import {
   FrameworkErrorPubSubLive,
   FrameworkErrorReporterLive,
 } from '@magnitudedev/event-core'
-import type { AppEvent } from '../../events'
+import { UserBashCommandId, type AppEvent } from '../../events'
 import { AgentLifecycleProjection } from '../agent-lifecycle'
 import { GoalProjection } from '../goal'
 import { WindowProjection, type ForkWindowState } from '../../window'
@@ -136,6 +136,7 @@ describe('WindowProjection queue ordering regressions', () => {
       } as any,
       {
         type: 'user_bash_command',
+        commandId: UserBashCommandId('bash-1'),
         timestamp: ts(3),
         forkId: null,
         command: 'pwd',

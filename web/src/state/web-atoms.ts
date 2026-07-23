@@ -19,7 +19,6 @@ import {
   nextEscWillKillAllAtom,
   composerHasContentAtom,
   pendingUserSubmitAtom,
-  bashOutputsAtom,
 } from "@magnitudedev/client-common"
 
 // Re-export all shared atoms so existing web imports keep working
@@ -36,7 +35,6 @@ export {
   nextEscWillKillAllAtom,
   composerHasContentAtom,
   pendingUserSubmitAtom,
-  bashOutputsAtom,
 }
 
 // ── Web-only atoms ──────────────────────────────────────────────

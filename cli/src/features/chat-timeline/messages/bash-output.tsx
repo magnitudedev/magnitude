@@ -4,16 +4,13 @@ import { useTheme } from '../../../hooks/use-theme'
 import { orange } from '../../../utils/theme'
 
 import { BOX_CHARS } from '../../../utils/ui-constants'
-import { shortenCommandPreview } from '@magnitudedev/client-common'
-import type { BashResult } from '@magnitudedev/client-common'
+import type { UserBashCommandMessage } from '@magnitudedev/sdk'
 
 const BASH_ACCENT = orange[400]
 const BASH_BOX_CHARS = { ...BOX_CHARS, vertical: '▎' }
-const MAX_COMMAND_DISPLAY_LEN = 80
-
 
 interface BashOutputProps {
-  result: BashResult
+  result: UserBashCommandMessage
 }
 
 export const BashOutput = memo(function BashOutput({ result }: BashOutputProps) {
@@ -54,6 +51,9 @@ export const BashOutput = memo(function BashOutput({ result }: BashOutputProps) 
         <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
           <span fg={BASH_ACCENT} attributes={TextAttributes.BOLD}>$ </span>
           <span attributes={TextAttributes.BOLD}>{result.command}</span>
+          <span fg={result.exitCode === 0 ? theme.success : theme.error}>
+            {result.exitCode === 0 ? ' ✓' : ` ✗ Exit ${result.exitCode}`}
+          </span>
         </text>
 
         {/* Output lines */}

@@ -2,8 +2,8 @@
  * Composer state hook — shared container logic for the composer.
  *
  * Handles: send (with existing session), auto-create session (with dedup),
- * interrupt, bash (returns RunBashResult, writes bashOutputsAtom),
- * slash commands (via app-provided CommandContext), attachment materialization handoff.
+ * interrupt, bash, slash commands (via app-provided CommandContext), and
+ * attachment materialization handoff.
  *
  * Both apps use this identically. The only app-specific part is the
  * CommandContext passed in — each app provides its own toast/recent-chats/etc.
@@ -27,7 +27,6 @@ import {
   composerTextAtom,
   composerAttachmentsAtom,
   composerHistoryIndexAtom,
-  bashOutputsAtom,
   messageHistoryAtom,
   sessionCreateOptionsAtom,
 } from "../state/session-atoms"
@@ -44,7 +43,6 @@ import type {
   RawMentionOccurrence,
 } from "@magnitudedev/sdk"
 import { createId } from "@magnitudedev/generate-id"
-import type { BashResult } from "../utils/bash-executor"
 
 export interface UseComposerStateResult {
   /** Root agent's role label (capitalized) */
@@ -70,8 +68,8 @@ export interface UseComposerStateResult {
   ) => void
   /** Interrupt the root agent */
   handleInterrupt: () => void
-  /** Run a bash command. Returns the display result and writes to bashOutputsAtom. */
-  handleRunBash: (command: string) => Promise<BashResult | null>
+  /** Run a bash command. The persisted event is the display source of truth. */
+  handleRunBash: (command: string) => Promise<boolean>
   /** Handle a slash command string */
   handleSlashCommand: (cmdText: string) => void
   /** Mention search client (null if runtime not ready) */
@@ -104,7 +102,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const activationPromiseRef = useRef<Promise<string> | null>(null)
   const activatedSessionIdRef = useRef<string | null>(null)
   const previousSelectedSessionIdRef = useRef<string | null>(selectedSessionId)
-  const setBashOutputs = useAtomSet(bashOutputsAtom)
   const setMessageHistory = useAtomSet(messageHistoryAtom)
   const sessionCreateOptions = useAtomValue(sessionCreateOptionsAtom)
 
@@ -312,35 +309,25 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     })
   }, [selectedSessionId, interruptMutation])
 
-  const handleRunBash = useCallback(async (command: string): Promise<BashResult | null> => {
+  const handleRunBash = useCallback(async (command: string): Promise<boolean> => {
     if (!selectedSessionId) {
       commandContext.showSystemMessage("Start a session first to run bash commands.")
-      return null
+      return false
     }
     try {
-      const result = await runBashMutation({
+      await runBashMutation({
         payload: {
           sessionId: selectedSessionId,
           command,
         },
       })
-      const bashResult: BashResult = {
-        id: createId(),
-        command,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exitCode: result.exitCode,
-        cwd: result.cwd,
-        timestamp: Date.now(),
-      }
-      // Write to shared bashOutputsAtom — both apps can render bash output
-      setBashOutputs((prev: BashResult[]) => [...prev, bashResult])
-      return bashResult
+      return true
     } catch (err) {
-      console.error("[Composer] RunBash failed:", err)
-      return null
+      const message = err instanceof Error ? err.message : String(err)
+      commandContext.showSystemMessage(`Bash command failed: ${message}`)
+      return false
     }
-  }, [selectedSessionId, runBashMutation, setBashOutputs, commandContext])
+  }, [selectedSessionId, runBashMutation, commandContext])
 
   const handleSlashCommand = useCallback((cmdText: string) => {
     routeSlashCommand(cmdText, commandContext)

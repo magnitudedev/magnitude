@@ -31,11 +31,19 @@ import {
   searchMentions,
   watchFile,
 } from "./ops";
-import type { AppEvent } from "@magnitudedev/agent";
+import { UserBashCommandId, type AppEvent } from "@magnitudedev/agent";
+import { createId } from "@magnitudedev/generate-id";
 import { Onboarding } from "./onboarding";
 import { MirroredStateChanges } from "./mirrored-state";
 import { LocalModelInventory } from "./local-model-inventory";
 import { LocalInferenceHardware } from "./local-inference-hardware";
+
+const MAX_BASH_OUTPUT_LENGTH = 50_000;
+
+const normalizeBashOutput = (output: string): string =>
+  output.length > MAX_BASH_OUTPUT_LENGTH
+    ? `${output.slice(0, MAX_BASH_OUTPUT_LENGTH)}\n[truncated]`
+    : output;
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
@@ -410,24 +418,23 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           sessionCommands.getRuntimeExecutionContext(sessionId).pipe(
             Effect.flatMap((context) =>
               runBash(context, command, stdin).pipe(
-                Effect.tap((result) => {
+                Effect.flatMap((result) => {
+                  const stdout = normalizeBashOutput(result.stdout)
+                  const stderr = normalizeBashOutput(result.stderr)
                   const event: Extract<AppEvent, { type: "user_bash_command" }> = {
                     type: "user_bash_command",
+                    commandId: UserBashCommandId(createId()),
                     forkId: null,
                     timestamp: Date.now(),
                     command,
                     cwd: context.cwd,
                     exitCode: result.exitCode,
-                    stdout:
-                      result.stdout.length > 50_000
-                        ? result.stdout.slice(0, 50_000) + "\n[truncated]"
-                        : result.stdout,
-                    stderr:
-                      result.stderr.length > 50_000
-                        ? result.stderr.slice(0, 50_000) + "\n[truncated]"
-                        : result.stderr,
+                    stdout,
+                    stderr,
                   }
-                  return sessionCommands.sendUserEvent(sessionId, event)
+                  return sessionCommands.sendUserEvent(sessionId, event).pipe(
+                    Effect.as({ ...result, stdout, stderr }),
+                  )
                 })
               )
             )

@@ -3,7 +3,6 @@ import { useAtomSet } from "@effect-atom/atom-react"
 import {
   selectedCwdAtom,
   pendingUserSubmitAtom,
-  bashOutputsAtom,
 } from "../state/session-atoms"
 import { clearSystemMessages } from "../stores/system-message-store"
 import { useDisplayViewControllerCore } from "../display-view-controller/hooks"
@@ -29,17 +28,14 @@ export function useSessionActions(): SessionActions {
   const displaySpeculator = useDisplaySpeculator()
   const setSelectedCwd = useAtomSet(selectedCwdAtom)
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
-  const setBashOutputs = useAtomSet(bashOutputsAtom)
 
   const resetSessionLocalState = useCallback(() => {
     setPendingUserSubmit(false)
-    setBashOutputs([])
     displaySpeculator.clear()
     clearSystemMessages()
   }, [
     displaySpeculator,
     setPendingUserSubmit,
-    setBashOutputs,
   ])
 
   const startNewSession = useCallback((options?: StartNewSessionOptions) => {

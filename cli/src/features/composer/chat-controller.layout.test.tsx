@@ -2,7 +2,6 @@ import { expect, test, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
 import { Option } from 'effect'
-import type { BashResult } from '@magnitudedev/client-common'
 import type { ChatTheme } from '../../types/theme-system'
 import type { ComposerProps } from './types'
 import type { TaskDisplayRow } from '@magnitudedev/sdk'
@@ -191,19 +190,6 @@ function makeTask(): TaskDisplayRow {
   }
 }
 
-function makeBashResult(): BashResult {
-  return {
-    id: 'bash-1',
-    command: '',
-    stdout: '',
-    stderr: '',
-
-    exitCode: 0,
-    cwd: '/tmp',
-    timestamp: 0,
-  }
-}
-
 function makeProps(): ComposerProps {
   return {
     sessionId: null,
@@ -228,7 +214,7 @@ function makeProps(): ComposerProps {
     autopilotGenerating: false,
     submitUserMessage: () => {},
     runSlashCommand: () => false,
-    executeBash: () => makeBashResult(),
+    executeBash: () => true,
     clearSystemBanners: noop,
     interruptFork: noop,
     interruptAll: noop,
@@ -263,4 +249,3 @@ test('shows a single no-provider label instead of model and reasoning effort', (
   expect(html).not.toContain('>model<')
   expect(html).not.toContain('>high<')
 })
-

@@ -17,6 +17,7 @@ import { GoalStatus } from "./goal-status"
 import { InterruptedMessage } from "./interrupted"
 import { ErrorMessage } from "./error-message"
 import { AgentCommunication } from "./agent-communication"
+import { UserBashCommand } from "./user-bash-command"
 
 export interface MessageDispatchProps {
   message: DisplayMessage
@@ -37,6 +38,8 @@ function MessageDispatchImpl({
       return <UserMessage message={message} />
     case "queued_user_message":
       return <QueuedUserMessage message={message} />
+    case "user_bash_command":
+      return <UserBashCommand message={message} />
     case "assistant_message":
       return (
         <AssistantMessage

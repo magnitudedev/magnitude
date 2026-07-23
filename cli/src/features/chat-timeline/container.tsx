@@ -17,7 +17,6 @@ import { useCallback, useRef, useSyncExternalStore, useMemo, type ReactNode } fr
 import { Atom, useAtomMount } from '@effect-atom/atom-react'
 import { Effect } from 'effect'
 import { TextAttributes } from '@opentui/core'
-import { useAtomValue } from '@effect-atom/atom-react'
 import type { ScrollBoxRenderable } from '@opentui/core'
 import {
   useDisplayState,
@@ -26,7 +25,6 @@ import {
   useDisplayViewControllerCore,
   useDisplayReader,
   useRootHistoryLoading,
-  bashOutputsAtom,
   subscribeSystemMessages,
   getSystemMessagesSnapshot,
   TimelineScrollController,
@@ -61,9 +59,6 @@ export function ChatTimelineContainer({
   const rootTimeline = useDisplayState((state) => getFork(state, null) ?? null)
   const hasMoreBefore = rootTimeline?.window.hasMoreBefore ?? false
 
-  // Bash output + system messages are CLI-local UX surfaces that are not part
-  // of the server-projected timeline. They are merged into the scrollback here.
-  const bashOutputs = useAtomValue(bashOutputsAtom)
   const systemMessages = useSyncExternalStore(subscribeSystemMessages, getSystemMessagesSnapshot)
 
   // ── Scroll: TimelineScrollController over a metrics adapter ─────────────
@@ -167,7 +162,6 @@ export function ChatTimelineContainer({
         timeline={rootTimeline}
         chatColumnWidth={chatColumnWidth}
         themeErrorColor={theme.error}
-        bashOutputs={bashOutputs}
         systemMessages={systemMessages}
         onFileClick={openFile}
         onForkExpand={pushFork}

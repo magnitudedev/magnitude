@@ -50,7 +50,7 @@ export interface ComposerProps {
   /** Interrupt the current turn */
   onInterrupt?: () => void
   /** Run a bash command (bash mode) */
-  onRunBash?: (command: string) => void
+  onRunBash?: (command: string) => Promise<boolean>
   /** Execute a slash command */
   onSlashCommand?: (command: string) => void
   /** Toggle bash mode */
@@ -173,12 +173,13 @@ export function Composer({
     [text, cursorPosition, attachments, setText, setAttachments],
   )
 
-  const handleSubmit = useCallback(() => {
+  const handleSubmit = useCallback(async () => {
     const trimmed = text.trim()
     if (!trimmed && attachments.length === 0) return
 
     if (bashMode && onRunBash) {
-      onRunBash(trimmed)
+      const didRun = await onRunBash(trimmed)
+      if (!didRun) return
       setText("")
       setAttachments([])
       lastUserTextRef.current = ""

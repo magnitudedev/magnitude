@@ -1,7 +1,2 @@
-export const hasConversationActivity = ({
-  displayMessageCount,
-  bashOutputCount,
-}: {
-  displayMessageCount: number
-  bashOutputCount: number
-}): boolean => displayMessageCount > 0 || bashOutputCount > 0
+export const hasConversationActivity = (displayMessageCount: number): boolean =>
+  displayMessageCount > 0

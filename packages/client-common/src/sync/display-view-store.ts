@@ -430,7 +430,9 @@ export function appendMessageToTimeline(
     ? timeline.messages.order
     : [...timeline.messages.order, message.id];
   const role: Extract<DisplayTimelineEntry, { kind: "message" }>["role"] =
-    message.type === "user_message" || message.type === "queued_user_message"
+    message.type === "user_message" ||
+    message.type === "queued_user_message" ||
+    message.type === "user_bash_command"
       ? "user"
       : message.type === "assistant_message"
       ? "assistant"

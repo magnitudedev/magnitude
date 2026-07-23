@@ -136,6 +136,7 @@ describe('Event Serialization', () => {
     test('serializes and deserializes user_bash_command', () => {
       const event: AppEvent = {
         type: 'user_bash_command',
+        commandId: 'bash-1',
         forkId: null,
         timestamp: Date.now(),
         command: 'ls -la',

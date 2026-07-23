@@ -28,7 +28,6 @@ import {
   toolSummaryLabel,
   TRANSCRIPT_LINE_CAP,
   truncateToDisplayWidth,
-  type BashResult,
   type SystemMessage,
 } from '@magnitudedev/client-common'
 import type { ActionId } from '../../types/ui-actions'
@@ -39,7 +38,6 @@ import { ShimmerText } from '../../components/shimmer-text'
 import { Button } from '../../components/button'
 import { useTheme } from '../../hooks/use-theme'
 import { fitItems } from './fit-items'
-import { BashOutput } from './messages/bash-output'
 import { SystemMessageRow } from './messages/system-message-row'
 import { green, red, violet } from '../../utils/theme'
 
@@ -51,8 +49,6 @@ interface ChatTimelineProps {
   timeline: DisplayTimeline | null
   chatColumnWidth: number
   themeErrorColor: string
-  /** CLI-local bash results from the composer's `/bash` surface (not projected). */
-  bashOutputs?: readonly BashResult[]
   /** CLI-local system banners from the slash-command surface (not projected). */
   systemMessages?: readonly SystemMessage[]
   onFileClick: (path: string, section?: string) => void
@@ -835,7 +831,6 @@ export const ChatTimeline = memo(function ChatTimeline({
   timeline,
   chatColumnWidth,
   themeErrorColor,
-  bashOutputs,
   systemMessages,
   onFileClick,
   onForkExpand,
@@ -846,9 +841,7 @@ export const ChatTimeline = memo(function ChatTimeline({
     [timeline, chatColumnWidth, themeErrorColor, onFileClick, onForkExpand, onErrorAction],
   )
 
-  // CLI-local rows (bash output + system banners) are not part of the projected
-  // timeline. They are appended after the projected entries — these reflect
-  // recent local composer activity (e.g. `/bash` results, slash-command banners).
+  // CLI-local system banners are not part of the projected timeline.
   const localRows = useMemo(() => {
     const rows: ReactNode[] = []
     if (systemMessages) {
@@ -856,13 +849,8 @@ export const ChatTimeline = memo(function ChatTimeline({
         rows.push(<SystemMessageRow key={`system:${message.id}`} message={message} />)
       }
     }
-    if (bashOutputs) {
-      for (const result of bashOutputs) {
-        rows.push(<BashOutput key={`bash:${result.id}`} result={result} />)
-      }
-    }
     return rows.length > 0 ? rows : null
-  }, [systemMessages, bashOutputs])
+  }, [systemMessages])
 
   if (!timeline) return null
 

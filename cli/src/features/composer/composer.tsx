@@ -511,7 +511,8 @@ export function Composer(props: ComposerProps) {
     if (bashMode) {
       const trimmed = message.trim()
       if (!trimmed) return
-      await Promise.resolve(executeBash(trimmed))
+      const didRun = await Promise.resolve(executeBash(trimmed))
+      if (!didRun) return
       exitBashMode()
       clearComposer()
       return
@@ -719,4 +720,3 @@ export function Composer(props: ComposerProps) {
     </>
   )
 }
-

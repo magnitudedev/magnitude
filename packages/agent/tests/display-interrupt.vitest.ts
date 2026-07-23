@@ -9,7 +9,7 @@ import {
   makeProjectionBusLayer,
 } from '@magnitudedev/event-core'
 import type { ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
-import type { AppEvent } from '../src/events'
+import { UserBashCommandId, type AppEvent } from '../src/events'
 import { DisplayTimelineProjection } from '../src/display'
 import { AgentRoutingProjection } from '../src/projections/agent-routing'
 import { AgentLifecycleProjection } from '../src/projections/agent-lifecycle'
@@ -109,6 +109,42 @@ function toolMessage(messages: readonly DisplayMessage[]) {
 }
 
 describe('display interrupt finalization', () => {
+  test('interrupt retains completed bash activity while removing queued text', async () => {
+    const messages = await runDisplay([
+      ...startedShellEvents(),
+      {
+        type: 'user_bash_command',
+        commandId: UserBashCommandId('bash-1'),
+        timestamp: ts(4),
+        forkId,
+        command: 'pwd',
+        cwd: '/tmp',
+        exitCode: 0,
+        stdout: '/tmp\n',
+        stderr: '',
+      },
+      {
+        type: 'user_message',
+        messageId: 'queued-1',
+        timestamp: ts(5),
+        forkId,
+        text: 'queued text',
+        mentions: [],
+        attachments: [],
+        mode: 'text',
+        synthetic: false,
+        taskMode: false,
+      },
+      { type: 'interrupt', timestamp: ts(6), forkId } as AppEvent,
+    ])
+
+    expect(messages.map((message) => message.type)).toEqual([
+      'tool',
+      'user_bash_command',
+      'interrupted',
+    ])
+  })
+
   test('interrupt event stores interrupted presentation from the typed handle', async () => {
     const messages = await runDisplay([
       ...startedShellEvents(),

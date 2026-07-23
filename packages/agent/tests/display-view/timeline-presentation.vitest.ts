@@ -107,6 +107,37 @@ const agentCommunication = (id: string, content: string, timestamp: number): Dis
 })
 
 describe('display timeline presentation', () => {
+  it('keeps a user bash command as a chronological message entry', () => {
+    const messages: DisplayMessage[] = [{
+      id: 'bash-1',
+      type: 'user_bash_command',
+      command: 'pwd',
+      cwd: '/tmp',
+      exitCode: 0,
+      stdout: '/tmp\n',
+      stderr: '',
+      timestamp: 1,
+    }]
+
+    expect(buildDisplayTimelinePresentation({
+      scope: 'root',
+      mode: 'default',
+      timelineMode: 'idle',
+      streamingMessageId: null,
+      messages,
+      window: windowFor(messages),
+    }).entries).toEqual([{
+      kind: 'message',
+      id: 'message:bash-1',
+      messageId: 'bash-1',
+      timestamp: 1,
+      role: 'user',
+      streaming: false,
+      interrupted: false,
+      nextMessageInterrupted: false,
+    }])
+  })
+
   it('summarizes only compact summary tools and ignores data-only worker messages between them', () => {
     const messages: DisplayMessage[] = [
       fileRead('tool-1', 'a.ts', 1),

@@ -602,7 +602,7 @@ function needsGutter(
   if (isToolEntry(entry)) return true
   if (entry.kind !== "message") return true
   const message = messageForEntry(timeline, entry)
-  return message?.type !== "user_message" && message?.type !== "queued_user_message" && message?.type !== "interrupted"
+  return message?.type !== "user_message" && message?.type !== "queued_user_message" && message?.type !== "user_bash_command" && message?.type !== "interrupted"
 }
 
 function TimelineEntryView({

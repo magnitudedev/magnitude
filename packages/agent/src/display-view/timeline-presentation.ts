@@ -48,6 +48,7 @@ function timelineRole(message: DisplayMessage): 'user' | 'assistant' | 'system' 
   switch (message.type) {
     case 'user_message':
     case 'queued_user_message':
+    case 'user_bash_command':
       return 'user'
     case 'assistant_message':
     case 'thinking':

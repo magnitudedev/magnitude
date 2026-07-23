@@ -4,7 +4,6 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { chatThemes } from '../../utils/theme'
-import type { BashResult } from '@magnitudedev/client-common'
 
 let latestMultilineProps: {
   onChange: (value: InputValue) => void
@@ -87,15 +86,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       displayMode: 'default' as const,
       submitUserMessage: mock(() => {}),
       runSlashCommand: mock(() => false),
-      executeBash: mock((command: string): BashResult => ({
-        id: 'test',
-        command,
-        stdout: '',
-        stderr: '',
-        exitCode: 0,
-        cwd: '/tmp',
-        timestamp: 0,
-      })),
+      executeBash: mock((_command: string) => true),
       clearSystemBanners: mock(() => {}),
       interruptFork: mock(() => {}),
       interruptAll: mock(() => {}),
@@ -176,4 +167,3 @@ describe('ChatController submit slash behavior', () => {
     act(() => renderer?.unmount())
   })
 })
-

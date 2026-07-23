@@ -1,5 +1,4 @@
 import type { DisplayMessage, DisplayTimeline, RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
-import type { BashResult } from '@magnitudedev/client-common'
 import type { KeyEvent } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
 
@@ -44,7 +43,7 @@ export type ComposerProps = {
     mentions: RawMentionOccurrence[]
   }) => void
   runSlashCommand: (commandText: string) => boolean | void
-  executeBash: (command: string) => BashResult | Promise<BashResult | null> | null
+  executeBash: (command: string) => boolean | Promise<boolean>
   clearSystemBanners: () => void
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void
@@ -64,4 +63,3 @@ export type ComposerProps = {
   selectedFileOpen: boolean
   onCloseFilePanel: () => void
 }
-

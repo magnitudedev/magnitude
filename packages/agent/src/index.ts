@@ -29,6 +29,7 @@ export {
 } from './errors'
 
 // Events
+export { UserBashCommandId } from './events'
 export type {
   AppEvent,
   SessionInitialized,
