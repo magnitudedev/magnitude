@@ -319,6 +319,15 @@ pub struct PerformanceEvidence {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PerformanceUnavailable {
+    pub method: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum OfferingAssessment {
@@ -330,6 +339,8 @@ pub enum OfferingAssessment {
         memory: Vec<MemoryAssessment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         performance: Option<PerformanceEvidence>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        performance_unavailable: Option<PerformanceUnavailable>,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {

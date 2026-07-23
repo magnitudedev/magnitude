@@ -169,9 +169,11 @@ export const describeLocalHardware = (
     hardware.platform === "MacOS" && hardware.architecture === "Arm64"
   const processorName = Option.getOrElse(hardware.processor, () =>
     isAppleSilicon ? "Apple Silicon" : "CPU")
+  const productName = Option.getOrElse(hardware.productName, () => "")
+  const acceleratorName = unifiedAcceleratorNames.join(" + ")
   const name = isAppleSilicon
     ? processorName
-    : unifiedAcceleratorNames.join(" + ") || processorName
+    : unique([productName, acceleratorName]).join(" · ") || processorName
   return {
     system: {
       name,

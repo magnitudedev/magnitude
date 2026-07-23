@@ -74,6 +74,10 @@ const fitAssessment = (
       remainingBytes: memory.remainingBytes,
     })),
     performance: Option.flatMap(assessment.performance, Option.fromNullable),
+    performanceUnavailable: Option.flatMap(
+      assessment.performanceUnavailable,
+      Option.fromNullable,
+    ),
   })
 })
 

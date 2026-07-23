@@ -639,6 +639,8 @@ pub struct HardwareSnapshot {
     pub captured_at: u64,
     pub platform: String,
     pub architecture: String,
+    #[serde(default)]
+    pub system_product_name: Option<String>,
     pub cpu_model: Option<String>,
     pub logical_cores: usize,
     pub system_memory: HardwareSystemMemory,

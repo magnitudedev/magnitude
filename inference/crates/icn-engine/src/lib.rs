@@ -4005,6 +4005,7 @@ mod tests {
             captured_at: 1,
             platform: "macos".to_owned(),
             architecture: "aarch64".to_owned(),
+            system_product_name: Some("MacBook Pro".to_owned()),
             cpu_model: Some("Apple".to_owned()),
             logical_cores: 8,
             system_memory: HardwareSystemMemory {

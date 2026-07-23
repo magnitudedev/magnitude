@@ -13,6 +13,15 @@ export class LocalInferenceHardwareProjectionFailure extends Data.TaggedError("L
   readonly message: string
 }> {}
 
+const genericBackendOrdinal = /^(?:CUDA|MTL|Vulkan|ROCm|SYCL|OpenCL)\d+$/i
+
+export const acceleratorDisplayName = (
+  device: Pick<Generated.HardwareDevice, "name" | "description">,
+): string => genericBackendOrdinal.test(device.name.trim())
+    && device.description.trim().length > 0
+    ? device.description.trim()
+    : device.name
+
 export const projectLocalInferenceHardware = (
   hardware: Generated.HardwareSnapshot,
 ): Effect.Effect<LocalInferenceHardwareState, LocalInferenceHardwareProjectionFailure> => Effect.gen(function* () {
@@ -33,7 +42,7 @@ export const projectLocalInferenceHardware = (
     .filter((device) => device.kind !== "cpu")
     .map((device) => ({
       acceleratorId: LocalInferenceAcceleratorIdSchema.make(device.id),
-      name: device.name,
+      name: acceleratorDisplayName(device),
       backend: device.backend,
       memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(domain.id),
     })))
@@ -56,6 +65,7 @@ export const projectLocalInferenceHardware = (
   return {
     platform,
     architecture,
+    productName: Option.flatMap(hardware.system_product_name, Option.fromNullable),
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
     logicalCores: Math.max(1, hardware.logical_cores),
     totalSystemMemoryBytes: hardware.system_memory.total_bytes,

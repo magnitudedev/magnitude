@@ -174,7 +174,7 @@ const CATALOG_MODELS: &[CatalogModel] = &[
         display_name: "NVIDIA Nemotron 3 Super 120B-A12B",
         description: "Workstation-class hybrid MoE model designed for agentic workflows.",
         repository: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
-        formats: &["MXFP4_MOE"],
+        formats: &["UD-Q4_K_XL", "MXFP4_MOE"],
         contexts: PRODUCT_CONTEXTS,
         license: "nvidia-nemotron-open-model-license",
         quality_score: 38.6,
@@ -497,6 +497,10 @@ mod tests {
         };
         assert_eq!(formats("laguna-s-2.1"), &["Q4_K_M", "Q8_0"]);
         assert_eq!(formats("qwen3.5-122b-a10b"), &["Q4_K_M"]);
+        assert_eq!(
+            formats("nemotron-3-super-120b-a12b"),
+            &["UD-Q4_K_XL", "MXFP4_MOE"]
+        );
         assert_eq!(formats("deepseek-v4-flash"), &["UD-Q3_K_M"]);
         assert_eq!(formats("glm-5.2"), &["BF16"]);
     }

@@ -308,6 +308,11 @@ export const FitsOfferingAssessmentSchema = Schema.TaggedStruct("Fits", {
     confidence: Schema.Literal("high", "moderate", "low"),
     method: NonEmptyString,
   }), { as: "Option", exact: true }),
+  performanceUnavailable: Schema.optionalWith(Schema.Struct({
+    method: NonEmptyString,
+    code: NonEmptyString,
+    message: NonEmptyString,
+  }), { as: "Option", exact: true }),
 })
 export type FitsOfferingAssessment = typeof FitsOfferingAssessmentSchema.Type
 
@@ -680,6 +685,7 @@ export const LocalInferenceMemoryDomainSchema = Schema.Struct({
 export const LocalInferenceHardwareSchema = Schema.Struct({
   platform: Schema.Literal("MacOS", "Linux", "Windows"),
   architecture: Schema.Literal("Arm64", "X64"),
+  productName: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   processor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   logicalCores: PositiveSafeInteger,
   totalSystemMemoryBytes: NonNegativeSafeInteger,

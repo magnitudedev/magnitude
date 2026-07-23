@@ -20,6 +20,7 @@ const localInferenceState = makeView({
   hardware: makeHardware({
     platform: "MacOS",
     architecture: "Arm64",
+    productName: Option.some("MacBook Pro"),
     processor: Option.some("Apple M4 Max"),
     totalSystemMemoryBytes: 64 * GIB,
     availableSystemMemoryBytes: Option.some(12 * GIB),
