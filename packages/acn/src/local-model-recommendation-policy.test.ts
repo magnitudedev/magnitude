@@ -318,13 +318,15 @@ describe("local model multicriteria recommendation policy", () => {
     ])
     expect(byIntent(recommendations, "balanced")?.explanation).toContain("Best overall mix")
     expect(byIntent(recommendations, "best_quality")?.explanation).toContain("more memory than Balanced")
-    expect(byIntent(recommendations, "best_quality")?.explanation).toContain("slower")
+    expect(byIntent(recommendations, "best_quality")?.explanation).toContain("slower than Balanced")
     expect(byIntent(recommendations, "fastest")?.explanation)
       .toContain("half as much code and conversation history")
     expect(byIntent(recommendations, "fastest")?.explanation)
       .toContain("substantial compression")
     expect(byIntent(recommendations, "lightweight")?.explanation)
       .toContain("less capable on difficult coding tasks")
+    expect(byIntent(recommendations, "lightweight")?.explanation)
+      .toContain("faster than Balanced")
   })
 
   it("describes quantization quality absolutely, including quality-aware checkpoints", () => {

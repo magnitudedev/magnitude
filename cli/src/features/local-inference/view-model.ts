@@ -6,6 +6,7 @@ import {
   type LocalInferenceMemoryDomainId,
   type LocalModel,
   type LocalModelRecommendation,
+  type LocalModelRecommendationProgressStep,
   type ProviderModelId,
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
@@ -141,6 +142,76 @@ export const formatContext = (tokens: number): string => tokens < 1_000
     : `${Math.round(tokens / 1_000)}K`
 
 export const formatModelLoadProgress = (percentage: number): string => `Loading ${percentage}%`
+
+const progressLabel = (
+  id: LocalModelRecommendationProgressStep["id"],
+  completed: boolean,
+): string => {
+  if (id === "hardware") return completed ? "Detected hardware" : "Detecting your hardware"
+  if (id === "catalog") {
+    return completed ? "Loaded models from Hugging Face" : "Loading models from Hugging Face"
+  }
+  if (id === "metadata") {
+    return completed ? "Checked model files" : "Checking model files"
+  }
+  if (id === "assessment") {
+    return completed ? "Evaluated models for this machine" : "Evaluating models for this machine"
+  }
+  return completed ? "Prepared recommendations" : "Choosing recommendations"
+}
+
+const formatDurationMs = (durationMs: number): string => durationMs < 1_000
+  ? `${(durationMs / 1_000).toFixed(1)}s`
+  : durationMs < 60_000
+    ? `${Math.round(durationMs / 1_000)}s`
+    : `${Math.floor(durationMs / 60_000)}m ${Math.round(durationMs % 60_000 / 1_000)}s`
+
+export interface LocalInferenceProgressLine {
+  readonly id: LocalModelRecommendationProgressStep["id"]
+  readonly state: "pending" | "running" | "completed" | "failed"
+  readonly label: string
+  readonly metadata: string
+}
+
+export const localInferenceProgressLines = (
+  steps: readonly LocalModelRecommendationProgressStep[],
+  nowMs: number,
+): readonly LocalInferenceProgressLine[] => steps.map((step) => {
+  const completed = step.status._tag === "Completed"
+  const label = progressLabel(step.id, completed)
+  const count = Option.match(step.totalItems, {
+    onNone: () => "",
+    onSome: (total) => Option.match(step.completedItems, {
+      onNone: () => ` · ${total}`,
+      onSome: (value) => ` · ${value}/${total}`,
+    }),
+  })
+  if (step.status._tag === "Pending") {
+    return { id: step.id, state: "pending", label, metadata: "" }
+  }
+  if (step.status._tag === "Running") {
+    return {
+      id: step.id,
+      state: "running",
+      label,
+      metadata: `${count} · ${formatDurationMs(Math.max(0, nowMs - step.status.startedAtMs))}`,
+    }
+  }
+  if (step.status._tag === "Failed") {
+    return {
+      id: step.id,
+      state: "failed",
+      label: `${label} failed`,
+      metadata: ` · ${step.status.failure.message}`,
+    }
+  }
+  return {
+    id: step.id,
+    state: "completed",
+    label,
+    metadata: `${count}${step.status.cached ? " · cached" : ` · ${formatDurationMs(step.status.durationMs)}`}`,
+  }
+})
 
 export interface LocalHardwarePresentation {
   readonly system: { readonly name: string; readonly details: readonly string[] }

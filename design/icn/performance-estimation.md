@@ -116,10 +116,13 @@ Synthetic weight buffers exceed typical consumer shared-cache working sets, so c
 streaming operation throughput rather than repeatedly crediting a small cache-resident tensor.
 
 Calibration is performed at most once for one native-build, enabled-backend, topology, and
-calibration-policy identity within an ICN process. The result is serializable so isolated planner
-workers reuse it. Calibration failure is non-fatal: memory fitting continues and performance is
-reported as unavailable. Calibration has explicit time and temporary-allocation bounds and releases
-all native resources before returning.
+calibration-policy identity while valid evidence is available. Successful calibration is stored in
+the shared disposable derived cache so daemon restarts and isolated planner workers reuse it.
+Evidence includes the native build, enabled backends, normalized topology, platform, architecture,
+and native calibration method. A missing, malformed, mismatched, or older-than-policy entry is a
+cache miss. Transient calibration failures are never persisted. Calibration failure is non-fatal:
+memory fitting continues and performance is reported as unavailable. Calibration has explicit time
+and temporary-allocation bounds and releases all native resources before returning.
 
 ## Estimate and confidence
 
@@ -159,10 +162,13 @@ runnable placement has no generation estimate. Operational failures needed to pr
 remain ordinary operation failures; estimator-specific failures become typed unavailable evidence
 and retain their method, code, and message through the public assessment response.
 
-Preview caches the composite profile assessment through the model-management cache. Cache reads and
-writes retain the no-fail behavior of disposable caches. Volatile calibration samples are not a new
-durable authority. Loading always replans, and installed-model runtime timing remains authoritative
-for observed performance.
+Preview caches the composite profile assessment through the model-management cache. A complete
+batch cache hit is checked from the target identity before remote sparse-header materialization, so
+reusing an assessment does not restart template or fit workers. The hardware environment identity
+is captured once per assessment or fit request and shared across every target/profile operation.
+Cache reads and writes retain the no-fail behavior of disposable caches. Persisted calibration is
+recomputable evidence, not a durable authority. Loading always replans, and installed-model runtime
+timing remains authoritative for observed performance.
 
 ## Acceptance criteria
 

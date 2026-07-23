@@ -207,7 +207,10 @@ export const LocalModelsLive: Layer.Layer<
   const offeringProjection = yield* LocalProviderOfferingProjection
   const mirror = yield* makeMirroredState(LocalModelsMirror, {
     models: [],
-    recommendations: { _tag: "Loading" },
+    recommendations: {
+      _tag: "Loading",
+      progress: [],
+    },
   })
   const equivalent = Schema.equivalence(LocalModelsMirror.stateSchema)
   const lock = yield* Effect.makeSemaphore(1)
@@ -331,9 +334,16 @@ export const LocalModelsLive: Layer.Layer<
       }
     }).sort((left, right) => left.displayName.localeCompare(right.displayName))
     const recommendationLifecycle = recommendationState._tag === "Loading"
-      ? { _tag: "Loading" as const }
+      ? {
+          _tag: "Loading" as const,
+          progress: recommendationState.progress,
+        }
       : recommendationState._tag === "Failed"
-        ? { _tag: "Failed" as const, failure: recommendationState.failure }
+        ? {
+            _tag: "Failed" as const,
+            failure: recommendationState.failure,
+            progress: recommendationState.progress,
+          }
         : {
             _tag: "Ready" as const,
             entries: recommendationState.recommendations.flatMap((recommendation) => {
@@ -343,6 +353,7 @@ export const LocalModelsLive: Layer.Layer<
                 ? [recommendationProjection(recommendation, recommendable)]
                 : []
             }),
+            progress: recommendationState.progress,
           }
     yield* mirror.setIfChanged({
       models,

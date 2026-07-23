@@ -233,7 +233,7 @@ const describeBestQuality = (
   const speed = generation.estimatedTokensPerSecond
   const balancedSpeed = generationFor(balanced)!.estimatedTokensPerSecond
   const speedTradeoff = speed < balancedSpeed * 0.95
-    ? ` It is about ${percentDifference(speed, balancedSpeed)}% slower.`
+    ? ` It is about ${percentDifference(speed, balancedSpeed)}% slower than Balanced.`
     : " It runs at nearly the same speed as Balanced."
   return `${reason}${qualitySentence(candidate)}${memoryTradeoff}${speedTradeoff}`
 }
@@ -270,10 +270,10 @@ const describeLightweight = (
     : `${downloadReduction}% less disk space`
   const balancedSpeed = generationFor(balanced)!.estimatedTokensPerSecond
   const speedTradeoff = generation.estimatedTokensPerSecond < balancedSpeed * 0.95
-    ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% slower on this machine.`
+    ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% slower than Balanced.`
     : generation.estimatedTokensPerSecond > balancedSpeed * 1.05
-      ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% faster on this machine.`
-      : " It runs at about the same speed on this machine."
+      ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% faster than Balanced.`
+      : " It runs at about the same speed as Balanced."
   const capabilityTradeoff = (capabilityScore(candidate) ?? 0)
       < (capabilityScore(balanced) ?? 0)
     ? " It is less capable on difficult coding tasks."

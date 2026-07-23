@@ -4,6 +4,7 @@ applies_to:
   - packages/storage/src/io/structured-file.ts
   - packages/storage/src/sessions/storage.ts
   - packages/acn/src/model-configuration.ts
+  - packages/acn/src/local-model-recommendations.ts
   - packages/icn/src/catalog/**
   - packages/ai/src/provider/file-catalog.ts
   - inference/crates/icn-models/**
@@ -138,6 +139,13 @@ Cache recovery must satisfy all of the following:
 - any diagnostics that are emitted are bounded, omit cached payload contents and secrets, and do
   not become user-facing errors; disposable caches are not required to allocate a recovery report;
 - repeated callers may coalesce regeneration in memory, but an in-flight map is not durable state.
+
+The local-model recommendation portfolio is one recomputable cache entry, not configuration. Its
+evidence contains the complete catalog target/profile inputs, normalized hardware topology and
+native build, enabled backends, and recommendation-policy identity. An exact hit may be published
+immediately after daemon restart for at most seven days. Any mismatch or expiration invalidates the
+complete portfolio because its four intent choices are one jointly selected result; the underlying
+ICN assessment cache still invalidates and recomputes at the finer target/profile boundary.
 
 Readers cannot assume that writers are cooperative or that a lock was honored. Writers encode the
 complete replacement before publication and use a uniquely named temporary file plus a

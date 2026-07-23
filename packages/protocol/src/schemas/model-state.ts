@@ -403,12 +403,56 @@ export const LocalModelRecommendationSchema = Schema.Struct({
 })
 export type LocalModelRecommendation = typeof LocalModelRecommendationSchema.Type
 
+export const LocalModelRecommendationProgressStepIdSchema = Schema.Literal(
+  "hardware",
+  "catalog",
+  "metadata",
+  "assessment",
+  "selection",
+)
+export type LocalModelRecommendationProgressStepId =
+  typeof LocalModelRecommendationProgressStepIdSchema.Type
+
+export const LocalModelRecommendationProgressStatusSchema = Schema.Union(
+  Schema.TaggedStruct("Pending", {}),
+  Schema.TaggedStruct("Running", {
+    startedAtMs: NonNegativeSafeInteger,
+  }),
+  Schema.TaggedStruct("Completed", {
+    startedAtMs: NonNegativeSafeInteger,
+    durationMs: NonNegativeSafeInteger,
+    cached: Schema.Boolean,
+  }),
+  Schema.TaggedStruct("Failed", {
+    startedAtMs: NonNegativeSafeInteger,
+    durationMs: NonNegativeSafeInteger,
+    failure: ModelFailureSchema,
+  }),
+)
+export type LocalModelRecommendationProgressStatus =
+  typeof LocalModelRecommendationProgressStatusSchema.Type
+
+export const LocalModelRecommendationProgressStepSchema = Schema.Struct({
+  id: LocalModelRecommendationProgressStepIdSchema,
+  status: LocalModelRecommendationProgressStatusSchema,
+  completedItems: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+  totalItems: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+})
+export type LocalModelRecommendationProgressStep =
+  typeof LocalModelRecommendationProgressStepSchema.Type
+
 export const LocalModelRecommendationsLifecycleSchema = Schema.Union(
-  Schema.TaggedStruct("Loading", {}),
+  Schema.TaggedStruct("Loading", {
+    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+  }),
   Schema.TaggedStruct("Ready", {
     entries: Schema.Array(LocalModelRecommendationSchema),
+    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
   }),
-  Schema.TaggedStruct("Failed", { failure: ModelFailureSchema }),
+  Schema.TaggedStruct("Failed", {
+    failure: ModelFailureSchema,
+    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+  }),
 )
 export type LocalModelRecommendationsLifecycle =
   typeof LocalModelRecommendationsLifecycleSchema.Type

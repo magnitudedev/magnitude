@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HardwareProvider,
     HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult,
@@ -14,7 +15,7 @@ use icn_contracts::{
     ModelPreviewProfile, ModelPreviewRequest, ModelPreviewSource, ModelPreviewer, ModelSource,
     ResolvedComponent, ResolvedModel,
 };
-use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::header::{CONTENT_RANGE, ETAG, IF_NONE_MATCH, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -33,7 +34,7 @@ const MAX_PREVIEW_CONTEXT_TOKENS: u32 = 16 * 1024 * 1024;
 const MAX_PREVIEW_PARALLEL_SEQUENCES: u32 = 64;
 const MAX_HUB_SEARCH_RESULTS: u32 = 50;
 const MAX_HUB_SEARCH_QUERY_BYTES: usize = 200;
-const HUB_REPOSITORY_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
+const HUB_REPOSITORY_SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60);
 const HUB_SEARCH_TTL: Duration = Duration::from_secs(60);
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 256;
 const HUB_REQUEST_ATTEMPTS: usize = 3;
@@ -42,12 +43,15 @@ const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CachedHuggingFaceRepositorySnapshot {
     captured_at: u64,
+    #[serde(default)]
+    etag: Option<String>,
     snapshot: HuggingFaceRepositorySnapshot,
 }
 
 pub struct ModelPreviewService {
     models: Arc<ModelManager>,
     assessor: Arc<dyn ModelHardwareAssessor>,
+    http: reqwest::Client,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
     hardware_snapshot: tokio::sync::Mutex<Option<(Instant, icn_contracts::HardwareSnapshot)>>,
     hub_repository_snapshots:
@@ -59,9 +63,11 @@ pub struct ModelPreviewService {
 impl ModelPreviewService {
     #[must_use]
     pub fn new(models: Arc<ModelManager>, assessor: Arc<dyn ModelHardwareAssessor>) -> Self {
+        let http = models.http.clone();
         Self {
             models,
             assessor,
+            http,
             work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
             hardware_snapshot: tokio::sync::Mutex::new(None),
             hub_repository_snapshots: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -309,9 +315,6 @@ impl HuggingFaceModelCatalog for ModelPreviewService {
                     return Ok(cached.clone());
                 }
             }
-            let http = reqwest::Client::builder()
-                .build()
-                .map_err(|error| InventoryError::Upstream(error.to_string()))?;
             let mut url = reqwest::Url::parse(self.models.client.endpoint())
                 .map_err(|error| InventoryError::Internal(error.to_string()))?;
             url.path_segments_mut()
@@ -332,7 +335,7 @@ impl HuggingFaceModelCatalog for ModelPreviewService {
                 .append_pair("expand", "tags")
                 .append_pair("expand", "private")
                 .append_pair("expand", "gated");
-            let mut outbound = http.get(url);
+            let mut outbound = self.http.get(url);
             if let Some(token) = hub_token() {
                 outbound = outbound.bearer_auth(token);
             }
@@ -393,42 +396,53 @@ impl HuggingFaceModelCatalog for ModelPreviewService {
                     return Ok(cached.clone());
                 }
             }
-            if let Some(cached) = self
+            let cached = self
                 .models
                 .cache
                 .read_index::<CachedHuggingFaceRepositorySnapshot>(
                     ModelIndexKind::HuggingFaceRepositorySnapshot,
                     &cache_key,
-                )
-                .filter(|cached| {
-                    now().saturating_sub(cached.captured_at)
-                        <= HUB_REPOSITORY_SNAPSHOT_TTL.as_secs()
-                })
-            {
+                );
+            if let Some(cached) = cached.as_ref().filter(|cached| {
+                now().saturating_sub(cached.captured_at) <= HUB_REPOSITORY_SNAPSHOT_TTL.as_secs()
+            }) {
                 let mut cache = self.hub_repository_snapshots.lock().await;
                 cache.insert(cache_key, (Instant::now(), cached.snapshot.clone()));
                 trim_discovery_cache(&mut cache);
-                return Ok(cached.snapshot);
+                return Ok(cached.snapshot.clone());
             }
-            let http = reqwest::Client::builder()
-                .build()
-                .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-            let metadata = fetch_hub_model(
-                &http,
+            if let Some(cached) = cached {
+                let snapshot = cached.snapshot.clone();
+                let models = Arc::clone(&self.models);
+                let http = self.http.clone();
+                let endpoint = self.models.client.endpoint().to_owned();
+                let request = request.clone();
+                let background_key = cache_key.clone();
+                tokio::spawn(async move {
+                    let _ = refresh_hub_repository_snapshot(
+                        &models,
+                        &http,
+                        &endpoint,
+                        request,
+                        background_key,
+                        Some(cached.clone()),
+                    )
+                    .await;
+                });
+                let mut cache = self.hub_repository_snapshots.lock().await;
+                cache.insert(cache_key, (Instant::now(), snapshot.clone()));
+                trim_discovery_cache(&mut cache);
+                return Ok(snapshot);
+            }
+            let snapshot = refresh_hub_repository_snapshot(
+                &self.models,
+                &self.http,
                 self.models.client.endpoint(),
-                &request.repository,
-                revision,
+                request,
+                cache_key.clone(),
+                None,
             )
             .await?;
-            let snapshot = metadata.into_snapshot(request.repository)?;
-            self.models.cache.write_index(
-                ModelIndexKind::HuggingFaceRepositorySnapshot,
-                &cache_key,
-                &CachedHuggingFaceRepositorySnapshot {
-                    captured_at: now(),
-                    snapshot: snapshot.clone(),
-                },
-            );
             let mut cache = self.hub_repository_snapshots.lock().await;
             cache.insert(cache_key, (Instant::now(), snapshot.clone()));
             trim_discovery_cache(&mut cache);
@@ -655,12 +669,60 @@ struct HubLfs {
     size: u64,
 }
 
+enum HubModelFetch {
+    NotModified,
+    Modified {
+        model: HubModel,
+        etag: Option<String>,
+    },
+}
+
+async fn refresh_hub_repository_snapshot(
+    models: &ModelManager,
+    http: &reqwest::Client,
+    endpoint: &str,
+    request: HuggingFaceRepositoryRequest,
+    cache_key: String,
+    cached: Option<CachedHuggingFaceRepositorySnapshot>,
+) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+    let fetched = fetch_hub_model(
+        http,
+        endpoint,
+        &request.repository,
+        request.revision.as_str(),
+        cached.as_ref().and_then(|cached| cached.etag.as_deref()),
+    )
+    .await?;
+    let (snapshot, etag) = match fetched {
+        HubModelFetch::NotModified => {
+            let cached = cached.ok_or_else(|| {
+                InventoryError::Upstream(
+                    "Hugging Face returned not modified without cached metadata".to_owned(),
+                )
+            })?;
+            (cached.snapshot, cached.etag)
+        }
+        HubModelFetch::Modified { model, etag } => (model.into_snapshot(request.repository)?, etag),
+    };
+    models.cache.write_index(
+        ModelIndexKind::HuggingFaceRepositorySnapshot,
+        &cache_key,
+        &CachedHuggingFaceRepositorySnapshot {
+            captured_at: now(),
+            etag,
+            snapshot: snapshot.clone(),
+        },
+    );
+    Ok(snapshot)
+}
+
 async fn fetch_hub_model(
     http: &reqwest::Client,
     endpoint: &str,
     repository: &str,
     revision: &str,
-) -> Result<HubModel, InventoryError> {
+    etag: Option<&str>,
+) -> Result<HubModelFetch, InventoryError> {
     let url = hub_metadata_url(endpoint, repository, revision)?;
     let token = hub_token();
     let response = send_hub_request(|| {
@@ -668,17 +730,30 @@ async fn fetch_hub_model(
         if let Some(token) = &token {
             request = request.bearer_auth(token);
         }
+        if let Some(etag) = etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
         request
     })
     .await?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(HubModelFetch::NotModified);
+    }
     if !response.status().is_success() {
         return Err(InventoryError::Upstream(format!(
             "Hugging Face metadata returned HTTP {}",
             response.status()
         )));
     }
-    serde_json::from_slice(&bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?)
-        .map_err(|error| InventoryError::Upstream(error.to_string()))
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let model =
+        serde_json::from_slice(&bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?)
+            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+    Ok(HubModelFetch::Modified { model, etag })
 }
 
 fn retryable_hub_status(status: reqwest::StatusCode) -> bool {
@@ -786,20 +861,60 @@ impl ModelManager {
         self.materialize_preview(artifact)
     }
 
+    pub async fn prepare_preview_from_repository_snapshot(
+        &self,
+        source: &ModelPreviewSource,
+        snapshot: &HuggingFaceRepositorySnapshot,
+    ) -> Result<PreparedPreview, InventoryError> {
+        validate_source(source)?;
+        if snapshot.repository != source.repository || snapshot.commit != source.revision {
+            return Err(InventoryError::Integrity(
+                "repository snapshot does not match the preview source".to_owned(),
+            ));
+        }
+        let evidence = serde_json::to_string(source)
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        let cached = self.cached_preview_artifact(source).filter(|artifact| {
+            artifact.components.iter().all(|component| {
+                self.cache
+                    .read_blob(ModelBlobKind::GgufHeader, &component.header_digest)
+                    .is_some()
+            })
+        });
+        let artifact = match cached {
+            Some(artifact) => artifact,
+            None => {
+                let artifact = self
+                    .acquire_preview_artifact_from_repository_snapshot(source, snapshot)
+                    .await?;
+                self.cache
+                    .write_index(ModelIndexKind::Artifact, &evidence, &artifact);
+                artifact
+            }
+        };
+        self.materialize_preview(artifact)
+    }
+
     async fn acquire_preview_artifact(
         &self,
         source: &ModelPreviewSource,
     ) -> Result<CachedArtifact, InventoryError> {
-        let http = reqwest::Client::builder()
-            .build()
-            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
         let metadata = fetch_hub_model(
-            &http,
+            &self.http,
             self.client.endpoint(),
             &source.repository,
             &source.revision,
+            None,
         )
         .await?;
+        let HubModelFetch::Modified {
+            model: metadata, ..
+        } = metadata
+        else {
+            return Err(InventoryError::Upstream(
+                "Hugging Face returned not modified without cached metadata".to_owned(),
+            ));
+        };
         if metadata.siblings.len() > MAX_HUB_SIBLINGS {
             return Err(InventoryError::Integrity(
                 "Hugging Face metadata contains too many files".to_owned(),
@@ -827,7 +942,7 @@ impl ModelManager {
                 relationship: selected.relationship,
             };
             let header = fetch_header(
-                &http,
+                &self.http,
                 self.client.endpoint(),
                 &source.repository,
                 &commit,
@@ -849,6 +964,57 @@ impl ModelManager {
             commit,
             primary_gguf: source.primary_gguf.clone(),
             components,
+        })
+    }
+
+    async fn acquire_preview_artifact_from_repository_snapshot(
+        &self,
+        source: &ModelPreviewSource,
+        snapshot: &HuggingFaceRepositorySnapshot,
+    ) -> Result<CachedArtifact, InventoryError> {
+        let selected = select_repository_snapshot_components(&snapshot.gguf_files, source)?;
+        let fetched = futures_util::stream::iter(selected.into_iter().enumerate())
+            .map(|(index, component)| async move {
+                let header = fetch_header(
+                    &self.http,
+                    self.client.endpoint(),
+                    &source.repository,
+                    &snapshot.commit,
+                    &component.path,
+                    component.size_bytes,
+                )
+                .await?;
+                let header_digest = format!("{:x}", Sha256::digest(&header));
+                Ok::<_, InventoryError>((
+                    index,
+                    CachedComponent {
+                        component,
+                        header_digest,
+                        acquired_header: Some(header),
+                    },
+                ))
+            })
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+        let mut components = fetched
+            .into_iter()
+            .collect::<Result<Vec<_>, InventoryError>>()?;
+        components.sort_by_key(|(index, _)| *index);
+        for (_, component) in &components {
+            if let Some(header) = &component.acquired_header {
+                self.cache
+                    .write_blob(ModelBlobKind::GgufHeader, &component.header_digest, header);
+            }
+        }
+        Ok(CachedArtifact {
+            repository: source.repository.clone(),
+            commit: snapshot.commit.clone(),
+            primary_gguf: source.primary_gguf.clone(),
+            components: components
+                .into_iter()
+                .map(|(_, component)| component)
+                .collect(),
         })
     }
 
@@ -1166,6 +1332,75 @@ fn select_artifact_components<'a>(
         selected.push(SelectedComponent {
             sibling,
             role: additional.role.clone(),
+            shard_index: None,
+            relationship: Some(component_relationship(additional, &source.primary_gguf)),
+        });
+    }
+    if selected.len() > MAX_MODEL_COMPONENTS as usize {
+        return Err(InventoryError::Integrity(
+            "preview artifact contains too many selected components".to_owned(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn select_repository_snapshot_components(
+    files: &[HuggingFaceRepositoryFile],
+    source: &ModelPreviewSource,
+) -> Result<Vec<ModelComponent>, InventoryError> {
+    let primary_paths = if let Some((prefix, total)) = split_parts(&source.primary_gguf) {
+        let parent = source
+            .primary_gguf
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        (1..=total)
+            .map(|index| parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf")))
+            .collect::<Vec<_>>()
+    } else {
+        vec![source.primary_gguf.clone()]
+    };
+    let mut selected = primary_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let file = files
+                .iter()
+                .find(|file| file.path == *path)
+                .ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "preview GGUF {} does not exist in the repository snapshot",
+                        path.display()
+                    ))
+                })?;
+            Ok(ModelComponent {
+                path: file.path.clone(),
+                role: if primary_paths.len() == 1 {
+                    ComponentRole::Weights
+                } else {
+                    ComponentRole::Shard
+                },
+                size_bytes: file.size_bytes,
+                content: file.content.clone(),
+                shard_index: (primary_paths.len() > 1).then_some(index as u32 + 1),
+                relationship: None,
+            })
+        })
+        .collect::<Result<Vec<_>, InventoryError>>()?;
+    for additional in &source.additional_components {
+        let file = files
+            .iter()
+            .find(|file| file.path == additional.path)
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "preview component {} does not exist in the repository snapshot",
+                    additional.path.display()
+                ))
+            })?;
+        selected.push(ModelComponent {
+            path: file.path.clone(),
+            role: additional.role.clone(),
+            size_bytes: file.size_bytes,
+            content: file.content.clone(),
             shard_index: None,
             relationship: Some(component_relationship(additional, &source.primary_gguf)),
         });
@@ -1546,6 +1781,39 @@ mod tests {
             snapshot.gguf_files[0].content,
             ContentIdentity::Sha256 { .. }
         ));
+    }
+
+    #[test]
+    fn repository_snapshot_supplies_exact_preview_components_without_metadata_refetch() {
+        let source = ModelPreviewSource {
+            repository: "owner/model-gguf".to_owned(),
+            revision: "a".repeat(40),
+            primary_gguf: PathBuf::from("model-00001-of-00002.gguf"),
+            additional_components: Vec::new(),
+        };
+        let files = vec![
+            HuggingFaceRepositoryFile {
+                path: PathBuf::from("model-00001-of-00002.gguf"),
+                size_bytes: 10,
+                content: ContentIdentity::Sha256 {
+                    value: "b".repeat(64),
+                },
+            },
+            HuggingFaceRepositoryFile {
+                path: PathBuf::from("model-00002-of-00002.gguf"),
+                size_bytes: 20,
+                content: ContentIdentity::Sha256 {
+                    value: "c".repeat(64),
+                },
+            },
+        ];
+
+        let selected = select_repository_snapshot_components(&files, &source).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].role, ComponentRole::Shard);
+        assert_eq!(selected[0].shard_index, Some(1));
+        assert_eq!(selected[1].shard_index, Some(2));
+        assert_eq!(selected[1].size_bytes, 20);
     }
 
     impl TemplateAssessor for TestTemplateAssessor {
