@@ -18,6 +18,8 @@ const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 pub enum ModelIndexKind {
     Artifact,
     ArtifactInspection,
+    HuggingFaceRepositorySnapshot,
+    RecommendableModelCatalog,
     HardwareAssessment,
     ExecutionAssessment,
     OfferingAssessment,
@@ -28,6 +30,8 @@ impl ModelIndexKind {
         match self {
             Self::Artifact => "artifacts",
             Self::ArtifactInspection => "inspections/artifacts",
+            Self::HuggingFaceRepositorySnapshot => "sources/hugging-face/repositories",
+            Self::RecommendableModelCatalog => "catalogs/recommendable-models",
             Self::HardwareAssessment => "assessments/hardware",
             Self::ExecutionAssessment => "assessments/execution",
             Self::OfferingAssessment => "assessments/offerings",
