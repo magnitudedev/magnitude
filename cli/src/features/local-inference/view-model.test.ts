@@ -8,12 +8,19 @@ import {
 import {
   buildLocalInferenceSelections,
   describeLocalHardware,
+  formatModelLoadProgress,
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
 import { GIB, makeHardware, makeModel, makeView } from "./test-fixtures"
 
 describe("local inference selection view model", () => {
+  it("uses honest indeterminate and finishing labels around native fractional progress", () => {
+    expect(formatModelLoadProgress(0)).toBe("Loading 0%")
+    expect(formatModelLoadProgress(42)).toBe("Loading 42%")
+    expect(formatModelLoadProgress(100)).toBe("Loading 100%")
+  })
+
   it("presents unified memory from the hardware contract", () => {
     const memoryDomainId = LocalInferenceMemoryDomainIdSchema.make("unified")
     const hardware = makeHardware({

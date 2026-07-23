@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Match, Option, Schema, Scope, Stream } from "effect"
+import { Context, Effect, Layer, Match, Option, Ref, Schema, Scope, Stream } from "effect"
 import {
   buildConfigStateFromSlots,
   type ConfigState,
@@ -45,6 +45,10 @@ export interface ModelSlotCoordinatorApi {
   readonly snapshot: Effect.Effect<MirroredSnapshot<ModelSlotsState>>
   readonly changes: Stream.Stream<MirroredSnapshot<ModelSlotsState>>
   readonly agentModelConfigurations: Stream.Stream<ConfigState>
+  readonly acquireLocalModel: (
+    slotId: SlotId,
+    providerModelId: ProviderModelId,
+  ) => Effect.Effect<void, LocalInferenceError, Scope.Scope>
   readonly updateModelSlot: (
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
@@ -212,6 +216,55 @@ const applyTarget = (previous: ModelSlot, target: ModelSlot): ModelSlot => {
   return transitionToTarget(previous, target)
 }
 
+export const applyLocalModelLoadProgress = (
+  slot: Exclude<ModelSlot, ModelSlotUnassigned>,
+  fraction: number,
+): ModelSlot => applyTarget(slot, new ModelSlotLoadingLocalModel({
+  slotId: slot.slotId,
+  selection: slot.selection,
+  percentage: Math.max(0, Math.min(100, Math.round(fraction * 100))),
+}))
+
+export const applyLocalModelLoadingStage = (
+  slot: ModelSlot,
+  targetProviderModelId: ProviderModelId,
+  fraction: number | null,
+): ModelSlot => {
+  if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) return slot
+  if (slot.selection.providerModelId !== targetProviderModelId) {
+    return applyReplacedLocalModelStage(slot, targetProviderModelId, "unloaded")
+  }
+  return applyLocalModelLoadProgress(slot, fraction ?? 0)
+}
+
+export const applyReplacedLocalModelStage = (
+  slot: ModelSlot,
+  targetProviderModelId: ProviderModelId,
+  stage: "unloading" | "unloaded",
+): ModelSlot => {
+  if (slot._tag === "Unassigned"
+    || slot.selection.providerId !== LOCAL_PROVIDER_ID
+    || slot.selection.providerModelId === targetProviderModelId
+    || slot._tag === "UnloadedLocalModel"
+    || slot._tag === "Blocked") return slot
+  return applyTarget(slot, stage === "unloading"
+    ? new ModelSlotUnloadingLocalModel({ slotId: slot.slotId, selection: slot.selection })
+    : new ModelSlotUnloadedLocalModel({ slotId: slot.slotId, selection: slot.selection }))
+}
+
+export const reconcileAvailableLocalSlot = (
+  slotId: SlotId,
+  selection: SlotSelection,
+  previous: Option.Option<ModelSlot>,
+): ModelSlot => {
+  if (Option.isSome(previous)
+    && previous.value._tag !== "Unassigned"
+    && sameSelection(previous.value.selection, selection)
+    && (previous.value._tag !== "Blocked"
+      || previous.value.reason._tag === "LocalModelLoadFailed")) return previous.value
+  return new ModelSlotUnloadedLocalModel({ slotId, selection })
+}
+
 export const ModelSlotCoordinatorLive: Layer.Layer<
   ModelSlotCoordinator,
   never,
@@ -224,48 +277,21 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
   const nativeInventory = yield* IcnInventory
   const scope = yield* Scope.Scope
   const reconciliationLock = yield* Effect.makeSemaphore(1)
+  const modelAdmission = yield* Effect.makeSemaphore(1)
 
-  const localResidencyTarget = (
+  const localSlotTarget = (
     slotId: SlotId,
     selection: SlotSelection,
     previous: Option.Option<ModelSlot>,
   ): Effect.Effect<ModelSlot> => Effect.gen(function* () {
     const nativeModelId = yield* localModels.nativeModelId(selection.providerModelId)
-    const native = (yield* nativeInventory.get).state.data.find((model) => model.id === nativeModelId)
-    if (!native) return new ModelSlotBlocked({
+    const downloaded = (yield* nativeInventory.get).state.data.some((model) => model.id === nativeModelId)
+    if (!downloaded) return new ModelSlotBlocked({
       slotId,
       selection,
       reason: { _tag: "ModelUnavailable", message: "The selected local model is not downloaded" },
     })
-    if (native.residency.type === "loaded") return new ModelSlotReady({ slotId, selection })
-    if (native.residency.type === "loading") {
-      const observed = Option.flatMap(native.residency.fraction, Option.fromNullable)
-      const priorPercentage = Option.flatMap(previous, (slot) => slot._tag === "LoadingLocalModel"
-        && sameSelection(slot.selection, selection)
-        ? Option.some(slot.percentage)
-        : Option.none())
-      if (Option.isNone(observed)) return new ModelSlotLoadingLocalModel({
-        slotId,
-        selection,
-        percentage: Option.getOrElse(priorPercentage, () => 0),
-      })
-      return new ModelSlotLoadingLocalModel({
-        slotId,
-        selection,
-        percentage: Math.max(0, Math.min(100, Math.round(observed.value * 100))),
-      })
-    }
-    if (native.residency.type === "unloading") return new ModelSlotUnloadingLocalModel({ slotId, selection })
-    if (native.residency.type === "load_failed") return new ModelSlotBlocked({
-      slotId,
-      selection,
-      reason: { _tag: "LocalModelLoadFailed", error: {
-        code: native.residency.code,
-        message: native.residency.message,
-        retryable: native.residency.retryable,
-      } },
-    })
-    return new ModelSlotUnloadedLocalModel({ slotId, selection })
+    return reconcileAvailableLocalSlot(slotId, selection, previous)
   }).pipe(Effect.catchTag("LocalModelMutationFailed", () => Effect.succeed<ModelSlot>(new ModelSlotBlocked({
     slotId,
     selection,
@@ -287,7 +313,7 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
         reason: issue.value,
       }))
       return selected.providerId === LOCAL_PROVIDER_ID
-        ? localResidencyTarget(slotId, selected, previous)
+        ? localSlotTarget(slotId, selected, previous)
         : Effect.succeed<ModelSlot>(new ModelSlotReady({ slotId, selection: selected }))
     },
   })
@@ -321,7 +347,9 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     Effect.zipRight(configuration.get),
   )))
 
-  const initialCatalog = (yield* catalog.snapshot).state
+  const initialCatalogSnapshot = yield* catalog.snapshot
+  const initialNativeInventorySnapshot = yield* nativeInventory.get
+  const initialCatalog = initialCatalogSnapshot.state
   const storedConfiguration = yield* configuration.get
   const persisted = yield* recoverSelections(storedConfiguration, initialCatalog)
   const initialPrimary = yield* targetFor(PRIMARY_SLOT_ID, persisted.slots.primary, initialCatalog, Option.none())
@@ -330,24 +358,50 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     slots: { primary: initialPrimary, secondary: initialSecondary },
   })
 
-  const updateMatchingLocalSlots = (
-    providerModelId: ProviderModelId,
-    update: (slot: Exclude<ModelSlot, ModelSlotUnassigned>) => ModelSlot,
+  const updateLocalSlots = (
+    update: (slot: ModelSlot) => ModelSlot,
   ) => mirror.modify((state) => {
     let changed = false
-    const matching = (slot: ModelSlot): ModelSlot => {
-      if (slot._tag === "Unassigned"
-        || slot.selection.providerId !== LOCAL_PROVIDER_ID
-        || slot.selection.providerModelId !== providerModelId) return slot
+    const apply = (slot: ModelSlot): ModelSlot => {
       const next = update(slot)
       changed ||= !Schema.equivalence(ModelSlotSchema)(slot, next)
       return next
     }
     return {
-      state: { slots: { primary: matching(state.slots.primary), secondary: matching(state.slots.secondary) } },
+      state: { slots: { primary: apply(state.slots.primary), secondary: apply(state.slots.secondary) } },
       result: undefined,
       changed,
     }
+  })
+
+  const updateMatchingLocalSlots = (
+    providerModelId: ProviderModelId,
+    update: (slot: Exclude<ModelSlot, ModelSlotUnassigned>) => ModelSlot,
+  ) => updateLocalSlots((slot) => {
+    if (slot._tag === "Unassigned"
+      || slot.selection.providerId !== LOCAL_PROVIDER_ID
+      || slot.selection.providerModelId !== providerModelId) return slot
+    return update(slot)
+  })
+
+  const updateLoadStage = (
+    providerModelId: ProviderModelId,
+    fraction: Option.Option<number | null>,
+  ) => updateLocalSlots((slot) => applyLocalModelLoadingStage(
+    slot,
+    providerModelId,
+    Option.getOrNull(fraction),
+  ))
+
+  const completeLoad = (providerModelId: ProviderModelId) => updateLocalSlots((slot) => {
+    if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) return slot
+    if (slot.selection.providerModelId !== providerModelId) {
+      return applyReplacedLocalModelStage(slot, providerModelId, "unloaded")
+    }
+    return applyTarget(
+      slot,
+      new ModelSlotReady({ slotId: slot.slotId, selection: slot.selection }),
+    )
   })
 
   const reconcileUnlocked = Effect.gen(function* () {
@@ -376,9 +430,15 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
   })
 
   const reconcile = reconciliationLock.withPermits(1)(reconcileUnlocked)
-  yield* Effect.forkIn(configuration.changes.pipe(Stream.drop(1), Stream.runForEach(() => reconcile)), scope)
-  yield* Effect.forkIn(nativeInventory.changes.pipe(Stream.drop(1), Stream.runForEach(() => reconcile)), scope)
-  yield* Effect.forkIn(catalog.changes.pipe(Stream.drop(1), Stream.runForEach(() => reconcile)), scope)
+  yield* Effect.forkIn(configuration.changes.pipe(Stream.runForEach(() => reconcile)), scope)
+  yield* Effect.forkIn(nativeInventory.changes.pipe(
+    Stream.dropWhile((snapshot) => snapshot.revision <= initialNativeInventorySnapshot.revision),
+    Stream.runForEach(() => reconcile),
+  ), scope)
+  yield* Effect.forkIn(catalog.changes.pipe(
+    Stream.dropWhile((snapshot) => snapshot.revision <= initialCatalogSnapshot.revision),
+    Stream.runForEach(() => reconcile),
+  ), scope)
 
   const reject = (slotId: SlotId, message: string) => new ModelSlotMutationRejected({ slotId, message })
   const slotFailure = (slotId: SlotId, code: string, error: unknown) => new ModelSlotMutationFailed({
@@ -432,13 +492,21 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     providerModelId: ProviderModelId,
   ): Effect.Effect<void, LocalInferenceError> => Effect.gen(function* () {
     const nativeModelId = yield* localModels.nativeModelId(providerModelId)
+    yield* updateMatchingLocalSlots(providerModelId, (slot) => applyTarget(
+      slot,
+      new ModelSlotUnloadingLocalModel({ slotId: slot.slotId, selection: slot.selection }),
+    ))
     yield* icn.models.unloadModel({ path: { model_id: nativeModelId } }).pipe(
       Effect.mapError((error) => localFailure("local_model_unload_failed", error)),
+      Effect.tapError(() => updateMatchingLocalSlots(providerModelId, (slot) => applyTarget(
+        slot,
+        new ModelSlotReady({ slotId: slot.slotId, selection: slot.selection }),
+      ))),
     )
-    yield* nativeInventory.refresh.pipe(
-      Effect.mapError((error) => localFailure("local_model_inventory_refresh_failed", error)),
-    )
-    yield* reconcile
+    yield* updateMatchingLocalSlots(providerModelId, (slot) => applyTarget(
+      slot,
+      new ModelSlotUnloadedLocalModel({ slotId: slot.slotId, selection: slot.selection }),
+    ))
   })
 
   const updateModelSlot: ModelSlotCoordinatorApi["updateModelSlot"] = (slotId, selection) =>
@@ -461,12 +529,14 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
         Option.exists(configuredSelection, (value) => value.providerId === LOCAL_PROVIDER_ID
           && value.providerModelId === previous.selection.providerModelId))
       if (stillSelected) return
-      yield* unloadProviderModel(previous.selection.providerModelId).pipe(
-        Effect.mapError((error) => slotFailure(slotId, "model_slot_followup_unload_failed", error)),
+      yield* modelAdmission.withPermits(1)(
+        unloadProviderModel(previous.selection.providerModelId).pipe(
+          Effect.mapError((error) => slotFailure(slotId, "model_slot_followup_unload_failed", error)),
+        ),
       )
     })
 
-  const loadSelectedSlot = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
+  const loadSelectedSlotUnlocked = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
     Effect.gen(function* () {
       const slot = yield* selectedSlot(slotId)
       if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) {
@@ -492,34 +562,60 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
         Effect.mapError((error) => localFailure("local_model_load_failed", error)),
         Effect.tapError((error) => blockLoad(providerModelId, error)),
       )
+      const readyObserved = yield* Ref.make(false)
+      const replacementStarted = yield* Ref.make(false)
       yield* response.events.pipe(
         Stream.runForEach((event) => {
+          if (event.type === "progress" && event.stage === "unloading") {
+            return updateLocalSlots((current) => applyReplacedLocalModelStage(
+              current,
+              providerModelId,
+              "unloading",
+            )).pipe(Effect.zipRight(Ref.set(replacementStarted, true)))
+          }
+          if (event.type === "progress" && event.stage === "loading") {
+            return updateLoadStage(providerModelId, event.fraction).pipe(Effect.asVoid)
+          }
+          if (event.type === "ready") {
+            return completeLoad(providerModelId).pipe(Effect.zipRight(Ref.set(readyObserved, true)))
+          }
           if (event.type === "failed") {
             const error = new LocalModelMutationFailed({
               code: event.code,
               message: event.message,
               retryable: event.retryable,
             })
-            return blockLoad(providerModelId, error).pipe(Effect.zipRight(error))
+            return blockLoad(providerModelId, error).pipe(Effect.zipRight(Effect.fail(error)))
           }
           return Effect.void
         }),
         Effect.mapError((error) => error._tag === "LocalModelMutationFailed"
           ? error
           : localFailure("local_model_load_stream_failed", error)),
+        Effect.tapError(() => Ref.get(replacementStarted).pipe(
+          Effect.flatMap((started) => started
+            ? updateLocalSlots((current) => applyReplacedLocalModelStage(
+                current,
+                providerModelId,
+                "unloaded",
+              ))
+            : Effect.void),
+        )),
+        Effect.tapError((error) => blockLoad(providerModelId, error)),
       )
-      yield* nativeInventory.refresh.pipe(
-        Effect.mapError((error) => localFailure("local_model_inventory_refresh_failed", error)),
-      )
-      yield* reconcile
+      if (!(yield* Ref.get(readyObserved))) {
+        const error = localFailure("local_model_load_stream_incomplete", "The model load ended before ICN reported readiness")
+        yield* blockLoad(providerModelId, error)
+        return yield* error
+      }
     })
 
   const loadModelSlot: ModelSlotCoordinatorApi["loadModelSlot"] = (slotId, selection) =>
     updateModelSlot(slotId, Option.some(selection)).pipe(
-      Effect.flatMap(() => loadSelectedSlot(slotId)),
+      Effect.flatMap(() => modelAdmission.withPermits(1)(loadSelectedSlotUnlocked(slotId))),
     )
 
-  const unloadModelSlot: ModelSlotCoordinatorApi["unloadModelSlot"] = (slotId) =>
+  const unloadModelSlotUnlocked = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
     Effect.gen(function* () {
       const slot = yield* selectedSlot(slotId)
       if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) {
@@ -530,18 +626,40 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       yield* unloadProviderModel(slot.selection.providerModelId)
     })
 
+  const unloadModelSlot: ModelSlotCoordinatorApi["unloadModelSlot"] = (slotId) =>
+    modelAdmission.withPermits(1)(unloadModelSlotUnlocked(slotId))
+
   const reloadModelSlot: ModelSlotCoordinatorApi["reloadModelSlot"] = (slotId) =>
-    Effect.gen(function* () {
+    modelAdmission.withPermits(1)(Effect.gen(function* () {
       const slot = yield* selectedSlot(slotId)
       if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) {
         return yield* reject(slotId, "The slot does not contain a local model")
       }
-      yield* unloadModelSlot(slotId)
-      yield* loadSelectedSlot(slotId)
-    })
+      yield* unloadModelSlotUnlocked(slotId)
+      yield* loadSelectedSlotUnlocked(slotId)
+    }))
+
+  const acquireLocalModel: ModelSlotCoordinatorApi["acquireLocalModel"] = (
+    slotId,
+    providerModelId,
+  ) => Effect.acquireRelease(
+    modelAdmission.take(1).pipe(
+      Effect.zipRight(Effect.gen(function* () {
+        const slot = yield* selectedSlot(slotId)
+        if (slot._tag === "Unassigned"
+          || slot.selection.providerId !== LOCAL_PROVIDER_ID
+          || slot.selection.providerModelId !== providerModelId) {
+          return yield* reject(slotId, "The local model request no longer matches the selected slot")
+        }
+        yield* loadSelectedSlotUnlocked(slotId)
+      })),
+      Effect.onError(() => modelAdmission.release(1)),
+    ),
+    () => modelAdmission.release(1),
+  ).pipe(Effect.asVoid)
 
   const deleteLocalModel: ModelSlotCoordinatorApi["deleteLocalModel"] = (localModelId) =>
-    Effect.gen(function* () {
+    modelAdmission.withPermits(1)(Effect.gen(function* () {
       const providerModelId = localModels.providerModelId(localModelId)
       const slots = (yield* mirror.get).state.slots
       const affected = [slots.primary, slots.secondary].filter((slot) => slot._tag !== "Unassigned"
@@ -552,7 +670,7 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       const ready = affected.find((slot) => slot._tag === "Ready")
       if (ready?._tag === "Ready") yield* unloadProviderModel(providerModelId)
       yield* localModels.delete(localModelId)
-    })
+    }))
 
   const sameAgentConfiguration = (left: ConfigState, right: ConfigState): boolean =>
     (["primary", "secondary"] as const).every((slotId) => {
@@ -592,6 +710,7 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     snapshot: mirror.get,
     changes: mirror.changes,
     agentModelConfigurations,
+    acquireLocalModel,
     updateModelSlot,
     loadModelSlot,
     reloadModelSlot,

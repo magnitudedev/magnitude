@@ -1242,16 +1242,6 @@ export const JsonSchemaRequest = S.Struct({
 export type JsonSchemaRequest = S.Schema.Type<typeof JsonSchemaRequest>
 export type JsonSchemaRequestEncoded = S.Schema.Encoded<typeof JsonSchemaRequest>
 
-export const LoadStageSchema = S.Union(
-  S.Literal("opening"),
-  S.Literal("mapping"),
-  S.Literal("allocating"),
-  S.Literal("initializing_context"),
-  S.Literal("warming"),
-)
-export type LoadStageSchema = S.Schema.Type<typeof LoadStageSchema>
-export type LoadStageSchemaEncoded = S.Schema.Encoded<typeof LoadStageSchema>
-
 export const LocalDeclarationSchema = S.Union(
   S.Literal("configuration"),
   S.Literal("discovery"),
@@ -1289,7 +1279,6 @@ export const Model = S.Struct({
   properties: S.suspend(
     (): S.Schema<InventoryPropertiesSchema, InventoryPropertiesSchemaEncoded> => InventoryPropertiesSchema,
   ),
-  residency: S.suspend((): S.Schema<ModelResidencySchema, ModelResidencySchemaEncoded> => ModelResidencySchema),
   serving_configuration: S.optionalWith(
     S.Union(
       S.Null,
@@ -1465,7 +1454,6 @@ export const ModelLoadEvent = S.Union(
   ),
   S.extend(
     S.Struct({
-      generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       model_id: S.String,
       operation_id: S.String,
       type: S.Literal("ready"),
@@ -1640,56 +1628,6 @@ export const ModelPreviewSourceSchema = S.extend(
 )
 export type ModelPreviewSourceSchema = S.Schema.Type<typeof ModelPreviewSourceSchema>
 export type ModelPreviewSourceSchemaEncoded = S.Schema.Encoded<typeof ModelPreviewSourceSchema>
-
-export const ModelResidencySchema = S.Union(
-  S.extend(
-    S.Struct({
-      type: S.Literal("not_resident"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      fraction: S.optionalWith(S.Union(S.Number, S.Null), { exact: true, as: "Option" }),
-      load_id: S.String,
-      stage: S.suspend((): S.Schema<LoadStageSchema, LoadStageSchemaEncoded> => LoadStageSchema),
-      started_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      type: S.Literal("loading"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      backend: S.String,
-      context_length: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      execution: S.suspend((): S.Schema<Value, ValueEncoded> => Value),
-      loaded_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      type: S.Literal("loaded"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      load_id: S.String,
-      started_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      type: S.Literal("unloading"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      attempted_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      code: S.String,
-      message: S.String,
-      retryable: S.Boolean,
-      stage: S.suspend((): S.Schema<LoadStageSchema, LoadStageSchemaEncoded> => LoadStageSchema),
-      type: S.Literal("load_failed"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type ModelResidencySchema = S.Schema.Type<typeof ModelResidencySchema>
-export type ModelResidencySchemaEncoded = S.Schema.Encoded<typeof ModelResidencySchema>
 
 export const ModelSourceSchema = S.Union(
   S.extend(
@@ -1918,12 +1856,6 @@ export const ResponseFormatRequest = S.Union(
 )
 export type ResponseFormatRequest = S.Schema.Type<typeof ResponseFormatRequest>
 export type ResponseFormatRequestEncoded = S.Schema.Encoded<typeof ResponseFormatRequest>
-
-export const RuntimeChangesResponse = S.Struct({
-  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type RuntimeChangesResponse = S.Schema.Type<typeof RuntimeChangesResponse>
-export type RuntimeChangesResponseEncoded = S.Schema.Encoded<typeof RuntimeChangesResponse>
 
 export const ServingConfigurationSchema = S.Struct({
   profile: S.suspend((): S.Schema<ServingProfileSchema, ServingProfileSchemaEncoded> => ServingProfileSchema),

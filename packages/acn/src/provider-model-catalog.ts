@@ -292,9 +292,10 @@ export const ProviderModelCatalogLive: Layer.Layer<
       )
     }))
 
+  const initialLocalInventorySnapshot = yield* localInventory.snapshot
   yield* refreshNow(false, Option.none())
   yield* Effect.forkIn(localInventory.changes.pipe(
-    Stream.drop(1),
+    Stream.dropWhile((snapshot) => snapshot.revision <= initialLocalInventorySnapshot.revision),
     Stream.runForEach(() => lock.withPermits(1)(Effect.gen(function* () {
       yield* beginRefresh
       yield* reconcile([])

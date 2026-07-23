@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, Request, State};
@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
-    ChatTemplateRequest, CompletionBackend, DownloadModelRequest, ExecutionConfig,
+    ChatTemplateRequest, CompletionBackend, DeletedModel, DownloadModelRequest, ExecutionConfig,
     ExecutionConfigReport, FinishReason, FlashAttention, Generation, GenerationMetrics,
     GenerationSnapshot, GpuLayers, GrammarTrigger, HardwareProvider, HardwareSnapshot,
     HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults,
@@ -33,7 +33,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use utoipa::openapi::extensions::Extensions;
 use utoipa::openapi::path::Operation;
 use utoipa::openapi::{Components, OpenApi as OpenApiDocument, RefOr};
-use utoipa::{IntoParams, OpenApi, PartialSchema, ToSchema};
+use utoipa::{OpenApi, PartialSchema, ToSchema};
 
 mod inventory_schema;
 mod media;
@@ -94,11 +94,6 @@ pub struct BackendRegistry {
     mutating: Arc<AtomicBool>,
     mutation_available: Arc<Notify>,
     lease_released: Arc<Notify>,
-    idle_since: Arc<Mutex<tokio::time::Instant>>,
-    activity_changed: Arc<Notify>,
-    activity_revision: Arc<AtomicU64>,
-    runtime_changed: Arc<Notify>,
-    runtime_revision: Arc<AtomicU64>,
 }
 
 struct BackendRegistryState {
@@ -115,9 +110,6 @@ pub struct BackendLease {
     generation: u64,
     active_leases: Arc<AtomicU64>,
     lease_released: Arc<Notify>,
-    idle_since: Arc<Mutex<tokio::time::Instant>>,
-    activity_changed: Arc<Notify>,
-    activity_revision: Arc<AtomicU64>,
 }
 
 pub struct BackendMutationGuard {
@@ -158,16 +150,8 @@ impl BackendLease {
 
 impl Drop for BackendLease {
     fn drop(&mut self) {
-        if self.active_leases.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut idle_since = self
-                .idle_since
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *idle_since = tokio::time::Instant::now();
-        }
+        self.active_leases.fetch_sub(1, Ordering::AcqRel);
         self.lease_released.notify_waiters();
-        self.activity_revision.fetch_add(1, Ordering::Release);
-        self.activity_changed.notify_one();
     }
 }
 
@@ -185,11 +169,6 @@ impl BackendRegistry {
             mutating: Arc::new(AtomicBool::new(false)),
             mutation_available: Arc::new(Notify::new()),
             lease_released: Arc::new(Notify::new()),
-            idle_since: Arc::new(Mutex::new(tokio::time::Instant::now())),
-            activity_changed: Arc::new(Notify::new()),
-            activity_revision: Arc::new(AtomicU64::new(0)),
-            runtime_changed: Arc::new(Notify::new()),
-            runtime_revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -206,13 +185,9 @@ impl BackendRegistry {
         let state = self.inner.read().ok()?;
         let backend = state.backend.clone()?;
         self.active_leases.fetch_add(1, Ordering::AcqRel);
-        self.activity_revision.fetch_add(1, Ordering::Release);
-        self.activity_changed.notify_one();
         if self.mutating.load(Ordering::Acquire) {
             self.active_leases.fetch_sub(1, Ordering::AcqRel);
             self.lease_released.notify_waiters();
-            self.activity_revision.fetch_add(1, Ordering::Release);
-            self.activity_changed.notify_one();
             return None;
         }
         Some(BackendLease {
@@ -221,9 +196,6 @@ impl BackendRegistry {
             generation: state.generation,
             active_leases: Arc::clone(&self.active_leases),
             lease_released: Arc::clone(&self.lease_released),
-            idle_since: Arc::clone(&self.idle_since),
-            activity_changed: Arc::clone(&self.activity_changed),
-            activity_revision: Arc::clone(&self.activity_revision),
         })
     }
 
@@ -248,41 +220,6 @@ impl BackendRegistry {
         state.model_aliases = Arc::new(aliases);
     }
 
-    /// The start of the current model-idle interval. It advances only when a
-    /// backend becomes ready or the final protected inference lease ends.
-    pub fn idle_since(&self) -> tokio::time::Instant {
-        self.idle_since
-            .lock()
-            .map(|value| *value)
-            .unwrap_or_else(|poisoned| *poisoned.into_inner())
-    }
-
-    pub fn activity_revision(&self) -> u64 {
-        self.activity_revision.load(Ordering::Acquire)
-    }
-
-    pub async fn activity_changed_since(&self, observed: u64) {
-        loop {
-            let notified = self.activity_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.activity_revision() != observed {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    fn begin_idle_interval(&self) {
-        let mut idle_since = self
-            .idle_since
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *idle_since = tokio::time::Instant::now();
-        self.activity_revision.fetch_add(1, Ordering::Release);
-        self.activity_changed.notify_one();
-    }
-
     pub fn try_begin_mutation(&self) -> Option<BackendMutationGuard> {
         self.mutating
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -296,32 +233,6 @@ impl BackendRegistry {
             mutating: Arc::clone(&self.mutating),
             mutation_available: Arc::clone(&self.mutation_available),
         })
-    }
-
-    /// Claims one exact due idle generation without waiting behind inference.
-    /// A lease or replacement winning first changes the revision/generation and
-    /// makes the claim fail; the caller must reschedule from fresh evidence.
-    pub fn try_begin_idle_mutation(
-        &self,
-        expected_generation: u64,
-        expected_revision: u64,
-        idle_timeout: std::time::Duration,
-    ) -> Option<BackendMutationGuard> {
-        let matches = || {
-            self.generation() == expected_generation
-                && self.activity_revision() == expected_revision
-                && self.active_leases() == 0
-                && self.idle_since().elapsed() >= idle_timeout
-        };
-        if !matches() {
-            return None;
-        }
-        let guard = self.try_begin_mutation()?;
-        if !matches() {
-            drop(guard);
-            return None;
-        }
-        Some(guard)
     }
 
     pub async fn begin_mutation(&self) -> BackendMutationGuard {
@@ -360,8 +271,6 @@ impl BackendRegistry {
         state.model_aliases = Arc::new(aliases);
         let generation = state.generation;
         drop(state);
-        self.begin_idle_interval();
-        self.notify_runtime_changed();
         generation
     }
 
@@ -374,36 +283,11 @@ impl BackendRegistry {
         state.model_aliases = Arc::new(BTreeSet::new());
         let generation = state.generation;
         drop(state);
-        self.begin_idle_interval();
-        self.notify_runtime_changed();
         generation
     }
 
     pub fn generation(&self) -> u64 {
         self.inner.read().map(|state| state.generation).unwrap_or(0)
-    }
-
-    pub fn runtime_revision(&self) -> u64 {
-        self.runtime_revision.load(Ordering::Acquire)
-    }
-
-    pub fn notify_runtime_changed(&self) -> u64 {
-        let revision = self.runtime_revision.fetch_add(1, Ordering::AcqRel) + 1;
-        self.runtime_changed.notify_waiters();
-        revision
-    }
-
-    pub async fn runtime_changed_since(&self, observed: u64) -> u64 {
-        loop {
-            let notified = self.runtime_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let current = self.runtime_revision();
-            if current != observed {
-                return current;
-            }
-            notified.await;
-        }
     }
 }
 
@@ -488,7 +372,6 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     let mut protected = Router::new()
         .route("/v1/hardware", get(hardware))
-        .route("/v1/runtime/changes", get(runtime_changes))
         .route("/v1/models", get(models))
         .route("/v1/models/preview", post(preview_model))
         .route(
@@ -588,7 +471,6 @@ pub enum ModelLoadEvent {
     Ready {
         operation_id: String,
         model_id: String,
-        generation: u64,
     },
     Failed {
         operation_id: String,
@@ -612,8 +494,9 @@ pub enum ModelLoadStage {
 
 pub trait RuntimeController: Send + Sync + 'static {
     fn load(&self, model_id: String) -> BoxStream<'static, ModelLoadEvent>;
-    fn acquire(&self, model_id: String) -> BoxFuture<'_, Result<BackendLease, InventoryError>>;
+    fn lease(&self, model_id: String) -> BoxFuture<'_, Result<BackendLease, InventoryError>>;
     fn unload(&self, model_id: String) -> BoxFuture<'_, Result<(), InventoryError>>;
+    fn delete(&self, model_id: String) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -621,19 +504,6 @@ pub trait RuntimeController: Send + Sync + 'static {
 pub struct ModelList {
     object: &'static str,
     data: Vec<Model>,
-}
-
-#[derive(Debug, Deserialize, IntoParams)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeChangesQuery {
-    #[param(nullable = false)]
-    after: Option<u64>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeChangesResponse {
-    revision: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -654,8 +524,6 @@ pub struct Model {
     serving_configuration: Option<ServingConfigurationSchema>,
     #[schema(value_type = inventory_schema::ModelAvailabilitySchema)]
     availability: JsonValue,
-    #[schema(value_type = inventory_schema::ModelResidencySchema)]
-    residency: JsonValue,
     #[schema(value_type = inventory_schema::ModelSourceSchema)]
     source: JsonValue,
     #[schema(value_type = inventory_schema::ModelLocationSchema)]
@@ -682,7 +550,6 @@ impl Model {
             supported_parameters: Vec::new(),
             serving_configuration: None,
             availability: JsonValue::Null,
-            residency: JsonValue::Null,
             source: JsonValue::Null,
             location: JsonValue::Null,
             properties: JsonValue::Null,
@@ -710,7 +577,6 @@ impl Model {
                 }
             }),
             availability: json_value(model.availability)?,
-            residency: json_value(model.residency)?,
             source: json_value(model.source)?,
             location: json_value(model.location)?,
             properties: json_value(model.properties)?,
@@ -1669,31 +1535,6 @@ async fn models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiErr
     }))
 }
 
-#[utoipa::path(
-    get,
-    path = "/v1/runtime/changes",
-    operation_id = "observeRuntimeChanges",
-    tag = "runtime",
-    params(RuntimeChangesQuery),
-    responses((status = 200, description = "Current or next runtime inventory revision", body = RuntimeChangesResponse))
-)]
-#[tracing::instrument(name = "icn.runtime.changes", skip_all)]
-async fn runtime_changes(
-    State(state): State<AppState>,
-    Query(query): Query<RuntimeChangesQuery>,
-) -> Json<RuntimeChangesResponse> {
-    let revision = match query.after {
-        Some(after) if state.backends.runtime_revision() == after => tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            state.backends.runtime_changed_since(after),
-        )
-        .await
-        .unwrap_or(after),
-        _ => state.backends.runtime_revision(),
-    };
-    Json(RuntimeChangesResponse { revision })
-}
-
 #[utoipa::path(post, path = "/v1/models/preview", operation_id = "previewModel", tag = "models",
     request_body(content = inventory_schema::ModelPreviewRequestSchema, content_type = "application/json"),
     responses(
@@ -1858,8 +1699,12 @@ async fn delete_model(
             magnitude: json_value(plan)?,
         }));
     }
-    let deleted = inventory
-        .delete(&id)
+    let runtime = state
+        .runtime
+        .as_ref()
+        .ok_or_else(|| ApiError::server("runtime controller is not configured"))?;
+    let deleted = runtime
+        .delete(id.0)
         .await
         .map_err(ApiError::from_inventory)?;
     Ok(Json(DeleteModelResponse {
@@ -1972,7 +1817,7 @@ async fn chat_completions(
         .ok_or_else(|| ApiError::invalid("model is required"))?;
     let lease = if let Some(runtime) = state.runtime.as_ref() {
         runtime
-            .acquire(model_id)
+            .lease(model_id)
             .await
             .map_err(ApiError::from_inventory)?
     } else {
@@ -2924,7 +2769,6 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
     paths(
         health,
         hardware,
-        runtime_changes,
         search_hugging_face_models,
         resolve_hugging_face_repository,
         models,
@@ -2949,10 +2793,8 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         inventory_schema::HuggingFaceRepositoryRequestSchema,
         inventory_schema::HuggingFaceRepositorySnapshotSchema,
         ModelList,
-        RuntimeChangesResponse,
         Model,
         inventory_schema::ModelAvailabilitySchema,
-        inventory_schema::ModelResidencySchema,
         inventory_schema::ModelSourceSchema,
         inventory_schema::ModelLocationSchema,
         inventory_schema::InventoryPropertiesSchema,
@@ -3688,20 +3530,19 @@ mod tests {
 
     struct StubRuntime {
         backends: BackendRegistry,
-        acquisitions: Arc<AtomicU64>,
+        leases: Arc<AtomicU64>,
+        loads: Arc<AtomicU64>,
     }
 
     impl RuntimeController for StubRuntime {
         fn load(&self, _model_id: String) -> BoxStream<'static, ModelLoadEvent> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
             futures_util::stream::empty().boxed()
         }
 
-        fn acquire(
-            &self,
-            _model_id: String,
-        ) -> BoxFuture<'_, Result<BackendLease, InventoryError>> {
+        fn lease(&self, _model_id: String) -> BoxFuture<'_, Result<BackendLease, InventoryError>> {
             Box::pin(async {
-                self.acquisitions.fetch_add(1, Ordering::Relaxed);
+                self.leases.fetch_add(1, Ordering::Relaxed);
                 self.backends
                     .lease()
                     .ok_or_else(|| InventoryError::Internal("test backend unavailable".into()))
@@ -3711,16 +3552,26 @@ mod tests {
         fn unload(&self, _model_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
             Box::pin(async { Ok(()) })
         }
+
+        fn delete(&self, model_id: String) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
+            Box::pin(async move {
+                Err(InventoryError::Unsupported(format!(
+                    "cannot delete {model_id} in stub runtime"
+                )))
+            })
+        }
     }
 
     #[tokio::test]
-    async fn ordinary_chat_acquires_the_requested_model_before_streaming() {
+    async fn ordinary_chat_leases_the_requested_resident_model_before_streaming() {
         let backends =
             BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
-        let acquisitions = Arc::new(AtomicU64::new(0));
+        let leases = Arc::new(AtomicU64::new(0));
+        let loads = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(StubRuntime {
             backends: backends.clone(),
-            acquisitions: Arc::clone(&acquisitions),
+            leases: Arc::clone(&leases),
+            loads: Arc::clone(&loads),
         });
         let response = app(AppState::model_free(backends).with_runtime(runtime))
             .oneshot(
@@ -3742,17 +3593,20 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("ready"));
-        assert_eq!(acquisitions.load(Ordering::Relaxed), 1);
+        assert_eq!(leases.load(Ordering::Relaxed), 1);
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
-    async fn invalid_chat_is_rejected_before_runtime_admission() {
+    async fn invalid_chat_is_rejected_before_model_lease() {
         let backends =
             BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
-        let acquisitions = Arc::new(AtomicU64::new(0));
+        let leases = Arc::new(AtomicU64::new(0));
+        let loads = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(StubRuntime {
             backends: backends.clone(),
-            acquisitions: Arc::clone(&acquisitions),
+            leases: Arc::clone(&leases),
+            loads,
         });
         let response = app(AppState::model_free(backends).with_runtime(runtime))
             .oneshot(
@@ -3771,7 +3625,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(acquisitions.load(Ordering::Relaxed), 0);
+        assert_eq!(leases.load(Ordering::Relaxed), 0);
     }
 
     struct ScriptedBackend {
@@ -3947,10 +3801,7 @@ mod tests {
             schemas["Model"]["properties"]["availability"]["$ref"],
             "#/components/schemas/ModelAvailabilitySchema"
         );
-        assert_eq!(
-            schemas["Model"]["properties"]["residency"]["$ref"],
-            "#/components/schemas/ModelResidencySchema"
-        );
+        assert!(schemas["Model"]["properties"].get("residency").is_none());
         assert_eq!(
             schemas["Model"]["properties"]["hardware"]["$ref"],
             "#/components/schemas/HardwareAssessmentSchema"
@@ -3968,6 +3819,7 @@ mod tests {
     fn exported_contract_is_model_centric() {
         let value = serde_json::to_value(openapi().unwrap()).unwrap();
         assert!(value["paths"].get("/v1/runtime").is_none());
+        assert!(value["paths"].get("/v1/runtime/changes").is_none());
         let load = &value["paths"]["/v1/models/{model_id}/load"]["post"];
         assert_eq!(load[STREAM_EXTENSION]["framing"], "sse");
         assert_eq!(load[STREAM_EXTENSION]["termination"]["type"], "eof");
@@ -4096,27 +3948,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_generation_observation_is_initial_and_then_change_driven() {
-        let registry = BackendRegistry::empty();
-        let initial = registry.runtime_revision();
-        let waiting = registry.clone();
-        let change = tokio::spawn(async move { waiting.runtime_changed_since(initial).await });
-        tokio::task::yield_now().await;
-        assert!(!change.is_finished());
-
-        let published = registry.replace(
-            Arc::new(FakeBackend::new("test-model", "ok")),
-            BTreeSet::new(),
-        );
-        assert_eq!(change.await.expect("change observer"), published);
-
-        let activity = registry.activity_revision();
-        assert_eq!(registry.observe().expect("metadata").model_id, "test-model");
-        assert_eq!(registry.activity_revision(), activity);
-        assert_eq!(registry.active_leases(), 0);
-    }
-
-    #[tokio::test]
     async fn coordinated_mutation_waits_for_the_response_lease() {
         let registry =
             BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ok")));
@@ -4138,69 +3969,6 @@ mod tests {
         assert!(registry.lease().is_none());
         drop(guard);
         assert!(registry.lease().is_some());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn backend_idle_interval_starts_when_the_final_inference_lease_ends() {
-        let registry =
-            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ok")));
-        let ready_at = registry.idle_since();
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
-
-        let first = registry.lease().expect("first lease");
-        let second = registry.lease().expect("second lease");
-        tokio::time::advance(std::time::Duration::from_secs(20)).await;
-        drop(first);
-        assert_eq!(registry.idle_since(), ready_at);
-
-        drop(second);
-        assert_eq!(registry.idle_since(), tokio::time::Instant::now());
-        tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        assert_eq!(
-            registry.idle_since().elapsed(),
-            std::time::Duration::from_secs(5)
-        );
-
-        drop(registry.lease().expect("no-op model use"));
-        assert_eq!(registry.idle_since(), tokio::time::Instant::now());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn inference_winning_the_idle_deadline_race_starts_a_fresh_interval() {
-        let registry =
-            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ok")));
-        let generation = registry.generation();
-        let due_revision = registry.activity_revision();
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
-        let lease = registry.lease().expect("inference admission");
-        assert!(
-            registry
-                .try_begin_idle_mutation(
-                    generation,
-                    due_revision,
-                    std::time::Duration::from_secs(30),
-                )
-                .is_none(),
-            "idle maintenance must not wait behind inference",
-        );
-
-        drop(lease);
-        assert_eq!(registry.idle_since(), tokio::time::Instant::now());
-        assert_eq!(
-            registry.idle_since().elapsed(),
-            std::time::Duration::ZERO,
-            "idle unload must recheck after inference drains",
-        );
-        assert!(
-            registry
-                .try_begin_idle_mutation(
-                    generation,
-                    registry.activity_revision(),
-                    std::time::Duration::from_secs(30),
-                )
-                .is_none(),
-            "the completed inference owns a fresh idle interval",
-        );
     }
 
     #[test]

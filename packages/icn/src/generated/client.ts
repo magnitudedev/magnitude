@@ -35,7 +35,6 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         downloadModel: makeStreamOperation(http, options, Operations.downloadModelOperation),
         loadModel: makeStreamOperation(http, options, Operations.loadModelOperation),
       },
-      runtime: { observeRuntimeChanges: makeHttpOperation(http, options, Operations.observeRuntimeChangesOperation) },
       system: {
         getHardware: makeHttpOperation(http, options, Operations.getHardwareOperation),
         health: makeHttpOperation(http, options, Operations.healthOperation),

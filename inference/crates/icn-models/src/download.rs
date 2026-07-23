@@ -12,7 +12,7 @@ use icn_contracts::{
     ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress,
     DownloadModelRequest, DownloadStage, HardwareAssessment, HuggingFaceDownloadSource, Integrity,
     InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
-    ModelDownloadEvent, ModelLocation, ModelResidency, ModelSource, ServingConfiguration,
+    ModelDownloadEvent, ModelLocation, ModelSource, ServingConfiguration,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -314,7 +314,6 @@ impl ModelManager {
                 started_at,
                 updated_at: started_at,
             },
-            residency: ModelResidency::NotResident,
             source: ModelSource::HuggingFace {
                 repository: repository.clone(),
                 requested_revision: revision.clone(),

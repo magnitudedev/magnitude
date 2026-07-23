@@ -5,6 +5,7 @@ import { Button } from "../../components/button"
 import { formatMemoryBytes } from "../../components/hardware-memory-domain"
 import { StackedBar, type StackedBarSegment } from "../../components/stacked-bar"
 import { useTheme } from "../../hooks/use-theme"
+import { formatModelLoadProgress } from "./view-model"
 
 interface LocalInferenceStatusBarProps {
   readonly state: LocalInferenceView
@@ -49,7 +50,7 @@ export const LocalInferenceStatusBar = ({ state, width, onOpenHardware }: LocalI
   if (!slot && !entry) return null
   const modelName = entry?.model.displayName ?? "Local model"
   const status = slot
-    ? slot._tag === "LoadingLocalModel" ? `Loading ${slot.percentage}%`
+    ? slot._tag === "LoadingLocalModel" ? formatModelLoadProgress(slot.percentage)
       : slot._tag === "UnloadedLocalModel" ? "Unloaded"
         : slot._tag === "UnloadingLocalModel" ? "Unloading"
           : slot._tag === "Blocked" ? "Failed"

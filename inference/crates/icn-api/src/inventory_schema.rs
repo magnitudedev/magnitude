@@ -7,7 +7,6 @@
 #![allow(dead_code)]
 
 use serde::Serialize;
-use serde_json::Value as JsonValue;
 use utoipa::ToSchema;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -366,16 +365,6 @@ pub enum DownloadStageSchema {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadStageSchema {
-    Opening,
-    Mapping,
-    Allocating,
-    InitializingContext,
-    Warming,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelAvailabilitySchema {
     Downloading {
@@ -407,35 +396,6 @@ pub enum ModelAvailabilitySchema {
         detected_at: u64,
         code: String,
         message: String,
-    },
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelResidencySchema {
-    NotResident,
-    Loading {
-        load_id: String,
-        stage: LoadStageSchema,
-        started_at: u64,
-        fraction: Option<f32>,
-    },
-    Loaded {
-        loaded_at: u64,
-        backend: String,
-        context_length: u32,
-        execution: JsonValue,
-    },
-    Unloading {
-        load_id: String,
-        started_at: u64,
-    },
-    LoadFailed {
-        attempted_at: u64,
-        stage: LoadStageSchema,
-        code: String,
-        message: String,
-        retryable: bool,
     },
 }
 

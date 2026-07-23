@@ -105,5 +105,6 @@ export interface UsageExtension<TResponse = UsageResponse, TError = unknown, R =
 }
 /** Process-local request attribution, such as per-slot MRU updates. */
 export interface RequestAttribution {
+  readonly key: string
   readonly requestStarted: Effect.Effect<void, never, never>
 }

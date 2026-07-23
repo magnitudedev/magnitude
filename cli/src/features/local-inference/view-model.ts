@@ -53,6 +53,8 @@ export const formatContext = (tokens: number): string => tokens < 1_000
     ? `${tokens / 1_024}K`
     : `${Math.round(tokens / 1_000)}K`
 
+export const formatModelLoadProgress = (percentage: number): string => `Loading ${percentage}%`
+
 export interface LocalHardwarePresentation {
   readonly system: { readonly name: string; readonly details: readonly string[] }
   readonly accelerators: readonly { readonly name: string; readonly details: string }[]

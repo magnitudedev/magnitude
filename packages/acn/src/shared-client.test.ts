@@ -81,7 +81,7 @@ const providerClient = (label: string): ProviderClientShape => ({
   sessionId: "session",
   resolveModel: () => Effect.die("not used"),
   discoverModelProperties: () => Effect.succeed(ModelDiscoveryOperationIdSchema.make("test")),
-  requestAttribution: () => ({ requestStarted: Effect.void }),
+  requestAttribution: (_providerId, _providerModelId, key) => ({ key, requestStarted: Effect.void }),
   webSearch: () => Effect.die("not used"),
   usage: () => Effect.die("not used"),
   runtimeConfig: { disableTraits: false },

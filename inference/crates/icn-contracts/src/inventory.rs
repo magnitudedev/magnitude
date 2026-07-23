@@ -208,36 +208,6 @@ pub enum ModelAvailability {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelResidency {
-    NotResident,
-    Loading {
-        load_id: String,
-        stage: LoadStage,
-        started_at: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        fraction: Option<f32>,
-    },
-    Loaded {
-        loaded_at: u64,
-        backend: String,
-        context_length: u32,
-        execution: BTreeMap<String, serde_json::Value>,
-    },
-    Unloading {
-        load_id: String,
-        started_at: u64,
-    },
-    LoadFailed {
-        attempted_at: u64,
-        stage: LoadStage,
-        code: String,
-        message: String,
-        retryable: bool,
-    },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadStage {
@@ -247,16 +217,6 @@ pub enum DownloadStage {
     Downloading,
     Verifying,
     Publishing,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadStage {
-    Opening,
-    Mapping,
-    Allocating,
-    InitializingContext,
-    Warming,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,7 +758,6 @@ pub struct InventoryModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving_configuration: Option<ServingConfiguration>,
     pub availability: ModelAvailability,
-    pub residency: ModelResidency,
     pub source: ModelSource,
     pub location: ModelLocation,
     pub properties: InventoryProperties,
@@ -960,11 +919,6 @@ pub trait ModelInventory: Send + Sync + 'static {
     fn plan_delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletePlan, InventoryError>>;
     fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
     fn resolve_ready(&self, id: &ModelId) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>>;
-    fn update_residency(
-        &self,
-        id: &ModelId,
-        residency: ModelResidency,
-    ) -> BoxFuture<'_, Result<(), InventoryError>>;
     fn configure_serving(
         &self,
         id: &ModelId,

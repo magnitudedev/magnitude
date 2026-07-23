@@ -766,38 +766,6 @@
           }
         }
       }
-    },
-    "/v1/runtime/changes": {
-      "get": {
-        "tags": [
-          "runtime"
-        ],
-        "operationId": "observeRuntimeChanges",
-        "parameters": [
-          {
-            "name": "after",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Current or next runtime inventory revision",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RuntimeChangesResponse"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
   "components": {
@@ -3462,16 +3430,6 @@
         },
         "additionalProperties": false
       },
-      "LoadStageSchema": {
-        "type": "string",
-        "enum": [
-          "opening",
-          "mapping",
-          "allocating",
-          "initializing_context",
-          "warming"
-        ]
-      },
       "LocalDeclarationSchema": {
         "type": "string",
         "enum": [
@@ -3507,7 +3465,6 @@
           "object",
           "owned_by",
           "availability",
-          "residency",
           "source",
           "location",
           "properties",
@@ -3561,9 +3518,6 @@
           },
           "availability": {
             "$ref": "#/components/schemas/ModelAvailabilitySchema"
-          },
-          "residency": {
-            "$ref": "#/components/schemas/ModelResidencySchema"
           },
           "source": {
             "$ref": "#/components/schemas/ModelSourceSchema"
@@ -4065,7 +4019,6 @@
             "required": [
               "operation_id",
               "model_id",
-              "generation",
               "type"
             ],
             "properties": {
@@ -4074,11 +4027,6 @@
               },
               "model_id": {
                 "type": "string"
-              },
-              "generation": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
               },
               "type": {
                 "type": "string",
@@ -4419,153 +4367,6 @@
             }
           }
         }
-      },
-      "ModelResidencySchema": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "not_resident"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "load_id",
-              "stage",
-              "started_at",
-              "type"
-            ],
-            "properties": {
-              "load_id": {
-                "type": "string"
-              },
-              "stage": {
-                "$ref": "#/components/schemas/LoadStageSchema"
-              },
-              "started_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "fraction": {
-                "type": [
-                  "number",
-                  "null"
-                ],
-                "format": "float"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "loading"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "loaded_at",
-              "backend",
-              "context_length",
-              "execution",
-              "type"
-            ],
-            "properties": {
-              "loaded_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "backend": {
-                "type": "string"
-              },
-              "context_length": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "execution": {
-                "$ref": "#/components/schemas/Value"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "loaded"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "load_id",
-              "started_at",
-              "type"
-            ],
-            "properties": {
-              "load_id": {
-                "type": "string"
-              },
-              "started_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "unloading"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "attempted_at",
-              "stage",
-              "code",
-              "message",
-              "retryable",
-              "type"
-            ],
-            "properties": {
-              "attempted_at": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "stage": {
-                "$ref": "#/components/schemas/LoadStageSchema"
-              },
-              "code": {
-                "type": "string"
-              },
-              "message": {
-                "type": "string"
-              },
-              "retryable": {
-                "type": "boolean"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "load_failed"
-                ]
-              }
-            }
-          }
-        ]
       },
       "ModelSourceSchema": {
         "oneOf": [
@@ -5076,20 +4877,6 @@
             }
           }
         ]
-      },
-      "RuntimeChangesResponse": {
-        "type": "object",
-        "required": [
-          "revision"
-        ],
-        "properties": {
-          "revision": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
       },
       "ServingConfigurationSchema": {
         "type": "object",
