@@ -12,12 +12,16 @@ use icn_contracts::{
     HuggingFaceModelCatalog, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
     InventoryError, ModelPreviewSource,
 };
+use serde::Serialize;
 
+use crate::cache::ModelIndexKind;
 use crate::capabilities::model_capabilities;
 use crate::inventory::ModelManager;
 use crate::package_service::{offering_target_id, package_from_resolved};
 
-#[derive(Clone, Copy)]
+const CATALOG_RESOLUTION_REVISION: &str = "recommendable-model-catalog-v1";
+
+#[derive(Clone, Copy, Serialize)]
 struct CatalogModel {
     id: &'static str,
     display_name: &'static str,
@@ -259,6 +263,21 @@ impl NativeRecommendableCatalog {
         format: &str,
         snapshot: &HuggingFaceRepositorySnapshot,
     ) -> Result<RecommendableModel, InventoryError> {
+        let evidence = serde_json::to_string(&(
+            CATALOG_RESOLUTION_REVISION,
+            declaration,
+            format,
+            snapshot.repository.as_str(),
+            snapshot.commit.as_str(),
+        ))
+        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        if let Some(model) = self
+            .models
+            .cache
+            .read_index(ModelIndexKind::RecommendableModelCatalog, &evidence)
+        {
+            return Ok(model);
+        }
         let selector = format.to_ascii_lowercase();
         let mut matches = snapshot
             .gguf_files
@@ -293,7 +312,7 @@ impl NativeRecommendableCatalog {
         let capabilities = model_capabilities(&prepared.model.model.properties);
         let (fidelity_rank, quantization_aware) = fidelity(declaration.id, format);
         let target_id = offering_target_id(&[&package.id]);
-        Ok(RecommendableModel {
+        let model = RecommendableModel {
             id: RecommendableModelId(format!("{}:{format}", declaration.id)),
             checkpoint_id: declaration.id.to_owned(),
             target_id,
@@ -323,7 +342,11 @@ impl NativeRecommendableCatalog {
                 .iter()
                 .map(|evidence| (*evidence).to_owned())
                 .collect(),
-        })
+        };
+        self.models
+            .cache
+            .write_index(ModelIndexKind::RecommendableModelCatalog, &evidence, &model);
+        Ok(model)
     }
 }
 

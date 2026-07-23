@@ -37,6 +37,12 @@ const HUB_REPOSITORY_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 const HUB_SEARCH_TTL: Duration = Duration::from_secs(60);
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 256;
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CachedHuggingFaceRepositorySnapshot {
+    captured_at: u64,
+    snapshot: HuggingFaceRepositorySnapshot,
+}
+
 pub struct ModelPreviewService {
     models: Arc<ModelManager>,
     assessor: Arc<dyn ModelHardwareAssessor>,
@@ -372,13 +378,35 @@ impl HuggingFaceModelCatalog for ModelPreviewService {
                     "Hugging Face revision contains unsupported characters".to_owned(),
                 ));
             }
-            let cache_key = format!("{}@{}", request.repository, revision);
+            let cache_key = format!(
+                "{}:{}@{}",
+                self.models.client.endpoint(),
+                request.repository,
+                revision
+            );
             {
                 let mut cache = self.hub_repository_snapshots.lock().await;
                 cache.retain(|_, (captured, _)| captured.elapsed() <= HUB_REPOSITORY_SNAPSHOT_TTL);
                 if let Some((_, cached)) = cache.get(&cache_key) {
                     return Ok(cached.clone());
                 }
+            }
+            if let Some(cached) = self
+                .models
+                .cache
+                .read_index::<CachedHuggingFaceRepositorySnapshot>(
+                    ModelIndexKind::HuggingFaceRepositorySnapshot,
+                    &cache_key,
+                )
+                .filter(|cached| {
+                    now().saturating_sub(cached.captured_at)
+                        <= HUB_REPOSITORY_SNAPSHOT_TTL.as_secs()
+                })
+            {
+                let mut cache = self.hub_repository_snapshots.lock().await;
+                cache.insert(cache_key, (Instant::now(), cached.snapshot.clone()));
+                trim_discovery_cache(&mut cache);
+                return Ok(cached.snapshot);
             }
             let http = reqwest::Client::builder()
                 .build()
@@ -391,6 +419,14 @@ impl HuggingFaceModelCatalog for ModelPreviewService {
             )
             .await?;
             let snapshot = metadata.into_snapshot(request.repository)?;
+            self.models.cache.write_index(
+                ModelIndexKind::HuggingFaceRepositorySnapshot,
+                &cache_key,
+                &CachedHuggingFaceRepositorySnapshot {
+                    captured_at: now(),
+                    snapshot: snapshot.clone(),
+                },
+            );
             let mut cache = self.hub_repository_snapshots.lock().await;
             cache.insert(cache_key, (Instant::now(), snapshot.clone()));
             trim_discovery_cache(&mut cache);
