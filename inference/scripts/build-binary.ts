@@ -21,8 +21,8 @@ function rustTarget(target: string): string {
   const mapped: Record<string, string> = {
     "darwin-arm64": "aarch64-apple-darwin",
     "darwin-x64": "x86_64-apple-darwin",
-    "linux-arm64": "aarch64-unknown-linux-musl",
-    "linux-x64": "x86_64-unknown-linux-musl",
+    "linux-arm64": "aarch64-unknown-linux-gnu",
+    "linux-x64": "x86_64-unknown-linux-gnu",
     "windows-x64": "x86_64-pc-windows-msvc",
   };
   const value = mapped[`${platform}-${arch}`];
