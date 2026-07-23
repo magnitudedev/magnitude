@@ -1,10 +1,20 @@
-import { Fragment, memo, useCallback, useMemo, useState } from "react"
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import {
   useLocalInferenceState,
+  getTickSnapshot,
+  subscribeNoop,
+  subscribeTick,
   type LocalInferenceView,
 } from "@magnitudedev/client-common"
 import {
@@ -22,6 +32,7 @@ import {
   describeLocalHardware,
   formatBytes,
   formatContext,
+  localInferenceProgressLines,
   selectedInferenceIndex,
   selectionCapacityWarning,
   selectionMetadata,
@@ -57,6 +68,18 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
   const theme = useTheme()
   const local = useLocalInferenceState()
   const snapshot = Result.value(local.state)
+  const [loadingStartedAt] = useState(() => Date.now())
+  const trackingProgress = Option.match(snapshot, {
+    onNone: () => true,
+    onSome: (state) => state.models.recommendations.progress
+      .some(({ status }) => status._tag === "Running"),
+  })
+  useSyncExternalStore(
+    trackingProgress ? subscribeTick : subscribeNoop,
+    getTickSnapshot,
+    getTickSnapshot,
+  )
+  const nowMs = Date.now()
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c" && !key.meta && !key.option) {
       key.preventDefault()
@@ -75,11 +98,23 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
         <text style={{ fg: theme.muted }}>{Cause.pretty(local.state.cause)}</text>
       </box>
     ) : (
-      <box style={{ height: "100%", alignItems: "center", justifyContent: "center" }}>
-        <text style={{ fg: theme.muted }}>Inspecting local inference…</text>
+      <box style={{ height: "100%", flexDirection: "column", paddingLeft: 4, paddingTop: 2 }}>
+        <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
+        <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
+        <box style={{ flexDirection: "column", paddingTop: 2 }}>
+          <text style={{ fg: theme.primary }}>
+            ⠹ Detecting your hardware · {Math.max(0, Math.floor((nowMs - loadingStartedAt) / 1_000))}s
+          </text>
+          <text style={{ fg: theme.muted }}>○ Loading models from Hugging Face</text>
+          <text style={{ fg: theme.muted }}>○ Checking model files</text>
+          <text style={{ fg: theme.muted }}>○ Evaluating models for this machine</text>
+          <text style={{ fg: theme.muted }}>○ Choosing recommendations</text>
+        </box>
       </box>
     ),
-    onSome: (state) => <ReadyLocalInferenceScreen {...props} state={state} local={local} />,
+    onSome: (state) => (
+      <ReadyLocalInferenceScreen {...props} state={state} local={local} nowMs={nowMs} />
+    ),
   })
 })
 
@@ -88,9 +123,11 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   local,
   onSkip,
   onConfigured,
+  nowMs,
 }: LocalInferenceScreenProps & {
   readonly state: LocalInferenceView
   readonly local: LocalInferenceController
+  readonly nowMs: number
 }) {
   const theme = useTheme()
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
@@ -177,6 +214,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   }, [activeBinding, confirmSelection, local, onConfigured, onSkip, primarySlot._tag, selected, selectedIndex, selections]))
 
   const hardware = describeLocalHardware(state.hardware)
+  const progress = localInferenceProgressLines(state.models.recommendations.progress, nowMs)
   const firstRunningIndex = selections.findIndex((selection) => selection.kind === "running")
   const firstStoredIndex = selections.findIndex((selection) => selection.kind === "stored")
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
@@ -207,6 +245,53 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
             )}
           </box>
         </box>
+        {progress.length > 0 && (
+          <box style={{
+            flexDirection: "column",
+            width: "100%",
+            maxWidth: LOCAL_MODEL_SECTION_WIDTH,
+            paddingBottom: 1,
+          }}>
+            <box style={{ flexDirection: "row", paddingBottom: 1 }}>
+              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
+                SETUP PROGRESS
+              </text>
+              <text style={{ fg: theme.border }}>
+                {"  "}{localModelSectionRule("SETUP PROGRESS")}
+              </text>
+            </box>
+            {progress.map((line) => (
+              <text
+                key={line.id}
+                style={{ fg: line.state === "pending" ? theme.muted : theme.foreground }}
+              >
+                <span fg={line.state === "completed"
+                  ? theme.success
+                  : line.state === "running"
+                    ? theme.primary
+                    : line.state === "failed"
+                      ? theme.error
+                      : theme.muted}>
+                  {line.state === "completed"
+                    ? "✓ "
+                    : line.state === "running"
+                      ? "⠹ "
+                      : line.state === "failed"
+                        ? "! "
+                        : "○ "}
+                </span>
+                <span fg={line.state === "pending" ? theme.muted : theme.foreground}>
+                  {line.label}
+                </span>
+                {line.metadata && (
+                  <span fg={line.state === "failed" ? theme.error : theme.muted}>
+                    {line.metadata}
+                  </span>
+                )}
+              </text>
+            ))}
+          </box>
+        )}
         <box style={{ flexDirection: "column" }}>
           {state.models.recommendations._tag === "Ready" && selections.length === 0
             ? <text style={{ fg: theme.warning }}>No curated model currently fits this configuration.</text>
@@ -245,7 +330,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                 </Button>
               </Fragment>
             })}
-          {state.models.recommendations._tag === "Loading" && <text style={{ fg: theme.primary }}>Calculating recommendations for this machine…</text>}
           {state.models.recommendations._tag === "Failed" && <text style={{ fg: theme.warning }}>{state.models.recommendations.failure.message}</text>}
           {details && selected && Option.isSome(selected.recommendation) && (() => {
             const recommendation = selected.recommendation.value

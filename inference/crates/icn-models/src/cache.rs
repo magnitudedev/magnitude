@@ -23,6 +23,7 @@ pub enum ModelIndexKind {
     HardwareAssessment,
     ExecutionAssessment,
     OfferingAssessment,
+    Calibration,
 }
 
 impl ModelIndexKind {
@@ -35,6 +36,7 @@ impl ModelIndexKind {
             Self::HardwareAssessment => "assessments/hardware",
             Self::ExecutionAssessment => "assessments/execution",
             Self::OfferingAssessment => "assessments/offerings",
+            Self::Calibration => "calibrations",
         }
     }
 }

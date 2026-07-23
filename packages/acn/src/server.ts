@@ -44,7 +44,7 @@ import { makeAcnIcn } from "./icn"
 import { LocalModelAutoSetupLive } from "./local-model-auto-setup"
 import { LocalModelEvaluationsLive } from "./local-model-evaluations"
 import { LocalModelPackagesLive } from "./local-model-packages"
-import { LocalModelRecommendationsLive } from "./local-model-recommendations"
+import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
 import { LocalModelRuntimeLive } from "./local-model-runtime"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
@@ -273,7 +273,7 @@ const addLocalInferenceServices = <A, E, R>(
     withOfferings,
   )
   const withRecommendations = Layer.provideMerge(
-    LocalModelRecommendationsLive,
+    makeLocalModelRecommendationsLive(dataDir),
     withOfferingProjection,
   )
   const withRuntime = Layer.provideMerge(LocalModelRuntimeLive, withRecommendations)

@@ -87,6 +87,7 @@ impl InventoryConfig {
 pub struct ModelManager {
     pub(crate) config: InventoryConfig,
     pub(crate) client: HFClient,
+    pub(crate) http: reqwest::Client,
     pub(crate) models: Arc<RwLock<BTreeMap<ModelId, InventoryModel>>>,
     pub(crate) operations:
         Arc<tokio::sync::Mutex<BTreeMap<String, Arc<crate::download::DownloadOperation>>>>,
@@ -107,6 +108,7 @@ impl Clone for ModelManager {
         Self {
             config: self.config.clone(),
             client: self.client.clone(),
+            http: self.http.clone(),
             models: Arc::clone(&self.models),
             operations: Arc::clone(&self.operations),
             download_slots: Arc::clone(&self.download_slots),
@@ -123,6 +125,11 @@ impl Clone for ModelManager {
 }
 
 impl ModelManager {
+    #[must_use]
+    pub fn derived_cache(&self) -> &ModelCache {
+        &self.cache
+    }
+
     pub(crate) async fn configure_serving_model(
         &self,
         id: &ModelId,
@@ -226,6 +233,7 @@ impl ModelManager {
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
             client,
+            http: reqwest::Client::new(),
             models: Arc::new(RwLock::new(models)),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             template_assessor,

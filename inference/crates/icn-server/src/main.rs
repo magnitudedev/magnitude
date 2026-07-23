@@ -33,8 +33,8 @@ use icn_contracts::{
 use icn_engine::{LlamaCompletionBackend, ModelLoadError, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedModelDownloads, ModelManager, ModelPreviewService,
-    NativeRecommendableCatalog,
+    InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
+    ModelPreviewService, NativeRecommendableCatalog, canonical_package_id, offering_target_id,
 };
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -195,6 +195,7 @@ struct ResidentNativeExecutor {
 
 struct NativeHardwareAssessor {
     defaults: RuntimePlanDefaults,
+    cache: Option<ModelCache>,
     native_backend: NativeBackend,
     native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
     gate: tokio::sync::Mutex<()>,
@@ -205,7 +206,14 @@ struct NativeHardwareAssessor {
 #[derive(Default)]
 struct CalibrationCache {
     topology_fingerprint: Option<String>,
+    evidence: Option<String>,
     result: Option<Result<llama_cpp_2::model::params::fit::FitCalibration, String>>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct PersistedCalibration {
+    captured_at: u64,
+    calibration: llama_cpp_2::model::params::fit::FitCalibration,
 }
 
 const ASSESSMENT_RESOLVER_REVISION: &str = "icn-backend-plan-v1";
@@ -213,6 +221,26 @@ const OFFERING_ASSESSMENT_REVISION: &str = "offering-assessment-v3-zero-kv-workl
 const CAPACITY_POLICY_REVISION: &str = "stable-total-reserve-v1";
 const MTP_SELECTOR_REVISION: &str = "icn-mtp-selector-v1";
 const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
+const CALIBRATION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+fn unix_time_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn calibration_evidence(snapshot: &HardwareSnapshot) -> Result<String, InventoryError> {
+    serde_json::to_string(&(
+        llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
+        &snapshot.native_build,
+        &snapshot.enabled_backends,
+        &snapshot.topology_fingerprint,
+        &snapshot.platform,
+        &snapshot.architecture,
+    ))
+    .map_err(|error| InventoryError::Internal(error.to_string()))
+}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PlanningWorkerRequest {
@@ -424,6 +452,20 @@ impl NativeHardwareAssessor {
             && guard.result.is_none()
             && let Some(calibration) = response.calibration.clone()
         {
+            if let Ok(value) = &calibration
+                && let Some(evidence) = guard.evidence.as_deref()
+            {
+                if let Some(cache) = &self.cache {
+                    cache.write_index(
+                        ModelIndexKind::Calibration,
+                        evidence,
+                        &PersistedCalibration {
+                            captured_at: unix_time_seconds(),
+                            calibration: value.clone(),
+                        },
+                    );
+                }
+            }
             guard.result = Some(calibration);
         }
         Ok(response.assessments)
@@ -489,15 +531,15 @@ impl NativeModelEvaluator {
         target
     }
 
-    async fn assess_profiles(
+    fn assessment_evidence(
         &self,
-        resolved: &icn_contracts::models::ResolvedModelTarget,
+        target_id: &icn_contracts::models::ModelOfferingTargetId,
         profiles: &[DomainServingProfile],
         reserve_bytes: u64,
         include_performance: bool,
-    ) -> Result<Vec<OfferingAssessment>, InventoryError> {
-        let environment_id = self.environment_id().await?;
-        let evidence = profiles
+        environment_id: &AssessmentEnvironmentId,
+    ) -> Result<Vec<String>, InventoryError> {
+        profiles
             .iter()
             .map(|profile| {
                 serde_json::to_string(&(
@@ -509,7 +551,7 @@ impl NativeModelEvaluator {
                     llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
                     llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
                     &environment_id.0,
-                    &resolved.target_id.0,
+                    &target_id.0,
                     profile.context_length,
                     profile.parallel_sequences,
                     reserve_bytes,
@@ -517,7 +559,46 @@ impl NativeModelEvaluator {
                 ))
                 .map_err(|error| InventoryError::Internal(error.to_string()))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect()
+    }
+
+    fn cached_profiles(
+        &self,
+        target_id: &icn_contracts::models::ModelOfferingTargetId,
+        profiles: &[DomainServingProfile],
+        reserve_bytes: u64,
+        include_performance: bool,
+        environment_id: &AssessmentEnvironmentId,
+    ) -> Result<Option<Vec<OfferingAssessment>>, InventoryError> {
+        let evidence = self.assessment_evidence(
+            target_id,
+            profiles,
+            reserve_bytes,
+            include_performance,
+            environment_id,
+        )?;
+        let results = evidence
+            .iter()
+            .map(|key| self.models.read_offering_assessment(key))
+            .collect::<Option<Vec<_>>>();
+        Ok(results)
+    }
+
+    async fn assess_profiles(
+        &self,
+        resolved: &icn_contracts::models::ResolvedModelTarget,
+        profiles: &[DomainServingProfile],
+        reserve_bytes: u64,
+        include_performance: bool,
+        environment_id: &AssessmentEnvironmentId,
+    ) -> Result<Vec<OfferingAssessment>, InventoryError> {
+        let evidence = self.assessment_evidence(
+            &resolved.target_id,
+            profiles,
+            reserve_bytes,
+            include_performance,
+            environment_id,
+        )?;
         let mut results = evidence
             .iter()
             .map(|key| self.models.read_offering_assessment(key))
@@ -574,6 +655,7 @@ impl NativeModelEvaluator {
         resolved: &icn_contracts::models::ResolvedModelTarget,
         request: &FitModelsRequest,
     ) -> Result<FitModelResult, InventoryError> {
+        let environment_id = self.environment_id().await?;
         let target_limit = match &resolved.target {
             icn_contracts::models::ModelOfferingTarget::Package { package } => {
                 package.properties.maximum_context_length
@@ -614,6 +696,7 @@ impl NativeModelEvaluator {
                 }],
                 reserve,
                 false,
+                &environment_id,
             )
             .await?
             .pop()
@@ -630,6 +713,7 @@ impl NativeModelEvaluator {
                     }],
                     reserve,
                     false,
+                    &environment_id,
                 )
                 .await?
                 .pop()
@@ -669,6 +753,7 @@ impl NativeModelEvaluator {
                         }],
                         reserve,
                         false,
+                        &environment_id,
                     )
                     .await?
                     .pop()
@@ -689,7 +774,7 @@ impl NativeModelEvaluator {
             })
             .collect::<Vec<_>>();
         let assessments = self
-            .assess_profiles(resolved, &parallel_profiles, reserve, true)
+            .assess_profiles(resolved, &parallel_profiles, reserve, true, &environment_id)
             .await?;
         let Some((profile, assessment)) = parallel_profiles
             .into_iter()
@@ -882,6 +967,33 @@ fn performance_result(
     }
 }
 
+fn package_operand_id(operand: &ModelPackageOperand) -> Result<&ModelPackageId, String> {
+    match operand {
+        ModelPackageOperand::Installed { package_id } => Ok(package_id),
+        ModelPackageOperand::SourceBacked { package } => {
+            let canonical = canonical_package_id(&package.files, &package.relationships);
+            if canonical != package.id {
+                return Err("source-backed package identity does not match its files".to_owned());
+            }
+            Ok(&package.id)
+        }
+    }
+}
+
+fn target_input_id(
+    target: &ModelTargetInput,
+) -> Result<icn_contracts::models::ModelOfferingTargetId, String> {
+    match target {
+        ModelTargetInput::Package { package } => {
+            Ok(offering_target_id(&[package_operand_id(package)?]))
+        }
+        ModelTargetInput::SpeculativeDecodingPair { target, draft } => Ok(offering_target_id(&[
+            package_operand_id(target)?,
+            package_operand_id(draft)?,
+        ])),
+    }
+}
+
 impl ModelEvaluator for NativeModelEvaluator {
     fn assess(
         &self,
@@ -894,31 +1006,66 @@ impl ModelEvaluator for NativeModelEvaluator {
                 .required_reserve_bytes_per_memory_domain;
             let include_performance = request.include_performance;
             let evaluated = futures_util::stream::iter(request.requests.into_iter().enumerate())
-                .map(|(index, item)| async move {
-                    let request_id = item.request_id;
-                    let result = match self.models.resolve_target(item.target).await {
-                        Ok(resolved) => AssessModelResult::Assessed {
-                            request_id,
-                            target_id: resolved.target_id.clone(),
-                            profiles: self
-                                .assess_profiles(
-                                    &resolved,
-                                    &item.profiles,
-                                    reserve_bytes,
-                                    include_performance,
-                                )
-                                .await?,
-                        },
-                        Err(error) => AssessModelResult::InvalidTarget {
-                            request_id,
-                            failure: DomainModelFailure {
-                                code: "invalid_target".to_owned(),
-                                message: error.to_string(),
-                                retryable: false,
-                            },
-                        },
-                    };
-                    Ok::<_, InventoryError>((index, result))
+                .map(|(index, item)| {
+                    let environment_id = environment_id.clone();
+                    async move {
+                        let request_id = item.request_id;
+                        let target_id = match target_input_id(&item.target) {
+                            Ok(target_id) => target_id,
+                            Err(message) => {
+                                return Ok::<_, InventoryError>((
+                                    index,
+                                    AssessModelResult::InvalidTarget {
+                                        request_id,
+                                        failure: DomainModelFailure {
+                                            code: "invalid_target".to_owned(),
+                                            message,
+                                            retryable: false,
+                                        },
+                                    },
+                                ));
+                            }
+                        };
+                        let cached = self.cached_profiles(
+                            &target_id,
+                            &item.profiles,
+                            reserve_bytes,
+                            include_performance,
+                            &environment_id,
+                        )?;
+                        let result = if let Some(profiles) = cached {
+                            AssessModelResult::Assessed {
+                                request_id,
+                                target_id,
+                                profiles,
+                            }
+                        } else {
+                            match self.models.resolve_target(item.target).await {
+                                Ok(resolved) => AssessModelResult::Assessed {
+                                    request_id,
+                                    target_id: resolved.target_id.clone(),
+                                    profiles: self
+                                        .assess_profiles(
+                                            &resolved,
+                                            &item.profiles,
+                                            reserve_bytes,
+                                            include_performance,
+                                            &environment_id,
+                                        )
+                                        .await?,
+                                },
+                                Err(error) => AssessModelResult::InvalidTarget {
+                                    request_id,
+                                    failure: DomainModelFailure {
+                                        code: "invalid_target".to_owned(),
+                                        message: error.to_string(),
+                                        retryable: false,
+                                    },
+                                },
+                            }
+                        };
+                        Ok::<_, InventoryError>((index, result))
+                    }
                 })
                 .buffer_unordered(MODEL_ASSESSMENT_CONCURRENCY)
                 .collect::<Vec<_>>()
@@ -1445,11 +1592,24 @@ impl HardwareProvider for NativeHardwareAssessor {
                 }
             }
             let mut calibration = self.calibration.lock().await;
-            if calibration.topology_fingerprint.as_deref()
-                != Some(snapshot.topology_fingerprint.as_str())
-            {
+            let evidence = calibration_evidence(&snapshot)?;
+            if calibration.evidence.as_deref() != Some(evidence.as_str()) {
                 calibration.topology_fingerprint = Some(snapshot.topology_fingerprint.clone());
-                calibration.result = None;
+                calibration.evidence = Some(evidence.clone());
+                calibration.result = self
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| {
+                        cache.read_index::<PersistedCalibration>(
+                            ModelIndexKind::Calibration,
+                            &evidence,
+                        )
+                    })
+                    .filter(|cached| {
+                        unix_time_seconds().saturating_sub(cached.captured_at)
+                            <= CALIBRATION_MAX_AGE_SECONDS
+                    })
+                    .map(|cached| Ok(cached.calibration));
             }
             Ok(snapshot)
         })
@@ -1978,6 +2138,7 @@ async fn main() -> anyhow::Result<()> {
             let native_executor_slot = Arc::new(RwLock::new(None));
             let inventory_hardware_assessor = Arc::new(NativeHardwareAssessor {
                 defaults: plan_defaults.clone(),
+                cache: Some(inventory.derived_cache().clone()),
                 native_backend: native_backend.clone(),
                 native_executor: Arc::clone(&native_executor_slot),
                 gate: tokio::sync::Mutex::new(()),
@@ -2267,6 +2428,7 @@ mod tests {
     fn available_and_preview_cache_keys_share_resolved_profile_identity() {
         let assessor = NativeHardwareAssessor {
             defaults: parity_test_defaults(),
+            cache: None,
             native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),
@@ -2351,6 +2513,7 @@ mod tests {
 
         let assessor = Arc::new(NativeHardwareAssessor {
             defaults: parity_test_defaults(),
+            cache: None,
             native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),

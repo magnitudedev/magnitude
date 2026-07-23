@@ -103,7 +103,11 @@ export const makeView = (options: {
     hardware: options.hardware ?? makeHardware(),
     models: {
       models,
-      recommendations: { _tag: "Ready", entries: options.recommendations ?? [] },
+      recommendations: {
+        _tag: "Ready",
+        entries: options.recommendations ?? [],
+        progress: [],
+      },
     },
     catalog: new ProviderModelCatalogReady({
       providers: [{

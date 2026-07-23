@@ -105,6 +105,12 @@ every behavior-changing input:
 A missing, corrupt, or stale entry is a cache miss. Cache failure never becomes a model-fit result.
 ACN may retain product projections, but it does not persist or recreate ICN assessment evidence.
 
+Batch assessment captures one normalized hardware environment identity and reuses it for every
+target and profile in that request. Before resolving a source-backed target, ICN derives its stable
+offering-target identity and checks whether every requested profile has valid cached evidence.
+Complete hits return without remote header materialization or native planning. Partial hits resolve
+the target and compute only the missing profiles.
+
 ## Loading
 
 Loading accepts one exact `ModelServingConfiguration`. ICN resolves and reassesses that

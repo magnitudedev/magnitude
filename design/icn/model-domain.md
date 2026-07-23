@@ -7,6 +7,7 @@ applies_to:
   - packages/acn/src/local-models.ts
   - packages/acn/src/local-provider-**
   - packages/protocol/src/schemas/model-state.ts
+  - cli/src/features/local-inference/**
   - packages/storage/src/types/config.ts
   - inference/crates/icn-contracts/src/models.rs
   - inference/crates/icn-models/**
@@ -166,12 +167,34 @@ is recommended, is installed, is offered, or is loaded.
 ICN exposes this catalog at `GET /v1/models/catalog`. It is distinct from ACN's provider model
 catalog, which contains configured provider offerings available for slot selection.
 
+Repository metadata used to resolve the curated catalog is a disposable snapshot. A fresh snapshot
+is reused without a network request. An expired snapshot remains sufficient to serve the last
+complete catalog immediately while ICN conditionally revalidates it in the background; a failed
+refresh never replaces the last complete result. A machine with no repository snapshot must fetch
+the metadata once before it can resolve exact immutable package files. The shared HTTP client is
+reused across repository operations. Curated package resolution consumes that one repository
+snapshot directly for every format, so preparing each quantization does not request the same
+repository metadata again. Missing immutable GGUF header ranges are acquired with bounded
+concurrency and remain keyed by published content identity.
+
 ### Recommendation
 
 A policy suggestion selecting one model serving configuration for a product intent.
 
 Recommendation changes never change package, configuration, provider-offering, or slot-selection
 identity.
+
+ACN persists the last complete recommendation portfolio as disposable derived state. It may reuse
+that portfolio only when the complete catalog-target/profile input, native hardware topology and
+build, enabled backends, and recommendation-policy identity are unchanged. Missing, malformed,
+unreadable, mismatched, or older-than-seven-days portfolio data is a cache miss. It never
+suppresses recomputation after one of those inputs changes.
+
+Recommendation calculation publishes an ordered, cumulative lifecycle for hardware, catalog,
+metadata preparation, assessment, and selection. Each step is pending, running, completed, or
+failed; running and terminal states carry authoritative timing, and bounded collection work carries
+completed and total counts. Completed work remains visible while later work runs. Presentation may
+animate a running step from the published start time, but it must not invent server progress.
 
 ### Provider offering
 

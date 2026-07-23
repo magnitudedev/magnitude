@@ -15,7 +15,7 @@ import {
   type ModelServingConfiguration,
   type ServingProfile,
 } from "@magnitudedev/protocol"
-import { IcnClient, type OfferingAssessment } from "@magnitudedev/icn"
+import { IcnClient, type AssessModelResult, type OfferingAssessment } from "@magnitudedev/icn"
 import { LocalModelPackages } from "./local-model-packages"
 import {
   offeringTargetFromIcn,
@@ -99,6 +99,13 @@ export interface LocalModelEvaluationsApi {
   readonly assessMany: (
     requests: readonly LocalModelAssessmentRequest[],
   ) => Effect.Effect<readonly LocalModelAssessmentResult[], LocalInferenceError>
+  readonly assessManyWithProgress: (
+    requests: readonly LocalModelAssessmentRequest[],
+    onProgress: (
+      completed: number,
+      total: number,
+    ) => Effect.Effect<void>,
+  ) => Effect.Effect<readonly LocalModelAssessmentResult[], LocalInferenceError>
   readonly assess: (
     target: ModelOfferingTarget,
     profiles: readonly ServingProfile[],
@@ -131,7 +138,10 @@ export const LocalModelEvaluationsLive: Layer.Layer<
   const targetInput = (target: ModelOfferingTarget) =>
     packages.installedPackageIds.pipe(Effect.flatMap((ids) => targetToIcn(target, ids)))
 
-  const assessMany: LocalModelEvaluationsApi["assessMany"] = (requests) =>
+  const assessManyWithProgress: LocalModelEvaluationsApi["assessManyWithProgress"] = (
+    requests,
+    onProgress,
+  ) =>
     Effect.gen(function* () {
       if (requests.length === 0) return []
       const installedIds = yield* packages.installedPackageIds
@@ -139,18 +149,25 @@ export const LocalModelEvaluationsLive: Layer.Layer<
         requests,
         ({ target }) => targetToIcn(target, installedIds),
       )
-      const response = yield* client.models.assessModels({
-        payload: {
-          requests: requests.map(({ profiles }, index) => ({
-            requestId: `assessment-${index}`,
-            target: nativeTargets[index]!,
-            profiles: profiles.map(servingProfileToIcn),
-          })),
-          capacityPolicy: { requiredReserveBytesPerMemoryDomain: REQUIRED_RESERVE_BYTES },
-          includePerformance: true,
-        },
-      })
-      const byRequest = new Map(response.results.map((result) => [String(result.requestId), result]))
+      const batchSize = 8
+      const nativeResults: AssessModelResult[] = []
+      for (let offset = 0; offset < requests.length; offset += batchSize) {
+        const batch = requests.slice(offset, offset + batchSize)
+        const response = yield* client.models.assessModels({
+          payload: {
+            requests: batch.map(({ profiles }, batchIndex) => ({
+              requestId: `assessment-${offset + batchIndex}`,
+              target: nativeTargets[offset + batchIndex]!,
+              profiles: profiles.map(servingProfileToIcn),
+            })),
+            capacityPolicy: { requiredReserveBytesPerMemoryDomain: REQUIRED_RESERVE_BYTES },
+            includePerformance: true,
+          },
+        })
+        nativeResults.push(...response.results)
+        yield* onProgress(Math.min(offset + batch.length, requests.length), requests.length)
+      }
+      const byRequest = new Map(nativeResults.map((result) => [String(result.requestId), result]))
       const results: LocalModelAssessmentResult[] = []
       for (let index = 0; index < requests.length; index += 1) {
         const result = byRequest.get(`assessment-${index}`)
@@ -174,8 +191,12 @@ export const LocalModelEvaluationsLive: Layer.Layer<
       return results
     }).pipe(Effect.mapError((error) => failure("assess_model_failed", error)))
 
+  const assessMany: LocalModelEvaluationsApi["assessMany"] = (requests) =>
+    assessManyWithProgress(requests, () => Effect.void)
+
   return LocalModelEvaluations.of({
     assessMany,
+    assessManyWithProgress,
     assess: (target, profiles) => assessMany([{ target, profiles }]).pipe(
       Effect.flatMap((results) => {
         const result = results[0]

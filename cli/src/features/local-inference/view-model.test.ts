@@ -10,6 +10,7 @@ import {
   buildLocalInferenceSelections,
   describeLocalHardware,
   formatModelLoadProgress,
+  localInferenceProgressLines,
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
@@ -18,6 +19,60 @@ import { GIB, makeHardware, makeModel, makeRecommendation, makeView } from "./te
 describe("local inference selection view model", () => {
   it("shows native load progress", () => {
     expect(formatModelLoadProgress(42)).toBe("Loading 42%")
+  })
+
+  it("presents cumulative recommendation progress with authoritative counts and timing", () => {
+    expect(localInferenceProgressLines([
+      {
+        id: "hardware",
+        status: {
+          _tag: "Completed",
+          startedAtMs: 1_000,
+          durationMs: 1_250,
+          cached: false,
+        },
+        completedItems: Option.some(1),
+        totalItems: Option.some(1),
+      },
+      {
+        id: "assessment",
+        status: { _tag: "Running", startedAtMs: 2_000 },
+        completedItems: Option.some(8),
+        totalItems: Option.some(28),
+      },
+    ], 4_000)).toEqual([
+      {
+        id: "hardware",
+        state: "completed",
+        label: "Detected hardware",
+        metadata: " · 1/1 · 1s",
+      },
+      {
+        id: "assessment",
+        state: "running",
+        label: "Evaluating models for this machine",
+        metadata: " · 8/28 · 2s",
+      },
+    ])
+  })
+
+  it("identifies reused recommendation work without implying a network refresh", () => {
+    expect(localInferenceProgressLines([{
+      id: "selection",
+      status: {
+        _tag: "Completed",
+        startedAtMs: 1_000,
+        durationMs: 0,
+        cached: true,
+      },
+      completedItems: Option.some(4),
+      totalItems: Option.some(4),
+    }], 1_000)[0]).toEqual({
+      id: "selection",
+      state: "completed",
+      label: "Prepared recommendations",
+      metadata: " · 4/4 · cached",
+    })
   })
 
   it("presents unified memory from the hardware contract", () => {

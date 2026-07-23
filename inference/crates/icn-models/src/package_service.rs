@@ -106,7 +106,7 @@ fn package_source(model: &InventoryModel, resolved: &ResolvedModel) -> ModelPack
     }
 }
 
-fn canonical_package_id(
+pub fn canonical_package_id(
     files: &[ModelFile],
     relationships: &[ModelFileRelationship],
 ) -> ModelPackageId {
@@ -291,7 +291,7 @@ fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
     }
 }
 
-pub(crate) fn offering_target_id(package_ids: &[&ModelPackageId]) -> ModelOfferingTargetId {
+pub fn offering_target_id(package_ids: &[&ModelPackageId]) -> ModelOfferingTargetId {
     let mut digest = Sha256::new();
     digest.update(b"magnitude-model-offering-target-v1\0");
     for package_id in package_ids {

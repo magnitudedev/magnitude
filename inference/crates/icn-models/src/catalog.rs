@@ -299,12 +299,15 @@ impl NativeRecommendableCatalog {
         let primary = matches.remove(0);
         let prepared = self
             .models
-            .prepare_preview(&ModelPreviewSource {
-                repository: snapshot.repository.clone(),
-                revision: snapshot.commit.clone(),
-                primary_gguf: primary.path.clone(),
-                additional_components: Vec::new(),
-            })
+            .prepare_preview_from_repository_snapshot(
+                &ModelPreviewSource {
+                    repository: snapshot.repository.clone(),
+                    revision: snapshot.commit.clone(),
+                    primary_gguf: primary.path.clone(),
+                    additional_components: Vec::new(),
+                },
+                snapshot,
+            )
             .await?;
         let package = package_from_resolved(&prepared.model)?;
         let capabilities = model_capabilities(&prepared.model.model.properties);
