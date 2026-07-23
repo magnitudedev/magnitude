@@ -29,7 +29,7 @@ describe("local inference selection view model", () => {
       totalSystemMemoryBytes: 64 * GIB,
       accelerators: [{
         acceleratorId: LocalInferenceAcceleratorIdSchema.make("metal"),
-        name: "Apple M4 Max",
+        name: "MTL0",
         backend: "Metal",
         memoryDomainId,
       }],
@@ -52,6 +52,39 @@ describe("local inference selection view model", () => {
         ],
       },
       accelerators: [],
+    })
+  })
+
+  it("uses the accelerator identity for a unified NVIDIA system", () => {
+    const memoryDomainId = LocalInferenceMemoryDomainIdSchema.make("unified")
+    const hardware = makeHardware({
+      platform: "Linux",
+      architecture: "Arm64",
+      processor: Option.some("CPU"),
+      logicalCores: 20,
+      totalSystemMemoryBytes: 128 * GIB,
+      accelerators: [{
+        acceleratorId: LocalInferenceAcceleratorIdSchema.make("cuda"),
+        name: "NVIDIA GB10",
+        backend: "CUDA",
+        memoryDomainId,
+      }],
+      memoryDomains: [{
+        memoryDomainId,
+        kind: "UnifiedMemory",
+        totalBytes: 128 * GIB,
+        stableCapacityBytes: 116 * GIB,
+        availableBytes: Option.none(),
+        sharesSystemMemory: true,
+      }],
+    })
+
+    expect(describeLocalHardware(hardware).system).toEqual({
+      name: "NVIDIA GB10",
+      details: [
+        "Linux · ARM64 · 20 logical CPU cores",
+        "128.0 GiB unified memory · CUDA GPU acceleration",
+      ],
     })
   })
 

@@ -14,7 +14,7 @@ pub(crate) fn enabled_backends() -> Vec<&'static str> {
     if cfg!(feature = "metal") || (cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
         backends.push("metal");
     }
-    if cfg!(feature = "cuda") {
+    if cfg!(feature = "cuda") || cfg!(feature = "cuda-no-vmm") {
         backends.push("cuda");
     }
     if cfg!(feature = "vulkan") {

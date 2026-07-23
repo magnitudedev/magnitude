@@ -10,7 +10,7 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "bun run dev:version && bun run icn:build && bun run dev:client",
+    "dev": "bun run scripts/dev.ts",
     "devl": "bun run dev:version && bun run dev:client:local",
     "dev:version": "bun run packages/version/scripts/generate-version.ts --dev",
     "dev:client": "bun run cli/src/index.tsx --debug",
@@ -47,7 +47,7 @@
     "icn:openapi": "cargo run --manifest-path inference/Cargo.toml -p icn-api --bin export-openapi --",
     "icn:verify-native-pin": "bun run inference/scripts/verify-native-pin.ts",
     "icn:check": "cargo check --manifest-path inference/Cargo.toml --workspace",
-    "icn:build": "cargo build --manifest-path inference/Cargo.toml -p icn-server",
+    "icn:build": "bun run inference/scripts/build-local.ts",
     "icn:build:release": "cargo build --release --manifest-path inference/Cargo.toml -p icn-server",
     "icn:build:reference": "bun run --cwd inference build:reference",
     "icn:build:candidate": "bun run --cwd inference build:candidate --",

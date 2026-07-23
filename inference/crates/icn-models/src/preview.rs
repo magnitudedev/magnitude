@@ -36,6 +36,8 @@ const MAX_HUB_SEARCH_QUERY_BYTES: usize = 200;
 const HUB_REPOSITORY_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 const HUB_SEARCH_TTL: Duration = Duration::from_secs(60);
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 256;
+const HUB_REQUEST_ATTEMPTS: usize = 3;
+const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CachedHuggingFaceRepositorySnapshot {
@@ -660,14 +662,15 @@ async fn fetch_hub_model(
     revision: &str,
 ) -> Result<HubModel, InventoryError> {
     let url = hub_metadata_url(endpoint, repository, revision)?;
-    let mut request = http.get(url).query(&[("blobs", "true")]);
-    if let Some(token) = hub_token() {
-        request = request.bearer_auth(token);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+    let token = hub_token();
+    let response = send_hub_request(|| {
+        let mut request = http.get(url.clone()).query(&[("blobs", "true")]);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        request
+    })
+    .await?;
     if !response.status().is_success() {
         return Err(InventoryError::Upstream(format!(
             "Hugging Face metadata returned HTTP {}",
@@ -676,6 +679,36 @@ async fn fetch_hub_model(
     }
     serde_json::from_slice(&bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?)
         .map_err(|error| InventoryError::Upstream(error.to_string()))
+}
+
+fn retryable_hub_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+async fn send_hub_request(
+    mut request: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, InventoryError> {
+    let mut last_failure = None;
+    for attempt in 0..HUB_REQUEST_ATTEMPTS {
+        match request().send().await {
+            Ok(response)
+                if retryable_hub_status(response.status())
+                    && attempt + 1 < HUB_REQUEST_ATTEMPTS =>
+            {
+                last_failure = Some(format!("HTTP {}", response.status()));
+            }
+            Ok(response) => return Ok(response),
+            Err(error) if attempt + 1 < HUB_REQUEST_ATTEMPTS => {
+                last_failure = Some(error.to_string());
+            }
+            Err(error) => return Err(InventoryError::Upstream(error.to_string())),
+        }
+        let multiplier = u32::try_from(attempt + 1).unwrap_or(u32::MAX);
+        tokio::time::sleep(HUB_RETRY_BASE_DELAY.saturating_mul(multiplier)).await;
+    }
+    Err(InventoryError::Upstream(last_failure.unwrap_or_else(
+        || "Hugging Face request failed".to_owned(),
+    )))
 }
 
 fn immutable_commit(value: String) -> Option<String> {
@@ -1289,17 +1322,16 @@ async fn fetch_header(
     loop {
         let range_start = bytes.len();
         let range_length = target_length.saturating_sub(range_start);
-        let mut request = http.get(url.clone()).header(
-            RANGE,
-            format!("bytes={range_start}-{}", target_length.saturating_sub(1)),
-        );
-        if let Some(token) = hub_token() {
-            request = request.bearer_auth(token);
-        }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+        let range = format!("bytes={range_start}-{}", target_length.saturating_sub(1));
+        let token = hub_token();
+        let mut response = send_hub_request(|| {
+            let mut request = http.get(url.clone()).header(RANGE, &range);
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
+            }
+            request
+        })
+        .await?;
         if !response.status().is_success() {
             return Err(InventoryError::Upstream(format!(
                 "GGUF header request returned HTTP {}",
@@ -1860,6 +1892,14 @@ mod tests {
         assert!(!valid_content_range("bytes 1-1024/4096", 0, 1024, 4096));
         assert!(!valid_content_range("bytes 0-1024/4096", 0, 1024, 4096));
         assert!(!valid_content_range("bytes 0-1023/8192", 0, 1024, 4096));
+    }
+
+    #[test]
+    fn retries_only_rate_limits_and_server_failures() {
+        assert!(retryable_hub_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_hub_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(!retryable_hub_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!retryable_hub_status(reqwest::StatusCode::UNAUTHORIZED));
     }
 
     #[tokio::test]

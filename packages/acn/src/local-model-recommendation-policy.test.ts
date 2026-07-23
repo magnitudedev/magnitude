@@ -186,6 +186,22 @@ describe("local model multicriteria recommendation policy", () => {
     ])
   })
 
+  it("builds a useful DGX Spark-class portfolio around the strongest responsive model", () => {
+    const recommendations = selectRecommendationPortfolio([
+      candidate({ id: "laguna-100", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 26, context: 100_000, runtimeGiB: 82, downloadGiB: 63.6, architecture: "moe" }),
+      candidate({ id: "laguna-200", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 14, context: 200_000, runtimeGiB: 96, downloadGiB: 63.6, architecture: "moe" }),
+      candidate({ id: "qwen122", score: 47.6, fidelity: 40, expected: 30, context: 100_000, runtimeGiB: 84, downloadGiB: 71, architecture: "moe" }),
+      candidate({ id: "gemma26", score: 39, fidelity: 58, expected: 43, context: 100_000, runtimeGiB: 28, downloadGiB: 13.3, architecture: "moe" }),
+      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 35, context: 200_000, runtimeGiB: 6, downloadGiB: 2.7 }),
+    ])
+
+    expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
+      ["laguna-100", "balanced"],
+      ["gemma26", "fastest"],
+      ["qwen4", "lightweight"],
+    ])
+  })
+
   it("lets responsiveness outweigh a modest capability lead inside the Balanced guard", () => {
     const recommendations = selectRecommendationPortfolio([
       candidate({ id: "benchmark-leader", score: 60, expected: 16, runtimeGiB: 36 }),

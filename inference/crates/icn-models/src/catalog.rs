@@ -162,7 +162,7 @@ const CATALOG_MODELS: &[CatalogModel] = &[
         display_name: "Qwen3.5 122B-A10B",
         description: "Workstation-class MoE model with a large knowledge footprint and moderate active compute.",
         repository: "unsloth/Qwen3.5-122B-A10B-GGUF",
-        formats: &["UD-Q4_K_XL"],
+        formats: &["Q4_K_M"],
         contexts: PRODUCT_CONTEXTS,
         license: "apache-2.0",
         quality_score: 47.6,
@@ -186,7 +186,7 @@ const CATALOG_MODELS: &[CatalogModel] = &[
         display_name: "DeepSeek V4 Flash 284B-A13B",
         description: "Frontier MoE model with a very large weight footprint and low active compute.",
         repository: "unsloth/DeepSeek-V4-Flash-GGUF",
-        formats: &["UD-Q8_K_XL"],
+        formats: &["UD-Q3_K_M"],
         contexts: PRODUCT_CONTEXTS,
         license: "mit",
         quality_score: 61.8,
@@ -210,7 +210,7 @@ const CATALOG_MODELS: &[CatalogModel] = &[
         display_name: "GLM 5.2 753B-A40B",
         description: "Largest catalog tier, intended only for exceptionally high-memory systems.",
         repository: "unsloth/GLM-5.2-GGUF",
-        formats: &["UD-Q4_K_XL"],
+        formats: &["BF16"],
         contexts: PRODUCT_CONTEXTS,
         license: "mit",
         quality_score: 77.9,
@@ -229,7 +229,7 @@ fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
         return (58, true);
     }
     if declaration_id == "glm-5.2" {
-        return (70, false);
+        return (100, false);
     }
     let rank = if format.contains("Q8") {
         80
@@ -408,43 +408,49 @@ impl RecommendableModelCatalogProvider for NativeRecommendableCatalog {
                     }
                 }
             }
-            let requests = CATALOG_MODELS
-                .iter()
-                .flat_map(|declaration| {
-                    declaration
-                        .formats
-                        .iter()
-                        .map(move |format| (*declaration, (*format).to_owned()))
-                })
-                .enumerate()
-                .collect::<Vec<_>>();
             let resolved_snapshots = &resolved_snapshots;
             let snapshot_failures = &snapshot_failures;
-            let mut resolved = stream::iter(requests)
-                .map(|(index, (declaration, format))| async move {
-                    let result = match resolved_snapshots.get(declaration.repository) {
-                        Some(snapshot) => self.resolve_model(declaration, &format, snapshot).await,
-                        None => Err(InventoryError::Io(
-                            snapshot_failures
-                                .get(declaration.repository)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "repository {} was not resolved",
-                                        declaration.repository
-                                    )
-                                }),
-                        )),
-                    };
-                    (index, declaration, format, result)
+            let resolved = stream::iter(CATALOG_MODELS.iter().copied().enumerate())
+                .map(|(declaration_index, declaration)| async move {
+                    let mut formats = Vec::with_capacity(declaration.formats.len());
+                    for (format_index, format) in declaration.formats.iter().enumerate() {
+                        let result = match resolved_snapshots.get(declaration.repository) {
+                            Some(snapshot) => {
+                                self.resolve_model(declaration, format, snapshot).await
+                            }
+                            None => Err(InventoryError::Io(
+                                snapshot_failures
+                                    .get(declaration.repository)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "repository {} was not resolved",
+                                            declaration.repository
+                                        )
+                                    }),
+                            )),
+                        };
+                        formats.push((
+                            declaration_index,
+                            format_index,
+                            declaration,
+                            (*format).to_owned(),
+                            result,
+                        ));
+                    }
+                    formats
                 })
-                .buffer_unordered(12)
+                .buffer_unordered(6)
+                .flat_map(stream::iter)
                 .collect::<Vec<_>>()
                 .await;
-            resolved.sort_by_key(|(index, ..)| *index);
+            let mut resolved = resolved;
+            resolved.sort_by_key(|(declaration_index, format_index, ..)| {
+                (*declaration_index, *format_index)
+            });
             let mut models = Vec::new();
             let mut diagnostics = Vec::new();
-            for (_, declaration, format, result) in resolved {
+            for (_, _, declaration, format, result) in resolved {
                 match result {
                     Ok(model) => models.push(model),
                     Err(error) => diagnostics.push(CatalogDiagnostic {
@@ -478,5 +484,20 @@ mod tests {
         assert!(!is_later_shard("model-00001-of-00003.gguf"));
         assert!(is_later_shard("model-00002-of-00003.gguf"));
         assert!(!is_later_shard("model.gguf"));
+    }
+
+    #[test]
+    fn workstation_catalog_uses_published_gguf_format_names() {
+        let formats = |id: &str| {
+            CATALOG_MODELS
+                .iter()
+                .find(|model| model.id == id)
+                .expect("catalog model")
+                .formats
+        };
+        assert_eq!(formats("laguna-s-2.1"), &["Q4_K_M", "Q8_0"]);
+        assert_eq!(formats("qwen3.5-122b-a10b"), &["Q4_K_M"]);
+        assert_eq!(formats("deepseek-v4-flash"), &["UD-Q3_K_M"]);
+        assert_eq!(formats("glm-5.2"), &["BF16"]);
     }
 }

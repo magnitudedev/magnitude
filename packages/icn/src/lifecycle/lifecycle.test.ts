@@ -98,7 +98,7 @@ describe("ICN managed launch", () => {
       const executable = join(directory, "magnitude-icn");
       await writeFile(
         executable,
-        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["model_load_control"]}'\n`
+        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["model_load_control"],"backends":["cpu"]}'\n`
       );
       await chmod(executable, 0o755);
       try {
@@ -146,7 +146,7 @@ describe("ICN managed launch", () => {
       await mkdir(payload, { recursive: true });
       await writeFile(
         executable,
-        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["model_load_control"]}'\n`
+        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["model_load_control"],"backends":["cpu"]}'\n`
       );
       await chmod(executable, 0o755);
       const bytes = await Bun.file(executable).arrayBuffer();
@@ -162,6 +162,7 @@ describe("ICN managed launch", () => {
           apiVersion: 1,
           nativeBuild: "native-test",
           target: "test-target",
+          backends: ["cpu"],
         })
       );
       const tar = Bun.spawn([

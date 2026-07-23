@@ -17,8 +17,12 @@ applies_to:
   - packages/acn/src/local-inference-hardware.ts
   - packages/protocol/src/schemas/model-state.ts
   - packages/acn/scripts/build-binary.ts
-  - inference/scripts/build-binary.ts
+  - inference/scripts/**
+  - inference/package.json
+  - package.json
+  - scripts/dev.ts
   - scripts/build-release-artifacts.ts
+  - .github/workflows/release.yml
 ---
 
 # ICN process lifecycle and Bun boundary
@@ -172,6 +176,18 @@ atomically publishes the matching release artifact before ACN readiness can succ
 An unresolved, non-executable, or incompatible binary is an ACN startup failure. There is no silent
 fallback to a different native runtime. Resolution canonicalizes the path and verifies the binary's
 machine-readable identity under a bounded command timeout and output limit.
+
+Linux releases may publish separate CPU and CUDA ICN artifacts for one operating-system and
+architecture target. The Bun composition layer selects the CUDA flavor only when an NVIDIA driver
+is available, permits an explicit CPU or CUDA development override, and otherwise selects the
+generic CPU flavor. This is binary compatibility selection, not hardware topology discovery:
+ICN remains the sole authority for enumerating devices, memory domains, and runtime capabilities.
+The selected artifact's manifest records its compiled backend set, and verification requires that
+set to match the executable's machine-readable identity.
+
+Source development builds use backend-specific Cargo target directories. The selected executable
+is passed to lifecycle resolution explicitly, so a generic build cannot overwrite or replace a
+CUDA build during one development launch.
 
 Compatibility is established by a versioned ICN API protocol identity plus the release's expected
 native build identity. It is not inferred merely because `/health` returned 200, and it need not

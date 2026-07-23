@@ -1,4 +1,5 @@
 import { homedir } from "node:os"
+import { existsSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { Duration, Effect, Layer, Option } from "effect"
 import {
@@ -15,14 +16,22 @@ import {
 } from "@magnitudedev/icn"
 import { ACN_VERSION } from "../version"
 import { AcnShutdown } from "../acn-shutdown"
+import { selectIcnReleasePlatformKey } from "./release-platform"
 
 const platformKey = (): string => {
-  if (process.platform === "darwin" && process.arch === "arm64") return "darwin-arm64"
-  if (process.platform === "darwin" && process.arch === "x64") return "darwin-x64"
-  if (process.platform === "linux" && process.arch === "x64") return "linux-x64"
-  if (process.platform === "linux" && process.arch === "arm64") return "linux-arm64"
-  if (process.platform === "win32" && process.arch === "x64") return "windows-x64"
-  throw new Error(`Unsupported ICN platform: ${process.platform} ${process.arch}`)
+  const nvidiaSmi = process.platform === "linux" ? Bun.which("nvidia-smi") : null
+  const nvidiaDriverAvailable = existsSync("/dev/nvidiactl")
+    || (nvidiaSmi !== null
+      && Bun.spawnSync([nvidiaSmi, "-L"], {
+        stdout: "ignore",
+        stderr: "ignore",
+      }).success)
+  return selectIcnReleasePlatformKey({
+    platform: process.platform,
+    arch: process.arch,
+    requestedBackend: process.env.MAGNITUDE_ICN_BACKEND,
+    nvidiaDriverAvailable,
+  })
 }
 
 const defaultDataDir = () => join(homedir(), ".magnitude")
