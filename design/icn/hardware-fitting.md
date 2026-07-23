@@ -26,6 +26,11 @@ Unified-memory machines expose one physical memory domain. CPU and accelerator a
 charged to that domain once. Device-specific working-set limits remain additional constraints; they
 are not reported as independent physical capacity.
 
+Hardware presentation keeps system-product identity, accelerator chip identity, runtime backend,
+and native device ordinal distinct. Product identity comes from operating-system firmware data;
+chip identity comes from the native backend's device description. Generic runtime ordinals such as
+`CUDA0` and `MTL0` are never interpreted as a particular product or chip.
+
 Failure to enumerate or normalize hardware fails the operation. It is never converted into an
 empty topology or “no accelerator” result.
 

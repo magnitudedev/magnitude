@@ -768,6 +768,7 @@ export const HardwareSnapshot = S.Struct({
     { exact: true, as: "Option" },
   ),
   system_memory: S.suspend((): S.Schema<HardwareSystemMemory, HardwareSystemMemoryEncoded> => HardwareSystemMemory),
+  system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   topology_fingerprint: S.String,
 })
 export type HardwareSnapshot = S.Schema.Type<typeof HardwareSnapshot>
@@ -1250,6 +1251,13 @@ export const OfferingAssessment = S.Union(
         ),
         { exact: true, as: "Option" },
       ),
+      performanceUnavailable: S.optionalWith(
+        S.Union(
+          S.Null,
+          S.suspend((): S.Schema<PerformanceUnavailable, PerformanceUnavailableEncoded> => PerformanceUnavailable),
+        ),
+        { exact: true, as: "Option" },
+      ),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1301,6 +1309,14 @@ export const PerformanceEvidence = S.Struct({
 })
 export type PerformanceEvidence = S.Schema.Type<typeof PerformanceEvidence>
 export type PerformanceEvidenceEncoded = S.Schema.Encoded<typeof PerformanceEvidence>
+
+export const PerformanceUnavailable = S.Struct({
+  code: S.String,
+  message: S.String,
+  method: S.String,
+})
+export type PerformanceUnavailable = S.Schema.Type<typeof PerformanceUnavailable>
+export type PerformanceUnavailableEncoded = S.Schema.Encoded<typeof PerformanceUnavailable>
 
 export const PropsResponse = S.Struct({
   build_info: S.String,

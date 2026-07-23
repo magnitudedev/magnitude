@@ -79,12 +79,13 @@ inconsistent expert metadata makes performance unavailable rather than falling b
 active-parameter ratio over the complete model.
 
 KV traffic is calculated from the native per-layer K/V row bytes. Full-attention layers scale with
-occupied depth, sliding-window layers are capped by their native window, and recurrent layers read
-one fixed state row per generated token regardless of occupied depth. Hybrid models apply these
+occupied depth and sliding-window layers are capped by their native window. Layers without
+attention expose zero K and V row bytes and add no context-dependent KV traffic; this commonly
+includes recurrent layers, whose fixed state work is covered only indirectly by the estimator's
+efficiency allowance. A layer with only one missing K/V row is invalid. Hybrid models apply these
 rules independently per layer. Native layer identities must be unique; duplicate identities make
-the workload invalid rather than double-counting it. Complete native recurrent-state accounting is
-not itself a reason to reduce confidence; incomplete state accounting reduces confidence or makes
-the estimate unavailable.
+the workload invalid rather than double-counting it. A recurrent workload is moderate confidence
+until native recurrent-state traffic is represented explicitly.
 
 Host/device placement is part of the workload: every tensor and every layer's KV traffic uses the
 calibration for its actual native device. A configuration that fits through partial offload or
@@ -142,7 +143,8 @@ not cache schema versions.
 Performance is independent of fit success. A calibration, workload, arithmetic, or decoding failure
 cannot change `Fits`, `DoesNotFit`, incompatibility, or native fit diagnostics. A profile without a
 runnable placement has no generation estimate. Operational failures needed to produce a memory fit
-remain ordinary operation failures; estimator-specific failures become typed unavailable evidence.
+remain ordinary operation failures; estimator-specific failures become typed unavailable evidence
+and retain their method, code, and message through the public assessment response.
 
 Preview caches the composite profile assessment through the model-management cache. Cache reads and
 writes retain the no-fail behavior of disposable caches. Volatile calibration samples are not a new

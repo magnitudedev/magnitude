@@ -2429,6 +2429,12 @@
           "architecture": {
             "type": "string"
           },
+          "system_product_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cpu_model": {
             "type": [
               "string",
@@ -3559,6 +3565,16 @@
                   }
                 ]
               },
+              "performanceUnavailable": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PerformanceUnavailable"
+                  }
+                ]
+              },
               "_tag": {
                 "type": "string",
                 "enum": [
@@ -3681,6 +3697,26 @@
             "$ref": "#/components/schemas/PerformanceConfidence"
           },
           "method": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PerformanceUnavailable": {
+        "type": "object",
+        "required": [
+          "method",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "method": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
             "type": "string"
           }
         },

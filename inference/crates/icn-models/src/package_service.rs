@@ -173,13 +173,13 @@ fn package_from_resolved_with(
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let shard_count = model
-        .location
-        .components()
-        .iter()
-        .filter_map(|component| component.shard_index)
-        .max()
-        .map_or(0, |index| index + 1);
+    let shard_count = shard_count(
+        model
+            .location
+            .components()
+            .iter()
+            .map(|component| component.shard_index),
+    );
     let mut relationships = Vec::new();
     for component in model.location.components() {
         let Some(file_id) = ids_by_declared_path.get(&component.path).cloned() else {
@@ -229,6 +229,10 @@ fn package_from_resolved_with(
         relationships,
         properties,
     })
+}
+
+fn shard_count(indices: impl IntoIterator<Item = Option<u32>>) -> u32 {
+    indices.into_iter().flatten().max().unwrap_or(0)
 }
 
 pub(crate) fn package_from_resolved(
@@ -588,5 +592,16 @@ impl InstalledModelPackages for ModelManager {
                 removed: deleted.deleted,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shard_count;
+
+    #[test]
+    fn shard_count_uses_one_based_component_indices() {
+        assert_eq!(shard_count([Some(1), Some(2), Some(3)]), 3);
+        assert_eq!(shard_count([None, None]), 0);
     }
 }

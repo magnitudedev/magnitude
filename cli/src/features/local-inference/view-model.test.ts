@@ -25,6 +25,7 @@ describe("local inference selection view model", () => {
     const hardware = makeHardware({
       platform: "MacOS",
       architecture: "Arm64",
+      productName: Option.some("MacBook Pro"),
       processor: Option.some("Apple M4 Max"),
       totalSystemMemoryBytes: 64 * GIB,
       accelerators: [{
@@ -60,6 +61,7 @@ describe("local inference selection view model", () => {
     const hardware = makeHardware({
       platform: "Linux",
       architecture: "Arm64",
+      productName: Option.some("DGX Spark"),
       processor: Option.some("CPU"),
       logicalCores: 20,
       totalSystemMemoryBytes: 128 * GIB,
@@ -80,7 +82,7 @@ describe("local inference selection view model", () => {
     })
 
     expect(describeLocalHardware(hardware).system).toEqual({
-      name: "NVIDIA GB10",
+      name: "DGX Spark · NVIDIA GB10",
       details: [
         "Linux · ARM64 · 20 logical CPU cores",
         "128.0 GiB unified memory · CUDA GPU acceleration",

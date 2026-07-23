@@ -1596,6 +1596,7 @@ mod tests {
                     captured_at: 1,
                     platform: "test".to_owned(),
                     architecture: "test".to_owned(),
+                    system_product_name: None,
                     cpu_model: None,
                     logical_cores: 1,
                     system_memory: icn_contracts::HardwareSystemMemory {

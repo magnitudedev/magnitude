@@ -214,6 +214,7 @@ struct HardwareEnvironment {
     enabled_backends: Vec<String>,
     platform: String,
     architecture: String,
+    system_product_name: Option<String>,
     logical_cores: usize,
     system_memory: HardwareSystemMemory,
 }
@@ -277,6 +278,7 @@ pub fn discover_hardware(
             enabled_backends,
             platform: std::env::consts::OS.to_owned(),
             architecture: std::env::consts::ARCH.to_owned(),
+            system_product_name: discover_system_product_name(std::env::consts::OS),
             logical_cores: std::thread::available_parallelism().map_or(1, |value| value.get()),
             system_memory,
         },
@@ -429,6 +431,7 @@ fn hardware_snapshot_from_devices(
             .map_or(0, |duration| duration.as_secs()),
         platform: environment.platform,
         architecture: environment.architecture,
+        system_product_name: environment.system_product_name,
         cpu_model: domains
             .iter()
             .flat_map(|domain| &domain.devices)
@@ -441,6 +444,64 @@ fn hardware_snapshot_from_devices(
         topology_fingerprint,
         memory_domains: domains,
         resident_memory: None,
+    }
+}
+
+fn discover_system_product_name(platform: &str) -> Option<String> {
+    match platform {
+        "linux" => [
+            "/sys/devices/virtual/dmi/id/product_name",
+            "/sys/class/dmi/id/product_name",
+            "/proc/device-tree/model",
+        ]
+        .into_iter()
+        .find_map(|path| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|value| normalize_product_name(&value))
+        }),
+        "macos" => std::process::Command::new("/usr/sbin/system_profiler")
+            .args(["SPHardwareDataType", "-json"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                    .ok()
+                    .and_then(|document| {
+                        document
+                            .get("SPHardwareDataType")
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|entries| entries.first())
+                            .and_then(|entry| entry.get("machine_name"))
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|name| normalize_product_name(name.as_bytes()))
+                    })
+            }),
+        _ => None,
+    }
+}
+
+fn normalize_product_name(value: &[u8]) -> Option<String> {
+    let name = String::from_utf8_lossy(value)
+        .trim_matches(|character: char| character == '\0' || character.is_whitespace())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.is_empty()
+        || [
+            "default string",
+            "not specified",
+            "system product name",
+            "to be filled by o.e.m.",
+            "unknown",
+        ]
+        .iter()
+        .any(|placeholder| name.eq_ignore_ascii_case(placeholder))
+    {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -1231,7 +1292,8 @@ fn estimate_generation_performance(
         ));
     }
 
-    let mut confidence = if has_routed_tensors || workload.hybrid_model {
+    let mut confidence = if has_routed_tensors || workload.hybrid_model || workload.recurrent_model
+    {
         GenerationPerformanceConfidence::Moderate
     } else {
         GenerationPerformanceConfidence::High
@@ -1268,9 +1330,16 @@ fn estimate_generation_performance(
         let mut kv_seconds = 0.0_f64;
         let mut kv_uncertainty_seconds = 0.0_f64;
         for layer in &workload.kv_layers {
-            let attended_tokens = if layer.recurrent {
-                1
-            } else if layer.sliding_window_tokens == 0 {
+            if layer.key_bytes_per_token == 0 && layer.value_bytes_per_token == 0 {
+                continue;
+            }
+            if layer.key_bytes_per_token == 0 || layer.value_bytes_per_token == 0 {
+                return Err(PerformanceEstimateFailure::new(
+                    "invalid_native_workload",
+                    format!("KV layer {} has incomplete row bytes", layer.layer),
+                ));
+            }
+            let attended_tokens = if layer.sliding_window_tokens == 0 {
                 context_tokens
             } else {
                 context_tokens.min(layer.sliding_window_tokens)
@@ -2325,6 +2394,20 @@ mod tests {
     }
 
     #[test]
+    fn product_identity_normalization_preserves_real_names_and_rejects_placeholders() {
+        assert_eq!(
+            normalize_product_name(b"  NVIDIA DGX Spark\0\n"),
+            Some("NVIDIA DGX Spark".to_owned())
+        );
+        assert_eq!(
+            normalize_product_name(b"MacBook   Pro"),
+            Some("MacBook Pro".to_owned())
+        );
+        assert_eq!(normalize_product_name(b"System Product Name\n"), None);
+        assert_eq!(normalize_product_name(b"To Be Filled By O.E.M.\0"), None);
+    }
+
+    #[test]
     fn hardware_snapshot_deduplicates_backend_aliases_without_merging_duplicate_cards() {
         let gpu = |backend: &str, name: &str| {
             let mut device = discovered_device(
@@ -2362,6 +2445,7 @@ mod tests {
                 enabled_backends: vec!["vulkan".to_owned(), "cuda".to_owned()],
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
+                system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
@@ -2377,6 +2461,7 @@ mod tests {
             assert_eq!(domain.devices.len(), 2);
         }
         assert_eq!(snapshot.enabled_backends, vec!["cuda", "vulkan"]);
+        assert_eq!(snapshot.system_product_name, None);
         assert_eq!(
             resolve_memory_domain(&snapshot, &NativeMemoryLocation::Host),
             Some("system"),
@@ -2439,6 +2524,7 @@ mod tests {
                 enabled_backends: vec!["cpu".to_owned(), "cuda".to_owned(), "vulkan".to_owned()],
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
+                system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
@@ -2492,6 +2578,7 @@ mod tests {
                 enabled_backends: vec!["metal".to_owned(), "cpu".to_owned()],
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
+                system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
@@ -2510,6 +2597,7 @@ mod tests {
                 enabled_backends: vec!["cpu".to_owned(), "metal".to_owned()],
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
+                system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
@@ -2518,6 +2606,7 @@ mod tests {
             },
         );
         assert_eq!(first.topology_fingerprint, second.topology_fingerprint);
+        assert_eq!(first.system_product_name.as_deref(), Some("MacBook Pro"));
         assert_eq!(first.memory_domains.len(), 1);
         assert_eq!(first.memory_domains[0].total_capacity_bytes, 64_000);
         assert_eq!(first.memory_domains[0].devices.len(), 2);
@@ -2570,6 +2659,7 @@ mod tests {
                 enabled_backends: vec!["cpu".to_owned(), "metal".to_owned()],
                 platform: "macos".to_owned(),
                 architecture: "x86_64".to_owned(),
+                system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
@@ -3343,7 +3433,7 @@ mod tests {
                 "MTL0",
             )],
             vec![
-                kv_layer(0, 5, 0, true, "Metal", "MTL0"),
+                kv_layer(0, 0, 0, true, "Metal", "MTL0"),
                 kv_layer(1, 5, 0, false, "Metal", "MTL0"),
             ],
             0,
@@ -3353,12 +3443,12 @@ mod tests {
         let (_, _, _, _, points) = estimated_parts(
             estimate_generation_performance(&hybrid, &calibration, 20, &[10, 20], false).unwrap(),
         );
-        assert_eq!(points[0].kv_bytes_read_per_token, 110);
-        assert_eq!(points[1].kv_bytes_read_per_token, 210);
+        assert_eq!(points[0].kv_bytes_read_per_token, 100);
+        assert_eq!(points[1].kv_bytes_read_per_token, 200);
     }
 
     #[test]
-    fn recurrent_state_traffic_is_invariant_across_context_depth() {
+    fn recurrent_layers_with_no_kv_rows_do_not_add_context_traffic() {
         let recurrent = workload(
             vec![tensor(
                 "output.weight",
@@ -3369,7 +3459,7 @@ mod tests {
                 "Metal",
                 "MTL0",
             )],
-            vec![kv_layer(0, 5, 0, true, "Metal", "MTL0")],
+            vec![kv_layer(0, 0, 0, true, "Metal", "MTL0")],
             0,
             0,
         );
@@ -3378,13 +3468,61 @@ mod tests {
             estimate_generation_performance(&recurrent, &calibration, 20, &[10, 20], false)
                 .unwrap(),
         );
-        assert_eq!(confidence, GenerationPerformanceConfidence::High);
-        assert_eq!(points[0].kv_bytes_read_per_token, 10);
-        assert_eq!(points[1].kv_bytes_read_per_token, 10);
+        assert_eq!(confidence, GenerationPerformanceConfidence::Moderate);
+        assert_eq!(points[0].kv_bytes_read_per_token, 0);
+        assert_eq!(points[1].kv_bytes_read_per_token, 0);
         assert_eq!(
             points[0].expected_tokens_per_second,
             points[1].expected_tokens_per_second
         );
+    }
+
+    #[test]
+    fn layers_without_attention_kv_rows_do_not_add_context_traffic() {
+        let no_attention = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 0, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let (_, _, _, _, points) = estimated_parts(
+            estimate_generation_performance(&no_attention, &calibration, 20, &[10, 20], false)
+                .unwrap(),
+        );
+        assert_eq!(points[0].kv_bytes_read_per_token, 0);
+        assert_eq!(points[1].kv_bytes_read_per_token, 0);
+    }
+
+    #[test]
+    fn incomplete_kv_rows_are_rejected() {
+        let mut incomplete = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 0, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        incomplete.kv_layers[0].value_bytes_per_token = 8;
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let error = estimate_generation_performance(&incomplete, &calibration, 20, &[10], false)
+            .expect_err("native K/V row metadata must be jointly present or absent");
+        assert_eq!(error.code, "invalid_native_workload");
     }
 
     #[test]

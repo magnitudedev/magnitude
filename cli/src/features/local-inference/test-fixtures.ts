@@ -30,6 +30,7 @@ export const makeHardware = (
 ): LocalInferenceHardware => ({
   platform: "Linux",
   architecture: "X64",
+  productName: Option.none(),
   processor: Option.some("Test CPU"),
   logicalCores: 16,
   totalSystemMemoryBytes: 64 * GIB,

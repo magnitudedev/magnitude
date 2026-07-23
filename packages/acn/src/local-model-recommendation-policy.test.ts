@@ -33,6 +33,7 @@ const candidate = (input: {
   readonly confidence?: "high" | "moderate" | "low"
   readonly runtimeGiB?: number
   readonly downloadGiB?: number
+  readonly capacityGiB?: number
   readonly architecture?: "dense" | "moe"
 }): RecommendationCandidate => {
   const checkpointId = input.checkpoint ?? input.id
@@ -42,6 +43,7 @@ const candidate = (input: {
   const fidelity = input.fidelity ?? 60
   const runtimeBytes = (input.runtimeGiB ?? 24) * GIB
   const downloadBytes = (input.downloadGiB ?? input.runtimeGiB ?? 20) * GIB
+  const capacityBytes = (input.capacityGiB ?? 64) * GIB
   const packageId = ModelPackageIdSchema.make(`package_${input.id}`)
   const profile = { contextLength: context, parallelSequences: 1 }
   const configurationId = ModelServingConfigurationIdSchema.make(`${input.id}:ctx${context}`)
@@ -103,10 +105,10 @@ const candidate = (input: {
       assessmentId: OfferingAssessmentIdSchema.make(`assessment_${input.id}_${context}`),
       memory: [{
         memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("memory"),
-        capacityBytes: 64 * GIB,
+        capacityBytes,
         requiredBytes: runtimeBytes,
         requiredReserveBytes: 0,
-        remainingBytes: (64 * GIB) - runtimeBytes,
+        remainingBytes: capacityBytes - runtimeBytes,
       }],
       performance: Option.some({
         contextTokens: context,
@@ -116,6 +118,7 @@ const candidate = (input: {
         confidence: input.confidence ?? "high",
         method: "test-estimator",
       }),
+      performanceUnavailable: Option.none(),
     },
     artifactId,
     checkpointId,
@@ -128,7 +131,7 @@ const candidate = (input: {
     fidelityRank: fidelity,
     quantizationAware: false,
     estimatedRuntimeBytes: runtimeBytes,
-    stableCapacityBudgetBytes: 64 * GIB,
+    stableCapacityBudgetBytes: capacityBytes,
     totalDownloadBytes: downloadBytes,
   }
 }
@@ -188,11 +191,11 @@ describe("local model multicriteria recommendation policy", () => {
 
   it("builds a useful DGX Spark-class portfolio around the strongest responsive model", () => {
     const recommendations = selectRecommendationPortfolio([
-      candidate({ id: "laguna-100", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 26, context: 100_000, runtimeGiB: 82, downloadGiB: 63.6, architecture: "moe" }),
-      candidate({ id: "laguna-200", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 14, context: 200_000, runtimeGiB: 96, downloadGiB: 63.6, architecture: "moe" }),
-      candidate({ id: "qwen122", score: 47.6, fidelity: 40, expected: 30, context: 100_000, runtimeGiB: 84, downloadGiB: 71, architecture: "moe" }),
-      candidate({ id: "gemma26", score: 39, fidelity: 58, expected: 43, context: 100_000, runtimeGiB: 28, downloadGiB: 13.3, architecture: "moe" }),
-      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 35, context: 200_000, runtimeGiB: 6, downloadGiB: 2.7 }),
+      candidate({ id: "laguna-100", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 26, context: 100_000, runtimeGiB: 90, downloadGiB: 73.4, capacityGiB: 121.7, architecture: "moe" }),
+      candidate({ id: "laguna-200", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 14, context: 200_000, runtimeGiB: 104, downloadGiB: 73.4, capacityGiB: 121.7, architecture: "moe" }),
+      candidate({ id: "qwen122", score: 47.6, fidelity: 40, expected: 16.87, context: 100_000, runtimeGiB: 84, downloadGiB: 71, capacityGiB: 121.7, architecture: "moe" }),
+      candidate({ id: "gemma26", score: 39, fidelity: 58, expected: 42.7, context: 100_000, runtimeGiB: 28, downloadGiB: 13.3, capacityGiB: 121.7, architecture: "moe" }),
+      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 21, context: 200_000, runtimeGiB: 6, downloadGiB: 2.7, capacityGiB: 121.7 }),
     ])
 
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([

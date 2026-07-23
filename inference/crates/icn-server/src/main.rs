@@ -19,7 +19,7 @@ use icn_contracts::models::{
     ModelFailure as DomainModelFailure, ModelLoadEvent, ModelLoadStage,
     ModelOfferingTarget as DomainModelOfferingTarget, ModelPackageId, ModelPackageOperand,
     ModelServingConfiguration, ModelServingConfigurationId, ModelTargetInput, OfferingAssessment,
-    OfferingAssessmentId, PerformanceConfidence, PerformanceEvidence,
+    OfferingAssessmentId, PerformanceConfidence, PerformanceEvidence, PerformanceUnavailable,
     RemoveInstalledModelPackageResponse, RuntimeResidencyId,
     ServingProfile as DomainServingProfile,
 };
@@ -209,6 +209,7 @@ struct CalibrationCache {
 }
 
 const ASSESSMENT_RESOLVER_REVISION: &str = "icn-backend-plan-v1";
+const OFFERING_ASSESSMENT_REVISION: &str = "offering-assessment-v2-performance-failure";
 const CAPACITY_POLICY_REVISION: &str = "stable-total-reserve-v1";
 const MTP_SELECTOR_REVISION: &str = "icn-mtp-selector-v1";
 const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
@@ -494,6 +495,7 @@ impl NativeModelEvaluator {
             .map(|profile| {
                 serde_json::to_string(&(
                     ASSESSMENT_RESOLVER_REVISION,
+                    OFFERING_ASSESSMENT_REVISION,
                     CAPACITY_POLICY_REVISION,
                     MTP_SELECTOR_REVISION,
                     &environment_id.0,
@@ -733,23 +735,28 @@ fn offering_assessment(
     digest.update(reserve_bytes.to_le_bytes());
     let assessment_id = OfferingAssessmentId(format!("assessment_{:x}", digest.finalize()));
     match assessment.hardware {
-        HardwareAssessment::Fits { memory, .. } => OfferingAssessment::Fits {
-            profile,
-            configuration_id,
-            assessment_id,
-            memory: memory
-                .domains
-                .into_iter()
-                .map(|domain| MemoryAssessment {
-                    memory_domain_id: domain.memory_domain,
-                    capacity_bytes: domain.available_bytes.saturating_add(reserve_bytes),
-                    required_bytes: domain.required_bytes,
-                    required_reserve_bytes: reserve_bytes,
-                    remaining_bytes: domain.margin_bytes,
-                })
-                .collect(),
-            performance: performance_evidence(assessment.performance, context_tokens),
-        },
+        HardwareAssessment::Fits { memory, .. } => {
+            let (performance, performance_unavailable) =
+                performance_result(assessment.performance, context_tokens);
+            OfferingAssessment::Fits {
+                profile,
+                configuration_id,
+                assessment_id,
+                memory: memory
+                    .domains
+                    .into_iter()
+                    .map(|domain| MemoryAssessment {
+                        memory_domain_id: domain.memory_domain,
+                        capacity_bytes: domain.available_bytes.saturating_add(reserve_bytes),
+                        required_bytes: domain.required_bytes,
+                        required_reserve_bytes: reserve_bytes,
+                        remaining_bytes: domain.margin_bytes,
+                    })
+                    .collect(),
+                performance,
+                performance_unavailable,
+            }
+        }
         HardwareAssessment::DoesNotFit {
             memory,
             limiting_resource,
@@ -804,38 +811,64 @@ fn offering_assessment(
     }
 }
 
-fn performance_evidence(
+fn performance_result(
     assessment: GenerationPerformanceAssessment,
     context_tokens: u32,
-) -> Option<PerformanceEvidence> {
+) -> (Option<PerformanceEvidence>, Option<PerformanceUnavailable>) {
     match assessment {
         GenerationPerformanceAssessment::Estimated {
             method,
             confidence,
             points,
             ..
-        } => points
-            .into_iter()
-            .find(|point| point.context_tokens == context_tokens)
-            .map(|point| PerformanceEvidence {
-                context_tokens: point.context_tokens,
-                lower_tokens_per_second: point.lower_tokens_per_second,
-                estimated_tokens_per_second: point.expected_tokens_per_second,
-                upper_tokens_per_second: point.upper_tokens_per_second,
-                confidence: match confidence {
-                    icn_contracts::GenerationPerformanceConfidence::High => {
-                        PerformanceConfidence::High
-                    }
-                    icn_contracts::GenerationPerformanceConfidence::Moderate => {
-                        PerformanceConfidence::Moderate
-                    }
-                    icn_contracts::GenerationPerformanceConfidence::Low => {
-                        PerformanceConfidence::Low
-                    }
-                },
+        } => {
+            let evidence = points
+                .into_iter()
+                .find(|point| point.context_tokens == context_tokens)
+                .map(|point| PerformanceEvidence {
+                    context_tokens: point.context_tokens,
+                    lower_tokens_per_second: point.lower_tokens_per_second,
+                    estimated_tokens_per_second: point.expected_tokens_per_second,
+                    upper_tokens_per_second: point.upper_tokens_per_second,
+                    confidence: match confidence {
+                        icn_contracts::GenerationPerformanceConfidence::High => {
+                            PerformanceConfidence::High
+                        }
+                        icn_contracts::GenerationPerformanceConfidence::Moderate => {
+                            PerformanceConfidence::Moderate
+                        }
+                        icn_contracts::GenerationPerformanceConfidence::Low => {
+                            PerformanceConfidence::Low
+                        }
+                    },
+                    method: method.clone(),
+                });
+            match evidence {
+                Some(evidence) => (Some(evidence), None),
+                None => (
+                    None,
+                    Some(PerformanceUnavailable {
+                        method,
+                        code: "requested_context_unavailable".to_owned(),
+                        message: format!(
+                            "generation performance has no point for requested context {context_tokens}"
+                        ),
+                    }),
+                ),
+            }
+        }
+        GenerationPerformanceAssessment::Unavailable {
+            method,
+            code,
+            message,
+        } => (
+            None,
+            Some(PerformanceUnavailable {
                 method,
+                code,
+                message,
             }),
-        GenerationPerformanceAssessment::Unavailable { .. } => None,
+        ),
     }
 }
 
@@ -2135,7 +2168,7 @@ mod tests {
 
     #[test]
     fn performance_evidence_preserves_the_exact_requested_context_and_bounds() {
-        let evidence = performance_evidence(
+        let (evidence, unavailable) = performance_result(
             GenerationPerformanceAssessment::Estimated {
                 method: "native".to_owned(),
                 confidence: icn_contracts::GenerationPerformanceConfidence::Moderate,
@@ -2163,15 +2196,38 @@ mod tests {
                 ],
             },
             100_000,
-        )
-        .expect("matching performance evidence");
+        );
+        let evidence = evidence.expect("matching performance evidence");
 
+        assert!(unavailable.is_none());
         assert_eq!(evidence.context_tokens, 100_000);
         assert_eq!(evidence.lower_tokens_per_second, 20.0);
         assert_eq!(evidence.estimated_tokens_per_second, 24.0);
         assert_eq!(evidence.upper_tokens_per_second, 28.0);
         assert_eq!(evidence.confidence, PerformanceConfidence::Moderate);
         assert_eq!(evidence.method, "native");
+    }
+
+    #[test]
+    fn performance_result_preserves_typed_unavailable_evidence() {
+        let (evidence, unavailable) = performance_result(
+            GenerationPerformanceAssessment::Unavailable {
+                method: "native_decode_v3".to_owned(),
+                code: "calibration_coverage_missing".to_owned(),
+                message: "no routed calibration covers backend CUDA device GPU0".to_owned(),
+            },
+            100_000,
+        );
+
+        assert!(evidence.is_none());
+        assert_eq!(
+            unavailable,
+            Some(PerformanceUnavailable {
+                method: "native_decode_v3".to_owned(),
+                code: "calibration_coverage_missing".to_owned(),
+                message: "no routed calibration covers backend CUDA device GPU0".to_owned(),
+            })
+        );
     }
 
     fn parity_test_defaults() -> RuntimePlanDefaults {
@@ -2203,6 +2259,7 @@ mod tests {
             captured_at: 1,
             platform: "test".to_owned(),
             architecture: "test".to_owned(),
+            system_product_name: None,
             cpu_model: None,
             logical_cores: 1,
             system_memory: icn_contracts::HardwareSystemMemory {
