@@ -21,11 +21,11 @@ hardware evidence. No model weights are downloaded until the user chooses a mode
 
 For each usage choice the ICN recipe service submits the applicable context and parallel-sequence
 profiles to preview. Recommendations use only exact 100K and 200K fits with generation evidence at
-that same context, and require at least 15 expected tokens per second. The service ranks eligible
-candidates into material Balanced, Best Quality, Fastest, and Lightweight intents using common
-Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization fidelity,
-and download size. Multiple quantizations of one checkpoint may appear when they explain a real
-quality trade-off; duplicate filler cards are omitted. The UI always presents these intents as
+that same context, and require at least 10 expected baseline tokens per second. The service ranks
+eligible candidates into material Balanced, Best Quality, Fastest, and Lightweight intents using
+common Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization
+fidelity, and download size. Multiple quantizations of one checkpoint may appear when they explain
+a real quality trade-off; duplicate filler cards are omitted. The UI always presents these intents as
 Balanced, Best Quality, Fastest, then Lightweight, and explains each specialized option by comparing
 its capability, speed, context, footprint, and possible quality loss with Balanced. The UI continues
 to show recommendations, exact artifact details, hardware, download progress, downloaded models,
