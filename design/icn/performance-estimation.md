@@ -59,16 +59,21 @@ These points are performance observations, not alternative model configurations.
 ## Native model workload facts
 
 The bindings return every stored tensor exactly once with its canonical name, tensor type, native
-buffer-device identity, complete storage bytes, native access class, and bytes touched by that
-access before routed-expert selection. Native access classes distinguish always-active tensors,
-routed-expert pools, and row lookups. Untied input and positional embeddings are row lookups; a
-token embedding shared with the output projection remains an always-active full matrix operation.
-The bindings report total and selected expert counts but do not apply their ratio.
+buffer-device identity, complete storage bytes, native access class, bytes touched by that access
+before routed-expert selection, and whether ordinary target-model decode executes it. Native access
+classes distinguish always-active tensors, routed-expert pools, and row lookups. Untied input,
+positional, per-layer, and hash-routing embeddings are row lookups; a token embedding shared with
+the output projection remains an always-active full matrix operation. Stored MTP/NextN tensors are
+explicitly not baseline operations. The bindings report total and selected expert counts but do not
+apply their ratio.
 
 For every layer, the bindings return native K/V row bytes, configured cache types, fitted KV-device
-identity, sliding-window limit, and recurrent flag. They also report native hybrid and recurrent
-model classifications. These are facts, not an estimate: the binding payload contains no token
-rates, efficiency constants, uncertainty bounds, or confidence labels.
+identity, attention head width and fixed-state type, sliding-window limit, recurrent flag and fixed
+recurrent-state rows, cache-compression ratio, and sparse-index row width and execution flag. The
+workload summary includes the canonical native architecture, MTP/NextN layer count, MLA/KV rank,
+and sparse-index dimensions and top-K. It also reports native hybrid and recurrent model
+classifications. These are facts, not an estimate: the binding payload contains no token rates,
+efficiency constants, uncertainty bounds, or confidence labels.
 
 ## ICN workload calculation
 
@@ -79,13 +84,16 @@ inconsistent expert metadata makes performance unavailable rather than falling b
 active-parameter ratio over the complete model.
 
 KV traffic is calculated from the native per-layer K/V row bytes. Full-attention layers scale with
-occupied depth and sliding-window layers are capped by their native window. Layers without
-attention expose zero K and V row bytes and add no context-dependent KV traffic; this commonly
-includes recurrent layers, whose fixed state work is covered only indirectly by the estimator's
-efficiency allowance. A layer with only one missing K/V row is invalid. Hybrid models apply these
-rules independently per layer. Native layer identities must be unique; duplicate identities make
-the workload invalid rather than double-counting it. A recurrent workload is moderate confidence
-until native recurrent-state traffic is represented explicitly.
+occupied depth and sliding-window layers are capped by their native window. Recurrent layers add no
+context-dependent KV traffic; they instead charge one fixed state read and write per generated token
+using their native state type and fitted device. Compressed attention scales stored depth by its
+native compression ratio. Sparse attention separately charges its context-growing index scan and
+its top-K-bounded cache gather. DeepSeek V4 compressed layers additionally charge a read of the
+native F32 compressor state—and CSA index state—plus the retained row written for the new token;
+this traffic does not grow with context. Specialized K-only caches may expose one zero ordinary K/V
+row; ordinary attention with only one missing row remains invalid. Hybrid models apply these rules
+independently per layer. Native layer identities must be unique; duplicate identities make the
+workload invalid rather than double-counting it.
 
 Host/device placement is part of the workload: every tensor and every layer's KV traffic uses the
 calibration for its actual native device. A configuration that fits through partial offload or
@@ -118,20 +126,25 @@ all native resources before returning.
 In `icn-hardware`, time for each native operation class is derived from its calibrated effective
 tensor-read rate and dispatch overhead. Routed and dense matrix operations use different calibration
 evidence. K and V traffic is charged independently for every layer, with sliding-window limits and
-the layer's actual native device. The reciprocal of total predicted seconds per token is the
-raw generation rate. Estimator v3 applies an ICN-owned efficiency factor of `0.82` for dense models
-and `0.75` for routed models to cover decode graph work outside the calibrated matrix operations.
-Cross-memory-domain placement applies a further `0.88` factor. These are versioned estimator
-policy: any change requires a new ICN estimator method identity and cache evidence.
+the layer's actual native device. The reciprocal of total predicted seconds per token is the raw
+generation rate. Estimator v5 applies ICN-owned upper efficiency factors of `0.82` for ordinary
+dense decode and `0.75` for routed decode. Recurrent, sparse-attention, and compressed-attention
+workloads cap that factor at `0.72`, `0.68`, and `0.65` respectively to cover state-update,
+selection, gather, compression, and elementwise work outside calibrated matrix and memory traffic.
+Cross-memory-domain placement applies a further `0.88` factor. These are versioned estimator policy:
+any change requires a new ICN estimator method identity and cache evidence.
 
 Every available result contains finite, positive lower, expected, and upper rates with
 `lower <= expected <= upper`. Bounds incorporate calibration dispersion and workload coverage.
-Estimator v3 starts with at least 12% uncertainty, weights observed calibration spread by `1.5`,
+Estimator v5 starts with at least 12% uncertainty, weights observed calibration spread by `1.5`,
 and widens routed and cross-memory-domain estimates further. Confidence is high, moderate, or low
 and is lowered by missing exact operation calibration, routed-expert uncertainty,
-cross-memory-domain placement, or incomplete native state accounting. Unified CPU/accelerator
-device ownership is not itself a reason to lower confidence. Unsupported inputs return a typed
-unavailable result; zero, NaN, infinity, and an unqualified point estimate are invalid.
+cross-memory-domain placement, or architecture work represented by a conservative related
+calibration. Unified CPU/accelerator device ownership is not itself a reason to lower confidence.
+When exact routed or quant calibration is absent but the same fitted device has valid related
+calibration, ICN returns a bounded hardware-specific estimate with lower confidence rather than
+suppressing the model. Structurally malformed workloads still return a typed unavailable result;
+zero, NaN, infinity, and an unqualified point estimate are invalid.
 
 The evidence identity includes the ICN estimator method, native workload schema, native calibration
 schema, artifact content, execution policy, native build, enabled backends, topology, capacity
@@ -157,16 +170,21 @@ for observed performance.
 - Native memory-fit outcomes and byte accounting are unchanged when performance is unavailable.
 - The bindings expose workload and calibration facts but contain no throughput formula, confidence
   assignment, context policy, or recommendation semantics.
-- Dense, routed-expert, shared-expert, sliding-window, unified-memory, CPU-only, and
-  cross-memory-domain calculations have deterministic fixture coverage.
+- Dense, routed-expert, shared-expert, sliding-window, recurrent, compressed-attention,
+  sparse-index, unified-memory, CPU-only, and cross-memory-domain calculations have deterministic
+  fixture coverage.
 - Apple Silicon CPU and Metal workload ownership resolves to one performance memory domain and
   never receives a cross-domain penalty solely because both native devices appear in the plan.
 - Increasing active tensor traffic, routed experts, or per-layer KV context depth cannot improve
   an otherwise identical estimate.
+- Recurrent state is charged once per token and never multiplied by occupied context.
+- Stored MTP/NextN tensors do not affect baseline target-model throughput.
+- Sparse index scans continue to scale with their indexed history after the gathered attention
+  depth reaches top-K; compressed histories scale by their native compression ratio.
 - Calibration is bounded, reusable across profiles and artifacts, and never runs concurrently for
   the same evidence identity.
-- Malformed native values, unsupported operations, and incomplete MoE metadata produce typed
-  unavailable results rather than guessed rates.
+- Malformed native values and incomplete MoE metadata produce typed unavailable results. Missing
+  exact operation calibration uses a conservative same-device fallback and lowers confidence.
 - Remote sparse and complete local forms of the same artifact produce identical model workloads.
 - Recommendation policy consumes only a complete estimate point matching the exact selected product
   context. Clients present the selected evidence but never reinterpret workload or throughput.

@@ -31,12 +31,22 @@ use sha2::{Digest, Sha256};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 pub const GENERATION_PERFORMANCE_CONTEXTS: [u32; 4] = [8_192, 32_768, 100_000, 200_000];
-pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v3";
+pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v5";
 // Versioned ICN policy for work not represented by the synthetic matrix-operation calibration.
 // Changing any of these constants requires a new GENERATION_PERFORMANCE_METHOD identity.
 const GENERATION_PERFORMANCE_WORKLOAD: &str = "baseline_single_sequence_decode";
 const DENSE_DECODE_EFFICIENCY: f64 = 0.82;
 const ROUTED_DECODE_EFFICIENCY: f64 = 0.75;
+const RECURRENT_DECODE_EFFICIENCY: f64 = 0.72;
+const SPARSE_ATTENTION_DECODE_EFFICIENCY: f64 = 0.68;
+const COMPRESSED_ATTENTION_DECODE_EFFICIENCY: f64 = 0.65;
+const RECURRENT_STATE_READ_WRITE_MULTIPLIER: u64 = 2;
+const DEEPSEEK4_CSA_STATE_ROWS: u64 = 8;
+const DEEPSEEK4_HCA_STATE_ROWS: u64 = 128;
+const DEEPSEEK4_STATE_TENSORS: u64 = 2;
+const DEEPSEEK4_CSA_EMBEDDING_MULTIPLIER: u64 = 2;
+const DEEPSEEK4_STATE_WRITE_ROWS_PER_TOKEN: u64 = 1;
+const F32_BYTES: u64 = 4;
 const CROSS_DOMAIN_PLACEMENT_EFFICIENCY: f64 = 0.88;
 const CALIBRATION_SPREAD_WEIGHT: f64 = 1.5;
 const MINIMUM_UNCERTAINTY: f64 = 0.12;
@@ -1051,7 +1061,9 @@ fn workload_crosses_memory_domains(
         Ok(())
     };
     for tensor in &workload.tensors {
-        record(tensor.backend_type, &tensor.backend, &tensor.device_id)?;
+        if tensor.baseline_executed {
+            record(tensor.backend_type, &tensor.backend, &tensor.device_id)?;
+        }
     }
     for layer in &workload.kv_layers {
         record(layer.backend_type, &layer.backend, &layer.device_id)?;
@@ -1112,26 +1124,41 @@ fn calibration_for<'a>(
     tensor_type: i32,
     routed: bool,
 ) -> Result<CalibrationSelection<'a>, PerformanceEstimateFailure> {
-    let mut fallback = None;
+    let mut same_operation_fallback = None;
+    let mut dense_fallback = None;
     for metric in calibration.metrics.iter().filter(|metric| {
         metric.backend_type == backend_type
             && metric.backend == backend
             && metric.device_id == *device_id
-            && metric.routed == routed
     }) {
-        if metric.tensor_type == tensor_type {
+        if metric.routed == routed && metric.tensor_type == tensor_type {
             return Ok(CalibrationSelection {
                 metric,
                 exact: true,
             });
         }
-        if fallback.is_none_or(|current: &FitCalibrationMetric| {
-            metric.bytes_per_second < current.bytes_per_second
-        }) {
-            fallback = Some(metric);
+        if metric.routed == routed
+            && same_operation_fallback.is_none_or(|current: &FitCalibrationMetric| {
+                metric.bytes_per_second < current.bytes_per_second
+            })
+        {
+            same_operation_fallback = Some(metric);
+        }
+        if routed
+            && !metric.routed
+            && dense_fallback.is_none_or(|current: &FitCalibrationMetric| {
+                let metric_exact_type = metric.tensor_type == tensor_type;
+                let current_exact_type = current.tensor_type == tensor_type;
+                metric_exact_type && !current_exact_type
+                    || metric_exact_type == current_exact_type
+                        && metric.bytes_per_second < current.bytes_per_second
+            })
+        {
+            dense_fallback = Some(metric);
         }
     }
-    fallback
+    same_operation_fallback
+        .or(dense_fallback)
         .map(|metric| CalibrationSelection {
             metric,
             exact: false,
@@ -1180,6 +1207,86 @@ fn operation_seconds(bytes: u64, metric: &FitCalibrationMetric) -> f64 {
     bytes as f64 / metric.bytes_per_second + metric.launch_microseconds / 1_000_000.0
 }
 
+fn deepseek4_attention_state_bytes(
+    workload: &FitDecodeWorkload,
+    layer: &llama_cpp_2::model::params::fit::FitKvLayerWorkload,
+) -> Result<u64, PerformanceEstimateFailure> {
+    if workload.architecture != "deepseek4" || layer.compression_ratio == 0 {
+        return Ok(0);
+    }
+    let (state_rows, embedding_width) = match layer.compression_ratio {
+        4 => (
+            DEEPSEEK4_CSA_STATE_ROWS,
+            u64::from(layer.attention_head_size)
+                .checked_mul(DEEPSEEK4_CSA_EMBEDDING_MULTIPLIER)
+                .ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "compressed-attention state width overflowed",
+                    )
+                })?,
+        ),
+        128 => (
+            DEEPSEEK4_HCA_STATE_ROWS,
+            u64::from(layer.attention_head_size),
+        ),
+        _ => return Ok(0),
+    };
+    let attention_state = DEEPSEEK4_STATE_TENSORS
+        .checked_mul(
+            state_rows
+                .checked_add(DEEPSEEK4_STATE_WRITE_ROWS_PER_TOKEN)
+                .ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "compressed-attention state row calculation overflowed",
+                    )
+                })?,
+        )
+        .and_then(|value| value.checked_mul(embedding_width))
+        .and_then(|value| value.checked_mul(F32_BYTES))
+        .ok_or_else(|| {
+            PerformanceEstimateFailure::new(
+                "workload_overflow",
+                "compressed-attention state calculation overflowed",
+            )
+        })?;
+    let index_state = if layer.compression_ratio == 4 && layer.sparse_index {
+        DEEPSEEK4_STATE_TENSORS
+            .checked_mul(
+                DEEPSEEK4_CSA_STATE_ROWS
+                    .checked_add(DEEPSEEK4_STATE_WRITE_ROWS_PER_TOKEN)
+                    .ok_or_else(|| {
+                        PerformanceEstimateFailure::new(
+                            "workload_overflow",
+                            "compressed-attention index state row calculation overflowed",
+                        )
+                    })?,
+            )
+            .and_then(|value| {
+                value.checked_mul(
+                    u64::from(workload.indexer_head_size)
+                        .checked_mul(DEEPSEEK4_CSA_EMBEDDING_MULTIPLIER)?,
+                )
+            })
+            .and_then(|value| value.checked_mul(F32_BYTES))
+            .ok_or_else(|| {
+                PerformanceEstimateFailure::new(
+                    "workload_overflow",
+                    "compressed-attention index state calculation overflowed",
+                )
+            })?
+    } else {
+        0
+    };
+    attention_state.checked_add(index_state).ok_or_else(|| {
+        PerformanceEstimateFailure::new(
+            "workload_overflow",
+            "compressed-attention state traffic overflowed",
+        )
+    })
+}
+
 fn estimate_generation_performance(
     workload: &FitDecodeWorkload,
     calibration: &FitCalibration,
@@ -1219,10 +1326,16 @@ fn estimate_generation_performance(
         ));
     }
 
-    let has_routed_tensors = workload
-        .tensors
-        .iter()
-        .any(|tensor| tensor.kind == FitTensorWorkloadKind::RoutedExpert);
+    if workload.architecture.is_empty() {
+        return Err(PerformanceEstimateFailure::new(
+            "incomplete_native_workload",
+            "native decode workload omitted the model architecture",
+        ));
+    }
+
+    let has_routed_tensors = workload.tensors.iter().any(|tensor| {
+        tensor.baseline_executed && tensor.kind == FitTensorWorkloadKind::RoutedExpert
+    });
     if has_routed_tensors {
         active_routed_bytes(1, workload.expert_count, workload.expert_used_count)?;
     } else if workload.expert_count != 0 || workload.expert_used_count != 0 {
@@ -1246,6 +1359,9 @@ fn estimate_generation_performance(
                 "invalid_native_workload",
                 format!("tensor {} has invalid byte counts", tensor.name),
             ));
+        }
+        if !tensor.baseline_executed {
+            continue;
         }
         let routed = tensor.kind == FitTensorWorkloadKind::RoutedExpert;
         let active_bytes = if routed {
@@ -1293,7 +1409,14 @@ fn estimate_generation_performance(
         ));
     }
 
-    let mut confidence = if has_routed_tensors || workload.hybrid_model || workload.recurrent_model
+    let specialized_attention = workload
+        .kv_layers
+        .iter()
+        .any(|layer| layer.compression_ratio > 0 || layer.sparse_index);
+    let mut confidence = if has_routed_tensors
+        || workload.hybrid_model
+        || workload.recurrent_model
+        || specialized_attention
     {
         GenerationPerformanceConfidence::Moderate
     } else {
@@ -1322,6 +1445,19 @@ fn estimate_generation_performance(
     } else {
         DENSE_DECODE_EFFICIENCY
     };
+    if workload.recurrent_model {
+        expected_efficiency = expected_efficiency.min(RECURRENT_DECODE_EFFICIENCY);
+    }
+    if workload.kv_layers.iter().any(|layer| layer.sparse_index) {
+        expected_efficiency = expected_efficiency.min(SPARSE_ATTENTION_DECODE_EFFICIENCY);
+    }
+    if workload
+        .kv_layers
+        .iter()
+        .any(|layer| layer.compression_ratio > 0)
+    {
+        expected_efficiency = expected_efficiency.min(COMPRESSED_ATTENTION_DECODE_EFFICIENCY);
+    }
     if cross_memory_domain_placement {
         expected_efficiency *= CROSS_DOMAIN_PLACEMENT_EFFICIENCY;
     }
@@ -1331,24 +1467,80 @@ fn estimate_generation_performance(
         let mut kv_seconds = 0.0_f64;
         let mut kv_uncertainty_seconds = 0.0_f64;
         for layer in &workload.kv_layers {
-            if layer.key_bytes_per_token == 0 && layer.value_bytes_per_token == 0 {
+            if layer.recurrent {
+                let state_bytes = layer
+                    .recurrent_conv_bytes
+                    .checked_add(layer.recurrent_state_bytes)
+                    .and_then(|bytes| bytes.checked_mul(RECURRENT_STATE_READ_WRITE_MULTIPLIER))
+                    .ok_or_else(|| {
+                        PerformanceEstimateFailure::new(
+                            "workload_overflow",
+                            "recurrent-state traffic calculation overflowed",
+                        )
+                    })?;
+                if state_bytes == 0 {
+                    confidence = GenerationPerformanceConfidence::Low;
+                    continue;
+                }
+                let selection = calibration_for(
+                    calibration,
+                    layer.backend_type,
+                    &layer.backend,
+                    &layer.device_id,
+                    layer.recurrent_type,
+                    false,
+                )?;
+                if !selection.exact {
+                    confidence = GenerationPerformanceConfidence::Low;
+                }
+                let seconds = operation_seconds(state_bytes, selection.metric);
+                kv_seconds += seconds;
+                kv_uncertainty_seconds +=
+                    seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
                 continue;
             }
-            if layer.key_bytes_per_token == 0 || layer.value_bytes_per_token == 0 {
+
+            let specialized_attention = layer.compression_ratio > 0 || layer.sparse_index;
+            if layer.key_bytes_per_token == 0
+                && layer.value_bytes_per_token == 0
+                && !specialized_attention
+            {
+                continue;
+            }
+            if layer.key_bytes_per_token == 0
+                && layer.value_bytes_per_token == 0
+                && specialized_attention
+            {
+                confidence = GenerationPerformanceConfidence::Low;
+            }
+            if (layer.key_bytes_per_token == 0) != (layer.value_bytes_per_token == 0)
+                && !specialized_attention
+            {
                 return Err(PerformanceEstimateFailure::new(
                     "invalid_native_workload",
                     format!("KV layer {} has incomplete row bytes", layer.layer),
                 ));
             }
-            let attended_tokens = if layer.sliding_window_tokens == 0 {
-                context_tokens
+
+            let stored_tokens = if layer.compression_ratio > 0 {
+                context_tokens.div_ceil(layer.compression_ratio)
             } else {
+                context_tokens
+            };
+            let attended_tokens = if layer.sparse_index && workload.indexer_top_k > 0 {
+                stored_tokens.min(workload.indexer_top_k)
+            } else if layer.sliding_window_tokens > 0 {
                 context_tokens.min(layer.sliding_window_tokens)
+            } else {
+                stored_tokens
             };
             for (tensor_type, row_bytes) in [
                 (layer.key_type, layer.key_bytes_per_token),
                 (layer.value_type, layer.value_bytes_per_token),
             ] {
+                if row_bytes == 0 {
+                    continue;
+                }
                 let bytes = row_bytes
                     .checked_mul(u64::from(attended_tokens))
                     .ok_or_else(|| {
@@ -1379,6 +1571,73 @@ fn estimate_generation_performance(
                 kv_seconds += seconds;
                 kv_uncertainty_seconds +=
                     seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+            }
+
+            if layer.sparse_index {
+                let index_depth = if layer.compression_ratio > 0 {
+                    stored_tokens
+                } else {
+                    context_tokens
+                };
+                let index_bytes = layer
+                    .indexer_bytes_per_token
+                    .checked_mul(u64::from(index_depth))
+                    .ok_or_else(|| {
+                        PerformanceEstimateFailure::new(
+                            "workload_overflow",
+                            "sparse-index traffic calculation overflowed",
+                        )
+                    })?;
+                if index_bytes == 0 {
+                    confidence = GenerationPerformanceConfidence::Low;
+                } else {
+                    kv_bytes_read_per_token = kv_bytes_read_per_token
+                        .checked_add(index_bytes)
+                        .ok_or_else(|| {
+                            PerformanceEstimateFailure::new(
+                                "workload_overflow",
+                                "sparse-index traffic accounting overflowed",
+                            )
+                        })?;
+                    let selection = calibration_for(
+                        calibration,
+                        layer.backend_type,
+                        &layer.backend,
+                        &layer.device_id,
+                        layer.key_type,
+                        false,
+                    )?;
+                    if !selection.exact {
+                        confidence = GenerationPerformanceConfidence::Low;
+                    }
+                    let seconds = operation_seconds(index_bytes, selection.metric);
+                    kv_seconds += seconds;
+                    kv_uncertainty_seconds +=
+                        seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+                }
+            }
+
+            let attention_state_bytes = deepseek4_attention_state_bytes(workload, layer)?;
+            if attention_state_bytes > 0 {
+                if layer.attention_head_size == 0 {
+                    confidence = GenerationPerformanceConfidence::Low;
+                } else {
+                    let selection = calibration_for(
+                        calibration,
+                        layer.backend_type,
+                        &layer.backend,
+                        &layer.device_id,
+                        layer.attention_state_type,
+                        false,
+                    )?;
+                    if !selection.exact {
+                        confidence = GenerationPerformanceConfidence::Low;
+                    }
+                    let seconds = operation_seconds(attention_state_bytes, selection.metric);
+                    kv_seconds += seconds;
+                    kv_uncertainty_seconds +=
+                        seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+                }
             }
         }
         let raw_seconds = weight_seconds + kv_seconds;
@@ -3022,6 +3281,7 @@ mod tests {
             device_id: Some(device_id.to_owned()),
             tensor_type,
             kind,
+            baseline_executed: true,
             stored_bytes,
             operation_bytes,
         }
@@ -3044,8 +3304,16 @@ mod tests {
             value_type: 1,
             key_bytes_per_token: row_bytes,
             value_bytes_per_token: row_bytes,
+            attention_head_size: row_bytes as u32,
+            attention_state_type: 1,
             sliding_window_tokens,
+            compression_ratio: 0,
+            sparse_index: false,
+            indexer_bytes_per_token: 0,
             recurrent,
+            recurrent_type: 1,
+            recurrent_conv_bytes: if recurrent { row_bytes } else { 0 },
+            recurrent_state_bytes: if recurrent { row_bytes } else { 0 },
         }
     }
 
@@ -3057,8 +3325,14 @@ mod tests {
     ) -> FitDecodeWorkload {
         FitDecodeWorkload {
             method: llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD.to_owned(),
+            architecture: "test".to_owned(),
             expert_count,
             expert_used_count,
+            nextn_layer_count: 0,
+            kv_lora_rank: 0,
+            indexer_head_count: 0,
+            indexer_head_size: 0,
+            indexer_top_k: 0,
             hybrid_model: false,
             recurrent_model: kv_layers.iter().any(|layer| layer.recurrent),
             tensors,
@@ -3370,7 +3644,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_moe_and_calibration_evidence_fail_typed() {
+    fn invalid_moe_fails_but_dense_calibration_can_bound_routed_work() {
         let invalid_moe = workload(
             vec![tensor(
                 "blk.0.ffn_exps.weight",
@@ -3394,9 +3668,11 @@ mod tests {
             expert_used_count: 2,
             ..invalid_moe
         };
-        let error = estimate_generation_performance(&valid_moe, &dense_only, 10, &[10], false)
-            .expect_err("dense calibration must not substitute for routed work");
-        assert_eq!(error.code, "calibration_coverage_missing");
+        let (confidence, _, _, _, _) = estimated_parts(
+            estimate_generation_performance(&valid_moe, &dense_only, 10, &[10], false)
+                .expect("dense calibration should provide a conservative routed fallback"),
+        );
+        assert_eq!(confidence, GenerationPerformanceConfidence::Low);
 
         let dense = workload(
             vec![tensor(
@@ -3423,6 +3699,233 @@ mod tests {
         let error = estimate_generation_performance(&dense, &malformed, 10, &[10], false)
             .expect_err("every calibration metric must be validated before use");
         assert_eq!(error.code, "invalid_calibration");
+    }
+
+    #[test]
+    fn baseline_decode_excludes_stored_nextn_tensors() {
+        let base = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 1, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let mut with_nextn = base.clone();
+        let mut nextn = tensor(
+            "blk.32.nextn.eh_proj.weight",
+            FitTensorWorkloadKind::AlwaysActive,
+            10_000,
+            10_000,
+            1,
+            "Metal",
+            "MTL0",
+        );
+        nextn.baseline_executed = false;
+        with_nextn.tensors.push(nextn);
+        with_nextn.nextn_layer_count = 1;
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+
+        let base = estimated_parts(
+            estimate_generation_performance(&base, &calibration, 10, &[10], false).unwrap(),
+        );
+        let with_nextn = estimated_parts(
+            estimate_generation_performance(&with_nextn, &calibration, 10, &[10], false).unwrap(),
+        );
+        assert_eq!(base.1, with_nextn.1);
+        assert_eq!(
+            base.4[0].expected_tokens_per_second,
+            with_nextn.4[0].expected_tokens_per_second
+        );
+    }
+
+    #[test]
+    fn recurrent_state_is_fixed_but_not_free() {
+        let mut recurrent = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 0, 0, true, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        recurrent.architecture = "qwen35".to_owned();
+        recurrent.kv_layers[0].recurrent_conv_bytes = 10;
+        recurrent.kv_layers[0].recurrent_state_bytes = 40;
+        let dense = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 0, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let recurrent = estimated_parts(
+            estimate_generation_performance(&recurrent, &calibration, 20, &[10, 20], false)
+                .unwrap(),
+        );
+        let dense = estimated_parts(
+            estimate_generation_performance(&dense, &calibration, 20, &[10], false).unwrap(),
+        );
+
+        assert_eq!(
+            recurrent.4[0].expected_tokens_per_second,
+            recurrent.4[1].expected_tokens_per_second
+        );
+        assert!(recurrent.4[0].expected_tokens_per_second < dense.4[0].expected_tokens_per_second);
+    }
+
+    #[test]
+    fn compressed_sparse_attention_scans_compressed_history_and_caps_gather() {
+        let mut compressed = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "CUDA",
+                "GPU0",
+            )],
+            vec![kv_layer(0, 4, 0, false, "CUDA", "GPU0")],
+            0,
+            0,
+        );
+        compressed.architecture = "deepseek4".to_owned();
+        compressed.indexer_top_k = 512;
+        compressed.kv_layers[0].compression_ratio = 4;
+        compressed.kv_layers[0].sparse_index = true;
+        compressed.kv_layers[0].indexer_bytes_per_token = 2;
+        compressed.kv_layers[0].value_bytes_per_token = 0;
+        let calibration = calibration(vec![calibration_metric(
+            "CUDA",
+            "GPU0",
+            1,
+            false,
+            1_000_000.0,
+        )]);
+        let (confidence, _, _, _, points) = estimated_parts(
+            estimate_generation_performance(
+                &compressed,
+                &calibration,
+                4_000,
+                &[1_000, 4_000],
+                false,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(confidence, GenerationPerformanceConfidence::Moderate);
+        assert_eq!(points[0].kv_bytes_read_per_token, 1_500);
+        assert_eq!(points[1].kv_bytes_read_per_token, 4_048);
+        assert!(points[1].expected_tokens_per_second < points[0].expected_tokens_per_second);
+    }
+
+    #[test]
+    fn deepseek4_compressor_state_is_fixed_but_not_free() {
+        let mut generic = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "CUDA",
+                "GPU0",
+            )],
+            vec![kv_layer(0, 4, 0, false, "CUDA", "GPU0")],
+            0,
+            0,
+        );
+        generic.kv_layers[0].compression_ratio = 4;
+        generic.kv_layers[0].attention_head_size = 16;
+        let mut deepseek = generic.clone();
+        deepseek.architecture = "deepseek4".to_owned();
+        let calibration = calibration(vec![calibration_metric(
+            "CUDA",
+            "GPU0",
+            1,
+            false,
+            1_000_000.0,
+        )]);
+        let generic = estimated_parts(
+            estimate_generation_performance(&generic, &calibration, 4_000, &[1_000, 4_000], false)
+                .unwrap(),
+        );
+        let deepseek = estimated_parts(
+            estimate_generation_performance(&deepseek, &calibration, 4_000, &[1_000, 4_000], false)
+                .unwrap(),
+        );
+
+        assert_eq!(
+            generic.4[0].kv_bytes_read_per_token,
+            deepseek.4[0].kv_bytes_read_per_token
+        );
+        assert_eq!(
+            generic.4[1].kv_bytes_read_per_token,
+            deepseek.4[1].kv_bytes_read_per_token
+        );
+        assert!(deepseek.4[0].expected_tokens_per_second < generic.4[0].expected_tokens_per_second);
+        let short_penalty = 1.0 / deepseek.4[0].expected_tokens_per_second
+            - 1.0 / generic.4[0].expected_tokens_per_second;
+        let long_penalty = 1.0 / deepseek.4[1].expected_tokens_per_second
+            - 1.0 / generic.4[1].expected_tokens_per_second;
+        assert!((short_penalty - long_penalty).abs() < f64::EPSILON * 16.0);
+    }
+
+    #[test]
+    fn dsa_index_scan_grows_after_sparse_attention_gather_is_capped() {
+        let mut sparse = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "CUDA",
+                "GPU0",
+            )],
+            vec![kv_layer(0, 4, 0, false, "CUDA", "GPU0")],
+            0,
+            0,
+        );
+        sparse.architecture = "glm-dsa".to_owned();
+        sparse.indexer_top_k = 512;
+        sparse.kv_layers[0].sparse_index = true;
+        sparse.kv_layers[0].indexer_bytes_per_token = 2;
+        let calibration = calibration(vec![calibration_metric(
+            "CUDA",
+            "GPU0",
+            1,
+            false,
+            1_000_000.0,
+        )]);
+        let (_, _, _, _, points) = estimated_parts(
+            estimate_generation_performance(&sparse, &calibration, 2_000, &[1_000, 2_000], false)
+                .unwrap(),
+        );
+
+        assert_eq!(points[0].kv_bytes_read_per_token, 6_096);
+        assert_eq!(points[1].kv_bytes_read_per_token, 8_096);
     }
 
     #[test]
@@ -3453,7 +3956,7 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_layers_with_no_kv_rows_do_not_add_context_traffic() {
+    fn recurrent_state_rows_do_not_scale_with_context_depth() {
         let recurrent = workload(
             vec![tensor(
                 "output.weight",
@@ -3464,7 +3967,7 @@ mod tests {
                 "Metal",
                 "MTL0",
             )],
-            vec![kv_layer(0, 0, 0, true, "Metal", "MTL0")],
+            vec![kv_layer(0, 5, 0, true, "Metal", "MTL0")],
             0,
             0,
         );
