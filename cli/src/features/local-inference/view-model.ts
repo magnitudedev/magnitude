@@ -15,6 +15,34 @@ export type LocalInferenceSelection = {
   readonly entry: LocalModelInventoryEntry
 }
 
+const selectionKindOrder: Record<LocalInferenceSelection["kind"], number> = {
+  running: 0,
+  stored: 1,
+  recommendation: 2,
+}
+
+const recommendationIntentOrder = {
+  balanced: 0,
+  best_quality: 1,
+  fastest: 2,
+  lightweight: 3,
+} as const
+
+const compareSelections = (
+  left: LocalInferenceSelection,
+  right: LocalInferenceSelection,
+): number => selectionKindOrder[left.kind] - selectionKindOrder[right.kind]
+  || (left.kind === "recommendation" && right.kind === "recommendation"
+    ? Option.match(left.entry.model.recommendation, {
+        onNone: () => 4,
+        onSome: ({ intent }) => recommendationIntentOrder[intent],
+      }) - Option.match(right.entry.model.recommendation, {
+        onNone: () => 4,
+        onSome: ({ intent }) => recommendationIntentOrder[intent],
+      })
+    : 0)
+  || left.entry.model.displayName.localeCompare(right.entry.model.displayName)
+
 export const buildLocalInferenceSelections = (
   view: LocalInferenceView,
 ): readonly LocalInferenceSelection[] => {
@@ -23,12 +51,12 @@ export const buildLocalInferenceSelections = (
     slot._tag === "Ready" && slot.selection.providerId === LOCAL_PROVIDER_ID
       ? [slot.selection.providerModelId]
       : []))
-  return view.inventory.entries.map((entry) => ({
+  return view.inventory.entries.map((entry): LocalInferenceSelection => ({
     kind: entry._tag === "Downloaded"
       ? running.has(entry.model.providerModelId) ? "running" : "stored"
       : "recommendation",
     entry,
-  }))
+  })).sort(compareSelections)
 }
 
 export const selectedInferenceIndex = (

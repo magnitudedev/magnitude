@@ -45,11 +45,11 @@ type LocalSetupHoveredAction = "models-skip"
 export const localModelSectionRule = (label: string): string =>
   "─".repeat(Math.max(0, LOCAL_MODEL_SECTION_WIDTH - label.length - SECTION_LABEL_GAP))
 
-const recommendationBadge = (badge: "recommended" | "lighter" | "higher_fidelity" | "alternative"): string => {
-  if (badge === "lighter") return "Smaller Model"
-  if (badge === "higher_fidelity") return "Higher Fidelity Option"
-  if (badge === "alternative") return "Alternative Option"
-  return "Recommended"
+const recommendationIntent = (intent: "balanced" | "best_quality" | "fastest" | "lightweight"): string => {
+  if (intent === "best_quality") return "Best Quality"
+  if (intent === "fastest") return "Fastest"
+  if (intent === "lightweight") return "Lightweight"
+  return "Balanced"
 }
 
 type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
@@ -226,11 +226,11 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                   <text style={{ fg: index === selectedIndex ? theme.primary : theme.foreground }} attributes={TextAttributes.BOLD}>
                     {index === selectedIndex ? "› " : "  "}{selectionTitle(selection)}
                     <span fg={theme.primary}>{selection.kind === "recommendation"
-                      ? Option.match(recommendation, { onNone: () => "", onSome: ({ badge }) => `  ${recommendationBadge(badge)}` })
+                      ? Option.match(recommendation, { onNone: () => "", onSome: ({ intent }) => `  ${recommendationIntent(intent)}` })
                       : selection.kind === "running" ? "  Already Running" : "  Already Downloaded"}</span>
                   </text>
                   <text style={{ fg: theme.muted }}>{selectionMetadata(selection)}</text>
-                  {Option.isSome(recommendation) && <text style={{ fg: theme.muted }}>{recommendation.value.fidelityLabel}</text>}
+                  {Option.isSome(recommendation) && <text style={{ fg: theme.muted }}>{recommendation.value.explanation}</text>}
                   {entry._tag === "Downloading" && <text style={{ fg: theme.primary }}>Downloading {entry.percentage}% · {formatBytes(entry.completedBytes)} / {formatBytes(entry.totalBytes)}</text>}
                   {entry._tag === "DownloadFailed" && <text style={{ fg: theme.error }}>Download failed · {entry.error.message}</text>}
                   {loading && <text style={{ fg: theme.primary }}>{formatModelLoadProgress(primarySlot.percentage)}</text>}
@@ -250,7 +250,8 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Quantization fidelity</text>
               <text style={{ fg: theme.muted }}>{recommendation.fidelityEvidence}</text>
               <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Fit</text>
-              <text style={{ fg: theme.muted }}>Estimated {formatBytes(recommendation.estimatedRuntimeBytes)} runtime; {formatBytes(recommendation.fitMarginBytes)} stable headroom.</text>
+              <text style={{ fg: theme.muted }}>Estimated {formatBytes(recommendation.estimatedRuntimeBytes)} runtime memory with {formatBytes(recommendation.fitMarginBytes)} remaining for the system.</text>
+              {Option.isSome(recommendation.estimatedGeneration) && <text style={{ fg: theme.muted }}>About {recommendation.estimatedGeneration.value.expectedTokensPerSecond.toFixed(1)} tokens/sec at {formatContext(recommendation.estimatedGeneration.value.contextTokens)} context ({recommendation.estimatedGeneration.value.confidence} confidence).</text>}
             </box>
           })()}
         </box>

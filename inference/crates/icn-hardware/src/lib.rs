@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 pub const GENERATION_PERFORMANCE_CONTEXTS: [u32; 4] = [8_192, 32_768, 100_000, 200_000];
-pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v2";
+pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v3";
 // Versioned ICN policy for work not represented by the synthetic matrix-operation calibration.
 // Changing any of these constants requires a new GENERATION_PERFORMANCE_METHOD identity.
 const GENERATION_PERFORMANCE_WORKLOAD: &str = "baseline_single_sequence_decode";
@@ -1138,6 +1138,18 @@ fn estimate_generation_performance(
             "native decode workload omitted tensors or KV layers",
         ));
     }
+    let mut kv_layer_ids = BTreeSet::new();
+    for layer in &workload.kv_layers {
+        if !kv_layer_ids.insert(layer.layer) {
+            return Err(PerformanceEstimateFailure::new(
+                "invalid_native_workload",
+                format!(
+                    "native decode workload contains duplicate KV layer {}",
+                    layer.layer
+                ),
+            ));
+        }
+    }
     if configured_context_tokens == 0 || requested_contexts.is_empty() {
         return Err(PerformanceEstimateFailure::new(
             "invalid_context_curve",
@@ -1224,7 +1236,7 @@ fn estimate_generation_performance(
     } else {
         GenerationPerformanceConfidence::High
     };
-    if used_fallback_calibration || cross_memory_domain_placement || workload.recurrent_model {
+    if used_fallback_calibration || cross_memory_domain_placement {
         confidence = GenerationPerformanceConfidence::Low;
     }
 
@@ -1256,7 +1268,9 @@ fn estimate_generation_performance(
         let mut kv_seconds = 0.0_f64;
         let mut kv_uncertainty_seconds = 0.0_f64;
         for layer in &workload.kv_layers {
-            let attended_tokens = if layer.sliding_window_tokens == 0 {
+            let attended_tokens = if layer.recurrent {
+                1
+            } else if layer.sliding_window_tokens == 0 {
                 context_tokens
             } else {
                 context_tokens.min(layer.sliding_window_tokens)
@@ -3317,8 +3331,8 @@ mod tests {
     }
 
     #[test]
-    fn kv_overflow_and_recurrent_workloads_are_handled_conservatively() {
-        let mut recurrent = workload(
+    fn recurrent_and_attention_layers_charge_independent_context_traffic() {
+        let hybrid = workload(
             vec![tensor(
                 "output.weight",
                 FitTensorWorkloadKind::AlwaysActive,
@@ -3328,18 +3342,96 @@ mod tests {
                 "Metal",
                 "MTL0",
             )],
-            vec![kv_layer(0, 1, 0, true, "Metal", "MTL0")],
+            vec![
+                kv_layer(0, 5, 0, true, "Metal", "MTL0"),
+                kv_layer(1, 5, 0, false, "Metal", "MTL0"),
+            ],
             0,
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let (confidence, _, _, _, _) = estimated_parts(
-            estimate_generation_performance(&recurrent, &calibration, 10, &[10], false).unwrap(),
+        let (_, _, _, _, points) = estimated_parts(
+            estimate_generation_performance(&hybrid, &calibration, 20, &[10, 20], false).unwrap(),
         );
-        assert_eq!(confidence, GenerationPerformanceConfidence::Low);
+        assert_eq!(points[0].kv_bytes_read_per_token, 110);
+        assert_eq!(points[1].kv_bytes_read_per_token, 210);
+    }
 
-        recurrent.kv_layers[0].key_bytes_per_token = u64::MAX;
-        let error = estimate_generation_performance(&recurrent, &calibration, 2, &[2], false)
+    #[test]
+    fn recurrent_state_traffic_is_invariant_across_context_depth() {
+        let recurrent = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 5, 0, true, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let (confidence, _, _, _, points) = estimated_parts(
+            estimate_generation_performance(&recurrent, &calibration, 20, &[10, 20], false)
+                .unwrap(),
+        );
+        assert_eq!(confidence, GenerationPerformanceConfidence::High);
+        assert_eq!(points[0].kv_bytes_read_per_token, 10);
+        assert_eq!(points[1].kv_bytes_read_per_token, 10);
+        assert_eq!(
+            points[0].expected_tokens_per_second,
+            points[1].expected_tokens_per_second
+        );
+    }
+
+    #[test]
+    fn duplicate_native_kv_layer_identity_is_rejected() {
+        let duplicate = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![
+                kv_layer(0, 1, 0, false, "Metal", "MTL0"),
+                kv_layer(0, 1, 0, false, "Metal", "MTL0"),
+            ],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let error = estimate_generation_performance(&duplicate, &calibration, 10, &[10], false)
+            .expect_err("duplicate KV layer identities must fail");
+        assert_eq!(error.code, "invalid_native_workload");
+    }
+
+    #[test]
+    fn kv_traffic_overflow_remains_typed() {
+        let mut dense = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                100,
+                100,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 1, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+
+        dense.kv_layers[0].key_bytes_per_token = u64::MAX;
+        let error = estimate_generation_performance(&dense, &calibration, 2, &[2], false)
             .expect_err("KV byte overflow must fail");
         assert_eq!(error.code, "workload_overflow");
     }

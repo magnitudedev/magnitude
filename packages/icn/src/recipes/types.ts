@@ -1,6 +1,7 @@
 export type RecipeQuantBitsClass = "q4" | "q5" | "q6" | "q8" | "mxfp4" | "other"
 export type CatalogEvidenceScope =
   | "publisher_checkpoint"
+  | "independent_checkpoint"
   | "checkpoint_quantization"
   | "exact_artifact"
   | "cross_model_quant_tier"
@@ -14,8 +15,10 @@ export interface RecipeBenchmarkEvidence {
   readonly higherIsBetter: boolean
   readonly methodologyId: string
   readonly mode: string
-  readonly evidenceScope: "publisher_checkpoint" | "exact_artifact"
+  readonly evidenceScope: "publisher_checkpoint" | "independent_checkpoint" | "exact_artifact"
+  readonly provenance: "measured_terminal_bench_2.1" | "estimated_terminal_bench_2.1"
   readonly sourceUrl: string
+  readonly basis: string
   readonly notes: string
 }
 
@@ -63,7 +66,6 @@ export interface ModelRecipe {
     readonly benchmarks: readonly RecipeBenchmarkEvidence[]
   }
   readonly licenseReview: RecipeLicenseReview
-  readonly qualityRank: number
   readonly artifacts: readonly ModelRecipeArtifact[]
 }
 
@@ -101,5 +103,5 @@ export interface ResolvedModelRecipe {
     readonly url: string
     readonly acknowledgementRequired: boolean
   }
-  readonly modelQualityRank: number
+  readonly capability: RecipeBenchmarkEvidence
 }

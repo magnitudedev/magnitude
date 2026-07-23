@@ -192,7 +192,7 @@ const nativeDetails = (
   }
 })
 
-const candidateDetails = (recommendation: ModelRecipeRecommendation): LocalModelInventoryEntryDetails => ({
+export const candidateDetails = (recommendation: ModelRecipeRecommendation): LocalModelInventoryEntryDetails => ({
   localModelId: candidateId(recommendation),
   providerModelId: providerModelId(candidateId(recommendation)),
   modelFamilyId: Option.none(),
@@ -217,7 +217,8 @@ const candidateDetails = (recommendation: ModelRecipeRecommendation): LocalModel
     memoryDomainIds: [],
   },
   recommendation: Option.some({
-    badge: recommendation.badge,
+    intent: recommendation.intent,
+    explanation: recommendation.explanation,
     fidelityLabel: recommendation.quantization.fidelityLabel,
     fidelityEvidence: recommendation.quantization.fidelityEvidence,
     repository: recommendation.repo,
@@ -226,6 +227,7 @@ const candidateDetails = (recommendation: ModelRecipeRecommendation): LocalModel
     sourcePageUrl: recommendation.sourcePageUrl,
     estimatedRuntimeBytes: recommendation.estimatedRuntimeBytes,
     fitMarginBytes: recommendation.fitMarginBytes,
+    estimatedGeneration: recommendation.estimatedGeneration,
   }),
 })
 
