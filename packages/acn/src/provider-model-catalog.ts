@@ -22,7 +22,7 @@ import {
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
-import { LocalModelInventory } from "./local-model-inventory"
+import { LocalProviderOfferingProjection } from "./local-provider-offering-projection"
 
 class ProviderContractViolation extends Data.TaggedError("ProviderContractViolation")<{
   readonly providerId: ProviderId
@@ -169,10 +169,10 @@ export class ProviderModelCatalog extends Context.Tag("ProviderModelCatalog")<
 export const ProviderModelCatalogLive: Layer.Layer<
   ProviderModelCatalog,
   never,
-  ProviderClient | LocalModelInventory | MirroredStateChanges
+  ProviderClient | LocalProviderOfferingProjection | MirroredStateChanges
 > = Layer.scoped(ProviderModelCatalog, Effect.gen(function* () {
   const client = yield* ProviderClient
-  const localInventory = yield* LocalModelInventory
+  const localProjection = yield* LocalProviderOfferingProjection
   const scope = yield* Scope.Scope
   const lock = yield* Effect.makeSemaphore(1)
   const mirror = yield* makeMirroredState(ProviderModelCatalogMirror, new ProviderModelCatalogLoading({}))
@@ -225,15 +225,16 @@ export const ProviderModelCatalogLive: Layer.Layer<
       }
     }
 
-    const localState = (yield* localInventory.snapshot).state
-    if (localState._tag === "Ready") {
-      modelsByProvider.set(LOCAL_PROVIDER_ID, yield* localInventory.localCatalog)
-      failuresByProvider.delete(LOCAL_PROVIDER_ID)
-    } else {
+    const localOfferingsResult = yield* Effect.either(localProjection.list)
+    const localModels = Either.isRight(localOfferingsResult) ? localOfferingsResult.right : []
+    modelsByProvider.set(LOCAL_PROVIDER_ID, localModels)
+    if (Either.isLeft(localOfferingsResult)) {
       failuresByProvider.set(LOCAL_PROVIDER_ID, providerFailure(
         LOCAL_PROVIDER_ID,
-        localState._tag === "Failed" ? localState.error.message : "Local model inventory is loading",
+        localOfferingsResult.left.message,
       ))
+    } else {
+      failuresByProvider.delete(LOCAL_PROVIDER_ID)
     }
 
     const providerResult = yield* client.listProviders.pipe(
@@ -292,10 +293,8 @@ export const ProviderModelCatalogLive: Layer.Layer<
       )
     }))
 
-  const initialLocalInventorySnapshot = yield* localInventory.snapshot
   yield* refreshNow(false, Option.none())
-  yield* Effect.forkIn(localInventory.changes.pipe(
-    Stream.dropWhile((snapshot) => snapshot.revision <= initialLocalInventorySnapshot.revision),
+  yield* Effect.forkIn(localProjection.changes.pipe(
     Stream.runForEach(() => lock.withPermits(1)(Effect.gen(function* () {
       yield* beginRefresh
       yield* reconcile([])

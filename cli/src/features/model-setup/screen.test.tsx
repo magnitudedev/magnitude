@@ -3,15 +3,18 @@ import { testRender } from "@opentui/react/test-utils"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
-import { LocalModelAvailableForDownload, LocalModelDownloading } from "@magnitudedev/sdk"
-import { GIB, makeModel, makeView } from "../local-inference/test-fixtures"
+import { GIB, makeModel, makeRecommendation, makeView } from "../local-inference/test-fixtures"
 
 const actions = vi.hoisted(() => ({
-  downloadModel: vi.fn(),
-  deleteModel: vi.fn(),
-  loadSlot: vi.fn(),
-  unloadSlot: vi.fn(),
-  reloadSlot: vi.fn(),
+  downloadRecommendedModel: vi.fn(),
+  retryModelDownload: vi.fn(),
+  cancelModelDownload: vi.fn(),
+  dismissModelDownloadFailure: vi.fn(),
+  deleteLocalModel: vi.fn(),
+  assignSlot: vi.fn(),
+  clearSlot: vi.fn(),
+  loadModel: vi.fn(),
+  unloadModel: vi.fn(),
 }))
 let state = makeView({ ready: false })
 
@@ -62,8 +65,12 @@ test("preserves the local model setup screen instead of introducing a model-sele
 })
 
 test("clicking an available inventory entry requests its download", async () => {
-  const model = makeModel()
-  state = makeView({ entries: [new LocalModelAvailableForDownload({ model })], ready: false })
+  const model = makeModel({
+    download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
+    preparation: { _tag: "NotDownloaded" },
+  })
+  const recommendation = makeRecommendation()
+  state = makeView({ models: [model], recommendations: [recommendation], ready: false })
   const view = await testRender(
     <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
     { width: 100, height: 30 },
@@ -72,7 +79,7 @@ test("clicking an available inventory entry requests its download", async () => 
     await act(view.renderOnce)
     const position = textPosition(view.captureCharFrame(), model.displayName)
     await act(async () => view.mockMouse.click(position.x, position.y))
-    expect(actions.downloadModel).toHaveBeenCalledWith(model.localModelId)
+    expect(actions.downloadRecommendedModel).toHaveBeenCalledWith(recommendation.id)
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -81,12 +88,15 @@ test("clicking an available inventory entry requests its download", async () => 
 test("renders download progress as one label followed by percentage", async () => {
   const model = makeModel()
   state = makeView({
-    entries: [new LocalModelDownloading({
-      model,
-      percentage: 25,
-      completedBytes: model.downloadBytes / 4,
-      totalBytes: model.downloadBytes,
-    })],
+    models: [{
+      ...model,
+      download: {
+        _tag: "Downloading",
+        completedBytes: model.downloadBytes / 4,
+        totalBytes: model.downloadBytes,
+      },
+      preparation: { _tag: "NotDownloaded" },
+    }],
     ready: false,
   })
   const view = await testRender(
@@ -105,28 +115,19 @@ test("renders download progress as one label followed by percentage", async () =
 
 test("renders consumer recommendation intent and its trade-off explanation", async () => {
   const model = makeModel({
-    recommendation: Option.some({
-      intent: "fastest",
-      explanation: "Prioritizes responsive generation at about 42.0 tokens/sec.",
-      fidelityLabel: "Very high fidelity",
-      fidelityEvidence: "Test evidence",
-      repository: "owner/repo",
-      revision: "commit",
-      files: [],
-      sourcePageUrl: "https://example.com/model",
-      estimatedRuntimeBytes: 12 * GIB,
-      fitMarginBytes: 20 * GIB,
-      estimatedGeneration: Option.some({
-        contextTokens: 100_000,
-        lowerTokensPerSecond: 38,
-        expectedTokensPerSecond: 42,
-        upperTokensPerSecond: 46,
-        confidence: "high",
-        method: "test-estimator",
-      }),
-    }),
+    download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
+    preparation: { _tag: "NotDownloaded" },
   })
-  state = makeView({ entries: [new LocalModelAvailableForDownload({ model })], ready: false })
+  const recommendation = makeRecommendation({
+    intent: "fastest",
+    explanation: "Prioritizes responsive generation at about 42.0 tokens/sec.",
+    fit: {
+      requiredBytes: 12 * GIB,
+      availableBytes: 32 * GIB,
+      estimatedTokensPerSecond: Option.some(42),
+    },
+  })
+  state = makeView({ models: [model], recommendations: [recommendation], ready: false })
   const view = await testRender(
     <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
     { width: 100, height: 30 },

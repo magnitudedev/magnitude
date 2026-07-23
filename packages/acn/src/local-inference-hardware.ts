@@ -14,7 +14,7 @@ export class LocalInferenceHardwareProjectionFailure extends Data.TaggedError("L
 }> {}
 
 export const projectLocalInferenceHardware = (
-  hardware: Generated.HardwareSnapshotSchema,
+  hardware: Generated.HardwareSnapshot,
 ): Effect.Effect<LocalInferenceHardwareState, LocalInferenceHardwareProjectionFailure> => Effect.gen(function* () {
   const memoryDomains = hardware.memory_domains.map((domain) => ({
     memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(domain.id),

@@ -33,9 +33,15 @@ const discardRemovedModelConfiguration = (config: MagnitudeConfig): {
   const models = config.models === undefined ? undefined : {
     slots: config.models.slots,
     localModelRecency: config.models.localModelRecency,
+    localProviderOfferings: config.models.localProviderOfferings,
+    dismissedDownloadFailures: config.models.dismissedDownloadFailures,
   };
   const removedModelFields = config.models !== undefined
-    && Reflect.ownKeys(config.models).some((key) => key !== "slots" && key !== "localModelRecency");
+    && Reflect.ownKeys(config.models).some((key) =>
+      key !== "slots"
+      && key !== "localModelRecency"
+      && key !== "localProviderOfferings"
+      && key !== "dismissedDownloadFailures");
   const value = models === undefined ? { ...config } : { ...config, models };
   const removedLocalInference = Reflect.has(value, "localInference");
   if (removedLocalInference) Reflect.deleteProperty(value, "localInference");
@@ -143,6 +149,13 @@ export function makeConfigStorage(): Effect.Effect<
     const readConfig = (): Effect.Effect<MagnitudeConfig, PlatformError | JsonError> =>
       io.withPathLock(g.configFile, readConfigUnlocked());
 
+    const emptyModelConfig = () => ({
+      slots: { primary: Option.none(), secondary: Option.none() },
+      localModelRecency: { primary: [], secondary: [] },
+      localProviderOfferings: [],
+      dismissedDownloadFailures: [],
+    } as const);
+
     return {
       load: () => readConfig(),
 
@@ -183,10 +196,7 @@ export function makeConfigStorage(): Effect.Effect<
           g.configFile,
           Effect.gen(function* () {
             const current = yield* readConfigUnlocked();
-            const existingModels = current.models ?? {
-              slots: { primary: Option.none(), secondary: Option.none() },
-              localModelRecency: { primary: [], secondary: [] },
-            };
+            const existingModels = current.models ?? emptyModelConfig();
             yield* writeConfigUnlocked({
               ...current,
               models: {
@@ -195,6 +205,61 @@ export function makeConfigStorage(): Effect.Effect<
               },
             });
           })
+        ),
+
+      upsertLocalProviderOffering: (offering) =>
+        io.withPathLock(
+          g.configFile,
+          Effect.gen(function* () {
+            const current = yield* readConfigUnlocked();
+            const existingModels = current.models ?? emptyModelConfig();
+            const withoutExisting = existingModels.localProviderOfferings.filter(
+              ({ providerModelId }) => providerModelId !== offering.providerModelId,
+            );
+            yield* writeConfigUnlocked({
+              ...current,
+              models: {
+                ...existingModels,
+                localProviderOfferings: [...withoutExisting, offering],
+              },
+            });
+          }),
+        ),
+
+      dismissDownloadFailure: (packageId) =>
+        io.withPathLock(
+          g.configFile,
+          Effect.gen(function* () {
+            const current = yield* readConfigUnlocked();
+            const existingModels = current.models ?? emptyModelConfig();
+            yield* writeConfigUnlocked({
+              ...current,
+              models: {
+                ...existingModels,
+                dismissedDownloadFailures: [
+                  ...new Set([...existingModels.dismissedDownloadFailures, packageId]),
+                ],
+              },
+            });
+          }),
+        ),
+
+      clearDismissedDownloadFailure: (packageId) =>
+        io.withPathLock(
+          g.configFile,
+          Effect.gen(function* () {
+            const current = yield* readConfigUnlocked();
+            const existingModels = current.models ?? emptyModelConfig();
+            yield* writeConfigUnlocked({
+              ...current,
+              models: {
+                ...existingModels,
+                dismissedDownloadFailures: existingModels.dismissedDownloadFailures.filter(
+                  (candidate) => candidate !== packageId,
+                ),
+              },
+            });
+          }),
         ),
 
       getOnboardingConfig: () =>

@@ -1,5 +1,10 @@
 # Design documents
 
+THESE ARE NOT PLANS. THESE ARE NOT SPECS. THESE ARE NOT WHATEVER YOU DECIDE THEM TO BE.
+THESE ARE CONCISE, HUMAN-READABLE, SOURCES OF TRUTH.
+CHANGING DESIGN REPRESENTS A DELTA IN INTENDED FUNCTIONALITY OR ARCHITECTURE.
+DESIGN MUST ONLY BE CHANGED WITH HUMAN APPROVAL.
+
 The documents in this directory are the high-level source of truth for Magnitude's architecture and behavior. They describe the system that should exist, independently of the current implementation.
 
 A design document should be sufficient for a capable engineer to reproduce the intended architecture, invariants, behavior, boundaries, and failure semantics without first reading the code. It should remain durable as files, types, functions, and internal implementation details change.

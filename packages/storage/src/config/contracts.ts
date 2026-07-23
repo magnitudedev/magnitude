@@ -3,7 +3,16 @@ import { Context, Effect, Option } from 'effect'
 
 import type { JsonError } from '../io/storage'
 import type { ResolvedContextLimitPolicy } from '../types/config'
-import type { ContextLimitPolicy, MagnitudeConfig, OnboardingConfig, OnboardingFlowId, SlotId, SlotModelConfig } from '../types'
+import type {
+  ContextLimitPolicy,
+  MagnitudeConfig,
+  ModelPackageId,
+  OnboardingConfig,
+  OnboardingFlowId,
+  PersistedLocalProviderOffering,
+  SlotId,
+  SlotModelConfig,
+} from '../types'
 
 export interface ConfigStorageShape {
   readonly load: () => Effect.Effect<MagnitudeConfig, PlatformError | JsonError>
@@ -20,6 +29,16 @@ export interface ConfigStorageShape {
   readonly updateModelSlot: (
     slotId: SlotId,
     selection: Option.Option<SlotModelConfig>,
+  ) => Effect.Effect<void, PlatformError | JsonError>
+
+  readonly upsertLocalProviderOffering: (
+    offering: PersistedLocalProviderOffering,
+  ) => Effect.Effect<void, PlatformError | JsonError>
+  readonly dismissDownloadFailure: (
+    packageId: ModelPackageId,
+  ) => Effect.Effect<void, PlatformError | JsonError>
+  readonly clearDismissedDownloadFailure: (
+    packageId: ModelPackageId,
   ) => Effect.Effect<void, PlatformError | JsonError>
 
   readonly getOnboardingConfig: () => Effect.Effect<OnboardingConfig | null, PlatformError | JsonError>

@@ -34,9 +34,7 @@ use llama_cpp_2::common_sampling::{
     CommonSamplerConfig, ReasoningBudgetLimit,
 };
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::{
-    LlamaMemoryBreakdown, LlamaMemoryBreakdownError, LlamaMemoryLocation,
-};
+use llama_cpp_2::context::{LlamaMemoryBreakdown, LlamaMemoryBreakdownError, LlamaMemoryLocation};
 use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
@@ -647,6 +645,10 @@ fn executor_main(
                 return;
             }
         };
+    // The progress callback owns the load-stream sender. It is valid only while
+    // llama.cpp is loading weights and must not keep the stream alive for the
+    // lifetime of the resident executor.
+    drop(model_params);
     let chat_templates = match CommonChatTemplates::from_model(&model) {
         Ok(templates) => templates,
         Err(error) => {
@@ -1024,11 +1026,12 @@ fn resident_memory_state(
                 native_index: *native_index,
             },
         };
-        let domain_id = icn_hardware::resolve_memory_domain(snapshot, &location).ok_or_else(|| {
-            HardwareObservationError::MemoryDomainUnresolved {
-                location: format!("{location:?}"),
-            }
-        })?;
+        let domain_id =
+            icn_hardware::resolve_memory_domain(snapshot, &location).ok_or_else(|| {
+                HardwareObservationError::MemoryDomainUnresolved {
+                    location: format!("{location:?}"),
+                }
+            })?;
         let domain = domains
             .entry(domain_id.to_owned())
             .or_insert_with(|| ResidentMemoryDomain {
@@ -1177,6 +1180,7 @@ fn run_scheduler<'model>(
                 &mut sequence_pool,
                 &mut queued,
                 &mut active,
+                config.context_size as usize,
             );
         }
 
@@ -1365,6 +1369,7 @@ fn admit_requests<'model>(
     sequence_pool: &mut SequencePool,
     queued: &mut VecDeque<QueuedCompletion>,
     active: &mut Vec<ActiveRequest<'model>>,
+    shared_context_capacity: usize,
 ) {
     while !queued.is_empty() {
         let matching_prompt = queued.front().and_then(|queued| {
@@ -1403,7 +1408,7 @@ fn admit_requests<'model>(
             model,
             chat_templates,
             multimodal,
-            context.n_ctx_seq() as usize,
+            shared_context_capacity,
             context.n_batch() as usize,
             context.n_ubatch() as usize,
             sequence_id,
@@ -2303,7 +2308,7 @@ fn model_properties(
     config: &ExecutionIntent,
     resolved_execution: ExecutionConfig,
     model: &LlamaModel,
-    context: &LlamaContext<'_>,
+    _context: &LlamaContext<'_>,
     templates: &CommonChatTemplates,
     modalities: ModelModalities,
 ) -> Result<ModelProperties, InferenceError> {
@@ -2315,7 +2320,7 @@ fn model_properties(
         model_size_bytes: model.size(),
         architecture: model.meta_val_str("general.architecture").ok(),
         name: model.meta_val_str("general.name").ok(),
-        context_tokens: context.n_ctx_seq(),
+        context_tokens: config.context_size,
         training_context_tokens: model.n_ctx_train(),
         sliding_window_tokens: model.n_swa(),
         template_fingerprint: fingerprint(&chat_template),

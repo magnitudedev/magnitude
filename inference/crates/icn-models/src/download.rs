@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -12,7 +13,7 @@ use icn_contracts::{
     ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress,
     DownloadModelRequest, DownloadStage, HardwareAssessment, HuggingFaceDownloadSource, Integrity,
     InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
-    ModelDownloadEvent, ModelLocation, ModelSource, ServingConfiguration,
+    ModelDownloadEvent, ModelLocation, ModelSource,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -27,11 +28,29 @@ const MAX_ATTEMPTS: usize = 5;
 
 pub(crate) struct DownloadOperation {
     sender: watch::Sender<ModelDownloadEvent>,
+    cancelled: AtomicBool,
 }
 
 impl DownloadOperation {
     fn subscribe(&self) -> DownloadEventStream {
         watch_stream(self.sender.subscribe())
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn ensure_active(&self) -> Result<(), DownloadError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(DownloadError {
+                code: "cancelled",
+                message: "download was cancelled".to_owned(),
+                retryable: true,
+                resumable: true,
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -103,7 +122,10 @@ impl ModelManager {
             revision: revision.clone(),
         };
         let (sender, _receiver) = watch::channel(initial);
-        let operation = Arc::new(DownloadOperation { sender });
+        let operation = Arc::new(DownloadOperation {
+            sender,
+            cancelled: AtomicBool::new(false),
+        });
         let stream = operation.subscribe();
         operations.insert(key.clone(), Arc::clone(&operation));
         drop(operations);
@@ -115,6 +137,22 @@ impl ModelManager {
                 .await;
         });
         Ok(stream)
+    }
+
+    pub(crate) async fn cancel_download(
+        &self,
+        request: &DownloadModelRequest,
+    ) -> Result<(), InventoryError> {
+        let key = request_key(request);
+        let operation = self
+            .operations
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| InventoryError::NotFound("active download".to_owned()))?;
+        operation.cancel();
+        Ok(())
     }
 
     async fn run_download(
@@ -170,6 +208,7 @@ impl ModelManager {
         request: &DownloadModelRequest,
         operation: &DownloadOperation,
     ) -> Result<(), DownloadError> {
+        operation.ensure_active()?;
         let HuggingFaceDownloadSource::HuggingFace {
             repository,
             revision,
@@ -279,18 +318,9 @@ impl ModelManager {
                 .cloned()
         });
         if existing.is_some() {
-            let configured = self
-                .configure_serving_model(&model_id, request.serving_profile.clone())
-                .await
-                .map_err(|error| DownloadError {
-                    code: "configuration_failed",
-                    message: error.to_string(),
-                    retryable: false,
-                    resumable: false,
-                })?;
             operation.sender.send_replace(ModelDownloadEvent::Ready {
                 operation_id: operation_id.to_owned(),
-                model: Box::new(configured),
+                model: Box::new(existing.expect("existing model was checked")),
             });
             return Ok(());
         }
@@ -302,9 +332,7 @@ impl ModelManager {
             created: started_at,
             name: repository.clone(),
             supported_parameters: Vec::new(),
-            serving_configuration: Some(ServingConfiguration {
-                profile: request.serving_profile.clone(),
-            }),
+            serving_configuration: None,
             availability: ModelAvailability::Downloading {
                 operation_id: operation_id.to_owned(),
                 stage: DownloadStage::Queued,
@@ -418,6 +446,7 @@ impl ModelManager {
 
         let started = Instant::now();
         for (index, component) in remote.iter().enumerate() {
+            operation.ensure_active()?;
             let resumed_from = component_partial_len(&repo_root, component).await;
             let mut last_progress_emit = Instant::now()
                 .checked_sub(Duration::from_millis(100))
@@ -474,6 +503,7 @@ impl ModelManager {
                         model.updated_at = updated_at;
                     }
                 },
+                &operation.cancelled,
             )
             .await?;
             operation_manifest.components[index].completed_bytes = component.size;
@@ -516,7 +546,6 @@ impl ModelManager {
         persist_managed_manifest(&self.config.root, &manifest).await?;
         let operation_path = operation_manifest_path(&self.config.root, &model_id);
         let _ = tokio::fs::remove_file(operation_path).await;
-        drop(lock_file);
         let primary = manifest
             .components
             .iter()
@@ -534,7 +563,7 @@ impl ModelManager {
                 retryable: false,
                 resumable: false,
             })?;
-        let mut model = build_model(
+        let model = build_model(
             manifest.model_id.clone(),
             manifest.content_id.clone(),
             manifest.created_at,
@@ -563,9 +592,6 @@ impl ModelManager {
             retryable: true,
             resumable: true,
         })?;
-        model.serving_configuration = Some(ServingConfiguration {
-            profile: request.serving_profile.clone(),
-        });
         let ready = self
             .complete_and_publish_model(model)
             .await
@@ -579,6 +605,7 @@ impl ModelManager {
             operation_id: operation_id.to_owned(),
             model: Box::new(ready),
         });
+        drop(lock_file);
         Ok(())
     }
 }
@@ -589,9 +616,19 @@ async fn download_component_with_retry(
     commit: &str,
     component: &RemoteComponent,
     mut progress: impl FnMut(u64),
+    cancelled: &AtomicBool,
 ) -> Result<(), DownloadError> {
     for attempt in 0..MAX_ATTEMPTS {
-        match download_component_once(repo, root, commit, component, &mut progress).await {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(DownloadError {
+                code: "cancelled",
+                message: "download was cancelled".to_owned(),
+                retryable: true,
+                resumable: true,
+            });
+        }
+        match download_component_once(repo, root, commit, component, &mut progress, cancelled).await
+        {
             Ok(()) => return Ok(()),
             Err(error) if error.retryable && attempt + 1 < MAX_ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_secs(1_u64 << attempt.min(4))).await;
@@ -608,6 +645,7 @@ async fn download_component_once(
     commit: &str,
     component: &RemoteComponent,
     progress: &mut impl FnMut(u64),
+    cancelled: &AtomicBool,
 ) -> Result<(), DownloadError> {
     let blobs = root
         .join("hub")
@@ -655,6 +693,15 @@ async fn download_component_once(
         .await
         .map_err(download_io)?;
     while let Some(chunk) = stream.next().await {
+        if cancelled.load(Ordering::Acquire) {
+            file.flush().await.map_err(download_io)?;
+            return Err(DownloadError {
+                code: "cancelled",
+                message: "download was cancelled".to_owned(),
+                retryable: true,
+                resumable: true,
+            });
+        }
         let chunk = chunk.map_err(map_hf_error)?;
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| DownloadError {
             code: "size_overflow",

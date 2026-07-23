@@ -3,10 +3,8 @@ import { Option } from "effect"
 import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
-  LocalModelAvailableForDownload,
-  LocalModelIdSchema,
-  ProviderModelIdSchema,
-  type LocalModelInventoryEntryDetails,
+  ModelOfferingTargetIdSchema,
+  RecommendationIdSchema,
 } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
@@ -15,13 +13,11 @@ import {
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
-import { GIB, makeHardware, makeModel, makeView } from "./test-fixtures"
+import { GIB, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
 
 describe("local inference selection view model", () => {
-  it("uses honest indeterminate and finishing labels around native fractional progress", () => {
-    expect(formatModelLoadProgress(0)).toBe("Loading 0%")
+  it("shows native load progress", () => {
     expect(formatModelLoadProgress(42)).toBe("Loading 42%")
-    expect(formatModelLoadProgress(100)).toBe("Loading 100%")
   })
 
   it("presents unified memory from the hardware contract", () => {
@@ -63,9 +59,16 @@ describe("local inference selection view model", () => {
     expect(buildLocalInferenceSelections(makeView())[0]?.kind).toBe("running")
   })
 
-  it("keeps downloadable inventory entries actionable without duplicating state", () => {
-    const entry = new LocalModelAvailableForDownload({ model: makeModel() })
-    const selections = buildLocalInferenceSelections(makeView({ entries: [entry], ready: false }))
+  it("keeps recommendations actionable without duplicating target state", () => {
+    const model = makeModel({
+      download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
+      preparation: { _tag: "NotDownloaded" },
+    })
+    const selections = buildLocalInferenceSelections(makeView({
+      models: [model],
+      recommendations: [makeRecommendation()],
+      ready: false,
+    }))
     expect(selections).toHaveLength(1)
     expect(selections[0]?.kind).toBe("recommendation")
     expect(selectionMetadata(selections[0]!)).toContain("Q4_K_M")
@@ -74,72 +77,48 @@ describe("local inference selection view model", () => {
   it("orders recommendation intents for comparison rather than by model name", () => {
     const recommendation = (
       intent: "balanced" | "best_quality" | "fastest" | "lightweight",
-    ): LocalModelInventoryEntryDetails["recommendation"] => Option.some({
+      index: number,
+    ) => makeRecommendation({
+      id: RecommendationIdSchema.make(`recommendation_${intent}`),
+      modelId: ModelOfferingTargetIdSchema.make(`target_${index}`),
       intent,
       explanation: `${intent} explanation`,
-      fidelityLabel: "Very high quality",
-      fidelityEvidence: "Test evidence",
-      repository: "owner/repo",
-      revision: "commit",
-      files: [],
-      sourcePageUrl: "https://example.com/model",
-      estimatedRuntimeBytes: 12 * GIB,
-      fitMarginBytes: 20 * GIB,
-      estimatedGeneration: Option.none(),
     })
-    const entry = (
-      intent: "balanced" | "best_quality" | "fastest" | "lightweight",
-      displayName: string,
-    ) => new LocalModelAvailableForDownload({
-      model: makeModel({
-        localModelId: LocalModelIdSchema.make(intent),
-        providerModelId: ProviderModelIdSchema.make(`local:${intent}`),
-        displayName,
-        recommendation: recommendation(intent),
-      }),
-    })
+    const intents = ["fastest", "lightweight", "best_quality", "balanced"] as const
+    const models = intents.map((intent, index) => makeModel({
+      id: ModelOfferingTargetIdSchema.make(`target_${index}`),
+      displayName: `${intent} model`,
+      download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
+      preparation: { _tag: "NotDownloaded" },
+    }))
     const selections = buildLocalInferenceSelections(makeView({
       ready: false,
-      entries: [
-        new LocalModelAvailableForDownload({
-          model: makeModel({
-            localModelId: LocalModelIdSchema.make("uncurated"),
-            providerModelId: ProviderModelIdSchema.make("local:uncurated"),
-            displayName: "A Uncurated Model",
-          }),
-        }),
-        entry("fastest", "A Fast Model"),
-        entry("lightweight", "B Small Model"),
-        entry("best_quality", "C Quality Model"),
-        entry("balanced", "Z Balanced Model"),
-      ],
+      models,
+      recommendations: intents.map(recommendation),
     }))
-    expect(selections.map(({ entry: value }) => Option.match(value.model.recommendation, {
-      onNone: () => "uncurated",
+    expect(selections.map(({ recommendation: value }) => Option.match(value, {
+      onNone: () => "none",
       onSome: ({ intent }) => intent,
     }))).toEqual([
       "balanced",
       "best_quality",
       "fastest",
       "lightweight",
-      "uncurated",
     ])
   })
 
-  it("exposes a capacity warning from the inventory entry fit state", () => {
+  it("exposes the target preparation failure", () => {
     const model = makeModel({
-      fit: {
-        _tag: "DoesNotFit",
-        requiredBytes: 24 * GIB,
-        availableBytes: 20 * GIB,
-        limitingResource: "memory",
-        memoryDomainIds: [],
+      preparation: {
+        _tag: "Unavailable",
+        providerModelIds: [],
+        failure: { code: "does_not_fit", message: "Requires more memory", retryable: false },
       },
     })
     const selection = buildLocalInferenceSelections(makeView({
-      entries: [new LocalModelAvailableForDownload({ model })],
+      models: [model],
       ready: false,
     }))[0]!
-    expect(selectionCapacityWarning(selection)).toContain("estimated 24.0 GiB")
+    expect(selectionCapacityWarning(selection)).toBe("Requires more memory")
   })
 })

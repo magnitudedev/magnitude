@@ -6,8 +6,11 @@ applies_to:
   - packages/protocol/src/schemas/model-state.ts
   - packages/protocol/src/rpcs/group.ts
   - packages/acn/src/mirrored-state.ts
+  - packages/acn/src/observed-state.ts
   - packages/acn/src/provider-model-catalog.ts
-  - packages/acn/src/local-model-inventory.ts
+  - packages/acn/src/local-model-packages.ts
+  - packages/acn/src/local-model-recommendations.ts
+  - packages/acn/src/local-models.ts
   - packages/acn/src/model-slot-coordinator.ts
   - packages/acn/src/local-inference-hardware.ts
   - packages/acn/src/handlers.ts
@@ -40,9 +43,11 @@ currently consumed mirrors.
 
 ## Ownership
 
-ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModelInventory`, `ModelSlots`, and
-`LocalInferenceHardware`. Private ICN types and native field names do not cross the protocol
-boundary. A backend may bind directly only when it owns the exact public schema and versioned replay.
+ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModels`, `ModelSlots`, and
+`LocalInferenceHardware`. `LocalModels` is the stable target-level product projection; package,
+download-attempt, and recommendation working state remain private ACN observations. Private ICN
+types and native field names do not cross the protocol boundary. A backend may bind directly only
+when it owns the exact public schema and versioned replay.
 
 Client-common owns one watch per client connection and all query invalidation. Query atoms remain
 distinct by Get RPC tag. Screens consume snapshots; they do not reconstruct state or open their own

@@ -1,13 +1,11 @@
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { PromptBuilder, ProviderModelIdSchema } from "@magnitudedev/ai"
-import { Effect, Exit, Layer, Option, Stream } from "effect"
+import { Effect, Exit, Layer, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { IcnClient } from "../client.js"
 import { makeIcnApiClient } from "../generated/client.js"
-import { IcnInventory, makeIcnInventory } from "../inventory/index.js"
-import { IcnRecipes } from "../recipes/service.js"
-import { IcnProvider, makeIcnProvider } from "./source.js"
+import { IcnProvider, IcnProviderModelResolver, makeIcnProvider } from "./source.js"
 
 const TEST_BASE_URL = "http://icn.test"
 
@@ -17,14 +15,10 @@ const makeTestLayer = (http: HttpClient.HttpClient) => {
     IcnClient,
     makeIcnApiClient({ baseUrl: TEST_BASE_URL }),
   ).pipe(Layer.provide(httpLayer))
-  const inventoryLayer = makeIcnInventory().pipe(Layer.provide(clientLayer))
-  const recipesLayer = Layer.succeed(IcnRecipes, IcnRecipes.of({
-    get: Effect.succeed({ revision: 0, state: { _tag: "Loading" } }),
-    changes: Stream.empty,
-    refresh: Effect.void,
+  const resolverLayer = Layer.succeed(IcnProviderModelResolver, IcnProviderModelResolver.of({
     resolve: () => Effect.succeed(Option.none()),
   }))
-  const dependencies = Layer.mergeAll(clientLayer, inventoryLayer, recipesLayer)
+  const dependencies = Layer.merge(clientLayer, resolverLayer)
 
   return makeIcnProvider().pipe(
     Layer.provide(dependencies),
@@ -46,21 +40,14 @@ const jsonResponse = (
 )
 
 describe("ICN local provider", () => {
-  it("projects its catalog from observed inventory and refreshes through the inventory owner", async () => {
-    let inventoryRequests = 0
-    const http = HttpClient.make((request) => {
-      return Effect.sync(() => {
-        inventoryRequests += 1
-        return jsonResponse(request, '{"object":"list","data":[]}')
-      })
-    })
+  it("keeps the local provider catalog product-owned", async () => {
+    const http = HttpClient.make((request) =>
+      Effect.succeed(jsonResponse(request, '{"object":"list","data":[]}')))
 
     await Effect.runPromise(Effect.gen(function* () {
       const provider = yield* IcnProvider
       expect(yield* provider.catalog.list).toEqual([])
-      expect(inventoryRequests).toBe(1)
       expect(yield* provider.catalog.refresh).toEqual([])
-      expect(inventoryRequests).toBe(2)
     }).pipe(Effect.provide(makeTestLayer(http))))
   })
 

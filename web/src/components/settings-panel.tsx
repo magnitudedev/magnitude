@@ -10,14 +10,13 @@ import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
-import type { CloudUsageResponse, UsagePeriod, SlotId, LocalModelInventoryEntry, ProviderModelCatalogEntry } from "@magnitudedev/sdk"
-import { ProviderIdSchema, ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
+import type { CloudUsageResponse, UsagePeriod, SlotId, LocalModel, ProviderModelCatalogEntry } from "@magnitudedev/sdk"
+import { ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
 import type { UseModelConfigResult } from "@magnitudedev/client-common"
 
 export type { UsagePeriod } from "@magnitudedev/sdk"
 
 type Tab = "settings" | "usage"
-const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 
 const catalogStateOf = (modelConfig: UseModelConfigResult) =>
   Option.map(Result.value(modelConfig.catalog), ({ state }) => state)
@@ -176,10 +175,9 @@ function SettingsTab({
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const localInference = useLocalInferenceQuery()
-  const localSnapshot = Result.value(localInference)
-  const localEntries = Option.match(localSnapshot, {
-    onNone: () => [] as const,
-    onSome: ({ inventory }) => inventory._tag === "Ready" ? inventory.entries : [],
+  const localModels = Option.match(Result.value(localInference), {
+    onNone: () => [] as readonly LocalModel[],
+    onSome: ({ models }) => models.models,
   })
   const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
   const catalogLoading = Option.match(catalogState, {
@@ -337,7 +335,7 @@ function SettingsTab({
               key={entry.slotId}
               entry={entry}
               modelConfig={modelConfig}
-              localEntries={localEntries}
+              localModels={localModels}
               isLast={i === slots.length - 1}
             />
           ))}
@@ -636,20 +634,15 @@ function formatPricing(pricing: { input: number; output: number }): string {
   return `$${pricing.input.toFixed(2)}/$${pricing.output.toFixed(2)}`
 }
 
-function formatMemoryGiB(bytes: number): string {
-  const gib = bytes / 1024 ** 3
-  return `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB`
-}
-
 function SlotCard({
   entry,
   modelConfig,
-  localEntries,
+  localModels,
   isLast,
 }: {
   entry: SlotEntry
   modelConfig?: UseModelConfigResult
-  localEntries: readonly LocalModelInventoryEntry[]
+  localModels: readonly LocalModel[]
   isLast: boolean
 }): ReactNode {
   const slotId = entry.slotId
@@ -687,13 +680,14 @@ function SlotCard({
     onNone: () => "",
     onSome: ({ slot }) => slot.selection.reasoningEffort,
   })
-  const capacityRisk = Option.flatMap(selected, ({ model }) => {
-    if (model.providerId !== LOCAL_PROVIDER_ID) return Option.none()
-    const inventoryEntry = localEntries.find((candidate) => candidate.model.providerModelId === model.providerModelId)
-    return inventoryEntry?.model.fit._tag === "DoesNotFit"
-      ? Option.some(inventoryEntry.model.fit)
-      : Option.none()
-  })
+  const capacityFailure = Option.flatMap(selected, ({ model }) =>
+    Option.fromNullable(localModels.find(({ preparation }) =>
+      preparation._tag === "Unavailable"
+      && preparation.providerModelIds.includes(model.providerModelId))
+      ?.preparation)).pipe(
+        Option.filter((preparation) => preparation._tag === "Unavailable"
+          && preparation.failure.code === "insufficient_resources"),
+      )
 
   const handleModelChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -785,11 +779,14 @@ function SlotCard({
             {Option.isNone(selected) && <option value="" disabled>Unassigned</option>}
             {Option.isSome(models) && models.value.length > 0 ? (
               models.value.map((model, index) => (
-                <option key={JSON.stringify([model.providerId, model.providerModelId])} value={String(index)}>
+                <option
+                  key={JSON.stringify([model.providerId, model.providerModelId])}
+                  value={String(index)}
+                  disabled={model.availability._tag === "Disabled"}
+                >
                   {model.displayName} — {formatContextWindowCompact(model.contextWindow)} ctx
                   {Option.match(model.pricing, { onNone: () => "", onSome: (pricing) => ` — ${formatPricing(pricing)}` })}
-                  {model.providerId === LOCAL_PROVIDER_ID && localEntries.some((inventoryEntry) => inventoryEntry.model.providerModelId === model.providerModelId
-                    && inventoryEntry.model.fit._tag === "DoesNotFit") ? " — memory warning" : ""}
+                  {model.availability._tag === "Disabled" ? " — unavailable" : ""}
                 </option>
               ))
             ) : (
@@ -824,9 +821,9 @@ function SlotCard({
             ))}
           </select>
           </div>
-          {Option.isSome(capacityRisk) && (
+          {Option.isSome(capacityFailure) && capacityFailure.value._tag === "Unavailable" && (
             <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-warning)" }}>
-              Estimated memory use is {formatMemoryGiB(capacityRisk.value.requiredBytes)}, above this machine&apos;s stable capacity. Loading may fail or affect system performance.
+              {capacityFailure.value.failure.message}
             </div>
           )}
           {Option.isSome(selected) && (

@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { LocalModelIdSchema, SlotIdSchema } from "./schemas/model-state"
+import { SlotIdSchema } from "./schemas/model-state"
 
 export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
   "SessionNotFound",
@@ -41,11 +41,6 @@ export const SessionError = Schema.Union(
 )
 export type SessionError = Schema.Schema.Type<typeof SessionError>
 
-export class LocalModelNotFound extends Schema.TaggedError<LocalModelNotFound>()(
-  "LocalModelNotFound",
-  { localModelId: LocalModelIdSchema },
-) {}
-
 export class LocalModelMutationFailed extends Schema.TaggedError<LocalModelMutationFailed>()(
   "LocalModelMutationFailed",
   {
@@ -80,7 +75,6 @@ export const ModelSlotUpdateError = Schema.Union(
 export type ModelSlotUpdateError = Schema.Schema.Type<typeof ModelSlotUpdateError>
 
 export const LocalInferenceError = Schema.Union(
-  LocalModelNotFound,
   LocalModelMutationFailed,
   ModelSlotMutationRejected,
   ModelSlotMutationFailed,

@@ -1,10 +1,13 @@
 import { Option } from "effect"
 import {
+  ProviderModelCatalogLifecycle,
   ProviderIdSchema,
-  type LocalModelId,
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
-  type LocalModelInventoryEntry,
+  type LocalModel,
+  type LocalModelRecommendation,
+  type ProviderModelId,
+  type ReasoningEffort,
 } from "@magnitudedev/sdk"
 import type { LocalInferenceView } from "@magnitudedev/client-common"
 
@@ -12,7 +15,11 @@ const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 
 export type LocalInferenceSelection = {
   readonly kind: "running" | "stored" | "recommendation"
-  readonly entry: LocalModelInventoryEntry
+  readonly id: string
+  readonly model: LocalModel
+  readonly recommendation: Option.Option<LocalModelRecommendation>
+  readonly providerModelId: Option.Option<ProviderModelId>
+  readonly reasoningEffort: Option.Option<ReasoningEffort>
 }
 
 const selectionKindOrder: Record<LocalInferenceSelection["kind"], number> = {
@@ -33,39 +40,91 @@ const compareSelections = (
   right: LocalInferenceSelection,
 ): number => selectionKindOrder[left.kind] - selectionKindOrder[right.kind]
   || (left.kind === "recommendation" && right.kind === "recommendation"
-    ? Option.match(left.entry.model.recommendation, {
+    ? Option.match(left.recommendation, {
         onNone: () => 4,
         onSome: ({ intent }) => recommendationIntentOrder[intent],
-      }) - Option.match(right.entry.model.recommendation, {
+      }) - Option.match(right.recommendation, {
         onNone: () => 4,
         onSome: ({ intent }) => recommendationIntentOrder[intent],
       })
     : 0)
-  || left.entry.model.displayName.localeCompare(right.entry.model.displayName)
+  || left.model.displayName.localeCompare(right.model.displayName)
 
 export const buildLocalInferenceSelections = (
   view: LocalInferenceView,
 ): readonly LocalInferenceSelection[] => {
-  if (view.inventory._tag !== "Ready") return []
   const running = new Set([view.slots.slots.primary, view.slots.slots.secondary].flatMap((slot) =>
     slot._tag === "Ready" && slot.selection.providerId === LOCAL_PROVIDER_ID
       ? [slot.selection.providerModelId]
       : []))
-  return view.inventory.entries.map((entry): LocalInferenceSelection => ({
-    kind: entry._tag === "Downloaded"
-      ? running.has(entry.model.providerModelId) ? "running" : "stored"
-      : "recommendation",
-    entry,
-  })).sort(compareSelections)
+  const catalogModels = ProviderModelCatalogLifecycle.match(view.catalog, {
+    Loading: () => [],
+    Ready: ({ models }) => models,
+    Refreshing: ({ models }) => models,
+    Degraded: ({ models }) => models,
+    Unavailable: () => [],
+  })
+  const localProviderIds = new Set(catalogModels
+    .filter(({ providerId, availability }) =>
+      providerId === LOCAL_PROVIDER_ID && availability._tag === "Available")
+    .map(({ providerModelId }) => providerModelId))
+  const stored = view.models.models
+    .filter(({ download }) => download._tag === "Downloaded")
+    .map((model): LocalInferenceSelection => {
+      const providerModelId = model.preparation._tag === "Available"
+        ? Option.fromNullable(model.preparation.providerModelIds.find((id) => localProviderIds.has(id)))
+        : Option.none<ProviderModelId>()
+      const providerModel = Option.flatMap(providerModelId, (id) =>
+        Option.fromNullable(catalogModels.find(({ providerModelId }) => providerModelId === id)))
+      return {
+        id: `model:${model.id}`,
+        kind: Option.exists(providerModelId, (id) => running.has(id)) ? "running" : "stored",
+        model,
+        recommendation: Option.none(),
+        providerModelId,
+        reasoningEffort: Option.flatMap(
+          providerModel,
+          ({ capabilities }) => capabilities.reasoning.defaultEffort,
+        ),
+      }
+    })
+  const recommendations = view.models.recommendations._tag === "Ready"
+    ? view.models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
+        const model = view.models.models.find(({ id }) => id === recommendation.modelId)
+        if (!model || model.download._tag === "Downloaded") return []
+        return [{
+          id: `recommendation:${recommendation.id}`,
+          kind: "recommendation",
+          model,
+          recommendation: Option.some(recommendation),
+          providerModelId: Option.none(),
+          reasoningEffort: Option.none(),
+        }]
+      })
+    : []
+  const representedModelIds = new Set(recommendations.map(({ model }) => model.id))
+  const transientDownloads = view.models.models
+    .filter((model) =>
+      (model.download._tag === "Downloading" || model.download._tag === "Failed")
+      && !representedModelIds.has(model.id))
+    .map((model): LocalInferenceSelection => ({
+      id: `download:${model.id}`,
+      kind: "recommendation",
+      model,
+      recommendation: Option.none(),
+      providerModelId: Option.none(),
+      reasoningEffort: Option.none(),
+    }))
+  return [...stored, ...recommendations, ...transientDownloads].sort(compareSelections)
 }
 
 export const selectedInferenceIndex = (
   selections: readonly LocalInferenceSelection[],
-  selectedId: Option.Option<LocalModelId>,
+  selectedId: Option.Option<string>,
 ): number => {
   const index = Option.match(selectedId, {
     onNone: () => -1,
-    onSome: (id) => selections.findIndex(({ entry }) => entry.model.localModelId === id),
+    onSome: (id) => selections.findIndex((selection) => selection.id === id),
   })
   return index >= 0 ? index : 0
 }
@@ -125,12 +184,15 @@ export const describeLocalHardware = (
   }
 }
 
-export const selectionTitle = ({ entry }: LocalInferenceSelection): string => entry.model.displayName
+export const selectionTitle = ({ model }: LocalInferenceSelection): string => model.displayName
 
-export const selectionMetadata = ({ entry }: LocalInferenceSelection): string =>
-  `${entry.model.quantization} · ${formatBytes(entry.model.downloadBytes)} · ${formatContext(entry.model.contextWindow)} context`
+export const selectionMetadata = ({ model, recommendation }: LocalInferenceSelection): string =>
+  `${model.quantization} · ${formatBytes(model.downloadBytes)} · ${formatContext(
+    Option.match(recommendation, {
+      onNone: () => model.maximumContextLength,
+      onSome: ({ profile }) => profile.contextLength,
+    }),
+  )} context`
 
-export const selectionCapacityWarning = ({ entry }: LocalInferenceSelection): string | null =>
-  entry.model.fit._tag === "DoesNotFit"
-    ? `Memory warning: estimated ${formatBytes(entry.model.fit.requiredBytes)}; constrained hardware capacity ${formatBytes(entry.model.fit.availableBytes)}. Loading may fail or affect system performance.`
-    : null
+export const selectionCapacityWarning = ({ model }: LocalInferenceSelection): string | null =>
+  model.preparation._tag === "Unavailable" ? model.preparation.failure.message : null

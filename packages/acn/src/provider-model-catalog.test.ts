@@ -12,8 +12,7 @@ import {
   type ProviderClientShape,
   type ProviderModel,
 } from "@magnitudedev/sdk"
-import { LocalModelInventoryReady } from "@magnitudedev/protocol"
-import { LocalModelInventory } from "./local-model-inventory"
+import { LocalProviderOfferingProjection } from "./local-provider-offering-projection"
 import { MirroredStateChangesLive } from "./mirrored-state"
 import { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderClient } from "@magnitudedev/sdk"
@@ -70,18 +69,13 @@ describe("provider model catalog", () => {
         usage: () => Effect.die("not used"),
         runtimeConfig: { disableTraits: false },
       }
-      const localInventory = LocalModelInventory.of({
-        snapshot: Effect.succeed({ revision: 0, state: new LocalModelInventoryReady({ entries: [] }) }),
-        changes: Stream.empty,
-        localCatalog: Effect.succeed([]),
-        providerModelId: (localModelId) => ProviderModelIdSchema.make(`local:${localModelId}`),
-        nativeModelId: () => Effect.die("not used"),
-        download: () => Effect.void,
-        delete: () => Effect.void,
-      })
       const dependencies = Layer.mergeAll(
         Layer.succeed(ProviderClient, ProviderClient.of(client)),
-        Layer.succeed(LocalModelInventory, localInventory),
+        Layer.succeed(LocalProviderOfferingProjection, LocalProviderOfferingProjection.of({
+          list: Effect.succeed([]),
+          state: Effect.succeed({ entries: [], failure: Option.none() }),
+          changes: Stream.empty,
+        })),
         MirroredStateChangesLive,
       )
       return yield* Effect.gen(function* () {

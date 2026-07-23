@@ -1,6 +1,6 @@
 import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
-import { HardwareSnapshotSchema } from "../generated/schemas.js"
+import { HardwareSnapshot as HardwareSnapshotSchema } from "../generated/schemas.js"
 import {
   makeIcnObservedState,
   type IcnObservedState,

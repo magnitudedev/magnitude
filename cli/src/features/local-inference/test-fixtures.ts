@@ -2,25 +2,26 @@ import { Option } from "effect"
 import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
-  LocalModelDownloaded,
-  LocalModelIdSchema,
+  ModelOfferingTargetIdSchema,
   ModelSlotReady,
   ModelSlotUnassigned,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
+  ProviderModelCatalogReady,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
+  RecommendationIdSchema,
   SECONDARY_SLOT_ID,
   type LocalInferenceHardware,
-  type LocalModelInventoryEntry,
-  type LocalModelInventoryEntryDetails,
+  type LocalModel,
+  type LocalModelRecommendation,
 } from "@magnitudedev/sdk"
 import type { LocalInferenceView } from "@magnitudedev/client-common"
 
 export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 export const TEST_MODEL_ID = ProviderModelIdSchema.make("local:test-model")
-export const TEST_LOCAL_MODEL_ID = LocalModelIdSchema.make("test-model")
+export const TEST_TARGET_ID = ModelOfferingTargetIdSchema.make("target_test")
 export const TEST_MEMORY_DOMAIN_ID = LocalInferenceMemoryDomainIdSchema.make("memory")
 export const TEST_REASONING_EFFORT = ReasoningEffortSchema.make("none")
 
@@ -51,53 +52,83 @@ export const makeHardware = (
   ...overrides,
 })
 
-export const makeModel = (
-  overrides: Partial<LocalModelInventoryEntryDetails> = {},
-): LocalModelInventoryEntryDetails => ({
-  localModelId: TEST_LOCAL_MODEL_ID,
-  providerModelId: TEST_MODEL_ID,
-  modelFamilyId: Option.none(),
+export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
+  id: TEST_TARGET_ID,
   displayName: "Qwen Test",
-  family: "qwen",
-  architecture: "Dense",
-  capabilities: {
-    vision: false,
-    tools: true,
-    structuredOutput: true,
-    reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
-  },
-  contextWindow: 32_768,
-  maxOutputTokens: 4_096,
+  description: "Test model",
+  kind: "Standalone",
   quantization: "Q4_K_M",
+  maximumContextLength: 32_768,
   downloadBytes: 16 * GIB,
-  fit: {
-    _tag: "Fits",
-    requiredBytes: 18 * GIB,
-    availableBytes: 22 * GIB,
-    memoryDomainIds: [TEST_MEMORY_DOMAIN_ID],
-  },
-  recommendation: Option.none(),
+  download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+  preparation: { _tag: "Available", providerModelIds: [TEST_MODEL_ID] },
   ...overrides,
 })
 
-export const makeDownloadedEntry = (
-  model = makeModel(),
-): LocalModelInventoryEntry => new LocalModelDownloaded({ model, downloadedBytes: model.downloadBytes })
+export const makeRecommendation = (
+  overrides: Partial<LocalModelRecommendation> = {},
+): LocalModelRecommendation => ({
+  id: RecommendationIdSchema.make("recommendation_test"),
+  modelId: TEST_TARGET_ID,
+  displayName: "Qwen Test",
+  intent: "balanced",
+  explanation: "Balanced local inference.",
+  sources: [],
+  qualityScoreProvenance: "Test evidence",
+  fidelityRank: 0,
+  qualityEvidence: ["Test quantization evidence"],
+  profile: { contextLength: 32_768, parallelSequences: 1 },
+  fit: {
+    requiredBytes: 18 * GIB,
+    availableBytes: 22 * GIB,
+    estimatedTokensPerSecond: Option.none(),
+  },
+  ...overrides,
+})
 
 export const makeView = (options: {
   readonly hardware?: LocalInferenceHardware
-  readonly entries?: readonly LocalModelInventoryEntry[]
+  readonly models?: readonly LocalModel[]
+  readonly recommendations?: readonly LocalModelRecommendation[]
   readonly ready?: boolean
 } = {}): LocalInferenceView => {
-  const model = options.entries?.[0]?.model ?? makeModel()
+  const models = options.models ?? [makeModel()]
   const selection = {
     providerId: LOCAL_PROVIDER_ID,
-    providerModelId: model.providerModelId,
+    providerModelId: TEST_MODEL_ID,
     reasoningEffort: TEST_REASONING_EFFORT,
   }
   return {
     hardware: options.hardware ?? makeHardware(),
-    inventory: { _tag: "Ready", entries: options.entries ?? [makeDownloadedEntry(model)] },
+    models: {
+      models,
+      recommendations: { _tag: "Ready", entries: options.recommendations ?? [] },
+    },
+    catalog: new ProviderModelCatalogReady({
+      providers: [{
+        providerId: LOCAL_PROVIDER_ID,
+        displayName: "Local",
+        authentication: "NotRequired",
+        availability: { _tag: "Available" },
+      }],
+      models: [{
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: TEST_MODEL_ID,
+        modelFamilyId: Option.none(),
+        displayName: "Qwen Test",
+        supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
+        contextWindow: 32_768,
+        maxOutputTokens: 4_096,
+        capabilities: {
+          vision: false,
+          tools: true,
+          structuredOutput: true,
+          reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+        },
+        availability: { _tag: "Available" },
+        pricing: Option.none(),
+      }],
+    }),
     slots: {
       slots: {
         primary: options.ready === false

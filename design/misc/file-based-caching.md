@@ -4,7 +4,7 @@ applies_to:
   - packages/storage/src/io/structured-file.ts
   - packages/storage/src/sessions/storage.ts
   - packages/acn/src/model-configuration.ts
-  - packages/icn/src/recipes/**
+  - packages/icn/src/catalog/**
   - packages/ai/src/provider/file-catalog.ts
   - inference/crates/icn-models/**
   - inference/crates/icn-hardware/**

@@ -1,5 +1,15 @@
 import { Schema } from 'effect'
-import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/ai'
+import { ProviderModelIdSchema } from '@magnitudedev/ai'
+import {
+  LocalProviderOfferingOriginSchema,
+  ModelOfferingTargetIdSchema,
+  ModelServingConfigurationSchema,
+  ModelPackageIdSchema,
+  SlotIdSchema,
+  SlotSelectionSchema,
+  type ModelPackageId,
+  type SlotId,
+} from '@magnitudedev/protocol'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {
@@ -18,24 +28,20 @@ export interface ContextLimitPolicy extends Omit<Schema.Schema.Type<typeof Conte
 // Slot-based model configuration
 // =============================================================================
 
-/**
- * Slot identifiers. Defined locally because the storage package cannot import
- * from @magnitudedev/roles. Kept in sync with
- * `packages/roles/src/types.ts`.
- */
-export const SlotIdSchema = Schema.Literal('primary', 'secondary').pipe(Schema.brand('SlotId'))
-export type SlotId = Schema.Schema.Type<typeof SlotIdSchema>
+export { ModelPackageIdSchema, SlotIdSchema }
+export type { ModelPackageId, SlotId }
 
-/**
- * Reasoning effort levels. Defined locally to avoid a cross-package dependency.
- * Kept in sync with `packages/providers/src/magnitude/contract.ts`.
- */
-export const SlotModelConfigSchema = Schema.Struct({
-  providerId: ProviderIdSchema,
-  providerModelId: ProviderModelIdSchema,
-  reasoningEffort: ReasoningEffortSchema,
-})
+export const SlotModelConfigSchema = SlotSelectionSchema
 export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
+
+export const PersistedLocalProviderOfferingSchema = Schema.Struct({
+  providerModelId: ProviderModelIdSchema,
+  modelId: ModelOfferingTargetIdSchema,
+  configuration: ModelServingConfigurationSchema,
+  origin: LocalProviderOfferingOriginSchema,
+})
+export type PersistedLocalProviderOffering =
+  Schema.Schema.Type<typeof PersistedLocalProviderOfferingSchema>
 
 export const ModelConfigSchema = Schema.Struct({
   slots: Schema.Struct({
@@ -48,6 +54,14 @@ export const ModelConfigSchema = Schema.Struct({
   }), {
     default: () => ({ primary: [], secondary: [] }),
   }),
+  localProviderOfferings: Schema.optionalWith(
+    Schema.Array(PersistedLocalProviderOfferingSchema),
+    { default: () => [] },
+  ),
+  dismissedDownloadFailures: Schema.optionalWith(
+    Schema.Array(ModelPackageIdSchema),
+    { default: () => [] },
+  ),
 })
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 

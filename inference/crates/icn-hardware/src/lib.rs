@@ -192,7 +192,7 @@ pub enum EstimateError {
 
 /// Stable Magnitude capacity policy. It intentionally uses total capacity,
 /// not volatile process-external free memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct CapacityPolicy {
     pub reserve_bytes_per_domain: u64,
 }

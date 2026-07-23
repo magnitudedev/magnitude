@@ -10,14 +10,14 @@
     "./generated": "./src/generated/schemas.ts",
     "./lifecycle": "./src/lifecycle/index.ts",
     "./hardware": "./src/hardware/index.ts",
-    "./inventory": "./src/inventory/index.ts",
-    "./recipes": "./src/recipes/index.ts",
+    "./catalog": "./src/catalog/index.ts",
+    "./installed": "./src/installed/index.ts",
+    "./downloads": "./src/downloads/index.ts",
     "./provider": "./src/provider/index.ts"
   },
   "scripts": {
     "generate": "bun run scripts/generate.ts",
     "check-generated": "bun run scripts/generate.ts --check",
-    "recipes:validate": "bun run scripts/validate-model-recipes.ts",
     "typecheck": "tsc --noEmit",
     "test": "bunx --bun vitest run"
   },

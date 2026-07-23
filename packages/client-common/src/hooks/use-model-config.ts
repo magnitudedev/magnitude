@@ -27,11 +27,14 @@ export function useModelConfig() {
   const client = useAgentClient()
   const catalog = useMirroredState(ProviderModelCatalogMirror)
   const slots = useMirroredState(ModelSlotsMirror)
-  const updateAtom = useMemo(() => client.mutation("UpdateModelSlot"), [client])
+  const assignAtom = useMemo(() => client.mutation("AssignSlot"), [client])
+  const clearAtom = useMemo(() => client.mutation("ClearSlot"), [client])
   const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
-  const slotUpdate = useAtomValue(updateAtom)
+  const slotUpdate = useAtomValue(assignAtom)
+  const slotClear = useAtomValue(clearAtom)
   const catalogRefresh = useAtomValue(refreshAtom)
-  const update = useAtomSet(updateAtom)
+  const assign = useAtomSet(assignAtom)
+  const clear = useAtomSet(clearAtom)
   const refresh = useAtomSet(refreshAtom)
 
   const selections = Option.map(Result.value(slots), ({ state }) => ({
@@ -51,10 +54,16 @@ export function useModelConfig() {
   const commit = useMemo(() => (
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
-  ): void => update({
-    payload: { slotId, selection },
-    reactivityKeys: [ModelSlotsMirror.id],
-  }), [update])
+  ): void => Option.match(selection, {
+    onNone: () => clear({
+      payload: { slotId },
+      reactivityKeys: [ModelSlotsMirror.id],
+    }),
+    onSome: (value) => assign({
+      payload: { slotId, selection: value },
+      reactivityKeys: [ModelSlotsMirror.id],
+    }),
+  }), [assign, clear])
 
   const selectionFor = useMemo(() => (
     slotId: SlotId,
@@ -66,10 +75,24 @@ export function useModelConfig() {
       candidate.providerId === providerId && candidate.providerModelId === providerModelId)))
     const currentEffort = Option.filter(current, (value) => value.providerId === providerId
       && value.providerModelId === providerModelId)
-    const reasoningEffort = Option.match(currentEffort, {
-      onSome: (value) => value.reasoningEffort,
-      onNone: () => Option.getOrElse(Option.flatMap(model, (value) => value.capabilities.reasoning.defaultEffort),
-        () => ReasoningEffortSchema.make("none")),
+    const reasoningEffort = Option.match(model, {
+      onNone: () => Option.match(currentEffort, {
+        onSome: (value) => value.reasoningEffort,
+        onNone: () => ReasoningEffortSchema.make("none"),
+      }),
+      onSome: (value) => Option.match(currentEffort, {
+        onSome: (currentSelection) =>
+          value.capabilities.reasoning.efforts.includes(currentSelection.reasoningEffort)
+            ? currentSelection.reasoningEffort
+            : Option.getOrElse(
+                value.capabilities.reasoning.defaultEffort,
+                () => ReasoningEffortSchema.make("none"),
+              ),
+        onNone: () => Option.getOrElse(
+          value.capabilities.reasoning.defaultEffort,
+          () => ReasoningEffortSchema.make("none"),
+        ),
+      }),
     })
     return {
       providerId,
@@ -96,6 +119,7 @@ export function useModelConfig() {
     catalog,
     slots,
     slotUpdate,
+    slotClear,
     catalogRefresh,
     updateSlotModel,
     clearSlot,

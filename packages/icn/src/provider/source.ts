@@ -33,15 +33,7 @@ import {
   GeneratedClientInvalidResponseError,
   type GeneratedClientError,
 } from "@magnitudedev/openapi-effect/client-runtime"
-import { IcnInventory } from "../inventory/index.js"
-import { IcnRecipes } from "../recipes/service.js"
 import type { LocalProviderSource } from "./provider.js"
-import {
-  NativeIcnModelIdSchema,
-  candidateLocalModelId,
-  localProviderModelId,
-  nativeLocalModelId,
-} from "./model-identity.js"
 
 const catalogError = <Cause>(
   message: string,
@@ -172,7 +164,6 @@ const generatedBodyFailure = (
 const bindIcnModel = (
   client: IcnClientService,
   providerModelId: ProviderModelId,
-  contextWindow: number,
   bindOptions?: ProviderModelBindOptions,
 ) => Effect.succeed({
   stream: (prompt: Prompt, tools: readonly ToolDefinition[], requestOptions?: BaseCallOptions & { generateToolCallId?: () => ToolCallId }) => {
@@ -201,10 +192,6 @@ const bindIcnModel = (
         message: "Unable to encode the ICN chat request",
         evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
       })),
-      Effect.tap(() => client.models.configureModelServing({
-        path: { model_id: providerModelId },
-        payload: { context_length: contextWindow, parallel_sequences: 1 },
-      }).pipe(Effect.mapError((cause) => generatedStartFailure(call, cause)))),
       Effect.tap(() => bindOptions?.requestAttribution?.requestStarted ?? Effect.void),
       Effect.flatMap((payload) =>
         client.chat.createChatCompletion({ payload }).pipe(
@@ -267,43 +254,31 @@ export class IcnProvider extends Context.Tag("@magnitudedev/icn/IcnProvider")<
   IcnProviderService
 >() {}
 
+export interface IcnProviderModelResolution {
+  readonly runtimeModelId: ProviderModelId
+}
+
+export interface IcnProviderModelResolverService {
+  readonly resolve: (
+    providerModelId: ProviderModelId,
+  ) => Effect.Effect<Option.Option<IcnProviderModelResolution>>
+}
+
+export class IcnProviderModelResolver extends Context.Tag(
+  "@magnitudedev/icn/IcnProviderModelResolver",
+)<IcnProviderModelResolver, IcnProviderModelResolverService>() {}
+
 export const makeIcnProvider = (): Layer.Layer<
   IcnProvider,
   never,
-  IcnClient | IcnInventory | IcnRecipes
+  IcnClient | IcnProviderModelResolver
 > => Layer.effect(
   IcnProvider,
   Effect.gen(function* () {
     const client = yield* IcnClient
-    const inventory = yield* IcnInventory
-    const recipes = yield* IcnRecipes
-    const associations = Effect.all({ inventory: inventory.get, recipes: recipes.get }).pipe(Effect.map(({ inventory, recipes }) => {
-      const recommendations = recipes.state._tag === "Ready" ? recipes.state.recommendations : []
-      const recommendationByNativeId = new Map(recommendations.flatMap((recommendation) => Option.match(
-        recommendation.modelId,
-        { onNone: () => [], onSome: (modelId) => [[modelId, recommendation] as const] },
-      )))
-      return inventory.state.data.flatMap((model) => {
-        const recommendation = recommendationByNativeId.get(NativeIcnModelIdSchema.make(model.id))
-        const contextWindow = recommendation?.contextWindow ?? (model.properties.type === "inspected"
-          ? Option.getOrUndefined(Option.filter(
-              Option.flatMap(model.properties.training_context_length, Option.fromNullable),
-              (value) => value > 0,
-            ))
-          : undefined)
-        if (contextWindow === undefined) return []
-        const localModelId = recommendation
-          ? candidateLocalModelId(recommendation)
-          : nativeLocalModelId(NativeIcnModelIdSchema.make(model.id))
-        const publicId = localProviderModelId(localModelId)
-        return [{ model, publicId, contextWindow }]
-      })
-    }))
+    const resolver = yield* IcnProviderModelResolver
     const list = Effect.succeed([])
-    const refresh = inventory.refresh.pipe(
-      Effect.mapError((cause) => catalogError("Unable to refresh local models from ICN", cause)),
-      Effect.zipRight(list),
-    )
+    const refresh = list
     const catalog = {
       list,
       refresh,
@@ -313,18 +288,15 @@ export const makeIcnProvider = (): Layer.Layer<
     }
     return IcnProvider.of({
       catalog,
-      bindModel: (providerModelId, options) => associations.pipe(
-        Effect.flatMap((values) => {
-          const association = values.find((value) => value.publicId === providerModelId)
-          return association
-            ? bindIcnModel(
-                client,
-                ProviderModelIdSchema.make(association.model.id),
-                association.contextWindow,
-                options,
-              )
-            : bindMissingIcnModel(providerModelId)
-        }),
+      bindModel: (providerModelId, options) => resolver.resolve(providerModelId).pipe(
+        Effect.flatMap(Option.match({
+          onNone: () => bindMissingIcnModel(providerModelId),
+          onSome: (resolution) => bindIcnModel(
+            client,
+            resolution.runtimeModelId,
+            options,
+          ),
+        })),
       ),
       discoverModelProperties: () => Effect.succeed(ModelDiscoveryOperationIdSchema.make("icn-authoritative")),
       status: client.system.health({}).pipe(

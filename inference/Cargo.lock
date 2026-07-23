@@ -1395,6 +1395,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "utoipa",
 ]
 
 [[package]]

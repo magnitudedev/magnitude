@@ -72,11 +72,17 @@ export const ModelSlotsMirror = defineMirroredState("GetModelSlots", {
   errorSchema: Schema.Never,
 })
 
-export const UpdateModelSlot = Rpc.make("UpdateModelSlot", {
+export const AssignSlot = Rpc.make("AssignSlot", {
   payload: Schema.Struct({
     slotId: SlotIdSchema,
-    selection: Schema.optionalWith(SlotSelectionSchema, { as: "Option", exact: true }),
+    selection: SlotSelectionSchema,
   }),
+  success: Schema.Struct({}),
+  error: ModelSlotUpdateError,
+})
+
+export const ClearSlot = Rpc.make("ClearSlot", {
+  payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: Schema.Struct({}),
   error: ModelSlotUpdateError,
 })

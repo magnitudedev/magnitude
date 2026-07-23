@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod inventory;
+pub mod models;
 pub mod output;
 
 pub use inventory::*;
@@ -118,7 +119,7 @@ impl Default for ExecutionConfig {
             offload_kqv: true,
             operation_offload: true,
             swa_full: false,
-            kv_unified: false,
+            kv_unified: true,
             threads: None,
             threads_batch: None,
             flash_attention: FlashAttention::Auto,
@@ -697,7 +698,7 @@ mod execution_config_tests {
         assert!(config.offload_kqv);
         assert!(config.operation_offload);
         assert!(!config.swa_full);
-        assert!(!config.kv_unified);
+        assert!(config.kv_unified);
         assert!(config.threads.is_none());
         assert!(config.threads_batch.is_none());
         assert_eq!(config.flash_attention, FlashAttention::Auto);

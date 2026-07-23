@@ -6,7 +6,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -14,17 +14,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
+use icn_contracts::models::{
+    AssessModelsRequest, AssessModelsResponse, DownloadAttempt, DownloadAttemptId,
+    FitModelsRequest, FitModelsResponse, InstalledModelPackages, InstalledModelPackagesResponse,
+    LoadModelRequest, ModelDownloads, ModelDownloadsResponse, ModelEvaluator, ModelLoadEvent,
+    ModelPackageId, RecommendableModelCatalog, RecommendableModelCatalogProvider,
+    RemoveInstalledModelPackageResponse, StartModelDownloadRequest, StartModelDownloadResponse,
+};
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
-    ChatTemplateRequest, CompletionBackend, DeletedModel, DownloadModelRequest, ExecutionConfig,
-    ExecutionConfigReport, FinishReason, FlashAttention, Generation, GenerationMetrics,
-    GenerationSnapshot, GpuLayers, GrammarTrigger, HardwareProvider, HardwareSnapshot,
-    HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults,
-    HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, ImageInput, InferenceError,
-    InferenceEvent, InferenceStreamEvent, InventoryError, InventoryModel, ModelId, ModelInventory,
-    ModelModalities, ModelPreview, ModelPreviewRequest, ModelPreviewer, ModelProperties,
-    PreparedChatInfo, ReasoningControl, ResponseFormat, ServingProfile, SplitMode,
-    TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
+    ChatTemplateRequest, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FinishReason,
+    FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
+    HardwareProvider, HardwareSnapshot, HuggingFaceModelCatalog, HuggingFaceModelSearchRequest,
+    HuggingFaceModelSearchResults, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
+    ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent, InventoryError,
+    ModelModalities, ModelProperties, PreparedChatInfo, ReasoningControl, ResponseFormat,
+    SplitMode, TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -35,7 +40,6 @@ use utoipa::openapi::path::Operation;
 use utoipa::openapi::{Components, OpenApi as OpenApiDocument, RefOr};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
-mod inventory_schema;
 mod media;
 
 const DEFAULT_MAX_TOKENS: u32 = 256;
@@ -60,9 +64,11 @@ const fn default_true() -> bool {
 #[derive(Clone)]
 pub struct AppState {
     backends: BackendRegistry,
-    inventory: Option<Arc<dyn ModelInventory>>,
+    installed_packages: Option<Arc<dyn InstalledModelPackages>>,
+    recommendable_catalog: Option<Arc<dyn RecommendableModelCatalogProvider>>,
+    model_evaluator: Option<Arc<dyn ModelEvaluator>>,
+    model_downloads: Option<Arc<dyn ModelDownloads>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
-    previewer: Option<Arc<dyn ModelPreviewer>>,
     hugging_face_catalog: Option<Arc<dyn HuggingFaceModelCatalog>>,
     runtime: Option<Arc<dyn RuntimeController>>,
     identity: ServerIdentity,
@@ -300,9 +306,11 @@ impl AppState {
     pub fn from_shared_backend(backend: Arc<dyn CompletionBackend>) -> Self {
         Self {
             backends: BackendRegistry::with_backend(backend),
-            inventory: None,
+            installed_packages: None,
+            recommendable_catalog: None,
+            model_evaluator: None,
+            model_downloads: None,
             hardware: None,
-            previewer: None,
             hugging_face_catalog: None,
             runtime: None,
             identity: ServerIdentity::default(),
@@ -314,9 +322,11 @@ impl AppState {
     pub fn model_free(backends: BackendRegistry) -> Self {
         Self {
             backends,
-            inventory: None,
+            installed_packages: None,
+            recommendable_catalog: None,
+            model_evaluator: None,
+            model_downloads: None,
             hardware: None,
-            previewer: None,
             hugging_face_catalog: None,
             runtime: None,
             identity: ServerIdentity::default(),
@@ -333,18 +343,34 @@ impl AppState {
         self
     }
 
-    pub fn with_inventory(mut self, inventory: Arc<dyn ModelInventory>) -> Self {
-        self.inventory = Some(inventory);
+    pub fn with_installed_packages(
+        mut self,
+        installed_packages: Arc<dyn InstalledModelPackages>,
+    ) -> Self {
+        self.installed_packages = Some(installed_packages);
+        self
+    }
+
+    pub fn with_recommendable_catalog(
+        mut self,
+        recommendable_catalog: Arc<dyn RecommendableModelCatalogProvider>,
+    ) -> Self {
+        self.recommendable_catalog = Some(recommendable_catalog);
+        self
+    }
+
+    pub fn with_model_evaluator(mut self, model_evaluator: Arc<dyn ModelEvaluator>) -> Self {
+        self.model_evaluator = Some(model_evaluator);
+        self
+    }
+
+    pub fn with_model_downloads(mut self, model_downloads: Arc<dyn ModelDownloads>) -> Self {
+        self.model_downloads = Some(model_downloads);
         self
     }
 
     pub fn with_hardware(mut self, hardware: Arc<dyn HardwareProvider>) -> Self {
         self.hardware = Some(hardware);
-        self
-    }
-
-    pub fn with_previewer(mut self, previewer: Arc<dyn ModelPreviewer>) -> Self {
-        self.previewer = Some(previewer);
         self
     }
 
@@ -372,8 +398,31 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     let mut protected = Router::new()
         .route("/v1/hardware", get(hardware))
-        .route("/v1/models", get(models))
-        .route("/v1/models/preview", post(preview_model))
+        .route("/v1/models/installed", get(installed_models))
+        .route(
+            "/v1/models/installed/{package_id}",
+            axum::routing::delete(remove_installed_model),
+        )
+        .route("/v1/models/catalog", get(recommendable_model_catalog))
+        .route("/v1/models/assess", post(assess_models))
+        .route("/v1/models/fit", post(fit_models))
+        .route(
+            "/v1/models/downloads",
+            get(model_downloads).post(start_model_download),
+        )
+        .route("/v1/models/load", post(load_model_configuration))
+        .route(
+            "/v1/models/residencies/{residency_id}",
+            axum::routing::delete(unload_model_residency),
+        )
+        .route(
+            "/v1/models/downloads/{attempt_id}",
+            get(model_download_attempt),
+        )
+        .route(
+            "/v1/models/downloads/{attempt_id}/cancel",
+            post(cancel_model_download),
+        )
         .route(
             "/v1/hugging-face/models/search",
             post(search_hugging_face_models),
@@ -382,14 +431,6 @@ pub fn app(state: AppState) -> Router {
             "/v1/hugging-face/models/resolve",
             post(resolve_hugging_face_repository),
         )
-        .route("/v1/models/download", post(download_model))
-        .route("/v1/models/{model_id}", get(model).delete(delete_model))
-        .route(
-            "/v1/models/{model_id}/serving-configuration",
-            axum::routing::put(configure_model_serving),
-        )
-        .route("/v1/models/{model_id}/load", post(load_model))
-        .route("/v1/models/{model_id}/unload", post(unload_model))
         .route("/props", get(props))
         .route("/v1/props", get(props))
         .route("/apply-template", post(apply_template))
@@ -438,285 +479,17 @@ pub struct HealthResponse {
     native_build: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ServingProfileSchema {
-    pub context_length: u32,
-    pub parallel_sequences: u32,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ServingConfigurationSchema {
-    pub profile: ServingProfileSchema,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ConfigureModelServingRequest {
-    pub context_length: u32,
-    pub parallel_sequences: u32,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelLoadEvent {
-    Progress {
-        operation_id: String,
-        model_id: String,
-        stage: ModelLoadStage,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fraction: Option<f32>,
-    },
-    Ready {
-        operation_id: String,
-        model_id: String,
-    },
-    Failed {
-        operation_id: String,
-        model_id: String,
-        code: String,
-        message: String,
-        retryable: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelLoadStage {
-    Queued,
-    Resolving,
-    Assessing,
-    Unloading,
-    Loading,
-    Verifying,
-}
-
 pub trait RuntimeController: Send + Sync + 'static {
-    fn load(&self, model_id: String) -> BoxStream<'static, ModelLoadEvent>;
-    fn lease(&self, model_id: String) -> BoxFuture<'_, Result<BackendLease, InventoryError>>;
-    fn unload(&self, model_id: String) -> BoxFuture<'_, Result<(), InventoryError>>;
-    fn delete(&self, model_id: String) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ModelList {
-    object: &'static str,
-    data: Vec<Model>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Model {
-    id: String,
-    object: &'static str,
-    owned_by: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content_id: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    supported_parameters: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    serving_configuration: Option<ServingConfigurationSchema>,
-    #[schema(value_type = inventory_schema::ModelAvailabilitySchema)]
-    availability: JsonValue,
-    #[schema(value_type = inventory_schema::ModelSourceSchema)]
-    source: JsonValue,
-    #[schema(value_type = inventory_schema::ModelLocationSchema)]
-    location: JsonValue,
-    #[schema(value_type = inventory_schema::InventoryPropertiesSchema)]
-    properties: JsonValue,
-    #[schema(value_type = inventory_schema::HardwareAssessmentSchema)]
-    hardware: JsonValue,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    operations: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    updated_at: Option<u64>,
-}
-
-impl Model {
-    fn loaded_only(id: String) -> Self {
-        Self {
-            id,
-            object: "model",
-            owned_by: "magnitude",
-            created: None,
-            name: None,
-            content_id: None,
-            supported_parameters: Vec::new(),
-            serving_configuration: None,
-            availability: JsonValue::Null,
-            source: JsonValue::Null,
-            location: JsonValue::Null,
-            properties: JsonValue::Null,
-            hardware: JsonValue::Null,
-            operations: Vec::new(),
-            updated_at: None,
-        }
-    }
-
-    fn inventory(model: InventoryModel) -> Result<Self, ApiError> {
-        Ok(Self {
-            id: model.id.0,
-            object: "model",
-            owned_by: "magnitude",
-            created: Some(model.created),
-            name: Some(model.name),
-            content_id: Some(model.content_id.0),
-            supported_parameters: model.supported_parameters,
-            serving_configuration: model.serving_configuration.map(|configuration| {
-                ServingConfigurationSchema {
-                    profile: ServingProfileSchema {
-                        context_length: configuration.profile.context_length,
-                        parallel_sequences: configuration.profile.parallel_sequences,
-                    },
-                }
-            }),
-            availability: json_value(model.availability)?,
-            source: json_value(model.source)?,
-            location: json_value(model.location)?,
-            properties: json_value(model.properties)?,
-            hardware: json_value(model.hardware)?,
-            operations: model
-                .operations
-                .into_iter()
-                .map(|operation| serde_json::to_value(operation).expect("enum serializes"))
-                .filter_map(|value| value.as_str().map(str::to_owned))
-                .collect(),
-            updated_at: Some(model.updated_at),
-        })
-    }
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DeleteQuery {
-    #[serde(default)]
-    dry_run: bool,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DeleteModelResponse {
-    id: String,
-    object: &'static str,
-    deleted: bool,
-    magnitude: JsonValue,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HuggingFaceDownloadSourceSchema {
-    HuggingFace {
-        repository: String,
-        revision: String,
-    },
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadComponentRoleSchema {
-    Weights,
-    Shard,
-    Projector,
-    Auxiliary,
-    Draft,
-    Mtp,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DownloadComponentSchema {
-    path: String,
-    role: DownloadComponentRoleSchema,
-    shard_index: Option<u32>,
-    expected_sha256: Option<String>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DownloadRelationshipSchema {
-    ProjectorFor { projector: String, model: String },
-    DraftFor { draft: String, model: String },
-    MtpFor { mtp: String, model: String },
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DownloadModelRequestSchema {
-    source: HuggingFaceDownloadSourceSchema,
-    components: Vec<DownloadComponentSchema>,
-    relationships: Vec<DownloadRelationshipSchema>,
-    serving_profile: ServingProfileSchema,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadStageSchema {
-    Queued,
-    Resolving,
-    CheckingSpace,
-    Downloading,
-    Verifying,
-    Publishing,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DownloadFileProgressSchema {
-    path: String,
-    completed_bytes: u64,
-    total_bytes: u64,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DownloadFailureSchema {
-    code: String,
-    message: String,
-    retryable: bool,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ModelDownloadEventSchema {
-    Resolving {
-        operation_id: String,
-        repository: String,
-        revision: String,
-    },
-    CheckingSpace {
-        operation_id: String,
-        model_id: String,
-        required_bytes: u64,
-        available_bytes: u64,
-        completed_bytes: u64,
-        total_bytes: u64,
-    },
-    Progress {
-        operation_id: String,
-        model_id: String,
-        stage: DownloadStageSchema,
-        completed_bytes: u64,
-        total_bytes: u64,
-        file: DownloadFileProgressSchema,
-        bytes_per_second: Option<f64>,
-        resumed_from_bytes: u64,
-    },
-    Ready {
-        operation_id: String,
-        model: Box<Model>,
-    },
-    Failed {
-        operation_id: String,
-        model_id: Option<String>,
-        error: DownloadFailureSchema,
-        completed_bytes: u64,
-        total_bytes: u64,
-        resumable: bool,
-    },
+    fn load_configuration(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent>;
+    fn unload_residency(&self, residency_id: String) -> BoxFuture<'_, Result<(), InventoryError>>;
+    fn remove_installed(
+        &self,
+        package_id: ModelPackageId,
+    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>>;
+    fn lease(
+        &self,
+        configuration_id: String,
+    ) -> BoxFuture<'_, Result<BackendLease, InventoryError>>;
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1239,7 +1012,8 @@ pub struct ErrorResponse {
 pub struct ApiErrorBody {
     pub message: String,
     pub r#type: &'static str,
-    pub code: &'static str,
+    pub code: String,
+    pub retryable: bool,
 }
 
 #[derive(Debug)]
@@ -1256,7 +1030,8 @@ impl ApiError {
                 error: ApiErrorBody {
                     message: message.into(),
                     r#type: "invalid_request_error",
-                    code: "invalid_request",
+                    code: "invalid_request".to_owned(),
+                    retryable: false,
                 },
             },
         }
@@ -1269,7 +1044,8 @@ impl ApiError {
                 error: ApiErrorBody {
                     message: message.into(),
                     r#type: "server_error",
-                    code: "backend_error",
+                    code: "backend_error".to_owned(),
+                    retryable: true,
                 },
             },
         }
@@ -1282,7 +1058,8 @@ impl ApiError {
                 error: ApiErrorBody {
                     message: message.into(),
                     r#type: "invalid_request_error",
-                    code,
+                    code: code.to_owned(),
+                    retryable: false,
                 },
             },
         }
@@ -1296,44 +1073,62 @@ impl ApiError {
     }
 
     fn from_inventory(error: InventoryError) -> Self {
-        let (status, error_type, code) = match &error {
+        let (status, error_type, code, retryable) = match &error {
             InventoryError::InvalidId(_) | InventoryError::InvalidRequest(_) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "invalid_request",
+                false,
             ),
             InventoryError::NotFound(_) => (
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
                 "model_not_found",
+                false,
             ),
             InventoryError::NotReady(_) => (
                 StatusCode::CONFLICT,
                 "invalid_request_error",
                 "model_not_ready",
+                true,
             ),
-            InventoryError::Busy(_) => {
-                (StatusCode::CONFLICT, "invalid_request_error", "model_busy")
-            }
+            InventoryError::Busy(_) => (
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "model_busy",
+                true,
+            ),
             InventoryError::Loaded(_) => (
                 StatusCode::CONFLICT,
                 "invalid_request_error",
                 "model_loaded",
+                false,
             ),
             InventoryError::DeletionUnsafe(_) => (
                 StatusCode::CONFLICT,
                 "invalid_request_error",
                 "deletion_unsafe",
+                false,
             ),
             InventoryError::Unsupported(_) => (
                 StatusCode::CONFLICT,
                 "invalid_request_error",
                 "operation_unsupported",
+                false,
             ),
             InventoryError::Integrity(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_request_error",
                 "integrity_failed",
+                false,
+            ),
+            InventoryError::Runtime {
+                code, retryable, ..
+            } => (
+                StatusCode::CONFLICT,
+                "runtime_error",
+                code.as_str(),
+                *retryable,
             ),
             InventoryError::Io(_)
             | InventoryError::Upstream(_)
@@ -1342,6 +1137,7 @@ impl ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "inventory_error",
+                true,
             ),
         };
         Self {
@@ -1350,7 +1146,8 @@ impl ApiError {
                 error: ApiErrorBody {
                     message: error.to_string(),
                     r#type: error_type,
-                    code,
+                    code: code.to_owned(),
+                    retryable,
                 },
             },
         }
@@ -1377,41 +1174,32 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-#[utoipa::path(post, path = "/v1/models/{model_id}/load", operation_id = "loadModel", tag = "models",
-    params(("model_id" = String, Path, description = "Stable inventory model ID")),
+#[utoipa::path(post, path = "/v1/models/load", operation_id = "loadModelConfiguration", tag = "models",
+    request_body(content = LoadModelRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Model load progress", body = String, content_type = "text/event-stream"),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 409, description = "Model cannot be loaded", body = ErrorResponse)
+        (status = 200, description = "Exact model configuration load progress", body = String, content_type = "text/event-stream"),
+        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(
-    name = "icn.model.load",
-    skip_all,
-    fields(model.id = %model_id),
-    err(Debug)
-)]
-async fn load_model(
+#[tracing::instrument(name = "icn.model_configuration.load", skip_all, err(Debug))]
+async fn load_model_configuration(
     State(state): State<AppState>,
-    Path(model_id): Path<String>,
+    Json(request): Json<LoadModelRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    if model_id.is_empty() {
-        return Err(ApiError::invalid("model_id must be non-empty"));
-    }
     let runtime = state
         .runtime
         .as_ref()
         .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
-    let stream = runtime.load(model_id);
-    let framed = tokio_stream::StreamExt::map(stream, |event| {
+    let events = runtime.load_configuration(request);
+    let framed = tokio_stream::StreamExt::map(events, |event| {
         let data = serde_json::to_string(&event).unwrap_or_else(|error| {
             serde_json::json!({
-                "type": "failed",
-                "operation_id": "serialization-failed",
-                "model_id": "unknown",
-                "code": "serialization_failed",
-                "message": error.to_string(),
-                "retryable": false
+                "_tag": "Failed",
+                "failure": {
+                    "code": "serialization_failed",
+                    "message": error.to_string(),
+                    "retryable": false
+                }
             })
             .to_string()
         });
@@ -1420,33 +1208,32 @@ async fn load_model(
     Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
 }
 
-#[utoipa::path(post, path = "/v1/models/{model_id}/unload", operation_id = "unloadModel", tag = "models",
-    params(("model_id" = String, Path, description = "Stable inventory model ID")),
+#[utoipa::path(delete, path = "/v1/models/residencies/{residency_id}", operation_id = "unloadModelResidency", tag = "models",
+    params(("residency_id" = String, Path, description = "Runtime residency ID")),
     responses(
-        (status = 204, description = "Model is not resident"),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 409, description = "Model is in use", body = ErrorResponse),
-        (status = 500, description = "Model unload failed", body = ErrorResponse)
+        (status = 204, description = "Residency is no longer loaded"),
+        (status = 404, description = "Residency not found", body = ErrorResponse),
+        (status = 500, description = "Runtime unload failed", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.model.unload", skip_all, fields(model.id = %model_id), err(Debug))]
-async fn unload_model(
+#[tracing::instrument(name = "icn.model_residency.unload", skip_all, err(Debug))]
+async fn unload_model_residency(
     State(state): State<AppState>,
-    Path(model_id): Path<String>,
+    Path(residency_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let runtime = state
         .runtime
         .as_ref()
         .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
     runtime
-        .unload(model_id)
+        .unload_residency(residency_id)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(get, path = "/v1/hardware", operation_id = "getHardware", tag = "system", responses(
-    (status = 200, description = "Hardware visible to the pinned ICN runtime", body = inventory_schema::HardwareSnapshotSchema),
+    (status = 200, description = "Hardware visible to the pinned ICN runtime", body = HardwareSnapshot),
     (status = 500, description = "Hardware discovery failed", body = ErrorResponse)
 ))]
 #[tracing::instrument(name = "icn.hardware.snapshot", skip_all, err(Debug))]
@@ -1463,9 +1250,9 @@ async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot
 }
 
 #[utoipa::path(post, path = "/v1/hugging-face/models/search", operation_id = "searchHuggingFaceModels", tag = "hugging-face",
-    request_body(content = inventory_schema::HuggingFaceModelSearchRequestSchema, content_type = "application/json"),
+    request_body(content = HuggingFaceModelSearchRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Live Hugging Face GGUF model search", body = inventory_schema::HuggingFaceModelSearchResultsSchema),
+        (status = 200, description = "Live Hugging Face GGUF model search", body = HuggingFaceModelSearchResults),
         (status = 400, description = "Invalid search request", body = ErrorResponse),
         (status = 500, description = "Hugging Face search failed", body = ErrorResponse)
     )
@@ -1487,9 +1274,9 @@ async fn search_hugging_face_models(
 }
 
 #[utoipa::path(post, path = "/v1/hugging-face/models/resolve", operation_id = "resolveHuggingFaceRepository", tag = "hugging-face",
-    request_body(content = inventory_schema::HuggingFaceRepositoryRequestSchema, content_type = "application/json"),
+    request_body(content = HuggingFaceRepositoryRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Immutable snapshot of the requested live Hugging Face repository", body = inventory_schema::HuggingFaceRepositorySnapshotSchema),
+        (status = 200, description = "Immutable snapshot of the requested live Hugging Face repository", body = HuggingFaceRepositorySnapshot),
         (status = 400, description = "Invalid repository request", body = ErrorResponse),
         (status = 500, description = "Hugging Face resolution failed", body = ErrorResponse)
     )
@@ -1510,224 +1297,206 @@ async fn resolve_hugging_face_repository(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/models", operation_id = "listModels", tag = "models", responses(
-    (status = 200, description = "Loaded models", body = ModelList)
-))]
-#[tracing::instrument(name = "icn.models.list", skip_all, err(Debug))]
-async fn models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiError> {
-    let data = match state.inventory.as_ref() {
-        Some(inventory) => inventory
-            .list()
-            .await
-            .map_err(ApiError::from_inventory)?
-            .into_iter()
-            .map(Model::inventory)
-            .collect::<Result<Vec<_>, _>>()?,
-        None => state
-            .backends
-            .observe()
-            .map(|backend| vec![Model::loaded_only(backend.model_id)])
-            .unwrap_or_default(),
-    };
-    Ok(Json(ModelList {
-        object: "list",
-        data,
-    }))
-}
-
-#[utoipa::path(post, path = "/v1/models/preview", operation_id = "previewModel", tag = "models",
-    request_body(content = inventory_schema::ModelPreviewRequestSchema, content_type = "application/json"),
+#[utoipa::path(get, path = "/v1/models/installed", operation_id = "listInstalledModels", tag = "models",
     responses(
-        (status = 200, description = "Metadata-only model assessment", body = inventory_schema::ModelPreviewSchema),
-        (status = 400, description = "Invalid immutable artifact or profile", body = ErrorResponse),
-        (status = 500, description = "Preview acquisition or assessment failed", body = ErrorResponse)
+        (status = 200, description = "Verified model packages installed on this machine", body = InstalledModelPackagesResponse),
+        (status = 500, description = "Installed package discovery failed", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.models.preview", skip_all, err(Debug))]
-async fn preview_model(
+#[tracing::instrument(name = "icn.models.installed", skip_all, err(Debug))]
+async fn installed_models(
     State(state): State<AppState>,
-    Json(request): Json<ModelPreviewRequest>,
-) -> Result<Json<ModelPreview>, ApiError> {
-    let previewer = state
-        .previewer
+) -> Result<Json<InstalledModelPackagesResponse>, ApiError> {
+    let installed = state
+        .installed_packages
         .as_ref()
-        .ok_or_else(|| ApiError::server("model preview is not configured"))?;
-    previewer
-        .preview(request)
+        .ok_or_else(|| ApiError::server("installed model packages are not configured"))?;
+    installed
+        .list_installed()
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/models/{model_id}", operation_id = "getModel", tag = "models",
-    params(("model_id" = String, Path, description = "Stable inventory model ID")),
+#[utoipa::path(delete, path = "/v1/models/installed/{package_id}", operation_id = "removeInstalledModel", tag = "models",
+    params(("package_id" = String, Path, description = "Canonical model package identity")),
     responses(
-        (status = 200, description = "Inventory model", body = Model),
-        (status = 404, description = "Model not found", body = ErrorResponse)
+        (status = 200, description = "Installed package removal result", body = RemoveInstalledModelPackageResponse),
+        (status = 404, description = "Installed package not found", body = ErrorResponse),
+        (status = 500, description = "Installed package removal failed", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(
-    name = "icn.models.get",
-    skip_all,
-    fields(model.id = %model_id),
-    err(Debug)
-)]
-async fn model(
+#[tracing::instrument(name = "icn.models.installed.remove", skip_all, fields(model.package.id = %package_id), err(Debug))]
+async fn remove_installed_model(
     State(state): State<AppState>,
-    Path(model_id): Path<String>,
-) -> Result<Json<Model>, ApiError> {
-    let inventory = require_inventory(&state)?;
-    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
-    let model = inventory.get(&id).await.map_err(ApiError::from_inventory)?;
-    Ok(Json(Model::inventory(model)?))
-}
-
-#[utoipa::path(put, path = "/v1/models/{model_id}/serving-configuration", operation_id = "configureModelServing", tag = "models",
-    params(("model_id" = String, Path, description = "Stable inventory model ID")),
-    request_body = ConfigureModelServingRequest,
-    responses(
-        (status = 200, description = "Updated inventory model", body = Model),
-        (status = 400, description = "Invalid serving profile", body = ErrorResponse),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 409, description = "Model is not available", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.configure_serving", skip_all, fields(model.id = %model_id), err(Debug))]
-async fn configure_model_serving(
-    State(state): State<AppState>,
-    Path(model_id): Path<String>,
-    Json(request): Json<ConfigureModelServingRequest>,
-) -> Result<Json<Model>, ApiError> {
-    let inventory = require_inventory(&state)?;
-    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
-    let model = inventory
-        .configure_serving(
-            &id,
-            ServingProfile {
-                context_length: request.context_length,
-                parallel_sequences: request.parallel_sequences,
-            },
-        )
-        .await
-        .map_err(ApiError::from_inventory)?;
-    Ok(Json(Model::inventory(model)?))
-}
-
-#[utoipa::path(post, path = "/v1/models/download", operation_id = "downloadModel", tag = "models",
-    request_body(content = DownloadModelRequestSchema, content_type = "application/json"),
-    responses(
-        (status = 200, description = "Server-owned download progress", body = String, content_type = "text/event-stream"),
-        (status = 400, description = "Invalid download request", body = ErrorResponse),
-        (status = 500, description = "Download could not start", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.download", skip_all, err(Debug))]
-async fn download_model(
-    State(state): State<AppState>,
-    Json(request): Json<DownloadModelRequest>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let inventory = require_inventory(&state)?;
-    let stream = inventory
-        .download(request)
-        .await
-        .map_err(ApiError::from_inventory)?;
-    let framed = tokio_stream::StreamExt::map(stream, |event| {
-        let data = download_event_json(event).unwrap_or_else(|error| {
-            serde_json::json!({
-                "type": "failed",
-                "error": {"code": "serialization_failed", "message": error.to_string(), "retryable": false},
-                "completed_bytes": 0,
-                "total_bytes": 0,
-                "resumable": true
-            })
-            .to_string()
-        });
-        Ok(Event::default().data(data))
-    });
-    Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
-}
-
-fn download_event_json(
-    event: icn_contracts::ModelDownloadEvent,
-) -> Result<String, serde_json::Error> {
-    let mut value = serde_json::to_value(event)?;
-    if value.get("type").and_then(JsonValue::as_str) == Some("ready")
-        && let Some(model) = value.get_mut("model").and_then(JsonValue::as_object_mut)
-    {
-        model.insert("object".to_owned(), JsonValue::String("model".to_owned()));
-        model.insert(
-            "owned_by".to_owned(),
-            JsonValue::String("magnitude".to_owned()),
-        );
-    }
-    serde_json::to_string(&value)
-}
-
-#[utoipa::path(delete, path = "/v1/models/{model_id}", operation_id = "deleteModel", tag = "models",
-    params(
-        ("model_id" = String, Path, description = "Stable inventory model ID"),
-        ("dry_run" = Option<bool>, Query, description = "Return the deletion plan without mutation")
-    ),
-    responses(
-        (status = 200, description = "Deletion result", body = DeleteModelResponse),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 409, description = "Model busy, loaded, or deletion unsafe", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(
-    name = "icn.models.delete",
-    skip_all,
-    fields(model.id = %model_id, delete.dry_run = query.dry_run),
-    err(Debug)
-)]
-async fn delete_model(
-    State(state): State<AppState>,
-    Path(model_id): Path<String>,
-    Query(query): Query<DeleteQuery>,
-) -> Result<Json<DeleteModelResponse>, ApiError> {
-    let inventory = require_inventory(&state)?;
-    let id = ModelId::parse(model_id).map_err(ApiError::from_inventory)?;
-    if query.dry_run {
-        let plan = inventory
-            .plan_delete(&id)
-            .await
-            .map_err(ApiError::from_inventory)?;
-        return Ok(Json(DeleteModelResponse {
-            id: id.0,
-            object: "model",
-            deleted: false,
-            magnitude: json_value(plan)?,
-        }));
-    }
+    Path(package_id): Path<String>,
+) -> Result<Json<RemoveInstalledModelPackageResponse>, ApiError> {
     let runtime = state
         .runtime
         .as_ref()
-        .ok_or_else(|| ApiError::server("runtime controller is not configured"))?;
-    let deleted = runtime
-        .delete(id.0)
+        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
+    runtime
+        .remove_installed(ModelPackageId(package_id))
         .await
-        .map_err(ApiError::from_inventory)?;
-    Ok(Json(DeleteModelResponse {
-        id: deleted.id.0,
-        object: "model",
-        deleted: deleted.deleted,
-        magnitude: json_value(serde_json::json!({
-            "freed_bytes": deleted.freed_bytes,
-            "retained_shared_bytes": deleted.retained_shared_bytes,
-            "plan": deleted.plan,
-        }))?,
-    }))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
-fn require_inventory(state: &AppState) -> Result<&Arc<dyn ModelInventory>, ApiError> {
-    state
-        .inventory
+#[utoipa::path(get, path = "/v1/models/catalog", operation_id = "getRecommendableModelCatalog", tag = "models",
+    responses(
+        (status = 200, description = "Resolved recommendable model catalog", body = RecommendableModelCatalog),
+        (status = 500, description = "Catalog publication failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.catalog", skip_all, err(Debug))]
+async fn recommendable_model_catalog(
+    State(state): State<AppState>,
+) -> Result<Json<RecommendableModelCatalog>, ApiError> {
+    let catalog = state
+        .recommendable_catalog
         .as_ref()
-        .ok_or_else(|| ApiError::server("model inventory is not configured"))
+        .ok_or_else(|| ApiError::server("recommendable model catalog is not configured"))?;
+    catalog
+        .catalog()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
-fn json_value(value: impl Serialize) -> Result<JsonValue, ApiError> {
-    serde_json::to_value(value).map_err(|error| ApiError::server(error.to_string()))
+#[utoipa::path(post, path = "/v1/models/assess", operation_id = "assessModels", tag = "models",
+    request_body(content = AssessModelsRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Exact target and profile assessments", body = AssessModelsResponse),
+        (status = 500, description = "Assessment operation failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.assess", skip_all, err(Debug))]
+async fn assess_models(
+    State(state): State<AppState>,
+    Json(request): Json<AssessModelsRequest>,
+) -> Result<Json<AssessModelsResponse>, ApiError> {
+    let evaluator = state
+        .model_evaluator
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model evaluation is not configured"))?;
+    evaluator
+        .assess(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/models/fit", operation_id = "fitModels", tag = "models",
+    request_body(content = FitModelsRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Automatically selected target profiles", body = FitModelsResponse),
+        (status = 500, description = "Automatic fitting operation failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.fit", skip_all, err(Debug))]
+async fn fit_models(
+    State(state): State<AppState>,
+    Json(request): Json<FitModelsRequest>,
+) -> Result<Json<FitModelsResponse>, ApiError> {
+    let evaluator = state
+        .model_evaluator
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model evaluation is not configured"))?;
+    evaluator
+        .fit(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/models/downloads", operation_id = "startModelDownload", tag = "models",
+    request_body(content = StartModelDownloadRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Authoritative download attempt", body = StartModelDownloadResponse),
+        (status = 500, description = "Download could not start", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.downloads.start", skip_all, err(Debug))]
+async fn start_model_download(
+    State(state): State<AppState>,
+    Json(request): Json<StartModelDownloadRequest>,
+) -> Result<Json<StartModelDownloadResponse>, ApiError> {
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    downloads
+        .start(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(get, path = "/v1/models/downloads", operation_id = "listModelDownloads", tag = "models",
+    responses(
+        (status = 200, description = "Retained model download attempts", body = ModelDownloadsResponse),
+        (status = 500, description = "Download attempts unavailable", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.downloads.list", skip_all, err(Debug))]
+async fn model_downloads(
+    State(state): State<AppState>,
+) -> Result<Json<ModelDownloadsResponse>, ApiError> {
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    downloads
+        .list_attempts()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(get, path = "/v1/models/downloads/{attempt_id}", operation_id = "getModelDownload", tag = "models",
+    params(("attempt_id" = String, Path, description = "Download attempt ID")),
+    responses(
+        (status = 200, description = "Authoritative model download attempt", body = DownloadAttempt),
+        (status = 404, description = "Attempt not found", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.downloads.get", skip_all, err(Debug))]
+async fn model_download_attempt(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+) -> Result<Json<DownloadAttempt>, ApiError> {
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    downloads
+        .get_attempt(&DownloadAttemptId(attempt_id))
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/models/downloads/{attempt_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
+    params(("attempt_id" = String, Path, description = "Download attempt ID")),
+    responses(
+        (status = 200, description = "Cancelled or terminal model download attempt", body = DownloadAttempt),
+        (status = 404, description = "Attempt not found", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.downloads.cancel", skip_all, err(Debug))]
+async fn cancel_model_download(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+) -> Result<Json<DownloadAttempt>, ApiError> {
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    downloads
+        .cancel(&DownloadAttemptId(attempt_id))
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(get, path = "/v1/props", operation_id = "getModelProperties", tag = "models", responses(
@@ -2101,18 +1870,19 @@ fn emit_done(sender: &mpsc::Sender<Result<Event, Infallible>>) {
 }
 
 fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
-    let (error_type, code) = match error {
-        InferenceError::InvalidConfig(_) => ("invalid_request_error", "invalid_request"),
-        InferenceError::Backend(_) => ("server_error", "backend_error"),
-        InferenceError::Cancelled => ("cancelled", "request_cancelled"),
-        InferenceError::Overloaded => ("server_error", "overloaded"),
-        InferenceError::ExecutorStopped => ("server_error", "executor_stopped"),
-        InferenceError::Callback(_) => ("server_error", "stream_callback_error"),
+    let (error_type, code, retryable) = match error {
+        InferenceError::InvalidConfig(_) => ("invalid_request_error", "invalid_request", false),
+        InferenceError::Backend(_) => ("server_error", "backend_error", true),
+        InferenceError::Cancelled => ("cancelled", "request_cancelled", true),
+        InferenceError::Overloaded => ("server_error", "overloaded", true),
+        InferenceError::ExecutorStopped => ("server_error", "executor_stopped", true),
+        InferenceError::Callback(_) => ("server_error", "stream_callback_error", true),
     };
     ApiErrorBody {
         message: error.to_string(),
         r#type: error_type,
-        code,
+        code: code.to_owned(),
+        retryable,
     }
 }
 
@@ -2771,50 +2541,41 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         hardware,
         search_hugging_face_models,
         resolve_hugging_face_repository,
-        models,
-        preview_model,
-        model,
-        configure_model_serving,
-        download_model,
-        delete_model,
-        load_model,
-        unload_model,
+        installed_models,
+        remove_installed_model,
+        recommendable_model_catalog,
+        assess_models,
+        fit_models,
+        start_model_download,
+        model_downloads,
+        model_download_attempt,
+        cancel_model_download,
+        load_model_configuration,
+        unload_model_residency,
         props,
         apply_template,
         chat_completions
     ),
     components(schemas(
         HealthResponse,
-        inventory_schema::HardwareSnapshotSchema,
-        inventory_schema::ModelPreviewRequestSchema,
-        inventory_schema::ModelPreviewSchema,
-        inventory_schema::HuggingFaceModelSearchRequestSchema,
-        inventory_schema::HuggingFaceModelSearchResultsSchema,
-        inventory_schema::HuggingFaceRepositoryRequestSchema,
-        inventory_schema::HuggingFaceRepositorySnapshotSchema,
-        ModelList,
-        Model,
-        inventory_schema::ModelAvailabilitySchema,
-        inventory_schema::ModelSourceSchema,
-        inventory_schema::ModelLocationSchema,
-        inventory_schema::InventoryPropertiesSchema,
-        inventory_schema::HardwareAssessmentSchema,
-        DeleteQuery,
-        DeleteModelResponse,
-        HuggingFaceDownloadSourceSchema,
-        DownloadComponentRoleSchema,
-        DownloadComponentSchema,
-        DownloadRelationshipSchema,
-        DownloadModelRequestSchema,
-        DownloadStageSchema,
-        DownloadFileProgressSchema,
-        DownloadFailureSchema,
-        ModelDownloadEventSchema,
-        ServingProfileSchema,
-        ServingConfigurationSchema,
-        ConfigureModelServingRequest,
+        HardwareSnapshot,
+        HuggingFaceModelSearchRequest,
+        HuggingFaceModelSearchResults,
+        HuggingFaceRepositoryRequest,
+        HuggingFaceRepositorySnapshot,
+        InstalledModelPackagesResponse,
+        RemoveInstalledModelPackageResponse,
+        RecommendableModelCatalog,
+        AssessModelsRequest,
+        AssessModelsResponse,
+        FitModelsRequest,
+        FitModelsResponse,
+        StartModelDownloadRequest,
+        StartModelDownloadResponse,
+        ModelDownloadsResponse,
+        DownloadAttempt,
+        LoadModelRequest,
         ModelLoadEvent,
-        ModelLoadStage,
         PropsResponse,
         ExecutionConfigResponse,
         ExecutionSettingsResponse,
@@ -2942,29 +2703,6 @@ impl StreamContract for ChatCompletionStream {
     }
 }
 
-struct DownloadModelStream;
-
-impl StreamContract for DownloadModelStream {
-    type Event = ModelDownloadEventSchema;
-    const RESPONSE_STATUS: u16 = 200;
-
-    fn metadata() -> StreamMetadata {
-        StreamMetadata {
-            version: 1,
-            response_status: Self::RESPONSE_STATUS,
-            framing: StreamFraming::Sse,
-            data: StreamData {
-                encoding: "json",
-                schema: StreamSchemaRef {
-                    reference: format!("#/components/schemas/{}", Self::Event::name()),
-                },
-            },
-            termination: StreamTermination::Eof,
-            reconnect: StreamReconnect::None,
-        }
-    }
-}
-
 struct ModelLoadStream;
 
 impl StreamContract for ModelLoadStream {
@@ -3014,12 +2752,11 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
         "createChatCompletion",
         "text/event-stream",
     )?;
-    attach_stream_contract::<DownloadModelStream>(
+    attach_stream_contract::<ModelLoadStream>(
         &mut document,
-        "downloadModel",
+        "loadModelConfiguration",
         "text/event-stream",
     )?;
-    attach_stream_contract::<ModelLoadStream>(&mut document, "loadModel", "text/event-stream")?;
     Ok(document)
 }
 
@@ -3239,7 +2976,6 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use futures_util::StreamExt as _;
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use tower::ServiceExt;
@@ -3347,50 +3083,6 @@ mod tests {
         }
     }
 
-    struct StubPreviewer;
-
-    impl ModelPreviewer for StubPreviewer {
-        fn preview(
-            &self,
-            request: ModelPreviewRequest,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ModelPreview, InventoryError>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                let profile = request
-                    .profiles
-                    .first()
-                    .ok_or_else(|| InventoryError::InvalidRequest("missing profile".to_owned()))?;
-                serde_json::from_value(json!({
-                    "repository": request.source.repository,
-                    "commit": request.source.revision,
-                    "components": [{
-                        "path": request.source.primary_gguf,
-                        "role": "weights",
-                        "size_bytes": 123,
-                        "content": {"type": "sha256", "value": "abc"},
-                        "shard_index": null,
-                        "relationship": null
-                    }],
-                    "properties": {"type": "pending"},
-                    "assessments": [{
-                        "profile_id": profile.id,
-                        "artifact_fingerprint": "artifact",
-                        "hardware_topology": "topology",
-                        "assessment": {"type": "not_assessed", "reason": "stub"},
-                        "performance": {
-                            "status": "unavailable",
-                            "method": "not_requested",
-                            "code": "not_requested",
-                            "message": "generation performance was not requested"
-                        }
-                    }]
-                }))
-                .map_err(|error| InventoryError::Internal(error.to_string()))
-            })
-        }
-    }
-
     #[tokio::test]
     async fn hardware_endpoint_returns_the_provider_snapshot() {
         let response =
@@ -3405,42 +3097,6 @@ mod tests {
                 .unwrap();
         assert_eq!(body["topology_fingerprint"], "topology");
         assert_eq!(body["memory_domains"][0]["stable_capacity_bytes"], 768);
-    }
-
-    #[tokio::test]
-    async fn preview_endpoint_uses_the_typed_previewer_contract() {
-        let commit = "a".repeat(40);
-        let response = app(AppState::new(FakeBackend::new("test-model", ""))
-            .with_previewer(Arc::new(StubPreviewer)))
-        .oneshot(
-            Request::post("/v1/models/preview")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "source": {
-                            "repository": "owner/repository",
-                            "revision": commit,
-                            "primary_gguf": "model.gguf",
-                            "additional_components": []
-                        },
-                        "profiles": [{
-                            "id": "interactive",
-                            "context_length": 4096,
-                            "parallel_sequences": 1
-                        }]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["repository"], "owner/repository");
-        assert_eq!(body["assessments"][0]["profile_id"], "interactive");
     }
 
     #[tokio::test]
@@ -3531,13 +3187,42 @@ mod tests {
     struct StubRuntime {
         backends: BackendRegistry,
         leases: Arc<AtomicU64>,
-        loads: Arc<AtomicU64>,
     }
 
     impl RuntimeController for StubRuntime {
-        fn load(&self, _model_id: String) -> BoxStream<'static, ModelLoadEvent> {
-            self.loads.fetch_add(1, Ordering::Relaxed);
-            futures_util::stream::empty().boxed()
+        fn load_configuration(
+            &self,
+            _request: LoadModelRequest,
+        ) -> BoxStream<'static, ModelLoadEvent> {
+            Box::pin(futures_util::stream::once(async {
+                ModelLoadEvent::Failed {
+                    failure: icn_contracts::models::ModelFailure {
+                        code: "unsupported".to_owned(),
+                        message: "exact configuration loading is unavailable in the stub runtime"
+                            .to_owned(),
+                        retryable: false,
+                    },
+                }
+            }))
+        }
+
+        fn unload_residency(
+            &self,
+            _residency_id: String,
+        ) -> BoxFuture<'_, Result<(), InventoryError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn remove_installed(
+            &self,
+            package_id: ModelPackageId,
+        ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
+            Box::pin(async move {
+                Err(InventoryError::Unsupported(format!(
+                    "cannot remove package {} in the stub runtime",
+                    package_id.0
+                )))
+            })
         }
 
         fn lease(&self, _model_id: String) -> BoxFuture<'_, Result<BackendLease, InventoryError>> {
@@ -3548,18 +3233,6 @@ mod tests {
                     .ok_or_else(|| InventoryError::Internal("test backend unavailable".into()))
             })
         }
-
-        fn unload(&self, _model_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn delete(&self, model_id: String) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
-            Box::pin(async move {
-                Err(InventoryError::Unsupported(format!(
-                    "cannot delete {model_id} in stub runtime"
-                )))
-            })
-        }
     }
 
     #[tokio::test]
@@ -3567,11 +3240,9 @@ mod tests {
         let backends =
             BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
         let leases = Arc::new(AtomicU64::new(0));
-        let loads = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(StubRuntime {
             backends: backends.clone(),
             leases: Arc::clone(&leases),
-            loads: Arc::clone(&loads),
         });
         let response = app(AppState::model_free(backends).with_runtime(runtime))
             .oneshot(
@@ -3594,7 +3265,6 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("ready"));
         assert_eq!(leases.load(Ordering::Relaxed), 1);
-        assert_eq!(loads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3602,11 +3272,9 @@ mod tests {
         let backends =
             BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
         let leases = Arc::new(AtomicU64::new(0));
-        let loads = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(StubRuntime {
             backends: backends.clone(),
             leases: Arc::clone(&leases),
-            loads,
         });
         let response = app(AppState::model_free(backends).with_runtime(runtime))
             .oneshot(
@@ -3784,49 +3452,6 @@ mod tests {
         );
         assert_eq!(speculative.draft_n, Some(3));
         assert_eq!(speculative.draft_n_accepted, Some(2));
-    }
-
-    #[test]
-    fn exported_inventory_contract_is_typed_and_streamed_to_eof() {
-        let value = serde_json::to_value(openapi().unwrap()).unwrap();
-        let operation = &value["paths"]["/v1/models/download"]["post"];
-        assert_eq!(operation[STREAM_EXTENSION]["framing"], "sse");
-        assert_eq!(operation[STREAM_EXTENSION]["termination"]["type"], "eof");
-        assert_eq!(
-            operation[STREAM_EXTENSION]["data"]["schema"]["$ref"],
-            "#/components/schemas/ModelDownloadEventSchema"
-        );
-        let schemas = &value["components"]["schemas"];
-        assert_eq!(
-            schemas["Model"]["properties"]["availability"]["$ref"],
-            "#/components/schemas/ModelAvailabilitySchema"
-        );
-        assert!(schemas["Model"]["properties"].get("residency").is_none());
-        assert_eq!(
-            schemas["Model"]["properties"]["hardware"]["$ref"],
-            "#/components/schemas/HardwareAssessmentSchema"
-        );
-        assert!(value["paths"].get("/v1/models/{model_id}/assess").is_none());
-        let relationships = &schemas["DownloadRelationshipSchema"]["oneOf"]
-            .as_array()
-            .unwrap()[0];
-        assert!(relationships["properties"]["projector"].is_object());
-        assert!(relationships["properties"]["model"].is_object());
-        assert!(relationships["properties"].get("component_path").is_none());
-    }
-
-    #[test]
-    fn exported_contract_is_model_centric() {
-        let value = serde_json::to_value(openapi().unwrap()).unwrap();
-        assert!(value["paths"].get("/v1/runtime").is_none());
-        assert!(value["paths"].get("/v1/runtime/changes").is_none());
-        let load = &value["paths"]["/v1/models/{model_id}/load"]["post"];
-        assert_eq!(load[STREAM_EXTENSION]["framing"], "sse");
-        assert_eq!(load[STREAM_EXTENSION]["termination"]["type"], "eof");
-        assert!(value["paths"]["/v1/models/{model_id}/unload"]["post"].is_object());
-        let chat = &value["paths"]["/v1/chat/completions"]["post"];
-        assert_eq!(chat[STREAM_EXTENSION]["framing"], "sse");
-        assert_eq!(chat[STREAM_EXTENSION]["termination"]["value"], "[DONE]");
     }
 
     #[tokio::test]
