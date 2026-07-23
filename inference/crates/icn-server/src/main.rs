@@ -209,7 +209,7 @@ struct CalibrationCache {
 }
 
 const ASSESSMENT_RESOLVER_REVISION: &str = "icn-backend-plan-v1";
-const OFFERING_ASSESSMENT_REVISION: &str = "offering-assessment-v2-performance-failure";
+const OFFERING_ASSESSMENT_REVISION: &str = "offering-assessment-v3-zero-kv-workload";
 const CAPACITY_POLICY_REVISION: &str = "stable-total-reserve-v1";
 const MTP_SELECTOR_REVISION: &str = "icn-mtp-selector-v1";
 const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
@@ -242,7 +242,14 @@ struct NativeTemplateAssessor;
 
 impl TemplateAssessor for NativeTemplateAssessor {
     fn cache_identity(&self) -> &str {
-        concat!("icn-native-model-template:", env!("CARGO_PKG_VERSION"))
+        concat!(
+            "icn-native-model-template:",
+            env!("CARGO_PKG_VERSION"),
+            ":",
+            env!("ICN_BINDINGS_REVISION"),
+            ":",
+            env!("ICN_NATIVE_BACKEND_REVISION")
+        )
     }
 
     fn assess(
@@ -498,6 +505,9 @@ impl NativeModelEvaluator {
                     OFFERING_ASSESSMENT_REVISION,
                     CAPACITY_POLICY_REVISION,
                     MTP_SELECTOR_REVISION,
+                    icn_hardware::GENERATION_PERFORMANCE_METHOD,
+                    llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
+                    llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
                     &environment_id.0,
                     &resolved.target_id.0,
                     profile.context_length,
@@ -2228,6 +2238,14 @@ mod tests {
                 message: "no routed calibration covers backend CUDA device GPU0".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn native_template_cache_identity_tracks_both_native_pins() {
+        let identity = NativeTemplateAssessor.cache_identity();
+
+        assert!(identity.contains(build_identity::BINDINGS_REVISION));
+        assert!(identity.contains(build_identity::NATIVE_BACKEND_REVISION));
     }
 
     fn parity_test_defaults() -> RuntimePlanDefaults {
