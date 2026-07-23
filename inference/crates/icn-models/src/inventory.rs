@@ -286,10 +286,35 @@ impl ModelManager {
     }
 
     pub async fn ensure_model_inventory(&self) -> Result<(), InventoryError> {
+        self.ensure_model_inventory_with_hardware(true).await
+    }
+
+    pub(crate) async fn ensure_installed_model_inventory(&self) -> Result<(), InventoryError> {
+        self.ensure_model_inventory_with_hardware(false).await
+    }
+
+    async fn ensure_model_inventory_with_hardware(
+        &self,
+        assess_hardware: bool,
+    ) -> Result<(), InventoryError> {
         let observed_generation = self.ensure_generation.load(Ordering::Acquire);
         let _guard = self.ensure_gate.lock().await;
         if self.ensure_generation.load(Ordering::Acquire) != observed_generation {
-            return Ok(());
+            let hardware_is_current = self
+                .models
+                .read()
+                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+                .values()
+                .filter(|model| matches!(model.properties, InventoryProperties::Inspected { .. }))
+                .all(|model| {
+                    matches!(
+                        model.hardware,
+                        HardwareAssessment::Fits { .. } | HardwareAssessment::DoesNotFit { .. }
+                    )
+                });
+            if !assess_hardware || hardware_is_current {
+                return Ok(());
+            }
         }
 
         let live_models = self
@@ -314,24 +339,29 @@ impl ModelManager {
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
             let mut discovered = scan_result.models;
-            let has_inspected = discovered
-                .values()
-                .any(|model| matches!(model.properties, InventoryProperties::Inspected { .. }));
-            let assessor = self
-                .hardware_assessor
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("hardware assessor lock poisoned".to_owned())
-                })?
-                .clone();
-            let hardware_key = match assessor.as_ref() {
-                Some(assessor) => assessor.cache_key().await?,
-                None if has_inspected => {
-                    return Err(InventoryError::Internal(
-                        "inventory hardware assessor is not configured".to_owned(),
-                    ));
-                }
-                None => String::new(),
+            let (assessor, hardware_key) = if assess_hardware {
+                let has_inspected = discovered
+                    .values()
+                    .any(|model| matches!(model.properties, InventoryProperties::Inspected { .. }));
+                let assessor = self
+                    .hardware_assessor
+                    .read()
+                    .map_err(|_| {
+                        InventoryError::Internal("hardware assessor lock poisoned".to_owned())
+                    })?
+                    .clone();
+                let hardware_key = match assessor.as_ref() {
+                    Some(assessor) => assessor.cache_key().await?,
+                    None if has_inspected => {
+                        return Err(InventoryError::Internal(
+                            "inventory hardware assessor is not configured".to_owned(),
+                        ));
+                    }
+                    None => String::new(),
+                };
+                (assessor, hardware_key)
+            } else {
+                (None, String::new())
             };
 
             let mut next_evidence = BTreeMap::new();
@@ -353,7 +383,9 @@ impl ModelManager {
                             ))
                         })?,
                 };
-                if matches!(model.properties, InventoryProperties::Inspected { .. }) {
+                if assess_hardware
+                    && matches!(model.properties, InventoryProperties::Inspected { .. })
+                {
                     let assessment_key = hardware_key_for_profile(
                         &hardware_key,
                         model
@@ -380,7 +412,7 @@ impl ModelManager {
                         };
                         let assessor = assessor
                             .as_ref()
-                            .expect("inspected models require an assessor");
+                            .expect("hardware inventory reconciliation requires an assessor");
                         let assessment = match model.serving_configuration.as_ref() {
                             Some(configuration) => {
                                 assessor
@@ -1425,10 +1457,22 @@ pub(crate) fn build_model(
                         Some(assessment.fingerprint),
                     ),
                     Err(error) => {
-                        return Err(InventoryError::Internal(format!(
-                            "template inspection failed for {}: {error}",
-                            primary.display()
-                        )));
+                        return Ok(unavailable_model(
+                            id,
+                            content_id,
+                            created,
+                            ready_at,
+                            source,
+                            location,
+                            primary,
+                            deletable,
+                            "template_inspection_failed",
+                            format!(
+                                "template inspection failed for {}: {error}",
+                                primary.display()
+                            ),
+                            false,
+                        ));
                     }
                 };
                 let name = inspection.name.clone().unwrap_or_else(|| {
@@ -1953,6 +1997,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use futures_util::future::BoxFuture;
+    use icn_contracts::models::{InstalledModelPackages, ModelPackageInspection};
     use icn_contracts::{
         CapabilityEvidence, HardwareMemory, HardwareProfile, HardwareRecommendation,
         InventoryHardwareAssessor, ModelInventory, ReasoningControlDomain, ReasoningDelimiters,
@@ -1974,6 +2019,7 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         delay: bool,
+        reject_name: Option<&'static str>,
     }
 
     impl TemplateAssessor for CompleteTemplateAssessor {
@@ -1981,8 +2027,17 @@ mod tests {
             "complete-template-assessor:test"
         }
 
-        fn assess(&self, _inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
+        fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.reject_name.is_some_and(|name| {
+                inputs
+                    .model_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|file_name| file_name.contains(name))
+            }) {
+                return Err("unsupported template".to_owned());
+            }
             let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             self.max_active.fetch_max(active, AtomicOrdering::SeqCst);
             if self.delay {
@@ -2057,6 +2112,101 @@ mod tests {
         bytes.extend_from_slice(&0_u64.to_le_bytes());
         bytes.resize(32, 0);
         fs::write(path, bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_packages_skip_hardware_assessment() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let source = temporary.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        write_minimal_gguf(&source.join("model.gguf"));
+
+        let mut config = InventoryConfig::with_root(store).unwrap();
+        config.hf_cache_dirs.clear();
+        config.model_sources.push(source);
+        let manager = ModelManager::open_with_template_assessor(
+            config,
+            Some(Arc::new(CompleteTemplateAssessor::default())),
+        )
+        .await
+        .unwrap();
+        let hardware = Arc::new(CountingHardwareAssessor(AtomicUsize::new(0)));
+        manager.set_hardware_assessor(hardware.clone()).unwrap();
+
+        let installed = manager.list_installed().await.unwrap();
+
+        assert_eq!(installed.packages.len(), 1);
+        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            manager
+                .models
+                .read()
+                .unwrap()
+                .values()
+                .all(|model| { matches!(model.hardware, HardwareAssessment::NotAssessed { .. }) })
+        );
+
+        let assessed = manager.list().await.unwrap();
+        assert_eq!(assessed.len(), 1);
+        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            assessed[0].hardware,
+            HardwareAssessment::Fits { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn template_failure_isolated_to_the_affected_installed_model() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let source = temporary.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        write_minimal_gguf(&source.join("working.gguf"));
+        write_minimal_gguf(&source.join("broken.gguf"));
+        fs::OpenOptions::new()
+            .append(true)
+            .open(source.join("broken.gguf"))
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+
+        let mut config = InventoryConfig::with_root(store).unwrap();
+        config.hf_cache_dirs.clear();
+        config.model_sources.push(source);
+        let manager = ModelManager::open_with_template_assessor(
+            config,
+            Some(Arc::new(CompleteTemplateAssessor {
+                reject_name: Some("broken"),
+                ..CompleteTemplateAssessor::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let installed = manager.list_installed().await.unwrap();
+
+        assert_eq!(installed.packages.len(), 2);
+        assert_eq!(
+            installed
+                .packages
+                .iter()
+                .filter(|package| {
+                    matches!(package.inspection, ModelPackageInspection::Inspected { .. })
+                })
+                .count(),
+            1,
+        );
+        assert_eq!(
+            installed
+                .packages
+                .iter()
+                .filter(|package| {
+                    matches!(package.inspection, ModelPackageInspection::Invalid { .. })
+                })
+                .count(),
+            1,
+        );
     }
 
     #[test]
