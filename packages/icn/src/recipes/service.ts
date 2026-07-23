@@ -13,6 +13,11 @@ import {
 import { ModelRecipesState, type ModelRecipeRecommendation } from "./schema.js"
 import type { ResolvedModelRecipe } from "./types.js"
 import {
+  RECOMMENDATION_POLICY_VERSION,
+  selectRecommendationPortfolio,
+  type RecommendationCandidate,
+} from "./recommendation-policy.js"
+import {
   ModelArtifactFingerprintSchema,
   ModelRecipeCatalogModelIdSchema,
   ModelRecipeConfigurationIdSchema,
@@ -23,8 +28,6 @@ import {
 const PREVIEW_REQUEST_CONCURRENCY = 12
 const PROFILE_CONTEXTS = [200_000, 100_000] as const
 const PROFILE_PARALLEL_SEQUENCES = 1
-const MAX_RECOMMENDATIONS = 4
-const MATERIALLY_LIGHTER_RATIO = 0.8
 interface RecommendationResult {
   readonly recommendations: readonly ModelRecipeRecommendation[]
   readonly failureCount: number
@@ -36,16 +39,16 @@ interface ResolvedRecipes {
   readonly failureCount: number
 }
 
-export interface RankedRecommendationCandidate {
-  readonly value: ModelRecipeRecommendation
-  readonly modelId: string
-  readonly modelQualityRank: number
-  readonly fidelityRank: number
-}
-
 export interface IcnRecipesService extends IcnObservedState<ModelRecipesState, never> {
   readonly resolve: (configurationId: ModelRecipeConfigurationId) => Effect.Effect<Option.Option<ModelRecipeRecommendation>>
 }
+
+export const recommendationCacheKey = (
+  policyVersion: string,
+  nativeBuild: string,
+  topologyFingerprint: string,
+  commits: readonly string[],
+): string => [policyVersion, nativeBuild, topologyFingerprint, ...commits].join(":")
 
 export class IcnRecipes extends Context.Tag("@magnitudedev/icn/IcnRecipes")<
   IcnRecipes,
@@ -74,6 +77,36 @@ type InspectedInventoryProperties = Extract<
   { readonly type: "inspected" }
 >
 
+export const exactRequestedProfileContext = (
+  profileId: string,
+  actualContext: number,
+): Option.Option<100_000 | 200_000> => Option.flatMap(
+  Option.fromNullable(profileId.match(/:ctx(\d+)$/)?.at(1)),
+  (value) => {
+    const requested = Number(value)
+    return requested === actualContext && (requested === 100_000 || requested === 200_000)
+      ? Option.some(requested)
+      : Option.none()
+  },
+)
+
+export const exactGenerationEstimate = (
+  performance: Generated.GenerationPerformanceAssessmentSchema,
+  context: number,
+) => performance.status === "estimated"
+  ? Option.map(
+    Option.fromNullable(performance.points.find(({ context_tokens }) => context_tokens === context)),
+    (point) => ({
+      contextTokens: point.context_tokens,
+      lowerTokensPerSecond: point.lower_tokens_per_second,
+      expectedTokensPerSecond: point.expected_tokens_per_second,
+      upperTokensPerSecond: point.upper_tokens_per_second,
+      confidence: performance.confidence,
+      method: performance.method,
+    }),
+  )
+  : Option.none()
+
 const recommendationFrom = (
   entry: ResolvedModelRecipe,
   preview: Generated.ModelPreviewSchema,
@@ -93,12 +126,9 @@ const recommendationFrom = (
   const totalParameters = nonNullProperty((value) => value.parameter_count)
   const activeParameters = nonNullProperty((value) => value.active_parameter_count)
   if (!preview.assessments.some((candidate) => candidate.profile_id === assessment.profile_id)) return Option.none()
-  const matchedContext = Option.flatMap(
-    Option.fromNullable(assessment.profile_id.match(/:ctx(\d+)$/)),
-    (match) => Option.flatMap(
-      Option.fromNullable(match.at(1)),
-      (value) => Option.liftPredicate(Number(value), (candidate) => Number.isSafeInteger(candidate) && candidate > 0),
-    ),
+  const matchedContext = exactRequestedProfileContext(
+    assessment.profile_id,
+    profile.context_length,
   )
   if (Option.isNone(matchedContext)) return Option.none()
   const contextWindow = matchedContext.value
@@ -136,7 +166,7 @@ const recommendationFrom = (
     catalogModelId: ModelRecipeCatalogModelIdSchema.make(entry.id),
     artifactFingerprint: ModelArtifactFingerprintSchema.make(assessment.artifact_fingerprint),
     modelId: Option.none(),
-    badge: "alternative",
+    intent: "balanced",
     displayName: entry.displayName,
     family: entry.family,
     architecture: Option.exists(architectureName, (name) => name.toLowerCase().includes("moe")) ? "moe" : "dense",
@@ -175,63 +205,9 @@ const recommendationFrom = (
     fitMarginBytes: memory.headroom_bytes,
     fitClass,
     constrainedContext: assessment.assessment.recommendation === "constrained",
+    estimatedGeneration: exactGenerationEstimate(assessment.performance, contextWindow),
     explanation: `${entry.quantization.fidelityLabel}; ${profile.acceleration} placement at ${Math.round(contextWindow / 1_000)}K context.`,
   })
-}
-
-const compareConfiguration = (
-  left: RankedRecommendationCandidate,
-  right: RankedRecommendationCandidate,
-): number => right.fidelityRank - left.fidelityRank
-  || right.value.contextWindow - left.value.contextWindow
-  || right.value.fitMarginBytes - left.value.fitMarginBytes
-
-const compareProductRank = (
-  left: RankedRecommendationCandidate,
-  right: RankedRecommendationCandidate,
-): number => right.modelQualityRank - left.modelQualityRank
-  || right.fidelityRank - left.fidelityRank
-  || right.value.contextWindow - left.value.contextWindow
-  || right.value.fitMarginBytes - left.value.fitMarginBytes
-
-export const selectRecommendationPortfolio = (
-  candidates: readonly RankedRecommendationCandidate[],
-): readonly ModelRecipeRecommendation[] => {
-  const bestByModel = new Map<string, RankedRecommendationCandidate>()
-  for (const candidate of candidates) {
-    const current = bestByModel.get(candidate.modelId)
-    if (!current || compareConfiguration(candidate, current) < 0) bestByModel.set(candidate.modelId, candidate)
-  }
-
-  const ranked = [...bestByModel.values()].sort(compareProductRank)
-  const primary = ranked.shift()
-  if (!primary) return []
-
-  const selected: Array<{
-    candidate: RankedRecommendationCandidate
-    badge: ModelRecipeRecommendation["badge"]
-  }> = [{ candidate: primary, badge: "recommended" }]
-  const remaining = new Map(ranked.map((candidate) => [candidate.modelId, candidate]))
-  const take = (
-    badge: ModelRecipeRecommendation["badge"],
-    predicate: (candidate: RankedRecommendationCandidate) => boolean,
-  ): void => {
-    const candidate = [...remaining.values()].find(predicate)
-    if (!candidate || selected.length >= MAX_RECOMMENDATIONS) return
-    remaining.delete(candidate.modelId)
-    selected.push({ candidate, badge })
-  }
-
-  take("lighter", (candidate) => candidate.value.estimatedRuntimeBytes
-    <= primary.value.estimatedRuntimeBytes * MATERIALLY_LIGHTER_RATIO)
-  take("higher_fidelity", (candidate) => candidate.fidelityRank > primary.fidelityRank)
-  take("alternative", (candidate) => candidate.value.family !== primary.value.family)
-
-  for (const candidate of remaining.values()) {
-    if (selected.length >= MAX_RECOMMENDATIONS) break
-    selected.push({ candidate, badge: "alternative" })
-  }
-  return selected.map(({ candidate, badge }) => ({ ...candidate.value, badge }))
 }
 
 export const makeIcnRecipes = (
@@ -286,7 +262,12 @@ export const makeIcnRecipes = (
     const readRecommendations = Effect.gen(function* () {
       const hardwareSnapshot = (yield* hardware.get).state
       const recipes = yield* resolveRecipes
-      const key = [hardwareSnapshot.native_build, hardwareSnapshot.topology_fingerprint, ...recipes.commits].join(":")
+      const key = recommendationCacheKey(
+        RECOMMENDATION_POLICY_VERSION,
+        hardwareSnapshot.native_build,
+        hardwareSnapshot.topology_fingerprint,
+        recipes.commits,
+      )
       const cached = (yield* Ref.get(cache)).get(key)
       if (cached) return cached
       const totalStableCapacity = hardwareSnapshot.memory_domains
@@ -307,19 +288,39 @@ export const makeIcnRecipes = (
         { concurrency: PREVIEW_REQUEST_CONCURRENCY },
       )
       const successful = previewResults.flatMap((result) => result._tag === "Right" ? [result.right] : [])
-      const candidates = successful.flatMap(({ entry, preview }) => preview.assessments.flatMap((assessment) => {
+      const candidates: readonly RecommendationCandidate[] = successful.flatMap(({ entry, preview }) => preview.assessments.flatMap((assessment) => {
         const value = recommendationFrom(entry, preview, assessment)
         return Option.toArray(Option.map(value, (recommendation) => ({
           value: recommendation,
-          modelId: entry.modelId,
-          modelQualityRank: entry.modelQualityRank,
+          artifactId: entry.id,
+          checkpointId: entry.modelId,
+          capability: entry.capability,
           fidelityRank: entry.quantization.fidelityRank,
         })))
       }))
+      const recommendations = selectRecommendationPortfolio(candidates)
       const result = {
-        recommendations: selectRecommendationPortfolio(candidates),
+        recommendations,
         failureCount: recipes.failureCount + previewResults.length - successful.length,
       }
+      yield* Effect.logDebug("Selected local model recommendation portfolio").pipe(
+        Effect.annotateLogs({
+          policy: RECOMMENDATION_POLICY_VERSION,
+          candidates: candidates.map((candidate) => [
+            candidate.value.configurationId,
+            candidate.checkpointId,
+            candidate.capability?.score ?? "unmeasured",
+            candidate.fidelityRank,
+            candidate.value.contextWindow,
+            Option.getOrUndefined(candidate.value.estimatedGeneration)?.expectedTokensPerSecond
+              ?? "unavailable",
+            candidate.value.estimatedRuntimeBytes,
+            candidate.value.totalDownloadBytes,
+          ].join(":")),
+          selected: recommendations.map(({ configurationId, intent }) =>
+            `${configurationId}:${intent}`),
+        }),
+      )
       yield* Ref.update(cache, (current) => new Map(current).set(key, result))
       return result
     })

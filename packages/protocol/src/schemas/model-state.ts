@@ -228,7 +228,8 @@ export const LocalModelInventoryEntryDetailsSchema = Schema.Struct({
   downloadBytes: NonNegativeSafeInteger,
   fit: LocalModelFitSchema,
   recommendation: Schema.optionalWith(Schema.Struct({
-    badge: Schema.Literal("recommended", "lighter", "higher_fidelity", "alternative"),
+    intent: Schema.Literal("balanced", "best_quality", "fastest", "lightweight"),
+    explanation: Schema.String,
     fidelityLabel: Schema.String,
     fidelityEvidence: Schema.String,
     repository: Schema.String,
@@ -237,6 +238,14 @@ export const LocalModelInventoryEntryDetailsSchema = Schema.Struct({
     sourcePageUrl: Schema.String,
     estimatedRuntimeBytes: NonNegativeSafeInteger,
     fitMarginBytes: Schema.Number.pipe(Schema.finite()),
+    estimatedGeneration: Schema.optionalWith(Schema.Struct({
+      contextTokens: PositiveSafeInteger,
+      lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+      expectedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+      upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+      confidence: Schema.Literal("high", "moderate", "low"),
+      method: Schema.String,
+    }), { as: "Option", exact: true }),
   }), { as: "Option", exact: true }),
 })
 export type LocalModelInventoryEntryDetails = typeof LocalModelInventoryEntryDetailsSchema.Type

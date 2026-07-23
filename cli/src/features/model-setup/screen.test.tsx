@@ -4,7 +4,7 @@ import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
 import { LocalModelAvailableForDownload, LocalModelDownloading } from "@magnitudedev/sdk"
-import { makeModel, makeView } from "../local-inference/test-fixtures"
+import { GIB, makeModel, makeView } from "../local-inference/test-fixtures"
 
 const actions = vi.hoisted(() => ({
   downloadModel: vi.fn(),
@@ -98,6 +98,45 @@ test("renders download progress as one label followed by percentage", async () =
     const frame = view.captureCharFrame()
     expect(frame).toContain("Downloading 25%")
     expect(frame).not.toContain("Downloading Downloading")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("renders consumer recommendation intent and its trade-off explanation", async () => {
+  const model = makeModel({
+    recommendation: Option.some({
+      intent: "fastest",
+      explanation: "Prioritizes responsive generation at about 42.0 tokens/sec.",
+      fidelityLabel: "Very high fidelity",
+      fidelityEvidence: "Test evidence",
+      repository: "owner/repo",
+      revision: "commit",
+      files: [],
+      sourcePageUrl: "https://example.com/model",
+      estimatedRuntimeBytes: 12 * GIB,
+      fitMarginBytes: 20 * GIB,
+      estimatedGeneration: Option.some({
+        contextTokens: 100_000,
+        lowerTokensPerSecond: 38,
+        expectedTokensPerSecond: 42,
+        upperTokensPerSecond: 46,
+        confidence: "high",
+        method: "test-estimator",
+      }),
+    }),
+  })
+  state = makeView({ entries: [new LocalModelAvailableForDownload({ model })], ready: false })
+  const view = await testRender(
+    <ModelSetupScreen mode="onboarding" onExit={() => {}} />,
+    { width: 100, height: 30 },
+  )
+  try {
+    await act(view.renderOnce)
+    const frame = view.captureCharFrame()
+    expect(frame).toContain("Fastest")
+    expect(frame).toContain("Prioritizes responsive generation")
+    expect(frame).not.toContain("Alternative Option")
   } finally {
     await act(async () => view.renderer.destroy())
   }

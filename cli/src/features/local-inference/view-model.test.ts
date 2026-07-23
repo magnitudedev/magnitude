@@ -4,6 +4,9 @@ import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   LocalModelAvailableForDownload,
+  LocalModelIdSchema,
+  ProviderModelIdSchema,
+  type LocalModelInventoryEntryDetails,
 } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
@@ -66,6 +69,61 @@ describe("local inference selection view model", () => {
     expect(selections).toHaveLength(1)
     expect(selections[0]?.kind).toBe("recommendation")
     expect(selectionMetadata(selections[0]!)).toContain("Q4_K_M")
+  })
+
+  it("orders recommendation intents for comparison rather than by model name", () => {
+    const recommendation = (
+      intent: "balanced" | "best_quality" | "fastest" | "lightweight",
+    ): LocalModelInventoryEntryDetails["recommendation"] => Option.some({
+      intent,
+      explanation: `${intent} explanation`,
+      fidelityLabel: "Very high quality",
+      fidelityEvidence: "Test evidence",
+      repository: "owner/repo",
+      revision: "commit",
+      files: [],
+      sourcePageUrl: "https://example.com/model",
+      estimatedRuntimeBytes: 12 * GIB,
+      fitMarginBytes: 20 * GIB,
+      estimatedGeneration: Option.none(),
+    })
+    const entry = (
+      intent: "balanced" | "best_quality" | "fastest" | "lightweight",
+      displayName: string,
+    ) => new LocalModelAvailableForDownload({
+      model: makeModel({
+        localModelId: LocalModelIdSchema.make(intent),
+        providerModelId: ProviderModelIdSchema.make(`local:${intent}`),
+        displayName,
+        recommendation: recommendation(intent),
+      }),
+    })
+    const selections = buildLocalInferenceSelections(makeView({
+      ready: false,
+      entries: [
+        new LocalModelAvailableForDownload({
+          model: makeModel({
+            localModelId: LocalModelIdSchema.make("uncurated"),
+            providerModelId: ProviderModelIdSchema.make("local:uncurated"),
+            displayName: "A Uncurated Model",
+          }),
+        }),
+        entry("fastest", "A Fast Model"),
+        entry("lightweight", "B Small Model"),
+        entry("best_quality", "C Quality Model"),
+        entry("balanced", "Z Balanced Model"),
+      ],
+    }))
+    expect(selections.map(({ entry: value }) => Option.match(value.model.recommendation, {
+      onNone: () => "uncurated",
+      onSome: ({ intent }) => intent,
+    }))).toEqual([
+      "balanced",
+      "best_quality",
+      "fastest",
+      "lightweight",
+      "uncurated",
+    ])
   })
 
   it("exposes a capacity warning from the inventory entry fit state", () => {

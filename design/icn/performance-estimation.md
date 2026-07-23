@@ -27,7 +27,8 @@ choose context points, or define fallback policy.
 `icn-hardware` owns the generation formula, active-expert arithmetic, context curve, calibration
 matching and fallback rules, uncertainty bounds, confidence, estimator version, and typed failure
 policy. ICN model management owns calibration lifecycle, evidence-key construction, and caching.
-ACN may rank complete estimates but must not reconstruct model workload or hardware throughput.
+The `@magnitudedev/icn` recipe service may rank complete estimates but must not reconstruct model
+workload or hardware throughput. ACN only projects the selected recipe result.
 
 The estimator may use only:
 
@@ -78,9 +79,12 @@ inconsistent expert metadata makes performance unavailable rather than falling b
 active-parameter ratio over the complete model.
 
 KV traffic is calculated from the native per-layer K/V row bytes. Full-attention layers scale with
-occupied depth and sliding-window layers are capped by their native window. Recurrent or hybrid
-state is used when represented by the native workload; incomplete state accounting reduces
-confidence or makes the estimate unavailable.
+occupied depth, sliding-window layers are capped by their native window, and recurrent layers read
+one fixed state row per generated token regardless of occupied depth. Hybrid models apply these
+rules independently per layer. Native layer identities must be unique; duplicate identities make
+the workload invalid rather than double-counting it. Complete native recurrent-state accounting is
+not itself a reason to reduce confidence; incomplete state accounting reduces confidence or makes
+the estimate unavailable.
 
 Host/device placement is part of the workload: every tensor and every layer's KV traffic uses the
 calibration for its actual native device. A configuration that fits through partial offload or
@@ -114,14 +118,14 @@ In `icn-hardware`, time for each native operation class is derived from its cali
 tensor-read rate and dispatch overhead. Routed and dense matrix operations use different calibration
 evidence. K and V traffic is charged independently for every layer, with sliding-window limits and
 the layer's actual native device. The reciprocal of total predicted seconds per token is the
-raw generation rate. Estimator v2 applies an ICN-owned efficiency factor of `0.82` for dense models
+raw generation rate. Estimator v3 applies an ICN-owned efficiency factor of `0.82` for dense models
 and `0.75` for routed models to cover decode graph work outside the calibrated matrix operations.
 Cross-memory-domain placement applies a further `0.88` factor. These are versioned estimator
 policy: any change requires a new ICN estimator method identity and cache evidence.
 
 Every available result contains finite, positive lower, expected, and upper rates with
 `lower <= expected <= upper`. Bounds incorporate calibration dispersion and workload coverage.
-Estimator v2 starts with at least 12% uncertainty, weights observed calibration spread by `1.5`,
+Estimator v3 starts with at least 12% uncertainty, weights observed calibration spread by `1.5`,
 and widens routed and cross-memory-domain estimates further. Confidence is high, moderate, or low
 and is lowered by missing exact operation calibration, routed-expert uncertainty,
 cross-memory-domain placement, or incomplete native state accounting. Unified CPU/accelerator
@@ -162,5 +166,5 @@ for observed performance.
 - Malformed native values, unsupported operations, and incomplete MoE metadata produce typed
   unavailable results rather than guessed rates.
 - Remote sparse and complete local forms of the same artifact produce identical model workloads.
-- No recommendation or client presentation consumes the estimate merely because this contract is
-  present; product policy adopts it in a separate change.
+- Recommendation policy consumes only a complete estimate point matching the exact selected product
+  context. Clients present the selected evidence but never reinterpret workload or throughput.

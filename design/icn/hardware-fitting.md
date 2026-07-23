@@ -402,16 +402,16 @@ reserved memory when the underlying planner can do so. Unsupported component com
 
 ## Catalog integration
 
-ACN owns one versioned, model-centric catalog overlay. A checkpoint appears once and groups its
+The `@magnitudedev/icn` integration package owns one versioned, model-centric catalog overlay. A checkpoint appears once and groups its
 curated quantization choices. The checked-in overlay contains stable Hugging Face model and artifact
 repository IDs, quantization selectors, product context profiles, display identity, quality and
 fidelity evidence, benchmark methodology, and license review. It does not contain mutable Hub
 commit revisions, filenames, shard membership, byte sizes, or content hashes.
 
-ICN owns live Hugging Face discovery. Repository resolution accepts a mutable ref such as `main`
+Native ICN owns live Hugging Face discovery. Repository resolution accepts a mutable ref such as `main`
 and returns an immutable per-request snapshot containing the resolved commit, current GGUF files,
 sizes, content identities, license data, and Hub metadata. Search returns current GGUF repositories.
-ACN joins an optional curated overlay to that snapshot. A repository absent from the overlay remains
+The recipe service joins an optional curated overlay to that snapshot. A repository absent from the overlay remains
 usable and can still receive artifact-derived fit and performance estimates, but it receives no
 Magnitude quality, fidelity, or support claim.
 
@@ -420,14 +420,15 @@ provenance for that preview or download, never a hand-maintained catalog pin. Th
 mutable branch from changing between selection and acquisition while allowing normal catalog
 refreshes to observe current Hub state.
 
-ACN submits catalog artifact identities and fixed product profiles to the preview API. It
+The recipe service submits catalog artifact identities and fixed product profiles to the preview API. It
 excludes invalid, incompatible, and `DoesNotFit` candidates and applies only product ranking to the
 remaining results. It must not modify or reinterpret ICN memory arithmetic.
 
 Recommendation projection has an explicit lifecycle. Before an uncached preview calculation begins,
-ACN publishes `Loading`; after the calculation it
-publishes either `Ready` with the complete ranked recommendation set or `Failed` with a bounded
-user-facing explanation. An empty `Ready` result means that no curated candidate fit. Clients must
+the recipe service publishes `Loading`; after the calculation it publishes either `Ready` with the
+complete ranked recommendation set or `Failed` with a bounded user-facing explanation. ACN projects
+that state into local model inventory without reranking it. An empty `Ready` result means that no
+curated candidate qualified. Clients must
 not infer that outcome from an absent or empty recommendation list while calculation is in flight.
 Cached results may transition directly to `Ready` without an observable loading state.
 
@@ -435,17 +436,56 @@ Cached results may transition directly to `Ready` without an observable loading 
 
 Recommendation fitting evaluates one resident native sequence. Magnitude's inference engine owns
 session multiplexing and KV-cache swapping, so user session count is not a recommendation input and
-clients do not ask for it. The supported product context profiles are 200K and 100K tokens. ACN
-prefers 200K for a chosen artifact and falls back to 100K when the larger profile does not fit; 64K
-is not a recommendation profile.
+clients do not ask for it. The only product contexts are exact 200K and 100K profiles; 64K and a
+model's arbitrary native limit are not recommendation profiles. A profile is eligible only when its
+native assessment reports that exact requested context and generation evidence contains a point for
+that same context.
 
-Context profiles and quantizations are fit alternatives, not separate products. ACN first keeps the
-best fitting context for each artifact, then keeps one configuration per base-model checkpoint. It
-prefers the highest-fidelity fitting quantization and, within that quantization, the 200K profile.
-The displayed portfolio contains distinct base models only. Badges describe an actual relationship
-to the primary recommendation: a smaller option must have materially lower runtime memory, a
-higher-fidelity option must have a higher curated fidelity rank, and an alternative should prefer a
-different model family. List position alone never determines those labels.
+Expected generation speed must be at least 15 tokens per second. Missing speed evidence and slower
+profiles are ineligible for every recommendation intent. For Balanced, Best Quality, and Lightweight,
+the service keeps the largest eligible context for each artifact: 200K when it clears the floor,
+otherwise 100K. Fastest may compare both contexts so a materially quicker 100K profile can explain
+that trade-off.
+
+Terminal-Bench v2.1 is the common checkpoint capability signal. Curated evidence states whether it
+is independently measured or explicitly estimated; estimates enter at their stated score without a
+hidden discount, while measured provenance breaks only an exact-score tie. An unmeasured arbitrary
+Hub model cannot outrank measured or estimated curated candidates, but remains a neutral fallback
+when it is the only eligible choice.
+
+The portfolio contains up to four material intents:
+
+- **Balanced** combines capability (40%), logarithmic expected speed from 15 to 60 tokens/sec (30%),
+  runtime-memory efficiency (15%), quantization fidelity (10%), and download-size efficiency (5%)
+  on fixed absolute curves. It is selected globally rather than being restricted to the highest
+  benchmark checkpoint.
+- **Best Quality** prioritizes capability, then exact-score measured provenance, fidelity, context,
+  and expected speed. It appears only with at least five more capability points or ten more fidelity
+  points than Balanced.
+- **Fastest** uses confidence-aware conservative speed: expected for high confidence, the midpoint
+  of lower and expected for moderate confidence, and the lower bound for low confidence. It appears
+  only when at least 15% faster than Balanced on that same conservative basis.
+- **Lightweight** minimizes runtime memory and then download size. It appears only when runtime or
+  download footprint is at most 80% of Balanced.
+
+Capability guards prevent speed and footprint extremes from displacing useful models. Given the
+highest eligible score, Balanced retains at least 70% and loses at most 20 points, Fastest retains
+at least 60% and loses at most 25 points, and Lightweight retains at least 45% and loses at most 25
+points. Balanced also remains within 20 fidelity-rank points of the best eligible fidelity.
+
+Multiple quantizations of one checkpoint remain eligible when they express a real Balanced versus
+Best Quality trade-off. The exact same configuration appears at most once, every card has one
+intent, and an intent with no materially distinct candidate is omitted rather than filled with an
+inferior duplicate. Model-family diversity is only a near-tie preference for Fastest and Lightweight.
+Dense and MoE models receive no recommendation-layer multiplier because native performance evidence
+already reflects their active workload.
+
+Clients present recommendation cards in a stable comparison order: Balanced, Best Quality, Fastest,
+then Lightweight. Explanations compare each specialized choice with Balanced in plain language,
+covering only material differences in difficult-task capability, generation speed, usable context,
+and memory or disk footprint. Quantization quality is described in absolute terms because fidelity
+is not reliably comparable across different model families. Quality-aware low-precision checkpoints
+are distinguished from ordinary Q4 compression.
 
 ### Catalog overlay versus runtime artifact facts
 
@@ -518,6 +558,12 @@ identities and all runtime, profile, hardware, and concrete planning inputs matc
 Volatile free memory may be captured in a report but is not part of a reusable stable-capacity
 result. Topology or stable-capacity changes invalidate affected assessments. Cache entries are
 committed only after complete successful assessment.
+
+Generation evidence versions the ICN-owned estimator method independently from native workload and
+calibration schemas. Recurrent layers read fixed state, full-attention layers scale with occupied
+context, and sliding-window layers cap that context at their native window. Hybrid models apply the
+appropriate rule per layer, and duplicate native layer identities invalidate the workload. A
+method change invalidates cached generation evidence without changing the memory-fit result.
 
 ## Failure semantics
 
@@ -614,8 +660,9 @@ The implementation conforms when:
 - ACN and clients contain no independent hardware normalization or fit arithmetic;
 - uncached recommendation calculation is represented as `Loading`, never as an empty completed result;
 - recommendation profiles use one resident sequence and only the 200K and 100K context tiers;
-- each displayed recommendation represents a distinct base model, with badges derived from actual
-  size, fidelity, or family differences rather than candidate position;
+- each displayed recommendation has one material consumer intent, exact configurations never repeat,
+  and useful quantizations of the same checkpoint may represent distinct Balanced and Best Quality
+  trade-offs;
 - downloaded inventory and remote preview return the same hardware-assessment type;
 - complete headers from every shard are used, with exact original logical sizes;
 - every allocation in the native model/context breakdown is accounted to a physical memory domain;

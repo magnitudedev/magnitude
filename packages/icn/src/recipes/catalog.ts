@@ -11,6 +11,9 @@ import type {
 } from "./types"
 
 const QUANT_STUDY = "https://arxiv.org/abs/2606.19558"
+const TERMINAL_BENCH_SOURCE = "https://artificialanalysis.ai/evaluations/terminalbench-v2-1"
+const TERMINAL_BENCH_ID = "terminal-bench-v2.1"
+const TERMINAL_BENCH_METHODOLOGY = "artificial-analysis-terminus-2-e2b-pass-at-1-3-repeats"
 const APACHE: RecipeLicenseReview = {
   expectedId: "apache-2.0",
   name: "Apache License 2.0",
@@ -89,25 +92,26 @@ const quantArtifacts = (
 ): readonly ModelRecipeArtifact[] => formats.map((format) =>
   artifact(modelId, repository, fidelityFor(format, overrides[format])))
 
-const benchmark = (
-  benchmarkId: string,
-  label: string,
+const terminalBench = (
   score: number,
-  methodologyId: string,
-  mode: string,
-  sourceUrl: string,
-  notes = "Publisher-reported checkpoint result; not an exact GGUF measurement.",
+  provenance: RecipeBenchmarkEvidence["provenance"] = "measured_terminal_bench_2.1",
+  basis = "Independently measured by Artificial Analysis using Terminus 2 on E2B; checkpoint-level evidence, not an exact GGUF quantization measurement.",
+  sourceUrl = TERMINAL_BENCH_SOURCE,
 ): RecipeBenchmarkEvidence => ({
-  benchmarkId,
-  label,
+  benchmarkId: TERMINAL_BENCH_ID,
+  label: "Terminal-Bench v2.1",
   score,
   unit: "percent",
   higherIsBetter: true,
-  methodologyId,
-  mode,
-  evidenceScope: "publisher_checkpoint",
+  methodologyId: TERMINAL_BENCH_METHODOLOGY,
+  mode: "terminus-2",
+  evidenceScope: "independent_checkpoint",
+  provenance,
   sourceUrl,
-  notes,
+  basis,
+  notes: provenance === "measured_terminal_bench_2.1"
+    ? "Independent checkpoint result; not an exact GGUF quantization measurement."
+    : "Magnitude estimate used only where no measured Terminal-Bench v2.1 result is available.",
 })
 
 const source = (repository: string): string => `https://huggingface.co/${repository}`
@@ -118,32 +122,32 @@ const qwenModels: readonly ModelRecipe[] = [
     id: "qwen3.5-4b", family: "qwen3.5", displayName: "Qwen3.5 4B", developer: "Qwen",
     description: "Compact dense model for machines where responsiveness and footprint matter most.",
     modelRepository: "Qwen/Qwen3.5-4B", productContextTokens: [100_000, 200_000],
-    performance: { summary: "The smallest Qwen catalog tier, optimized for low footprint.", benchmarks: [benchmark("livecodebench-v6", "LiveCodeBench v6", 55.8, "qwen3.5-small-2026", "thinking", source("Qwen/Qwen3.5-4B"))] },
-    licenseReview: APACHE, qualityRank: 10,
+    performance: { summary: "The smallest Qwen catalog tier, optimized for low footprint.", benchmarks: [terminalBench(25.8)] },
+    licenseReview: APACHE,
     artifacts: quantArtifacts("qwen3.5-4b", "unsloth/Qwen3.5-4B-GGUF", qwenFormats),
   },
   {
     id: "qwen3.5-9b", family: "qwen3.5", displayName: "Qwen3.5 9B", developer: "Qwen",
     description: "Small dense model that trades some speed and memory for a substantial quality gain over 4B.",
     modelRepository: "Qwen/Qwen3.5-9B", productContextTokens: [100_000, 200_000],
-    performance: { summary: "Higher coding capability than the 4B checkpoint while remaining practical on common consumer machines.", benchmarks: [benchmark("livecodebench-v6", "LiveCodeBench v6", 65.6, "qwen3.5-small-2026", "thinking", source("Qwen/Qwen3.5-9B"))] },
-    licenseReview: APACHE, qualityRank: 20,
+    performance: { summary: "Higher coding capability than the 4B checkpoint while remaining practical on common consumer machines.", benchmarks: [terminalBench(29.2)] },
+    licenseReview: APACHE,
     artifacts: quantArtifacts("qwen3.5-9b", "unsloth/Qwen3.5-9B-GGUF", qwenFormats),
   },
   {
     id: "qwen3.6-27b", family: "qwen3.6", displayName: "Qwen3.6 27B", developer: "Qwen",
     description: "Large dense coding model with strong publisher-reported agent and coding results.",
     modelRepository: "Qwen/Qwen3.6-27B", productContextTokens: [100_000, 200_000],
-    performance: { summary: "The strongest dense Qwen checkpoint in the initial consumer catalog.", benchmarks: [benchmark("livecodebench-v6", "LiveCodeBench v6", 83.9, "qwen3.6-medium-2026", "thinking", source("Qwen/Qwen3.6-27B"))] },
-    licenseReview: APACHE, qualityRank: 45,
+    performance: { summary: "The strongest dense Qwen checkpoint in the initial consumer catalog.", benchmarks: [terminalBench(60.7)] },
+    licenseReview: APACHE,
     artifacts: quantArtifacts("qwen3.6-27b", "unsloth/Qwen3.6-27B-GGUF", qwenFormats),
   },
   {
     id: "qwen3.6-35b-a3b", family: "qwen3.6", displayName: "Qwen3.6 35B-A3B", developer: "Qwen",
     description: "Efficient MoE coding model with a large knowledge footprint and low active compute per token.",
     modelRepository: "Qwen/Qwen3.6-35B-A3B", productContextTokens: [100_000, 200_000],
-    performance: { summary: "MoE execution reduces generation work relative to a similarly sized dense model.", benchmarks: [benchmark("livecodebench-v6", "LiveCodeBench v6", 80.4, "qwen3.6-medium-2026", "thinking", source("Qwen/Qwen3.6-35B-A3B"))] },
-    licenseReview: APACHE, qualityRank: 50,
+    performance: { summary: "MoE execution reduces generation work relative to a similarly sized dense model.", benchmarks: [terminalBench(44.9)] },
+    licenseReview: APACHE,
     artifacts: quantArtifacts("qwen3.6-35b-a3b", "unsloth/Qwen3.6-35B-A3B-GGUF", qwenFormats, {
       "UD-Q4_K_XL": { evidenceScope: "exact_artifact", summary: "Model-specific testing places this artifact in the study's near-baseline region (KLD 0.0135).", sourceUrl: QUANT_STUDY },
       "UD-Q5_K_XL": { evidenceScope: "exact_artifact", summary: "Model-specific testing places this artifact in the study's near-baseline region (KLD 0.0082).", sourceUrl: QUANT_STUDY },
@@ -167,22 +171,21 @@ const gemma = (
   description: string,
   modelRepository: string,
   artifactRepository: string,
-  score: number,
-  rank: number,
+  capability: RecipeBenchmarkEvidence,
   productContextTokens: readonly (100_000 | 200_000)[],
 ): ModelRecipe => ({
   id, family: "gemma-4", displayName, developer: "Google DeepMind", description,
   modelRepository, productContextTokens,
-  performance: { summary: "Publisher benchmark from the common Gemma 4 family evaluation.", benchmarks: [benchmark("livecodebench-v6", "LiveCodeBench v6", score, "gemma4-family-2026", "thinking", gemmaSource)] },
-  licenseReview: GEMMA, qualityRank: rank,
+  performance: { summary: "Terminal-Bench v2.1 capability evidence for this checkpoint.", benchmarks: [capability] },
+  licenseReview: GEMMA,
   artifacts: [artifact(id, artifactRepository, qatFidelity)],
 })
 
 const gemmaModels: readonly ModelRecipe[] = [
-  gemma("gemma-4-e2b-it-qat", "Gemma 4 E2B", "Very small dense model optimized for on-device use.", "google/gemma-4-E2B-it-qat-q4_0-unquantized", "unsloth/gemma-4-E2B-it-qat-GGUF", 44, 8, [100_000]),
-  gemma("gemma-4-12b-it-qat", "Gemma 4 12B", "Mid-size dense model with native tool use, reasoning, vision, and audio capabilities.", "google/gemma-4-12B-it-qat-q4_0-unquantized", "unsloth/gemma-4-12B-it-qat-GGUF", 72, 30, [100_000, 200_000]),
-  gemma("gemma-4-26b-a4b-it-qat", "Gemma 4 26B-A4B", "Mid-size MoE model balancing a substantial weight footprint with low active compute.", "google/gemma-4-26B-A4B-it-qat-q4_0-unquantized", "unsloth/gemma-4-26B-A4B-it-qat-GGUF", 77.1, 34, [100_000, 200_000]),
-  gemma("gemma-4-31b-it-qat", "Gemma 4 31B", "Large dense Gemma model with the strongest publisher-reported coding score in its family.", "google/gemma-4-31B-it-qat-q4_0-unquantized", "unsloth/gemma-4-31B-it-qat-GGUF", 80, 36, [100_000, 200_000]),
+  gemma("gemma-4-e2b-it-qat", "Gemma 4 E2B", "Very small dense model optimized for on-device use.", "google/gemma-4-E2B-it-qat-q4_0-unquantized", "unsloth/gemma-4-E2B-it-qat-GGUF", terminalBench(15, "estimated_terminal_bench_2.1", "Magnitude estimate based on relative Gemma family capability; no measured Terminal-Bench v2.1 result is available.", source("google/gemma-4-E2B-it-qat-q4_0-unquantized")), [100_000]),
+  gemma("gemma-4-12b-it-qat", "Gemma 4 12B", "Mid-size dense model with native tool use, reasoning, vision, and audio capabilities.", "google/gemma-4-12B-it-qat-q4_0-unquantized", "unsloth/gemma-4-12B-it-qat-GGUF", terminalBench(21, "estimated_terminal_bench_2.1", "Magnitude estimate based on relative Gemma family capability; no measured Terminal-Bench v2.1 result is available.", source("google/gemma-4-12B-it-qat-q4_0-unquantized")), [100_000, 200_000]),
+  gemma("gemma-4-26b-a4b-it-qat", "Gemma 4 26B-A4B", "Mid-size MoE model balancing a substantial weight footprint with low active compute.", "google/gemma-4-26B-A4B-it-qat-q4_0-unquantized", "unsloth/gemma-4-26B-A4B-it-qat-GGUF", terminalBench(39.0), [100_000, 200_000]),
+  gemma("gemma-4-31b-it-qat", "Gemma 4 31B", "Large dense Gemma model with the strongest measured coding score in its family.", "google/gemma-4-31B-it-qat-q4_0-unquantized", "unsloth/gemma-4-31B-it-qat-GGUF", terminalBench(43.4), [100_000, 200_000]),
 ]
 
 const largeModel = (input: {
@@ -195,11 +198,6 @@ const largeModel = (input: {
   artifactRepository: string
   format: string
   score: number
-  benchmarkId: string
-  benchmarkLabel: string
-  methodologyId: string
-  mode: string
-  rank: number
   licenseReview: RecipeLicenseReview
   fidelity?: Partial<RecipeQuantizationEvidence>
 }): ModelRecipe => ({
@@ -207,23 +205,22 @@ const largeModel = (input: {
   description: input.description, modelRepository: input.modelRepository, productContextTokens: [100_000, 200_000],
   performance: {
     summary: input.description,
-    benchmarks: [benchmark(input.benchmarkId, input.benchmarkLabel, input.score, input.methodologyId, input.mode, source(input.modelRepository))],
+    benchmarks: [terminalBench(input.score)],
   },
   licenseReview: input.licenseReview,
-  qualityRank: input.rank,
   artifacts: [artifact(input.id, input.artifactRepository, fidelityFor(input.format, input.fidelity))],
 })
 
 const largeModels: readonly ModelRecipe[] = [
-  largeModel({ id: "qwen3.5-122b-a10b", family: "qwen3.5", displayName: "Qwen3.5 122B-A10B", developer: "Qwen", description: "Workstation-class MoE model with a large knowledge footprint and moderate active compute.", modelRepository: "Qwen/Qwen3.5-122B-A10B", artifactRepository: "unsloth/Qwen3.5-122B-A10B-GGUF", format: "UD-Q4_K_XL", score: 78.9, benchmarkId: "livecodebench-v6", benchmarkLabel: "LiveCodeBench v6", methodologyId: "qwen3.5-large-2026", mode: "thinking", rank: 64, licenseReview: APACHE }),
-  largeModel({ id: "nemotron-3-super-120b-a12b", family: "nemotron-3", displayName: "NVIDIA Nemotron 3 Super 120B-A12B", developer: "NVIDIA", description: "Workstation-class hybrid MoE model designed for agentic workflows and efficient low-precision execution.", modelRepository: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", artifactRepository: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF", format: "MXFP4_MOE", score: 78.44, benchmarkId: "livecodebench-v6-2024-08-2025-05", benchmarkLabel: "LiveCodeBench v6", methodologyId: "nemotron3-super-2026", mode: "reasoning", rank: 65, licenseReview: NEMOTRON, fidelity: { bitsClass: "mxfp4", quantAwareCheckpoint: true, fidelityRank: 58, fidelityLabel: "Near-original fidelity in benchmark comparisons", evidenceScope: "checkpoint_quantization", summary: "NVIDIA reports near-BF16 benchmark results for its low-precision checkpoint; the GGUF conversion itself is not directly benchmarked.", sourceUrl: source("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16") } }),
-  largeModel({ id: "deepseek-v4-flash", family: "deepseek-v4", displayName: "DeepSeek V4 Flash 284B-A13B", developer: "DeepSeek", description: "Frontier MoE model with a very large weight footprint but low active compute relative to its size.", modelRepository: "deepseek-ai/DeepSeek-V4-Flash", artifactRepository: "unsloth/DeepSeek-V4-Flash-GGUF", format: "UD-Q8_K_XL", score: 91.6, benchmarkId: "livecodebench", benchmarkLabel: "LiveCodeBench", methodologyId: "deepseek-v4-2026", mode: "maximum reasoning", rank: 72, licenseReview: MIT }),
-  largeModel({ id: "nemotron-3-ultra-550b-a55b", family: "nemotron-3", displayName: "NVIDIA Nemotron 3 Ultra 550B-A55B", developer: "NVIDIA", description: "Frontier workstation/server MoE model intended for exceptionally high-memory systems.", modelRepository: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", artifactRepository: "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF", format: "MXFP4_MOE", score: 89, benchmarkId: "livecodebench-v6", benchmarkLabel: "LiveCodeBench v6", methodologyId: "nemotron3-ultra-2026", mode: "reasoning", rank: 76, licenseReview: OPEN_MDW, fidelity: { bitsClass: "mxfp4", quantAwareCheckpoint: true, fidelityRank: 58, fidelityLabel: "Near-original fidelity in benchmark comparisons", evidenceScope: "checkpoint_quantization", summary: "NVIDIA reports near-BF16 benchmark results for its low-precision checkpoint; the GGUF conversion itself is not directly benchmarked.", sourceUrl: source("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16") } }),
-  largeModel({ id: "glm-5.2", family: "glm-5.2", displayName: "GLM 5.2 753B-A40B", developer: "Z.ai", description: "Largest catalog tier, intended only for exceptionally high-memory systems.", modelRepository: "zai-org/GLM-5.2", artifactRepository: "unsloth/GLM-5.2-GGUF", format: "UD-Q4_K_XL", score: 81, benchmarkId: "terminal-bench-2.1-terminus-2", benchmarkLabel: "Terminal Bench 2.1", methodologyId: "glm5.2-2026", mode: "reasoning", rank: 80, licenseReview: MIT, fidelity: { fidelityRank: 70, fidelityLabel: "Near-original fidelity in quantization tests", evidenceScope: "exact_artifact", summary: "Unsloth reports approximately 97.5% top-token agreement against Q8_0 for this artifact family; this is not coding accuracy.", sourceUrl: "https://huggingface.co/unsloth/GLM-5.2-GGUF/discussions/3" } }),
+  largeModel({ id: "qwen3.5-122b-a10b", family: "qwen3.5", displayName: "Qwen3.5 122B-A10B", developer: "Qwen", description: "Workstation-class MoE model with a large knowledge footprint and moderate active compute.", modelRepository: "Qwen/Qwen3.5-122B-A10B", artifactRepository: "unsloth/Qwen3.5-122B-A10B-GGUF", format: "UD-Q4_K_XL", score: 47.6, licenseReview: APACHE }),
+  largeModel({ id: "nemotron-3-super-120b-a12b", family: "nemotron-3", displayName: "NVIDIA Nemotron 3 Super 120B-A12B", developer: "NVIDIA", description: "Workstation-class hybrid MoE model designed for agentic workflows and efficient low-precision execution.", modelRepository: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", artifactRepository: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF", format: "MXFP4_MOE", score: 38.6, licenseReview: NEMOTRON, fidelity: { bitsClass: "mxfp4", quantAwareCheckpoint: true, fidelityRank: 58, fidelityLabel: "Near-original fidelity in benchmark comparisons", evidenceScope: "checkpoint_quantization", summary: "NVIDIA reports near-BF16 benchmark results for its low-precision checkpoint; the GGUF conversion itself is not directly benchmarked.", sourceUrl: source("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16") } }),
+  largeModel({ id: "deepseek-v4-flash", family: "deepseek-v4", displayName: "DeepSeek V4 Flash 284B-A13B", developer: "DeepSeek", description: "Frontier MoE model with a very large weight footprint but low active compute relative to its size.", modelRepository: "deepseek-ai/DeepSeek-V4-Flash", artifactRepository: "unsloth/DeepSeek-V4-Flash-GGUF", format: "UD-Q8_K_XL", score: 61.8, licenseReview: MIT }),
+  largeModel({ id: "nemotron-3-ultra-550b-a55b", family: "nemotron-3", displayName: "NVIDIA Nemotron 3 Ultra 550B-A55B", developer: "NVIDIA", description: "Frontier workstation/server MoE model intended for exceptionally high-memory systems.", modelRepository: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", artifactRepository: "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF", format: "MXFP4_MOE", score: 53.9, licenseReview: OPEN_MDW, fidelity: { bitsClass: "mxfp4", quantAwareCheckpoint: true, fidelityRank: 58, fidelityLabel: "Near-original fidelity in benchmark comparisons", evidenceScope: "checkpoint_quantization", summary: "NVIDIA reports near-BF16 benchmark results for its low-precision checkpoint; the GGUF conversion itself is not directly benchmarked.", sourceUrl: source("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16") } }),
+  largeModel({ id: "glm-5.2", family: "glm-5.2", displayName: "GLM 5.2 753B-A40B", developer: "Z.ai", description: "Largest catalog tier, intended only for exceptionally high-memory systems.", modelRepository: "zai-org/GLM-5.2", artifactRepository: "unsloth/GLM-5.2-GGUF", format: "UD-Q4_K_XL", score: 77.9, licenseReview: MIT, fidelity: { fidelityRank: 70, fidelityLabel: "Near-original fidelity in quantization tests", evidenceScope: "exact_artifact", summary: "Unsloth reports approximately 97.5% top-token agreement against Q8_0 for this artifact family; this is not coding accuracy.", sourceUrl: "https://huggingface.co/unsloth/GLM-5.2-GGUF/discussions/3" } }),
 ]
 
 export const MODEL_RECIPE_REGISTRY: ModelRecipeRegistry = {
-  reviewedAt: "2026-07-20",
+  reviewedAt: "2026-07-22",
   models: [...qwenModels, ...gemmaModels, ...largeModels],
 }
 
@@ -245,10 +242,23 @@ export const validateModelRecipeRegistry = (catalog: ModelRecipeRegistry): reado
     if (!REPOSITORY.test(model.modelRepository)) issues.push(`${model.id} has an invalid model repository`)
     if (model.productContextTokens.length === 0) issues.push(`${model.id} has no product contexts`)
     if (new Set(model.productContextTokens).size !== model.productContextTokens.length) issues.push(`${model.id} has duplicate product contexts`)
-    if (model.performance.benchmarks.length === 0) issues.push(`${model.id} has no performance evidence`)
+    const terminalBenchEvidence = model.performance.benchmarks.filter(({ benchmarkId }) =>
+      benchmarkId === TERMINAL_BENCH_ID)
+    if (terminalBenchEvidence.length !== 1) {
+      issues.push(`${model.id} must have exactly one Terminal-Bench v2.1 capability score`)
+    }
     for (const evidence of model.performance.benchmarks) {
       if (!evidence.benchmarkId || !evidence.methodologyId || !evidence.mode) issues.push(`${model.id} has incomplete benchmark evidence`)
-      if (!Number.isFinite(evidence.score) || !isHttpsUrl(evidence.sourceUrl)) issues.push(`${model.id} has invalid benchmark evidence`)
+      if (!Number.isFinite(evidence.score) || evidence.score < 0 || evidence.score > 100 || !isHttpsUrl(evidence.sourceUrl)) issues.push(`${model.id} has invalid benchmark evidence`)
+      if (!evidence.basis.trim()) issues.push(`${model.id} has benchmark evidence without a stated basis`)
+      if (evidence.benchmarkId === TERMINAL_BENCH_ID
+        && evidence.methodologyId !== TERMINAL_BENCH_METHODOLOGY) {
+        issues.push(`${model.id} has inconsistent Terminal-Bench v2.1 methodology`)
+      }
+      if (evidence.provenance === "measured_terminal_bench_2.1"
+        && evidence.sourceUrl !== TERMINAL_BENCH_SOURCE) {
+        issues.push(`${model.id} has measured Terminal-Bench evidence without the canonical source`)
+      }
     }
     if (!model.licenseReview.expectedId || !isHttpsUrl(model.licenseReview.url)) issues.push(`${model.id} has an incomplete license review`)
     if (model.artifacts.length === 0) issues.push(`${model.id} has no artifact selectors`)
@@ -325,6 +335,9 @@ export const resolveModelRecipeArtifact = (
   candidate: ModelRecipeArtifact,
   snapshot: ResolvedHubSnapshot,
 ): Option.Option<ResolvedModelRecipe> => {
+  const capability = model.performance.benchmarks.find(({ benchmarkId }) =>
+    benchmarkId === TERMINAL_BENCH_ID)
+  if (!capability) return Option.none()
   const selector = candidate.filenameIncludes.toLowerCase()
   const matches = snapshot.ggufFiles.filter(({ path }) => {
     const lower = path.toLowerCase()
@@ -369,7 +382,7 @@ export const resolveModelRecipeArtifact = (
       ),
       acknowledgementRequired: model.licenseReview.acknowledgementRequired,
     },
-    modelQualityRank: model.qualityRank,
+    capability,
     })))
 }
 

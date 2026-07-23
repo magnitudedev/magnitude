@@ -13,7 +13,7 @@ describe("canonical local model catalog overlay", () => {
 
   it("is internally valid and records its evidence review date", () => {
     expect(MODEL_RECIPE_REGISTRY).toMatchObject({
-      reviewedAt: "2026-07-20",
+      reviewedAt: "2026-07-22",
     })
     expect(validateModelRecipeRegistry(MODEL_RECIPE_REGISTRY)).toEqual([])
   })
@@ -36,6 +36,44 @@ describe("canonical local model catalog overlay", () => {
       "UD-Q6_K_XL",
       "UD-Q8_K_XL",
     ])
+  })
+
+  it("uses one comparable Terminal-Bench v2.1 capability cohort", () => {
+    const scores = Object.fromEntries(MODEL_RECIPE_REGISTRY.models.map((model) => {
+      const evidence = required(
+        Option.fromNullable(model.performance.benchmarks.find(({ benchmarkId }) =>
+          benchmarkId === "terminal-bench-v2.1")),
+        `${model.id} Terminal-Bench evidence`,
+      )
+      return [model.id, evidence.score]
+    }))
+    expect(scores).toEqual({
+      "qwen3.5-4b": 25.8,
+      "qwen3.5-9b": 29.2,
+      "qwen3.6-27b": 60.7,
+      "qwen3.6-35b-a3b": 44.9,
+      "gemma-4-e2b-it-qat": 15,
+      "gemma-4-12b-it-qat": 21,
+      "gemma-4-26b-a4b-it-qat": 39,
+      "gemma-4-31b-it-qat": 43.4,
+      "qwen3.5-122b-a10b": 47.6,
+      "nemotron-3-super-120b-a12b": 38.6,
+      "deepseek-v4-flash": 61.8,
+      "nemotron-3-ultra-550b-a55b": 53.9,
+      "glm-5.2": 77.9,
+    })
+  })
+
+  it("marks only the two unmeasured Gemma scores as explicit estimates", () => {
+    const estimated = MODEL_RECIPE_REGISTRY.models.flatMap((model) =>
+      model.performance.benchmarks
+        .filter(({ provenance }) => provenance === "estimated_terminal_bench_2.1")
+        .map((evidence) => ({ id: model.id, score: evidence.score, basis: evidence.basis })))
+    expect(estimated).toEqual([
+      expect.objectContaining({ id: "gemma-4-e2b-it-qat", score: 15 }),
+      expect.objectContaining({ id: "gemma-4-12b-it-qat", score: 21 }),
+    ])
+    expect(estimated.every(({ basis }) => basis.length > 0)).toBe(true)
   })
 
   it("resolves an unsharded selector against a live snapshot", () => {
@@ -114,5 +152,29 @@ describe("canonical local model catalog overlay", () => {
     expect(issues).toContain(`duplicate model id ${original.id}`)
     expect(issues).toContain(`duplicate artifact id ${originalArtifact.id}`)
     expect(issues.some((issue) => issue.includes("pinned path"))).toBe(true)
+  })
+
+  it("rejects duplicate or malformed Terminal-Bench evidence", () => {
+    const original = required(Option.fromNullable(MODEL_RECIPE_REGISTRY.models.at(0)), "first model recipe")
+    const evidence = required(Option.fromNullable(original.performance.benchmarks.at(0)), "capability evidence")
+    const broken: ModelRecipeRegistry = {
+      ...MODEL_RECIPE_REGISTRY,
+      models: [{
+        ...original,
+        performance: {
+          ...original.performance,
+          benchmarks: [evidence, {
+            ...evidence,
+            score: 101,
+            provenance: "estimated_terminal_bench_2.1",
+            basis: "",
+          }],
+        },
+      }],
+    }
+    const issues = validateModelRecipeRegistry(broken)
+    expect(issues).toContain(`${original.id} must have exactly one Terminal-Bench v2.1 capability score`)
+    expect(issues).toContain(`${original.id} has invalid benchmark evidence`)
+    expect(issues).toContain(`${original.id} has benchmark evidence without a stated basis`)
   })
 })

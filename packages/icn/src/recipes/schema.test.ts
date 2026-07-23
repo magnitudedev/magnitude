@@ -15,7 +15,7 @@ describe("ModelRecipesState wire schema", () => {
       catalogModelId: ModelRecipeCatalogModelIdSchema.make("model"),
       artifactFingerprint: ModelArtifactFingerprintSchema.make("owner/repo:commit:content"),
       modelId: Option.none(),
-      badge: "recommended" as const,
+      intent: "balanced" as const,
       displayName: "Model",
       family: "family",
       architecture: "moe" as const,
@@ -49,6 +49,14 @@ describe("ModelRecipesState wire schema", () => {
       fitMarginBytes: 0,
       fitClass: "full_accelerator" as const,
       constrainedContext: false,
+      estimatedGeneration: Option.some({
+        contextTokens: 1,
+        lowerTokensPerSecond: 10,
+        expectedTokensPerSecond: 12,
+        upperTokensPerSecond: 14,
+        confidence: "high" as const,
+        method: "test-estimator",
+      }),
       explanation: "Test fixture",
     }
     const state = { _tag: "Ready" as const, recommendations: [recommendation], failureCount: 0 }
@@ -59,6 +67,9 @@ describe("ModelRecipesState wire schema", () => {
     expect(encoded.recommendations[0]).toMatchObject({
       totalParametersBillions: 35,
       activeParametersBillions: 3,
+      estimatedGeneration: {
+        expectedTokensPerSecond: 12,
+      },
     })
     expect(encoded.recommendations[0]).not.toHaveProperty("effectiveParametersBillions")
 

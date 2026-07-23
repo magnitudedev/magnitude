@@ -7,6 +7,7 @@ import {
   LocalModelDownloading,
   LocalModelIdSchema,
   LocalModelInventoryEntryLifecycle,
+  LocalModelInventoryEntryDetailsSchema,
   LocalModelInventoryFailed,
   LocalModelInventoryLifecycle,
   LocalModelInventoryLoading,
@@ -231,6 +232,41 @@ describe("product model FSMs", () => {
     const ready = ModelSlotLifecycle.transition(progressed, "Ready", {})
     const unloading = ModelSlotLifecycle.transition(ready, "UnloadingLocalModel", {})
     expect(ModelSlotLifecycle.transition(unloading, "UnloadedLocalModel", {})._tag).toBe("UnloadedLocalModel")
+  })
+})
+
+describe("local model recommendation evidence", () => {
+  it("round-trips intent, explanation, and exact generation evidence", () => {
+    const recommended = {
+      ...model,
+      recommendation: Option.some({
+        intent: "balanced" as const,
+        explanation: "Balances capability with responsive generation.",
+        fidelityLabel: "Very high fidelity",
+        fidelityEvidence: "Test evidence",
+        repository: "owner/repo",
+        revision: "commit",
+        files: [],
+        sourcePageUrl: "https://example.com/model",
+        estimatedRuntimeBytes: 10,
+        fitMarginBytes: 10,
+        estimatedGeneration: Option.some({
+          contextTokens: 100_000,
+          lowerTokensPerSecond: 20,
+          expectedTokensPerSecond: 25,
+          upperTokensPerSecond: 30,
+          confidence: "high" as const,
+          method: "test-estimator",
+        }),
+      }),
+    }
+    const encoded = Schema.encodeSync(LocalModelInventoryEntryDetailsSchema)(recommended)
+    expect(encoded.recommendation).toMatchObject({
+      intent: "balanced",
+      estimatedGeneration: { expectedTokensPerSecond: 25 },
+    })
+    const decoded = Schema.decodeUnknownSync(LocalModelInventoryEntryDetailsSchema)(encoded)
+    expect(Option.getOrThrow(decoded.recommendation).explanation).toContain("responsive")
   })
 })
 

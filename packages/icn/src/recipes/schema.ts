@@ -8,6 +8,7 @@ import {
 } from "../provider/model-identity.js"
 
 const NonNegativeNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
+const PositiveNumber = Schema.Number.pipe(Schema.finite(), Schema.positive())
 const PositiveInteger = Schema.Number.pipe(Schema.int(), Schema.positive())
 
 export const ModelRecipeFitClass = Schema.Literal(
@@ -27,12 +28,30 @@ export const ModelRecipeQuantization = Schema.Struct({
 })
 export type ModelRecipeQuantization = Schema.Schema.Type<typeof ModelRecipeQuantization>
 
+export const ModelRecipeRecommendationIntent = Schema.Literal(
+  "balanced",
+  "best_quality",
+  "fastest",
+  "lightweight",
+)
+export type ModelRecipeRecommendationIntent = Schema.Schema.Type<typeof ModelRecipeRecommendationIntent>
+
+export const ModelRecipeGenerationEstimate = Schema.Struct({
+  contextTokens: PositiveInteger,
+  lowerTokensPerSecond: PositiveNumber,
+  expectedTokensPerSecond: PositiveNumber,
+  upperTokensPerSecond: PositiveNumber,
+  confidence: Schema.Literal("high", "moderate", "low"),
+  method: Schema.String,
+})
+export type ModelRecipeGenerationEstimate = Schema.Schema.Type<typeof ModelRecipeGenerationEstimate>
+
 export const ModelRecipeRecommendation = Schema.Struct({
   configurationId: ModelRecipeConfigurationIdSchema,
   catalogModelId: ModelRecipeCatalogModelIdSchema,
   artifactFingerprint: ModelArtifactFingerprintSchema,
   modelId: Schema.optionalWith(NativeIcnModelIdSchema, { as: "Option", exact: true }),
-  badge: Schema.Literal("recommended", "lighter", "higher_fidelity", "alternative"),
+  intent: ModelRecipeRecommendationIntent,
   displayName: Schema.String,
   family: Schema.String,
   architecture: Schema.Literal("dense", "moe"),
@@ -69,6 +88,7 @@ export const ModelRecipeRecommendation = Schema.Struct({
   fitMarginBytes: Schema.Number.pipe(Schema.finite()),
   fitClass: ModelRecipeFitClass,
   constrainedContext: Schema.Boolean,
+  estimatedGeneration: Schema.optionalWith(ModelRecipeGenerationEstimate, { as: "Option", exact: true }),
   explanation: Schema.String,
 })
 export type ModelRecipeRecommendation = Schema.Schema.Type<typeof ModelRecipeRecommendation>
