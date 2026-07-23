@@ -8,7 +8,7 @@ import {
 } from "@magnitudedev/protocol"
 
 export const RECOMMENDATION_POLICY_VERSION =
-  "local-model-multicriteria-v6-user-facing-copy"
+  "local-model-multicriteria-v7-workstation-intents"
 export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 15
 
 const MAX_RECOMMENDATIONS = 4
@@ -118,6 +118,14 @@ const withinCapabilityGuard = (
 ): readonly RecommendationCandidate[] => {
   const floor = capabilityFloor(candidates, maximumLoss, minimumRetention)
   return candidates.filter((candidate) => (capabilityScore(candidate) ?? floor) >= floor)
+}
+
+const lightweightCapabilityGuard = (
+  candidates: readonly RecommendationCandidate[],
+): readonly RecommendationCandidate[] => {
+  const guarded = withinCapabilityGuard(candidates, 45, 0.3)
+    .filter((candidate) => (capabilityScore(candidate) ?? 20) >= 20)
+  return guarded.length > 0 ? guarded : candidates
 }
 
 const clamp = (value: number): number => Math.max(0, Math.min(1, value))
@@ -345,7 +353,7 @@ export const selectRecommendationPortfolio = (
     usedCheckpointIds.add(bestQuality.checkpointId)
   }
 
-  const fastestCapable = withinCapabilityGuard(feasible, 25, 0.6)
+  const fastestCapable = withinCapabilityGuard(feasible, 35, 0.5)
     .filter((candidate) =>
       !selectedConfigurations.has(candidate.assessment.configurationId))
     .sort((left, right) => conservativeGenerationSpeed(right)
@@ -365,7 +373,7 @@ export const selectRecommendationPortfolio = (
     usedCheckpointIds.add(fastest.checkpointId)
   }
 
-  const lightweightCapable = withinCapabilityGuard(largestContexts, 25, 0.45)
+  const lightweightCapable = lightweightCapabilityGuard(largestContexts)
     .filter((candidate) =>
       !selectedConfigurations.has(candidate.assessment.configurationId))
     .sort((left, right) => left.estimatedRuntimeBytes - right.estimatedRuntimeBytes

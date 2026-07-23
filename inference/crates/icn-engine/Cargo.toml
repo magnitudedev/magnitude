@@ -23,6 +23,7 @@ libc = "0.2.180"
 [features]
 default = []
 cuda = ["llama-cpp-2/cuda", "icn-hardware/cuda", "icn-mtp/cuda"]
+cuda-no-vmm = ["llama-cpp-2/cuda-no-vmm", "icn-hardware/cuda-no-vmm", "icn-mtp/cuda-no-vmm"]
 metal = ["llama-cpp-2/metal", "icn-hardware/metal", "icn-mtp/metal"]
 mtmd = ["llama-cpp-2/mtmd", "icn-hardware/mtmd"]
 parity-probe = []

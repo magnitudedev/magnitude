@@ -47,19 +47,37 @@ jobs:
           targets: ${{ matrix.rust_target }}
       - name: Install Linux native build toolchain
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake wget
       - run: bun install --frozen-lockfile
       - run: bun run scripts/build-release-artifacts.ts ${{ matrix.target }} release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install CUDA build toolkit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          case "$(uname -m)" in
+            x86_64) CUDA_REPOSITORY_ARCH=x86_64 ;;
+            aarch64) CUDA_REPOSITORY_ARCH=sbsa ;;
+            *) echo "Unsupported CUDA build architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${CUDA_REPOSITORY_ARCH}/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+      - name: Build CUDA ICN release
+        if: runner.os == 'Linux'
+        run: bun run inference/scripts/build-binary.ts ${{ matrix.target }} release cuda
+        env:
+          CUDA_PATH: /usr/local/cuda-13.0
       - name: Verify release artifact count
         shell: bash
         run: |
-          test "$(find release -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = "2"
-          CLI_TARBALL=$(find release -maxdepth 1 -name 'magnitude-*.tar.gz' ! -name 'magnitude-acn-*.tar.gz' -print)
-          ACN_TARBALL=$(find release -maxdepth 1 -name 'magnitude-acn-*.tar.gz' -print)
-          tar -tzf "$CLI_TARBALL"
-          tar -tzf "$ACN_TARBALL"
+          EXPECTED=3
+          if [ "${{ runner.os }}" = "Linux" ]; then EXPECTED=4; fi
+          test "$(find release -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = "$EXPECTED"
+          find release -maxdepth 1 -name '*.tar.gz' -print0 | xargs -0 -n1 tar -tzf
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -83,10 +101,12 @@ jobs:
       - name: Verify downloaded release assets
         shell: bash
         run: |
-          CLI_COUNT=$(find release-artifacts -name 'magnitude-*.tar.gz' ! -name 'magnitude-acn-*.tar.gz' | wc -l | tr -d ' ')
+          CLI_COUNT=$(find release-artifacts -name 'magnitude-*.tar.gz' ! -name 'magnitude-acn-*.tar.gz' ! -name 'magnitude-icn-*.tar.gz' | wc -l | tr -d ' ')
           ACN_COUNT=$(find release-artifacts -name 'magnitude-acn-*.tar.gz' | wc -l | tr -d ' ')
+          ICN_COUNT=$(find release-artifacts -name 'magnitude-icn-*.tar.gz' | wc -l | tr -d ' ')
           test "$CLI_COUNT" = "5"
           test "$ACN_COUNT" = "5"
+          test "$ICN_COUNT" = "7"
           find release-artifacts -name '*.tar.gz' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
 
       - name: Changesets
@@ -111,4 +131,3 @@ jobs:
           gh release upload "$TAG" SHA256SUMS --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

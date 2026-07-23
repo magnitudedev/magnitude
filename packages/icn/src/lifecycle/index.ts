@@ -95,6 +95,7 @@ export const IcnBinaryIdentity = Schema.Struct({
   native_build: NonEmpty,
   target: NonEmpty,
   capabilities: Schema.Array(NonEmpty),
+  backends: Schema.Array(NonEmpty),
 });
 export type IcnBinaryIdentity = typeof IcnBinaryIdentity.Type;
 
@@ -169,6 +170,7 @@ const ReleaseManifest = Schema.Struct({
   apiVersion: PositiveInt,
   nativeBuild: NonEmpty,
   target: NonEmpty,
+  backends: Schema.Array(NonEmpty),
 });
 
 const releaseTag = (version: string) => `@magnitudedev/cli@${version}`;
@@ -569,7 +571,9 @@ export const makeIcnBinaryResolver = () => Layer.effect(
               (identity.api_version !== candidate.manifest.value.apiVersion ||
                 identity.native_build !==
                   candidate.manifest.value.nativeBuild ||
-                identity.target !== candidate.manifest.value.target)
+                identity.target !== candidate.manifest.value.target ||
+                [...identity.backends].sort().join("\0") !==
+                  [...candidate.manifest.value.backends].sort().join("\0"))
             )
               return yield* lifecycleError(
                 "verify",

@@ -39,6 +39,7 @@ tracing-subscriber.workspace = true
 [features]
 default = ["mtmd"]
 cuda = ["icn-engine/cuda", "icn-hardware/cuda", "icn-mtp/cuda"]
+cuda-no-vmm = ["icn-engine/cuda-no-vmm", "icn-hardware/cuda-no-vmm", "icn-mtp/cuda-no-vmm"]
 metal = ["icn-engine/metal", "icn-hardware/metal", "icn-mtp/metal"]
 mtmd = ["icn-engine/mtmd", "icn-hardware/mtmd"]
 vulkan = ["icn-engine/vulkan", "icn-hardware/vulkan", "icn-mtp/vulkan"]

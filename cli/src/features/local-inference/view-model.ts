@@ -156,8 +156,6 @@ export const describeLocalHardware = (
   const unified = hardware.memoryDomains.filter((domain) =>
     domain.kind === "UnifiedMemory" && domain.sharesSystemMemory)
   const discrete = hardware.memoryDomains.filter((domain) => domain.kind === "PhysicalDevice")
-  const name = Option.getOrElse(hardware.processor, () =>
-    hardware.platform === "MacOS" && hardware.architecture === "Arm64" ? "Apple Silicon" : "CPU")
   const backendsFor = (memoryDomainId: LocalInferenceMemoryDomainId) => unique(hardware.accelerators
     .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
     .map((accelerator) => accelerator.backend))
@@ -165,6 +163,15 @@ export const describeLocalHardware = (
     .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
     .map((accelerator) => accelerator.name))
   const unifiedBackends = unique(unified.flatMap((domain) => backendsFor(domain.memoryDomainId)))
+  const unifiedAcceleratorNames = unique(unified.flatMap((domain) =>
+    namesFor(domain.memoryDomainId)))
+  const isAppleSilicon =
+    hardware.platform === "MacOS" && hardware.architecture === "Arm64"
+  const processorName = Option.getOrElse(hardware.processor, () =>
+    isAppleSilicon ? "Apple Silicon" : "CPU")
+  const name = isAppleSilicon
+    ? processorName
+    : unifiedAcceleratorNames.join(" + ") || processorName
   return {
     system: {
       name,

@@ -22,6 +22,7 @@ thiserror.workspace = true
 [features]
 default = []
 cuda = ["llama-cpp-2/cuda"]
+cuda-no-vmm = ["llama-cpp-2/cuda-no-vmm"]
 metal = ["llama-cpp-2/metal"]
 mtmd = ["llama-cpp-2/mtmd"]
 vulkan = ["llama-cpp-2/vulkan"]
