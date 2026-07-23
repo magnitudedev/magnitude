@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
+use icn_contracts::models::ModelPackageId;
 use icn_contracts::{
     CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, HardwareAssessment,
     Integrity, InventoryError, InventoryHardwareAssessor, InventoryModel, InventoryProperties,
@@ -93,6 +94,9 @@ pub struct ModelManager {
     pub(crate) template_assessor: Option<Arc<dyn TemplateAssessor>>,
     hardware_assessor: Arc<RwLock<Option<Arc<dyn InventoryHardwareAssessor>>>>,
     pub(crate) cache: ModelCache,
+    pub(crate) package_digests:
+        Arc<RwLock<BTreeMap<PathBuf, (u64, std::time::SystemTime, String)>>>,
+    pub(crate) package_models: Arc<RwLock<BTreeMap<ModelPackageId, ModelId>>>,
     cache_evidence: Arc<RwLock<BTreeMap<ModelId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
@@ -109,6 +113,8 @@ impl Clone for ModelManager {
             template_assessor: self.template_assessor.clone(),
             hardware_assessor: Arc::clone(&self.hardware_assessor),
             cache: self.cache.clone(),
+            package_digests: Arc::clone(&self.package_digests),
+            package_models: Arc::clone(&self.package_models),
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
@@ -225,6 +231,8 @@ impl ModelManager {
             template_assessor,
             hardware_assessor: Arc::new(RwLock::new(None)),
             cache,
+            package_digests: Arc::new(RwLock::new(BTreeMap::new())),
+            package_models: Arc::new(RwLock::new(BTreeMap::new())),
             cache_evidence: Arc::new(RwLock::new(cache_evidence)),
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),

@@ -31,10 +31,12 @@ pub(crate) fn json() -> Value {
         "native_build": native_build,
         "capabilities": [
             "hardware",
-            "model_inventory",
-            "model_preview",
-            "model_download",
-            "model_load_control",
+            "model_catalog",
+            "model_installed",
+            "model_assessment",
+            "model_fit",
+            "model_downloads",
+            "model_residency",
             "chat_streaming"
         ],
         "target": TARGET,

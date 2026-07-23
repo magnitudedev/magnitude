@@ -45,6 +45,8 @@ describe("config storage onboarding state", () => {
             secondary: Option.some(selection("local", "model")),
           },
           localModelRecency: { primary: [], secondary: [] },
+          localProviderOfferings: [],
+          dismissedDownloadFailures: [],
         },
         futureDomain: { enabled: true },
       }))

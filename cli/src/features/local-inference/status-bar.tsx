@@ -41,14 +41,15 @@ export const LocalInferenceStatusBar = ({ state, width, onOpenHardware }: LocalI
   const slots = [state.slots.slots.primary, state.slots.slots.secondary]
   const slot = slots.find((candidate) => candidate._tag !== "Unassigned"
     && candidate.selection.providerId === LOCAL_PROVIDER_ID)
-  const entries = state.inventory._tag === "Ready" ? state.inventory.entries : []
-  const activeEntry = slot && slot._tag !== "Unassigned"
-    ? entries.find((entry) => entry.model.providerModelId === slot.selection.providerModelId)
+  const activeModel = slot && slot._tag !== "Unassigned"
+    ? state.models.models.find((model) => model.preparation._tag === "Available"
+      && model.preparation.providerModelIds.includes(slot.selection.providerModelId))
     : undefined
-  const downloadEntry = entries.find((entry) => entry._tag === "Downloading" || entry._tag === "DownloadFailed")
-  const entry = activeEntry ?? downloadEntry
-  if (!slot && !entry) return null
-  const modelName = entry?.model.displayName ?? "Local model"
+  const downloadModel = state.models.models.find((model) =>
+    model.download._tag === "Downloading" || model.download._tag === "Failed")
+  const model = activeModel ?? downloadModel
+  if (!slot && !model) return null
+  const modelName = model?.displayName ?? "Local model"
   const status = slot
     ? slot._tag === "LoadingLocalModel" ? formatModelLoadProgress(slot.percentage)
       : slot._tag === "UnloadedLocalModel" ? "Unloaded"
@@ -56,13 +57,12 @@ export const LocalInferenceStatusBar = ({ state, width, onOpenHardware }: LocalI
           : slot._tag === "Blocked" ? "Failed"
             : slot._tag === "Ready" ? "Ready"
               : "Unassigned"
-    : entry?._tag === "Downloading" ? `Downloading ${entry.percentage}%`
-      : entry?._tag === "DownloadFailed" ? "Download failed"
+    : model?.download._tag === "Downloading"
+      ? `Downloading ${Math.round(model.download.completedBytes / Math.max(1, model.download.totalBytes) * 100)}%`
+      : model?.download._tag === "Failed" ? "Download failed"
         : "Ready"
-  const participatingDomainIds = entry?.model.fit.memoryDomainIds ?? []
   const memoryView = deriveHardwareMemoryView(state.hardware, {
-    participatingDomainIds,
-    fallbackToAccelerators: slot?._tag === "LoadingLocalModel",
+    fallbackToAccelerators: slot !== undefined,
   })
   const memory = memoryView.compact
   const barSegments = compactBarSegments(memoryView.domains, {

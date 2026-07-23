@@ -35,6 +35,8 @@ describe("model configuration ownership", () => {
             secondary: Option.some(selection("secondary-old")),
           },
           localModelRecency: { primary: [], secondary: [] },
+          localProviderOfferings: [],
+          dismissedDownloadFailures: [],
         },
       })
       const configuration = yield* makeModelConfiguration(updateStorage(state))
@@ -59,6 +61,8 @@ describe("model configuration ownership", () => {
             primary: [ProviderModelIdSchema.make("local-b"), ProviderModelIdSchema.make("local-a")],
             secondary: [],
           },
+          localProviderOfferings: [],
+          dismissedDownloadFailures: [],
         },
       })
       const configuration = yield* makeModelConfiguration(updateStorage(stored))

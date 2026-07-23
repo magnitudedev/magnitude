@@ -1,45 +1,30 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  ModelArtifactFingerprintSchema,
-  ModelRecipeCatalogModelIdSchema,
-  ModelRecipeConfigurationIdSchema,
-} from "../provider/model-identity.js"
-import type { RecipeBenchmarkEvidence } from "./types.js"
-import type { ModelRecipeRecommendation } from "./schema.js"
+  LocalInferenceMemoryDomainIdSchema,
+  ModelFileIdSchema,
+  ModelOfferingTargetIdSchema,
+  ModelPackageIdSchema,
+  ModelServingConfigurationIdSchema,
+  OfferingAssessmentIdSchema,
+  RecommendableModelIdSchema,
+  type Recommendation,
+} from "@magnitudedev/protocol"
 import {
   MINIMUM_EXPECTED_TOKENS_PER_SECOND,
   conservativeGenerationSpeed,
   selectRecommendationPortfolio,
   type RecommendationCandidate,
-} from "./recommendation-policy.js"
+} from "./local-model-recommendation-policy"
 
 const GIB = 1024 ** 3
-
-const capability = (
-  score: number,
-  provenance: RecipeBenchmarkEvidence["provenance"] = "measured_terminal_bench_2.1",
-): RecipeBenchmarkEvidence => ({
-  benchmarkId: "terminal-bench-v2.1",
-  label: "Terminal-Bench v2.1",
-  score,
-  unit: "percent",
-  higherIsBetter: true,
-  methodologyId: "test-methodology",
-  mode: "test",
-  evidenceScope: "independent_checkpoint",
-  provenance,
-  sourceUrl: "https://example.com/benchmark",
-  basis: "Test fixture",
-  notes: "Test fixture",
-})
 
 const candidate = (input: {
   readonly id: string
   readonly checkpoint?: string
   readonly artifact?: string
   readonly score?: number
-  readonly provenance?: RecipeBenchmarkEvidence["provenance"]
+  readonly provenance?: string
   readonly fidelity?: number
   readonly context?: 100_000 | 200_000
   readonly expected?: number
@@ -55,69 +40,104 @@ const candidate = (input: {
   const context = input.context ?? 200_000
   const expected = input.expected ?? 30
   const fidelity = input.fidelity ?? 60
-  const value: ModelRecipeRecommendation = {
-    configurationId: ModelRecipeConfigurationIdSchema.make(`${input.id}:ctx${context}`),
-    catalogModelId: ModelRecipeCatalogModelIdSchema.make(checkpointId),
-    artifactFingerprint: ModelArtifactFingerprintSchema.make(`${artifactId}:fingerprint`),
-    modelId: Option.none(),
-    intent: "balanced",
-    displayName: input.id,
-    family: checkpointId.split("-")[0] ?? checkpointId,
-    architecture: input.architecture ?? "dense",
-    capabilities: {
-      vision: false,
-      tools: true,
-      structuredOutput: true,
-      reasoningEfforts: [],
-      defaultReasoningEffort: Option.none(),
-    },
-    totalParametersBillions: Option.none(),
-    activeParametersBillions: Option.none(),
-    effectiveParametersBillions: Option.none(),
-    quantization: {
-      format: `Q${fidelity}`,
-      quantAwareCheckpoint: false,
-      fidelityLabel: `Fidelity ${fidelity}`,
-      fidelityEvidence: "Test evidence",
-      fidelitySourceUrl: "https://example.com/fidelity",
-    },
-    quantTag: `Q${fidelity}`,
-    repo: "owner/repo",
-    revision: "commit",
-    files: [],
-    totalDownloadBytes: (input.downloadGiB ?? input.runtimeGiB ?? 20) * GIB,
-    sourcePageUrl: "https://example.com/model",
-    license: { id: "test", url: "https://example.com/license", acknowledgementRequired: false },
-    contextWindow: context,
-    estimatedRuntimeBytes: (input.runtimeGiB ?? 24) * GIB,
-    stableCapacityBudgetBytes: 64 * GIB,
-    fitMarginBytes: (64 - (input.runtimeGiB ?? 24)) * GIB,
-    fitClass: "cpu_or_unified",
-    constrainedContext: false,
-    estimatedGeneration: Option.some({
-      contextTokens: context,
-      lowerTokensPerSecond: input.lower ?? expected * 0.85,
-      expectedTokensPerSecond: expected,
-      upperTokensPerSecond: input.upper ?? expected * 1.15,
-      confidence: input.confidence ?? "high",
-      method: "test-estimator",
-    }),
-    explanation: "Unranked fixture",
-  }
+  const runtimeBytes = (input.runtimeGiB ?? 24) * GIB
+  const downloadBytes = (input.downloadGiB ?? input.runtimeGiB ?? 20) * GIB
+  const packageId = ModelPackageIdSchema.make(`package_${input.id}`)
+  const profile = { contextLength: context, parallelSequences: 1 }
+  const configurationId = ModelServingConfigurationIdSchema.make(`${input.id}:ctx${context}`)
   return {
-    value,
+    model: {
+      id: RecommendableModelIdSchema.make(artifactId),
+      checkpointId,
+      targetId: ModelOfferingTargetIdSchema.make(`target_${input.id}`),
+      target: {
+        _tag: "Package",
+        package: {
+          id: packageId,
+          source: {
+            _tag: "HuggingFace",
+            repository: "owner/repo",
+            revision: "commit",
+          },
+          files: [{
+            id: ModelFileIdSchema.make(`file_${input.id}`),
+            path: `${input.id}.gguf`,
+            role: "weights",
+            sizeBytes: downloadBytes,
+            sha256: "a".repeat(64),
+          }],
+          relationships: [],
+          properties: {
+            format: "gguf",
+            quantization: `Q${fidelity}`,
+            architecture: input.architecture ?? "dense",
+            maximumContextLength: context,
+          },
+        },
+      },
+      eligibleServingProfiles: [profile],
+      displayName: input.id,
+      description: "Test fixture",
+      license: "test",
+      capabilities: {
+        vision: false,
+        tools: true,
+        structuredOutput: true,
+        reasoning: {
+          supported: false,
+          efforts: [],
+          defaultEffort: Option.none(),
+        },
+      },
+      qualityScore: input.score ?? 0,
+      qualityScoreProvenance: input.provenance ?? "measured_terminal_bench_2.1",
+      fidelityRank: fidelity,
+      quantizationAware: false,
+      qualityEvidence: ["Test evidence"],
+    },
+    profile,
+    assessment: {
+      _tag: "Fits",
+      profile,
+      configurationId,
+      assessmentId: OfferingAssessmentIdSchema.make(`assessment_${input.id}_${context}`),
+      memory: [{
+        memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("memory"),
+        capacityBytes: 64 * GIB,
+        requiredBytes: runtimeBytes,
+        requiredReserveBytes: 0,
+        remainingBytes: (64 * GIB) - runtimeBytes,
+      }],
+      performance: Option.some({
+        contextTokens: context,
+        lowerTokensPerSecond: input.lower ?? expected * 0.85,
+        estimatedTokensPerSecond: expected,
+        upperTokensPerSecond: input.upper ?? expected * 1.15,
+        confidence: input.confidence ?? "high",
+        method: "test-estimator",
+      }),
+    },
     artifactId,
     checkpointId,
-    capability: input.score === undefined ? undefined : capability(input.score, input.provenance),
+    capability: input.score === undefined
+      ? undefined
+      : {
+          score: input.score,
+          provenance: input.provenance ?? "measured_terminal_bench_2.1",
+        },
     fidelityRank: fidelity,
+    quantizationAware: false,
+    estimatedRuntimeBytes: runtimeBytes,
+    stableCapacityBudgetBytes: 64 * GIB,
+    totalDownloadBytes: downloadBytes,
   }
 }
 
 const byIntent = (
-  recommendations: readonly ModelRecipeRecommendation[],
-  intent: ModelRecipeRecommendation["intent"],
-): ModelRecipeRecommendation | undefined => recommendations.find((recommendation) =>
-  recommendation.intent === intent)
+  recommendations: readonly Recommendation[],
+  intent: Recommendation["intent"],
+): Recommendation | undefined =>
+  recommendations.find((recommendation) => recommendation.intent === intent)
 
 describe("local model multicriteria recommendation policy", () => {
   it("prefers 200K for an artifact when it clears the responsiveness floor", () => {
@@ -125,7 +145,7 @@ describe("local model multicriteria recommendation policy", () => {
       candidate({ id: "model-100", checkpoint: "model", artifact: "model:q6", score: 50, context: 100_000, expected: 40 }),
       candidate({ id: "model-200", checkpoint: "model", artifact: "model:q6", score: 50, context: 200_000, expected: 20 }),
     ])
-    expect(byIntent(recommendations, "balanced")?.contextWindow).toBe(200_000)
+    expect(byIntent(recommendations, "balanced")?.configuration.profile.contextLength).toBe(200_000)
   })
 
   it("falls back to 100K when the 200K profile misses the speed floor", () => {
@@ -133,15 +153,20 @@ describe("local model multicriteria recommendation policy", () => {
       candidate({ id: "model-100", checkpoint: "model", artifact: "model:q6", score: 50, context: 100_000, expected: 30 }),
       candidate({ id: "model-200", checkpoint: "model", artifact: "model:q6", score: 50, context: 200_000, expected: 14 }),
     ])
-    expect(byIntent(recommendations, "balanced")?.contextWindow).toBe(100_000)
+    expect(byIntent(recommendations, "balanced")?.configuration.profile.contextLength).toBe(100_000)
   })
 
   it("excludes missing or sub-floor speed evidence from every intent", () => {
-    const slow = candidate({ id: "slow", score: 90, expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1 })
-    const missing = { ...candidate({ id: "missing", score: 80 }), value: {
-      ...candidate({ id: "missing", score: 80 }).value,
-      estimatedGeneration: Option.none(),
-    } }
+    const slow = candidate({
+      id: "slow",
+      score: 90,
+      expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1,
+    })
+    const missingBase = candidate({ id: "missing", score: 80 })
+    const missing = {
+      ...missingBase,
+      assessment: { ...missingBase.assessment, performance: Option.none() },
+    }
     expect(selectRecommendationPortfolio([slow, missing])).toEqual([])
   })
 
@@ -183,9 +208,10 @@ describe("local model multicriteria recommendation policy", () => {
       candidate({ id: "q6", checkpoint: "same", artifact: "same:q6", score: 50, fidelity: 60, expected: 35, runtimeGiB: 25 }),
       candidate({ id: "q8", checkpoint: "same", artifact: "same:q8", score: 50, fidelity: 80, expected: 33, runtimeGiB: 32 }),
     ])
-    expect(recommendations.map(({ quantTag, intent }) => [quantTag, intent])).toEqual([
-      ["Q60", "balanced"],
-      ["Q80", "best_quality"],
+    expect(recommendations.map(({ recommendableModelId, intent }) =>
+      [recommendableModelId, intent])).toEqual([
+      ["same:q6", "balanced"],
+      ["same:q8", "best_quality"],
     ])
   })
 
@@ -195,7 +221,7 @@ describe("local model multicriteria recommendation policy", () => {
       candidate({ id: "quick-100", checkpoint: "quick", artifact: "quick:q6", score: 45, expected: 50, context: 100_000, runtimeGiB: 28 }),
       candidate({ id: "quick-200", checkpoint: "quick", artifact: "quick:q6", score: 45, expected: 32, context: 200_000, runtimeGiB: 30 }),
     ])
-    expect(byIntent(recommendations, "fastest")?.contextWindow).toBe(100_000)
+    expect(byIntent(recommendations, "fastest")?.configuration.profile.contextLength).toBe(100_000)
   })
 
   it("uses confidence-aware conservative speed for Fastest", () => {
@@ -263,27 +289,36 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "balanced")?.explanation).toContain("Best overall mix")
     expect(byIntent(recommendations, "best_quality")?.explanation).toContain("more memory than Balanced")
     expect(byIntent(recommendations, "best_quality")?.explanation).toContain("slower")
-    expect(byIntent(recommendations, "fastest")?.explanation).toContain("half as much code and conversation history")
-    expect(byIntent(recommendations, "fastest")?.explanation).toContain("substantial compression")
-    expect(byIntent(recommendations, "lightweight")?.explanation).toContain("less capable on difficult coding tasks")
+    expect(byIntent(recommendations, "fastest")?.explanation)
+      .toContain("half as much code and conversation history")
+    expect(byIntent(recommendations, "fastest")?.explanation)
+      .toContain("substantial compression")
+    expect(byIntent(recommendations, "lightweight")?.explanation)
+      .toContain("less capable on difficult coding tasks")
   })
 
   it("describes quantization quality absolutely, including quality-aware checkpoints", () => {
-    const qat = candidate({ id: "qat", score: 30, fidelity: 58, expected: 50, runtimeGiB: 20 })
+    const qatBase = candidate({
+      id: "qat",
+      score: 30,
+      fidelity: 58,
+      expected: 50,
+      runtimeGiB: 20,
+    })
+    const qat = {
+      ...qatBase,
+      quantizationAware: true,
+      model: { ...qatBase.model, quantizationAware: true },
+    }
     const recommendations = selectRecommendationPortfolio([
       candidate({ id: "balanced", score: 50, fidelity: 60, expected: 30, runtimeGiB: 30 }),
-      {
-        ...qat,
-        value: {
-          ...qat.value,
-          quantization: { ...qat.value.quantization, quantAwareCheckpoint: true },
-        },
-      },
+      qat,
       candidate({ id: "light", score: 30, fidelity: 40, expected: 25, runtimeGiB: 8 }),
     ])
     expect(byIntent(recommendations, "fastest")?.explanation)
       .toContain("very high output quality with minimal loss")
-    expect(byIntent(recommendations, "fastest")?.explanation).not.toContain("lower precision than Balanced")
+    expect(byIntent(recommendations, "fastest")?.explanation)
+      .not.toContain("lower precision than Balanced")
     expect(byIntent(recommendations, "lightweight")?.explanation)
       .toContain("substantial compression with some possible quality loss")
   })

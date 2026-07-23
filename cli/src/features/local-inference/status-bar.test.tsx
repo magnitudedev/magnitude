@@ -42,7 +42,7 @@ test("ready status renders model and resident memory", async () => {
   }
 })
 
-test("loading status contains one loading label followed by percentage", async () => {
+test("loading status shows native progress", async () => {
   const ready = makeView()
   const state = { ...ready, slots: { slots: { ...ready.slots.slots, primary: new ModelSlotLoadingLocalModel({
     slotId: PRIMARY_SLOT_ID,

@@ -20,6 +20,7 @@ pub enum ModelIndexKind {
     ArtifactInspection,
     HardwareAssessment,
     ExecutionAssessment,
+    OfferingAssessment,
 }
 
 impl ModelIndexKind {
@@ -29,6 +30,7 @@ impl ModelIndexKind {
             Self::ArtifactInspection => "inspections/artifacts",
             Self::HardwareAssessment => "assessments/hardware",
             Self::ExecutionAssessment => "assessments/execution",
+            Self::OfferingAssessment => "assessments/offerings",
         }
     }
 }

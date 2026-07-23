@@ -1,5 +1,6 @@
 import {
   MagnitudeRpcs,
+  LocalModelMutationFailed,
   SessionOperationFailed,
   ModelSlotMutationRejected,
   type DisplayViewShape,
@@ -35,8 +36,12 @@ import { UserBashCommandId, type AppEvent } from "@magnitudedev/agent";
 import { createId } from "@magnitudedev/generate-id";
 import { Onboarding } from "./onboarding";
 import { MirroredStateChanges } from "./mirrored-state";
-import { LocalModelInventory } from "./local-model-inventory";
 import { LocalInferenceHardware } from "./local-inference-hardware";
+import { LocalModelPackages } from "./local-model-packages";
+import { LocalModelRecommendations } from "./local-model-recommendations";
+import { LocalModels } from "./local-models";
+import { LocalProviderOfferings } from "./local-provider-offerings";
+import { modelOfferingTargetPackageIds } from "@magnitudedev/protocol";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -57,8 +62,11 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const displayStreams = yield* DisplayViewStreams;
     const onboarding = yield* Onboarding;
     const mirroredStateChanges = yield* MirroredStateChanges;
-    const localModels = yield* LocalModelInventory;
     const localHardware = yield* LocalInferenceHardware;
+    const localModelPackages = yield* LocalModelPackages;
+    const localModelRecommendations = yield* LocalModelRecommendations;
+    const localModels = yield* LocalModels;
+    const localProviderOfferings = yield* LocalProviderOfferings;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -286,10 +294,16 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       GetModelSlots: () =>
         observeRpcDefects("GetModelSlots", modelSlots.snapshot),
 
-      UpdateModelSlot: ({ slotId, selection }) =>
+      AssignSlot: ({ slotId, selection }) =>
         observeRpcDefects(
-          "UpdateModelSlot",
-          modelSlots.updateModelSlot(slotId, selection).pipe(Effect.as({})),
+          "AssignSlot",
+          modelSlots.updateModelSlot(slotId, Option.some(selection)).pipe(Effect.as({})),
+        ),
+
+      ClearSlot: ({ slotId }) =>
+        observeRpcDefects(
+          "ClearSlot",
+          modelSlots.updateModelSlot(slotId, Option.none()).pipe(Effect.as({})),
         ),
 
       GetCloudUsage: (payload) =>
@@ -305,8 +319,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       GetLocalInferenceHardware: () =>
         observeRpcDefects("GetLocalInferenceHardware", localHardware.snapshot),
 
-      GetLocalModelInventory: () =>
-        observeRpcDefects("GetLocalModelInventory", localModels.snapshot),
+      GetLocalModels: () =>
+        observeRpcDefects("GetLocalModels", localModels.snapshot),
 
       WatchMirroredStates: () =>
         observeRpcStreamDefects(
@@ -314,36 +328,129 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           mirroredStateChanges.stream,
         ),
 
-      DownloadLocalModel: ({ localModelId }) =>
+      DownloadRecommendedModel: ({ recommendationId }) =>
         observeRpcDefects(
-          "DownloadLocalModel",
-          localModels.download(localModelId).pipe(Effect.as({})),
+          "DownloadRecommendedModel",
+          Effect.gen(function* () {
+            const recommendation = yield* localModelRecommendations.get(recommendationId);
+            if (!recommendation) {
+              return yield* new LocalModelMutationFailed({
+                code: "model_recommendation_not_found",
+                message: `Model recommendation ${recommendationId} is no longer available`,
+                retryable: false,
+              });
+            }
+            yield* localProviderOfferings.save(
+              recommendation.modelId,
+              recommendation.configuration,
+              { _tag: "Recommendation", recommendationId },
+            );
+            yield* localModelPackages.downloadTarget(recommendation.configuration.target);
+            return {};
+          }),
         ),
 
-      LoadModelSlot: ({ slotId, selection }) =>
+      RetryModelDownload: ({ modelId }) =>
         observeRpcDefects(
-          "LoadModelSlot",
-          modelSlots.loadModelSlot(slotId, selection).pipe(Effect.as({})),
+          "RetryModelDownload",
+          Effect.gen(function* () {
+            const target = yield* localModels.target(modelId);
+            if (!target) {
+              return yield* new LocalModelMutationFailed({
+                code: "local_model_not_found",
+                message: `Local model ${modelId} was not found`,
+                retryable: false,
+              });
+            }
+            yield* localModelPackages.downloadTarget(target);
+            return {};
+          }),
         ),
 
-      ReloadModelSlot: ({ slotId }) =>
+      CancelModelDownload: ({ modelId }) =>
         observeRpcDefects(
-          "ReloadModelSlot",
-          modelSlots.reloadModelSlot(slotId).pipe(Effect.as({})),
+          "CancelModelDownload",
+          Effect.gen(function* () {
+            const target = yield* localModels.target(modelId);
+            if (!target) {
+              return yield* new LocalModelMutationFailed({
+                code: "local_model_not_found",
+                message: `Local model ${modelId} was not found`,
+                retryable: false,
+              });
+            }
+            yield* localModelPackages.cancelTargetDownload(target);
+            return {};
+          }),
         ),
 
-      DeleteLocalModel: ({ localModelId }) =>
+      DismissModelDownloadFailure: ({ modelId }) =>
+        observeRpcDefects(
+          "DismissModelDownloadFailure",
+          Effect.gen(function* () {
+            const target = yield* localModels.target(modelId);
+            if (!target) {
+              return yield* new LocalModelMutationFailed({
+                code: "local_model_not_found",
+                message: `Local model ${modelId} was not found`,
+                retryable: false,
+              });
+            }
+            yield* localModelPackages.dismissTargetFailure(target);
+            return {};
+          }),
+        ),
+
+      DeleteLocalModel: ({ modelId }) =>
         observeRpcDefects(
           "DeleteLocalModel",
-          modelSlots.deleteLocalModel(localModelId).pipe(
-            Effect.as({}),
-          ),
+          Effect.gen(function* () {
+            const target = yield* localModels.target(modelId);
+            if (!target) {
+              return yield* new LocalModelMutationFailed({
+                code: "local_model_not_found",
+                message: `Local model ${modelId} was not found`,
+                retryable: false,
+              });
+            }
+            const targetOfferings = (yield* localProviderOfferings.list)
+              .filter((offering) => offering.modelId === modelId);
+            const targetProviderModelIds = new Set(
+              targetOfferings.map((offering) => offering.providerModelId),
+            );
+            const slots = (yield* modelSlots.snapshot).state.slots;
+            for (const slot of [slots.primary, slots.secondary]) {
+              if ((slot._tag === "LoadingLocalModel" || slot._tag === "UnloadingLocalModel")
+                && targetProviderModelIds.has(slot.selection.providerModelId)) {
+                return yield* new ModelSlotMutationRejected({
+                  slotId: slot.slotId,
+                  message: "The local model cannot be deleted while loading or unloading",
+                });
+              }
+              if (slot._tag === "Ready"
+                && targetProviderModelIds.has(slot.selection.providerModelId)) {
+                yield* modelSlots.unloadModel(slot.slotId);
+              }
+            }
+            const retainedOfferings = (yield* localProviderOfferings.list)
+              .filter((offering) => offering.modelId !== modelId);
+            const retainedPackageIds = new Set(retainedOfferings.flatMap((offering) =>
+              modelOfferingTargetPackageIds(offering.configuration.target)));
+            yield* localModelPackages.removeTargetPackages(target, retainedPackageIds);
+            return {};
+          }),
         ),
 
-      UnloadModelSlot: ({ slotId }) =>
+      LoadModel: ({ slotId }) =>
         observeRpcDefects(
-          "UnloadModelSlot",
-          modelSlots.unloadModelSlot(slotId).pipe(Effect.as({})),
+          "LoadModel",
+          modelSlots.loadModel(slotId).pipe(Effect.as({})),
+        ),
+
+      UnloadModel: ({ slotId }) =>
+        observeRpcDefects(
+          "UnloadModel",
+          modelSlots.unloadModel(slotId).pipe(Effect.as({})),
         ),
 
       // Generic onboarding completion, independent of local inference

@@ -58,6 +58,7 @@ pub enum ComponentRole {
     Mtp,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentIdentity {
@@ -538,6 +539,7 @@ pub enum HardwareRecommendation {
     Constrained,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareMemoryDomainKind {
@@ -546,6 +548,7 @@ pub enum HardwareMemoryDomainKind {
     UnifiedMemory,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareDeviceKind {
@@ -556,12 +559,14 @@ pub enum HardwareDeviceKind {
     Unknown,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareDeviceMemoryLimitKind {
     RecommendedWorkingSet,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareDeviceMemoryLimit {
@@ -571,6 +576,7 @@ pub struct HardwareDeviceMemoryLimit {
     pub current_free_bytes: Option<u64>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareDevice {
@@ -585,6 +591,7 @@ pub struct HardwareDevice {
     pub memory_limit: Option<HardwareDeviceMemoryLimit>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareSystemMemory {
@@ -592,6 +599,7 @@ pub struct HardwareSystemMemory {
     pub current_available_bytes: Option<u64>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareMemoryDomain {
@@ -604,6 +612,7 @@ pub struct HardwareMemoryDomain {
     pub devices: Vec<HardwareDevice>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidentMemoryDomain {
@@ -614,6 +623,7 @@ pub struct ResidentMemoryDomain {
     pub auxiliary_bytes: u64,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidentMemory {
@@ -622,6 +632,7 @@ pub struct ResidentMemory {
     pub domains: Vec<ResidentMemoryDomain>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareSnapshot {
@@ -689,6 +700,7 @@ pub struct ModelPreview {
     pub assessments: Vec<ModelPreviewAssessment>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HuggingFaceModelSearchRequest {
@@ -696,6 +708,7 @@ pub struct HuggingFaceModelSearchRequest {
     pub limit: u32,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResult {
@@ -709,12 +722,14 @@ pub struct HuggingFaceModelSearchResult {
     pub tags: Vec<String>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResults {
     pub models: Vec<HuggingFaceModelSearchResult>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HuggingFaceRepositoryRequest {
@@ -722,14 +737,17 @@ pub struct HuggingFaceRepositoryRequest {
     pub revision: String,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HuggingFaceRepositoryFile {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub path: PathBuf,
     pub size_bytes: u64,
     pub content: ContentIdentity,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HuggingFaceRepositorySnapshot {
@@ -808,7 +826,6 @@ pub struct DownloadModelRequest {
     pub components: Vec<DownloadComponent>,
     #[serde(default)]
     pub relationships: Vec<ComponentRelationship>,
-    pub serving_profile: ServingProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1045,6 +1062,12 @@ pub enum InventoryError {
     Integrity(String),
     #[error("model artifacts changed during inspection: {0}")]
     ConcurrentMutation(String),
+    #[error("{message}")]
+    Runtime {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
     #[error("internal inventory failure: {0}")]
     Internal(String),
 }

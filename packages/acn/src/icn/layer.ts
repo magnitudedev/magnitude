@@ -5,12 +5,12 @@ import {
   IcnBinaryResolutionConfig,
   IcnLifecycleConfig,
   IcnProcess,
+  makeIcnCatalog,
   makeIcnClient,
+  makeIcnDownloads,
   makeIcnProcess,
   makeIcnHardware,
-  makeIcnInventory,
-  makeIcnProvider,
-  makeIcnRecipes,
+  makeIcnInstalledModels,
   IcnStorageConfig,
 } from "@magnitudedev/icn"
 import { ACN_VERSION } from "../version"
@@ -63,10 +63,12 @@ const makeProcess = (dataDir: string) =>
         expectedTarget: Option.none(),
         requiredCapabilities: [
           "hardware",
-          "model_inventory",
-          "model_preview",
-          "model_download",
-          "model_load_control",
+          "model_catalog",
+          "model_installed",
+          "model_assessment",
+          "model_fit",
+          "model_downloads",
+          "model_residency",
           "chat_streaming",
         ],
         allowBuildMismatch: false,
@@ -111,7 +113,8 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process)
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess)
   const withHardware = Layer.provideMerge(makeIcnHardware(), withClient)
-  const withInventory = Layer.provideMerge(makeIcnInventory(), withHardware)
-  const withRecipes = Layer.provideMerge(makeIcnRecipes(), withInventory)
-  return Layer.provideMerge(makeIcnProvider(), withRecipes).pipe(Layer.orDie)
+  const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware)
+  const withInstalled = Layer.provideMerge(makeIcnInstalledModels(), withCatalog)
+  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withInstalled)
+  return withDownloads.pipe(Layer.orDie)
 }

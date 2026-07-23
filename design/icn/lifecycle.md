@@ -11,7 +11,8 @@ applies_to:
   - packages/acn/src/daemon-lifecycle.ts
   - packages/acn/src/model-configuration.ts
   - packages/acn/src/provider-model-catalog.ts
-  - packages/acn/src/local-model-inventory.ts
+  - packages/acn/src/local-model-packages.ts
+  - packages/acn/src/local-model-evaluations.ts
   - packages/acn/src/model-slot-coordinator.ts
   - packages/acn/src/local-inference-hardware.ts
   - packages/protocol/src/schemas/model-state.ts
@@ -58,9 +59,9 @@ The ICN package owns:
 - exposing one scoped generated client whose admitted streams preserve their response lifetime; and
 - supplying the generated client with the connection established by the managed child lifecycle.
 
-The package owns curated model recipes, recommendation ranking through native preview, exact
-hardware and inventory observation, and the local provider adaptation because those capabilities
-compose the one generated ICN client. It does not own durable user selection, ACN RPC state, cloud
+The package owns exact hardware, recommendable-catalog, installed-package, and download observation
+plus the local provider adaptation because those capabilities compose the one generated ICN client.
+It does not own recommendation policy, durable offerings, user selection, ACN RPC state, cloud
 provider routing, or client presentation. It does not independently inspect hardware or GGUF files
 in Bun; it obtains those facts through generated ICN operations. It contains no fallback
 implementation of an ICN operation and no hand-written HTTP client, SSE parser, wire schema, or
@@ -105,9 +106,9 @@ response metadata.
 
 Every operation in the normalized IR is emitted into the callable client automatically. There is
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
-and identity, hardware, live Hugging Face GGUF search and repository resolution, model
-list/get/preview/download/delete/load/unload, template application, model properties, and streamed
-chat completion. Generator tests
+and identity, hardware, live Hugging Face discovery, recommendable catalog, installed packages,
+assessment, automatic fitting, downloads, exact configuration load, residency unload, template
+application, model properties, and streamed chat completion. Generator tests
 prove that the manifest, descriptors, and callable client contain the same operation set.
 
 The ICN package checks in generated schemas and operations. Its public authored boundary exposes
@@ -134,13 +135,12 @@ store, and ICN does not implicitly discover or adopt a host user's global Huggin
 External caches or directories participate only when they are supplied explicitly as read-only
 import/source roots. ACN supplies no such roots for the product-managed ICN.
 
-Context length and sequence count are process-local ICN serving configuration rehydrated from
-durable ACN product selection. They are not installation-manifest or derived-cache fields. Preview evaluates
-candidate serving configurations; model management validates and applies one; runtime load realizes
-the selected configuration. Batching, GPU placement, KV policy, projector, draft, and MTP selection
-are ICN-owned plan resolution. Model path, model ID, model alias, and execution flags are not
-singleton startup options. This separation lets one ICN live for one ACN lifetime while models
-change independently.
+Context length and sequence count belong to an explicit model serving configuration supplied to
+assessment, fitting, and load. ACN persists that configuration inside a provider offering; ICN owns
+its identity and ephemeral residency. Serving configuration is not an installation-manifest, cache,
+or process-launch field. Batching, GPU placement, KV policy, projector, draft, and MTP selection are
+ICN-owned plan resolution. This separation lets one ICN live for one ACN lifetime while models and
+configurations change independently.
 
 Runtime code receives configuration explicitly and uses Effect platform services for command
 execution, filesystem/path work, HTTP, clock, randomness, logging, and scope. Core lifecycle code
@@ -264,15 +264,16 @@ backstops, not child adoption or sharing.
 
 ## Runtime model lifecycle
 
-The singleton starts with no loaded model. Inventory, preview, hardware, download, and deletion
+The singleton starts with no loaded model. Catalog, installed-package, assessment, fitting,
+download, and deletion
 remain available in that state. ICN owns the native backend, the currently resident target, and
 generation leases needed to keep that target alive during inference. ACN owns the product model
 slots and is the sole policy authority that decides when a selected local model is loaded or
 unloaded. A slot is not an ICN resource and ICN does not expose a separate public runtime resource.
 
-Runtime load accepts an inventory model ID only and realizes that model's current serving
-configuration. Serving configuration contains caller-owned context length and parallel sequence
-count; it is changed through model management rather than supplied as a competing runtime fallback.
+Runtime load accepts one exact model serving configuration. The configuration contains the target,
+context length, and parallel sequence count; ICN owns its stable identity and ACN passes it
+unchanged from the selected provider offering.
 Load does not accept a planner name, planner version, capacity-policy identifier, or native flags.
 ICN reassesses the exact plan and streams typed progress through resolution, assessment,
 unload/replacement, loading, verification, and ready or failed termination. Load of the
@@ -286,8 +287,8 @@ same capability. Creating or dropping a model executor never initializes or tear
 backend, and runtime orchestration has no operation-level initialization path. Isolated planner and
 template workers each own one separate backend for their complete private process lifetime.
 
-An ordinary chat request names an inventory model and may proceed only when that exact model and
-serving profile are already resident. ICN acquires a generation lease and holds it until the
+An ordinary chat request names the exact serving-configuration identity and may proceed only when
+that configuration is already resident. ICN acquires a generation lease and holds it until the
 response stream succeeds, fails, or is canceled. A nonresident or differently configured target is
 rejected as not ready; chat never starts a model transition. Before starting a local provider
 request, ACN acquires the selected slot's local-model admission as a scoped resource. That
@@ -295,12 +296,12 @@ acquisition performs or joins the slot's explicit load operation and remains hel
 the chat request and takes its generation lease.
 
 ACN consumes the admitted load operation's stream directly. Loading fractions update every product
-slot selecting that local model, the ready event transitions them to Ready, and a failed or
+slot selecting that local offering, the ready event transitions them to Ready, and a failed or
 incomplete stream transitions them to a typed blocked state. Explicit unload similarly moves slots
 through Unloading to Unloaded. Because ICN has one resident target, a replacement load moves every
 slot selecting a different local model through Unloading to Unloaded before the target slot becomes
-Ready. Model listing remains an artifact/configuration inventory and does not duplicate this
-operation lifecycle or expose native residency.
+Ready. The target-level local-model projection does not duplicate this operation lifecycle or
+expose native residency.
 
 Replacing a model must not claim the new model is ready until its backend is usable. Failure leaves
 the runtime in an explicitly reported state and must not make requests route to a half-loaded

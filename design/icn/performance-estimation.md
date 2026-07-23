@@ -27,8 +27,8 @@ choose context points, or define fallback policy.
 `icn-hardware` owns the generation formula, active-expert arithmetic, context curve, calibration
 matching and fallback rules, uncertainty bounds, confidence, estimator version, and typed failure
 policy. ICN model management owns calibration lifecycle, evidence-key construction, and caching.
-The `@magnitudedev/icn` recipe service may rank complete estimates but must not reconstruct model
-workload or hardware throughput. ACN only projects the selected recipe result.
+ICN returns complete evidence through model assessment. ACN recommendation policy may rank those
+results but must not reconstruct model workload or hardware throughput.
 
 The estimator may use only:
 

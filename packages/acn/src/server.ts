@@ -13,7 +13,7 @@ import {
   VersionLive,
 } from "@magnitudedev/storage"
 import { MagnitudeRpcs } from "@magnitudedev/protocol"
-import { IcnProcess } from "@magnitudedev/icn"
+import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { HandlersLive } from "./handlers"
 import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
 import { AgentFactoryLive } from "./agent-factory"
@@ -41,7 +41,15 @@ import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { makeModelConfigurationLayer } from "./model-configuration"
 import { makeAcnIcn } from "./icn"
-import { LocalModelInventoryLive } from "./local-model-inventory"
+import { LocalModelAutoSetupLive } from "./local-model-auto-setup"
+import { LocalModelEvaluationsLive } from "./local-model-evaluations"
+import { LocalModelPackagesLive } from "./local-model-packages"
+import { LocalModelRecommendationsLive } from "./local-model-recommendations"
+import { LocalModelsLive } from "./local-models"
+import { LocalModelRuntimeLive } from "./local-model-runtime"
+import { LocalProviderOfferingsLive } from "./local-provider-offerings"
+import { LocalProviderOfferingProjectionLive } from "./local-provider-offering-projection"
+import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
@@ -257,9 +265,24 @@ const addLocalInferenceServices = <A, E, R>(
   const withIcn = Layer.provideMerge(makeAcnIcn(dataDir), base)
   const withConfiguration = Layer.provideMerge(makeModelConfigurationLayer(), withIcn)
   const withHardware = Layer.provideMerge(LocalInferenceHardwareLive, withConfiguration)
-  const withInventory = Layer.provideMerge(LocalModelInventoryLive, withHardware)
-  const withOnboarding = Layer.provideMerge(OnboardingLive, withInventory)
-  const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withOnboarding)
+  const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
+  const withEvaluations = Layer.provideMerge(LocalModelEvaluationsLive, withPackages)
+  const withOfferings = Layer.provideMerge(LocalProviderOfferingsLive, withEvaluations)
+  const withOfferingProjection = Layer.provideMerge(
+    LocalProviderOfferingProjectionLive,
+    withOfferings,
+  )
+  const withRecommendations = Layer.provideMerge(
+    LocalModelRecommendationsLive,
+    withOfferingProjection,
+  )
+  const withRuntime = Layer.provideMerge(LocalModelRuntimeLive, withRecommendations)
+  const withAutoSetup = Layer.provideMerge(LocalModelAutoSetupLive, withRuntime)
+  const withLocalModels = Layer.provideMerge(LocalModelsLive, withAutoSetup)
+  const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)
+  const withResolver = Layer.provideMerge(LocalProviderResolverLive, withOnboarding)
+  const withIcnProvider = Layer.provideMerge(makeIcnProvider(), withResolver)
+  const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withIcnProvider)
   return withProviderClients
 }
 

@@ -1,4 +1,4 @@
-import { Effect, Equivalence, Ref, Stream, SubscriptionRef } from "effect"
+import { Effect, Equivalence, Stream, SubscriptionRef } from "effect"
 
 export interface IcnObservedSnapshot<A> {
   readonly revision: number
@@ -8,6 +8,7 @@ export interface IcnObservedSnapshot<A> {
 export interface IcnObservedState<A, E> {
   readonly get: Effect.Effect<IcnObservedSnapshot<A>>
   readonly changes: Stream.Stream<IcnObservedSnapshot<A>>
+  readonly initialized: Effect.Effect<boolean>
   readonly refresh: Effect.Effect<void, E>
 }
 
@@ -17,25 +18,33 @@ export const makeIcnObservedState = <A, E>(
   equivalent: Equivalence.Equivalence<A>,
 ): Effect.Effect<IcnObservedState<A, E>> =>
   Effect.gen(function* () {
-    const current = yield* SubscriptionRef.make<IcnObservedSnapshot<A>>({
-      revision: 0,
-      state: initial,
+    const current = yield* SubscriptionRef.make({
+      initialized: false,
+      snapshot: {
+        revision: 0,
+        state: initial,
+      },
     })
     const refreshLock = yield* Effect.makeSemaphore(1)
 
     const refresh = refreshLock.withPermits(1)(Effect.gen(function* () {
       const nextState = yield* read
-      const snapshot = yield* Ref.get(current)
-      if (equivalent(snapshot.state, nextState)) return
-      yield* SubscriptionRef.set(current, {
-        revision: snapshot.revision + 1,
-        state: nextState,
-      })
+      yield* SubscriptionRef.modify(current, (previous) =>
+        previous.initialized && equivalent(previous.snapshot.state, nextState)
+          ? [undefined, previous]
+          : [undefined, {
+              initialized: true,
+              snapshot: {
+                revision: previous.snapshot.revision + 1,
+                state: nextState,
+              },
+            }])
     }))
 
     return {
-      get: Ref.get(current),
-      changes: current.changes,
+      get: SubscriptionRef.get(current).pipe(Effect.map(({ snapshot }) => snapshot)),
+      changes: current.changes.pipe(Stream.map(({ snapshot }) => snapshot)),
+      initialized: SubscriptionRef.get(current).pipe(Effect.map(({ initialized }) => initialized)),
       refresh,
     }
   })

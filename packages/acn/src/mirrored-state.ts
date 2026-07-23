@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, PubSub, Schema, Stream, SubscriptionRef } from "effect"
+import { Context, Effect, Layer, PubSub, Schema, Stream, SubscriptionRef, type Equivalence } from "effect"
 import type { MirroredSnapshot, MirroredStateInvalidation } from "@magnitudedev/protocol"
 
 export interface MirroredStateTransition<State, Result> {
@@ -32,6 +32,15 @@ export interface MirroredStateReader<State> {
 export interface MirroredStateChangesApi {
   readonly publish: (event: MirroredStateInvalidation) => Effect.Effect<void>
   readonly stream: Stream.Stream<MirroredStateInvalidation>
+}
+
+export interface ObservedState<State> {
+  readonly get: Effect.Effect<MirroredSnapshot<State>>
+  readonly changes: Stream.Stream<MirroredSnapshot<State>>
+  readonly setIfChanged: (
+    state: State,
+    equivalent: Equivalence.Equivalence<State>,
+  ) => Effect.Effect<void>
 }
 
 export class MirroredStateChanges extends Context.Tag("MirroredStateChanges")<
@@ -99,6 +108,25 @@ export const makeMirroredState = <const Id extends string, State, StateEncoded, 
           ? previous
           : yield* commit(previous, nextState)
       })),
+    }
+  })
+
+export const makeObservedState = <State>(initial: State): Effect.Effect<ObservedState<State>> =>
+  Effect.gen(function* () {
+    const state = yield* SubscriptionRef.make<MirroredSnapshot<State>>({
+      revision: 0,
+      state: initial,
+    })
+    const lock = yield* Effect.makeSemaphore(1)
+    return {
+      get: SubscriptionRef.get(state),
+      changes: state.changes,
+      setIfChanged: (nextState, equivalent) => lock.withPermits(1)(
+        SubscriptionRef.modify(state, (current) =>
+          equivalent(current.state, nextState)
+            ? [undefined, current]
+            : [undefined, { revision: current.revision + 1, state: nextState }]),
+      ),
     }
   })
 

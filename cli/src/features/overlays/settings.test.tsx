@@ -15,7 +15,7 @@ const textPosition = (frame: string, needle: string) => {
 
 const memoryDomainId = LocalInferenceMemoryDomainIdSchema.make("system")
 const localInferenceState = makeView({
-  entries: [],
+  models: [],
   ready: false,
   hardware: makeHardware({
     platform: "MacOS",

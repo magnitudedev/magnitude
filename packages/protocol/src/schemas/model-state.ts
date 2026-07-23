@@ -16,6 +16,8 @@ const NonNegativeSafeInteger = Schema.Number.pipe(
 )
 const PositiveSafeInteger = NonNegativeSafeInteger.pipe(Schema.positive())
 const FiniteNonNegative = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
+const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
+const Sha256Digest = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/))
 
 export const SlotIdSchema = Schema.Literal("primary", "secondary").pipe(Schema.brand("SlotId"))
 export type SlotId = typeof SlotIdSchema.Type
@@ -23,13 +25,6 @@ export type SlotId = typeof SlotIdSchema.Type
 export const PRIMARY_SLOT_ID = SlotIdSchema.make("primary")
 export const SECONDARY_SLOT_ID = SlotIdSchema.make("secondary")
 export const MODEL_SLOT_IDS = [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID] as const
-
-export const LocalModelIdSchema = Schema.String.pipe(
-  Schema.minLength(1),
-  Schema.maxLength(512),
-  Schema.brand("LocalModelId"),
-)
-export type LocalModelId = typeof LocalModelIdSchema.Type
 
 export const LocalInferenceAcceleratorIdSchema = Schema.String.pipe(
   Schema.minLength(1),
@@ -55,6 +50,103 @@ export const ModelFailureSchema = Schema.Struct({
 })
 export type ModelFailure = typeof ModelFailureSchema.Type
 
+// =============================================================================
+// Local model packages, targets, evaluations, and offerings
+// =============================================================================
+
+export const ModelFileIdSchema = NonEmptyString.pipe(Schema.brand("ModelFileId"))
+export type ModelFileId = typeof ModelFileIdSchema.Type
+
+export const ModelPackageIdSchema = NonEmptyString.pipe(Schema.brand("ModelPackageId"))
+export type ModelPackageId = typeof ModelPackageIdSchema.Type
+
+export const DownloadAttemptIdSchema = NonEmptyString.pipe(Schema.brand("DownloadAttemptId"))
+export type DownloadAttemptId = typeof DownloadAttemptIdSchema.Type
+
+export const SpeculativeDecodingPairIdSchema =
+  NonEmptyString.pipe(Schema.brand("SpeculativeDecodingPairId"))
+export type SpeculativeDecodingPairId = typeof SpeculativeDecodingPairIdSchema.Type
+
+export const ModelOfferingTargetIdSchema =
+  NonEmptyString.pipe(Schema.brand("ModelOfferingTargetId"))
+export type ModelOfferingTargetId = typeof ModelOfferingTargetIdSchema.Type
+
+export const ModelServingConfigurationIdSchema =
+  NonEmptyString.pipe(Schema.brand("ModelServingConfigurationId"))
+export type ModelServingConfigurationId = typeof ModelServingConfigurationIdSchema.Type
+
+export const RecommendableModelIdSchema =
+  NonEmptyString.pipe(Schema.brand("RecommendableModelId"))
+export type RecommendableModelId = typeof RecommendableModelIdSchema.Type
+
+export const RecommendationIdSchema = NonEmptyString.pipe(Schema.brand("RecommendationId"))
+export type RecommendationId = typeof RecommendationIdSchema.Type
+
+export const OfferingAssessmentIdSchema =
+  NonEmptyString.pipe(Schema.brand("OfferingAssessmentId"))
+export type OfferingAssessmentId = typeof OfferingAssessmentIdSchema.Type
+
+export const AssessmentEnvironmentIdSchema =
+  NonEmptyString.pipe(Schema.brand("AssessmentEnvironmentId"))
+export type AssessmentEnvironmentId = typeof AssessmentEnvironmentIdSchema.Type
+
+export const ModelFileRoleSchema = Schema.Literal("weights", "projector", "mtp", "auxiliary")
+export type ModelFileRole = typeof ModelFileRoleSchema.Type
+
+export const ModelFileSchema = Schema.Struct({
+  id: ModelFileIdSchema,
+  path: NonEmptyString,
+  role: ModelFileRoleSchema,
+  sizeBytes: NonNegativeSafeInteger,
+  sha256: Sha256Digest,
+})
+export type ModelFile = typeof ModelFileSchema.Type
+
+export const ModelPackageSourceSchema = Schema.Union(
+  Schema.TaggedStruct("HuggingFace", {
+    repository: NonEmptyString,
+    revision: NonEmptyString,
+  }),
+  Schema.TaggedStruct("Local", {
+    path: NonEmptyString,
+  }),
+)
+export type ModelPackageSource = typeof ModelPackageSourceSchema.Type
+
+export const ModelFileRelationshipSchema = Schema.Union(
+  Schema.TaggedStruct("Shard", {
+    fileId: ModelFileIdSchema,
+    index: NonNegativeSafeInteger,
+    count: PositiveSafeInteger,
+  }),
+  Schema.TaggedStruct("ProjectorFor", {
+    projectorFileId: ModelFileIdSchema,
+    weightsFileId: ModelFileIdSchema,
+  }),
+  Schema.TaggedStruct("MtpFor", {
+    mtpFileId: ModelFileIdSchema,
+    weightsFileId: ModelFileIdSchema,
+  }),
+)
+export type ModelFileRelationship = typeof ModelFileRelationshipSchema.Type
+
+export const ModelPackagePropertiesSchema = Schema.Struct({
+  format: NonEmptyString,
+  quantization: NonEmptyString,
+  architecture: NonEmptyString,
+  maximumContextLength: PositiveSafeInteger,
+})
+export type ModelPackageProperties = typeof ModelPackagePropertiesSchema.Type
+
+export const ModelPackageSchema = Schema.Struct({
+  id: ModelPackageIdSchema,
+  source: ModelPackageSourceSchema,
+  files: Schema.Array(ModelFileSchema),
+  relationships: Schema.Array(ModelFileRelationshipSchema),
+  properties: ModelPackagePropertiesSchema,
+})
+export type ModelPackage = typeof ModelPackageSchema.Type
+
 const ModelReasoningCapabilitiesSchema = Schema.Struct({
   supported: Schema.Boolean,
   efforts: Schema.Array(ReasoningEffortSchema),
@@ -76,20 +168,283 @@ export const ModelCapabilitiesSchema = Schema.Struct({
 })
 export type ModelCapabilities = typeof ModelCapabilitiesSchema.Type
 
-export const LocalModelFitSchema = Schema.Union(
-  Schema.TaggedStruct("Fits", {
-    requiredBytes: NonNegativeSafeInteger,
-    availableBytes: NonNegativeSafeInteger,
-    memoryDomainIds: Schema.Array(LocalInferenceMemoryDomainIdSchema),
+export const ModelPackageInspectionSchema = Schema.Union(
+  Schema.TaggedStruct("Pending", {}),
+  Schema.TaggedStruct("Inspected", { capabilities: ModelCapabilitiesSchema }),
+  Schema.TaggedStruct("Invalid", { failure: ModelFailureSchema }),
+  Schema.TaggedStruct("Incompatible", { failure: ModelFailureSchema }),
+)
+export type ModelPackageInspection = typeof ModelPackageInspectionSchema.Type
+
+export const ModelPackageLocalStateSchema = Schema.Union(
+  Schema.TaggedStruct("NotInstalled", {}),
+  Schema.TaggedStruct("Downloading", {
+    attemptId: DownloadAttemptIdSchema,
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
   }),
-  Schema.TaggedStruct("DoesNotFit", {
-    requiredBytes: NonNegativeSafeInteger,
-    availableBytes: NonNegativeSafeInteger,
-    limitingResource: Schema.String,
-    memoryDomainIds: Schema.Array(LocalInferenceMemoryDomainIdSchema),
+  Schema.TaggedStruct("Installed", { path: NonEmptyString }),
+)
+export type ModelPackageLocalState = typeof ModelPackageLocalStateSchema.Type
+
+export const ModelPackageEntrySchema = Schema.Struct({
+  package: ModelPackageSchema,
+  targetId: Schema.optionalWith(ModelOfferingTargetIdSchema, { as: "Option", exact: true }),
+  localState: ModelPackageLocalStateSchema,
+  inspection: ModelPackageInspectionSchema,
+  lastDownloadFailure: Schema.optionalWith(Schema.Struct({
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+    failure: ModelFailureSchema,
+  }), { as: "Option", exact: true }),
+})
+export type ModelPackageEntry = typeof ModelPackageEntrySchema.Type
+
+export const DownloadAttemptSchema = Schema.Union(
+  Schema.TaggedStruct("Pending", {
+    id: DownloadAttemptIdSchema,
+    packageId: ModelPackageIdSchema,
+  }),
+  Schema.TaggedStruct("Downloading", {
+    id: DownloadAttemptIdSchema,
+    packageId: ModelPackageIdSchema,
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+  }),
+  Schema.TaggedStruct("Completed", {
+    id: DownloadAttemptIdSchema,
+    packageId: ModelPackageIdSchema,
+  }),
+  Schema.TaggedStruct("Failed", {
+    id: DownloadAttemptIdSchema,
+    packageId: ModelPackageIdSchema,
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+    failure: ModelFailureSchema,
+  }),
+  Schema.TaggedStruct("Cancelled", {
+    id: DownloadAttemptIdSchema,
+    packageId: ModelPackageIdSchema,
   }),
 )
-export type LocalModelFit = typeof LocalModelFitSchema.Type
+export type DownloadAttempt = typeof DownloadAttemptSchema.Type
+
+export const PackageOfferingTargetSchema = Schema.TaggedStruct("Package", {
+  package: ModelPackageSchema,
+})
+
+export const SpeculativeDecodingPairSchema = Schema.TaggedStruct("SpeculativeDecodingPair", {
+  id: SpeculativeDecodingPairIdSchema,
+  target: ModelPackageSchema,
+  draft: ModelPackageSchema,
+})
+
+export const ModelOfferingTargetSchema = Schema.Union(
+  PackageOfferingTargetSchema,
+  SpeculativeDecodingPairSchema,
+)
+export type ModelOfferingTarget = typeof ModelOfferingTargetSchema.Type
+
+export const modelOfferingTargetPackageIds = (
+  target: ModelOfferingTarget,
+): readonly ModelPackageId[] =>
+  target._tag === "Package"
+    ? [target.package.id]
+    : [target.target.id, target.draft.id]
+
+export const ServingProfileSchema = Schema.Struct({
+  contextLength: PositiveSafeInteger,
+  parallelSequences: PositiveSafeInteger,
+})
+export type ServingProfile = typeof ServingProfileSchema.Type
+
+export const ModelServingConfigurationSchema = Schema.Struct({
+  id: ModelServingConfigurationIdSchema,
+  target: ModelOfferingTargetSchema,
+  profile: ServingProfileSchema,
+})
+export type ModelServingConfiguration = typeof ModelServingConfigurationSchema.Type
+
+export const RecommendableModelCapabilitiesSchema = ModelCapabilitiesSchema
+export type RecommendableModelCapabilities = typeof RecommendableModelCapabilitiesSchema.Type
+
+export const RecommendableModelSchema = Schema.Struct({
+  id: RecommendableModelIdSchema,
+  checkpointId: NonEmptyString,
+  targetId: ModelOfferingTargetIdSchema,
+  target: ModelOfferingTargetSchema,
+  eligibleServingProfiles: Schema.Array(ServingProfileSchema),
+  displayName: NonEmptyString,
+  description: Schema.String,
+  license: NonEmptyString,
+  capabilities: RecommendableModelCapabilitiesSchema,
+  qualityScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+  qualityScoreProvenance: NonEmptyString,
+  fidelityRank: NonNegativeSafeInteger,
+  quantizationAware: Schema.Boolean,
+  qualityEvidence: Schema.Array(NonEmptyString),
+})
+export type RecommendableModel = typeof RecommendableModelSchema.Type
+
+export const MemoryAssessmentSchema = Schema.Struct({
+  memoryDomainId: LocalInferenceMemoryDomainIdSchema,
+  capacityBytes: NonNegativeSafeInteger,
+  requiredBytes: NonNegativeSafeInteger,
+  requiredReserveBytes: NonNegativeSafeInteger,
+  remainingBytes: Schema.Number.pipe(Schema.int()),
+})
+export type MemoryAssessment = typeof MemoryAssessmentSchema.Type
+
+export const FitsOfferingAssessmentSchema = Schema.TaggedStruct("Fits", {
+  profile: ServingProfileSchema,
+  configurationId: ModelServingConfigurationIdSchema,
+  assessmentId: OfferingAssessmentIdSchema,
+  memory: Schema.Array(MemoryAssessmentSchema),
+  performance: Schema.optionalWith(Schema.Struct({
+    contextTokens: PositiveSafeInteger,
+    lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+    estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+    upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+    confidence: Schema.Literal("high", "moderate", "low"),
+    method: NonEmptyString,
+  }), { as: "Option", exact: true }),
+})
+export type FitsOfferingAssessment = typeof FitsOfferingAssessmentSchema.Type
+
+export const RecommendationSchema = Schema.Struct({
+  id: RecommendationIdSchema,
+  modelId: ModelOfferingTargetIdSchema,
+  recommendableModelId: RecommendableModelIdSchema,
+  displayName: NonEmptyString,
+  description: Schema.String,
+  configuration: ModelServingConfigurationSchema,
+  assessment: FitsOfferingAssessmentSchema,
+  intent: Schema.Literal("balanced", "best_quality", "fastest", "lightweight"),
+  explanation: Schema.String,
+})
+export type Recommendation = typeof RecommendationSchema.Type
+
+export const LocalModelDownloadSchema = Schema.Union(
+  Schema.TaggedStruct("NotDownloaded", {
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+  }),
+  Schema.TaggedStruct("Downloading", {
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+  }),
+  Schema.TaggedStruct("Failed", {
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+    failure: ModelFailureSchema,
+  }),
+  Schema.TaggedStruct("Downloaded", {
+    installedBytes: NonNegativeSafeInteger,
+  }),
+)
+export type LocalModelDownload = typeof LocalModelDownloadSchema.Type
+
+export const LocalModelPreparationSchema = Schema.Union(
+  Schema.TaggedStruct("NotDownloaded", {}),
+  Schema.TaggedStruct("Preparing", {}),
+  Schema.TaggedStruct("Unavailable", {
+    providerModelIds: Schema.Array(ProviderModelIdSchema),
+    failure: ModelFailureSchema,
+  }),
+  Schema.TaggedStruct("Available", {
+    providerModelIds: Schema.Array(ProviderModelIdSchema),
+  }),
+)
+export type LocalModelPreparation = typeof LocalModelPreparationSchema.Type
+
+export const LocalModelSchema = Schema.Struct({
+  id: ModelOfferingTargetIdSchema,
+  displayName: NonEmptyString,
+  description: Schema.String,
+  kind: Schema.Literal("Standalone", "SpeculativePair"),
+  quantization: NonEmptyString,
+  maximumContextLength: PositiveSafeInteger,
+  downloadBytes: NonNegativeSafeInteger,
+  download: LocalModelDownloadSchema,
+  preparation: LocalModelPreparationSchema,
+})
+export type LocalModel = typeof LocalModelSchema.Type
+
+export const LocalModelRecommendationSchema = Schema.Struct({
+  id: RecommendationIdSchema,
+  modelId: ModelOfferingTargetIdSchema,
+  displayName: NonEmptyString,
+  intent: Schema.Literal("balanced", "best_quality", "fastest", "lightweight"),
+  explanation: Schema.String,
+  sources: Schema.Array(Schema.Struct({
+    source: ModelPackageSourceSchema,
+    files: Schema.Array(Schema.Struct({
+      path: NonEmptyString,
+      sha256: Sha256Digest,
+    })),
+  })),
+  qualityScoreProvenance: NonEmptyString,
+  fidelityRank: NonNegativeSafeInteger,
+  qualityEvidence: Schema.Array(NonEmptyString),
+  profile: ServingProfileSchema,
+  fit: Schema.Struct({
+    requiredBytes: NonNegativeSafeInteger,
+    availableBytes: NonNegativeSafeInteger,
+    estimatedTokensPerSecond: Schema.optionalWith(
+      Schema.Number.pipe(Schema.finite(), Schema.positive()),
+      { as: "Option", exact: true },
+    ),
+  }),
+})
+export type LocalModelRecommendation = typeof LocalModelRecommendationSchema.Type
+
+export const LocalModelRecommendationsLifecycleSchema = Schema.Union(
+  Schema.TaggedStruct("Loading", {}),
+  Schema.TaggedStruct("Ready", {
+    entries: Schema.Array(LocalModelRecommendationSchema),
+  }),
+  Schema.TaggedStruct("Failed", { failure: ModelFailureSchema }),
+)
+export type LocalModelRecommendationsLifecycle =
+  typeof LocalModelRecommendationsLifecycleSchema.Type
+
+export const LocalModelsStateSchema = Schema.Struct({
+  models: Schema.Array(LocalModelSchema),
+  recommendations: LocalModelRecommendationsLifecycleSchema,
+})
+export type LocalModelsState = typeof LocalModelsStateSchema.Type
+
+export const ModelPackagesStateSchema = Schema.Struct({
+  entries: Schema.Array(ModelPackageEntrySchema),
+})
+export type ModelPackagesState = typeof ModelPackagesStateSchema.Type
+
+export const ModelRecommendationsStateSchema = Schema.Struct({
+  recommendations: Schema.Array(RecommendationSchema),
+  failure: Schema.optionalWith(ModelFailureSchema, { as: "Option", exact: true }),
+})
+export type ModelRecommendationsState = typeof ModelRecommendationsStateSchema.Type
+
+export const LocalModelDownloadsStateSchema = Schema.Struct({
+  attempts: Schema.Array(DownloadAttemptSchema),
+})
+export type LocalModelDownloadsState = typeof LocalModelDownloadsStateSchema.Type
+
+export const LocalProviderOfferingOriginSchema = Schema.Union(
+  Schema.TaggedStruct("Automatic", {}),
+  Schema.TaggedStruct("Recommendation", { recommendationId: RecommendationIdSchema }),
+  Schema.TaggedStruct("UserConfigured", {}),
+)
+export type LocalProviderOfferingOrigin = typeof LocalProviderOfferingOriginSchema.Type
+
+export const LocalProviderOfferingSchema = Schema.Struct({
+  providerModelId: ProviderModelIdSchema,
+  modelId: ModelOfferingTargetIdSchema,
+  configuration: ModelServingConfigurationSchema,
+  origin: LocalProviderOfferingOriginSchema,
+  capabilities: ModelCapabilitiesSchema,
+})
+export type LocalProviderOffering = typeof LocalProviderOfferingSchema.Type
 
 export const ProviderAuthenticationSchema = Schema.Literal("Authenticated", "NotConfigured", "NotRequired")
 export const ProviderAvailabilitySchema = Schema.Union(
@@ -213,117 +568,6 @@ export const ProviderModelCatalogStateSchema = Schema.Union(
   return state.models.every(({ providerId }) => uniqueProviderIds.has(providerId))
 }, { message: () => "catalog identities must be unique and every model provider must resolve" }))
 export type ProviderModelCatalogState = typeof ProviderModelCatalogStateSchema.Type
-
-export const LocalModelInventoryEntryDetailsSchema = Schema.Struct({
-  localModelId: LocalModelIdSchema,
-  providerModelId: ProviderModelIdSchema,
-  modelFamilyId: Schema.optionalWith(ModelFamilyIdSchema, { as: "Option", exact: true }),
-  displayName: Schema.String,
-  family: Schema.String,
-  architecture: Schema.Literal("Dense", "MixtureOfExperts"),
-  capabilities: ModelCapabilitiesSchema,
-  contextWindow: PositiveSafeInteger,
-  maxOutputTokens: PositiveSafeInteger,
-  quantization: Schema.String,
-  downloadBytes: NonNegativeSafeInteger,
-  fit: LocalModelFitSchema,
-  recommendation: Schema.optionalWith(Schema.Struct({
-    intent: Schema.Literal("balanced", "best_quality", "fastest", "lightweight"),
-    explanation: Schema.String,
-    fidelityLabel: Schema.String,
-    fidelityEvidence: Schema.String,
-    repository: Schema.String,
-    revision: Schema.String,
-    files: Schema.Array(Schema.Struct({ path: Schema.String, sha256: Schema.String })),
-    sourcePageUrl: Schema.String,
-    estimatedRuntimeBytes: NonNegativeSafeInteger,
-    fitMarginBytes: Schema.Number.pipe(Schema.finite()),
-    estimatedGeneration: Schema.optionalWith(Schema.Struct({
-      contextTokens: PositiveSafeInteger,
-      lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-      expectedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-      upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-      confidence: Schema.Literal("high", "moderate", "low"),
-      method: Schema.String,
-    }), { as: "Option", exact: true }),
-  }), { as: "Option", exact: true }),
-})
-export type LocalModelInventoryEntryDetails = typeof LocalModelInventoryEntryDetailsSchema.Type
-
-export class LocalModelAvailableForDownload extends Schema.TaggedClass<LocalModelAvailableForDownload>()("AvailableForDownload", {
-  model: LocalModelInventoryEntryDetailsSchema,
-}) {}
-export class LocalModelDownloading extends Schema.TaggedClass<LocalModelDownloading>()("Downloading", {
-  model: LocalModelInventoryEntryDetailsSchema,
-  percentage: PercentageSchema,
-  completedBytes: NonNegativeSafeInteger,
-  totalBytes: NonNegativeSafeInteger,
-}) {}
-export class LocalModelDownloaded extends Schema.TaggedClass<LocalModelDownloaded>()("Downloaded", {
-  model: LocalModelInventoryEntryDetailsSchema,
-  downloadedBytes: NonNegativeSafeInteger,
-}) {}
-export class LocalModelDownloadFailed extends Schema.TaggedClass<LocalModelDownloadFailed>()("DownloadFailed", {
-  model: LocalModelInventoryEntryDetailsSchema,
-  completedBytes: NonNegativeSafeInteger,
-  totalBytes: NonNegativeSafeInteger,
-  error: ModelFailureSchema,
-}) {}
-
-export const LocalModelInventoryEntryLifecycle = defineFSM(
-  {
-    AvailableForDownload: LocalModelAvailableForDownload,
-    Downloading: LocalModelDownloading,
-    Downloaded: LocalModelDownloaded,
-    DownloadFailed: LocalModelDownloadFailed,
-  },
-  {
-    AvailableForDownload: ["Downloading"],
-    Downloading: ["Downloaded", "DownloadFailed"],
-    Downloaded: ["AvailableForDownload"],
-    DownloadFailed: ["Downloading"],
-  } as const,
-)
-
-export const LocalModelInventoryEntrySchema = Schema.Union(
-  LocalModelAvailableForDownload,
-  LocalModelDownloading,
-  LocalModelDownloaded,
-  LocalModelDownloadFailed,
-).pipe(Schema.filter((entry) => entry._tag !== "Downloading" && entry._tag !== "DownloadFailed"
-  || entry.completedBytes <= entry.totalBytes,
-{ message: () => "completed download bytes cannot exceed total bytes" }))
-export type LocalModelInventoryEntry = typeof LocalModelInventoryEntrySchema.Type
-
-export class LocalModelInventoryLoading extends Schema.TaggedClass<LocalModelInventoryLoading>()("Loading", {}) {}
-export class LocalModelInventoryReady extends Schema.TaggedClass<LocalModelInventoryReady>()("Ready", {
-  entries: Schema.Array(LocalModelInventoryEntrySchema),
-}) {}
-export class LocalModelInventoryFailed extends Schema.TaggedClass<LocalModelInventoryFailed>()("Failed", {
-  error: ModelFailureSchema,
-}) {}
-
-export const LocalModelInventoryLifecycle = defineFSM(
-  {
-    Loading: LocalModelInventoryLoading,
-    Ready: LocalModelInventoryReady,
-    Failed: LocalModelInventoryFailed,
-  },
-  {
-    Loading: ["Ready", "Failed"],
-    Ready: ["Failed"],
-    Failed: ["Loading"],
-  } as const,
-)
-
-export const LocalModelInventoryStateSchema = Schema.Union(
-  LocalModelInventoryLoading,
-  LocalModelInventoryReady,
-  LocalModelInventoryFailed,
-).pipe(Schema.filter((state) => state._tag !== "Ready"
-  || new Set(state.entries.map((entry) => entry.model.localModelId)).size === state.entries.length,
-{ message: () => "local model inventory identities must be unique" }))
-export type LocalModelInventoryState = typeof LocalModelInventoryStateSchema.Type
 
 export const SlotSelectionSchema = Schema.Struct({
   providerId: ProviderIdSchema,

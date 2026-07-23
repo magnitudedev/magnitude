@@ -41,6 +41,8 @@ export class ModelConfiguration extends Context.Tag("ModelConfiguration")<
 const EMPTY_MODEL_CONFIGURATION: StoredModelConfiguration = {
   slots: { primary: Option.none(), secondary: Option.none() },
   localModelRecency: { primary: [], secondary: [] },
+  localProviderOfferings: [],
+  dismissedDownloadFailures: [],
 }
 
 const RECENCY_LIMIT = 32

@@ -3,31 +3,42 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use futures_util::{
-    future::BoxFuture,
-    stream::{BoxStream, StreamExt},
-};
+use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
 use icn_api::{
-    AppState, BackendMutationGuard, BackendRegistry, FakeBackend, ModelLoadEvent, ModelLoadStage,
-    RuntimeController, ServerIdentity, app,
+    AppState, BackendMutationGuard, BackendRegistry, FakeBackend, RuntimeController,
+    ServerIdentity, app,
+};
+use icn_contracts::models::{
+    AssessModelResult, AssessModelsRequest, AssessModelsResponse, AssessmentEnvironmentId,
+    FitModelResult, FitModelsRequest, FitModelsResponse, InstalledModelPackages as _,
+    LoadModelReady, LoadModelRequest, MemoryAssessment, ModelEvaluator,
+    ModelFailure as DomainModelFailure, ModelLoadEvent, ModelLoadStage,
+    ModelOfferingTarget as DomainModelOfferingTarget, ModelPackageId, ModelPackageOperand,
+    ModelServingConfiguration, ModelServingConfigurationId, ModelTargetInput, OfferingAssessment,
+    OfferingAssessmentId, PerformanceConfidence, PerformanceEvidence,
+    RemoveInstalledModelPackageResponse, RuntimeResidencyId,
+    ServingProfile as DomainServingProfile,
 };
 use icn_contracts::{
-    CacheType, CompletionBackend, ComponentRole, DeletedModel, ExecutionConfig, ExecutionIntent,
-    FlashAttention, GenerationPerformanceAssessment, GpuLayers, HardwareAssessment,
-    HardwareProvider, HardwareSnapshot, InventoryError, InventoryHardwareAssessor,
-    ModelExecutionAssessment, ModelHardwareAssessor, ModelId, ModelInventory, ModelPreviewProfile,
-    ProjectorConfig, ResolvedModel, SplitMode, TemplateAssessment, TemplateAssessor,
+    CacheType, CompletionBackend, ComponentRole, ExecutionConfig, ExecutionIntent, FlashAttention,
+    GenerationPerformanceAssessment, GpuLayers, HardwareAssessment, HardwareProvider,
+    HardwareSnapshot, InventoryError, InventoryHardwareAssessor, ModelExecutionAssessment,
+    ModelHardwareAssessor, ModelPreviewProfile, ProjectorConfig, ResolvedModel, SplitMode,
+    TemplateAssessment, TemplateAssessor,
 };
 use icn_engine::{LlamaCompletionBackend, ModelLoadError, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
-use icn_models::{InventoryConfig, ModelManager, ModelPreviewService};
+use icn_models::{
+    InventoryConfig, ManagedModelDownloads, ModelManager, ModelPreviewService,
+    NativeRecommendableCatalog,
+};
+use sha2::{Digest, Sha256};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::Instrument as _;
 
 mod build_identity;
 mod telemetry;
@@ -107,7 +118,9 @@ struct RuntimeExecutionProfile {
 #[derive(Debug, Clone)]
 struct ResidentTarget {
     model_id: String,
+    residency_id: String,
     profile: RuntimeExecutionProfile,
+    package_ids: Vec<ModelPackageId>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +149,7 @@ fn runtime_plan_defaults() -> RuntimePlanDefaults {
             offload_kqv: true,
             operation_offload: true,
             swa_full: false,
-            kv_unified: false,
+            kv_unified: true,
             threads: None,
             threads_batch: None,
             flash_attention: FlashAttention::Auto,
@@ -198,6 +211,7 @@ struct CalibrationCache {
 const ASSESSMENT_RESOLVER_REVISION: &str = "icn-backend-plan-v1";
 const CAPACITY_POLICY_REVISION: &str = "stable-total-reserve-v1";
 const MTP_SELECTOR_REVISION: &str = "icn-mtp-selector-v1";
+const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PlanningWorkerRequest {
@@ -206,6 +220,7 @@ struct PlanningWorkerRequest {
     mtp: Vec<PathBuf>,
     defaults: Vec<RuntimePlanDefaults>,
     estimate_performance: bool,
+    capacity_policy: CapacityPolicy,
     calibration: Option<llama_cpp_2::model::params::fit::FitCalibration>,
     calibration_unavailable: Option<String>,
 }
@@ -296,6 +311,22 @@ impl NativeHardwareAssessor {
         profiles: Vec<ModelPreviewProfile>,
         estimate_performance: bool,
     ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
+        self.assess_resolved_plans_with_policy(
+            resolved,
+            profiles,
+            estimate_performance,
+            CapacityPolicy::default(),
+        )
+        .await
+    }
+
+    async fn assess_resolved_plans_with_policy(
+        &self,
+        resolved: ResolvedModel,
+        profiles: Vec<ModelPreviewProfile>,
+        estimate_performance: bool,
+        capacity_policy: CapacityPolicy,
+    ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
         let id = resolved.model.id.clone();
         let primary = resolved
             .components
@@ -353,6 +384,7 @@ impl NativeHardwareAssessor {
             mtp,
             defaults,
             estimate_performance,
+            capacity_policy,
             calibration,
             calibration_unavailable,
         };
@@ -411,6 +443,506 @@ impl NativeHardwareAssessor {
     }
 }
 
+struct NativeModelEvaluator {
+    models: Arc<ModelManager>,
+    assessor: Arc<NativeHardwareAssessor>,
+}
+
+impl NativeModelEvaluator {
+    fn new(models: Arc<ModelManager>, assessor: Arc<NativeHardwareAssessor>) -> Self {
+        Self { models, assessor }
+    }
+
+    async fn environment_id(&self) -> Result<AssessmentEnvironmentId, InventoryError> {
+        let snapshot = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
+        let mut digest = Sha256::new();
+        digest.update(b"magnitude-assessment-environment-v1\0");
+        digest.update(snapshot.native_build.as_bytes());
+        digest.update(b"\0");
+        digest.update(snapshot.topology_fingerprint.as_bytes());
+        Ok(AssessmentEnvironmentId(format!(
+            "environment_{:x}",
+            digest.finalize()
+        )))
+    }
+
+    fn resolved_for_planning(
+        resolved: &icn_contracts::models::ResolvedModelTarget,
+    ) -> ResolvedModel {
+        let mut target = resolved.target_model.clone();
+        if let Some(draft) = &resolved.draft_model {
+            target
+                .components
+                .extend(draft.components.iter().cloned().map(|mut component| {
+                    component.role = ComponentRole::Draft;
+                    component
+                }));
+        }
+        target
+    }
+
+    async fn assess_profiles(
+        &self,
+        resolved: &icn_contracts::models::ResolvedModelTarget,
+        profiles: &[DomainServingProfile],
+        reserve_bytes: u64,
+        include_performance: bool,
+    ) -> Result<Vec<OfferingAssessment>, InventoryError> {
+        let environment_id = self.environment_id().await?;
+        let evidence = profiles
+            .iter()
+            .map(|profile| {
+                serde_json::to_string(&(
+                    ASSESSMENT_RESOLVER_REVISION,
+                    CAPACITY_POLICY_REVISION,
+                    MTP_SELECTOR_REVISION,
+                    &environment_id.0,
+                    &resolved.target_id.0,
+                    profile.context_length,
+                    profile.parallel_sequences,
+                    reserve_bytes,
+                    include_performance,
+                ))
+                .map_err(|error| InventoryError::Internal(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut results = evidence
+            .iter()
+            .map(|key| self.models.read_offering_assessment(key))
+            .collect::<Vec<_>>();
+        let missing = results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, assessment)| assessment.is_none().then_some(index))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(results
+                .into_iter()
+                .map(|assessment| assessment.expect("cache hit was checked"))
+                .collect());
+        }
+        let native_profiles = missing
+            .iter()
+            .map(|index| ModelPreviewProfile {
+                id: format!("assessment-{index}"),
+                context_length: profiles[*index].context_length,
+                parallel_sequences: profiles[*index].parallel_sequences,
+            })
+            .collect::<Vec<_>>();
+        let assessed = self
+            .assessor
+            .assess_resolved_plans_with_policy(
+                Self::resolved_for_planning(resolved),
+                native_profiles,
+                include_performance,
+                CapacityPolicy {
+                    reserve_bytes_per_domain: reserve_bytes,
+                },
+            )
+            .await?;
+        for (index, assessment) in missing.into_iter().zip(assessed) {
+            let assessment = offering_assessment(
+                &resolved.target_id,
+                profiles[index].clone(),
+                reserve_bytes,
+                assessment,
+            );
+            self.models
+                .write_offering_assessment(&evidence[index], &assessment);
+            results[index] = Some(assessment);
+        }
+        Ok(results
+            .into_iter()
+            .map(|assessment| assessment.expect("missing assessment was populated"))
+            .collect())
+    }
+
+    async fn fit_one(
+        &self,
+        resolved: &icn_contracts::models::ResolvedModelTarget,
+        request: &FitModelsRequest,
+    ) -> Result<FitModelResult, InventoryError> {
+        let target_limit = match &resolved.target {
+            icn_contracts::models::ModelOfferingTarget::Package { package } => {
+                package.properties.maximum_context_length
+            }
+            icn_contracts::models::ModelOfferingTarget::SpeculativeDecodingPair {
+                target, ..
+            } => target.properties.maximum_context_length,
+        };
+        let maximum_context = request
+            .maximum_context_length
+            .min(target_limit)
+            .min(200_000);
+        if maximum_context < request.minimum_context_length {
+            return Ok(FitModelResult::InvalidTarget {
+                request_id: icn_contracts::models::ModelAssessmentRequestId(String::new()),
+                failure: DomainModelFailure {
+                    code: "model_context_limit".to_owned(),
+                    message: format!(
+                        "model context limit is {maximum_context} tokens, below the requested minimum of {}",
+                        request.minimum_context_length
+                    ),
+                    retryable: false,
+                },
+            });
+        }
+
+        let reserve = request
+            .capacity_policy
+            .required_reserve_bytes_per_memory_domain;
+        let mut lower = request.minimum_context_length;
+        let mut upper = maximum_context;
+        let upper_assessment = self
+            .assess_profiles(
+                resolved,
+                &[DomainServingProfile {
+                    context_length: upper,
+                    parallel_sequences: 1,
+                }],
+                reserve,
+                false,
+            )
+            .await?
+            .pop()
+            .expect("one requested profile produces one assessment");
+        let mut best_context =
+            matches!(upper_assessment, OfferingAssessment::Fits { .. }).then_some(upper);
+        if best_context.is_none() {
+            let minimum = self
+                .assess_profiles(
+                    resolved,
+                    &[DomainServingProfile {
+                        context_length: lower,
+                        parallel_sequences: 1,
+                    }],
+                    reserve,
+                    false,
+                )
+                .await?
+                .pop()
+                .expect("one requested profile produces one assessment");
+            if !matches!(minimum, OfferingAssessment::Fits { .. }) {
+                return Ok(match minimum {
+                    OfferingAssessment::DoesNotFit {
+                        limiting_resource,
+                        deficit_bytes,
+                        ..
+                    } => FitModelResult::DoesNotFit {
+                        request_id: icn_contracts::models::ModelAssessmentRequestId(String::new()),
+                        target_id: resolved.target_id.clone(),
+                        limiting_resource,
+                        deficit_bytes,
+                    },
+                    OfferingAssessment::Incompatible { failure, .. } => {
+                        FitModelResult::InvalidTarget {
+                            request_id: icn_contracts::models::ModelAssessmentRequestId(
+                                String::new(),
+                            ),
+                            failure,
+                        }
+                    }
+                    OfferingAssessment::Fits { .. } => unreachable!(),
+                });
+            }
+            best_context = Some(lower);
+            while lower + 1 < upper {
+                let middle = lower + (upper - lower) / 2;
+                let assessment = self
+                    .assess_profiles(
+                        resolved,
+                        &[DomainServingProfile {
+                            context_length: middle,
+                            parallel_sequences: 1,
+                        }],
+                        reserve,
+                        false,
+                    )
+                    .await?
+                    .pop()
+                    .expect("one requested profile produces one assessment");
+                if matches!(assessment, OfferingAssessment::Fits { .. }) {
+                    lower = middle;
+                    best_context = Some(middle);
+                } else {
+                    upper = middle;
+                }
+            }
+        }
+        let context_length = best_context.expect("minimum fitting context was recorded");
+        let parallel_profiles = (1..=request.maximum_parallel_sequences)
+            .map(|parallel_sequences| DomainServingProfile {
+                context_length,
+                parallel_sequences,
+            })
+            .collect::<Vec<_>>();
+        let assessments = self
+            .assess_profiles(resolved, &parallel_profiles, reserve, true)
+            .await?;
+        let Some((profile, assessment)) = parallel_profiles
+            .into_iter()
+            .zip(assessments)
+            .rev()
+            .find(|(_, assessment)| matches!(assessment, OfferingAssessment::Fits { .. }))
+        else {
+            return Err(InventoryError::Internal(
+                "a previously fitting context no longer fits".to_owned(),
+            ));
+        };
+        let configuration_id = serving_configuration_id(&resolved.target_id, &profile);
+        Ok(FitModelResult::Fitted {
+            request_id: icn_contracts::models::ModelAssessmentRequestId(String::new()),
+            target_id: resolved.target_id.clone(),
+            configuration: ModelServingConfiguration {
+                id: configuration_id,
+                target: resolved.target.clone(),
+                profile,
+            },
+            assessment,
+        })
+    }
+}
+
+fn serving_configuration_id(
+    target_id: &icn_contracts::models::ModelOfferingTargetId,
+    profile: &DomainServingProfile,
+) -> ModelServingConfigurationId {
+    let mut digest = Sha256::new();
+    digest.update(b"magnitude-serving-configuration-v1\0");
+    digest.update(target_id.0.as_bytes());
+    digest.update(b"\0");
+    digest.update(profile.context_length.to_le_bytes());
+    digest.update(profile.parallel_sequences.to_le_bytes());
+    ModelServingConfigurationId(format!("configuration_{:x}", digest.finalize()))
+}
+
+fn offering_assessment(
+    target_id: &icn_contracts::models::ModelOfferingTargetId,
+    profile: DomainServingProfile,
+    reserve_bytes: u64,
+    assessment: ModelExecutionAssessment,
+) -> OfferingAssessment {
+    let context_tokens = profile.context_length;
+    let configuration_id = serving_configuration_id(target_id, &profile);
+    let mut digest = Sha256::new();
+    digest.update(b"magnitude-offering-assessment-v1\0");
+    digest.update(target_id.0.as_bytes());
+    digest.update(b"\0");
+    digest.update(profile.context_length.to_le_bytes());
+    digest.update(profile.parallel_sequences.to_le_bytes());
+    digest.update(reserve_bytes.to_le_bytes());
+    let assessment_id = OfferingAssessmentId(format!("assessment_{:x}", digest.finalize()));
+    match assessment.hardware {
+        HardwareAssessment::Fits { memory, .. } => OfferingAssessment::Fits {
+            profile,
+            configuration_id,
+            assessment_id,
+            memory: memory
+                .domains
+                .into_iter()
+                .map(|domain| MemoryAssessment {
+                    memory_domain_id: domain.memory_domain,
+                    capacity_bytes: domain.available_bytes.saturating_add(reserve_bytes),
+                    required_bytes: domain.required_bytes,
+                    required_reserve_bytes: reserve_bytes,
+                    remaining_bytes: domain.margin_bytes,
+                })
+                .collect(),
+            performance: performance_evidence(assessment.performance, context_tokens),
+        },
+        HardwareAssessment::DoesNotFit {
+            memory,
+            limiting_resource,
+            ..
+        } => OfferingAssessment::DoesNotFit {
+            profile,
+            configuration_id,
+            assessment_id,
+            memory: memory
+                .domains
+                .into_iter()
+                .map(|domain| MemoryAssessment {
+                    memory_domain_id: domain.memory_domain,
+                    capacity_bytes: domain.available_bytes.saturating_add(reserve_bytes),
+                    required_bytes: domain.required_bytes,
+                    required_reserve_bytes: reserve_bytes,
+                    remaining_bytes: domain.margin_bytes,
+                })
+                .collect(),
+            limiting_resource,
+            deficit_bytes: memory.deficit_bytes.max(1),
+        },
+        HardwareAssessment::InvalidArtifact { code, message } => OfferingAssessment::Incompatible {
+            profile,
+            configuration_id,
+            failure: DomainModelFailure {
+                code,
+                message,
+                retryable: false,
+            },
+        },
+        HardwareAssessment::IncompatibleArtifact { code, message } => {
+            OfferingAssessment::Incompatible {
+                profile,
+                configuration_id,
+                failure: DomainModelFailure {
+                    code,
+                    message,
+                    retryable: false,
+                },
+            }
+        }
+        HardwareAssessment::NotAssessed { reason } => OfferingAssessment::Incompatible {
+            profile,
+            configuration_id,
+            failure: DomainModelFailure {
+                code: "not_assessed".to_owned(),
+                message: reason,
+                retryable: true,
+            },
+        },
+    }
+}
+
+fn performance_evidence(
+    assessment: GenerationPerformanceAssessment,
+    context_tokens: u32,
+) -> Option<PerformanceEvidence> {
+    match assessment {
+        GenerationPerformanceAssessment::Estimated {
+            method,
+            confidence,
+            points,
+            ..
+        } => points
+            .into_iter()
+            .find(|point| point.context_tokens == context_tokens)
+            .map(|point| PerformanceEvidence {
+                context_tokens: point.context_tokens,
+                lower_tokens_per_second: point.lower_tokens_per_second,
+                estimated_tokens_per_second: point.expected_tokens_per_second,
+                upper_tokens_per_second: point.upper_tokens_per_second,
+                confidence: match confidence {
+                    icn_contracts::GenerationPerformanceConfidence::High => {
+                        PerformanceConfidence::High
+                    }
+                    icn_contracts::GenerationPerformanceConfidence::Moderate => {
+                        PerformanceConfidence::Moderate
+                    }
+                    icn_contracts::GenerationPerformanceConfidence::Low => {
+                        PerformanceConfidence::Low
+                    }
+                },
+                method,
+            }),
+        GenerationPerformanceAssessment::Unavailable { .. } => None,
+    }
+}
+
+impl ModelEvaluator for NativeModelEvaluator {
+    fn assess(
+        &self,
+        request: AssessModelsRequest,
+    ) -> BoxFuture<'_, Result<AssessModelsResponse, InventoryError>> {
+        Box::pin(async move {
+            let environment_id = self.environment_id().await?;
+            let reserve_bytes = request
+                .capacity_policy
+                .required_reserve_bytes_per_memory_domain;
+            let include_performance = request.include_performance;
+            let evaluated = futures_util::stream::iter(request.requests.into_iter().enumerate())
+                .map(|(index, item)| async move {
+                    let request_id = item.request_id;
+                    let result = match self.models.resolve_target(item.target).await {
+                        Ok(resolved) => AssessModelResult::Assessed {
+                            request_id,
+                            target_id: resolved.target_id.clone(),
+                            profiles: self
+                                .assess_profiles(
+                                    &resolved,
+                                    &item.profiles,
+                                    reserve_bytes,
+                                    include_performance,
+                                )
+                                .await?,
+                        },
+                        Err(error) => AssessModelResult::InvalidTarget {
+                            request_id,
+                            failure: DomainModelFailure {
+                                code: "invalid_target".to_owned(),
+                                message: error.to_string(),
+                                retryable: false,
+                            },
+                        },
+                    };
+                    Ok::<_, InventoryError>((index, result))
+                })
+                .buffer_unordered(MODEL_ASSESSMENT_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            let mut results = evaluated.into_iter().collect::<Result<Vec<_>, _>>()?;
+            results.sort_unstable_by_key(|(index, _)| *index);
+            Ok(AssessModelsResponse {
+                environment_id,
+                results: results.into_iter().map(|(_, result)| result).collect(),
+            })
+        })
+    }
+
+    fn fit(
+        &self,
+        request: FitModelsRequest,
+    ) -> BoxFuture<'_, Result<FitModelsResponse, InventoryError>> {
+        Box::pin(async move {
+            if request.minimum_context_length == 0
+                || request.minimum_context_length > request.maximum_context_length
+                || request.maximum_parallel_sequences == 0
+            {
+                return Err(InventoryError::InvalidRequest(
+                    "fit bounds must be positive and ordered".to_owned(),
+                ));
+            }
+            let environment_id = self.environment_id().await?;
+            let mut results = Vec::with_capacity(request.targets.len());
+            for item in &request.targets {
+                let request_id = item.request_id.clone();
+                match self.models.resolve_target(item.target.clone()).await {
+                    Ok(resolved) => {
+                        let mut result = self.fit_one(&resolved, &request).await?;
+                        match &mut result {
+                            FitModelResult::Fitted {
+                                request_id: result_request_id,
+                                ..
+                            }
+                            | FitModelResult::DoesNotFit {
+                                request_id: result_request_id,
+                                ..
+                            }
+                            | FitModelResult::InvalidTarget {
+                                request_id: result_request_id,
+                                ..
+                            } => *result_request_id = request_id,
+                        }
+                        results.push(result);
+                    }
+                    Err(error) => results.push(FitModelResult::InvalidTarget {
+                        request_id,
+                        failure: DomainModelFailure {
+                            code: "invalid_target".to_owned(),
+                            message: error.to_string(),
+                            retryable: false,
+                        },
+                    }),
+                }
+            }
+            Ok(FitModelsResponse {
+                environment_id,
+                results,
+            })
+        })
+    }
+}
+
 fn planner_concurrency() -> usize {
     std::thread::available_parallelism().map_or(1, |cores| cores.get().clamp(1, 16))
 }
@@ -461,8 +993,9 @@ fn assess_planning_request_with_backend(
     } else {
         None
     };
+    let capacity_policy = request.capacity_policy;
     let assess_without_performance = |code: &str, message: String| {
-        icn_hardware::assess_profiles_with_backend(backend, &plans, CapacityPolicy::default()).map(
+        icn_hardware::assess_profiles_with_backend(backend, &plans, capacity_policy).map(
             |assessments| {
                 assessments
                     .into_iter()
@@ -478,7 +1011,7 @@ fn assess_planning_request_with_backend(
         Some(Ok(calibration)) => icn_hardware::assess_execution_profiles_with_backend(
             backend,
             &plans,
-            CapacityPolicy::default(),
+            capacity_policy,
             calibration,
         )
         .or_else(|error| {
@@ -487,18 +1020,17 @@ fn assess_planning_request_with_backend(
         Some(Err(calibration_error)) => {
             assess_without_performance("calibration_failed", calibration_error.clone())
         }
-        None => {
-            icn_hardware::assess_profiles_with_backend(backend, &plans, CapacityPolicy::default())
-                .map(|assessments| {
-                    assessments
-                        .into_iter()
-                        .map(|hardware| ModelExecutionAssessment {
-                            hardware,
-                            performance: GenerationPerformanceAssessment::not_requested(),
-                        })
-                        .collect()
-                })
-        }
+        None => icn_hardware::assess_profiles_with_backend(backend, &plans, capacity_policy).map(
+            |assessments| {
+                assessments
+                    .into_iter()
+                    .map(|hardware| ModelExecutionAssessment {
+                        hardware,
+                        performance: GenerationPerformanceAssessment::not_requested(),
+                    })
+                    .collect()
+            },
+        ),
     }?;
     let assessments = plans
         .iter_mut()
@@ -517,8 +1049,7 @@ fn assess_planning_request_with_backend(
                 return Ok(base);
             }
             let hardware =
-                icn_hardware::assess_with_backend(backend, plan, CapacityPolicy::default())?
-                    .assessment;
+                icn_hardware::assess_with_backend(backend, plan, capacity_policy)?.assessment;
             let performance = if matches!(hardware, HardwareAssessment::Fits { .. }) {
                 // Phase 1 intentionally estimates baseline target-model decode. MTP changes fit
                 // memory but is not credited with an unmeasured speculative-decoding speedup.
@@ -891,7 +1422,6 @@ struct NativeRuntimeController {
     defaults: RuntimePlanDefaults,
     state: Arc<tokio::sync::RwLock<RuntimeState>>,
     mutation: Arc<tokio::sync::Mutex<()>>,
-    next_operation: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -899,21 +1429,14 @@ struct RuntimeFailure {
     code: &'static str,
     message: String,
     retryable: bool,
-    runtime_lost: bool,
 }
 
 impl RuntimeFailure {
-    fn new(
-        code: &'static str,
-        message: impl Into<String>,
-        retryable: bool,
-        runtime_lost: bool,
-    ) -> Self {
+    fn new(code: &'static str, message: impl Into<String>, retryable: bool) -> Self {
         Self {
             code,
             message: message.into(),
             retryable,
-            runtime_lost,
         }
     }
 }
@@ -935,29 +1458,37 @@ impl From<InventoryError> for RuntimeTransitionFailure {
             "runtime_transition_failed",
             message,
             true,
-            true,
         ))
     }
 }
 
-struct RuntimeProgress {
-    sender: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
-    operation_id: String,
-    model_id: String,
-}
-
-impl RuntimeProgress {
-    fn emit(&self, stage: ModelLoadStage, fraction: Option<f32>) {
-        let _ = self.sender.send(ModelLoadEvent::Progress {
-            operation_id: self.operation_id.clone(),
-            model_id: self.model_id.clone(),
-            stage,
-            fraction,
-        });
-    }
-}
-
 impl NativeRuntimeController {
+    fn load_failure(error: InventoryError) -> DomainModelFailure {
+        let (code, retryable) = match &error {
+            InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
+            InventoryError::InvalidRequest(_) => ("invalid_request".to_owned(), false),
+            InventoryError::NotFound(_) => ("not_found".to_owned(), false),
+            InventoryError::NotReady(_) => ("not_ready".to_owned(), true),
+            InventoryError::Busy(_) => ("busy".to_owned(), true),
+            InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
+            InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
+            InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
+            InventoryError::Io(_) => ("io_failed".to_owned(), true),
+            InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
+            InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
+            InventoryError::ConcurrentMutation(_) => ("concurrent_mutation".to_owned(), true),
+            InventoryError::Runtime {
+                code, retryable, ..
+            } => (code.clone(), *retryable),
+            InventoryError::Internal(_) => ("internal".to_owned(), true),
+        };
+        DomainModelFailure {
+            code,
+            message: error.to_string(),
+            retryable,
+        }
+    }
+
     fn new(
         backends: BackendRegistry,
         inventory: Arc<ModelManager>,
@@ -974,47 +1505,7 @@ impl NativeRuntimeController {
             defaults,
             state: Arc::new(tokio::sync::RwLock::new(initial)),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
-            next_operation: Arc::new(AtomicU64::new(1)),
         }
-    }
-
-    async fn emit(
-        sender: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
-        event: ModelLoadEvent,
-    ) -> bool {
-        sender.send(event).is_ok()
-    }
-
-    async fn fail(
-        &self,
-        sender: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
-        operation_id: String,
-        model_id: String,
-        failure: RuntimeFailure,
-    ) {
-        tracing::error!(
-            operation.id = %operation_id,
-            model.id = %model_id,
-            error.code = failure.code,
-            error.message = %failure.message,
-            error.retryable = failure.retryable,
-            runtime.lost = failure.runtime_lost,
-            "runtime model operation failed"
-        );
-        if failure.runtime_lost {
-            *self.state.write().await = RuntimeState { resident: None };
-        }
-        let _ = Self::emit(
-            sender,
-            ModelLoadEvent::Failed {
-                operation_id,
-                model_id,
-                code: failure.code.to_owned(),
-                message: failure.message,
-                retryable: failure.retryable,
-            },
-        )
-        .await;
     }
 
     fn profile_defaults(
@@ -1027,15 +1518,50 @@ impl NativeRuntimeController {
         Ok(defaults)
     }
 
-    async fn resolved_load(
+    async fn resolved_configuration_load(
         &self,
-        model_id: &str,
-        profile: &RuntimeExecutionProfile,
-    ) -> Result<(ResolvedModel, ExecutionIntent, MtpCandidateSelection), InventoryError> {
-        let id = ModelId::parse(model_id.to_owned())?;
-        self.inventory.ensure_model_inventory().await?;
-        let resolved = self.inventory.resolve_ready(&id).await?;
-        let primary = resolved
+        configuration: &ModelServingConfiguration,
+    ) -> Result<
+        (
+            ResolvedModel,
+            ExecutionIntent,
+            MtpCandidateSelection,
+            Vec<ModelPackageId>,
+        ),
+        InventoryError,
+    > {
+        let (target, package_ids) = match &configuration.target {
+            DomainModelOfferingTarget::Package { package } => (
+                ModelTargetInput::Package {
+                    package: ModelPackageOperand::Installed {
+                        package_id: package.id.clone(),
+                    },
+                },
+                vec![package.id.clone()],
+            ),
+            DomainModelOfferingTarget::SpeculativeDecodingPair { target, draft, .. } => (
+                ModelTargetInput::SpeculativeDecodingPair {
+                    target: ModelPackageOperand::Installed {
+                        package_id: target.id.clone(),
+                    },
+                    draft: ModelPackageOperand::Installed {
+                        package_id: draft.id.clone(),
+                    },
+                },
+                vec![target.id.clone(), draft.id.clone()],
+            ),
+        };
+        let resolved = self.inventory.resolve_target(target).await?;
+        let mut model = resolved.target_model;
+        if let Some(draft) = resolved.draft_model {
+            model
+                .components
+                .extend(draft.components.into_iter().map(|mut component| {
+                    component.role = ComponentRole::Draft;
+                    component
+                }));
+        }
+        let primary = model
             .components
             .iter()
             .filter(|component| {
@@ -1047,47 +1573,49 @@ impl NativeRuntimeController {
             .min_by_key(|component| component.shard_index.unwrap_or(0))
             .map(|component| component.path.clone())
             .ok_or_else(|| InventoryError::NotReady("model has no runnable weights".into()))?;
-        let projector = resolved
+        let projector = model
             .components
             .iter()
             .find(|component| component.role == ComponentRole::Projector)
             .map(|component| component.path.clone());
-        let mtp = resolved
+        let mtp = model
             .components
             .iter()
             .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
             .map(|component| component.path.clone())
             .collect();
-        let defaults = self.profile_defaults(profile)?;
+        let defaults = self.profile_defaults(&RuntimeExecutionProfile {
+            context_length: configuration.profile.context_length,
+            parallel_sequences: configuration.profile.parallel_sequences,
+        })?;
         let plan = execution_intent(primary, projector, &defaults).map_err(|error| {
             InventoryError::Internal(format!("failed to resolve runtime intent: {error:#}"))
         })?;
-        Ok((resolved, plan, MtpCandidateSelection::Automatic(mtp)))
+        Ok((
+            model,
+            plan,
+            MtpCandidateSelection::Automatic(mtp),
+            package_ids,
+        ))
     }
 
     #[tracing::instrument(
         name = "icn.runtime.load.operation",
         skip_all,
-        fields(operation.id = %progress.operation_id, model.id = %progress.model_id)
+        fields(model.configuration.id = %configuration_id)
     )]
-    async fn perform_transition(
+    async fn perform_prepared_transition(
         self,
-        progress: RuntimeProgress,
-    ) -> Result<(), RuntimeTransitionFailure> {
-        let model_id = progress.model_id.clone();
+        configuration_id: String,
+        profile: RuntimeExecutionProfile,
+        resolved: ResolvedModel,
+        plan: ExecutionIntent,
+        mtp_selection: MtpCandidateSelection,
+        package_ids: Vec<ModelPackageId>,
+        events: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
+    ) -> Result<RuntimeResidencyId, RuntimeTransitionFailure> {
+        let model_id = configuration_id;
         let existing = self.state.read().await.clone();
-        let profile = match self.load_profile(&model_id).await {
-            Ok(profile) => profile,
-            Err(error) => {
-                let message = error.to_string();
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "model_unavailable",
-                    message,
-                    false,
-                    false,
-                )));
-            }
-        };
 
         if existing
             .resident
@@ -1096,63 +1624,44 @@ impl NativeRuntimeController {
         {
             if let Some(lease) = self.backends.lease() {
                 drop(lease);
-                return Ok(());
+                let residency_id = existing
+                    .resident
+                    .expect("matching resident was checked")
+                    .residency_id;
+                return Ok(RuntimeResidencyId(residency_id));
             }
         };
         let _backend_mutation = self.backends.begin_mutation().await;
 
-        for stage in [ModelLoadStage::Queued, ModelLoadStage::Resolving] {
-            progress.emit(stage, None);
+        if existing.resident.is_some() {
+            let _ = events.send(ModelLoadEvent::Progress {
+                stage: ModelLoadStage::Unloading,
+                fraction: None,
+            });
         }
-
-        let (resolved, plan, mtp_selection) = match self.resolved_load(&model_id, &profile).await {
-            Ok(value) => value,
-            Err(error) => {
-                let message = error.to_string();
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "model_unavailable",
-                    message,
-                    false,
-                    false,
-                )));
-            }
-        };
-        progress.emit(ModelLoadStage::Assessing, None);
-
         *self.state.write().await = RuntimeState { resident: None };
 
-        progress.emit(ModelLoadStage::Unloading, None);
         if let Ok(mut slot) = self.native_executor.write() {
             *slot = None;
         }
         self.backends.clear();
 
-        progress.emit(ModelLoadStage::Loading, None);
         let load_model_id = model_id.clone();
         let native_backend = self.native_backend.clone();
-        let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let progress_events = events.clone();
+        let _ = events.send(ModelLoadEvent::Progress {
+            stage: ModelLoadStage::Loading,
+            fraction: Some(0.0),
+        });
         let load_task = spawn_blocking_traced(move || {
-            let mut last_reported = -1.0_f32;
             native_backend.load_with_progress(load_model_id, plan, mtp_selection, move |fraction| {
-                let fraction = fraction.clamp(0.0, 1.0);
-                if fraction >= 1.0 || fraction - last_reported >= 0.005 {
-                    last_reported = fraction;
-                    let _ = progress_sender.send(fraction);
-                }
+                let _ = progress_events.send(ModelLoadEvent::Progress {
+                    stage: ModelLoadStage::Loading,
+                    fraction: Some(fraction),
+                });
             })
         });
-        tokio::pin!(load_task);
-        let load_result = loop {
-            tokio::select! {
-                result = &mut load_task => break result,
-                load_progress = progress_receiver.recv() => {
-                    let Some(fraction) = load_progress else {
-                        break load_task.await;
-                    };
-                    progress.emit(ModelLoadStage::Loading, Some(fraction));
-                }
-            }
-        };
+        let load_result = load_task.await;
         let backend = match load_result {
             Ok(Ok(backend)) => Arc::new(backend),
             Ok(Err(error)) => {
@@ -1167,7 +1676,7 @@ impl NativeRuntimeController {
                             ("incompatible_artifact", false)
                         }
                         HardwareAssessment::NotAssessed { .. } => ("planner_failed", true),
-                        HardwareAssessment::Fits { .. } => ("planner_invariant", false),
+                        HardwareAssessment::Fits { .. } => ("planner_invariant", true),
                     },
                     ModelLoadError::MemoryAttribution(_) => ("memory_attribution_failed", true),
                     ModelLoadError::Backend(_) => ("backend_load_failed", true),
@@ -1176,7 +1685,6 @@ impl NativeRuntimeController {
                     code,
                     error.to_string(),
                     retryable,
-                    true,
                 )));
             }
             Err(error) => {
@@ -1184,19 +1692,20 @@ impl NativeRuntimeController {
                     "load_task_failed",
                     error.to_string(),
                     true,
-                    true,
                 )));
             }
         };
-        progress.emit(ModelLoadStage::Verifying, None);
+        let _ = events.send(ModelLoadEvent::Progress {
+            stage: ModelLoadStage::Verifying,
+            fraction: None,
+        });
         match backend.properties() {
             Ok(_) => {}
             Err(error) => {
                 return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
                     "verification_failed",
                     error.to_string(),
-                    true,
-                    true,
+                    false,
                 )));
             }
         }
@@ -1212,31 +1721,18 @@ impl NativeRuntimeController {
                 backend: Arc::clone(&backend),
             });
         }
+        let residency_id = format!("residency-{model_id}-{generation}");
         let state = RuntimeState {
             resident: Some(ResidentTarget {
                 model_id: model_id.clone(),
+                residency_id: residency_id.clone(),
                 profile,
+                package_ids,
             }),
         };
         *self.state.write().await = state.clone();
         tracing::info!("runtime model ready");
-        Ok(())
-    }
-
-    async fn load_profile(
-        &self,
-        model_id: &str,
-    ) -> Result<RuntimeExecutionProfile, InventoryError> {
-        let id = ModelId::parse(model_id.to_owned())?;
-        self.inventory.ensure_model_inventory().await?;
-        let model = self.inventory.get(&id).await?;
-        let configuration = model.serving_configuration.ok_or_else(|| {
-            InventoryError::NotReady("model has no serving configuration".to_owned())
-        })?;
-        Ok(RuntimeExecutionProfile {
-            context_length: configuration.profile.context_length,
-            parallel_sequences: configuration.profile.parallel_sequences,
-        })
+        Ok(RuntimeResidencyId(residency_id))
     }
 
     async fn unload_resident_with_admission_closed(
@@ -1269,84 +1765,95 @@ impl NativeRuntimeController {
 }
 
 impl RuntimeController for NativeRuntimeController {
-    fn load(&self, model_id: String) -> BoxStream<'static, ModelLoadEvent> {
-        let operation_id = format!(
-            "runtime-{}",
-            self.next_operation.fetch_add(1, Ordering::Relaxed)
-        );
-        let runtime = self.clone();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(
-            async move {
-                let _guard = runtime.mutation.lock().await;
-                let failure_runtime = runtime.clone();
-                let failure_sender = sender.clone();
-                let failure_operation_id = operation_id.clone();
-                let failure_model_id = model_id.clone();
-                let progress = RuntimeProgress {
-                    sender,
-                    operation_id: operation_id.clone(),
-                    model_id: model_id.clone(),
+    fn load_configuration(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent> {
+        let controller = self.clone();
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let _ = events.send(ModelLoadEvent::Progress {
+                stage: ModelLoadStage::Queued,
+                fraction: None,
+            });
+            let _guard = controller.mutation.lock().await;
+            let configuration = request.configuration;
+            let _ = events.send(ModelLoadEvent::Progress {
+                stage: ModelLoadStage::Resolving,
+                fraction: None,
+            });
+            let (resolved, plan, mtp_selection, package_ids) =
+                match controller.resolved_configuration_load(&configuration).await {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = events.send(ModelLoadEvent::Failed {
+                            failure: Self::load_failure(error),
+                        });
+                        return;
+                    }
                 };
-                match runtime.clone().perform_transition(progress).await {
-                    Ok(()) => {
-                        let _ = Self::emit(
-                            &failure_sender,
-                            ModelLoadEvent::Ready {
-                                operation_id: failure_operation_id,
-                                model_id: failure_model_id,
-                            },
-                        )
-                        .await;
-                    }
-                    Err(failure) => {
-                        failure_runtime
-                            .fail(
-                                &failure_sender,
-                                failure_operation_id,
-                                failure_model_id,
-                                failure.event,
-                            )
-                            .await;
-                    }
-                }
-            }
-            .in_current_span(),
-        );
-        tokio_stream::wrappers::UnboundedReceiverStream::new(receiver).boxed()
-    }
-
-    fn lease(
-        &self,
-        model_id: String,
-    ) -> BoxFuture<'_, Result<icn_api::BackendLease, InventoryError>> {
-        Box::pin(async move {
-            let _guard = self.mutation.lock().await;
-            let resident = self.state.read().await.clone();
-            if resident
-                .resident
-                .as_ref()
-                .is_none_or(|resident| resident.model_id != model_id)
+            let profile = RuntimeExecutionProfile {
+                context_length: configuration.profile.context_length,
+                parallel_sequences: configuration.profile.parallel_sequences,
+            };
+            let residency_id = match controller
+                .clone()
+                .perform_prepared_transition(
+                    configuration.id.0.clone(),
+                    profile,
+                    resolved,
+                    plan,
+                    mtp_selection,
+                    package_ids,
+                    events.clone(),
+                )
+                .await
             {
-                return Err(InventoryError::NotReady(format!(
-                    "model {model_id} is not loaded"
-                )));
-            }
-            self.backends.lease().ok_or_else(|| {
-                InventoryError::NotReady(format!("model {model_id} is not available for inference"))
-            })
-        })
+                Ok(residency_id) => residency_id,
+                Err(failure) => {
+                    let _ = events.send(ModelLoadEvent::Failed {
+                        failure: DomainModelFailure {
+                            code: failure.event.code.to_owned(),
+                            message: failure.event.message,
+                            retryable: failure.event.retryable,
+                        },
+                    });
+                    return;
+                }
+            };
+            let mut digest = Sha256::new();
+            digest.update(b"magnitude-runtime-execution-evidence-v1\0");
+            digest.update(configuration.id.0.as_bytes());
+            digest.update(b"\0");
+            digest.update(residency_id.0.as_bytes());
+            let _ = events.send(ModelLoadEvent::Ready {
+                ready: LoadModelReady {
+                    residency_id,
+                    configuration_id: configuration.id,
+                    execution_evidence_id: format!("execution_{:x}", digest.finalize()),
+                },
+            });
+        });
+        UnboundedReceiverStream::new(receiver).boxed()
     }
 
-    fn unload(&self, model_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
+    fn unload_residency(&self, residency_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
         Box::pin(async move {
             let _guard = self.mutation.lock().await;
-            self.unload_resident_locked(&model_id).await?;
+            let resident = self
+                .state
+                .read()
+                .await
+                .resident
+                .clone()
+                .filter(|resident| resident.residency_id == residency_id)
+                .ok_or_else(|| InventoryError::NotFound(residency_id.clone()))?;
+            self.unload_resident_locked(&resident.model_id).await?;
             Ok(())
         })
     }
 
-    fn delete(&self, model_id: String) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
+    fn remove_installed(
+        &self,
+        package_id: ModelPackageId,
+    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
         Box::pin(async move {
             let _guard = self.mutation.lock().await;
             if self
@@ -1355,12 +1862,35 @@ impl RuntimeController for NativeRuntimeController {
                 .await
                 .resident
                 .as_ref()
-                .is_some_and(|resident| resident.model_id == model_id)
+                .is_some_and(|resident| resident.package_ids.contains(&package_id))
             {
-                return Err(InventoryError::Loaded(model_id));
+                return Err(InventoryError::Loaded(package_id.0));
             }
-            let id = ModelId::parse(model_id)?;
-            self.inventory.delete(&id).await
+            self.inventory.remove_installed(&package_id).await
+        })
+    }
+
+    fn lease(
+        &self,
+        configuration_id: String,
+    ) -> BoxFuture<'_, Result<icn_api::BackendLease, InventoryError>> {
+        Box::pin(async move {
+            let _guard = self.mutation.lock().await;
+            let resident = self.state.read().await.clone();
+            if resident
+                .resident
+                .as_ref()
+                .is_none_or(|resident| resident.model_id != configuration_id)
+            {
+                return Err(InventoryError::NotReady(format!(
+                    "configuration {configuration_id} is not loaded"
+                )));
+            }
+            self.backends.lease().ok_or_else(|| {
+                InventoryError::NotReady(format!(
+                    "configuration {configuration_id} is not available for inference"
+                ))
+            })
         })
     }
 }
@@ -1418,6 +1948,15 @@ async fn main() -> anyhow::Result<()> {
                 inventory.clone(),
                 inventory_hardware_assessor.clone(),
             ));
+            let recommendable_catalog = Arc::new(NativeRecommendableCatalog::new(
+                inventory.clone(),
+                previewer.clone(),
+            ));
+            let model_evaluator = Arc::new(NativeModelEvaluator::new(
+                inventory.clone(),
+                inventory_hardware_assessor.clone(),
+            ));
+            let model_downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()));
             let backends = BackendRegistry::empty();
             if fake {
                 let model_id = "icn-fake".to_owned();
@@ -1445,10 +1984,12 @@ async fn main() -> anyhow::Result<()> {
                 ))
             });
             let mut state = AppState::model_free(backends)
-                .with_inventory(inventory)
+                .with_installed_packages(inventory)
                 .with_hardware(inventory_hardware_assessor)
-                .with_previewer(previewer.clone())
+                .with_model_evaluator(model_evaluator)
+                .with_model_downloads(model_downloads)
                 .with_hugging_face_catalog(previewer)
+                .with_recommendable_catalog(recommendable_catalog)
                 .with_identity(identity);
             if let Some(runtime) = runtime {
                 state = state.with_runtime(runtime);
@@ -1590,6 +2131,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icn_contracts::ModelInventory as _;
+
+    #[test]
+    fn performance_evidence_preserves_the_exact_requested_context_and_bounds() {
+        let evidence = performance_evidence(
+            GenerationPerformanceAssessment::Estimated {
+                method: "native".to_owned(),
+                confidence: icn_contracts::GenerationPerformanceConfidence::Moderate,
+                workload: "baseline_single_sequence_decode".to_owned(),
+                always_active_weight_bytes: 10,
+                routed_expert_weight_bytes: 80,
+                expert_count: 8,
+                expert_used_count: 2,
+                cross_memory_domain_placement: true,
+                points: vec![
+                    icn_contracts::GenerationSpeedPoint {
+                        context_tokens: 100_000,
+                        kv_bytes_read_per_token: 4_096,
+                        lower_tokens_per_second: 20.0,
+                        expected_tokens_per_second: 24.0,
+                        upper_tokens_per_second: 28.0,
+                    },
+                    icn_contracts::GenerationSpeedPoint {
+                        context_tokens: 200_000,
+                        kv_bytes_read_per_token: 8_192,
+                        lower_tokens_per_second: 15.0,
+                        expected_tokens_per_second: 18.0,
+                        upper_tokens_per_second: 21.0,
+                    },
+                ],
+            },
+            100_000,
+        )
+        .expect("matching performance evidence");
+
+        assert_eq!(evidence.context_tokens, 100_000);
+        assert_eq!(evidence.lower_tokens_per_second, 20.0);
+        assert_eq!(evidence.estimated_tokens_per_second, 24.0);
+        assert_eq!(evidence.upper_tokens_per_second, 28.0);
+        assert_eq!(evidence.confidence, PerformanceConfidence::Moderate);
+        assert_eq!(evidence.method, "native");
+    }
 
     fn parity_test_defaults() -> RuntimePlanDefaults {
         RuntimePlanDefaults {
