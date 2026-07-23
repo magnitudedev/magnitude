@@ -1,22 +1,29 @@
-import { Effect, Option } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   LocalModelAvailableForDownload,
   LocalModelDownloading,
   LocalModelIdSchema,
+  ModelSlotBlocked,
   ModelSlotLoadingLocalModel,
   ModelSlotReady,
+  ModelSlotsStateSchema,
   ModelSlotUnloadedLocalModel,
   ModelSlotUnloadingLocalModel,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
+  SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
 import {
+  applyLocalModelLoadProgress,
+  applyLocalModelLoadingStage,
+  applyReplacedLocalModelStage,
   isModelSlotLoadSatisfied,
   isModelSlotUnloadSatisfied,
   recoverRecentLocalSelection,
+  reconcileAvailableLocalSlot,
 } from "./model-slot-coordinator"
 import { transitionLocalInventoryEntry } from "./local-model-inventory"
 
@@ -111,6 +118,82 @@ describe("ACN model-state transitions", () => {
       slotId: PRIMARY_SLOT_ID,
       selection: localSelection,
     }))).toBe(true)
+  })
+
+  it("projects real ICN load fractions into monotonic slot percentages", () => {
+    const unloaded = new ModelSlotUnloadedLocalModel({
+      slotId: PRIMARY_SLOT_ID,
+      selection: localSelection,
+    })
+    const started = applyLocalModelLoadProgress(unloaded, 0)
+    const advanced = started._tag === "Unassigned"
+      ? started
+      : applyLocalModelLoadProgress(started, 0.816)
+    const stale = advanced._tag === "Unassigned"
+      ? advanced
+      : applyLocalModelLoadProgress(advanced, 0.2825)
+
+    expect(started).toMatchObject({ _tag: "LoadingLocalModel", percentage: 0 })
+    expect(advanced).toMatchObject({ _tag: "LoadingLocalModel", percentage: 82 })
+    expect(stale).toMatchObject({ _tag: "LoadingLocalModel", percentage: 82 })
+  })
+
+  it("unloads a ready local slot when the singleton backend is replaced", () => {
+    const replacementModelId = ProviderModelIdSchema.make("local:replacement")
+    const ready = new ModelSlotReady({
+      slotId: PRIMARY_SLOT_ID,
+      selection: localSelection,
+    })
+    const unloading = applyReplacedLocalModelStage(ready, replacementModelId, "unloading")
+    const unloaded = applyReplacedLocalModelStage(unloading, replacementModelId, "unloaded")
+    const replacement = new ModelSlotLoadingLocalModel({
+      slotId: SECONDARY_SLOT_ID,
+      selection: { ...localSelection, providerModelId: replacementModelId },
+      percentage: 40,
+    })
+
+    expect(unloading).toMatchObject({ _tag: "UnloadingLocalModel" })
+    expect(unloaded).toMatchObject({ _tag: "UnloadedLocalModel" })
+    expect(applyReplacedLocalModelStage(replacement, replacementModelId, "unloaded")).toBe(replacement)
+  })
+
+  it("keeps every replacement-stage slot snapshot schema-valid", () => {
+    const replacementModelId = ProviderModelIdSchema.make("local:replacement")
+    const replacementSelection = { ...localSelection, providerModelId: replacementModelId }
+    const ready = new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection: localSelection })
+    const replacement = new ModelSlotUnloadedLocalModel({
+      slotId: SECONDARY_SLOT_ID,
+      selection: replacementSelection,
+    })
+    const unloading = {
+      slots: {
+        primary: applyReplacedLocalModelStage(ready, replacementModelId, "unloading"),
+        secondary: replacement,
+      },
+    }
+    const loading = {
+      slots: {
+        primary: applyLocalModelLoadingStage(unloading.slots.primary, replacementModelId, null),
+        secondary: applyLocalModelLoadingStage(unloading.slots.secondary, replacementModelId, null),
+      },
+    }
+
+    expect(Schema.is(ModelSlotsStateSchema)(unloading)).toBe(true)
+    expect(Schema.is(ModelSlotsStateSchema)(loading)).toBe(true)
+    expect(loading.slots.primary).toMatchObject({ _tag: "UnloadedLocalModel" })
+    expect(loading.slots.secondary).toMatchObject({ _tag: "LoadingLocalModel", percentage: 0 })
+  })
+
+  it("clears a transient availability block after the selected local model becomes valid", () => {
+    const blocked = new ModelSlotBlocked({
+      slotId: PRIMARY_SLOT_ID,
+      selection: localSelection,
+      reason: { _tag: "ProviderUnavailable", message: "Local model inventory is loading" },
+    })
+
+    expect(reconcileAvailableLocalSlot(PRIMARY_SLOT_ID, localSelection, Option.some(blocked))).toEqual(
+      new ModelSlotUnloadedLocalModel({ slotId: PRIMARY_SLOT_ID, selection: localSelection }),
+    )
   })
 
   it("recovers a missing local selection from per-slot recency even when the model is unloaded", () => {

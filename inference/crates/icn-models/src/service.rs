@@ -6,29 +6,24 @@ use fs2::FileExt;
 use futures_util::future::BoxFuture;
 use icn_contracts::{
     DeletePlan, DeletedModel, DownloadEventStream, DownloadModelRequest, InventoryError,
-    InventoryModel, ModelAvailability, ModelId, ModelInventory, ModelLocation, ModelResidency,
-    ModelSource, ResolvedComponent, ResolvedModel, ServingProfile,
+    InventoryModel, ModelAvailability, ModelId, ModelInventory, ModelLocation, ModelSource,
+    ResolvedComponent, ResolvedModel, ServingProfile,
 };
 
 use crate::download::blob_key;
-use crate::inventory::{ModelManager, RuntimeResidency, hf_repo_dir, now};
+use crate::inventory::{ModelManager, hf_repo_dir, now};
 use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationManifest};
 
 impl ModelInventory for ModelManager {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>> {
         Box::pin(async move {
             self.ensure_model_inventory().await?;
-            let residencies = self
-                .residencies
-                .read()
-                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
-                .clone();
             let mut models = self
                 .models
                 .read()
                 .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
                 .values()
-                .map(|model| model_with_residency(model, residencies.get(&model.id)))
+                .cloned()
                 .collect::<Vec<_>>();
             models.sort_by(|left, right| {
                 status_rank(left)
@@ -50,11 +45,7 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            let residencies = self
-                .residencies
-                .read()
-                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?;
-            Ok(model_with_residency(&model, residencies.get(&id)))
+            Ok(model)
         })
     }
 
@@ -75,13 +66,6 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            let residency = self
-                .residencies
-                .read()
-                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned();
-            let model = model_with_residency(&model, residency.as_ref());
             ensure_deletable_status(&model)?;
             if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
                 return plan_interrupted_delete(&self.config.root, &model);
@@ -123,13 +107,6 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            let residency = self
-                .residencies
-                .read()
-                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned();
-            let model = model_with_residency(&model, residency.as_ref());
             ensure_deletable_status(&model)?;
             if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
                 let plan = plan_interrupted_delete(&self.config.root, &model)?;
@@ -195,45 +172,11 @@ impl ModelInventory for ModelManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            let residencies = self
-                .residencies
-                .read()
-                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?;
-            let model = model_with_residency(&model, residencies.get(&id));
             if !matches!(model.availability, ModelAvailability::Available { .. }) {
                 return Err(InventoryError::NotReady(id.0.clone()));
             }
             let components = resolve_components(&self.config.root, &model)?;
             Ok(ResolvedModel { model, components })
-        })
-    }
-
-    fn update_residency(
-        &self,
-        id: &ModelId,
-        residency: ModelResidency,
-    ) -> BoxFuture<'_, Result<(), InventoryError>> {
-        let id = id.clone();
-        Box::pin(async move {
-            if !self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .contains_key(&id)
-            {
-                return Err(InventoryError::NotFound(id.0));
-            }
-            self.residencies
-                .write()
-                .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
-                .insert(
-                    id,
-                    RuntimeResidency {
-                        state: residency,
-                        updated_at: now(),
-                    },
-                );
-            Ok(())
         })
     }
 
@@ -244,63 +187,6 @@ impl ModelInventory for ModelManager {
     ) -> BoxFuture<'_, Result<InventoryModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move { self.configure_serving_model(&id, profile).await })
-    }
-}
-
-pub(crate) fn model_with_residency(
-    model: &InventoryModel,
-    residency: Option<&RuntimeResidency>,
-) -> InventoryModel {
-    let mut model = model.clone();
-    if let Some(residency) = residency {
-        model.residency = residency.state.clone();
-        model.updated_at = model.updated_at.max(residency.updated_at);
-    } else {
-        model.residency = ModelResidency::NotResident;
-    }
-    model.operations = operations_for(&model);
-    model
-}
-
-fn operations_for(model: &InventoryModel) -> Vec<icn_contracts::ModelOperation> {
-    use icn_contracts::ModelOperation;
-    match (&model.availability, &model.residency) {
-        (
-            ModelAvailability::Available { .. },
-            ModelResidency::NotResident | ModelResidency::LoadFailed { .. },
-        ) => {
-            let mut operations = vec![ModelOperation::Load];
-            if matches!(
-                model.location,
-                ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. }
-            ) {
-                operations.push(ModelOperation::Delete);
-            }
-            operations
-        }
-        (ModelAvailability::Available { .. }, ModelResidency::Loaded { .. }) => {
-            vec![ModelOperation::Unload]
-        }
-        (ModelAvailability::Interrupted { .. }, _) => vec![ModelOperation::Delete],
-        (
-            ModelAvailability::InvalidArtifact { .. }
-            | ModelAvailability::IncompatibleArtifact { .. },
-            _,
-        ) => {
-            if matches!(
-                model.location,
-                ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. }
-            ) {
-                vec![ModelOperation::Delete]
-            } else {
-                Vec::new()
-            }
-        }
-        (ModelAvailability::Downloading { .. }, _)
-        | (
-            ModelAvailability::Available { .. },
-            ModelResidency::Loading { .. } | ModelResidency::Unloading { .. },
-        ) => Vec::new(),
     }
 }
 
@@ -402,7 +288,6 @@ pub(crate) fn reconcile_tombstones(root: &Path) -> Result<(), InventoryError> {
             availability: ModelAvailability::Available {
                 ready_at: manifest.ready_at,
             },
-            residency: ModelResidency::NotResident,
             source: ModelSource::HuggingFace {
                 repository: manifest.repository.clone(),
                 requested_revision: manifest.requested_revision.clone(),
@@ -506,33 +391,18 @@ fn finish_managed_tombstone(
 }
 
 fn status_rank(model: &InventoryModel) -> u8 {
-    match (&model.availability, &model.residency) {
-        (ModelAvailability::Available { .. }, ModelResidency::Loaded { .. }) => 0,
-        (
-            ModelAvailability::Available { .. },
-            ModelResidency::Loading { .. } | ModelResidency::Unloading { .. },
-        ) => 1,
-        (ModelAvailability::Downloading { .. }, _) => 2,
-        (ModelAvailability::Interrupted { .. }, _) => 3,
-        (ModelAvailability::Available { .. }, ModelResidency::NotResident) => 4,
-        (
-            ModelAvailability::InvalidArtifact { .. }
-            | ModelAvailability::IncompatibleArtifact { .. },
-            _,
-        ) => 5,
-        (ModelAvailability::Available { .. }, ModelResidency::LoadFailed { .. }) => 6,
+    match &model.availability {
+        ModelAvailability::Available { .. } => 0,
+        ModelAvailability::Downloading { .. } => 1,
+        ModelAvailability::Interrupted { .. } => 2,
+        ModelAvailability::InvalidArtifact { .. }
+        | ModelAvailability::IncompatibleArtifact { .. } => 3,
     }
 }
 
 fn ensure_deletable_status(model: &InventoryModel) -> Result<(), InventoryError> {
-    match (&model.availability, &model.residency) {
-        (ModelAvailability::Downloading { .. }, _) => Err(InventoryError::Busy(model.id.0.clone())),
-        (
-            _,
-            ModelResidency::Loading { .. }
-            | ModelResidency::Loaded { .. }
-            | ModelResidency::Unloading { .. },
-        ) => Err(InventoryError::Loaded(model.id.0.clone())),
+    match model.availability {
+        ModelAvailability::Downloading { .. } => Err(InventoryError::Busy(model.id.0.clone())),
         _ => Ok(()),
     }
 }

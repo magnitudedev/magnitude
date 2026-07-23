@@ -352,9 +352,10 @@ export const makeIcnRecipes = (
       read,
       Schema.equivalence(ModelRecipesState),
     )
+    const initialInventorySnapshot = yield* inventory.get
     yield* observed.refresh.pipe(Effect.forkScoped)
     yield* inventory.changes.pipe(
-      Stream.drop(1),
+      Stream.dropWhile((snapshot) => snapshot.revision <= initialInventorySnapshot.revision),
       Stream.runForEach(() => observed.refresh),
       Effect.forkScoped,
     )

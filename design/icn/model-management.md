@@ -35,18 +35,11 @@ Consequently, a successful list response must not expose `Pending`, `Assessing`,
 
 Non-ready records, such as an in-progress or interrupted download, may still appear with their operation status. They are not `Available` models and are outside the completed-assessment invariant until their artifact set is ready.
 
-Availability, serving configuration, and residency are separate. Availability describes durable
-artifact usability. Serving configuration is caller-owned execution intent: ACN persists the user
-selection and rehydrates ICN's process-local value. Residency is
-a process-local projection of the runtime coordinator and is reset
-to not-resident during recovery. Loading, loaded, unloading, and load-failed never replace or erase
-artifact availability.
-
-The inventory implementation stores artifact/configuration observations and runtime residency in
-separate process-local state. Reconciliation may atomically replace the artifact observation, but
-it cannot publish, reset, or overwrite residency. Model listing composes the current values from
-both owners and derives available operations from that composition. Runtime residency is never
-written to the durable inventory index; an ICN restart begins with no resident model.
+Availability and serving configuration are separate. Availability describes durable artifact
+usability. Serving configuration is caller-owned execution intent: ACN persists the user selection
+and rehydrates ICN's process-local value. Native residency is ephemeral execution state owned by the
+ICN loader, not model inventory. It is neither serialized in the durable index nor returned by model
+listing; an ICN restart begins with no resident model.
 
 Publishing a managed download validates and applies its selected serving configuration before the
 model becomes available in that process. An idempotent model-management operation may replace that
@@ -92,26 +85,26 @@ phases:
 Concurrent list requests share the same in-flight reconciliation. They do not duplicate directory
 scans, metadata inspection, template probes, or native hardware assessment.
 
-Startup initializes storage, recovers interrupted operations, and may hydrate the durable index, but does not inspect every model. Download and acquisition completion directly records or invalidates the affected artifact. Deletion removes or invalidates the affected entry. Filesystem and runtime watchers only invalidate relevant cache entries. None of these paths launches inventory-wide enrichment.
+Startup initializes storage, recovers interrupted operations, and may hydrate the durable index, but does not inspect every model. Download and acquisition completion directly records or invalidates the affected artifact. Deletion removes or invalidates the affected entry. Filesystem watchers only invalidate relevant cache entries. None of these paths launches inventory-wide enrichment.
 
 The configured ICN model store is the product's authoritative model inventory. Its managed
 Hugging Face hub is contained within that store. Default configuration does not scan or adopt the
 host user's global Hugging Face cache, and ACN does not supply external cache or directory roots.
 Explicit read-only roots remain an ICN deployment input, not an ACN-side discovery mechanism.
 
-## Runtime residency projection
+## Explicit load operations
 
-ICN is authoritative for process-local residency. Backend generation and observable runtime revision
-are distinct. Load, replacement, unload, failed-load cleanup, and idle unload publish terminal
-inventory state before incrementing runtime revision. Transitional notifications are allowed, but a
-notification alone never implies terminal state.
+The model load endpoint is the sole observation boundary for one requested load. Its admitted event
+stream carries ordered stages, monotonic native loading fractions when available, and exactly one
+ready or failed terminal result. The unload endpoint returns only after the named resident target is
+released. Available inventory models advertise both idempotent commands regardless of current
+residency; their operation list does not encode process state. These operation results are not
+copied into model inventory.
 
-Runtime changes use bounded long-poll from the caller's last revision. An unchanged revision polls
-again without listing; a changed revision fetches authoritative inventory.
-
-ACN projects inventory residency into the matching product model slot. It has no native-residency
-idle timer or optimistic residency state; autonomous unload becomes visible only through ICN
-inventory.
+ACN owns product `ModelSlot` lifecycle and maps the explicit operation directly: fractions become
+slot percentages, ready becomes Ready, load failure becomes Blocked, and successful unload becomes
+Unloaded. ICN has no runtime-change revision, residency watch, or autonomous idle transition that
+would require a second synchronization mechanism.
 
 ## Reasoning discovery
 
@@ -325,9 +318,11 @@ The implementation satisfies this design when:
 - deleting or making the complete cache unwritable does not change computed results or fail an
   otherwise successful operation;
 - simultaneous lists share one ensure operation;
-- runtime-change observation is bounded, and a changed revision causes authoritative list refresh
-  rather than optimistic state synthesis;
-- automatic idle unload becomes visible as terminal not-resident inventory before ACN projects it;
+- model listing contains artifact and serving-configuration facts but no native residency state;
+- explicit load progress is consumed from the admitted operation stream and is not reconstructed
+  through inventory refresh, polling, or revision counters;
+- ICN never changes residency autonomously; ACN slot commands and scoped provider admission
+  initiate loads, and ACN slot commands initiate unloads;
 - adding, changing, regrouping, or removing artifacts invalidates exactly the affected entries;
 - no successful response contains unresolved properties for an available model;
 - missing template metadata follows runtime fallback semantics;

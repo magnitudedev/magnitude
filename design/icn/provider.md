@@ -24,9 +24,10 @@ applies_to:
 
 ICN implements Magnitude's `local` AI provider. A local model is invoked through the same
 provider-facing operation as any other model: bind a provider model ID, then stream a completion.
-Model residency is an implementation concern of that invocation. Callers do not perform a
-readiness check, load a model, select an ICN process, or use a second runtime-specific completion
-operation before inference.
+ACN model slots own whether that provider model is available for agent use. Loading is always an
+explicit ICN operation owned by the applicable slot transition. A local provider request acquires
+that slot transition as a scoped resource, so an unloaded selection is loaded through the same
+operation before ICN chat admission rather than through an ICN chat side effect.
 
 This design separates three concepts which must never be collapsed:
 
@@ -47,11 +48,14 @@ The local provider implements the ordinary provider contract:
    from downloaded `LocalModelInventory` entries.
 2. Binding a model captures only its provider model ID and ordinary provider defaults. Binding is
    cheap, has no runtime side effect, and succeeds independently of current residency.
-3. Calling the bound model submits one ordinary streamed chat-completion request naming that model.
-4. The call does not return a usable response stream until ICN has admitted the HTTP request,
-   resolved the model's serving target, ensured that target is resident, and acquired a lease on
-   the resulting runtime generation.
-5. The generation lease remains held until the response body completes, fails, or is canceled.
+3. Calling the bound model first acquires the attributed ACN slot's local-model admission in an
+   Effect scope. Acquisition performs or joins the same explicit load transition used by a manual
+   slot command and holds replacement admission closed until chat is accepted.
+4. The bound model then submits one ordinary streamed chat-completion request naming that model.
+5. ICN admits the call only when the exact model and serving configuration are already resident,
+   then acquires a lease on that runtime generation.
+6. Once ICN accepts the response, the ACN scope releases; the ICN generation lease remains held
+   until the response body completes, fails, or is canceled.
 
 The agent, provider registry, and generic AI package see only `BoundModel<BaseCallOptions>`. They do
 not see load targets, runtime generations, hardware profiles, MTP choices, or ICN lifecycle types.
@@ -99,9 +103,9 @@ native configuration before availability. ACN does not maintain a parallel selec
 or a background selection-to-serving reconciliation process. ICN may derive its own valid default
 for standalone inventory use; that default is native execution policy, never user selection.
 
-Changing serving configuration is distinct from loading. It does not require the caller to issue a
-load before the next completion. If the model is resident under an older configuration, the next
-demand resolves the new target and the runtime coordinator performs the required replacement.
+Changing serving configuration is distinct from loading. ACN applies configuration immediately
+before an explicit load; changing a resident target requires the owning slot operation to unload or
+replace it before the next completion.
 
 ### Runtime residency
 
@@ -110,45 +114,26 @@ internal combination of canonical model identity and its effective serving profi
 policy and the resolved execution plan remain ICN implementation details. The target is never
 assembled in ACN and is never a provider request field.
 
-Catalog availability and residency are independent dimensions:
+Catalog availability and slot lifecycle are independent dimensions. `available` means the artifact
+is valid, configured, supported, and fits the applicable hardware policy; it does not mean a slot
+has loaded it. Load progress and failure remain on matching ACN slots without changing catalog
+availability. ICN model listing exposes inventory facts only and contains no residency projection.
 
-```text
-availability: available | unavailable
-residency:    not_resident | loading | resident | load_failed | unloading
-```
+## Explicit residency path
 
-`available` means the artifact is valid, configured, supported, and fits the applicable hardware
-policy, so it may be called directly. It does not mean the model is already loaded. A retryable
-load failure does not silently make a valid model disappear from the catalog; the failure remains
-visible in residency state. Permanent artifact, compatibility, or fit failures make the model
-unavailable with their canonical reason.
+ACN translates both a manual local-slot load command and scoped local-provider admission into the
+same model-centric ICN operation. It applies the selected serving configuration, admits
+`load(model ID)`, and consumes that operation's event stream until a terminal result. Chat only
+requests a lease for the already-resident model and continues into template application,
+tokenization, generation admission, and streaming. Unload closes new
+admission, waits for active generation leases to drain, and then releases native resources. Since
+the executor is a singleton, loading a different target also unloads every ACN slot selecting the
+replaced local model; only slots selecting the new target become Ready.
 
-Model listing is the authoritative projection of both dimensions. ACN mirrors that projection and
-does not infer it from provider calls, maintain a parallel active-model cache, or manufacture a
-successful `loaded` provider result.
+The model-centric residency commands are therefore limited to:
 
-## One fulfillment path
-
-Both ordinary inference and explicit eager load call the same transport-independent operation:
-
-```text
-acquire(model ID)
-  -> read the model's serving profile
-  -> resolve canonical artifact and auxiliary components
-  -> assess and resolve the execution plan
-  -> serialize and perform the required runtime transition
-  -> return a lease for the resident generation
-```
-
-Chat continues from that lease into template application, tokenization, generation admission, and
-streaming. Explicit load discards the lease after readiness is established. Unload enters the same
-coordinator, closes new admission, waits for active generation leases to drain, and then releases
-native resources.
-
-The public model-residency operations are therefore limited to:
-
-- **load(model ID)**: eagerly run the same acquisition transition; useful for user-requested warmup, but never a
-  prerequisite for chat;
+- **load(model ID)**: run the explicit transition and stream progress to its caller; this is the
+  prerequisite that makes an ACN local slot Ready;
 - **unload(model ID)**: idempotently release that model when resident after its leases drain.
 
 They are explicit `POST` commands on the named model's `/load` and `/unload` resources. There is no
@@ -165,12 +150,11 @@ readiness algorithm.
 
 ## Concurrency and lifetime
 
-The runtime coordinator is the only mutation/admission authority. It uses one mutation lock and a
-monotonically increasing resident generation.
+The ICN runtime coordinator is the only native mutation/admission authority. It uses one mutation
+lock and a monotonically increasing internal resident generation.
 
-- Concurrent demand serializes on that lock. After acquiring it, every caller re-reads the
-  effective profile and rechecks residency; if the preceding call loaded the same target, the next
-  call returns readiness without loading again.
+- Concurrent explicit load commands serialize on that lock. After acquiring it, every caller
+  re-reads the effective profile and rechecks residency; an identical target is idempotent.
 - There is no cached transition promise or second single-flight state machine. A failed call does
   not poison or own later calls; a later caller may retry under the same serialization rule.
 - Demand for a different target queues behind the current mutation and is resolved only after
@@ -178,12 +162,16 @@ monotonically increasing resident generation.
 - New generation leases are closed before replacement or unload begins. Existing leases drain
   before native resources are mutated.
 - A completion holds exactly one lease and cannot switch generations mid-stream.
-- Completion of a load transition publishes the resident generation once. Model-list residency
-  derives from that transition.
+- Completion of a load transition publishes one ready terminal event. The internal generation is
+  used for leases and is not a public synchronization counter.
 - Failure publishes one typed transition failure. It never leaves a half-installed backend or a
   state that claims readiness without a leasable generation.
 
-There is no ACN-side mutex, target cache, shared promise, polling loop, or state-check/load race.
+There is no ACN-side native target cache, polling loop, runtime revision observer, or
+state-check/load race. The slot coordinator's scoped acquisition serializes load and replacement,
+rechecks the attributed slot after admission, and advances the product slot FSM from the operation
+it started. Concurrent requests join through that same admission boundary and cannot issue
+duplicate effective loads.
 
 The coordinator's core transition returns a typed terminal result. Progress is a non-blocking
 broadcast observation and is never the result channel; an internal chat admission cannot deadlock
@@ -195,19 +183,11 @@ Provider binding is not model loading. Property discovery `Deferred` means that 
 property has not been requested or resolved; it does not describe runtime residency. Provider
 health `loading` describes ACN/ICN process startup; it does not describe a model transition.
 
-Model loading is deferred until the first completion unless an explicit load warms it earlier.
-Once a completion has entered ICN:
-
-- loading is normal progress of that same request, not a provider failure;
-- the request waits for serialized residency establishment rather than failing and being retried by
-  the agent;
-- only a terminal load failure rejects the request; and
-- the model-list residency projection may update independently, but a `loaded` transition is never
-  presented as the completion's outcome.
-
-ACN active-work accounting covers the complete interval from provider request admission
-through loading and generation. It does not end after starting an ICN stream or after receiving a
-load operation ID.
+Model loading is never delegated to ICN chat. A manual local-slot command waits for its explicit
+load stream to reach ready. A provider request against an unloaded selection performs or joins that
+same slot transition before chat. A chat that somehow reaches ICN for a nonresident target is
+rejected as not ready and cannot mutate native residency. ACN active-work accounting covers each
+explicit slot mutation and each admitted provider request through its own completion.
 
 ## Request validation and prompt history
 
@@ -264,9 +244,9 @@ cancellation, and body cleanup. `@magnitudedev/icn` and ACN do not wrap an actua
 synthetic accepted-200 `BodyReadFailure`, create endpoint-specific SSE parsers, or stringify a typed
 remote error into an opaque cause.
 
-ICN does not send status 200 until the target is resident, the request has passed admission, and an
-SSE body can be produced. A load or validation failure therefore remains a real non-2xx start
-failure. Once status 200 is sent, subsequent inference failures are typed in-band stream failures.
+ICN does not send status 200 until the target is confirmed resident, the request has passed
+admission, and an SSE body can be produced. A not-ready or validation failure therefore remains a
+real non-2xx start failure. Once status 200 is sent, subsequent inference failures are typed in-band stream failures.
 When a valid provider error envelope contains an actionable message, the normalized failure
 snapshot preserves that message separately from its diagnostic rendering and user-facing error
 presentation displays it. A generic stream-failure label must not replace a known provider reason.
@@ -276,8 +256,8 @@ presentation displays it. A generic stream-failure label must not replace a know
 `@magnitudedev/icn` owns recipe curation, private product-to-native identity resolution, generic
 prompt encoding, and generated chat failure mapping. ACN owns user selection, the product local
 inventory, local-provider catalog projection, catalog aggregation, and slot residency projection.
-It observes native residency but does not duplicate the native coordinator, readiness algorithm,
-or execution planning.
+It consumes the explicit load/unload results it initiated but does not duplicate the native
+coordinator, readiness algorithm, or execution planning.
 
 The generated ICN boundary owns typed requests, response admission, streaming transport, and exact
 error preservation. Authored ICN services may coordinate observation, recipes, or provider
@@ -285,18 +265,19 @@ adaptation, but never rename generated operations or introduce an alternate HTTP
 runtime state machine, or lifecycle cache.
 
 ICN model management owns canonical artifact identity, serving configuration, inventory
-availability, inspection, and fitting. The ICN runtime coordinator owns target resolution,
-resident generations, mutation serialization, leases, load/unload, and inference admission. The
-native executor owns the resolved model, projector, MTP/draft runtime, scheduler, and token work.
+availability, inspection, and fitting. ACN owns product slot selection and lifecycle. The ICN
+runtime coordinator owns target resolution, internal resident generations, mutation serialization,
+leases, explicit load/unload, and inference admission. The native executor owns the resolved model,
+projector, MTP/draft runtime, scheduler, and token work.
 
 ## Forbidden duplicate logic
 
 A conforming implementation has none of the following:
 
-- an ACN state-check followed by load and chat for ordinary completion demand;
+- any model load or replacement initiated by ordinary completion demand;
 - an ACN runtime-target resolver, profile fallback, component matcher, or active-model cache;
 - a second runtime-specific completion endpoint;
-- different load implementations for explicit load and completion;
+- model residency or runtime revision copied into model inventory;
 - provider catalog availability derived from current residency;
 - hardware, fitting, projector, draft, or MTP selection in Bun;
 - hand-written ICN HTTP/SSE parsing or endpoint-specific transport-error conversion;
@@ -308,10 +289,12 @@ A conforming implementation has none of the following:
 
 The provider design conforms when:
 
-- any available model can be called directly from an empty runtime and the call either streams a
-  valid response or returns one correctly classified failure;
-- direct chat and explicit load for the same configured model perform at most one effective load
-  and produce one resident generation;
+- a nonresident chat is rejected without starting a load, while an explicitly loaded slot can
+  stream an ordinary provider response;
+- explicit load events move matching ACN slots through monotonic progress to Ready or a typed
+  failure without inventory polling;
+- replacing the resident local model makes every differently selected local slot Unloaded before
+  the new target is advertised as Ready;
 - changing serving configuration cannot race a call into loading the previous target after the new
   configuration has won admission;
 - catalog context, fit assessment, loaded context, and request capacity all use the same serving
@@ -321,7 +304,8 @@ The provider design conforms when:
   contain no property-discovery state;
 - concurrent incompatible calls never overlap native mutation and an active response never changes
   generation;
-- model listing exposes availability and residency without ACN inference or polling;
+- model listing exposes availability without residency, and ACN slot state is driven by the
+  explicit operation owner;
 - MTP and projector selection are identical in assessment and actual load and remain ICN-owned;
 - an ICN HTTP 400 is observed as a start rejection with status 400 and its typed error body;
 - an in-band ICN provider error is shown with its provider-authored reason rather than only a

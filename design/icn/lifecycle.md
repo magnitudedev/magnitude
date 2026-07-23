@@ -265,10 +265,10 @@ backstops, not child adoption or sharing.
 ## Runtime model lifecycle
 
 The singleton starts with no loaded model. Inventory, preview, hardware, download, and deletion
-remain available in that state. ICN exposes one authoritative runtime coordinator describing the
-active model, configured target, resident generation, transition, and readiness for inference.
-Model availability, serving configuration, and runtime residency are independent fields projected
-from their owning services.
+remain available in that state. ICN owns the native backend, the currently resident target, and
+generation leases needed to keep that target alive during inference. ACN owns the product model
+slots and is the sole policy authority that decides when a selected local model is loaded or
+unloaded. A slot is not an ICN resource and ICN does not expose a separate public runtime resource.
 
 Runtime load accepts an inventory model ID only and realizes that model's current serving
 configuration. Serving configuration contains caller-owned context length and parallel sequence
@@ -276,8 +276,8 @@ count; it is changed through model management rather than supplied as a competin
 Load does not accept a planner name, planner version, capacity-policy identifier, or native flags.
 ICN reassesses the exact plan and streams typed progress through resolution, assessment,
 unload/replacement, loading, verification, and ready or failed termination. Load of the
-already-resident identical model and profile is idempotent. Concurrent identical readiness demand
-serializes, rechecks residency, and performs at most one effective successful native load. Concurrent
+already-resident identical model and profile is idempotent. Concurrent identical explicit loads
+serialize, recheck residency, and perform at most one effective successful native load. Concurrent
 incompatible mutations are serialized by the native coordinator; they never race native
 process-global state or rely on ACN-side locking.
 The ICN composition root creates one process-lifetime native-backend capability before readiness.
@@ -286,22 +286,21 @@ same capability. Creating or dropping a model executor never initializes or tear
 backend, and runtime orchestration has no operation-level initialization path. Isolated planner and
 template workers each own one separate backend for their complete private process lifetime.
 
-An ordinary chat request names an available inventory model directly. Under the same native
-admission boundary used by explicit load, ICN either leases an already-resident matching target or
-ensures the model's configured profile is resident. The lease is held until
-the response stream succeeds, fails, or is canceled. Callers do not perform a state-check/load/chat
-sequence and chat does not use a second runtime-specific transport endpoint.
+An ordinary chat request names an inventory model and may proceed only when that exact model and
+serving profile are already resident. ICN acquires a generation lease and holds it until the
+response stream succeeds, fails, or is canceled. A nonresident or differently configured target is
+rejected as not ready; chat never starts a model transition. Before starting a local provider
+request, ACN acquires the selected slot's local-model admission as a scoped resource. That
+acquisition performs or joins the slot's explicit load operation and remains held until ICN accepts
+the chat request and takes its generation lease.
 
-Explicit load and completion demand enter one shared ensure coordinator. Concurrent compatible
-demand serializes and rechecks residency instead of starting duplicate native work. Incompatible
-mutations serialize behind protected inference leases. Serving-configuration
-changes invalidate target identity; subsequent completions realize the new revision. Restart is
-composition of unload and load when a caller truly needs it, not a separate ICN API.
-
-Runtime transitions remain visible in private ICN model listing. ACN projects their product
-consequence only into matching `ModelSlot` FSMs, including transitions caused implicitly by a
-completion request. Acquisition state remains in `LocalModelInventory`; no independent public
-runtime or residency resource exists.
+ACN consumes the admitted load operation's stream directly. Loading fractions update every product
+slot selecting that local model, the ready event transitions them to Ready, and a failed or
+incomplete stream transitions them to a typed blocked state. Explicit unload similarly moves slots
+through Unloading to Unloaded. Because ICN has one resident target, a replacement load moves every
+slot selecting a different local model through Unloading to Unloaded before the target slot becomes
+Ready. Model listing remains an artifact/configuration inventory and does not duplicate this
+operation lifecycle or expose native residency.
 
 Replacing a model must not claim the new model is ready until its backend is usable. Failure leaves
 the runtime in an explicitly reported state and must not make requests route to a half-loaded
@@ -310,13 +309,10 @@ to drain, and returns only after native resources are released. Chat requests bi
 to the active runtime generation they began with and cannot silently continue on a replacement.
 
 Every inference request holds an exact backend-generation lease through stream end or cancellation.
-Final release starts a 30-minute monotonic idle interval; automatic unload requires that complete
-interval with zero leases. Same-model load also holds a lease and starts a fresh interval on release.
-There is no separate touch timestamp.
-
-Inference, load, replacement, explicit unload, and idle unload share backend admission and mutation
-authority. Idle unload records generation/activity revision, waits without holding inference
-admission, then revalidates generation, revision, leases, and elapsed time under mutation authority.
+Explicit load, replacement, and unload share backend admission and mutation authority. Unload and
+replacement close new inference admission and wait for existing leases to drain. ICN does not
+perform idle unloading or any other autonomous residency transition; a loaded model remains resident
+until an explicit load replaces it, an explicit unload releases it, or the process exits.
 
 ICN's pinned runtime is part of the ICN build, so ACN has no separate native-runtime install,
 discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
@@ -352,7 +348,7 @@ stdout/stderr is bounded, line-framed, level-mapped where possible, and correlat
 instance ID. A diagnostic tail is retained for failures without becoming an unbounded in-memory
 log store.
 
-Health, inventory, hardware, and runtime-revision observation are not ACN demand. ACN/session leases
+Health, inventory, and hardware observation are not ACN demand. ACN/session leases
 cover accepted user operations and inference; ICN backend leases cover native admission and response
 streams. These are composed resource gates, not shared activity timestamps.
 
@@ -373,11 +369,16 @@ The lifecycle conforms when:
   pinned-runtime management;
 - the public local provider ID is exactly `local`, and its bound model streams through the scoped
   ordinary generated chat client rather than an endpoint URL adapter;
-- direct completion of an available model and explicit load share one ensure coordinator, perform
-  at most one compatible native load, and project the same lifecycle state into model listing;
-- a resident model unloads after 30 idle minutes, never during admitted inference, and a
-  last-moment admission or same-model load receives a complete fresh interval;
-- idle unload, replacement, load, and explicit unload serialize through native mutation authority;
+- chat leases only an already-resident matching target and never starts a load or replacement;
+- ACN slot commands and scoped local-provider admission are the only product paths that start
+  explicit ICN load operations; only ACN slot operations start unload;
+- load-stream fractions and terminal events drive the matching slot FSMs without an inventory poll,
+  revision counter, or second residency projection;
+- loading one local model unloads every slot selecting a different local model, so two different
+  local models can never both be advertised as Ready against the singleton executor;
+- a resident model remains loaded until explicit replacement, explicit unload, or process exit;
+- replacement, load, and explicit unload serialize through native mutation authority and cannot
+  invalidate an admitted inference lease;
 - product model-download, activation, deletion, hardware, and fit operations reach ICN only through
   the generated client, with no alternate model-repository or host-inspection path in ACN;
 - interrupting a consumer stream closes its response without terminating ICN;

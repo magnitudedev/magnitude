@@ -377,6 +377,7 @@ export const LocalModelInventoryLive: Layer.Layer<
   )
 
   const rebuildInventory = lock.withPermits(1)(Effect.gen(function* () {
+    if ((yield* recipes.get).state._tag !== "Ready") return
     const current = (yield* inventoryMirror.get).state
     const previousEntries = current._tag === "Ready"
       ? new Map(current.entries.map((entry) => [entry.model.localModelId, entry]))
@@ -444,10 +445,16 @@ export const LocalModelInventoryLive: Layer.Layer<
         : state)
   }).pipe(Effect.catchAll(publishProjectionFailure)))
 
+  const initialNativeInventorySnapshot = yield* inventory.get
+  const initialRecipesSnapshot = yield* recipes.get
   yield* rebuildInventory
   yield* Effect.forkIn(Stream.merge(
-    inventory.changes.pipe(Stream.drop(1)),
-    recipes.changes.pipe(Stream.drop(1)),
+    inventory.changes.pipe(
+      Stream.dropWhile((snapshot) => snapshot.revision <= initialNativeInventorySnapshot.revision),
+    ),
+    recipes.changes.pipe(
+      Stream.dropWhile((snapshot) => snapshot.revision <= initialRecipesSnapshot.revision),
+    ),
   ).pipe(
     Stream.runForEach(() => beginRecovery.pipe(Effect.zipRight(rebuildInventory))),
   ), scope)

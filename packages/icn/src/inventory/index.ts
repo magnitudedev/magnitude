@@ -1,4 +1,4 @@
-import { Cause, Context, Duration, Effect, Layer, Option, Schema } from "effect"
+import { Context, Effect, Layer, Schema } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
 import { ModelList } from "../generated/schemas.js"
 import {
@@ -15,13 +15,7 @@ export class IcnInventory extends Context.Tag("@magnitudedev/icn/IcnInventory")<
   IcnInventoryService
 >() {}
 
-export interface IcnInventoryOptions {
-  readonly reconnectDelay?: Duration.DurationInput
-}
-
-export const makeIcnInventory = (
-  options: IcnInventoryOptions = {},
-): Layer.Layer<IcnInventory, InventoryReadError, IcnClient> =>
+export const makeIcnInventory = (): Layer.Layer<IcnInventory, InventoryReadError, IcnClient> =>
   Layer.scoped(
     IcnInventory,
     Effect.gen(function* () {
@@ -33,36 +27,6 @@ export const makeIcnInventory = (
         read,
         Schema.equivalence(ModelList),
       )
-      // Fetch-backed requests are not reliably interruptible on every runtime.
-      // Disconnect the bounded long-poll so layer shutdown never waits on the
-      // transport before it can reap the ICN process.
-      const observeRevision = (after: Option.Option<number>) =>
-        client.runtime
-          .observeRuntimeChanges({ urlParams: { after } })
-          .pipe(Effect.disconnect)
-      const observeChanges = Effect.gen(function* () {
-        let revision = (yield* observeRevision(Option.none())).revision
-        while (true) {
-          const nextRevision = (yield* observeRevision(Option.some(revision))).revision
-          if (nextRevision === revision) continue
-          revision = nextRevision
-          yield* observed.refresh
-        }
-      })
-
-      yield* observeChanges.pipe(
-        Effect.catchAll((error) =>
-          Effect.logWarning("ICN runtime change observation disconnected; retrying").pipe(
-            Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
-            Effect.zipRight(
-              Effect.sleep(options.reconnectDelay ?? "250 millis"),
-            ),
-          ),
-        ),
-        Effect.forever,
-        Effect.forkScoped,
-      )
-
       return IcnInventory.of(observed)
     }),
   )

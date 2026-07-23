@@ -191,7 +191,7 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
     resolveModel: (providerId, providerModelId, options) =>
       registry.resolveModel(providerId, providerModelId, options),
     discoverModelProperties: registry.discoverModelProperties,
-    requestAttribution: () => ({ requestStarted: Effect.void }),
+    requestAttribution: (_providerId, _providerModelId, key) => ({ key, requestStarted: Effect.void }),
     webSearch: magnitudeInstance.provider.webSearch,
     usage: magnitudeInstance.provider.usage,
     runtimeConfig: {

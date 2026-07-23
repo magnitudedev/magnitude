@@ -10,8 +10,7 @@ use icn_contracts::{
     CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, HardwareAssessment,
     Integrity, InventoryError, InventoryHardwareAssessor, InventoryModel, InventoryProperties,
     LocalDeclaration, ModelAvailability, ModelComponent, ModelId, ModelLocation, ModelOperation,
-    ModelResidency, ModelSource, ReasoningCapability, ServingConfiguration, ServingProfile,
-    TemplateAssessor,
+    ModelSource, ReasoningCapability, ServingConfiguration, ServingProfile, TemplateAssessor,
 };
 use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
@@ -48,12 +47,6 @@ type HydratedInventory = (
     BTreeMap<ModelId, InventoryModel>,
     BTreeMap<ModelId, CacheEvidence>,
 );
-
-#[derive(Clone)]
-pub(crate) struct RuntimeResidency {
-    pub(crate) state: ModelResidency,
-    pub(crate) updated_at: u64,
-}
 
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
@@ -94,7 +87,6 @@ pub struct ModelManager {
     pub(crate) config: InventoryConfig,
     pub(crate) client: HFClient,
     pub(crate) models: Arc<RwLock<BTreeMap<ModelId, InventoryModel>>>,
-    pub(crate) residencies: Arc<RwLock<BTreeMap<ModelId, RuntimeResidency>>>,
     pub(crate) operations:
         Arc<tokio::sync::Mutex<BTreeMap<String, Arc<crate::download::DownloadOperation>>>>,
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
@@ -112,7 +104,6 @@ impl Clone for ModelManager {
             config: self.config.clone(),
             client: self.client.clone(),
             models: Arc::clone(&self.models),
-            residencies: Arc::clone(&self.residencies),
             operations: Arc::clone(&self.operations),
             download_slots: Arc::clone(&self.download_slots),
             template_assessor: self.template_assessor.clone(),
@@ -200,16 +191,7 @@ impl ModelManager {
             .write()
             .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? = models;
         self.ensure_generation.fetch_add(1, Ordering::Release);
-        let residency = self
-            .residencies
-            .read()
-            .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
-            .get(id)
-            .cloned();
-        Ok(crate::service::model_with_residency(
-            &updated,
-            residency.as_ref(),
-        ))
+        Ok(updated)
     }
 
     pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
@@ -239,7 +221,6 @@ impl ModelManager {
             config,
             client,
             models: Arc::new(RwLock::new(models)),
-            residencies: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             template_assessor,
             hardware_assessor: Arc::new(RwLock::new(None)),
@@ -434,16 +415,11 @@ impl ModelManager {
         };
 
         persist_inventory_index(&self.cache, &discovered, &next_evidence);
-        let published_ids = discovered.keys().cloned().collect::<BTreeSet<_>>();
         *self
             .models
             .write()
             .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? =
             discovered;
-        self.residencies
-            .write()
-            .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
-            .retain(|id, _| published_ids.contains(id));
         *self
             .cache_evidence
             .write()
@@ -631,10 +607,6 @@ impl ModelManager {
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
             .clone();
         models.remove(id);
-        self.residencies
-            .write()
-            .map_err(|_| InventoryError::Internal("residency lock poisoned".to_owned()))?
-            .remove(id);
         cache.remove(id);
         persist_inventory_index(&self.cache, &models, &cache);
         *self
@@ -725,7 +697,6 @@ fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
         if model.id != id {
             continue;
         }
-        model.residency = ModelResidency::NotResident;
         model.serving_configuration = None;
         models.insert(id, model);
     }
@@ -752,7 +723,6 @@ fn persist_inventory_index(
         .map(|(id, model)| {
             let mut cached = model.clone();
             cached.serving_configuration = None;
-            cached.residency = ModelResidency::NotResident;
             (id.clone(), cached)
         })
         .collect();
@@ -1240,7 +1210,6 @@ fn scan_interrupted(
                     .unwrap_or_else(|| "daemon_restarted".to_owned()),
                 updated_at: manifest.updated_at,
             },
-            residency: ModelResidency::NotResident,
             source: ModelSource::HuggingFace {
                 repository: manifest.repository,
                 requested_revision: manifest.requested_revision,
@@ -1330,29 +1299,16 @@ fn reuse_inspection(
         model.content_id = candidate.content_id.clone();
         model.source = candidate.source.clone();
         model.location = candidate.location.clone();
-        model.operations = match (&model.availability, &model.residency) {
-            (
-                ModelAvailability::Available { .. },
-                ModelResidency::NotResident | ModelResidency::LoadFailed { .. },
-            ) => {
-                let mut operations = vec![ModelOperation::Load];
+        model.operations = match &model.availability {
+            ModelAvailability::Available { .. } => {
+                let mut operations = vec![ModelOperation::Load, ModelOperation::Unload];
                 if candidate.deletable {
                     operations.push(ModelOperation::Delete);
                 }
                 operations
             }
-            (ModelAvailability::Available { .. }, ModelResidency::Loaded { .. }) => {
-                vec![ModelOperation::Unload]
-            }
-            (
-                ModelAvailability::Available { .. },
-                ModelResidency::Loading { .. } | ModelResidency::Unloading { .. },
-            ) => Vec::new(),
-            (
-                ModelAvailability::InvalidArtifact { .. }
-                | ModelAvailability::IncompatibleArtifact { .. },
-                _,
-            ) => candidate
+            ModelAvailability::InvalidArtifact { .. }
+            | ModelAvailability::IncompatibleArtifact { .. } => candidate
                 .deletable
                 .then_some(ModelOperation::Delete)
                 .into_iter()
@@ -1525,7 +1481,7 @@ pub(crate) fn build_model(
             }
         },
     };
-    let mut operations = vec![ModelOperation::Load];
+    let mut operations = vec![ModelOperation::Load, ModelOperation::Unload];
     if deletable {
         operations.push(ModelOperation::Delete);
     }
@@ -1537,7 +1493,6 @@ pub(crate) fn build_model(
         supported_parameters: inspected.supported_parameters,
         serving_configuration: None,
         availability: ModelAvailability::Available { ready_at },
-        residency: ModelResidency::NotResident,
         source,
         location,
         properties: inspected.properties,
@@ -1603,7 +1558,6 @@ fn unavailable_model(
         supported_parameters: Vec::new(),
         serving_configuration: None,
         availability,
-        residency: ModelResidency::NotResident,
         source,
         location,
         properties: InventoryProperties::Unavailable { reason: message },
@@ -2152,23 +2106,6 @@ mod tests {
         reopened.set_hardware_assessor(hardware.clone()).unwrap();
         let warm = reopened.list().await.unwrap();
         assert_eq!(warm.len(), 1);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
-
-        reopened
-            .update_residency(
-                &warm[0].id,
-                ModelResidency::Loaded {
-                    loaded_at: now(),
-                    backend: "test".to_owned(),
-                    context_length: 4096,
-                    execution: BTreeMap::new(),
-                },
-            )
-            .await
-            .unwrap();
-        let loaded = reopened.list().await.unwrap();
-        assert!(matches!(loaded[0].residency, ModelResidency::Loaded { .. }));
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
 

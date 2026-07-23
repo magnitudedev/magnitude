@@ -19,6 +19,7 @@ import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   buildLocalInferenceSelections,
+  formatModelLoadProgress,
   describeLocalHardware,
   formatBytes,
   formatContext,
@@ -232,7 +233,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                   {Option.isSome(recommendation) && <text style={{ fg: theme.muted }}>{recommendation.value.fidelityLabel}</text>}
                   {entry._tag === "Downloading" && <text style={{ fg: theme.primary }}>Downloading {entry.percentage}% · {formatBytes(entry.completedBytes)} / {formatBytes(entry.totalBytes)}</text>}
                   {entry._tag === "DownloadFailed" && <text style={{ fg: theme.error }}>Download failed · {entry.error.message}</text>}
-                  {loading && <text style={{ fg: theme.primary }}>Loading {primarySlot.percentage}%</text>}
+                  {loading && <text style={{ fg: theme.primary }}>{formatModelLoadProgress(primarySlot.percentage)}</text>}
                   {capacityWarning && <text style={{ fg: theme.warning }}>{capacityWarning}</text>}
                 </Button>
               </Fragment>
