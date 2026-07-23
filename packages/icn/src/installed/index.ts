@@ -1,4 +1,4 @@
-import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Schedule, Schema } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
 import { InstalledModelPackagesResponse as InstalledModelPackagesResponseSchema } from "../generated/schemas.js"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
@@ -27,9 +27,8 @@ export const makeIcnInstalledModels = (
     Effect.gen(function* () {
       const client = yield* IcnClient
       const read = client.models.listInstalledModels({})
-      const initial = yield* read
       const observed = yield* makeIcnObservedState(
-        initial,
+        { packages: [] },
         read,
         Schema.equivalence(InstalledModelPackagesResponseSchema),
       )
@@ -38,8 +37,7 @@ export const makeIcnInstalledModels = (
           Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
         )),
         Effect.option,
-        Effect.delay(options.refreshInterval ?? "5 seconds"),
-        Effect.forever,
+        Effect.repeat(Schedule.spaced(options.refreshInterval ?? "5 seconds")),
         Effect.forkScoped,
       )
       return IcnInstalledModels.of(observed)

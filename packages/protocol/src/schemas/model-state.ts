@@ -405,6 +405,7 @@ export type LocalModelRecommendation = typeof LocalModelRecommendationSchema.Typ
 
 export const LocalModelRecommendationProgressStepIdSchema = Schema.Literal(
   "hardware",
+  "inventory",
   "catalog",
   "metadata",
   "assessment",

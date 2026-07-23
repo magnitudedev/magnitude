@@ -13,7 +13,7 @@ import {
   type RecommendationId,
   type RecommendableModel,
 } from "@magnitudedev/protocol"
-import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
+import { IcnCatalog, IcnHardware, IcnInstalledModels } from "@magnitudedev/icn"
 import {
   readStructuredFile,
   writeStructuredFileAtomic,
@@ -75,6 +75,7 @@ const pendingProgress = (
 
 const initialProgress = (): readonly LocalModelRecommendationProgressStep[] => [
   pendingProgress("hardware"),
+  pendingProgress("inventory"),
   pendingProgress("catalog"),
   pendingProgress("metadata"),
   pendingProgress("assessment"),
@@ -108,10 +109,11 @@ export const makeLocalModelRecommendationsLive = (
 ): Layer.Layer<
   LocalModelRecommendations,
   never,
-  IcnCatalog | IcnHardware | LocalModelEvaluations | FileSystem.FileSystem
+  IcnCatalog | IcnHardware | IcnInstalledModels | LocalModelEvaluations | FileSystem.FileSystem
 > => Layer.scoped(LocalModelRecommendations, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
   const hardware = yield* IcnHardware
+  const installed = yield* IcnInstalledModels
   const evaluations = yield* LocalModelEvaluations
   const fs = yield* FileSystem.FileSystem
   const portfolioPath = NodePath.join(
@@ -223,6 +225,26 @@ export const makeLocalModelRecommendationsLive = (
       {
         completed: hardwareSnapshot.memory_domains.length,
         total: hardwareSnapshot.memory_domains.length,
+      },
+    )
+
+    const inventoryStep = progress.find(({ id }) => id === "inventory")
+    const inventoryStartedAt = inventoryStep?.status._tag === "Running"
+      ? inventoryStep.status.startedAtMs
+      : Date.now()
+    if (inventoryStep?.status._tag !== "Running") {
+      progress = yield* startStep(progress, "inventory")
+    }
+    if (!(yield* installed.initialized)) return
+    const installedState = (yield* installed.get).state
+    progress = yield* completeStep(
+      progress,
+      "inventory",
+      inventoryStartedAt,
+      false,
+      {
+        completed: installedState.packages.length,
+        total: installedState.packages.length,
       },
     )
 
@@ -504,8 +526,8 @@ export const makeLocalModelRecommendationsLive = (
 
   yield* refresh.pipe(Effect.forkScoped)
   yield* Stream.merge(
-    catalog.changes,
-    hardware.changes,
+    Stream.merge(catalog.changes, hardware.changes),
+    installed.changes,
   ).pipe(Stream.runForEach(() => refresh), Effect.forkScoped)
 
   return LocalModelRecommendations.of({

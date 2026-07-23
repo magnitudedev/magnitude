@@ -190,11 +190,12 @@ build, enabled backends, and recommendation-policy identity are unchanged. Missi
 unreadable, mismatched, or older-than-seven-days portfolio data is a cache miss. It never
 suppresses recomputation after one of those inputs changes.
 
-Recommendation calculation publishes an ordered, cumulative lifecycle for hardware, catalog,
-metadata preparation, assessment, and selection. Each step is pending, running, completed, or
-failed; running and terminal states carry authoritative timing, and bounded collection work carries
-completed and total counts. Completed work remains visible while later work runs. Presentation may
-animate a running step from the published start time, but it must not invent server progress.
+Recommendation calculation publishes an ordered, cumulative lifecycle for hardware, downloaded
+model discovery, catalog, metadata preparation, assessment, and selection. Each step is pending,
+running, completed, or failed; running and terminal states carry authoritative timing, and bounded
+collection work carries completed and total counts. Completed work remains visible while later work
+runs. Presentation may animate a running step from the published start time, but it must not invent
+server progress.
 
 ### Provider offering
 
