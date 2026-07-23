@@ -141,6 +141,10 @@ resolves the active standard Hugging Face Hub cache from the process environment
 fallback and supplies the existing root explicitly. ICN treats every such artifact as externally
 owned and non-deletable.
 
+ACN health is independent of external model inventory latency. Installed-model reconciliation
+starts after the ICN client is available and hydrates its observed state asynchronously; a large or
+slow cache cannot delay ACN registration.
+
 Context length and sequence count belong to an explicit model serving configuration supplied to
 assessment, fitting, and load. ACN persists that configuration inside a provider offering; ICN owns
 its identity and ephemeral residency. Serving configuration is not an installation-manifest, cache,

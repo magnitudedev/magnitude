@@ -35,6 +35,17 @@ describe("local inference selection view model", () => {
         totalItems: Option.some(1),
       },
       {
+        id: "inventory",
+        status: {
+          _tag: "Completed",
+          startedAtMs: 1_500,
+          durationMs: 500,
+          cached: false,
+        },
+        completedItems: Option.some(2),
+        totalItems: Option.some(2),
+      },
+      {
         id: "assessment",
         status: { _tag: "Running", startedAtMs: 2_000 },
         completedItems: Option.some(8),
@@ -46,6 +57,12 @@ describe("local inference selection view model", () => {
         state: "completed",
         label: "Detected hardware",
         metadata: " · 1/1 · 1s",
+      },
+      {
+        id: "inventory",
+        state: "completed",
+        label: "Checked for downloaded models",
+        metadata: " · 2/2 · 0.5s",
       },
       {
         id: "assessment",

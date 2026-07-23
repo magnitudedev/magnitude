@@ -148,11 +148,16 @@ const progressLabel = (
   completed: boolean,
 ): string => {
   if (id === "hardware") return completed ? "Detected hardware" : "Detecting your hardware"
+  if (id === "inventory") {
+    return completed ? "Checked for downloaded models" : "Checking for downloaded models"
+  }
   if (id === "catalog") {
-    return completed ? "Loaded models from Hugging Face" : "Loading models from Hugging Face"
+    return completed
+      ? "Loaded curated Hugging Face model details"
+      : "Loading curated Hugging Face model details"
   }
   if (id === "metadata") {
-    return completed ? "Checked model files" : "Checking model files"
+    return completed ? "Prepared model details" : "Preparing model details"
   }
   if (id === "assessment") {
     return completed ? "Evaluated models for this machine" : "Evaluating models for this machine"

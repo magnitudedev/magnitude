@@ -68,6 +68,12 @@ The catalog is ICN-owned. ACN owns assessment batching and recommendation policy
 `GET /v1/models/installed` returns only packages currently installed in configured local sources,
 including their local path and inspection result.
 
+Product startup does not wait for external-source reconciliation. The installed-package observer
+publishes an empty initial snapshot, starts reconciliation immediately in the background, and
+publishes the complete result when ICN returns it. Later refreshes retain the previous complete
+snapshot while reconciliation runs. Large external caches therefore cannot prevent ACN from
+becoming healthy.
+
 It does not return:
 
 - catalog-only packages;
