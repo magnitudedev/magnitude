@@ -13,7 +13,7 @@ describe("canonical local model catalog overlay", () => {
 
   it("is internally valid and records its evidence review date", () => {
     expect(MODEL_RECIPE_REGISTRY).toMatchObject({
-      reviewedAt: "2026-07-22",
+      reviewedAt: "2026-07-23",
     })
     expect(validateModelRecipeRegistry(MODEL_RECIPE_REGISTRY)).toEqual([])
   })
@@ -24,8 +24,8 @@ describe("canonical local model catalog overlay", () => {
     expect(encoded).not.toContain('"sha256"')
     expect(encoded).not.toContain('"sizeBytes"')
     expect(encoded).not.toContain('"primaryFile"')
-    expect(MODEL_RECIPE_REGISTRY.models).toHaveLength(13)
-    expect(MODEL_RECIPE_REGISTRY.models.flatMap(({ artifacts }) => artifacts)).toHaveLength(25)
+    expect(MODEL_RECIPE_REGISTRY.models).toHaveLength(14)
+    expect(MODEL_RECIPE_REGISTRY.models.flatMap(({ artifacts }) => artifacts)).toHaveLength(27)
   })
 
   it("groups fidelity choices under one canonical model", () => {
@@ -56,12 +56,38 @@ describe("canonical local model catalog overlay", () => {
       "gemma-4-12b-it-qat": 21,
       "gemma-4-26b-a4b-it-qat": 39,
       "gemma-4-31b-it-qat": 43.4,
+      "laguna-s-2.1": 70.2,
       "qwen3.5-122b-a10b": 47.6,
       "nemotron-3-super-120b-a12b": 38.6,
       "deepseek-v4-flash": 61.8,
       "nemotron-3-ultra-550b-a55b": 53.9,
       "glm-5.2": 77.9,
     })
+  })
+
+  it("uses Poolside's official Laguna model and GGUF artifacts", () => {
+    const model = required(
+      Option.fromNullable(MODEL_RECIPE_REGISTRY.models.find(({ id }) => id === "laguna-s-2.1")),
+      "Laguna recipe",
+    )
+    expect(model).toMatchObject({
+      modelRepository: "poolside/Laguna-S-2.1",
+      licenseReview: { expectedId: "openmdw-1.1" },
+    })
+    expect(model.artifacts.map(({ repository, filenameIncludes }) => ({
+      repository,
+      filenameIncludes,
+    }))).toEqual([
+      { repository: "poolside/Laguna-S-2.1-GGUF", filenameIncludes: "Q4_K_M" },
+      { repository: "poolside/Laguna-S-2.1-GGUF", filenameIncludes: "Q8_0" },
+    ])
+    expect(model.performance.benchmarks).toEqual([
+      expect.objectContaining({
+        score: 70.2,
+        evidenceScope: "publisher_checkpoint",
+        sourceUrl: "https://huggingface.co/poolside/Laguna-S-2.1",
+      }),
+    ])
   })
 
   it("marks only the two unmeasured Gemma scores as explicit estimates", () => {
