@@ -135,9 +135,11 @@ deadlines, output bounds, authentication/instance identity, and compatible API/b
 It must be validated before spawning.
 
 The configured model store is authoritative. ICN's managed Hugging Face hub lives beneath that
-store, and ICN does not implicitly discover or adopt a host user's global Hugging Face cache.
-External caches or directories participate only when they are supplied explicitly as read-only
-import/source roots. ACN supplies no such roots for the product-managed ICN.
+store, and ICN does not implicitly discover host directories. External caches or directories
+participate only when supplied explicitly as read-only import/source roots. The product-managed ACN
+resolves the active standard Hugging Face Hub cache from the process environment and user-home
+fallback and supplies the existing root explicitly. ICN treats every such artifact as externally
+owned and non-deletable.
 
 Context length and sequence count belong to an explicit model serving configuration supplied to
 assessment, fitting, and load. ACN persists that configuration inside a provider offering; ICN owns

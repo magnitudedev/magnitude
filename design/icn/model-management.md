@@ -20,8 +20,16 @@ runtime residency.
 ## Managed store
 
 The configured model store is authoritative for Magnitude-managed local models. ICN does not
-implicitly adopt the host user's global Hugging Face cache. Explicit read-only import roots are
-deployment inputs and are not enabled by default.
+implicitly adopt host directories. The product-managed ACN resolves the active standard Hugging
+Face Hub cache from `HF_HUB_CACHE`, the deprecated `HUGGINGFACE_HUB_CACHE`, `HF_HOME`,
+`XDG_CACHE_HOME`, or the user-home default, in that precedence order. When the resolved directory
+exists, ACN supplies it to ICN as an explicit read-only cache root. A nonstandard per-operation
+`cache_dir` remains an explicit deployment input because it cannot be inferred from process
+configuration.
+
+External cache artifacts are locally available but remain externally owned. Inventory may inspect,
+fit, offer, and load them without copying them into the managed store. Magnitude must not delete or
+mutate them.
 
 Downloaded model artifacts are authoritative data. Derived indexes, inspections, resolutions, and
 assessments are disposable caches.

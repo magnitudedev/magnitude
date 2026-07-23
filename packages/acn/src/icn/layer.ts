@@ -16,6 +16,7 @@ import {
 } from "@magnitudedev/icn"
 import { ACN_VERSION } from "../version"
 import { AcnShutdown } from "../acn-shutdown"
+import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache"
 import { selectIcnReleasePlatformKey } from "./release-platform"
 
 const platformKey = (): string => {
@@ -87,7 +88,7 @@ const makeProcess = (dataDir: string) =>
       storage: new IcnStorageConfig({
         modelStore: Option.some(join(dataDir, "models")),
         modelSources: [],
-        huggingFaceCaches: [],
+        huggingFaceCaches: resolveHuggingFaceCacheRoots(),
       }),
       host: "127.0.0.1",
       startupTimeout: Duration.seconds(30),
