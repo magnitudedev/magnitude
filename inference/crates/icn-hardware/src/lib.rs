@@ -484,6 +484,7 @@ fn discover_system_product_name(platform: &str) -> Option<String> {
 
 fn normalize_product_name(value: &[u8]) -> Option<String> {
     let name = String::from_utf8_lossy(value)
+        .replace('_', " ")
         .trim_matches(|character: char| character == '\0' || character.is_whitespace())
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -2397,6 +2398,10 @@ mod tests {
     fn product_identity_normalization_preserves_real_names_and_rejects_placeholders() {
         assert_eq!(
             normalize_product_name(b"  NVIDIA DGX Spark\0\n"),
+            Some("NVIDIA DGX Spark".to_owned())
+        );
+        assert_eq!(
+            normalize_product_name(b"NVIDIA_DGX_Spark"),
             Some("NVIDIA DGX Spark".to_owned())
         );
         assert_eq!(
