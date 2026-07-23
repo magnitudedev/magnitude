@@ -68,6 +68,11 @@ The catalog is ICN-owned. ACN owns assessment batching and recommendation policy
 `GET /v1/models/installed` returns only packages currently installed in configured local sources,
 including their local path and inspection result.
 
+Installed-package reconciliation discovers artifacts and obtains hardware-independent inspection
+facts only. It never calibrates hardware, chooses a serving profile, or runs fit assessment.
+Failure to inspect one artifact is reported on that package and does not fail or restart the
+inventory-wide scan.
+
 Product startup does not wait for external-source reconciliation. The installed-package observer
 publishes an empty initial snapshot, starts reconciliation immediately in the background, and
 publishes the complete result when ICN returns it. Later refreshes retain the previous complete
@@ -147,6 +152,7 @@ permanent failed state.
 
 - Catalog, installed packages, downloads, offerings, and residency remain distinct.
 - Installed listing returns installed packages only.
+- Installed listing performs no hardware assessment and isolates artifact inspection failures.
 - Download failure belongs to one attempt and can be retried with a new attempt.
 - Package identity is independent of paths and mutable repository refs.
 - Catalog failure does not hide installed packages.

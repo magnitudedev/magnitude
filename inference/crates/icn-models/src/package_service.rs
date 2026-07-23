@@ -493,7 +493,14 @@ impl InstalledModelPackages for ModelManager {
         &self,
     ) -> BoxFuture<'_, Result<InstalledModelPackagesResponse, InventoryError>> {
         Box::pin(async move {
-            let models = <Self as ModelInventory>::list(self).await?;
+            self.ensure_installed_model_inventory().await?;
+            let models = self
+                .models
+                .read()
+                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
             let mut packages = Vec::new();
             let mut package_models = BTreeMap::new();
             for model in models {

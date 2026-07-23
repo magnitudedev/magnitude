@@ -12,9 +12,9 @@ import { Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import {
   useLocalInferenceState,
-  getTickSnapshot,
+  getAnimationTickSnapshot,
   subscribeNoop,
-  subscribeTick,
+  subscribeAnimationTick,
   type LocalInferenceView,
 } from "@magnitudedev/client-common"
 import {
@@ -50,6 +50,7 @@ interface LocalInferenceScreenProps {
 export const LOCAL_MODEL_SECTION_WIDTH = 72
 const SECTION_LABEL_GAP = 2
 const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const
 
 type LocalSetupHoveredAction = "models-skip"
 export const localModelSectionRule = (label: string): string =>
@@ -74,11 +75,12 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
     onSome: (state) => state.models.recommendations.progress
       .some(({ status }) => status._tag === "Running"),
   })
-  useSyncExternalStore(
-    trackingProgress ? subscribeTick : subscribeNoop,
-    getTickSnapshot,
-    getTickSnapshot,
+  const animationTick = useSyncExternalStore(
+    trackingProgress ? subscribeAnimationTick : subscribeNoop,
+    getAnimationTickSnapshot,
+    getAnimationTickSnapshot,
   )
+  const spinnerFrame = SPINNER_FRAMES[animationTick % SPINNER_FRAMES.length]
   const nowMs = Date.now()
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c" && !key.meta && !key.option) {
@@ -103,17 +105,24 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
         <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
         <box style={{ flexDirection: "column", paddingTop: 2 }}>
           <text style={{ fg: theme.primary }}>
-            ⠹ Detecting your hardware · {Math.max(0, Math.floor((nowMs - loadingStartedAt) / 1_000))}s
+            {spinnerFrame} Detecting your hardware · {Math.max(0, Math.floor((nowMs - loadingStartedAt) / 1_000))}s
           </text>
-          <text style={{ fg: theme.muted }}>○ Loading models from Hugging Face</text>
-          <text style={{ fg: theme.muted }}>○ Checking model files</text>
+          <text style={{ fg: theme.muted }}>○ Checking for downloaded models</text>
+          <text style={{ fg: theme.muted }}>○ Loading curated Hugging Face model details</text>
+          <text style={{ fg: theme.muted }}>○ Preparing model details</text>
           <text style={{ fg: theme.muted }}>○ Evaluating models for this machine</text>
           <text style={{ fg: theme.muted }}>○ Choosing recommendations</text>
         </box>
       </box>
     ),
     onSome: (state) => (
-      <ReadyLocalInferenceScreen {...props} state={state} local={local} nowMs={nowMs} />
+      <ReadyLocalInferenceScreen
+        {...props}
+        state={state}
+        local={local}
+        nowMs={nowMs}
+        spinnerFrame={spinnerFrame}
+      />
     ),
   })
 })
@@ -124,10 +133,12 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   onSkip,
   onConfigured,
   nowMs,
+  spinnerFrame,
 }: LocalInferenceScreenProps & {
   readonly state: LocalInferenceView
   readonly local: LocalInferenceController
   readonly nowMs: number
+  readonly spinnerFrame: string
 }) {
   const theme = useTheme()
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
@@ -275,7 +286,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                   {line.state === "completed"
                     ? "✓ "
                     : line.state === "running"
-                      ? "⠹ "
+                      ? `${spinnerFrame} `
                       : line.state === "failed"
                         ? "! "
                         : "○ "}
