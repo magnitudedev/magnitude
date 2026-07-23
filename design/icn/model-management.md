@@ -71,7 +71,13 @@ including their local path and inspection result.
 Installed-package reconciliation discovers artifacts and obtains hardware-independent inspection
 facts only. It never calibrates hardware, chooses a serving profile, or runs fit assessment.
 Failure to inspect one artifact is reported on that package and does not fail or restart the
-inventory-wide scan.
+inventory-wide scan. Recognized draft and MTP companion GGUFs remain available in their source
+cache for explicit paired configurations but are not projected as independently loadable models.
+Discovery prefers authoritative GGUF role evidence (`eagle3` architecture or DFlash decoder
+metadata), then exact role tokens in filenames. The `mtp`, `eagle3`, and `dflash` tokens follow
+the GGUF naming convention or llama.cpp's own companion discovery; `draft` is a compatibility
+fallback for older or vendor-specific conversions. File size is never used to infer a model's
+execution role.
 
 Product startup does not wait for external-source reconciliation. The installed-package observer
 publishes an empty initial snapshot, starts reconciliation immediately in the background, and
@@ -153,6 +159,7 @@ permanent failed state.
 - Catalog, installed packages, downloads, offerings, and residency remain distinct.
 - Installed listing returns installed packages only.
 - Installed listing performs no hardware assessment and isolates artifact inspection failures.
+- Draft and MTP execution companions are never listed as standalone installed models.
 - Download failure belongs to one attempt and can be retried with a new attempt.
 - Package identity is independent of paths and mutable repository refs.
 - Catalog failure does not hide installed packages.

@@ -32,6 +32,12 @@ pub struct GgufInspection {
     pub tensor_count: u64,
     pub header_bytes: u64,
     pub fingerprint_material: Vec<u8>,
+    pub execution_role: Option<GgufExecutionRole>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufExecutionRole {
+    Draft,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +132,13 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     }
 
     let architecture = string_value(&metadata, "general.architecture");
+    let execution_role = if architecture.as_deref() == Some("eagle3")
+        || string_value(&metadata, "dflash.decoder_arch").is_some()
+    {
+        Some(GgufExecutionRole::Draft)
+    } else {
+        None
+    };
     let training_context_length = architecture
         .as_ref()
         .and_then(|architecture| u32_value(&metadata, &format!("{architecture}.context_length")))
@@ -190,6 +203,7 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
         tensor_count,
         header_bytes,
         fingerprint_material,
+        execution_role,
     })
 }
 

@@ -1664,6 +1664,10 @@ fn discover_groups(
             .to_ascii_lowercase();
         if name.contains("mmproj") || name.contains("projector") {
             projectors.push(path);
+        } else if is_execution_companion(&path, &name) {
+            // Draft and MTP artifacts are not independently loadable chat models. They remain
+            // available at their source path for an explicit paired configuration.
+            continue;
         } else if let Some((prefix, index, total)) = split_shard_name(&path) {
             groups.entry(prefix).or_default().push((index, total, path));
         } else {
@@ -1698,6 +1702,17 @@ fn discover_groups(
         });
     }
     Ok(output)
+}
+
+fn is_execution_companion(path: &Path, name: &str) -> bool {
+    gguf::inspect(path).is_ok_and(|inspection| inspection.execution_role.is_some())
+        || is_execution_companion_name(name)
+}
+
+fn is_execution_companion_name(name: &str) -> bool {
+    name.trim_end_matches(".gguf")
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| matches!(part, "dflash" | "draft" | "eagle3" | "mtp"))
 }
 
 fn components_for_group(
@@ -2114,6 +2129,24 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn write_minimal_gguf_with_string_metadata(path: &Path, entries: &[(&str, &str)]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, value) in entries {
+            bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(&8_u32.to_le_bytes());
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        let aligned = bytes.len().div_ceil(32) * 32;
+        bytes.resize(aligned, 0);
+        fs::write(path, bytes).unwrap();
+    }
+
     #[tokio::test]
     async fn installed_packages_skip_hardware_assessment() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2217,6 +2250,35 @@ mod tests {
             Some((1, 2))
         );
         assert!(split_shard_name(Path::new("model-1-of-2.gguf")).is_none());
+    }
+
+    #[test]
+    fn excludes_execution_companions_from_standalone_model_groups() {
+        let temporary = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&temporary.path().join("laguna-s-2.1-Q4_K_M.gguf"));
+        write_minimal_gguf_with_string_metadata(
+            &temporary.path().join("unlabelled-laguna-companion.gguf"),
+            &[("dflash.decoder_arch", "laguna")],
+        );
+        write_minimal_gguf_with_string_metadata(
+            &temporary.path().join("unlabelled-eagle-companion.gguf"),
+            &[("general.architecture", "eagle3")],
+        );
+        write_minimal_gguf(&temporary.path().join("qwen-MTP-BF16.gguf"));
+
+        let groups = discover_groups(temporary.path(), temporary.path()).unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].paths[0]
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("laguna-s-2.1-Q4_K_M.gguf"),
+        );
+        assert!(is_execution_companion_name("laguna-s-2.1-dflash-bf16.gguf"));
+        assert!(is_execution_companion_name("eagle3-qwen-4b.gguf"));
+        assert!(is_execution_companion_name("qwen-mtp-bf16.gguf"));
+        assert!(!is_execution_companion_name("draftsmanship-q4.gguf"));
     }
 
     #[test]
