@@ -19,7 +19,7 @@ import {
   type Timestamped,
 } from '@magnitudedev/event-core'
 import { ProviderToolCallIdSchema, ToolCallIdSchema } from '@magnitudedev/ai'
-import type { AppEvent } from '../src/events'
+import { UserBashCommandId, type AppEvent } from '../src/events'
 import type { ToolKey } from '../src/tools/toolkits'
 import { toToolKeyErased } from '../src/tools/toolkits'
 import { TurnProjection } from '../src/projections/turn'
@@ -106,6 +106,18 @@ const turnStarted = (timestamp: number, id = turnId): TimestampedAppEvent => ({
   chainId: 'c1',
 })
 
+const userBashCommand = (timestamp: number): TimestampedAppEvent => ({
+  type: 'user_bash_command',
+  commandId: UserBashCommandId('bash-1'),
+  timestamp,
+  forkId: null,
+  command: 'pwd',
+  cwd: '/tmp',
+  exitCode: 0,
+  stdout: '/tmp\n',
+  stderr: '',
+})
+
 const toolInputStarted = (
   timestamp: number,
   toolKey: ToolKey,
@@ -156,6 +168,31 @@ const toolExecutionStarted = (
 })
 
 describe('Display — toolKey routing & no-duplicate steps', () => {
+  it('projects a durable user bash command with its event identity and output', async () => {
+    const messages = listMessages(await runDisplay([userBashCommand(ts(1))]))
+
+    expect(messages).toEqual([{
+      id: 'bash-1',
+      type: 'user_bash_command',
+      command: 'pwd',
+      cwd: '/tmp',
+      exitCode: 0,
+      stdout: '/tmp\n',
+      stderr: '',
+      timestamp: ts(1),
+    }])
+  })
+
+  it('keeps bash invoked during a turn after subsequent output from that turn', async () => {
+    const messages = listMessages(await runDisplay([
+      turnStarted(ts(1)),
+      userBashCommand(ts(2)),
+      toolInputStarted(ts(3), 'fileTree', 'tree'),
+    ]))
+
+    expect(messages.map((message) => message.type)).toEqual(['tool', 'user_bash_command'])
+  })
+
   it('uses the app event message id for user message display identity', async () => {
     const messages = await runDisplay([
       userMessage('client-message-1', ts(1), 'hello'),

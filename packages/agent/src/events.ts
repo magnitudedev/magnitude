@@ -7,7 +7,7 @@
  */
 
 
-import { Option } from 'effect'
+import { Brand, Option } from 'effect'
 import type { ContextPart } from './content'
 import type { ModelAttemptFailureSnapshot, ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
 import type { ToolLifecycleEvent } from '@magnitudedev/harness'
@@ -100,8 +100,12 @@ export interface ObservationsCaptured {
   readonly parts: readonly ContextPart[]
 }
 
+export type UserBashCommandId = string & Brand.Brand<'UserBashCommandId'>
+export const UserBashCommandId = Brand.nominal<UserBashCommandId>()
+
 export interface UserBashCommand {
   readonly type: 'user_bash_command'
+  readonly commandId: UserBashCommandId
   readonly forkId: null
   readonly timestamp: number
   readonly command: string

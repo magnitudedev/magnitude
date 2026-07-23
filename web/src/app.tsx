@@ -622,7 +622,7 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
       bashMode={composer.bashMode}
       onSend={(text, mentions) => { void composer.handleSend(text, { mentions }) }}
       onInterrupt={composer.handleInterrupt}
-      onRunBash={(command) => { void composer.handleRunBash(command) }}
+      onRunBash={composer.handleRunBash}
       onSlashCommand={composer.handleSlashCommand}
       onToggleBashMode={() => composer.setBashMode((prev: boolean) => !prev)}
       onMentionConfirm={handleMentionConfirm}

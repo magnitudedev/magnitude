@@ -16,7 +16,6 @@ import {
   useRecentChatsNavigation,
   useSessionActions,
   pendingUserSubmitAtom,
-  bashOutputsAtom,
   composerHasContentAtom,
   settingsOpenAtom,
   usageOpenAtom,
@@ -62,13 +61,9 @@ export function useRecentChatsWidgetState(): RecentChatsWidgetState {
   const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
   const composerHasContent = useAtomValue(composerHasContentAtom)
   const pendingUserSubmit = useAtomValue(pendingUserSubmitAtom)
-  const bashOutputs = useAtomValue(bashOutputsAtom)
   const messageCount = useDisplayState((state) => getFork(state, null)?.messages.order.length ?? 0)
 
-  const hasActivity = pendingUserSubmit || hasConversationActivity({
-    displayMessageCount: messageCount,
-    bashOutputCount: bashOutputs.length,
-  })
+  const hasActivity = pendingUserSubmit || hasConversationActivity(messageCount)
 
   const resumeSession = useResumeSession()
   const resumeChat = useCallback((chat: RecentChat) => resumeSession(chat.id), [resumeSession])

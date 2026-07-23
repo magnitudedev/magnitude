@@ -11,9 +11,13 @@ applies_to:
   - packages/acn/src/session-drafts.ts
   - packages/acn/src/active-session-statuses.ts
   - packages/acn/src/display-view-streams.ts
+  - packages/acn/src/handlers.ts
+  - packages/acn/src/ops.ts
   - packages/acn/src/server.ts
   - packages/protocol/src/rpcs/**
   - packages/protocol/src/schemas/subscription.ts
+  - packages/protocol/src/schemas/display.ts
+  - packages/protocol/src/schemas/shell.ts
   - packages/sdk/src/jit-rpc/**
   - packages/sdk/src/acn-jit/**
   - packages/client-common/src/**
@@ -21,6 +25,8 @@ applies_to:
   - packages/agent/src/coding-agent.ts
   - packages/agent/src/compaction/worker.ts
   - packages/agent/src/events.ts
+  - packages/agent/src/display/**
+  - packages/agent/src/display-view/**
   - packages/agent/src/index.ts
   - packages/agent/src/execution/execution-manager.ts
   - packages/agent/src/execution/types.ts
@@ -66,6 +72,18 @@ owned detached processes. Both UI status and runtime lifetime use that status.
 Session startup is single-flight. Unloading closes the current runtime before publishing it as
 absent; later work creates a new runtime. A draft stores session intent, not a runtime. Deletion
 blocks new work, waits for current work to finish, closes the runtime, then deletes durable state.
+
+## User bash command history
+
+A user bash command is session work. Completion records one identified session event containing the
+command, working directory, exit code, and bounded stdout and stderr. That event is the sole source
+of truth for agent context and display history; clients must not maintain a parallel command-result
+history.
+
+Display replay, pagination, and session resume reproduce each recorded command exactly once. A
+command issued during an active agent turn remains in the pending user-activity suffix so later
+output from that turn is displayed before the command. Interrupting the turn restores queued text
+to the composer but retains already-executed bash commands in history.
 
 ## Display streams during session unload
 

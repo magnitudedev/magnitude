@@ -102,16 +102,17 @@ function removeActiveToolProducer(
 function appendMessageToFork(
   messages: DisplayTimelineMessagesHandle,
   fork: DisplayTimelineState,
-  message: DisplayMessage
+  message: DisplayMessage,
+  pendingUserActivity = message.type === 'queued_user_message',
 ) {
   return Effect.map(
     appendDisplayMessage(messages, fork.messages, message),
     (index): DisplayTimelineState => ({
       ...fork,
       messages: index,
-      _queuedUserMessageCount: message.type === 'queued_user_message'
-        ? fork._queuedUserMessageCount + 1
-        : fork._queuedUserMessageCount
+      _pendingUserActivityCount: pendingUserActivity
+        ? fork._pendingUserActivityCount + 1
+        : fork._pendingUserActivityCount
     })
   )
 }
@@ -121,21 +122,19 @@ function insertMessageIntoFork(
   fork: DisplayTimelineState,
   message: DisplayMessage
 ) {
-  return fork._queuedUserMessageCount === 0
+  return fork._pendingUserActivityCount === 0
     ? appendMessageToFork(messages, fork, message)
     : Effect.map(
       messages.replaceRange(
         fork.messages,
-        fork.messages.totalCount - fork._queuedUserMessageCount,
-        fork.messages.totalCount - fork._queuedUserMessageCount,
+        fork.messages.totalCount - fork._pendingUserActivityCount,
+        fork.messages.totalCount - fork._pendingUserActivityCount,
         [message]
       ),
       (index): DisplayTimelineState => ({
         ...fork,
         messages: index,
-        _queuedUserMessageCount: message.type === 'queued_user_message'
-          ? fork._queuedUserMessageCount + 1
-          : fork._queuedUserMessageCount
+        _pendingUserActivityCount: fork._pendingUserActivityCount
       })
     )
 }
@@ -449,7 +448,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
   initialFork: {
     mode: 'idle',
     messages: DisplayTimelineMessages.empty,
-    _queuedUserMessageCount: 0,
+    _pendingUserActivityCount: 0,
     _pendingInboundCommunications: [],
     _currentTurnId: null,
     streamingMessageId: null,
@@ -491,6 +490,18 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
           })),
       })
     },
+
+    user_bash_command: ({ event, fork, addressed }) =>
+      appendMessageToFork(addressed.messages, fork, {
+        id: event.commandId,
+        type: 'user_bash_command',
+        command: event.command,
+        cwd: event.cwd,
+        exitCode: event.exitCode,
+        stdout: event.stdout,
+        stderr: event.stderr,
+        timestamp: event.timestamp,
+      }, fork._currentTurnId !== null),
 
     skill_activated: ({ event, fork, addressed }) => {
       if (event.source !== 'user') return fork
@@ -537,23 +548,23 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
     turn_started: ({ event, fork, addressed }) => Effect.gen(function* () {
       let stateWithMessages = yield* releaseActiveThinking(addressed.messages, fork)
 
-      if (stateWithMessages._queuedUserMessageCount > 0) {
-        // Queued messages are by invariant the tail suffix; promote each in
-        // place (content-only, same ids and offsets).
+      if (stateWithMessages._pendingUserActivityCount > 0) {
+        // Pending user activity is by invariant the tail suffix. Promote
+        // queued text in place; completed bash entries need no state change.
         let index = stateWithMessages.messages
-        const queuedIds = tailDisplayMessageIds(
+        const pendingIds = tailDisplayMessageIds(
           addressed.messages,
           index,
-          stateWithMessages._queuedUserMessageCount
+          stateWithMessages._pendingUserActivityCount
         )
-        for (const queuedId of queuedIds) {
-          index = yield* addressed.messages.updateById(index, queuedId, (msg) =>
+        for (const pendingId of pendingIds) {
+          index = yield* addressed.messages.updateById(index, pendingId, (msg) =>
             msg.type === 'queued_user_message'
               ? { ...msg, type: 'user_message' as const }
               : msg
           )
         }
-        stateWithMessages = { ...stateWithMessages, messages: index, _queuedUserMessageCount: 0 }
+        stateWithMessages = { ...stateWithMessages, messages: index, _pendingUserActivityCount: 0 }
       }
 
       return {
@@ -1007,14 +1018,15 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
     },
 
     interrupt: ({ event, fork, emit, read, addressed }) => Effect.gen(function* () {
-      // Queued messages are by invariant the tail suffix.
-      if (fork._queuedUserMessageCount > 0) {
-        const queuedMessages = yield* addressed.messages.readWindow(
-          addressed.messages.resolveTailWindow(fork.messages, fork._queuedUserMessageCount)
+      // Pending user activity is by invariant the tail suffix.
+      let pendingUserActivity: readonly DisplayMessage[] = []
+      if (fork._pendingUserActivityCount > 0) {
+        pendingUserActivity = yield* addressed.messages.readWindow(
+          addressed.messages.resolveTailWindow(fork.messages, fork._pendingUserActivityCount)
         )
         emit.restoreQueuedMessages({
           forkId: event.forkId,
-          messages: queuedMessages.flatMap((m) =>
+          messages: pendingUserActivity.flatMap((m) =>
             m.type === 'queued_user_message'
               ? [{ id: m.id, content: m.content, taskMode: m.taskMode }]
               : []
@@ -1031,13 +1043,14 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
 
       const cleanedState = yield* releaseActiveThinking(addressed.messages, stateWithInterruptedTools)
 
-      // Replace the queued tail suffix with the interrupted marker.
+      // Restore queued messages to the composer, retain completed user bash
+      // activity in history, then append the interrupted marker.
       const total = cleanedState.messages.totalCount
       const messages = yield* addressed.messages.replaceRange(
         cleanedState.messages,
-        total - cleanedState._queuedUserMessageCount,
+        total - cleanedState._pendingUserActivityCount,
         total,
-        [{
+        [...pendingUserActivity.filter((message) => message.type === 'user_bash_command'), {
           id: `interrupt:${forkIdKey(event.forkId)}:${fork._currentTurnId ?? 'idle'}:${event.timestamp}`,
           type: 'interrupted' as const,
           timestamp: event.timestamp,
@@ -1048,7 +1061,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
       const withMessages = {
         ...cleanedState,
         messages,
-        _queuedUserMessageCount: 0,
+        _pendingUserActivityCount: 0,
         _activeToolCallIds: [],
         _communicationMessageIdsByStreamId: {}
       }

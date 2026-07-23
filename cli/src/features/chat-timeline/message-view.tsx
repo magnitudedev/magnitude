@@ -7,6 +7,7 @@ import { QueuedUserMessage } from './messages/queued-user-message'
 import { AssistantMessage } from './messages/assistant-message'
 import { AgentCommunicationCard } from './messages/agent-communication-card'
 import { ErrorMessage } from './messages/error-message'
+import { BashOutput } from './messages/bash-output'
 import { useTheme } from '../../hooks/use-theme'
 import { green, red, violet } from '../../utils/theme'
 import { TextAttributes } from '@opentui/core'
@@ -75,7 +76,9 @@ export const MessageView = memo(function MessageView({
   mode = 'default',
 }: MessageViewProps) {
   const theme = useTheme()
-  const isUserType = message.type === 'user_message' || message.type === 'queued_user_message'
+  const isUserType = message.type === 'user_message'
+    || message.type === 'queued_user_message'
+    || message.type === 'user_bash_command'
 
   const content = (() => {
     switch (message.type) {
@@ -84,6 +87,9 @@ export const MessageView = memo(function MessageView({
 
       case 'queued_user_message':
         return <QueuedUserMessage content={message.content} />
+
+      case 'user_bash_command':
+        return <BashOutput result={message} />
 
       case 'assistant_message':
         return (

@@ -11,7 +11,6 @@
 import { Atom } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import type { SessionOptions } from "@magnitudedev/sdk"
-import type { BashResult } from "../utils/bash-executor"
 import type { InputMentionSegment } from "../types/store"
 
 /**
@@ -87,12 +86,6 @@ export const composerHasContentAtom = Atom.make(false)
  * Guards against concurrent session creation from rapid submits.
  */
 export const pendingUserSubmitAtom = Atom.make(false)
-
-/**
- * Bash command outputs — shared so both apps can render bash output.
- * Each entry is a RunBashResult from the daemon.
- */
-export const bashOutputsAtom = Atom.make<BashResult[]>([])
 
 /**
  * Options applied when a client lazily creates a session (safeguard flags,

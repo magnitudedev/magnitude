@@ -22,7 +22,7 @@ const displayTimelineState = (
   streamingMessageId: null,
   _currentTurnId: null,
   _pendingInboundCommunications: [],
-  _queuedUserMessageCount: 0,
+  _pendingUserActivityCount: 0,
   _thinkingMessageId: null,
   _activeToolCallIds: [],
   _communicationMessageIdsByStreamId: {},

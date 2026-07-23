@@ -47,6 +47,18 @@ export const AssistantMessage = Schema.Struct({
 })
 export type AssistantMessage = Schema.Schema.Type<typeof AssistantMessage>
 
+export const UserBashCommandMessage = Schema.Struct({
+  id: Schema.String,
+  type: Schema.Literal("user_bash_command"),
+  command: Schema.String,
+  cwd: Schema.String,
+  exitCode: Schema.Number,
+  stdout: Schema.String,
+  stderr: Schema.String,
+  timestamp: Schema.Number
+})
+export type UserBashCommandMessage = Schema.Schema.Type<typeof UserBashCommandMessage>
+
 export const ThinkingMessage = Schema.Struct({
   id: Schema.String,
   type: Schema.Literal("thinking"),
@@ -219,6 +231,7 @@ export type AgentCommunicationMessage = Schema.Schema.Type<typeof AgentCommunica
 export const DisplayMessage = Schema.Union(
   UserMessage,
   QueuedUserMessage,
+  UserBashCommandMessage,
   AssistantMessage,
   ThinkingMessage,
   ToolMessage,
