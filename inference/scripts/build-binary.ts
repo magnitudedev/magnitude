@@ -89,6 +89,7 @@ async function smokeIcn(binaryFile: string): Promise<void> {
   }
 
   const modelStore = await mkdtemp(join(tmpdir(), "magnitude-icn-smoke-"));
+  const cacheRoot = await mkdtemp(join(tmpdir(), "magnitude-icn-cache-smoke-"));
   const capability = crypto.randomUUID();
   const child = Bun.spawn(
     [
@@ -102,6 +103,8 @@ async function smokeIcn(binaryFile: string): Promise<void> {
       String(process.pid),
       "--model-store",
       modelStore,
+      "--cache-root",
+      cacheRoot,
     ],
     {
       stdout: "pipe",

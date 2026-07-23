@@ -10,6 +10,9 @@ applies_to:
   - inference/crates/icn-models/**
   - inference/crates/icn-hardware/**
   - inference/crates/icn-utils/**
+  - inference/crates/icn-server/src/load_progress.rs
+  - packages/icn/src/lifecycle/**
+  - packages/acn/src/icn/layer.ts
 ---
 
 # File-based cache, index, and configuration recovery
@@ -32,7 +35,7 @@ Every file-backed format must be classified before its persistence behavior is d
 
 | Class | Examples | Recovery authority | Cache/file failure visible to caller? |
 | --- | --- | --- | --- |
-| Recomputable cache | fit assessment, remote header, parsed provider catalog | Recompute from authoritative inputs | Never |
+| Recomputable cache | fit assessment, load timing evidence, remote header, parsed provider catalog | Recompute from authoritative inputs | Never |
 | Recomputable index | local-model inventory, session lookup index | Re-enumerate authoritative files or records | Never |
 | Durable configuration | user preferences with defined defaults | Preserve valid values; default damaged values | Only if recovery is catastrophic |
 | Irreplaceable record | session events, user content, credentials | Format-specific durability and repair protocol | Yes; this document's defaulting rules do not apply |

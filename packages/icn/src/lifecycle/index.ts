@@ -66,6 +66,7 @@ export class IcnStorageConfig extends Schema.Class<IcnStorageConfig>(
   "IcnStorageConfig"
 )({
   modelStore: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
+  cacheRoot: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
   modelSources: Schema.Array(NonEmpty),
   huggingFaceCaches: Schema.Array(NonEmpty),
 }) {}
@@ -815,6 +816,10 @@ export const renderIcnArguments = (
   ...Option.match(config.storage.modelStore, {
     onNone: () => [],
     onSome: (value) => ["--model-store", value],
+  }),
+  ...Option.match(config.storage.cacheRoot, {
+    onNone: () => [],
+    onSome: (value) => ["--cache-root", value],
   }),
   ...config.storage.modelSources.flatMap((value) => ["--model-source", value]),
   ...config.storage.huggingFaceCaches.flatMap((value) => ["--hf-cache", value]),

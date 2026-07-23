@@ -82,9 +82,9 @@ impl Drop for ModelCacheWorkspace {
 
 impl ModelCache {
     #[must_use]
-    pub fn new(model_store_root: &Path) -> Self {
+    pub fn new(cache_root: &Path) -> Self {
         Self {
-            root: model_store_root.join("cache"),
+            root: cache_root.to_path_buf(),
         }
     }
 
@@ -114,6 +114,19 @@ impl ModelCache {
         write_json_atomic(
             &self.index_path_for_digest(kind, &digest),
             &self.lock_path(&format!("index-{digest}")),
+            value,
+            MAX_INDEX_BYTES,
+        );
+    }
+
+    pub fn read_load_timing_store<T: DeserializeOwned>(&self) -> Option<T> {
+        read_json(&self.load_timing_path(), MAX_INDEX_BYTES)
+    }
+
+    pub fn write_load_timing_store<T: Serialize>(&self, value: &T) {
+        write_json_atomic(
+            &self.load_timing_path(),
+            &self.lock_path("load-timings"),
             value,
             MAX_INDEX_BYTES,
         );
@@ -230,6 +243,10 @@ impl ModelCache {
 
     fn inventory_path(&self) -> PathBuf {
         self.root.join("indexes/inventory.json")
+    }
+
+    fn load_timing_path(&self) -> PathBuf {
+        self.root.join("indexes/runtime/load-timings.json")
     }
 
     fn index_path(&self, kind: ModelIndexKind, evidence: &str) -> PathBuf {
@@ -389,8 +406,9 @@ mod tests {
     #[test]
     fn workspace_falls_back_when_the_cache_root_is_unusable() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("cache"), b"not a directory").unwrap();
-        let cache = ModelCache::new(directory.path());
+        let cache_root = directory.path().join("blocked-cache");
+        fs::write(&cache_root, b"not a directory").unwrap();
+        let cache = ModelCache::new(&cache_root);
         let path = {
             let workspace = cache.workspace().unwrap();
             let path = workspace.path().to_path_buf();

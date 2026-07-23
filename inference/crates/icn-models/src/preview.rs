@@ -2009,13 +2009,15 @@ mod tests {
     async fn fresh_preview_survives_an_unusable_persistent_cache() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("model-store");
-        let mut config = crate::inventory::InventoryConfig::with_root(store.clone()).unwrap();
+        let cache_root = temporary.path().join("cache");
+        let mut config =
+            crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
+                .unwrap();
         config.hf_cache_dirs.clear();
         let manager =
             ModelManager::open_with_template_assessor(config, Some(Arc::new(TestTemplateAssessor)))
                 .await
                 .unwrap();
-        let cache_root = store.join("cache");
         let _ = fs::remove_dir_all(&cache_root);
         fs::write(&cache_root, b"not a directory").unwrap();
 
@@ -2174,9 +2176,11 @@ mod tests {
     #[tokio::test]
     async fn preview_assessments_cache_only_terminal_results_by_complete_evidence() {
         let temporary = tempfile::tempdir().unwrap();
-        let mut config =
-            crate::inventory::InventoryConfig::with_root(temporary.path().join("model-store"))
-                .unwrap();
+        let mut config = crate::inventory::InventoryConfig::with_roots(
+            temporary.path().join("model-store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
         config.hf_cache_dirs.clear();
         let manager = ModelManager::open(config).await.unwrap();
         let assessment = HardwareAssessment::Fits {
@@ -2248,7 +2252,10 @@ mod tests {
     async fn concurrent_identical_previews_coalesce_native_assessment() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("model-store");
-        let mut config = crate::inventory::InventoryConfig::with_root(store.clone()).unwrap();
+        let cache_root = temporary.path().join("cache");
+        let mut config =
+            crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
+                .unwrap();
         config.hf_cache_dirs.clear();
         let manager = Arc::new(
             ModelManager::open_with_template_assessor(config, Some(Arc::new(TestTemplateAssessor)))
@@ -2319,7 +2326,7 @@ mod tests {
                 if code == "not_requested"
         ));
         assert_eq!(assessor.0.load(Ordering::SeqCst), 1);
-        fs::remove_dir_all(store.join("cache/blobs")).unwrap();
+        fs::remove_dir_all(cache_root.join("blobs")).unwrap();
         service.preview(request).await.unwrap();
         assert_eq!(assessor.0.load(Ordering::SeqCst), 1);
     }
@@ -2343,9 +2350,11 @@ mod tests {
         }
 
         let temporary = tempfile::tempdir().unwrap();
-        let mut config =
-            crate::inventory::InventoryConfig::with_root(temporary.path().join("model-store"))
-                .unwrap();
+        let mut config = crate::inventory::InventoryConfig::with_roots(
+            temporary.path().join("model-store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
         config.hf_cache_dirs.clear();
         let manager =
             ModelManager::open_with_template_assessor(config, Some(Arc::new(TestTemplateAssessor)))

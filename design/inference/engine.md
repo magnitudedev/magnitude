@@ -45,9 +45,11 @@ API / caller threads
 
 `NativeBackend` is the process-lifetime capability proving that llama.cpp's global backend is
 initialized. ICN creates it once at the server composition root and retains it until shutdown.
-`LlamaCompletionBackend` is the resident-model handle. Loading it requires the native capability,
-starts a named executor thread, creates a fresh process-local backend plan, and consumes that exact
-owned plan to initialize the model, context, chat templates, worker
+`LlamaCompletionBackend` is the resident-model handle. Preparing a load requires the native
+capability, starts the named executor thread, creates a fresh process-local backend plan on that
+thread, and returns a `PreparedModelLoad` only after the exact plan is fixed. The non-`Send` native
+plan remains on its owner thread; executing the prepared handle releases that thread to consume the
+exact owned plan and initialize the model, context, chat templates, worker
 pools, and optional projector or MTP runtime. It then returns a typed readiness result which
 distinguishes invalid or incompatible artifacts, `DoesNotFit`, operational planning failure,
 allocation failure, and success with normalized resolved evidence. The
@@ -60,6 +62,11 @@ one ICN planner implementation. They are retained in pointer-safe owned native o
 directly to loading. The engine never reconstructs them from a serialized summary. Preview uses the
 same planner but destroys the process-local plan and caches only normalized assessment evidence;
 loading always replans under current conditions.
+
+Prepared execution reports synchronous semantic boundaries for target model, target context,
+optional draft model and context, optional projector, runtime setup, warm-up, and finalization.
+These boundaries describe completed engine work; they are not native tensor percentages and do not
+claim that any individual phase exposes byte-level completion.
 
 ## Ownership and concurrency
 

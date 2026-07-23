@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -30,7 +30,9 @@ use icn_contracts::{
     ModelHardwareAssessor, ModelPreviewProfile, ProjectorConfig, ResolvedModel, SplitMode,
     TemplateAssessment, TemplateAssessor,
 };
-use icn_engine::{LlamaCompletionBackend, ModelLoadError, MtpCandidateSelection, NativeBackend};
+use icn_engine::{
+    LlamaCompletionBackend, ModelLoadError, ModelLoadObserver, MtpCandidateSelection, NativeBackend,
+};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
     InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
@@ -41,7 +43,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
 mod build_identity;
+mod load_progress;
 mod telemetry;
+
+use load_progress::{LoadProgressEstimator, LoadProgressTracker};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,6 +82,9 @@ enum Command {
         /// Magnitude-owned model inventory and Hugging Face cache root.
         #[arg(long, visible_alias = "models-dir")]
         model_store: Option<PathBuf>,
+        /// Magnitude-owned root for all disposable derived cache data.
+        #[arg(long)]
+        cache_root: Option<PathBuf>,
         /// Additional read-only directories containing GGUF models.
         #[arg(long = "model-source")]
         model_sources: Vec<PathBuf>,
@@ -1623,6 +1631,8 @@ struct NativeRuntimeController {
     native_backend: NativeBackend,
     native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
     defaults: RuntimePlanDefaults,
+    load_progress: Arc<LoadProgressEstimator>,
+    loaded_configurations: Arc<Mutex<std::collections::BTreeSet<String>>>,
     state: Arc<tokio::sync::RwLock<RuntimeState>>,
     mutation: Arc<tokio::sync::Mutex<()>>,
 }
@@ -1666,6 +1676,24 @@ impl From<InventoryError> for RuntimeTransitionFailure {
 }
 
 impl NativeRuntimeController {
+    fn model_load_failure(error: ModelLoadError) -> RuntimeTransitionFailure {
+        let (code, retryable) = match &error {
+            ModelLoadError::InvalidConfiguration(_) => ("invalid_configuration", false),
+            ModelLoadError::MtpSelection(_) => ("incompatible_auxiliary", false),
+            ModelLoadError::Planning(_) => ("planner_failed", true),
+            ModelLoadError::AssessmentRejected(assessment) => match assessment.as_ref() {
+                HardwareAssessment::DoesNotFit { .. } => ("does_not_fit", false),
+                HardwareAssessment::InvalidArtifact { .. } => ("invalid_artifact", false),
+                HardwareAssessment::IncompatibleArtifact { .. } => ("incompatible_artifact", false),
+                HardwareAssessment::NotAssessed { .. } => ("planner_failed", true),
+                HardwareAssessment::Fits { .. } => ("planner_invariant", true),
+            },
+            ModelLoadError::MemoryAttribution(_) => ("memory_attribution_failed", true),
+            ModelLoadError::Backend(_) => ("backend_load_failed", true),
+        };
+        RuntimeTransitionFailure::new(RuntimeFailure::new(code, error.to_string(), retryable))
+    }
+
     fn load_failure(error: InventoryError) -> DomainModelFailure {
         let (code, retryable) = match &error {
             InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
@@ -1698,7 +1726,8 @@ impl NativeRuntimeController {
         native_backend: NativeBackend,
         native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
         defaults: RuntimePlanDefaults,
-        initial: RuntimeState,
+        cache: ModelCache,
+        native_build: String,
     ) -> Self {
         Self {
             backends,
@@ -1706,7 +1735,9 @@ impl NativeRuntimeController {
             native_backend,
             native_executor,
             defaults,
-            state: Arc::new(tokio::sync::RwLock::new(initial)),
+            load_progress: Arc::new(LoadProgressEstimator::new(cache, native_build)),
+            loaded_configurations: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            state: Arc::new(tokio::sync::RwLock::new(RuntimeState { resident: None })),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -1805,19 +1836,22 @@ impl NativeRuntimeController {
     #[tracing::instrument(
         name = "icn.runtime.load.operation",
         skip_all,
-        fields(model.configuration.id = %configuration_id)
+        fields(model.configuration.id = %configuration.id.0)
     )]
     async fn perform_prepared_transition(
         self,
-        configuration_id: String,
-        profile: RuntimeExecutionProfile,
+        configuration: ModelServingConfiguration,
         resolved: ResolvedModel,
         plan: ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
         package_ids: Vec<ModelPackageId>,
         events: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
     ) -> Result<RuntimeResidencyId, RuntimeTransitionFailure> {
-        let model_id = configuration_id;
+        let model_id = configuration.id.0.clone();
+        let profile = RuntimeExecutionProfile {
+            context_length: configuration.profile.context_length,
+            parallel_sequences: configuration.profile.parallel_sequences,
+        };
         let existing = self.state.read().await.clone();
 
         if existing
@@ -1851,45 +1885,62 @@ impl NativeRuntimeController {
 
         let load_model_id = model_id.clone();
         let native_backend = self.native_backend.clone();
-        let progress_events = events.clone();
+        let prepared = match spawn_blocking_traced(move || {
+            native_backend.prepare_load(load_model_id, plan, mtp_selection)
+        })
+        .await
+        {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => return Err(Self::model_load_failure(error)),
+            Err(error) => {
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "load_task_failed",
+                    error.to_string(),
+                    true,
+                )));
+            }
+        };
+        let previously_loaded_in_process = self
+            .loaded_configurations
+            .lock()
+            .is_ok_and(|loaded| loaded.contains(&model_id));
+        let signature = self.load_progress.signature(
+            &configuration,
+            prepared.acceleration(),
+            prepared.timing_plan_identity(),
+            prepared.phases(),
+            previously_loaded_in_process,
+        );
+        let acceleration = prepared.acceleration().to_owned();
+        let estimates = self.load_progress.estimate(
+            &signature,
+            &configuration,
+            &acceleration,
+            prepared.phases(),
+        );
+        let tracker = LoadProgressTracker::new(estimates);
+        let observer: Arc<dyn ModelLoadObserver> = Arc::new(tracker.clone());
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Loading,
             fraction: Some(0.0),
         });
-        let load_task = spawn_blocking_traced(move || {
-            native_backend.load_with_progress(load_model_id, plan, mtp_selection, move |fraction| {
-                let _ = progress_events.send(ModelLoadEvent::Progress {
-                    stage: ModelLoadStage::Loading,
-                    fraction: Some(fraction),
-                });
-            })
-        });
-        let load_result = load_task.await;
+        let mut load_task = spawn_blocking_traced(move || prepared.execute(observer));
+        let mut progress_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let load_result = loop {
+            tokio::select! {
+                result = &mut load_task => break result,
+                _ = progress_tick.tick() => {
+                    let _ = events.send(ModelLoadEvent::Progress {
+                        stage: ModelLoadStage::Loading,
+                        fraction: Some(tracker.fraction()),
+                    });
+                }
+            }
+        };
         let backend = match load_result {
             Ok(Ok(backend)) => Arc::new(backend),
-            Ok(Err(error)) => {
-                let (code, retryable) = match &error {
-                    ModelLoadError::InvalidConfiguration(_) => ("invalid_configuration", false),
-                    ModelLoadError::MtpSelection(_) => ("incompatible_auxiliary", false),
-                    ModelLoadError::Planning(_) => ("planner_failed", true),
-                    ModelLoadError::AssessmentRejected(assessment) => match assessment.as_ref() {
-                        HardwareAssessment::DoesNotFit { .. } => ("does_not_fit", false),
-                        HardwareAssessment::InvalidArtifact { .. } => ("invalid_artifact", false),
-                        HardwareAssessment::IncompatibleArtifact { .. } => {
-                            ("incompatible_artifact", false)
-                        }
-                        HardwareAssessment::NotAssessed { .. } => ("planner_failed", true),
-                        HardwareAssessment::Fits { .. } => ("planner_invariant", true),
-                    },
-                    ModelLoadError::MemoryAttribution(_) => ("memory_attribution_failed", true),
-                    ModelLoadError::Backend(_) => ("backend_load_failed", true),
-                };
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    code,
-                    error.to_string(),
-                    retryable,
-                )));
-            }
+            Ok(Err(error)) => return Err(Self::model_load_failure(error)),
             Err(error) => {
                 return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
                     "load_task_failed",
@@ -1900,7 +1951,7 @@ impl NativeRuntimeController {
         };
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Verifying,
-            fraction: None,
+            fraction: Some(tracker.fraction()),
         });
         match backend.properties() {
             Ok(_) => {}
@@ -1934,6 +1985,16 @@ impl NativeRuntimeController {
             }),
         };
         *self.state.write().await = state.clone();
+        tracker.phase_completed(icn_engine::ModelLoadPhase::Finalize);
+        let _ = events.send(ModelLoadEvent::Progress {
+            stage: ModelLoadStage::Verifying,
+            fraction: Some(tracker.fraction()),
+        });
+        if let Ok(mut loaded) = self.loaded_configurations.lock() {
+            loaded.insert(model_id.clone());
+        }
+        self.load_progress
+            .record_success(&signature, &acceleration, &tracker);
         tracing::info!("runtime model ready");
         Ok(RuntimeResidencyId(residency_id))
     }
@@ -1978,6 +2039,7 @@ impl RuntimeController for NativeRuntimeController {
             });
             let _guard = controller.mutation.lock().await;
             let configuration = request.configuration;
+            let configuration_id = configuration.id.clone();
             let _ = events.send(ModelLoadEvent::Progress {
                 stage: ModelLoadStage::Resolving,
                 fraction: None,
@@ -1992,15 +2054,10 @@ impl RuntimeController for NativeRuntimeController {
                         return;
                     }
                 };
-            let profile = RuntimeExecutionProfile {
-                context_length: configuration.profile.context_length,
-                parallel_sequences: configuration.profile.parallel_sequences,
-            };
             let residency_id = match controller
                 .clone()
                 .perform_prepared_transition(
-                    configuration.id.0.clone(),
-                    profile,
+                    configuration,
                     resolved,
                     plan,
                     mtp_selection,
@@ -2023,13 +2080,13 @@ impl RuntimeController for NativeRuntimeController {
             };
             let mut digest = Sha256::new();
             digest.update(b"magnitude-runtime-execution-evidence-v1\0");
-            digest.update(configuration.id.0.as_bytes());
+            digest.update(configuration_id.0.as_bytes());
             digest.update(b"\0");
             digest.update(residency_id.0.as_bytes());
             let _ = events.send(ModelLoadEvent::Ready {
                 ready: LoadModelReady {
                     residency_id,
-                    configuration_id: configuration.id,
+                    configuration_id,
                     execution_evidence_id: format!("execution_{:x}", digest.finalize()),
                 },
             });
@@ -2112,6 +2169,7 @@ async fn main() -> anyhow::Result<()> {
             auth_token,
             fake,
             model_store,
+            cache_root,
             model_sources,
             hf_caches,
         } => {
@@ -2120,7 +2178,12 @@ async fn main() -> anyhow::Result<()> {
                 None => InventoryConfig::default_root()
                     .context("failed to determine default model store")?,
             };
-            let mut inventory_config = InventoryConfig::with_root(inventory_root)
+            let cache_root = match cache_root {
+                Some(root) => root,
+                None => InventoryConfig::default_cache_root()
+                    .context("failed to determine default cache root")?,
+            };
+            let mut inventory_config = InventoryConfig::with_roots(inventory_root, cache_root)
                 .context("invalid model inventory configuration")?;
             inventory_config.model_sources.extend(model_sources);
             inventory_config.hf_cache_dirs.extend(hf_caches);
@@ -2184,7 +2247,8 @@ async fn main() -> anyhow::Result<()> {
                     native_backend,
                     native_executor_slot,
                     plan_defaults,
-                    RuntimeState { resident: None },
+                    inventory.derived_cache().clone(),
+                    native_build.clone(),
                 ))
             });
             let mut state = AppState::model_free(backends)
@@ -2528,8 +2592,11 @@ mod tests {
 
         for fixture in fixtures {
             let store = tempfile::tempdir().expect("temporary model store");
-            let mut config = InventoryConfig::with_root(store.path().join("inventory"))
-                .expect("inventory config");
+            let mut config = InventoryConfig::with_roots(
+                store.path().join("inventory"),
+                store.path().join("cache"),
+            )
+            .expect("inventory config");
             config.model_sources = vec![fixture.parent().expect("fixture parent").to_path_buf()];
             config.hf_cache_dirs.clear();
             let manager = ModelManager::open_with_template_assessor(
