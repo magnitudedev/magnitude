@@ -87,6 +87,7 @@ const makeProcess = (dataDir: string) =>
       }),
       storage: new IcnStorageConfig({
         modelStore: Option.some(join(dataDir, "models")),
+        cacheRoot: Option.some(join(dataDir, "cache")),
         modelSources: [],
         huggingFaceCaches: resolveHuggingFaceCacheRoots(),
       }),

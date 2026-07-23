@@ -147,7 +147,14 @@ silently invalidates a resident model.
 
 ## Cache behavior
 
-ICN uses the shared model-derived cache for source resolution, inspection, and assessment evidence.
+ICN uses the shared `.magnitude/cache` root for source resolution, inspection, and assessment
+evidence. The authoritative `.magnitude/models` store contains installed artifacts and the managed
+Hugging Face hub, never disposable derived-cache namespaces.
+Successful model loads also retain bounded, disposable phase-duration evidence for adaptive loading
+progress. Exact observations are keyed by content, serving profile, native build, path-independent
+resolved plan identity, selected acceleration, phase shape, and process-residency class; cross-model
+observations from the same native environment are workload-scaled fallbacks. Failed or canceled
+loads never train this cache.
 Keys include immutable package identity and every behavior-changing runtime or hardware input.
 
 Malformed, missing, stale, or unreadable entries are misses at the smallest independent unit.

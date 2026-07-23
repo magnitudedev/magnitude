@@ -134,16 +134,13 @@ binding, model-store and cache roots, optional read-only import/source roots, st
 deadlines, output bounds, authentication/instance identity, and compatible API/build identity.
 It must be validated before spawning.
 
-The configured model store is authoritative. ICN's managed Hugging Face hub lives beneath that
-store, and ICN does not implicitly discover host directories. External caches or directories
-participate only when supplied explicitly as read-only import/source roots. The product-managed ACN
-resolves the active standard Hugging Face Hub cache from the process environment and user-home
-fallback and supplies the existing root explicitly. ICN treats every such artifact as externally
-owned and non-deletable.
-
-ACN health is independent of external model inventory latency. Installed-model reconciliation
-starts after the ICN client is available and hydrates its observed state asynchronously; a large or
-slow cache cannot delay ACN registration.
+The model store and disposable cache are separate roots. In the managed product layout, authoritative
+model artifacts live under `.magnitude/models` and every Magnitude-owned disposable cache namespace
+lives under `.magnitude/cache`; cache implementations must not create private cache roots beneath
+the model store. ICN's managed Hugging Face hub lives beneath the model store, and ICN does not
+implicitly discover or adopt a host user's global Hugging Face cache.
+External caches or directories participate only when they are supplied explicitly as read-only
+import/source roots. ACN supplies no such roots for the product-managed ICN.
 
 Context length and sequence count belong to an explicit model serving configuration supplied to
 assessment, fitting, and load. ACN persists that configuration inside a provider offering; ICN owns
@@ -298,7 +295,11 @@ context length, and parallel sequence count; ICN owns its stable identity and AC
 unchanged from the selected provider offering.
 Load does not accept a planner name, planner version, capacity-policy identifier, or native flags.
 ICN reassesses the exact plan and streams typed progress through resolution, assessment,
-unload/replacement, loading, verification, and ready or failed termination. Load of the
+unload/replacement, loading, verification, and ready or failed termination. Loading percentage
+begins only after the exact native plan is prepared and prior residency is released. ICN estimates
+total progress from the prepared plan's semantic phase sequence and phase-duration estimates,
+updates it on a 100-millisecond cadence, keeps it monotonic, and caps it at 99%; only the terminal
+ready event means 100%. Load of the
 already-resident identical model and profile is idempotent. Concurrent identical explicit loads
 serialize, recheck residency, and perform at most one effective successful native load. Concurrent
 incompatible mutations are serialized by the native coordinator; they never race native
@@ -317,8 +318,10 @@ request, ACN acquires the selected slot's local-model admission as a scoped reso
 acquisition performs or joins the slot's explicit load operation and remains held until ICN accepts
 the chat request and takes its generation lease.
 
-ACN consumes the admitted load operation's stream directly. Loading fractions update every product
-slot selecting that local offering, the ready event transitions them to Ready, and a failed or
+ACN consumes the admitted load operation's stream directly. A missing fraction leaves the current
+percentage unchanged, and ACN neither invents phase timers nor maps verification to 100%. Loading
+fractions update every product slot selecting that local offering, the ready event transitions them
+to Ready, and a failed or
 incomplete stream transitions them to a typed blocked state. Explicit unload similarly moves slots
 through Unloading to Unloaded. Because ICN has one resident target, a replacement load moves every
 slot selecting a different local model through Unloading to Unloaded before the target slot becomes

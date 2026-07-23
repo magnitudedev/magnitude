@@ -256,7 +256,8 @@ export const applyLocalModelLoadProgress = (
   slot: Exclude<ModelSlot, ModelSlotUnassigned>,
   fraction: number,
 ): ModelSlot => {
-  const percentage = Math.max(0, Math.min(100, Math.round(fraction * 100)))
+  // Only the terminal Ready event owns 100%. Estimated loading progress is capped at 99.
+  const percentage = Math.max(0, Math.min(99, Math.round(fraction * 100)))
   switch (slot._tag) {
     case "LoadingLocalModel":
       return ModelSlotLifecycle.hold(slot, {
@@ -455,11 +456,11 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
         progress.stage === "unloading" ? "unloading" : "unloaded",
       )
     }
+    if (progress.stage === "queued"
+      || progress.stage === "resolving"
+      || progress.stage === "unloading") return slot
     const fraction = Option.getOrNull(progress.fraction)
-    return applyLocalModelLoadProgress(
-      slot,
-      progress.stage === "verifying" ? 1 : fraction ?? 0,
-    )
+    return fraction === null ? slot : applyLocalModelLoadProgress(slot, fraction)
   })
 
   const reconcileUnlocked = Effect.gen(function* () {

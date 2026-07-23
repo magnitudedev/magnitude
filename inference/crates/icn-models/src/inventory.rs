@@ -52,6 +52,7 @@ type HydratedInventory = (
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
     pub root: PathBuf,
+    pub cache_root: PathBuf,
     pub hf_cache_dirs: Vec<PathBuf>,
     pub model_sources: Vec<PathBuf>,
     pub max_concurrent_downloads: usize,
@@ -68,14 +69,24 @@ impl InventoryConfig {
         Ok(PathBuf::from(home).join(".magnitude/models"))
     }
 
-    pub fn with_root(root: PathBuf) -> Result<Self, InventoryError> {
-        if !root.is_absolute() {
+    pub fn default_cache_root() -> Result<PathBuf, InventoryError> {
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            InventoryError::InvalidRequest(
+                "cannot determine the user home directory for the cache".to_owned(),
+            )
+        })?;
+        Ok(PathBuf::from(home).join(".magnitude/cache"))
+    }
+
+    pub fn with_roots(root: PathBuf, cache_root: PathBuf) -> Result<Self, InventoryError> {
+        if !root.is_absolute() || !cache_root.is_absolute() {
             return Err(InventoryError::InvalidRequest(
-                "model store root must be absolute".to_owned(),
+                "model store and cache roots must be absolute".to_owned(),
             ));
         }
         Ok(Self {
             root,
+            cache_root,
             hf_cache_dirs: Vec::new(),
             model_sources: Vec::new(),
             max_concurrent_downloads: 2,
@@ -227,7 +238,7 @@ impl ModelManager {
             .cache_dir(config.root.join("hub"))
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let cache = ModelCache::new(&config.root);
+        let cache = ModelCache::new(&config.cache_root);
         let (models, cache_evidence) = load_inventory_index(&cache);
         let manager = Self {
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
@@ -822,6 +833,11 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
             "model store root must be absolute".to_owned(),
         ));
     }
+    if !config.cache_root.is_absolute() {
+        return Err(InventoryError::InvalidRequest(
+            "cache root must be absolute".to_owned(),
+        ));
+    }
     if config.max_concurrent_downloads == 0 {
         return Err(InventoryError::InvalidRequest(
             "max_concurrent_downloads must be positive".to_owned(),
@@ -928,7 +944,8 @@ fn scan(
     }
     scan_interrupted(config, &mut discovered)?;
 
-    let (mut cached_models, cached_evidence) = load_inventory_index(&ModelCache::new(&config.root));
+    let (mut cached_models, cached_evidence) =
+        load_inventory_index(&ModelCache::new(&config.cache_root));
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
     // that independently survived durable schema validation.
     for (id, durable) in &mut cached_models {
@@ -2022,7 +2039,9 @@ mod tests {
     #[test]
     fn configured_store_does_not_adopt_host_hugging_face_caches() {
         let root = std::env::temp_dir().join("icn-owned-model-store");
-        let config = InventoryConfig::with_root(root).expect("absolute model store");
+        let config =
+            InventoryConfig::with_roots(root, std::env::temp_dir().join("icn-owned-model-cache"))
+                .expect("absolute model and cache roots");
 
         assert!(config.hf_cache_dirs.is_empty());
         assert!(config.model_sources.is_empty());
@@ -2294,11 +2313,12 @@ mod tests {
     async fn list_is_complete_shared_and_reuses_valid_durable_evidence() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
+        let cache_root = temporary.path().join("cache");
         let source = temporary.path().join("source");
         fs::create_dir_all(&source).unwrap();
         write_minimal_gguf(&source.join("model.gguf"));
 
-        let mut config = InventoryConfig::with_root(store.clone()).unwrap();
+        let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
         config.hf_cache_dirs.clear();
         config.model_sources.push(source.clone());
         let template = Arc::new(CompleteTemplateAssessor::default());
@@ -2330,7 +2350,7 @@ mod tests {
         assert_eq!(serving.profile.context_length, 4096);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
-        let persisted_bytes = fs::read(store.join("cache/indexes/inventory.json")).unwrap();
+        let persisted_bytes = fs::read(cache_root.join("indexes/inventory.json")).unwrap();
         let persisted_text = String::from_utf8(persisted_bytes.clone()).unwrap();
         assert!(!persisted_text.contains("serving_configuration"));
         let persisted: serde_json::Value = serde_json::from_slice(&persisted_bytes).unwrap();
@@ -2363,12 +2383,13 @@ mod tests {
     async fn malformed_index_entry_is_isolated_and_stale_candidates_enrich_in_parallel() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
+        let cache_root = temporary.path().join("cache");
         let source = temporary.path().join("source");
         fs::create_dir_all(&source).unwrap();
         write_minimal_gguf(&source.join("first.gguf"));
         write_minimal_gguf(&source.join("second.gguf"));
 
-        let mut config = InventoryConfig::with_root(store.clone()).unwrap();
+        let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
         config.hf_cache_dirs.clear();
         config.model_sources.push(source);
         let template = Arc::new(CompleteTemplateAssessor {
@@ -2384,7 +2405,7 @@ mod tests {
         assert_eq!(manager.list().await.unwrap().len(), 2);
         assert!(template.max_active.load(AtomicOrdering::SeqCst) > 1);
 
-        let index_path = store.join("cache/indexes/inventory.json");
+        let index_path = cache_root.join("indexes/inventory.json");
         let mut index: serde_json::Value =
             serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
         let models = index
@@ -2404,7 +2425,7 @@ mod tests {
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
 
-        let inspection_dir = store.join("cache/indexes/inspections/artifacts");
+        let inspection_dir = cache_root.join("indexes/inspections/artifacts");
         let one_inspection = fs::read_dir(&inspection_dir)
             .unwrap()
             .next()

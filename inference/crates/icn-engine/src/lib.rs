@@ -97,20 +97,18 @@ impl NativeBackend {
         self.backend.as_ref()
     }
 
-    /// Load a model while reporting llama.cpp's exact weight-loading fraction.
-    pub fn load_with_progress(
+    /// Resolve the exact native load plan without making a model resident.
+    pub fn prepare_load(
         &self,
         model_id: impl Into<String>,
         config: ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
-        on_progress: impl FnMut(f32) + Send + 'static,
-    ) -> Result<LlamaCompletionBackend, ModelLoadError> {
-        LlamaCompletionBackend::load_with_progress(
+    ) -> Result<PreparedModelLoad, ModelLoadError> {
+        PreparedModelLoad::prepare(
             Arc::clone(&self.backend),
-            model_id,
+            model_id.into(),
             config,
             mtp_selection,
-            on_progress,
         )
     }
 }
@@ -314,6 +312,161 @@ pub enum MtpCandidateSelection {
     Explicit(PathBuf),
 }
 
+/// Stable semantic phases of prepared native model loading.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelLoadPhase {
+    TargetModel,
+    TargetContext,
+    DraftModel,
+    DraftContext,
+    Projector,
+    Runtime,
+    Warmup,
+    Finalize,
+}
+
+/// Receives synchronous phase boundaries from the executor.
+///
+/// `Finalize` begins after warm-up; the prepared-load caller completes it after verification and
+/// resident publication so the last measured phase covers the complete ready boundary.
+pub trait ModelLoadObserver: Send + Sync + 'static {
+    fn phase_started(&self, phase: ModelLoadPhase);
+    fn phase_completed(&self, phase: ModelLoadPhase);
+}
+
+/// A fully resolved native plan which can be executed without replanning.
+pub struct PreparedModelLoad {
+    model_id: String,
+    acceleration: String,
+    timing_plan_identity: String,
+    phases: Vec<ModelLoadPhase>,
+    commands: SyncSender<ExecutorCommand>,
+    start: SyncSender<Arc<dyn ModelLoadObserver>>,
+    ready: Receiver<Result<(ModelProperties, String), ModelLoadError>>,
+    executor: JoinHandle<()>,
+}
+
+impl PreparedModelLoad {
+    fn prepare(
+        backend: Arc<LlamaBackend>,
+        model_id: String,
+        config: ExecutionIntent,
+        mtp_selection: MtpCandidateSelection,
+    ) -> Result<Self, ModelLoadError> {
+        validate_model_config(&config).map_err(ModelLoadError::from)?;
+        tracing::Span::current().record("model.id", model_id.as_str());
+        let (commands, command_receiver) = sync_channel(COMMAND_QUEUE_CAPACITY);
+        let (ready_sender, ready) = sync_channel(1);
+        let (prepared_sender, prepared_receiver) = sync_channel(1);
+        let (start, start_receiver) = sync_channel(1);
+        let executor_model_id = model_id.clone();
+        let executor = thread::Builder::new()
+            .name(format!("icn-llama-{model_id}"))
+            .spawn(move || {
+                let result = prepare_native_plan(backend.as_ref(), config, mtp_selection);
+                match result {
+                    Ok((planned, acceleration, phases)) => {
+                        let timing_plan_identity = timing_plan_identity(&planned.assessed.plan);
+                        if prepared_sender
+                            .send(Ok((acceleration.clone(), timing_plan_identity, phases)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let Ok(observer) = start_receiver.recv() else {
+                            return;
+                        };
+                        executor_main(
+                            backend,
+                            planned,
+                            acceleration,
+                            command_receiver,
+                            ready_sender,
+                            observer,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = prepared_sender.send(Err(error));
+                    }
+                }
+            })
+            .map_err(|error| ModelLoadError::Backend(error.to_string()))?;
+        match prepared_receiver.recv() {
+            Ok(Ok((acceleration, timing_plan_identity, phases))) => Ok(Self {
+                model_id: executor_model_id,
+                acceleration,
+                timing_plan_identity,
+                phases,
+                commands,
+                start,
+                ready,
+                executor,
+            }),
+            Ok(Err(error)) => {
+                let _ = executor.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = executor.join();
+                Err(InferenceError::ExecutorStopped.into())
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn phases(&self) -> &[ModelLoadPhase] {
+        &self.phases
+    }
+
+    #[must_use]
+    pub fn acceleration(&self) -> &str {
+        &self.acceleration
+    }
+
+    /// Path-independent identity of load- and allocation-relevant resolved plan values.
+    #[must_use]
+    pub fn timing_plan_identity(&self) -> &str {
+        &self.timing_plan_identity
+    }
+
+    pub fn execute(
+        self,
+        observer: Arc<dyn ModelLoadObserver>,
+    ) -> Result<LlamaCompletionBackend, ModelLoadError> {
+        let Self {
+            model_id,
+            commands,
+            start,
+            ready,
+            executor,
+            ..
+        } = self;
+        start
+            .send(observer)
+            .map_err(|_| ModelLoadError::from(InferenceError::ExecutorStopped))?;
+        match ready.recv() {
+            Ok(Ok((properties, acceleration))) => Ok(LlamaCompletionBackend {
+                model_id,
+                properties,
+                acceleration,
+                commands,
+                executor: Mutex::new(Some(executor)),
+            }),
+            Ok(Err(error)) => {
+                let _ = executor.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = executor.join();
+                Err(InferenceError::ExecutorStopped.into())
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ModelLoadError {
     InvalidConfiguration(String),
@@ -358,51 +511,6 @@ impl From<InferenceError> for ModelLoadError {
 }
 
 impl LlamaCompletionBackend {
-    fn load_with_progress(
-        backend: Arc<LlamaBackend>,
-        model_id: impl Into<String>,
-        config: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
-        on_progress: impl FnMut(f32) + Send + 'static,
-    ) -> Result<Self, ModelLoadError> {
-        validate_model_config(&config).map_err(ModelLoadError::from)?;
-        let model_id = model_id.into();
-        tracing::Span::current().record("model.id", model_id.as_str());
-        let (commands, command_receiver) = sync_channel(COMMAND_QUEUE_CAPACITY);
-        let (ready_sender, ready_receiver) = sync_channel(1);
-        let executor = thread::Builder::new()
-            .name(format!("icn-llama-{}", model_id))
-            .spawn(move || {
-                executor_main(
-                    backend,
-                    config,
-                    mtp_selection,
-                    command_receiver,
-                    ready_sender,
-                    Box::new(on_progress),
-                )
-            })
-            .map_err(|error| ModelLoadError::Backend(error.to_string()))?;
-
-        match ready_receiver.recv() {
-            Ok(Ok((properties, acceleration))) => Ok(Self {
-                model_id,
-                properties,
-                acceleration,
-                commands,
-                executor: Mutex::new(Some(executor)),
-            }),
-            Ok(Err(error)) => {
-                let _ = executor.join();
-                Err(error)
-            }
-            Err(_) => {
-                let _ = executor.join();
-                Err(InferenceError::ExecutorStopped.into())
-            }
-        }
-    }
-
     /// The normalized acceleration selected by the native load plan.
     #[must_use]
     pub fn acceleration(&self) -> &str {
@@ -544,46 +652,111 @@ impl Drop for LlamaCompletionBackend {
     }
 }
 
-fn executor_main(
-    backend: Arc<LlamaBackend>,
+fn prepare_native_plan(
+    backend: &LlamaBackend,
     mut requested: ExecutionIntent,
     mtp_selection: MtpCandidateSelection,
-    commands: Receiver<ExecutorCommand>,
-    ready: SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
-    mut on_load_progress: Box<dyn FnMut(f32) + Send>,
-) {
+) -> Result<(icn_hardware::BackendLoadPlan, String, Vec<ModelLoadPhase>), ModelLoadError> {
     let candidates = match &mtp_selection {
         MtpCandidateSelection::Automatic(paths) => icn_mtp::CandidatePolicy::Automatic(paths),
         MtpCandidateSelection::Explicit(path) => icn_mtp::CandidatePolicy::Explicit(path),
     };
-    requested.mtp = match icn_mtp::select_mtp_with_backend(backend.as_ref(), &requested, candidates)
-    {
-        Ok(mtp) => mtp,
-        Err(error) => {
-            let _ = ready.send(Err(ModelLoadError::MtpSelection(error.to_string())));
-            return;
-        }
-    };
-    let planned = match icn_hardware::plan_load_with_backend(
-        backend.as_ref(),
+    requested.mtp = icn_mtp::select_mtp_with_backend(backend, &requested, candidates)
+        .map_err(|error| ModelLoadError::MtpSelection(error.to_string()))?;
+    let planned = icn_hardware::plan_load_with_backend(
+        backend,
         &requested,
         icn_hardware::CapacityPolicy::default(),
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let _ = ready.send(Err(ModelLoadError::Planning(error.to_string())));
-            return;
-        }
-    };
+    )
+    .map_err(|error| ModelLoadError::Planning(error.to_string()))?;
     let acceleration = match &planned.assessed.assessment {
         HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
         assessment => {
-            let _ = ready.send(Err(ModelLoadError::AssessmentRejected(Box::new(
+            return Err(ModelLoadError::AssessmentRejected(Box::new(
                 assessment.clone(),
-            ))));
-            return;
+            )));
         }
     };
+    let mut phases = vec![ModelLoadPhase::TargetModel, ModelLoadPhase::TargetContext];
+    if matches!(
+        planned.assessed.plan.mtp,
+        icn_contracts::MtpConfig::Enabled {
+            source: icn_contracts::MtpSource::Separate { .. },
+            ..
+        }
+    ) {
+        phases.push(ModelLoadPhase::DraftModel);
+    }
+    if matches!(
+        planned.assessed.plan.mtp,
+        icn_contracts::MtpConfig::Enabled { .. }
+    ) {
+        phases.push(ModelLoadPhase::DraftContext);
+    }
+    if planned.assessed.plan.projector.is_some() {
+        phases.push(ModelLoadPhase::Projector);
+    }
+    phases.extend([
+        ModelLoadPhase::Runtime,
+        ModelLoadPhase::Warmup,
+        ModelLoadPhase::Finalize,
+    ]);
+    Ok((planned, acceleration, phases))
+}
+
+fn timing_plan_identity(config: &ExecutionIntent) -> String {
+    let mtp = match &config.mtp {
+        icn_contracts::MtpConfig::Disabled { .. } => serde_json::json!({ "enabled": false }),
+        icn_contracts::MtpConfig::Enabled {
+            source,
+            n_max,
+            n_min,
+            p_min,
+            cache_type_k,
+            cache_type_v,
+        } => serde_json::json!({
+            "enabled": true,
+            "source": match source {
+                icn_contracts::MtpSource::Bundled => "bundled",
+                icn_contracts::MtpSource::Separate { .. } => "separate",
+            },
+            "nMax": n_max,
+            "nMin": n_min,
+            "pMin": p_min,
+            "cacheTypeK": cache_type_k,
+            "cacheTypeV": cache_type_v,
+        }),
+    };
+    let projector = config.projector.as_ref().map(|projector| {
+        serde_json::json!({
+            "useGpu": projector.use_gpu,
+            "warmup": projector.warmup,
+            "imageMinTokens": projector.image_min_tokens,
+            "imageMaxTokens": projector.image_max_tokens,
+            "inputLimits": projector.input_limits,
+        })
+    });
+    let evidence = serde_json::json!({
+        "contextSize": config.context_size,
+        "batchSize": config.batch_size,
+        "ubatchSize": config.ubatch_size,
+        "maxSequences": config.max_sequences,
+        "prefillQuantum": config.prefill_quantum,
+        "execution": config.execution,
+        "projector": projector,
+        "mtp": mtp,
+    });
+    format!("{:x}", Sha256::digest(evidence.to_string().as_bytes()))
+}
+
+fn executor_main(
+    backend: Arc<LlamaBackend>,
+    planned: icn_hardware::BackendLoadPlan,
+    acceleration: String,
+    commands: Receiver<ExecutorCommand>,
+    ready: SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
+    observer: Arc<dyn ModelLoadObserver>,
+) {
     #[cfg(feature = "mtmd")]
     let auxiliary_allocations = planned
         .assessed
@@ -611,12 +784,6 @@ fn executor_main(
     let native_mtp = planned.native_mtp.map(|plan| plan.into_parts());
     let (model_path, model_params, context_params, threads, threads_batch) =
         planned.native.into_parts();
-    let model_params = Box::pin(
-        std::pin::Pin::into_inner(model_params).with_progress_callback(move |fraction| {
-            on_load_progress(fraction);
-            true
-        }),
-    );
     let threads = match nonzero_i32(threads, "threads") {
         Ok(value) => value,
         Err(error) => {
@@ -637,6 +804,7 @@ fn executor_main(
         threads,
         threads_batch,
     );
+    observer.phase_started(ModelLoadPhase::TargetModel);
     let model =
         match LlamaModel::load_from_file(&backend, &model_path, model_params.as_ref().get_ref()) {
             Ok(model) => model,
@@ -645,10 +813,10 @@ fn executor_main(
                 return;
             }
         };
-    // The progress callback owns the load-stream sender. It is valid only while
-    // llama.cpp is loading weights and must not keep the stream alive for the
-    // lifetime of the resident executor.
+    observer.phase_completed(ModelLoadPhase::TargetModel);
+    // Native model parameters are needed only for weight loading.
     drop(model_params);
+    observer.phase_started(ModelLoadPhase::TargetContext);
     let chat_templates = match CommonChatTemplates::from_model(&model) {
         Ok(templates) => templates,
         Err(error) => {
@@ -663,6 +831,7 @@ fn executor_main(
             return;
         }
     };
+    observer.phase_completed(ModelLoadPhase::TargetContext);
     let mut context = Some(context);
     let draft_model = match (&config.mtp, native_mtp.as_ref()) {
         (
@@ -672,12 +841,16 @@ fn executor_main(
             },
             Some((_, draft_model_params, _, _, _)),
         ) => {
+            observer.phase_started(ModelLoadPhase::DraftModel);
             match LlamaModel::load_from_file(
                 &backend,
                 model_path,
                 draft_model_params.as_ref().get_ref(),
             ) {
-                Ok(model) => Some(model),
+                Ok(model) => {
+                    observer.phase_completed(ModelLoadPhase::DraftModel);
+                    Some(model)
+                }
                 Err(error) => {
                     let _ = ready.send(Err(backend_error(error).into()));
                     return;
@@ -702,6 +875,7 @@ fn executor_main(
             p_min,
             ..
         } => {
+            observer.phase_started(ModelLoadPhase::DraftContext);
             let Some((_, _, draft_context_params, _, _)) = native_mtp.as_ref() else {
                 let _ = ready.send(Err(InferenceError::InvalidConfig(
                     "native planner omitted the enabled MTP context".to_owned(),
@@ -723,7 +897,10 @@ fn executor_main(
                 },
                 config.max_sequences,
             ) {
-                Ok(mtp) => Some(mtp),
+                Ok(mtp) => {
+                    observer.phase_completed(ModelLoadPhase::DraftContext);
+                    Some(mtp)
+                }
                 Err(error) => {
                     let _ = ready.send(Err(backend_error(error).into()));
                     return;
@@ -735,18 +912,24 @@ fn executor_main(
         #[cfg(feature = "mtmd")]
         {
             match config.projector.as_ref() {
-                Some(projector) => match MultimodalRuntime::load(
-                    projector,
-                    &model,
-                    config.execution.flash_attention,
-                    Some(threads.get()),
-                ) {
-                    Ok(runtime) => Some(runtime),
-                    Err(error) => {
-                        let _ = ready.send(Err(error.into()));
-                        return;
+                Some(projector) => {
+                    observer.phase_started(ModelLoadPhase::Projector);
+                    match MultimodalRuntime::load(
+                        projector,
+                        &model,
+                        config.execution.flash_attention,
+                        Some(threads.get()),
+                    ) {
+                        Ok(runtime) => {
+                            observer.phase_completed(ModelLoadPhase::Projector);
+                            Some(runtime)
+                        }
+                        Err(error) => {
+                            let _ = ready.send(Err(error.into()));
+                            return;
+                        }
                     }
-                },
+                }
                 None => None,
             }
         }
@@ -755,6 +938,7 @@ fn executor_main(
             None::<MultimodalRuntime<'_>>
         }
     };
+    observer.phase_started(ModelLoadPhase::Runtime);
     let mut main_pool = match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads)) {
         Ok(pool) => pool,
         Err(error) => {
@@ -775,6 +959,7 @@ fn executor_main(
         if threads == threads_batch {
             let mut draft_attached = draft_context.attach_threadpool(&mut draft_main_pool);
             let mut attached = context.attach_threadpool(&mut main_pool);
+            observer.phase_completed(ModelLoadPhase::Runtime);
             run_initialized_executor(
                 &backend,
                 &config,
@@ -790,6 +975,7 @@ fn executor_main(
                 &commands,
                 &ready,
                 acceleration.clone(),
+                observer.as_ref(),
             );
         } else {
             let mut batch_pool =
@@ -811,6 +997,7 @@ fn executor_main(
             let mut draft_attached =
                 draft_context.attach_threadpools(&mut draft_main_pool, &mut draft_batch_pool);
             let mut attached = context.attach_threadpools(&mut main_pool, &mut batch_pool);
+            observer.phase_completed(ModelLoadPhase::Runtime);
             run_initialized_executor(
                 &backend,
                 &config,
@@ -826,6 +1013,7 @@ fn executor_main(
                 &commands,
                 &ready,
                 acceleration.clone(),
+                observer.as_ref(),
             );
         }
     } else if threads == threads_batch {
@@ -833,6 +1021,7 @@ fn executor_main(
             .take()
             .expect("non-MTP target context remains owned");
         let mut attached = context.attach_threadpool(&mut main_pool);
+        observer.phase_completed(ModelLoadPhase::Runtime);
         run_initialized_executor(
             &backend,
             &config,
@@ -848,6 +1037,7 @@ fn executor_main(
             &commands,
             &ready,
             acceleration.clone(),
+            observer.as_ref(),
         );
     } else {
         let mut context = context
@@ -862,6 +1052,7 @@ fn executor_main(
                 }
             };
         let mut attached = context.attach_threadpools(&mut main_pool, &mut batch_pool);
+        observer.phase_completed(ModelLoadPhase::Runtime);
         run_initialized_executor(
             &backend,
             &config,
@@ -877,6 +1068,7 @@ fn executor_main(
             &commands,
             &ready,
             acceleration,
+            observer.as_ref(),
         );
     }
 }
@@ -926,11 +1118,15 @@ fn run_initialized_executor<'model>(
     commands: &Receiver<ExecutorCommand>,
     ready: &SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
     acceleration: String,
+    observer: &dyn ModelLoadObserver,
 ) {
+    observer.phase_started(ModelLoadPhase::Warmup);
     if let Err(error) = warm_up(model, context, mtp.as_deref_mut()) {
         let _ = ready.send(Err(error.into()));
         return;
     }
+    observer.phase_completed(ModelLoadPhase::Warmup);
+    observer.phase_started(ModelLoadPhase::Finalize);
     let resident_allocations = match capture_resident_allocations(
         context,
         draft_context.as_deref(),

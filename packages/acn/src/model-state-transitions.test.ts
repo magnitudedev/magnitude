@@ -14,6 +14,7 @@ import {
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
 import {
+  applyLocalModelLoadProgress,
   applyReplacedLocalModelStage,
   isModelSlotLoadSatisfied,
   isModelSlotUnloadSatisfied,
@@ -35,6 +36,17 @@ const capabilities = {
 }
 
 describe("ACN model-state transitions", () => {
+  it("keeps estimated load progress monotonic and reserves 100 for Ready", () => {
+    const loading = new ModelSlotLoadingLocalModel({
+      slotId: PRIMARY_SLOT_ID,
+      selection: localSelection,
+      percentage: 72,
+    })
+
+    expect(applyLocalModelLoadProgress(loading, 0.5)).toMatchObject({ percentage: 72 })
+    expect(applyLocalModelLoadProgress(loading, 1)).toMatchObject({ percentage: 99 })
+  })
+
   it("treats repeated load and unload commands as already satisfied", () => {
     expect(isModelSlotLoadSatisfied(new ModelSlotLoadingLocalModel({
       slotId: PRIMARY_SLOT_ID,
