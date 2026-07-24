@@ -74,6 +74,7 @@ export const AgentFactoryLive = (options: {
             sessionContext: prepared.sessionContext,
             sessionId: input.sessionId,
             providerClient: prepared.providerClient,
+            modelConfiguration: modelSlots.agentModelConfiguration,
             modelConfigurations: modelSlots.agentModelConfigurations,
             disableShellSafeguards: input.options.disableShellSafeguards,
             disableCwdSafeguards: input.options.disableCwdSafeguards,

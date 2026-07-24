@@ -24,11 +24,13 @@ const actions = vi.hoisted(() => ({
 }))
 let state = makeView({ ready: false })
 let mutationFailure: Option.Option<Result.Result<unknown, unknown>> = Option.none()
+let slotAssignment: Result.Result<unknown, unknown> = Result.initial()
 
 vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   ...await importOriginal<typeof import("@magnitudedev/client-common")>(),
   useLocalInferenceState: () => ({
     state: Result.success(state),
+    slotAssignment,
     mutationFailure,
     ...actions,
   }),
@@ -52,6 +54,7 @@ const textPosition = (frame: string, label: string): { x: number; y: number } =>
 beforeEach(() => {
   state = makeView({ ready: false })
   mutationFailure = Option.none()
+  slotAssignment = Result.initial()
   for (const action of Object.values(actions)) action.mockClear()
   actions.assignSlot.mockResolvedValue(undefined)
 })
@@ -152,7 +155,7 @@ test("renders consumer recommendation intent and its trade-off explanation", asy
   }
 })
 
-test("keeps setup open until the selected model is confirmed by the slot mirror", async () => {
+test("keeps setup open until the slot-assignment mutation succeeds", async () => {
   state = makeView({ ready: false })
   let refresh: (() => void) | undefined
   let resolveAssignment: (() => void) | undefined
@@ -172,6 +175,10 @@ test("keeps setup open until the selected model is confirmed by the slot mirror"
     await act(async () => view.mockMouse.click(position.x, position.y))
     expect(actions.assignSlot).toHaveBeenCalledTimes(1)
     expect(onComplete).not.toHaveBeenCalled()
+
+    slotAssignment = Result.initial(true)
+    await act(async () => refresh?.())
+    await act(view.renderOnce)
     expect(view.captureCharFrame()).toContain("Selecting this model")
 
     await act(async () => view.mockMouse.click(position.x, position.y))
@@ -179,11 +186,6 @@ test("keeps setup open until the selected model is confirmed by the slot mirror"
 
     resolveAssignment?.()
     await act(async () => Promise.resolve())
-    expect(onComplete).not.toHaveBeenCalled()
-
-    state = makeView({ ready: true })
-    await act(async () => refresh?.())
-    await act(view.renderOnce)
     expect(onComplete).toHaveBeenCalledTimes(1)
   } finally {
     await act(async () => view.renderer.destroy())
