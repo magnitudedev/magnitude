@@ -35,6 +35,10 @@ const runtimeEntryToSession = (entry: {
   readonly scratchpadPath: string
   readonly createdAt: number
   readonly updatedAt: number
+  readonly generation: number
+  readonly residentSince: number
+  readonly gate: AcnIntrospectionSession["gate"]
+  readonly retirement: AcnIntrospectionSession["retirement"]
 }): AcnIntrospectionSession => ({
   sessionId: entry.sessionId,
   title: entry.title,
@@ -42,6 +46,10 @@ const runtimeEntryToSession = (entry: {
   scratchpadPath: entry.scratchpadPath,
   createdAt: entry.createdAt,
   updatedAt: entry.updatedAt,
+  generation: entry.generation,
+  residentSince: entry.residentSince,
+  gate: entry.gate,
+  retirement: entry.retirement,
 })
 
 const introspectionFailure = (sessionId: string, cause: unknown) =>

@@ -8,7 +8,7 @@
  * - Supports session persistence and hydration
  */
 
-import { Context, Data, Effect, Fiber, Layer, Option, Stream } from 'effect'
+import { Context, Data, Effect, Layer, Option, Stream } from 'effect'
 import { EventEngine, Introspection, Surface } from '@magnitudedev/event-core'
 import { AmbientServiceTag, HydrationContext, WorkerBusTag, type AmbientService } from '@magnitudedev/event-core'
 import type { FrameworkError } from '@magnitudedev/event-core'
@@ -371,9 +371,8 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         options.modelConfiguration,
       )
 
-      yield* Effect.acquireRelease(
-        Effect.forkScoped(Stream.runForEach(options.modelConfigurations, modelConfiguration.apply)),
-        Fiber.interrupt,
+      yield* Stream.runForEach(options.modelConfigurations, modelConfiguration.apply).pipe(
+        Effect.forkScoped,
       )
 
       // Root resources are app-owned, not event-core-owned. LifecycleCoordinator
@@ -633,10 +632,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         })
       ).pipe(Effect.ignoreLogged)
 
-      yield* Effect.acquireRelease(
-        Effect.forkScoped(selfHeal),
-        (fiber) => Fiber.interrupt(fiber),
-      )
+      yield* selfHeal.pipe(Effect.forkScoped)
 
       return {
         events: engine.events,

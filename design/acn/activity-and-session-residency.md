@@ -100,6 +100,10 @@ When the session unloads, ACN detaches the live display and tells the subscripti
 The client keeps the last display state. A later materialization, shape change, or resync reloads the
 session, reattaches the display, and sends a full snapshot.
 
+Detachment invalidates the attachment generation before signaling its forwarding fiber to stop.
+Retirement does not wait for that fiber's downstream finalizers: the generation token prevents any
+late event from being published, while cleanup completes asynchronously.
+
 Closing the final subscription removes the display registration. There is no separate close RPC.
 
 ## Subscription protocol
@@ -122,3 +126,10 @@ Work is represented by scoped claims tied to a specific ACN or session-runtime g
 claim starts that generation's idle timer. Starting work and committing shutdown are serialized, so
 work cannot be admitted into a generation that is being destroyed. Stale or duplicate cleanup from
 an older generation cannot affect its replacement.
+
+Resolving a session under the runtime admission lock never waits for that session's retirement.
+This prevents one wedged generation from blocking unrelated sessions. A command that arrives behind
+an abnormally long retirement fails after a bounded wait, before its session event is accepted, so
+the client can restore the user's unsent input instead of waiting forever. Retirement that remains
+stalled beyond the process liveness deadline requests controlled ACN replacement; the old gate is
+never rolled back into a partially closed generation.
