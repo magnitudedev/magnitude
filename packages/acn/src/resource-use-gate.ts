@@ -21,6 +21,7 @@ export interface ResourceUseGateSnapshot {
   readonly generation: number;
   readonly phase: "open" | "retirement-claimed" | "retired";
   readonly leaseCount: number;
+  readonly leaseLabels: ReadonlyArray<string>;
   readonly idleSince: number | null;
   readonly revision: number;
 }
@@ -471,6 +472,7 @@ export const makeResourceUseGate = <E = never, R = never>(
           generation: options.generation,
           phase: current.phase,
           leaseCount: current.phase === "open" ? current.leases.size : 0,
+          leaseLabels: current.phase === "open" ? [...current.leases.values()] : [],
           idleSince: current.phase === "open" ? current.idleSince : null,
           revision: current.revision,
         })

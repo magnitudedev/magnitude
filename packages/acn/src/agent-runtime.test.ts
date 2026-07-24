@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   Deferred,
+  Duration,
   Effect,
   Either,
   Fiber,
@@ -21,6 +22,7 @@ import type {
 } from "@magnitudedev/agent"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
 import { SessionOperationFailed } from "@magnitudedev/protocol"
+import { AcnShutdown, type AcnShutdownApi } from "./acn-shutdown"
 import { AgentFactory, type AgentFactoryApi } from "./agent-factory"
 import {
   AgentRuntime,
@@ -122,6 +124,9 @@ const makeLayer = (input: {
   readonly factory: AgentFactoryApi
   readonly storedSessions?: ReadonlyArray<StoredSessionMeta>
   readonly storedRuntimeOptions?: ReadonlyMap<string, SessionRuntimeOptions>
+  readonly retirementAdmissionTimeout?: Duration.DurationInput
+  readonly retirementShutdownTimeout?: Duration.DurationInput
+  readonly shutdown?: AcnShutdownApi
 }) => {
   const dependencies = Layer.mergeAll(
     Layer.succeed(AgentFactory, input.factory),
@@ -160,8 +165,13 @@ const makeLayer = (input: {
         } satisfies SessionRuntimeOptionsStoreApi
       }),
     ),
+    ...(input.shutdown ? [Layer.succeed(AcnShutdown, input.shutdown)] : []),
   )
-  return makeAgentRuntimeLive({ idleTimeout: "2 seconds" }).pipe(
+  return makeAgentRuntimeLive({
+    idleTimeout: "2 seconds",
+    retirementAdmissionTimeout: input.retirementAdmissionTimeout,
+    retirementShutdownTimeout: input.retirementShutdownTimeout,
+  }).pipe(
     Layer.provide(dependencies),
     Layer.provideMerge(TestContext.TestContext),
   )
@@ -288,6 +298,94 @@ describe("AgentRuntime", () => {
         yield* Effect.yieldNow()
         expect(yield* residentCount(runtime)).toBe(0)
         expect(yield* runtime.withSession("rehydrate", "two", (_, generation) => Effect.succeed(generation))).toBe(2)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("bounds admission behind a stalled retirement without blocking other sessions", async () => {
+    const program = Effect.gen(function* () {
+      const retirementStarted = yield* Deferred.make<void>()
+      const layer = makeLayer({
+        factory: { createSession: () => Effect.succeed(idleSession) },
+        storedSessions: [makeMeta("stalled"), makeMeta("independent")],
+        retirementAdmissionTimeout: "1 second",
+      })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        yield* runtime
+          .registerRetirementObserver({
+            retire: ({ sessionId }) =>
+              sessionId === "stalled"
+                ? Deferred.succeed(retirementStarted, undefined).pipe(
+                    Effect.zipRight(Effect.never),
+                  )
+                : Effect.void,
+          })
+          .pipe(Effect.asVoid)
+        yield* runtime.withSession("stalled", "initial", () => Effect.void)
+        yield* TestClock.adjust("2 seconds")
+        yield* Deferred.await(retirementStarted)
+
+        const blocked = yield* runtime
+          .withSession("stalled", "after-idle", () => Effect.void)
+          .pipe(Effect.either, Effect.fork)
+        expect(
+          yield* runtime.withSession(
+            "independent",
+            "unrelated",
+            (_, generation) => Effect.succeed(generation),
+          ),
+        ).toBe(1)
+
+        yield* TestClock.adjust("1 second")
+        const result = yield* Fiber.join(blocked)
+        expect(Either.isLeft(result)).toBe(true)
+        if (Either.isLeft(result)) {
+          expect(result.left._tag).toBe("SessionOperationFailed")
+          if (result.left._tag === "SessionOperationFailed") {
+            expect(result.left.reason).toContain("did not finish shutting down")
+          }
+        }
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("requests controlled ACN replacement when retirement remains stalled", async () => {
+    const program = Effect.gen(function* () {
+      const retirementStarted = yield* Deferred.make<void>()
+      const shutdownRequest = yield* Ref.make<string | null>(null)
+      const shutdown: AcnShutdownApi = {
+        request: (request) =>
+          Ref.set(shutdownRequest, request.detail ?? request.reason).pipe(Effect.as(true)),
+        await: Effect.never,
+        current: Effect.succeed(Option.none()),
+      }
+      const layer = makeLayer({
+        factory: { createSession: () => Effect.succeed(idleSession) },
+        storedSessions: [makeMeta("stalled-replacement")],
+        retirementShutdownTimeout: "3 seconds",
+        shutdown,
+      })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        yield* runtime
+          .registerRetirementObserver({
+            retire: () =>
+              Deferred.succeed(retirementStarted, undefined).pipe(
+                Effect.zipRight(Effect.never),
+              ),
+          })
+          .pipe(Effect.asVoid)
+        yield* runtime.withSession("stalled-replacement", "initial", () => Effect.void)
+        yield* TestClock.adjust("2 seconds")
+        yield* Deferred.await(retirementStarted)
+        yield* TestClock.adjust("3 seconds")
+        yield* Effect.yieldNow()
+        expect(yield* Ref.get(shutdownRequest)).toContain(
+          "session stalled-replacement generation 1 retirement stalled",
+        )
       }).pipe(Effect.provide(layer))
     })
     await Effect.runPromise(program)

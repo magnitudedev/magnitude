@@ -19,9 +19,15 @@ import {
   type SessionError,
 } from "@magnitudedev/protocol"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
+import { AcnShutdown } from "./acn-shutdown"
 import { AcnActivityTracker } from "./activity-tracker"
 import { AgentFactory } from "./agent-factory"
-import { makeResourceUseGate, ResourceRetired, type ResourceUseGate } from "./resource-use-gate"
+import {
+  makeResourceUseGate,
+  ResourceRetired,
+  type ResourceUseGate,
+  type ResourceUseGateSnapshot,
+} from "./resource-use-gate"
 import { SessionStore } from "./session-store"
 import {
   SessionRuntimeOptionsStore,
@@ -47,6 +53,19 @@ export interface ResidentSessionSnapshot {
   readonly updatedAt: number
   readonly residentSince: number
   readonly workStatus: SessionWorkStatus
+  readonly gate: ResourceUseGateSnapshot
+  readonly retirement: SessionRetirementSnapshot | null
+}
+
+export type SessionRetirementStage =
+  | "notifying-observers"
+  | "closing-runtime"
+  | "removing-generation"
+
+export interface SessionRetirementSnapshot {
+  readonly stage: SessionRetirementStage
+  readonly startedAt: number
+  readonly stageStartedAt: number
 }
 
 export interface SessionRetirementObserver {
@@ -115,6 +134,8 @@ type DeleteClaim =
 
 export interface AgentRuntimeOptions {
   readonly idleTimeout?: Duration.DurationInput
+  readonly retirementAdmissionTimeout?: Duration.DurationInput
+  readonly retirementShutdownTimeout?: Duration.DurationInput
 }
 
 export const makeAgentRuntimeLive = (
@@ -127,6 +148,7 @@ export const makeAgentRuntimeLive = (
       const store = yield* SessionStore
       const runtimeOptions = yield* SessionRuntimeOptionsStore
       const rootActivity = yield* Effect.serviceOption(AcnActivityTracker)
+      const shutdown = yield* Effect.serviceOption(AcnShutdown)
       const managerScope = yield* Effect.scope
       const entries = yield* Ref.make(new Map<string, ResidentGeneration>())
       const starts = yield* Ref.make(new Map<string, StartDeferred>())
@@ -134,6 +156,7 @@ export const makeAgentRuntimeLive = (
       const admissionLock = yield* Effect.makeSemaphore(1)
       const generations = yield* Ref.make(new Map<string, number>())
       const observers = yield* Ref.make(new Set<SessionRetirementObserver>())
+      const retirements = yield* Ref.make(new Map<string, SessionRetirementSnapshot>())
       const changes = yield* PubSub.unbounded<void>()
 
       const publishChange = PubSub.publish(changes, undefined).pipe(Effect.asVoid)
@@ -373,28 +396,44 @@ export const makeAgentRuntimeLive = (
                     return yield* deleting()
                   }
                   const existing = (yield* Ref.get(entries)).get(request.sessionId)
-                  if (existing) {
-                    const release = yield* existing.gate.acquire(label)
-                    return { _tag: "resident" as const, resident: existing, release }
-                  }
+                  if (existing) return { _tag: "resident" as const, resident: existing }
                   return { _tag: "start" as const, claim: yield* claimStart(request.sessionId) }
                 }),
               ),
             )
             if (resolved._tag === "resident") {
-              return [resolved.resident, resolved.release] as const
+              const release = yield* restore(
+                resolved.resident.gate.acquire(label).pipe(
+                  Effect.timeoutFail({
+                    duration: options.retirementAdmissionTimeout ?? "10 seconds",
+                    onTimeout: () =>
+                      new SessionOperationFailed({
+                        operation: `session ${request.sessionId}`,
+                        reason:
+                          "The previous idle session runtime did not finish shutting down in time",
+                      }),
+                  }),
+                ),
+              )
+              return [resolved.resident, release] as const
             }
 
             const claim = resolved.claim
             if (claim._tag === "joiner") {
               const resident = yield* restore(Deferred.await(claim.deferred))
+              if ((yield* Ref.get(deletions)).has(request.sessionId)) {
+                return yield* deleting()
+              }
               const release = yield* restore(
-                admissionLock.withPermits(1)(
-                  Effect.gen(function* () {
-                    if ((yield* Ref.get(deletions)).has(request.sessionId)) {
-                      return yield* deleting()
-                    }
-                    return yield* resident.gate.acquire(label)
+                resident.gate.acquire(label).pipe(
+                  Effect.timeoutFail({
+                    duration: options.retirementAdmissionTimeout ?? "10 seconds",
+                    onTimeout: () =>
+                      new SessionOperationFailed({
+                        operation: `session ${request.sessionId}`,
+                        reason:
+                          "The newly started session runtime did not become available in time",
+                      }),
                   }),
                 ),
               )
@@ -488,11 +527,32 @@ export const makeAgentRuntimeLive = (
           }),
         )
 
-      retireGeneration = (sessionId, generation) =>
-        Effect.gen(function* () {
+      retireGeneration = (sessionId, generation) => {
+        const retire = Effect.gen(function* () {
           const resident = (yield* Ref.get(entries)).get(sessionId)
           if (!resident || resident.generation !== generation) return true
 
+          const startedAt = Date.now()
+          const setRetirementStage = (stage: SessionRetirementStage) =>
+            Ref.update(retirements, (current) =>
+              new Map(current).set(sessionId, {
+                stage,
+                startedAt,
+                stageStartedAt: Date.now(),
+              }),
+            )
+          const logStage = (stage: SessionRetirementStage, stageStartedAt: number) =>
+            Effect.logDebug("Session retirement stage completed").pipe(
+              Effect.annotateLogs({
+                sessionId,
+                generation,
+                stage,
+                durationMs: Date.now() - stageStartedAt,
+              }),
+            )
+
+          let stageStartedAt = Date.now()
+          yield* setRetirementStage("notifying-observers")
           for (const observer of yield* Ref.get(observers)) {
             yield* observer.retire({ sessionId, generation }).pipe(
               Effect.catchAllCause((cause) =>
@@ -506,8 +566,41 @@ export const makeAgentRuntimeLive = (
               ),
             )
           }
-          yield* Scope.close(resident.scope, Exit.void)
+          yield* logStage("notifying-observers", stageStartedAt)
+
+          stageStartedAt = Date.now()
+          yield* setRetirementStage("closing-runtime")
+          const closeExit = yield* Scope.close(resident.scope, Exit.void).pipe(Effect.exit)
+          if (Exit.isFailure(closeExit)) {
+            yield* Effect.logError("Session runtime scope failed to close").pipe(
+              Effect.annotateLogs({
+                sessionId,
+                generation,
+                cause: String(closeExit.cause),
+              }),
+            )
+            if (Option.isSome(shutdown)) {
+              yield* shutdown.value.request({
+                reason: "fatal",
+                detail: `session ${sessionId} generation ${generation} scope close failed`,
+              })
+            }
+            // Never reopen a generation whose scope may be only partially
+            // finalized. Controlled ACN shutdown owns the recovery boundary.
+            return yield* Effect.never
+          }
+          yield* logStage("closing-runtime", stageStartedAt)
+
+          stageStartedAt = Date.now()
+          yield* setRetirementStage("removing-generation")
           const removed = yield* removeExact(sessionId, generation)
+          yield* Ref.update(retirements, (current) => {
+            if (!current.has(sessionId)) return current
+            const next = new Map(current)
+            next.delete(sessionId)
+            return next
+          })
+          yield* logStage("removing-generation", stageStartedAt)
           if (removed) {
             yield* publishChange
             yield* Effect.logInfo("Evicted idle session").pipe(
@@ -516,6 +609,31 @@ export const makeAgentRuntimeLive = (
           }
           return true
         })
+        return Option.match(shutdown, {
+          onNone: () => retire,
+          onSome: (coordinator) =>
+            Effect.raceFirst(
+              retire,
+              Effect.sleep(options.retirementShutdownTimeout ?? "15 seconds").pipe(
+                Effect.zipRight(
+                  Effect.logError("Session retirement exceeded its liveness deadline").pipe(
+                    Effect.annotateLogs({ sessionId, generation }),
+                  ),
+                ),
+                Effect.zipRight(
+                  coordinator.request({
+                    reason: "fatal",
+                    detail: `session ${sessionId} generation ${generation} retirement stalled`,
+                  }),
+                ),
+                // The retirement result remains authoritative. Requesting a
+                // controlled process replacement must not roll this gate back
+                // and admit work into a partially closed generation.
+                Effect.zipRight(Effect.never),
+              ),
+            ),
+        })
+      }
 
       const dispose = Effect.fn("acn.agent-runtime.dispose")(function* (sessionId: string) {
         const resident = (yield* Ref.get(entries)).get(sessionId)
@@ -578,6 +696,8 @@ export const makeAgentRuntimeLive = (
               updatedAt: resident.entry.updatedAt,
               residentSince: resident.residentSince,
               workStatus: yield* Ref.get(resident.workStatus),
+              gate: yield* resident.gate.snapshot,
+              retirement: (yield* Ref.get(retirements)).get(resident.entry.id) ?? null,
             })
           }
           return result

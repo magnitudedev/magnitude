@@ -1,5 +1,7 @@
 import type { AgentIntrospection } from "@magnitudedev/agent"
 import type { AcnActivityState } from "../activity-tracker"
+import type { SessionRetirementSnapshot } from "../agent-runtime"
+import type { ResourceUseGateSnapshot } from "../resource-use-gate"
 import type { AcnDisplayViewIntrospection } from "./display-views"
 
 export interface AcnIntrospectionSession {
@@ -9,6 +11,10 @@ export interface AcnIntrospectionSession {
   readonly scratchpadPath: string
   readonly createdAt: number
   readonly updatedAt: number
+  readonly generation: number
+  readonly residentSince: number
+  readonly gate: ResourceUseGateSnapshot
+  readonly retirement: SessionRetirementSnapshot | null
 }
 
 export interface AcnIntrospectionOverview {

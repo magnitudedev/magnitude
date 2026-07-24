@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Effect, Fiber, Layer, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import type { AgentLifecycleState, CodingAgentSession, ForkTurnState } from "@magnitudedev/agent"
 import { type DisplayState, type DisplayViewShape } from "@magnitudedev/protocol"
 import {
@@ -63,6 +63,10 @@ const makeSession = (
   title: string,
   closed: Ref.Ref<string[]>,
   shapes: Ref.Ref<DisplayViewShape[]>,
+  displayStream: Stream.Stream<{ shape: DisplayViewShape; state: DisplayState }> = Stream.succeed({
+    shape: rootShape,
+    state: displayState(title),
+  }).pipe(Stream.concat(Stream.never)),
 ): CodingAgentSession => ({
   on: { restoreQueuedMessages: Stream.never },
   state: {
@@ -80,7 +84,7 @@ const makeSession = (
     },
   },
   displayView: {
-    stream: () => Stream.succeed({ shape: rootShape, state: displayState(title) }).pipe(Stream.concat(Stream.never)),
+    stream: () => displayStream,
     snapshot: () => Effect.succeed({ shape: rootShape, state: displayState(title) }),
     setShape: (_viewId, shape) => Ref.update(shapes, (all) => [...all, shape]),
     close: (viewId) => Ref.update(closed, (all) => [...all, viewId]),
@@ -102,7 +106,10 @@ const makeSetup = Effect.gen(function* () {
   const observers = yield* Ref.make(new Set<SessionRetirementObserver>())
   const changes = yield* PubSub.unbounded<void>()
   const withSessionCalls = yield* Ref.make(0)
-  const makeEntry = Effect.fn("test.display-entry")(function* (title: string) {
+  const makeEntry = Effect.fn("test.display-entry")(function* (
+    title: string,
+    displayStream?: Stream.Stream<{ shape: DisplayViewShape; state: DisplayState }>,
+  ) {
     const scope = yield* Scope.make()
     return {
       id: "s1",
@@ -111,7 +118,7 @@ const makeSetup = Effect.gen(function* () {
       title,
       cwd: "/tmp",
       scratchpadPath: "/tmp/scratchpad.md",
-      session: makeSession(title, closed, shapes),
+      session: makeSession(title, closed, shapes, displayStream),
       scope,
     } satisfies RuntimeEntry
   })
@@ -255,6 +262,36 @@ describe("DisplayViewStreams", () => {
         yield* streams.requestDisplayViewSnapshot("s1", "view-a")
         expect(yield* Queue.take(received)).toBe("generation-2")
         yield* Fiber.interrupt(streamFiber)
+      }).pipe(Effect.provide(setup.layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("does not make retirement wait for an attachment fiber finalizer", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      const releaseFinalizer = yield* Deferred.make<void>()
+      const delayedDisplay = Stream.succeed({
+        shape: rootShape,
+        state: displayState("generation-1"),
+      }).pipe(
+        Stream.concat(Stream.never),
+        Stream.ensuring(Deferred.await(releaseFinalizer)),
+      )
+      yield* Ref.set(setup.entry, yield* setup.makeEntry("generation-1", delayedDisplay))
+
+      yield* Effect.gen(function* () {
+        const streams = yield* DisplayViewStreams
+        yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
+        const observer = [...(yield* Ref.get(setup.observers))][0]
+        if (!observer) return yield* Effect.die("missing retirement observer")
+
+        const retired = yield* Effect.raceFirst(
+          observer.retire({ sessionId: "s1", generation: 1 }).pipe(Effect.as(true)),
+          Effect.sleep("100 millis").pipe(Effect.as(false)),
+        )
+        yield* Deferred.succeed(releaseFinalizer, undefined)
+        expect(retired).toBe(true)
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)

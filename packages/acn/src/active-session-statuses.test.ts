@@ -18,6 +18,16 @@ const resident = (
   updatedAt: 2,
   residentSince: 1,
   workStatus,
+  gate: {
+    resource: `session:${sessionId}`,
+    generation: 1,
+    phase: "open",
+    leaseCount: 0,
+    leaseLabels: [],
+    idleSince: 1,
+    revision: 0,
+  },
+  retirement: null,
 })
 
 const protocolMeta = (sessionId: string, updatedAt: number): SessionMetadata => ({

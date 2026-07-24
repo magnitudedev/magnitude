@@ -117,18 +117,24 @@ export const DisplayViewStreamsLive: Layer.Layer<
 
       const detachUnlocked = (registration: Registration, generation?: number) =>
         Ref.modify(registration.state, (state) => {
-            const attachment = state.attachment
-            if (
-              attachment === null ||
-              (generation !== undefined && attachment.generation !== generation)
-            ) {
-              return [null, state] as const
-            }
-            return [attachment, { ...state, attachment: null }] as const
-          }).pipe(
-          Effect.flatMap((attachment) =>
-            attachment ? Fiber.interrupt(attachment.fiber).pipe(Effect.asVoid) : Effect.void,
-          ),
+          const attachment = state.attachment
+          if (
+            attachment === null ||
+            (generation !== undefined && attachment.generation !== generation)
+          ) {
+            return [null, state] as const
+          }
+          return [attachment, { ...state, attachment: null }] as const
+        }).pipe(
+          Effect.flatMap((attachment) => {
+            if (!attachment) return Effect.void
+            // Clearing the attachment is the authoritative detach. Forwarding
+            // already checks the token before publishing, so termination can
+            // happen asynchronously without allowing stale events through.
+            // Waiting here would make session retirement depend on every
+            // downstream stream finalizer completing promptly.
+            return Fiber.interruptFork(attachment.fiber)
+          }),
         )
 
       const detach = (registration: Registration, generation?: number) =>
