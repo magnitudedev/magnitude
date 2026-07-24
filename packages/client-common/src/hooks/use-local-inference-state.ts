@@ -81,7 +81,7 @@ export function useLocalInferenceState() {
   const cancel = useAtomSet(cancelAtom)
   const dismiss = useAtomSet(dismissAtom)
   const deleteModel = useAtomSet(deleteAtom)
-  const assign = useAtomSet(assignAtom)
+  const assign = useAtomSet(assignAtom, { mode: "promise" })
   const clear = useAtomSet(clearAtom)
   const load = useAtomSet(loadAtom)
   const unload = useAtomSet(unloadAtom)

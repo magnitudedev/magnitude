@@ -2,7 +2,9 @@ import {
   Fragment,
   memo,
   useCallback,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
 } from "react"
@@ -62,6 +64,17 @@ const recommendationIntent = (intent: "balanced" | "best_quality" | "fastest" | 
   if (intent === "lightweight") return "Lightweight"
   return "Balanced"
 }
+
+const sameSlotSelection = (left: SlotSelection, right: SlotSelection): boolean =>
+  left.providerId === right.providerId
+  && left.providerModelId === right.providerModelId
+  && left.reasoningEffort === right.reasoningEffort
+
+const blockedSlotMessage = (
+  slot: Extract<LocalInferenceView["slots"]["slots"]["primary"], { readonly _tag: "Blocked" }>,
+): string => slot.reason._tag === "LocalModelLoadFailed"
+  ? slot.reason.error.message
+  : slot.reason.message
 
 type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
 
@@ -144,6 +157,8 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const [details, setDetails] = useState(false)
   const [hoveredAction, setHoveredAction] = useState<LocalSetupHoveredAction | null>(null)
+  const [pendingSelection, setPendingSelection] = useState<Option.Option<SlotSelection>>(Option.none())
+  const completionStarted = useRef(false)
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
   const selectedIndex = selectedInferenceIndex(selections, selectedId)
   const selected = selections[selectedIndex]
@@ -152,6 +167,20 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     ? Option.some(primarySlot.selection)
     : Option.none<SlotSelection>()
   const mutationFailure = local.mutationFailure
+  const assigning = Option.isSome(pendingSelection)
+
+  useEffect(() => {
+    if (Option.isNone(pendingSelection) || primarySlot._tag === "Unassigned") return
+    if (!sameSlotSelection(primarySlot.selection, pendingSelection.value)) return
+    if (primarySlot._tag === "Blocked") {
+      setPendingSelection(Option.none())
+      return
+    }
+    if (primarySlot._tag === "UnloadingLocalModel" || completionStarted.current) return
+    completionStarted.current = true
+    setPendingSelection(Option.none())
+    onConfigured()
+  }, [onConfigured, pendingSelection, primarySlot])
 
   const selectionFor = useCallback((selection: LocalInferenceSelection): Option.Option<SlotSelection> =>
     Option.map(selection.providerModelId, (providerModelId) => ({
@@ -164,6 +193,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     })), [])
 
   const confirmSelection = useCallback((selection: LocalInferenceSelection) => {
+    if (assigning) return
     if (selection.model.download._tag === "Downloading") return
     if (selection.model.download._tag === "Failed") {
       local.retryModelDownload(selection.model.id)
@@ -180,14 +210,24 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     Option.match(selectionFor(selection), {
       onNone: () => undefined,
       onSome: (slotSelection) => {
-        local.assignSlot(PRIMARY_SLOT_ID, slotSelection)
-        onConfigured()
+        completionStarted.current = false
+        setPendingSelection(Option.some(slotSelection))
+        void local.assignSlot(PRIMARY_SLOT_ID, slotSelection).catch(() => {
+          setPendingSelection((current) => Option.exists(current, (pending) =>
+            sameSlotSelection(pending, slotSelection))
+            ? Option.none()
+            : current)
+        })
       },
     })
-  }, [local, onConfigured, selectionFor])
+  }, [assigning, local, onConfigured, selectionFor])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c") return
+    if (assigning) {
+      key.preventDefault()
+      return
+    }
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
       setSelectedId(Option.fromNullable(selections[Math.max(0, selectedIndex - 1)]?.id))
@@ -217,12 +257,15 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         key.preventDefault(); local.dismissModelDownloadFailure(selected.model.id); return
       }
     }
-    if (key.name === "c" && Option.isSome(activeBinding)) { key.preventDefault(); onConfigured(); return }
+    if (key.name === "c" && Option.isSome(activeBinding)
+      && primarySlot._tag !== "Blocked" && primarySlot._tag !== "UnloadingLocalModel") {
+      key.preventDefault(); onConfigured(); return
+    }
     if ((key.name === "return" || key.name === "enter") && selected) {
       key.preventDefault(); confirmSelection(selected); return
     }
     if (key.name === "escape") { key.preventDefault(); onSkip() }
-  }, [activeBinding, confirmSelection, local, onConfigured, onSkip, primarySlot._tag, selected, selectedIndex, selections]))
+  }, [activeBinding, assigning, confirmSelection, local, onConfigured, onSkip, primarySlot._tag, selected, selectedIndex, selections]))
 
   const hardware = describeLocalHardware(state.hardware)
   const progress = localInferenceProgressLines(state.models.recommendations.progress, nowMs)
@@ -317,12 +360,15 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               const loading = primarySlot._tag === "LoadingLocalModel"
                 && Option.exists(selection.providerModelId, (id) =>
                   primarySlot.selection.providerModelId === id)
+              const selecting = Option.exists(pendingSelection, (pending) =>
+                Option.exists(selection.providerModelId, (providerModelId) =>
+                  pending.providerModelId === providerModelId))
               return <Fragment key={selection.id}>
                 {sectionLabel && <box style={{ flexDirection: "row", paddingTop: index === 0 ? 0 : 1, paddingBottom: 1, width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}>
                   <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{sectionLabel}</text>
                   <text style={{ fg: theme.border }}>  {localModelSectionRule(sectionLabel)}</text>
                 </box>}
-                <Button id={`local-model-${index}`} onClick={() => confirmSelection(selection)} onMouseOver={() => setSelectedId(Option.some(selection.id))} cursor={model.download._tag === "Downloading" ? "default" : "pointer"} style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: index === selectedIndex ? theme.primary : theme.border, paddingLeft: 1, paddingRight: 1, marginBottom: 1, flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}>
+                <Button id={`local-model-${index}`} onClick={() => confirmSelection(selection)} onMouseOver={() => setSelectedId(Option.some(selection.id))} cursor={model.download._tag === "Downloading" || assigning ? "default" : "pointer"} style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: index === selectedIndex ? theme.primary : theme.border, paddingLeft: 1, paddingRight: 1, marginBottom: 1, flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}>
                   <text style={{ fg: index === selectedIndex ? theme.primary : theme.foreground }} attributes={TextAttributes.BOLD}>
                     {index === selectedIndex ? "› " : "  "}{selectionTitle(selection)}
                     <span fg={theme.primary}>{selection.kind === "recommendation"
@@ -336,6 +382,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                   {model.download._tag === "Downloaded" && model.preparation._tag === "Preparing" && (
                     <text style={{ fg: theme.primary }}>Choosing a serving profile for this machine…</text>
                   )}
+                  {selecting && <text style={{ fg: theme.primary }}>{spinnerFrame} Selecting this model…</text>}
                   {loading && <text style={{ fg: theme.primary }}>{formatModelLoadProgress(primarySlot.percentage)}</text>}
                   {capacityWarning && <text style={{ fg: theme.warning }}>{capacityWarning}</text>}
                 </Button>
@@ -366,6 +413,9 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           })()}
         </box>
         {Option.isSome(mutationFailure) && <text style={{ fg: theme.error }}>{Cause.pretty(mutationFailure.value.cause)}</text>}
+        {primarySlot._tag === "Blocked" && (
+          <text style={{ fg: theme.error }}>Unable to use this model · {blockedSlotMessage(primarySlot)}</text>
+        )}
         <text style={{ fg: theme.muted, marginTop: 1 }}>
           ↑/↓ choose · D details
           {selected?.model.download._tag === "Downloading"
@@ -377,7 +427,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                 : " · Enter download"}
         </text>
         <box style={{ paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: "row" }}>
-          <Button onClick={onSkip} onMouseOver={() => setHoveredAction("models-skip")} onMouseOut={() => setHoveredAction((current) => current === "models-skip" ? null : current)}>
+          <Button onClick={() => { if (!assigning) onSkip() }} onMouseOver={() => setHoveredAction("models-skip")} onMouseOut={() => setHoveredAction((current) => current === "models-skip" ? null : current)}>
             <box style={{ borderStyle: "single", borderColor: hoveredAction === "models-skip" ? theme.primary : theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
               <text style={{ fg: hoveredAction === "models-skip" ? theme.primary : theme.foreground }}>Skip for now (Esc)</text>
             </box>
