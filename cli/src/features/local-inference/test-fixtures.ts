@@ -1,8 +1,10 @@
 import { Option } from "effect"
 import {
+  CatalogCandidateIdSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
+  ModelServingConfigurationIdSchema,
   ModelSlotReady,
   ModelSlotUnassigned,
   PRIMARY_SLOT_ID,
@@ -14,6 +16,7 @@ import {
   SECONDARY_SLOT_ID,
   type LocalInferenceHardware,
   type LocalModel,
+  type LocalModelCatalogCandidate,
   type LocalModelRecommendation,
 } from "@magnitudedev/sdk"
 import type { LocalInferenceView } from "@magnitudedev/client-common"
@@ -22,6 +25,8 @@ export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 export const TEST_MODEL_ID = ProviderModelIdSchema.make("local:test-model")
 export const TEST_TARGET_ID = ModelOfferingTargetIdSchema.make("target_test")
+export const TEST_CONFIGURATION_ID = ModelServingConfigurationIdSchema.make("configuration_test")
+export const TEST_CANDIDATE_ID = CatalogCandidateIdSchema.make("candidate_test")
 export const TEST_MEMORY_DOMAIN_ID = LocalInferenceMemoryDomainIdSchema.make("memory")
 export const TEST_REASONING_EFFORT = ReasoningEffortSchema.make("none")
 
@@ -55,6 +60,7 @@ export const makeHardware = (
 
 export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
   id: TEST_TARGET_ID,
+  catalogCandidateIds: [TEST_CANDIDATE_ID],
   displayName: "Qwen Test",
   description: "Test model",
   kind: "Standalone",
@@ -66,24 +72,47 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
   ...overrides,
 })
 
+export const makeCatalogCandidate = (
+  overrides: Partial<LocalModelCatalogCandidate> = {},
+): LocalModelCatalogCandidate => ({
+  id: TEST_CANDIDATE_ID,
+  displayName: "Qwen Test",
+  description: "Test model",
+  license: "Apache-2.0",
+  profile: { contextLength: 32_768, parallelSequences: 1 },
+  downloadBytes: 16 * GIB,
+  download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
+  preparation: { _tag: "NotDownloaded" },
+  quantization: "Q4_K_M",
+  quantizationName: "4-bit",
+  runtimeMemoryBytes: 18 * GIB,
+  availableMemoryBytes: 22 * GIB,
+  intelligenceScore: 75,
+  intelligenceProvenance: "Test evidence",
+  fidelityRank: 75,
+  qualityEvidence: ["Test quantization evidence"],
+  estimatedTokensPerSecond: Option.none(),
+  capabilities: {
+    vision: false,
+    tools: true,
+    structuredOutput: true,
+    reasoning: {
+      supported: false,
+      efforts: [],
+      defaultEffort: Option.none(),
+    },
+  },
+  sources: [],
+  ...overrides,
+})
+
 export const makeRecommendation = (
   overrides: Partial<LocalModelRecommendation> = {},
 ): LocalModelRecommendation => ({
   id: RecommendationIdSchema.make("recommendation_test"),
-  modelId: TEST_TARGET_ID,
-  displayName: "Qwen Test",
   intent: "balanced",
   explanation: "Balanced local inference.",
-  sources: [],
-  qualityScoreProvenance: "Test evidence",
-  fidelityRank: 0,
-  qualityEvidence: ["Test quantization evidence"],
-  profile: { contextLength: 32_768, parallelSequences: 1 },
-  fit: {
-    requiredBytes: 18 * GIB,
-    availableBytes: 22 * GIB,
-    estimatedTokensPerSecond: Option.none(),
-  },
+  candidate: makeCatalogCandidate(),
   ...overrides,
 })
 
@@ -106,6 +135,7 @@ export const makeView = (options: {
       recommendations: {
         _tag: "Ready",
         entries: options.recommendations ?? [],
+        catalog: [],
         progress: [],
       },
     },
@@ -124,6 +154,7 @@ export const makeView = (options: {
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
         contextWindow: 32_768,
         maxOutputTokens: 4_096,
+        runtimeMemoryBytes: Option.none(),
         capabilities: {
           vision: false,
           tools: true,
@@ -141,6 +172,8 @@ export const makeView = (options: {
           : new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection }),
         secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
       },
+      recentModelIds: { primary: [TEST_MODEL_ID], secondary: [] },
+      favoriteModels: [],
     },
   }
 }

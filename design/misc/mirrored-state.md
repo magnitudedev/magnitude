@@ -49,6 +49,10 @@ download-attempt, and recommendation working state remain private ACN observatio
 types and native field names do not cross the protocol boundary. A backend may bind directly only
 when it owns the exact public schema and versioned replay.
 
+`ModelSlots` also carries the provider-qualified model preferences needed to present model
+selection, including favorites and recency. Preference mutations durably commit before the mirror
+publishes the new snapshot.
+
 Client-common owns one watch per client connection and all query invalidation. Query atoms remain
 distinct by Get RPC tag. Screens consume snapshots; they do not reconstruct state or open their own
 operation streams.

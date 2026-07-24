@@ -2,7 +2,7 @@ import { act } from "react"
 import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { expect, test, vi } from "vitest"
-import { ModelSlotLoadingLocalModel, PRIMARY_SLOT_ID } from "@magnitudedev/sdk"
+import { ModelSlotLoadingLocalModel, PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
 import { GIB, LOCAL_PROVIDER_ID, makeHardware, makeView, TEST_MEMORY_DOMAIN_ID, TEST_MODEL_ID, TEST_REASONING_EFFORT } from "./test-fixtures"
 
 vi.mock("../../hooks/use-theme", () => ({
@@ -29,7 +29,7 @@ test("ready status renders model and resident memory", async () => {
     }),
   })
   const view = await testRender(
-    <LocalInferenceStatusBar state={state} width={100} onOpenHardware={() => {}} />,
+    <LocalInferenceStatusBar state={state} width={100} selectedModelName="Qwen Test" selectedProviderId={LOCAL_PROVIDER_ID} onOpenModels={() => {}} onOpenHardware={() => {}} />,
     { width: 110, height: 5 },
   )
   try {
@@ -44,7 +44,7 @@ test("ready status renders model and resident memory", async () => {
 
 test("loading status shows native progress", async () => {
   const ready = makeView()
-  const state = { ...ready, slots: { slots: { ...ready.slots.slots, primary: new ModelSlotLoadingLocalModel({
+  const state = { ...ready, slots: { ...ready.slots, slots: { ...ready.slots.slots, primary: new ModelSlotLoadingLocalModel({
     slotId: PRIMARY_SLOT_ID,
     selection: {
       providerId: LOCAL_PROVIDER_ID,
@@ -54,7 +54,7 @@ test("loading status shows native progress", async () => {
     percentage: 42,
   }) } } }
   const view = await testRender(
-    <LocalInferenceStatusBar state={state} width={100} onOpenHardware={() => {}} />,
+    <LocalInferenceStatusBar state={state} width={100} selectedModelName="Qwen Test" selectedProviderId={LOCAL_PROVIDER_ID} onOpenModels={() => {}} onOpenHardware={() => {}} />,
     { width: 110, height: 5 },
   )
   try {
@@ -62,6 +62,20 @@ test("loading status shows native progress", async () => {
     const frame = view.captureCharFrame()
     expect(frame).toContain("Loading 42%")
     expect(frame).not.toContain("Loading Loading")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("cloud selection keeps the model bar visible without local state", async () => {
+  const view = await testRender(
+    <LocalInferenceStatusBar state={null} width={100} selectedModelName="Claude Max" selectedProviderId={ProviderIdSchema.make("magnitude")} onOpenModels={() => {}} onOpenHardware={() => {}} />,
+    { width: 110, height: 5 },
+  )
+  try {
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain("Claude Max")
+    expect(view.captureCharFrame()).toContain("Cloud")
   } finally {
     await act(async () => view.renderer.destroy())
   }

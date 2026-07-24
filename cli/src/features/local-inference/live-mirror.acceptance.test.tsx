@@ -32,7 +32,7 @@ test.skipIf(Option.isNone(acnUrl))("live independent mirrors compose into the lo
     return (
       <box style={{ flexDirection: "column" }}>
         <text>mirror:success</text>
-        <LocalInferenceStatusBar state={result.value} width={100} onOpenHardware={() => {}} />
+        <LocalInferenceStatusBar state={result.value} width={100} selectedModelName="Qwen Test" selectedProviderId={null} onOpenModels={() => {}} onOpenHardware={() => {}} />
       </box>
     )
   }

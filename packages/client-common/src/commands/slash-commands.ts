@@ -40,7 +40,8 @@ const SLASH_COMMANDS: SlashCommandDefinition[] = [
   { id: 'exit',     label: 'exit',     description: 'Exit Magnitude', aliases: ['quit', 'q'] },
   { id: 'bash',     label: 'bash',     description: 'Enter bash mode' },
   { id: 'init',     label: 'init',     description: 'Generate AGENTS.md for this project' },
-  { id: 'settings',      label: 'settings',      description: 'Open settings', aliases: ['s'] },
+  { id: 'settings', label: 'settings', description: 'Open model settings', aliases: ['s'] },
+  { id: 'transcript', label: 'transcript', description: 'Toggle transcript display mode' },
   { id: 'usage',         label: 'usage',         description: 'View cloud subscription, limits, and recent usage', aliases: ['limits'] },
   { id: 'autopilot',     label: 'autopilot',     description: 'Toggle autopilot mode', featureFlag: 'MAGNITUDE_ENABLE_AUTOPILOT' },
 ]

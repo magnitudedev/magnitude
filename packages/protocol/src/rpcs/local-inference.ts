@@ -2,10 +2,10 @@ import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
 import {
+  CatalogCandidateIdSchema,
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
   ModelOfferingTargetIdSchema,
-  RecommendationIdSchema,
   SlotIdSchema,
 } from "../schemas/model-state"
 import { defineMirroredState } from "./mirrored-state"
@@ -20,8 +20,26 @@ export const LocalModelsMirror = defineMirroredState("GetLocalModels", {
   errorSchema: Schema.Never,
 })
 
-export const DownloadRecommendedModel = Rpc.make("DownloadRecommendedModel", {
-  payload: Schema.Struct({ recommendationId: RecommendationIdSchema }),
+export const DownloadCatalogModel = Rpc.make("DownloadCatalogModel", {
+  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+})
+
+export const CancelCatalogModelDownload = Rpc.make("CancelCatalogModelDownload", {
+  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+})
+
+export const DeleteCatalogModel = Rpc.make("DeleteCatalogModel", {
+  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+})
+
+export const SelectCatalogModel = Rpc.make("SelectCatalogModel", {
+  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })

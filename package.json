@@ -22,6 +22,7 @@
     "typecheck": "bun run packages/version/scripts/generate-version.ts && turbo typecheck",
     "test": "bun run packages/version/scripts/generate-version.ts && bun test",
     "cache:clear": "rm -rf ~/.magnitude/cache",
+    "onboarding:reset": "bun run scripts/reset-onboarding.ts",
     "design-docs": "bun run scripts/design-docs.ts",
     "session": "bun run --cwd evals session",
     "tbench": "bun run evals/tbench/cli.ts",

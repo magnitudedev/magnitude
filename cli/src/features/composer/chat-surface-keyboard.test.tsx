@@ -28,6 +28,12 @@ function renderKeyboard(overrides: Partial<Parameters<typeof ChatSurfaceKeyboard
       onClearInput={() => {}}
       bashMode={false}
       onExitBashMode={() => {}}
+      thinkingOpen={false}
+      thinkingOptionCount={0}
+      onToggleThinking={() => {}}
+      onMoveThinking={() => {}}
+      onApplyThinking={() => {}}
+      onCancelThinking={() => {}}
       {...overrides}
     />,
   )
@@ -58,6 +64,23 @@ function makeEscapeKey() {
     name: 'escape',
     sequence: '',
     ctrl: false,
+    meta: false,
+    option: false,
+    shift: false,
+    defaultPrevented: false,
+    preventDefault() {
+      prevented = true
+    },
+  } as unknown as KeyEvent
+  return { key, wasPrevented: () => prevented }
+}
+
+function makeKey(name: string, ctrl = false) {
+  let prevented = false
+  const key = {
+    name,
+    sequence: '',
+    ctrl,
     meta: false,
     option: false,
     shift: false,
@@ -148,4 +171,40 @@ test('keyboard handler no-ops when blocking overlay is active', () => {
   expect(interruptedAll).toBe(0)
   expect(setKillAll).toBe(0)
   expect(wasPrevented()).toBe(false)
+})
+
+test('Ctrl-T opens the thinking selector when the model exposes choices', () => {
+  let toggled = 0
+  const handler = renderKeyboard({
+    thinkingOptionCount: 4,
+    onToggleThinking: () => { toggled += 1 },
+  })
+
+  const { key, wasPrevented } = makeKey('t', true)
+  handler(key)
+
+  expect(toggled).toBe(1)
+  expect(wasPrevented()).toBe(true)
+})
+
+test('thinking selector owns arrow, Enter, and Escape keys while open', () => {
+  const movements: number[] = []
+  let applied = 0
+  let cancelled = 0
+  const handler = renderKeyboard({
+    thinkingOpen: true,
+    thinkingOptionCount: 4,
+    onMoveThinking: (direction) => { movements.push(direction) },
+    onApplyThinking: () => { applied += 1 },
+    onCancelThinking: () => { cancelled += 1 },
+  })
+
+  handler(makeKey('up').key)
+  handler(makeKey('down').key)
+  handler(makeKey('return').key)
+  handler(makeEscapeKey().key)
+
+  expect(movements).toEqual([-1, 1])
+  expect(applied).toBe(1)
+  expect(cancelled).toBe(1)
 })

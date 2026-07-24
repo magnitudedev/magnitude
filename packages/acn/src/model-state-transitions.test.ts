@@ -99,6 +99,8 @@ describe("ACN model-state transitions", () => {
         primary: applyReplacedLocalModelStage(ready, replacementModelId, "unloading"),
         secondary: replacement,
       },
+      recentModelIds: { primary: [], secondary: [] },
+      favoriteModels: [],
     }
     expect(Schema.is(ModelSlotsStateSchema)(unloading)).toBe(true)
   })
@@ -129,6 +131,7 @@ describe("ACN model-state transitions", () => {
         supportedSlots: [PRIMARY_SLOT_ID],
         contextWindow: 200_000,
         maxOutputTokens: 32_768,
+        runtimeMemoryBytes: Option.none(),
         capabilities,
         availability: { _tag: "Available" },
         pricing: Option.none(),
@@ -154,6 +157,7 @@ describe("ACN model-state transitions", () => {
         supportedSlots: [PRIMARY_SLOT_ID],
         contextWindow: 200_000,
         maxOutputTokens: 32_768,
+        runtimeMemoryBytes: Option.none(),
         capabilities,
         availability: { _tag: "Available" },
         pricing: Option.none(),

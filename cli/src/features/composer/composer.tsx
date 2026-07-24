@@ -152,6 +152,7 @@ export function Composer(props: ComposerProps) {
     hasRunningForks,
     bashMode,
     modelsConfigured,
+    downloadSummary,
     modelSummary,
     tokenUsage,
     contextHardCap,
@@ -173,6 +174,9 @@ export function Composer(props: ComposerProps) {
     interruptFork,
     interruptAll,
     openSettings,
+    openCatalog,
+    thinkingOptions,
+    applyThinking,
     handleWidgetKeyEvent,
     enterBashMode,
     exitBashMode,
@@ -226,8 +230,35 @@ export function Composer(props: ComposerProps) {
   const historyNavRef = useRef(false)
   const [nextEscWillKillAll, setNextEscWillKillAll] = useState(false)
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
+  const [thinkingOpen, setThinkingOpen] = useState(false)
+  const currentThinkingIndex = Math.max(
+    0,
+    thinkingOptions.findIndex((option) =>
+      option.label.toLowerCase() === modelSummary?.thinkingLevel.toLowerCase()),
+  )
+  const [thinkingIndex, setThinkingIndex] = useState(currentThinkingIndex)
+  const openThinking = useCallback(() => {
+    if (thinkingOptions.length === 0) return
+    setThinkingIndex(currentThinkingIndex)
+    setThinkingOpen(true)
+  }, [currentThinkingIndex, thinkingOptions.length])
+  const toggleThinking = useCallback(() => {
+    if (thinkingOpen) {
+      setThinkingOpen(false)
+    } else {
+      openThinking()
+    }
+  }, [openThinking, thinkingOpen])
+  const moveThinking = useCallback((direction: -1 | 1) => {
+    setThinkingIndex((index) =>
+      (index + direction + thinkingOptions.length) % thinkingOptions.length)
+  }, [thinkingOptions.length])
+  const commitThinking = useCallback(() => {
+    const option = thinkingOptions[thinkingIndex]
+    if (option) applyThinking(option.value)
+    setThinkingOpen(false)
+  }, [applyThinking, thinkingIndex, thinkingOptions])
   const multilineInputRef = useRef<MultilineInputHandle | null>(null)
 
   // Refs to mirror local state so the sync Effect reads the latest values
@@ -572,6 +603,12 @@ export function Composer(props: ComposerProps) {
           clearComposer()
         }}
         onToggleAutopilot={enableAutopilot ? toggleAutopilot : undefined}
+        thinkingOpen={thinkingOpen}
+        thinkingOptionCount={thinkingOptions.length}
+        onToggleThinking={toggleThinking}
+        onMoveThinking={moveThinking}
+        onApplyThinking={commitThinking}
+        onCancelThinking={() => setThinkingOpen(false)}
       />
 
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
@@ -600,6 +637,34 @@ export function Composer(props: ComposerProps) {
                 onHoverIndex={slashCommands.setSelectedIndex}
               />
             )}
+            {!bashMode && thinkingOpen && (
+              <box style={{
+                flexDirection: 'column',
+                borderStyle: 'single',
+                borderColor: theme.primary,
+                backgroundColor: theme.inputBg,
+                paddingLeft: 1,
+                paddingRight: 1,
+                marginBottom: 1,
+              }}>
+                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Thinking level</text>
+                <text style={{ fg: theme.muted }}>↑↓ choose · Enter apply · Esc cancel</text>
+                {thinkingOptions.map((option, index) => (
+                  <Button
+                    key={option.value}
+                    onClick={() => {
+                      applyThinking(option.value)
+                      setThinkingOpen(false)
+                    }}
+                    onMouseOver={() => setThinkingIndex(index)}
+                  >
+                    <text style={{ fg: index === thinkingIndex ? theme.primary : theme.foreground }}>
+                      {index === thinkingIndex ? '› ' : '  '}{option.label}
+                    </text>
+                  </Button>
+                ))}
+              </box>
+            )}
             <box style={{ flexDirection: 'column' }}>
               <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
                 <box style={{ flexGrow: 1, minWidth: 0 }}>
@@ -615,7 +680,7 @@ export function Composer(props: ComposerProps) {
                     onSubmit={handleInputSubmit}
                     onPaste={handlePaste}
                     onKeyIntercept={handleKeyIntercept}
-                    focused={composerCanFocus}
+                    focused={composerCanFocus && !thinkingOpen}
                     highlightColor={bashMode ? orange[400] : undefined}
                     placeholder={bashMode ? 'Enter a command...' : status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
                     maxHeight={10}
@@ -629,47 +694,25 @@ export function Composer(props: ComposerProps) {
                 ) : !modelsConfigured ? (
                   <Button
                     onClick={openSettings}
-                    onMouseOver={() => setModelLabelHovered(true)}
-                    onMouseOut={() => setModelLabelHovered(false)}
                   >
-                    <text style={{
-                      fg: modelLabelHovered ? theme.primary : theme.foreground,
-                    }}>
-                      <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                        No provider configured
-                      </span>
+                    <text style={{ fg: theme.foreground }}>
+                      <span>No provider configured</span>
                     </text>
                   </Button>
                 ) : (
-                  <>
-                    <Button
-                      onClick={openSettings}
-                      onMouseOver={() => setModelLabelHovered(true)}
-                      onMouseOut={() => setModelLabelHovered(false)}
-                    >
-                      <text style={{
-                        fg: modelLabelHovered ? theme.primary : theme.foreground,
-                      }}>
-                        <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                          {modelSummary?.model ?? '-'}
-                        </span>
-                      </text>
-                    </Button>
-                    <text style={{ fg: theme.muted }}> {'\u00b7'} </text>
-                    <Button
-                      onClick={openSettings}
-                      onMouseOver={() => setThinkingLabelHovered(true)}
-                      onMouseOut={() => setThinkingLabelHovered(false)}
-                    >
-                      <text style={{
-                        fg: thinkingLabelHovered ? theme.primary : theme.foreground,
-                      }}>
-                        <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                          {modelSummary?.thinkingLevel ?? '-'}
-                        </span>
-                      </text>
-                    </Button>
-                  </>
+                  <Button
+                    onClick={openThinking}
+                    onMouseOver={() => setThinkingLabelHovered(true)}
+                    onMouseOut={() => setThinkingLabelHovered(false)}
+                  >
+                    <text style={{
+                      fg: thinkingLabelHovered ? theme.primary : theme.foreground,
+                    }}>
+                      <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                        Thinking: {modelSummary?.thinkingLevel ?? '-'}
+                      </span>
+                    </text>
+                  </Button>
                 )}
               </box>
             </box>
@@ -682,6 +725,11 @@ export function Composer(props: ComposerProps) {
 
       <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
+          {downloadSummary && (
+            <Button onClick={openCatalog}>
+              <text style={{ fg: theme.primary }}>{downloadSummary}</text>
+            </Button>
+          )}
           {enableAutopilot && (
             <AutopilotIndicator
               enabled={autopilotEnabled}

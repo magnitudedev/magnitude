@@ -5,7 +5,6 @@
  *
  * - Ctrl+C: exit (guarded — not while composing or streaming)
  * - Ctrl+R: toggle recent chats overlay
- * - Ctrl+T: toggle default/transcript display mode
  * - Error CTA chords: dispatch the most recent actionable inline error
  */
 import { useCallback } from 'react'
@@ -17,11 +16,10 @@ import {
   useDisplayState,
   getFork,
   useDisplayViewController,
-  settingsOpenAtom,
   usageOpenAtom,
   composerHasContentAtom,
 } from '@magnitudedev/client-common'
-import { cloudModelsOpenAtom, modelSetupRouteAtom, showRecentChatsOverlayAtom } from '../state/cli-atoms'
+import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../state/cli-atoms'
 import { matchKeyToChord } from '../utils/chord'
 import type { ActionId } from '../types/ui-actions'
 
@@ -40,13 +38,11 @@ export function shouldExitOnCtrlC(input: {
 
 export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardParams): void {
   const composerHasContent = useAtomValue(composerHasContentAtom)
-  const { expandedForkStack, togglePresentationMode } = useDisplayViewController()
+  const { expandedForkStack } = useDisplayViewController()
   const showRecentChats = useAtomValue(showRecentChatsOverlayAtom)
   const setShowRecentChats = useAtomSet(showRecentChatsOverlayAtom)
-  const settingsOpen = useAtomValue(settingsOpenAtom)
+  const modelMenu = useAtomValue(modelMenuStateAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
-  const cloudModelsOpen = useAtomValue(cloudModelsOpenAtom)
-  const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
 
   const rootMode = useDisplayState((state) => getFork(state, null)?.mode ?? 'idle')
   const latestErrorCta = useDisplayState((state) => {
@@ -62,9 +58,8 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
     return null
   })
 
-  const localModelSetupOpen = modelSetupRoute !== 'closed'
-  const overlayActive = showRecentChats || settingsOpen || usageOpen || cloudModelsOpen || localModelSetupOpen || expandedForkStack.length > 0
-  const canToggleRecentChats = !settingsOpen && !usageOpen && !cloudModelsOpen && !localModelSetupOpen && expandedForkStack.length === 0
+  const overlayActive = showRecentChats || modelMenu.open || usageOpen || expandedForkStack.length > 0
+  const canToggleRecentChats = !modelMenu.open && !usageOpen && expandedForkStack.length === 0
 
   useKeyboard(
     useCallback((key: KeyEvent) => {
@@ -72,7 +67,6 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
 
       const isCtrlC = key.ctrl && key.name === 'c' && !key.meta && !key.option
       const isCtrlR = key.ctrl && key.name === 'r' && !key.meta && !key.option
-      const isCtrlT = key.ctrl && key.name === 't' && !key.meta && !key.option
 
       if (isCtrlC) {
         if (!shouldExitOnCtrlC({ overlayActive, composerHasContent, rootMode })) return
@@ -85,12 +79,6 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
         if (!canToggleRecentChats) return
         key.preventDefault()
         setShowRecentChats((prev: boolean) => !prev)
-        return
-      }
-
-      if (isCtrlT) {
-        key.preventDefault()
-        togglePresentationMode()
         return
       }
 
@@ -108,7 +96,6 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
       overlayActive,
       latestErrorCta,
       setShowRecentChats,
-      togglePresentationMode,
       dispatchErrorAction,
     ]),
   )

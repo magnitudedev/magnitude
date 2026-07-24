@@ -16,6 +16,12 @@ interface ChatSurfaceKeyboardProps {
   bashMode: boolean
   onExitBashMode: () => void
   onToggleAutopilot?: () => void
+  thinkingOpen: boolean
+  thinkingOptionCount: number
+  onToggleThinking: () => void
+  onMoveThinking: (direction: -1 | 1) => void
+  onApplyThinking: () => void
+  onCancelThinking: () => void
 }
 
 export function ChatSurfaceKeyboard({
@@ -32,6 +38,12 @@ export function ChatSurfaceKeyboard({
   bashMode,
   onExitBashMode,
   onToggleAutopilot,
+  thinkingOpen,
+  thinkingOptionCount,
+  onToggleThinking,
+  onMoveThinking,
+  onApplyThinking,
+  onCancelThinking,
 }: ChatSurfaceKeyboardProps) {
   useKeyboard(
     useCallback((key: KeyEvent) => {
@@ -39,8 +51,39 @@ export function ChatSurfaceKeyboard({
 
       const isEscape = key.name === 'escape'
       const isCtrlC = key.ctrl && key.name === 'c' && !key.meta && !key.option
+      const isCtrlT = key.ctrl && key.name === 't' && !key.meta && !key.option
 
       if (isBlockingOverlayActive) return
+
+      if (isCtrlT && thinkingOptionCount > 0) {
+        key.preventDefault()
+        onToggleThinking()
+        return
+      }
+
+      if (thinkingOpen) {
+        if (isEscape) {
+          key.preventDefault()
+          onCancelThinking()
+          return
+        }
+        if (key.name === 'up' || key.name === 'k') {
+          key.preventDefault()
+          onMoveThinking(-1)
+          return
+        }
+        if (key.name === 'down' || key.name === 'j') {
+          key.preventDefault()
+          onMoveThinking(1)
+          return
+        }
+        if (key.name === 'return' || key.name === 'enter') {
+          key.preventDefault()
+          onApplyThinking()
+          return
+        }
+        return
+      }
 
       const isCtrlA = key.ctrl && key.name === 'a' && !key.meta && !key.option
       if (isCtrlA && onToggleAutopilot) {
@@ -103,6 +146,12 @@ export function ChatSurfaceKeyboard({
       bashMode,
       onExitBashMode,
       onToggleAutopilot,
+      thinkingOpen,
+      thinkingOptionCount,
+      onToggleThinking,
+      onMoveThinking,
+      onApplyThinking,
+      onCancelThinking,
     ]),
   )
 

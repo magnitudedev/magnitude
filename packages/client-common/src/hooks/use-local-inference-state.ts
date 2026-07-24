@@ -5,8 +5,8 @@ import {
   LocalModelsMirror,
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
+  type CatalogCandidateId,
   type ModelOfferingTargetId,
-  type RecommendationId,
   type SlotId,
   type SlotSelection,
 } from "@magnitudedev/sdk"
@@ -56,7 +56,13 @@ export function useLocalInferenceQuery() {
 export function useLocalInferenceState() {
   const client = useAgentClient()
   const state = useLocalInferenceQuery()
-  const downloadAtom = useMemo(() => client.mutation("DownloadRecommendedModel"), [client])
+  const downloadCatalogAtom = useMemo(() => client.mutation("DownloadCatalogModel"), [client])
+  const cancelCatalogDownloadAtom = useMemo(
+    () => client.mutation("CancelCatalogModelDownload"),
+    [client],
+  )
+  const deleteCatalogModelAtom = useMemo(() => client.mutation("DeleteCatalogModel"), [client])
+  const selectCatalogModelAtom = useMemo(() => client.mutation("SelectCatalogModel"), [client])
   const retryAtom = useMemo(() => client.mutation("RetryModelDownload"), [client])
   const cancelAtom = useMemo(() => client.mutation("CancelModelDownload"), [client])
   const dismissAtom = useMemo(() => client.mutation("DismissModelDownloadFailure"), [client])
@@ -66,7 +72,10 @@ export function useLocalInferenceState() {
   const loadAtom = useMemo(() => client.mutation("LoadModel"), [client])
   const unloadAtom = useMemo(() => client.mutation("UnloadModel"), [client])
   const mutations = [
-    useAtomValue(downloadAtom),
+    useAtomValue(downloadCatalogAtom),
+    useAtomValue(cancelCatalogDownloadAtom),
+    useAtomValue(deleteCatalogModelAtom),
+    useAtomValue(selectCatalogModelAtom),
     useAtomValue(retryAtom),
     useAtomValue(cancelAtom),
     useAtomValue(dismissAtom),
@@ -76,7 +85,10 @@ export function useLocalInferenceState() {
     useAtomValue(loadAtom),
     useAtomValue(unloadAtom),
   ]
-  const download = useAtomSet(downloadAtom)
+  const downloadCatalog = useAtomSet(downloadCatalogAtom)
+  const cancelCatalogDownload = useAtomSet(cancelCatalogDownloadAtom)
+  const removeCatalogModel = useAtomSet(deleteCatalogModelAtom)
+  const assignCatalogModel = useAtomSet(selectCatalogModelAtom)
   const retry = useAtomSet(retryAtom)
   const cancel = useAtomSet(cancelAtom)
   const dismiss = useAtomSet(dismissAtom)
@@ -89,10 +101,26 @@ export function useLocalInferenceState() {
   return {
     state,
     mutationFailure: Option.fromNullable(mutations.find(Result.isFailure)),
-    downloadRecommendedModel: useCallback((recommendationId: RecommendationId) => download({
-      payload: { recommendationId },
-      reactivityKeys: modelKeys,
-    }), [download]),
+    downloadCatalogModel: useCallback((id: CatalogCandidateId) =>
+      downloadCatalog({
+        payload: { id },
+        reactivityKeys: modelKeys,
+      }), [downloadCatalog]),
+    cancelCatalogModelDownload: useCallback((id: CatalogCandidateId) =>
+      cancelCatalogDownload({
+        payload: { id },
+        reactivityKeys: [LocalModelsMirror.id],
+      }), [cancelCatalogDownload]),
+    deleteCatalogModel: useCallback((id: CatalogCandidateId) =>
+      removeCatalogModel({
+        payload: { id },
+        reactivityKeys: modelKeys,
+      }), [removeCatalogModel]),
+    selectCatalogModel: useCallback((id: CatalogCandidateId) =>
+      assignCatalogModel({
+        payload: { id },
+        reactivityKeys: [ModelSlotsMirror.id, ProviderModelCatalogMirror.id],
+      }), [assignCatalogModel]),
     retryModelDownload: useCallback((modelId: ModelOfferingTargetId) => retry({
       payload: { modelId },
       reactivityKeys: modelKeys,

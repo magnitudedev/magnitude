@@ -1,4 +1,4 @@
-import type { DisplayMessage, DisplayTimeline, RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
+import type { DisplayMessage, DisplayTimeline, RawImageAttachment, RawMentionOccurrence, ReasoningEffort } from '@magnitudedev/sdk'
 import type { KeyEvent } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
 
@@ -16,6 +16,7 @@ export type ComposerProps = {
   hasRunningForks: boolean
   bashMode: boolean
   modelsConfigured: boolean
+  downloadSummary: string | null
   modelSummary: { role: string; model: string; thinkingLevel: string } | null
   tokenUsage: number | null
   contextHardCap: number | null
@@ -48,6 +49,9 @@ export type ComposerProps = {
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void
   openSettings: () => void
+  openCatalog: () => void
+  thinkingOptions: readonly { value: ReasoningEffort; label: string }[]
+  applyThinking: (effort: ReasoningEffort) => void
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
   enterBashMode: () => void
   exitBashMode: () => void

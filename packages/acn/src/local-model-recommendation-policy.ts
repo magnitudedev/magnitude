@@ -159,6 +159,13 @@ const compareBalanced = (
 ): number => balancedUtility(right) - balancedUtility(left)
   || stableCompare(left, right)
 
+/** Compatible catalog candidates in the same general-purpose order used by Balanced. */
+export const rankCatalogCandidates = (
+  input: readonly RecommendationCandidate[],
+): readonly RecommendationCandidate[] =>
+  [...collapseLargestContext(preferScoredCandidates(input.filter(usable)))]
+    .sort(compareBalanced)
+
 const compareBestQuality = (
   left: RecommendationCandidate,
   right: RecommendationCandidate,

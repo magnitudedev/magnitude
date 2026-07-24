@@ -35,7 +35,9 @@ hashes package or profile data to create another configuration identity.
 An offering exists independently of current installation, fit, slot selection, or residency.
 ACN's local-offering projection combines the durable offering with installed-package and assessment
 observations to produce the provider model catalog entry. This is the only place that derives local
-provider availability.
+provider availability. When the exact configuration fits, that catalog entry also carries its
+assessed runtime-memory requirement, summed across the physical memory domains reported by ICN.
+Generic and cloud provider entries do not fabricate a local runtime-memory requirement.
 
 The target ID groups every serving configuration of the same standalone package or speculative
 pair into one product model. Provider model IDs continue to distinguish configurations.
@@ -125,6 +127,8 @@ drafting actually ran.
 - Every local provider call resolves through one durable offering.
 - Runtime load receives the stored ICN configuration unchanged.
 - Local availability is derived in one ACN projection.
+- Every available local provider catalog entry exposes ICN's assessed runtime-memory requirement
+  for that exact serving configuration.
 - Provider binding does not load a model.
 - Chat cannot mutate residency.
 - Slot selection and recency refer only to stable provider model IDs.

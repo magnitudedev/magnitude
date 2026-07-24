@@ -16,6 +16,8 @@ function createContext(overrides: Partial<CommandContext> = {}): CommandContext 
     openSettings: vi.fn(),
     openUsage: vi.fn(),
     openCloud: vi.fn(),
+    openModelMenu: vi.fn(),
+    toggleTranscript: vi.fn(),
     toggleAutopilot: vi.fn(),
     ...overrides,
   }
@@ -35,10 +37,28 @@ describe('routeSlashCommand', () => {
     expect(ctx.openUsage).toHaveBeenCalledTimes(2)
   })
 
-  test('opens standalone cloud setup from /cloud', () => {
+  test('opens each model menu directly', () => {
     const ctx = createContext()
+    expect(routeSlashCommand('/models', ctx)).toBe(true)
+    expect(routeSlashCommand('/catalog', ctx)).toBe(true)
+    expect(routeSlashCommand('/hardware', ctx)).toBe(true)
     expect(routeSlashCommand('/cloud', ctx)).toBe(true)
-    expect(ctx.openCloud).toHaveBeenCalledTimes(1)
+    expect(ctx.openModelMenu).toHaveBeenNthCalledWith(1, 'models')
+    expect(ctx.openModelMenu).toHaveBeenNthCalledWith(2, 'catalog')
+    expect(ctx.openModelMenu).toHaveBeenNthCalledWith(3, 'hardware')
+    expect(ctx.openModelMenu).toHaveBeenNthCalledWith(4, 'cloud')
+  })
+
+  test('/settings opens the Models menu', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/settings', ctx)).toBe(true)
+    expect(ctx.openModelMenu).toHaveBeenCalledWith('models')
+  })
+
+  test('/transcript preserves direct access to transcript mode', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/transcript', ctx)).toBe(true)
+    expect(ctx.toggleTranscript).toHaveBeenCalledTimes(1)
   })
 
   test('unknown command is not handled', () => {

@@ -5,7 +5,7 @@
  * the CLI's slash-command surface (overlays, system messages, bash mode).
  */
 import { useCallback, useMemo, useRef, type ReactNode } from 'react'
-import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
+import { Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import type { KeyEvent } from '@opentui/core'
 import {
   useComposerState,
@@ -20,15 +20,19 @@ import {
   useSelectedSessionId,
   selectedCwdAtom,
   selectedFilePathAtom,
-  settingsOpenAtom,
   usageOpenAtom,
   bashModeAtom,
   useDisplayViewController,
   type CommandContext,
+  reasoningEffortControl,
+  selectedSlotModel,
+  useModelConfig,
 } from '@magnitudedev/client-common'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
-import { cloudModelsOpenAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
+import { Option } from 'effect'
+import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
+import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
 import { INIT_PROMPT } from '../../commands/init-prompt'
 import { Composer } from './composer'
@@ -39,25 +43,26 @@ export function ComposerContainer({
   widgetNavActive,
   handleWidgetKeyEvent,
   modelsConfigured,
+  downloadSummary,
 }: {
   chatColumnWidth: number
   widgetNavActive: boolean
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
   modelsConfigured: boolean
+  downloadSummary: string | null
 }): ReactNode {
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
   const selectedCwd = useAtomValue(selectedCwdAtom)
-  const setSettingsOpen = useAtomSet(settingsOpenAtom)
+  const menu = useAtomValue(modelMenuStateAtom)
+  const setMenu = useAtomSet(modelMenuStateAtom)
   const setUsageOpen = useAtomSet(usageOpenAtom)
-  const setCloudModelsOpen = useAtomSet(cloudModelsOpenAtom)
   const setBashMode = useAtomSet(bashModeAtom)
   const setShowRecentChats = useAtomSet(showRecentChatsOverlayAtom)
-  const { displayMode, expandedForkStack } = useDisplayViewController()
+  const { displayMode, expandedForkStack, togglePresentationMode } = useDisplayViewController()
   const selectedFilePath = useAtomValue(selectedFilePathAtom)
   const setSelectedFilePath = useAtomSet(selectedFilePathAtom)
   const showRecentChats = useAtomValue(showRecentChatsOverlayAtom)
-  const settingsOpen = useAtomValue(settingsOpenAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
   const { startNewSession } = useSessionActions()
 
@@ -82,11 +87,13 @@ export function ComposerContainer({
       sendRef.current(content)
     },
     initProject: () => { void sendRef.current(INIT_PROMPT) },
-    openSettings: () => setSettingsOpen(true),
+    openSettings: () => setMenu({ open: true, root: 'models' }),
+    openModelMenu: (root) => setMenu({ open: true, root }),
+    toggleTranscript: togglePresentationMode,
     openUsage: () => setUsageOpen(true),
-    openCloud: () => setCloudModelsOpen(true),
+    openCloud: () => setMenu({ open: true, root: 'cloud' }),
     toggleAutopilot: () => { /* disabled */ },
-  }), [startNewSession, setShowRecentChats, setBashMode, setSettingsOpen, setUsageOpen, setCloudModelsOpen, theme.error])
+  }), [startNewSession, setShowRecentChats, setBashMode, setMenu, setUsageOpen, togglePresentationMode])
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
@@ -96,6 +103,24 @@ export function ComposerContainer({
 
   const { interrupt, interruptAll } = useInterruptActions()
   const { rootRoleLabel, rootProfile } = useSlotProfiles()
+  const modelConfig = useModelConfig()
+  const selectedModel = Option.flatMap(
+    Option.all({
+      catalog: Result.value(modelConfig.catalog),
+      slots: Result.value(modelConfig.slots),
+    }),
+    ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
+  )
+  const thinkingOptions = Option.match(selectedModel, {
+    onNone: () => [],
+    onSome: ({ model }) => {
+      const control = reasoningEffortControl(model)
+      return control._tag === 'Available' ? [...control.options] : []
+    },
+  })
+  const applyThinking = useCallback((effort: typeof thinkingOptions[number]["value"]) => {
+    modelConfig.updateSlotReasoning(PRIMARY_SLOT_ID, effort)
+  }, [modelConfig.updateSlotReasoning])
 
   const rootTimeline = useDisplayState((state) => getFork(state, null) ?? null)
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
@@ -112,7 +137,7 @@ export function ComposerContainer({
   const contextTextWidth = 24
   const attachmentsMaxWidth = Math.max(0, chatColumnWidth - 4 - maxEscHintWidth - contextTextWidth - 5)
 
-  const composerCanFocus = !showRecentChats && !settingsOpen && !usageOpen && expandedForkStack.length === 0
+  const composerCanFocus = !showRecentChats && !menu.open && !usageOpen && expandedForkStack.length === 0
 
   const submitUserMessage = useCallback((payload: {
     message: string
@@ -161,7 +186,11 @@ export function ComposerContainer({
       clearSystemBanners={clearSystemMessages}
       interruptFork={interrupt}
       interruptAll={interruptAll}
-      openSettings={() => setSettingsOpen(true)}
+      openSettings={() => setMenu({ open: true, root: 'models' })}
+      openCatalog={() => setMenu({ open: true, root: 'catalog' })}
+      downloadSummary={downloadSummary}
+      thinkingOptions={thinkingOptions}
+      applyThinking={applyThinking}
       handleWidgetKeyEvent={handleWidgetKeyEvent}
       enterBashMode={() => setBashMode(true)}
       exitBashMode={() => setBashMode(false)}

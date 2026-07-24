@@ -226,6 +226,8 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
   userMessageBg: slate[800],
   userMessageHoverBg: slate[750],
   inputBg: '#232f41',
+  menuBg: '#232f41',
+  menuAltBg: slate[750],
 
   agentToggleExpandedBg: indigo[600],
   agentFocusedBg: slate[700],
@@ -301,6 +303,8 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
   userMessageBg: slate[150],
   userMessageHoverBg: slate[200],
   inputBg: slate[150],
+  menuBg: slate[150],
+  menuAltBg: slate[200],
 
   agentToggleExpandedBg: indigo[600],
   agentFocusedBg: slate[100],

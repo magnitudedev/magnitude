@@ -1,5 +1,10 @@
 import { Context, Effect, Layer, Option, Stream, SubscriptionRef } from "effect"
-import type { ProviderModelId, SlotId, SlotSelection } from "@magnitudedev/sdk"
+import type {
+  ProviderModelId,
+  ProviderModelIdentity,
+  SlotId,
+  SlotSelection,
+} from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
   type ConfigStorageShape,
@@ -31,6 +36,10 @@ export interface ModelConfigurationApi {
     slotId: SlotId,
     providerModelId: ProviderModelId,
   ) => Effect.Effect<void, ModelConfigurationError>
+  readonly setFavorite: (
+    model: ProviderModelIdentity,
+    favorite: boolean,
+  ) => Effect.Effect<void, ModelConfigurationError>
 }
 
 export class ModelConfiguration extends Context.Tag("ModelConfiguration")<
@@ -41,6 +50,7 @@ export class ModelConfiguration extends Context.Tag("ModelConfiguration")<
 const EMPTY_MODEL_CONFIGURATION: StoredModelConfiguration = {
   slots: { primary: Option.none(), secondary: Option.none() },
   localModelRecency: { primary: [], secondary: [] },
+  favoriteModels: [],
   localProviderOfferings: [],
   dismissedDownloadFailures: [],
 }
@@ -87,12 +97,10 @@ export const makeModelConfiguration = (
         slots: { ...current.slots, [slotId]: selection },
         localModelRecency: Option.match(selection, {
           onNone: () => current.localModelRecency,
-          onSome: (selected) => selected.providerId !== "local"
-            ? current.localModelRecency
-            : {
-                ...current.localModelRecency,
-                [slotId]: moveToFront(recencyFor(current.localModelRecency, slotId), selected.providerModelId),
-              },
+          onSome: (selected) => ({
+            ...current.localModelRecency,
+            [slotId]: moveToFront(recencyFor(current.localModelRecency, slotId), selected.providerModelId),
+          }),
         }),
       }))
       const current = yield* SubscriptionRef.get(state)
@@ -119,11 +127,31 @@ export const makeModelConfiguration = (
       })
     })))
 
+  const setFavorite: ModelConfigurationApi["setFavorite"] = (model, favorite) =>
+    lock.withPermits(1)(Effect.uninterruptible(Effect.gen(function* () {
+      const observed = yield* SubscriptionRef.get(state)
+      const matches = (candidate: ProviderModelIdentity) =>
+        candidate.providerId === model.providerId
+        && candidate.providerModelId === model.providerModelId
+      if (observed.favoriteModels.some(matches) === favorite) return
+      const persisted = yield* persist((current) => ({
+        ...current,
+        favoriteModels: favorite
+          ? [model, ...current.favoriteModels.filter((candidate) => !matches(candidate))]
+          : current.favoriteModels.filter((candidate) => !matches(candidate)),
+      }))
+      yield* SubscriptionRef.set(state, {
+        ...persisted,
+        contextLimits: observed.contextLimits,
+      })
+    })))
+
   return ModelConfiguration.of({
     get: SubscriptionRef.get(state),
     changes: state.changes,
     updateSlot,
     recordUse,
+    setFavorite,
   })
 })
 

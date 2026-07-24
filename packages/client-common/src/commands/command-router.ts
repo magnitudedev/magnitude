@@ -1,8 +1,8 @@
 import { getAllCommands, type SlashCommandDefinition } from './slash-commands'
-import { Effect } from 'effect'
 
 /** Optional feature-flag lookup function. Defaults to checking process.env. */
 export type GetFeatureFlag = (key: string) => boolean | undefined
+export type ModelMenuId = "models" | "catalog" | "hardware" | "cloud"
 
 const defaultGetFeatureFlag: GetFeatureFlag = (key) => {
   if (typeof process !== 'undefined' && process.env) {
@@ -43,12 +43,16 @@ export interface CommandContext {
   activateSkill: (skillName: string, skillPath: string | undefined, args: string) => void
   /** Run the /init flow: explore codebase and generate AGENTS.md */
   initProject: () => void
-  /** Handle /settings command. Opens settings overlay. */
+  /** Legacy settings entry point for clients without the model-menu surface. */
   openSettings: () => void
   /** Open the usage overlay */
   openUsage: () => void
   /** Open the client-owned cloud model setup surface, when available. */
   openCloud?: () => void
+  /** Open a client-owned model menu root, when available. */
+  openModelMenu?: (menu: ModelMenuId) => void
+  /** Toggle between the default and transcript timeline presentations. */
+  toggleTranscript?: () => void
   /** Toggle autopilot mode */
   toggleAutopilot: () => void
 }
@@ -130,8 +134,6 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
   const parsed = parseSlashCommand(trimmed)
   if (!parsed) return false
 
-  Effect.runFork(Effect.logInfo(`Slash command executed: ${parsed.commandId} ${JSON.stringify(parsed.args)}`))
-
   // Check if this is a skill command
   const cmd = getAvailableCommands().find(c => c.id === parsed.commandId)
   if (cmd?.source === 'skill') {
@@ -161,16 +163,28 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
       return true
 
     case 'settings':
-      ctx.openSettings()
+      if (ctx.openModelMenu) {
+        ctx.openModelMenu("models")
+      } else {
+        ctx.openSettings()
+      }
       return true
 
     case 'usage':
       ctx.openUsage()
       return true
 
+    case 'transcript':
+      if (!ctx.toggleTranscript) return false
+      ctx.toggleTranscript()
+      return true
+
+    case 'models':
+    case 'catalog':
+    case 'hardware':
     case 'cloud':
-      if (!ctx.openCloud) return false
-      ctx.openCloud()
+      if (!ctx.openModelMenu) return false
+      ctx.openModelMenu(parsed.commandId)
       return true
 
     case 'autopilot':

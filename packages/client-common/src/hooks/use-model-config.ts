@@ -10,6 +10,7 @@ import {
   SECONDARY_SLOT_ID,
   type ModelSlotsState,
   type ProviderId,
+  type ProviderModelIdentity,
   type ProviderModelId,
   type ReasoningEffort,
   type SlotId,
@@ -30,12 +31,15 @@ export function useModelConfig() {
   const assignAtom = useMemo(() => client.mutation("AssignSlot"), [client])
   const clearAtom = useMemo(() => client.mutation("ClearSlot"), [client])
   const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
+  const favoriteAtom = useMemo(() => client.mutation("SetModelFavorite"), [client])
   const slotUpdate = useAtomValue(assignAtom)
   const slotClear = useAtomValue(clearAtom)
   const catalogRefresh = useAtomValue(refreshAtom)
+  const favoriteUpdate = useAtomValue(favoriteAtom)
   const assign = useAtomSet(assignAtom)
   const clear = useAtomSet(clearAtom)
   const refresh = useAtomSet(refreshAtom)
+  const setFavoriteMutation = useAtomSet(favoriteAtom)
 
   const selections = Option.map(Result.value(slots), ({ state }) => ({
     primary: selectionAt(state, PRIMARY_SLOT_ID),
@@ -115,12 +119,27 @@ export function useModelConfig() {
     commit(slotId, Option.some({ ...current.value, reasoningEffort: effort }))
   }, [commit, selections])
 
+  const favoriteModels = Option.match(Result.value(slots), {
+    onNone: () => [] as readonly ProviderModelIdentity[],
+    onSome: ({ state }) => state.favoriteModels,
+  })
+  const setModelFavorite = useMemo(() => (
+    model: ProviderModelIdentity,
+    favorite: boolean,
+  ): void => setFavoriteMutation({
+    payload: { model, favorite },
+    reactivityKeys: [ModelSlotsMirror.id],
+  }), [setFavoriteMutation])
+
   return {
     catalog,
     slots,
     slotUpdate,
     slotClear,
     catalogRefresh,
+    favoriteUpdate,
+    favoriteModels,
+    setModelFavorite,
     updateSlotModel,
     clearSlot,
     updateSlotReasoning,

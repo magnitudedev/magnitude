@@ -186,7 +186,7 @@ export const ProviderClientRegistryLive: Layer.Layer<
           return {
             key,
             requestStarted: attribution.requestStarted.pipe(Effect.zipRight(
-              providerId === "local" && Schema.is(SlotIdSchema)(key)
+              Schema.is(SlotIdSchema)(key)
                 ? modelConfiguration.recordUse(key, providerModelId).pipe(Effect.ignore)
                 : Effect.void,
             )),

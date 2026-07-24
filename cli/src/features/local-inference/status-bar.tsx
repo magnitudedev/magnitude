@@ -1,5 +1,6 @@
 import { deriveHardwareMemoryView, type LocalInferenceView } from "@magnitudedev/client-common"
 import { ProviderIdSchema } from "@magnitudedev/sdk"
+import type { ProviderId } from "@magnitudedev/sdk"
 import { TextAttributes } from "@opentui/core"
 import { Button } from "../../components/button"
 import { formatMemoryBytes } from "../../components/hardware-memory-domain"
@@ -8,8 +9,11 @@ import { useTheme } from "../../hooks/use-theme"
 import { formatModelLoadProgress } from "./view-model"
 
 interface LocalInferenceStatusBarProps {
-  readonly state: LocalInferenceView
+  readonly state: LocalInferenceView | null
   readonly width: number
+  readonly selectedModelName: string | null
+  readonly selectedProviderId: ProviderId | null
+  readonly onOpenModels: () => void
   readonly onOpenHardware: () => void
 }
 
@@ -36,8 +40,35 @@ const compactBarSegments = (
   ]
 }
 
-export const LocalInferenceStatusBar = ({ state, width, onOpenHardware }: LocalInferenceStatusBarProps) => {
+export const LocalInferenceStatusBar = ({
+  state,
+  width,
+  selectedModelName,
+  selectedProviderId,
+  onOpenModels,
+  onOpenHardware,
+}: LocalInferenceStatusBarProps) => {
   const theme = useTheme()
+  if (selectedProviderId !== null && selectedProviderId !== LOCAL_PROVIDER_ID) {
+    return (
+      <box style={{ marginLeft: 1, marginRight: 1, flexDirection: "row", flexShrink: 0, borderStyle: "rounded", borderColor: theme.border, paddingLeft: 1, paddingRight: 1 }}>
+        <Button onClick={onOpenModels}>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{selectedModelName ?? "Cloud model"}</text>
+        </Button>
+        <text style={{ fg: theme.muted }}>  Ready · Cloud</text>
+      </box>
+    )
+  }
+  if (state === null) {
+    return (
+      <box style={{ marginLeft: 1, marginRight: 1, flexDirection: "row", flexShrink: 0, borderStyle: "rounded", borderColor: theme.border, paddingLeft: 1, paddingRight: 1 }}>
+        <Button onClick={onOpenModels}>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{selectedModelName ?? "Choose a model"}</text>
+        </Button>
+        <text style={{ fg: theme.muted }}>  Local status unavailable</text>
+      </box>
+    )
+  }
   const slots = [state.slots.slots.primary, state.slots.slots.secondary]
   const slot = slots.find((candidate) => candidate._tag !== "Unassigned"
     && candidate.selection.providerId === LOCAL_PROVIDER_ID)
@@ -48,11 +79,10 @@ export const LocalInferenceStatusBar = ({ state, width, onOpenHardware }: LocalI
   const downloadModel = state.models.models.find((model) =>
     model.download._tag === "Downloading" || model.download._tag === "Failed")
   const model = activeModel ?? downloadModel
-  if (!slot && !model) return null
-  const modelName = model?.displayName ?? "Local model"
+  const modelName = selectedModelName ?? model?.displayName ?? "Choose a model"
   const status = slot
     ? slot._tag === "LoadingLocalModel" ? formatModelLoadProgress(slot.percentage)
-      : slot._tag === "UnloadedLocalModel" ? "Unloaded"
+      : slot._tag === "UnloadedLocalModel" ? "Idle"
         : slot._tag === "UnloadingLocalModel" ? "Unloading"
           : slot._tag === "Blocked" ? "Failed"
             : slot._tag === "Ready" ? "Ready"
@@ -60,7 +90,7 @@ export const LocalInferenceStatusBar = ({ state, width, onOpenHardware }: LocalI
     : model?.download._tag === "Downloading"
       ? `Downloading ${Math.round(model.download.completedBytes / Math.max(1, model.download.totalBytes) * 100)}%`
       : model?.download._tag === "Failed" ? "Download failed"
-        : "Ready"
+        : selectedProviderId === null ? "Not configured" : "Ready"
   const memoryView = deriveHardwareMemoryView(state.hardware, {
     fallbackToAccelerators: slot !== undefined,
   })
@@ -74,7 +104,9 @@ export const LocalInferenceStatusBar = ({ state, width, onOpenHardware }: LocalI
   const showMemoryWord = width >= 62
   return (
     <box style={{ marginLeft: 1, marginRight: 1, flexDirection: "row", flexShrink: 0, borderStyle: "rounded", borderColor: theme.border, paddingLeft: 1, paddingRight: 1 }}>
-      <text style={{ fg: theme.foreground, flexShrink: 1 }} attributes={TextAttributes.BOLD}>{modelName}</text>
+      <Button onClick={onOpenModels}>
+        <text style={{ fg: theme.foreground, flexShrink: 1 }} attributes={TextAttributes.BOLD}>{modelName}</text>
+      </Button>
       <text style={{ fg: theme.muted }}>  {status}</text>
       <box style={{ flexGrow: 1 }} />
       {memory && (

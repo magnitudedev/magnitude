@@ -22,12 +22,18 @@ export const authSourceAtom = Atom.make<AuthSource>({ source: "none" })
  */
 export const showRecentChatsOverlayAtom = Atom.make(false)
 
-/** CLI local-model setup route. */
-export type ModelSetupRoute = "closed" | "local"
-export const modelSetupRouteAtom = Atom.make<ModelSetupRoute>("closed")
+export type ModelMenuRoot = "models" | "catalog" | "hardware" | "cloud"
 
-/** Standalone Magnitude Cloud setup overlay, opened by /cloud. */
-export const cloudModelsOpenAtom = Atom.make(false)
+export interface ModelMenuState {
+  readonly open: boolean
+  readonly root: ModelMenuRoot
+}
+
+/** Bottom-docked model menu presentation state. */
+export const modelMenuStateAtom = Atom.make<ModelMenuState>({
+  open: false,
+  root: "models",
+})
 
 /**
  * Autopilot atoms — disabled but kept for potential future re-enablement.
@@ -53,4 +59,3 @@ export const autopilotRetainedContentAtom = Atom.make<string | null>(null)
  * selectedFilePathAtom from client-common.
  */
 export const selectedFileSectionAtom = Atom.make<string | undefined>(undefined)
-

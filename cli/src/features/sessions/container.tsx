@@ -17,12 +17,11 @@ import {
   useSessionActions,
   pendingUserSubmitAtom,
   composerHasContentAtom,
-  settingsOpenAtom,
   usageOpenAtom,
   sessionsToRecentChats,
   type RecentChat,
 } from '@magnitudedev/client-common'
-import { cloudModelsOpenAtom, modelSetupRouteAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
+import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { hasConversationActivity } from '../../utils/start-state'
 import { RecentChatsWidget } from './recent-chats-widget'
 import { RecentChatsOverlay } from './recent-chats-overlay'
@@ -55,10 +54,8 @@ export function useRecentChatsWidgetState(): RecentChatsWidgetState {
   const chats = loading ? null : sessionsToRecentChats(sessions)
 
   const showOverlay = useAtomValue(showRecentChatsOverlayAtom)
-  const settingsOpen = useAtomValue(settingsOpenAtom)
+  const modelMenu = useAtomValue(modelMenuStateAtom)
   const usageOpen = useAtomValue(usageOpenAtom)
-  const cloudModelsOpen = useAtomValue(cloudModelsOpenAtom)
-  const modelSetupRoute = useAtomValue(modelSetupRouteAtom)
   const composerHasContent = useAtomValue(composerHasContentAtom)
   const pendingUserSubmit = useAtomValue(pendingUserSubmitAtom)
   const messageCount = useDisplayState((state) => getFork(state, null)?.messages.order.length ?? 0)
@@ -69,10 +66,8 @@ export function useRecentChatsWidgetState(): RecentChatsWidgetState {
   const resumeChat = useCallback((chat: RecentChat) => resumeSession(chat.id), [resumeSession])
 
   const widgetNavActive = !showOverlay
-    && !settingsOpen
+    && !modelMenu.open
     && !usageOpen
-    && !cloudModelsOpen
-    && modelSetupRoute === 'closed'
     && !hasActivity
     && !composerHasContent
   const navigation = useRecentChatsNavigation(chats ? chats.slice(0, 5) : [], resumeChat, widgetNavActive)
