@@ -23,7 +23,10 @@ import { AgentToolkitProjection } from './projections/agent-toolkit'
 import { DetachedProcessProjection } from './projections/detached-process'
 import { WindowProjection } from './window'
 import { WorkerActivityProjection } from './projections/worker-activity'
-import { DisplayTimelineProjection } from './display'
+import {
+  DisplayTimelineProjection,
+  ModelRequestActivityProjection,
+} from './display'
 import { AutopilotStateProjection } from './projections/autopilot-state'
 
 import { AgentRoutingProjection } from './projections/agent-routing'
@@ -91,7 +94,6 @@ import { collectSessionContext } from './util/collect-session-context'
 // Engine layers
 
 import { AgentModelResolverLive } from './model/model-resolver'
-import { ModelRequestActivityLive } from './model-request-activity'
 
 // Config & Auth
 import { ProviderClient, SlotIdSchema, type ProviderClientShape } from '@magnitudedev/sdk'
@@ -148,6 +150,7 @@ export const CodingAgent = EventEngine.make<AppEvent>()({
     WindowProjection,
     TaskAssignmentProjection,
     DisplayTimelineProjection,
+    ModelRequestActivityProjection,
     ConversationProjection,
     AutopilotStateProjection,
     AtifProjection,
@@ -733,7 +736,6 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     providerClientLayer,
     chatTitleServiceLayer,
     ObserverStateLive,
-    ModelRequestActivityLive,
 
     FetchHttpClient.layer,
     FsLive,

@@ -27,7 +27,6 @@ applies_to:
   - packages/agent/src/events.ts
   - packages/agent/src/display/**
   - packages/agent/src/display-view/**
-  - packages/agent/src/model-request-activity.ts
   - packages/agent/src/model/model-resolver.ts
   - packages/agent/src/index.ts
   - packages/agent/src/execution/execution-manager.ts
@@ -112,6 +111,12 @@ current request while it remains active. It disappears when generation begins or
 stream ends and is never written to session history. Clients may delay rendering briefly to avoid
 flashing short prefills, but they do not infer token progress or preserve a second copy.
 
+Provider progress enters the event engine as timestamped ambient observations. A display-owned
+projection reduces those observations into the current per-fork request activity and response
+timing. Display views read that projection through the normal projection-consumer path, so activity
+changes invalidate and rematerialize snapshots without an app event or a separately merged runtime
+stream. Projection evaluation never reads a clock; observation time is fixed at ambient ingress.
+
 The CLI reserves one fixed-height activity rail below the chat timeline. Root-model loading,
 conversation prefill, and model response activity all occupy that same row, so transitions do not
 move the chat or composer. Model loading is shown immediately. Request preparation and prefill are
@@ -128,12 +133,12 @@ request identifier remains absent until ICN accepts the native request, and that
 the activity start time. Consequently a long model load satisfies the client's anti-flicker delay
 and the rail transitions directly into conversation loading when the slot becomes ready.
 
-The activity service records the generation-start timestamp in the same atomic update that removes
-prefill progress. Display snapshots attach that timestamp to root work for the current chain. The
-live Working timer therefore begins when the model starts responding, rather than including model
-admission or prefill time, and the rail can transition from prefill to Working without disappearing
-between snapshots. Providers that do not expose granular request progress continue to use the
-actor's work-start timestamp as a fallback.
+The activity projection records the generation-start timestamp in the same atomic transition that
+removes prefill progress. Display snapshots attach that timestamp to root work for the current
+chain. The live Working timer therefore begins when the model starts responding, rather than
+including model admission or prefill time, and the rail can transition from prefill to Working
+without disappearing between snapshots. Providers that do not expose granular request progress
+continue to use the actor's work-start timestamp as a fallback.
 
 Closing the final subscription removes the display registration. There is no separate close RPC.
 
