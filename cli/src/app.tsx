@@ -47,10 +47,9 @@ import { AnimatedLogo } from './components/animated-logo'
 import { Button } from './components/button'
 import { ChatTimelineContainer } from './features/chat-timeline/container'
 import { ComposerContainer } from './features/composer/container'
-import { ActivityRailContainer, TaskListContainer } from './features/agent-status/container'
+import { AgentStatusRowContainer, TaskListContainer } from './features/agent-status/container'
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
-import { LocalInferenceStatusBar } from './features/local-inference/status-bar'
 import { ModelMenusContainer } from './features/model-menus/container'
 import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/sessions/container'
 import {
@@ -226,13 +225,14 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const downloadSummary = downloadingModelCount === 0
     ? null
     : `${downloadingModelCount} ${downloadingModelCount === 1 ? 'model' : 'models'} downloading`
-  const { rootProfile, rootSlotId } = useSlotProfiles()
+  const { rootSlotId } = useSlotProfiles()
   const localModelLoadActivity = Option.match(localInferenceSnapshot, {
     onNone: () => null,
     onSome: (state) => deriveLocalModelLoadActivity(state.slots, rootSlotId),
   })
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
+  const clientWorkingDirectory = process.cwd()
 
   const dispatchErrorAction = useCallback((actionId: ActionId) => {
     switch (actionId) {
@@ -256,7 +256,7 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
       <box style={{ paddingLeft: 1, flexDirection: 'row' }}>
         <text style={{ fg: theme.muted }}>Current directory: </text>
         <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>
-          {process.cwd().replace(process.env.HOME || '', '~')}
+          {clientWorkingDirectory.replace(process.env.HOME || '', '~')}
         </text>
       </box>
       <box style={{ paddingLeft: 1, paddingBottom: widget.hasActivity ? 1 : 0, flexDirection: 'row' }}>
@@ -283,16 +283,6 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
           style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, position: 'relative', height: '100%' }}
         >
           <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
-            <LocalInferenceStatusBar
-              state={Option.getOrNull(localInferenceSnapshot)}
-              width={chatColumnWidth}
-              selectedModelName={rootProfile?.modelDisplayName ?? null}
-              selectedProviderId={rootProfile?.providerId ?? null}
-              selectedSlotId={rootSlotId}
-              modelLoadActivity={localModelLoadActivity}
-              onOpenModels={() => setMenu({ open: true, root: 'models' })}
-              onOpenHardware={() => setMenu({ open: true, root: 'hardware' })}
-            />
             <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
               <box style={{ flexGrow: 1, flexShrink: 1, minHeight: 0, flexDirection: 'column', overflow: 'hidden' }}>
                 <ChatTimelineContainer
@@ -301,7 +291,7 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                   dispatchErrorAction={dispatchErrorAction}
                   isOverlayActive={isOverlayActive}
                 />
-                <ActivityRailContainer
+                <AgentStatusRowContainer
                   modelLoadActivity={localModelLoadActivity}
                   width={chatColumnWidth}
                 />
@@ -314,10 +304,10 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                 : (
                   <ComposerContainer
                     chatColumnWidth={chatColumnWidth}
+                    clientWorkingDirectory={clientWorkingDirectory}
                     widgetNavActive={widget.widgetNavActive}
                     handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
                     modelsConfigured={props.modelsConfigured}
-                    downloadSummary={downloadSummary}
                   />
                 )}
             </box>

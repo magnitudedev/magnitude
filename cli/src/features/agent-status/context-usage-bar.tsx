@@ -9,9 +9,37 @@ interface ContextUsageBarProps {
   isCompacting?: boolean
 }
 
+const formatTokens = (n: number): string => {
+  if (n >= 1000) {
+    const value = (n / 1000).toFixed(1)
+    return (value.endsWith('.0') ? value.slice(0, -2) : value) + 'k'
+  }
+  return String(n)
+}
+
+export const formatContextUsage = (
+  tokenUsage: number | null,
+  hardCap: number | null,
+): string => tokenUsage == null
+  ? (hardCap == null ? '-' : '-/' + formatTokens(hardCap))
+  : (() => {
+      const tokens = hardCap == null
+        ? formatTokens(tokenUsage) + '/Unknown'
+        : formatTokens(tokenUsage) + '/' + formatTokens(hardCap)
+      return hardCap == null
+        ? tokens
+        : Math.round((tokenUsage / hardCap) * 100) + '% ' + tokens
+    })()
+
+export const contextUsageWidth = (
+  tokenUsage: number | null,
+  hardCap: number | null,
+  isCompacting: boolean,
+): number => formatContextUsage(tokenUsage, hardCap).length + (isCompacting ? 8 : 0)
+
 /**
- * Context usage indicator, rendered inline next to the PWD in the footer.
- * Shows " · 1%  45k/272k" (middle-dot separator, double space between % and tokens).
+ * Context usage indicator rendered on the right side of the agent-status row.
+ * Shows "1% 45k/272k".
  *
  * During compaction, inward-pointing arrows animate on each side of
  * the percent and token count.
@@ -22,24 +50,7 @@ export const ContextUsageBar = ({ tokenUsage, hardCap, isCompacting = false }: C
   // 200ms / 80ms per tick ≈ 3 ticks per frame
   const frame = isCompacting ? Math.floor(tick / 3) : 0
 
-  const formatTokens = (n: number) => {
-    if (n >= 1000) {
-      const v = (n / 1000).toFixed(1)
-      return (v.endsWith('.0') ? v.slice(0, -2) : v) + 'k'
-    }
-    return String(n)
-  }
-
-  const displayText = tokenUsage == null
-    ? (hardCap == null ? '-' : '-/' + formatTokens(hardCap))
-    : (() => {
-      const tokensStr = hardCap == null
-        ? formatTokens(tokenUsage) + '/Unknown'
-        : formatTokens(tokenUsage) + '/' + formatTokens(hardCap)
-      return hardCap == null
-        ? tokensStr
-        : Math.round((tokenUsage / hardCap) * 100) + '% ' + tokensStr
-    })()
+  const displayText = formatContextUsage(tokenUsage, hardCap)
 
   // Normal (non-compacting) rendering
   if (!isCompacting) {

@@ -13,8 +13,8 @@ import { FileMentionMenu } from './mention-menu'
 import { SlashCommandMenu } from './slash-menu'
 import { MultilineInput, type MultilineInputHandle } from './multiline-input'
 import { AttachmentsBar } from './attachment-bar'
-import { ContextUsageBar } from '../agent-status/context-usage-bar'
 import { AutopilotIndicator } from './autopilot-indicator'
+import { deriveLocalInferenceFooterView } from '../local-inference/footer-status'
 import { useFileMentions, type MentionSearchClient } from '@magnitudedev/client-common'
 import { useSlashCommands } from '@magnitudedev/client-common'
 import { readClipboardBitmap, readClipboardText } from '../../utils/clipboard'
@@ -32,6 +32,13 @@ import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
 import { allowProviderMessageSend } from './provider-send-guard'
+
+const displayWorkingDirectory = (cwd: string): string => {
+  const home = process.env.HOME
+  return home && (cwd === home || cwd.startsWith(home + '/'))
+    ? `~${cwd.slice(home.length)}`
+    : cwd
+}
 
 export type PendingImageAttachment = RawImageAttachment
 
@@ -148,15 +155,15 @@ export function Composer(props: ComposerProps) {
   const {
     sessionId,
     cwd,
+    clientWorkingDirectory,
     status,
     hasRunningForks,
     bashMode,
     modelsConfigured,
-    downloadSummary,
     modelSummary,
-    tokenUsage,
-    contextHardCap,
-    isCompacting,
+    localInferenceState,
+    selectedProviderId,
+    selectedSlotId,
     displayMode,
     theme,
     modeColor,
@@ -174,7 +181,7 @@ export function Composer(props: ComposerProps) {
     interruptFork,
     interruptAll,
     openSettings,
-    openCatalog,
+    openHardware,
     thinkingOptions,
     applyThinking,
     handleWidgetKeyEvent,
@@ -238,6 +245,15 @@ export function Composer(props: ComposerProps) {
       option.label.toLowerCase() === modelSummary?.thinkingLevel.toLowerCase()),
   )
   const [thinkingIndex, setThinkingIndex] = useState(currentThinkingIndex)
+  const modelFooter = useMemo(
+    () => deriveLocalInferenceFooterView(
+      localInferenceState,
+      modelSummary?.model ?? null,
+      selectedProviderId,
+      selectedSlotId,
+    ),
+    [localInferenceState, modelSummary?.model, selectedProviderId, selectedSlotId],
+  )
   const openThinking = useCallback(() => {
     if (thinkingOptions.length === 0) return
     setThinkingIndex(currentThinkingIndex)
@@ -616,7 +632,7 @@ export function Composer(props: ComposerProps) {
           <box style={{ height: 1, borderStyle: 'single', border: ['top'], borderColor: theme.inputBg, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: '▄', vertical: ' ', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }} />
         </box>
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
-          <box style={{ backgroundColor: theme.inputBg, paddingTop: 1, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
+          <box style={{ backgroundColor: theme.inputBg, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
             {!bashMode && fileMentions.isOpen && (
               <FileMentionMenu
                 isOpen={fileMentions.isOpen}
@@ -665,55 +681,26 @@ export function Composer(props: ComposerProps) {
                 ))}
               </box>
             )}
-            <box style={{ flexDirection: 'column' }}>
-              <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
-                <box style={{ flexGrow: 1, minWidth: 0 }}>
-                  <MultilineInput
-                    ref={multilineInputRef}
-                    value={inputValue.text}
-                    cursorPosition={inputValue.cursorPosition}
-                    pasteSegments={inputValue.pasteSegments}
-                    selectedPasteSegmentId={inputValue.selectedPasteSegmentId}
-                    mentionSegments={inputValue.mentionSegments}
-                    selectedMentionSegmentId={inputValue.selectedMentionSegmentId}
-                    onChange={handleInputChange}
-                    onSubmit={handleInputSubmit}
-                    onPaste={handlePaste}
-                    onKeyIntercept={handleKeyIntercept}
-                    focused={composerCanFocus && !thinkingOpen}
-                    highlightColor={bashMode ? orange[400] : undefined}
-                    placeholder={bashMode ? 'Enter a command...' : status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
-                    maxHeight={10}
-                    minHeight={1}
-                  />
-                </box>
-              </box>
-              <box style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
-                {bashMode ? (
-                  <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
-                ) : !modelsConfigured ? (
-                  <Button
-                    onClick={openSettings}
-                  >
-                    <text style={{ fg: theme.foreground }}>
-                      <span>No provider configured</span>
-                    </text>
-                  </Button>
-                ) : (
-                  <Button
-                    onClick={openThinking}
-                    onMouseOver={() => setThinkingLabelHovered(true)}
-                    onMouseOut={() => setThinkingLabelHovered(false)}
-                  >
-                    <text style={{
-                      fg: thinkingLabelHovered ? theme.primary : theme.foreground,
-                    }}>
-                      <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                        Thinking: {modelSummary?.thinkingLevel ?? '-'}
-                      </span>
-                    </text>
-                  </Button>
-                )}
+            <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
+              <box style={{ flexGrow: 1, minWidth: 0 }}>
+                <MultilineInput
+                  ref={multilineInputRef}
+                  value={inputValue.text}
+                  cursorPosition={inputValue.cursorPosition}
+                  pasteSegments={inputValue.pasteSegments}
+                  selectedPasteSegmentId={inputValue.selectedPasteSegmentId}
+                  mentionSegments={inputValue.mentionSegments}
+                  selectedMentionSegmentId={inputValue.selectedMentionSegmentId}
+                  onChange={handleInputChange}
+                  onSubmit={handleInputSubmit}
+                  onPaste={handlePaste}
+                  onKeyIntercept={handleKeyIntercept}
+                  focused={composerCanFocus && !thinkingOpen}
+                  highlightColor={bashMode ? orange[400] : undefined}
+                  placeholder={bashMode ? 'Enter a command...' : status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
+                  maxHeight={10}
+                  minHeight={1}
+                />
               </box>
             </box>
           </box>
@@ -725,10 +712,40 @@ export function Composer(props: ComposerProps) {
 
       <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
-          {downloadSummary && (
-            <Button onClick={openCatalog}>
-              <text style={{ fg: theme.primary }}>{downloadSummary}</text>
+          {bashMode ? (
+            <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
+          ) : !modelsConfigured ? (
+            <Button onClick={openSettings}>
+              <text style={{ fg: theme.foreground }}>No provider configured</text>
             </Button>
+          ) : (
+            <>
+              <Button onClick={openSettings}>
+                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
+                  {modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'}
+                </text>
+              </Button>
+              <text style={{ fg: theme.muted }}>{'\u00b7'}</text>
+              <Button
+                onClick={openThinking}
+                onMouseOver={() => setThinkingLabelHovered(true)}
+                onMouseOut={() => setThinkingLabelHovered(false)}
+              >
+                <text style={{ fg: thinkingLabelHovered ? theme.primary : theme.foreground }}>
+                  <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                    {modelSummary?.thinkingLevel ?? '-'}
+                  </span>
+                </text>
+              </Button>
+              {modelFooter.memoryLabel && (
+                <>
+                  <text style={{ fg: theme.muted }}>{'\u00b7'}</text>
+                  <Button onClick={openHardware}>
+                    <text style={{ fg: theme.muted }}>{modelFooter.memoryLabel}</text>
+                  </Button>
+                </>
+              )}
+            </>
           )}
           {enableAutopilot && (
             <AutopilotIndicator
@@ -757,11 +774,9 @@ export function Composer(props: ComposerProps) {
               <text style={{ fg: theme.muted }}>{' \u00b7 '}</text>
             </>
           )}
-          <ContextUsageBar
-            tokenUsage={tokenUsage}
-            hardCap={contextHardCap}
-            isCompacting={isCompacting}
-          />
+          <text style={{ fg: theme.muted }}>
+            {displayWorkingDirectory(clientWorkingDirectory)}
+          </text>
         </box>
       </box>
 
