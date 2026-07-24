@@ -14,7 +14,7 @@ const RawStoredSessionMetaSchema = Schema.Struct({
   gitBranch: Schema.optionalWith(Schema.NullishOr(Schema.String), { default: () => null }),
   firstUserMessage: Schema.optionalWith(Schema.NullishOr(Schema.String), { default: () => null }),
   lastMessage: Schema.optionalWith(Schema.NullishOr(Schema.String), { default: () => null }),
-  messageCount: Schema.Number,
+  messageCount: Schema.optionalWith(Schema.Number, { default: () => 0 }),
 })
 
 const DecodedStoredSessionMetaSchema = Schema.Struct({

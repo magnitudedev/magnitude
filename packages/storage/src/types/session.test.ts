@@ -76,6 +76,21 @@ describe('StoredSessionMetaSchema', () => {
     expect(result.lastActiveVersion).toBe(VERSION)
   })
 
+  test('legacy metadata without a message count defaults to zero', async () => {
+    const schema = makeStoredSessionMetaSchema(VERSION)
+    const result = await Effect.runPromise(
+      Schema.decodeUnknown(schema)({
+        sessionId: 'session-1',
+        created: '2026-01-01T00:00:00.000Z',
+        updated: '2026-01-01T00:00:00.000Z',
+        chatName: 'Chat',
+        workingDirectory: '/repo',
+      })
+    )
+
+    expect(result.messageCount).toBe(0)
+  })
+
   test('readMeta returns version defaults for missing fields via StorageLive', async () => {
     const root = await mkdtemp(join(tmpdir(), 'magnitude-storage-session-'))
     const sessionId = 'session-1'

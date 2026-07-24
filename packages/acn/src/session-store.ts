@@ -13,6 +13,7 @@ import {
   type SessionMetadata as ProtocolSessionMetadata,
 } from "@magnitudedev/protocol"
 import type { SessionExecutionContext } from "./session-types"
+import { sessionErrorMessage } from "./session-errors"
 
 export interface SessionStoreApi {
   readonly createId: Effect.Effect<string>
@@ -133,13 +134,24 @@ export const SessionStoreLive = Layer.effect(
       return meta ? storedMetaToProtocol(meta) : null
     })
 
+    const readMetaForListing = Effect.fn("acn.session-store.read-meta-for-listing")(function* (sessionId: string) {
+      return yield* readMeta(sessionId).pipe(
+        Effect.catchAll((error) =>
+          Effect.logWarning("Skipping unreadable session metadata").pipe(
+            Effect.annotateLogs({ sessionId, error: sessionErrorMessage(error) }),
+            Effect.as(null),
+          )
+        ),
+      )
+    })
+
     const readAllProtocolMetas = Effect.fn("acn.session-store.read-all-protocol-metas")(function* () {
       const ids = yield* storage.sessions.listSessionIds().pipe(
         Effect.mapError(toSessionErrorFromPlatform("list sessions")),
       )
       const metas: ProtocolSessionMetadata[] = []
       for (const id of ids) {
-        const rawMeta = yield* readMeta(id)
+        const rawMeta = yield* readMetaForListing(id)
         if (!rawMeta || rawMeta.visibility !== "visible") continue
         metas.push(storedMetaToProtocol(rawMeta))
       }
@@ -174,7 +186,7 @@ export const SessionStoreLive = Layer.effect(
         )
         const draftIds: string[] = []
         for (const id of ids) {
-          const meta = yield* readMeta(id)
+          const meta = yield* readMetaForListing(id)
           if (meta?.visibility === "draft") draftIds.push(id)
         }
         return draftIds

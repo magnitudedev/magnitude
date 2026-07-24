@@ -16,6 +16,7 @@ interface RecentChatsOverlayProps {
   chats: RecentChat[]
   hasMore: boolean
   isLoading: boolean
+  error: string | null
   loadMore: () => void
 }
 
@@ -28,6 +29,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
   chats,
   hasMore,
   isLoading,
+  error,
   loadMore,
 }: RecentChatsOverlayProps) {
   const theme = useTheme()
@@ -156,7 +158,11 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
           },
         }}
       >
-        {chats.length === 0 && !isLoading ? (
+        {error ? (
+          <box style={{ paddingLeft: 1 }}>
+            <text style={{ fg: theme.error }}>{error}</text>
+          </box>
+        ) : chats.length === 0 && !isLoading ? (
           <box style={{ paddingLeft: 1 }}>
             <text style={{ fg: theme.muted }}>No recent conversations found.</text>
           </box>
@@ -190,7 +196,11 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
       <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span attributes={TextAttributes.DIM}>
-            {isLoading ? 'Loading...' : `${chats.length} conversation${chats.length === 1 ? '' : 's'}`}
+            {isLoading
+              ? 'Loading...'
+              : error
+                ? 'Unable to load conversations'
+                : `${chats.length} conversation${chats.length === 1 ? '' : 's'}`}
           </span>
         </text>
       </box>

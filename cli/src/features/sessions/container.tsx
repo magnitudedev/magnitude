@@ -94,7 +94,7 @@ export function RecentChatsOverlayContainer(): ReactNode {
   const setShowOverlay = useAtomSet(showRecentChatsOverlayAtom)
   const resumeSession = useResumeSession()
 
-  const { sessions, loading, loadingMore, hasMore, loadMore } = usePaginatedSessions({ pageSize: 50 })
+  const { sessions, loading, error, loadingMore, hasMore, loadMore } = usePaginatedSessions({ pageSize: 50 })
 
   return (
     <RecentChatsOverlay
@@ -103,6 +103,7 @@ export function RecentChatsOverlayContainer(): ReactNode {
       chats={sessions}
       hasMore={hasMore}
       isLoading={loading || loadingMore}
+      error={error}
       loadMore={loadMore}
     />
   )

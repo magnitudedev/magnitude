@@ -24,6 +24,8 @@ export interface UseSessionsListParams {
 export interface UseSessionsListResult {
   /** Whether the query is loading */
   loading: boolean
+  /** A list-level failure. Individual unreadable sessions are omitted by ACN. */
+  error: string | null
   /** Sessions list (empty during loading/failure) */
   sessions: SessionMetadata[]
   nextCursor: string | null
@@ -51,6 +53,7 @@ export function useSessionsList(params?: UseSessionsListParams): UseSessionsList
   const result = useAtomValue(sessionsAtom)
 
   const loading = Result.isInitial(result)
+  const error = Result.isFailure(result) ? "Failed to load conversations." : null
   const sessions = Result.match(result, {
     onInitial: (): SessionMetadata[] => [],
     onFailure: (): SessionMetadata[] => [],
@@ -70,5 +73,5 @@ export function useSessionsList(params?: UseSessionsListParams): UseSessionsList
     onSuccess: (s) => s.value.hasMore,
   })
 
-  return { loading, sessions, nextCursor, hasMore }
+  return { loading, error, sessions, nextCursor, hasMore }
 }
