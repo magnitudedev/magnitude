@@ -12,6 +12,7 @@ import { Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import {
   useLocalInferenceState,
+  formatModelLoadProgress,
   getAnimationTickSnapshot,
   subscribeNoop,
   subscribeAnimationTick,
@@ -28,7 +29,6 @@ import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   buildLocalInferenceSelections,
-  formatModelLoadProgress,
   describeLocalHardware,
   formatBytes,
   formatContext,

@@ -107,4 +107,20 @@ export interface UsageExtension<TResponse = UsageResponse, TError = unknown, R =
 export interface RequestAttribution {
   readonly key: string
   readonly requestStarted: Effect.Effect<void, never, never>
+  readonly requestProgress?: (
+    progress: ModelRequestProgress,
+  ) => Effect.Effect<void, never, never>
 }
+
+export type ModelRequestProgress =
+  | { readonly phase: "queued"; readonly requestId: string }
+  | { readonly phase: "preparing"; readonly requestId: string | null }
+  | {
+      readonly phase: "prefill"
+      readonly requestId: string
+      readonly completedTokens: number
+      readonly totalTokens: number
+      readonly cachedTokens: number
+    }
+  | { readonly phase: "generating"; readonly requestId: string }
+  | { readonly phase: "cleared"; readonly requestId: string | null }

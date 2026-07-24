@@ -1,11 +1,23 @@
 import { describe, expect, it } from "vitest"
-import { Effect, Ref } from "effect"
+import { Effect, Ref, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import type { ProviderAuth } from "@magnitudedev/protocol"
-import { ModelDiscoveryOperationIdSchema, ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, ReasoningProperty, VisionProperty, type ProviderClientShape } from "@magnitudedev/sdk"
+import {
+  ModelDiscoveryOperationIdSchema,
+  ModelFamilyIdSchema,
+  PRIMARY_SLOT_ID,
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  ReasoningProperty,
+  VisionProperty,
+  type ProviderClientShape,
+} from "@magnitudedev/sdk"
+import { PromptBuilder, type ModelRequestProgress } from "@magnitudedev/ai"
 import {
   makeDelegatingProviderClient,
   resolveEndpointProviderAuthFromStorage,
+  withModelSlotAdmission,
 } from "./shared-client"
 
 function storageWithAuth(initial?: ProviderAuth) {
@@ -98,5 +110,52 @@ describe("delegating provider client", () => {
       expect((yield* stable.catalog.list.pipe(Effect.provide(FetchHttpClient.layer)))[0]?.providerId).toBe("second")
       expect(stable.sessionId).toBe("session")
     }))
+  })
+})
+
+describe("local model admission", () => {
+  it("marks a request as preparing before acquiring the model", async () => {
+    const progress: ModelRequestProgress[] = []
+    const order: string[] = []
+    const localProviderId = ProviderIdSchema.make("local")
+    const modelId = ProviderModelIdSchema.make("model")
+    const client: ProviderClientShape = {
+      ...providerClient("local"),
+      resolveModel: () => Effect.succeed({
+        stream: () => Effect.sync(() => {
+          order.push("stream")
+          return {
+            events: Stream.empty,
+            parsers: new Map(),
+            logprobs: [],
+            requestId: null,
+          }
+        }),
+      }),
+    }
+    const admitted = withModelSlotAdmission(client, {
+      acquireLocalModel: () => Effect.sync(() => {
+        order.push("acquire")
+      }),
+    })
+    const model = await Effect.runPromise(admitted.resolveModel(localProviderId, modelId, {
+      requestAttribution: {
+        key: PRIMARY_SLOT_ID,
+        requestStarted: Effect.void,
+        requestProgress: (update) => Effect.sync(() => {
+          progress.push(update)
+          order.push(update.phase)
+        }),
+      },
+    }))
+
+    await Effect.runPromise(
+      model.stream(PromptBuilder.empty().user("hello").build(), []).pipe(
+        Effect.provide(FetchHttpClient.layer),
+      ),
+    )
+
+    expect(order).toEqual(["preparing", "acquire", "stream"])
+    expect(progress).toEqual([{ phase: "preparing", requestId: null }])
   })
 })

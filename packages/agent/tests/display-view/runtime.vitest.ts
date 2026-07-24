@@ -28,6 +28,10 @@ import {
 import { makeCountingAddressedEntryStore } from '../helpers/counting-addressed-store'
 import { ToolUniverseSource } from '../../src/ambient/tool-universe-ambient'
 import { toolUniverseToolkit } from '../../src/tools/toolkits'
+import {
+  ModelRequestActivity,
+  ModelRequestActivityLive,
+} from '../../src/model-request-activity'
 
 const TestAgent = EventEngine.make<AppEvent>()({
   name: 'DisplayViewRuntimeTestAgent',
@@ -66,10 +70,13 @@ const rootSmallShape: DisplayViewShape = {
 const provideRuntime = (storeLayer: Layer.Layer<Addressed.AddressedEntryStore>) =>
   Layer.provideMerge(
     DisplayViewRuntimeLive,
-    Layer.provideMerge(TestAgent.EngineLayer, Layer.merge(
-      storeLayer,
-      Layer.succeed(ToolUniverseSource, { toolkit: toolUniverseToolkit }),
-    ))
+    Layer.merge(
+      Layer.provideMerge(TestAgent.EngineLayer, Layer.merge(
+        storeLayer,
+        Layer.succeed(ToolUniverseSource, { toolkit: toolUniverseToolkit }),
+      )),
+      ModelRequestActivityLive,
+    )
   )
 
 describe('display view runtime', () => {
@@ -146,6 +153,69 @@ describe('display view runtime', () => {
     expect(listMessages((snapshots[1] as any).state.timelines.root.messages)).toMatchObject([
       { type: 'assistant_message', content: 'updated' },
     ])
+  })
+
+  it('streams transient model request activity without persisting an app event', async () => {
+    const fixture = await Effect.runPromise(makeCountingAddressedEntryStore)
+
+    const snapshots = await Effect.runPromise(Effect.gen(function* () {
+      const runtime = yield* DisplayViewRuntime
+      const activity = yield* ModelRequestActivity
+      const engine = (yield* EventEngine.Service) as EventEngine.Shape<AppEvent, unknown>
+      const queue = yield* Queue.unbounded<any>()
+
+      yield* engine.send({
+        type: 'turn_started',
+        forkId: null,
+        turnId: 'turn-1',
+        chainId: 'chain-1',
+      })
+      yield* runtime.setShape('view-progress', rootSmallShape)
+      const fiber = yield* runtime.stream('view-progress').pipe(
+        Stream.tap((snapshot) => Queue.offer(queue, snapshot)),
+        Stream.runDrain,
+        Effect.fork,
+      )
+
+      yield* Queue.take(queue)
+      yield* activity.update(
+        { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
+        {
+          phase: 'prefill',
+          requestId: 'request-1',
+          completedTokens: 14_020,
+          totalTokens: 14_300,
+          cachedTokens: 13_200,
+        },
+      )
+      let active = yield* Queue.take(queue)
+      while (!active.state.modelRequests.root) {
+        active = yield* Queue.take(queue)
+      }
+
+      yield* activity.update(
+        { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
+        { phase: 'generating', requestId: 'request-1' },
+      )
+      let cleared = yield* Queue.take(queue)
+      while (cleared.state.modelRequests.root) {
+        cleared = yield* Queue.take(queue)
+      }
+
+      yield* Fiber.interrupt(fiber)
+      return [active, cleared] as const
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(provideRuntime(Layer.succeed(Addressed.AddressedEntryStore, fixture.store))),
+      Effect.orDie,
+    ))
+
+    expect(snapshots[0].state.modelRequests.root).toMatchObject({
+      requestId: 'request-1',
+      phase: 'prefill',
+    })
+    expect(snapshots[1].state.modelRequests.root).toBeUndefined()
+    expect(snapshots[1].state.actors.root?.work.respondingSince).toBeTypeOf('number')
   })
 
   it('closes a runtime view explicitly', async () => {

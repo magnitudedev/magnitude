@@ -1175,6 +1175,9 @@
               "$ref": "#/components/schemas/ChunkChoice"
             }
           },
+          "progress": {
+            "$ref": "#/components/schemas/ChatCompletionProgress"
+          },
           "usage": {
             "$ref": "#/components/schemas/Usage"
           },
@@ -1186,6 +1189,84 @@
           }
         },
         "additionalProperties": false
+      },
+      "ChatCompletionProgress": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Queued"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Preparing"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completedTokens",
+              "totalTokens",
+              "cachedTokens",
+              "_tag"
+            ],
+            "properties": {
+              "completedTokens": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalTokens": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "cachedTokens": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Prefill"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Generating"
+                ]
+              }
+            }
+          }
+        ]
       },
       "ChatCompletionRequest": {
         "type": "object",

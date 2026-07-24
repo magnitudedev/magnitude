@@ -16,6 +16,27 @@ export interface SelectedSlotModel {
   readonly slot: AssignedSlot
 }
 
+export interface LocalModelLoadActivity {
+  readonly percentage: number
+  readonly text: string
+}
+
+export const formatModelLoadProgress = (percentage: number): string =>
+  `Loading model · ${percentage}%`
+
+export function deriveLocalModelLoadActivity(
+  slots: ModelSlotsState,
+  slotId: SlotId,
+): LocalModelLoadActivity | null {
+  const slot = slots.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
+  return slot._tag === "LoadingLocalModel"
+    ? {
+        percentage: slot.percentage,
+        text: formatModelLoadProgress(slot.percentage),
+      }
+    : null
+}
+
 export const isModelSlotUsableForMessages = (slot: ModelSlot): boolean =>
   slot._tag === "UnloadedLocalModel"
   || slot._tag === "LoadingLocalModel"

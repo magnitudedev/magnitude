@@ -42,6 +42,9 @@ const RootWorkStateSchema = Schema.Struct({
   activity: Schema.NullOr(DisplayActivity),
   activeChildCount: Schema.Number,
   _currentTurnId: Schema.NullOr(Schema.String),
+  _currentChainId: Schema.optionalWith(Schema.NullOr(Schema.String), {
+    default: () => null,
+  }),
   _thinkingCharCount: Schema.NullOr(Schema.Number),
   _activeToolKey: Schema.NullOr(Schema.String),
 })
@@ -169,6 +172,7 @@ function stopRootWork(
     lastChainMs: chainMs,
     activity: null,
     _currentTurnId: null,
+    _currentChainId: null,
     _thinkingCharCount: null,
     _activeToolKey: null,
   }
@@ -271,6 +275,7 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
       activity: null,
       activeChildCount: 0,
       _currentTurnId: null,
+      _currentChainId: null,
       _thinkingCharCount: null,
       _activeToolKey: null,
     },
@@ -360,7 +365,11 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
         }
         next = {
           ...next,
-          rootWork: { ...next.rootWork, _currentTurnId: event.turnId },
+          rootWork: {
+            ...next.rootWork,
+            _currentTurnId: event.turnId,
+            _currentChainId: event.chainId,
+          },
         }
         return next
       }

@@ -27,6 +27,7 @@ import {
   useFileWatchBridge,
   useLocalInferenceQuery,
   isModelSlotUsableForMessages,
+  deriveLocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, type SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, modelMenuStateAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
@@ -46,7 +47,7 @@ import { AnimatedLogo } from './components/animated-logo'
 import { Button } from './components/button'
 import { ChatTimelineContainer } from './features/chat-timeline/container'
 import { ComposerContainer } from './features/composer/container'
-import { WorkingTimerContainer, TaskListContainer } from './features/agent-status/container'
+import { ActivityRailContainer, TaskListContainer } from './features/agent-status/container'
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
 import { LocalInferenceStatusBar } from './features/local-inference/status-bar'
@@ -225,7 +226,11 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const downloadSummary = downloadingModelCount === 0
     ? null
     : `${downloadingModelCount} ${downloadingModelCount === 1 ? 'model' : 'models'} downloading`
-  const { rootProfile } = useSlotProfiles()
+  const { rootProfile, rootSlotId } = useSlotProfiles()
+  const localModelLoadActivity = Option.match(localInferenceSnapshot, {
+    onNone: () => null,
+    onSome: (state) => deriveLocalModelLoadActivity(state.slots, rootSlotId),
+  })
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
 
@@ -283,6 +288,8 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
               width={chatColumnWidth}
               selectedModelName={rootProfile?.modelDisplayName ?? null}
               selectedProviderId={rootProfile?.providerId ?? null}
+              selectedSlotId={rootSlotId}
+              modelLoadActivity={localModelLoadActivity}
               onOpenModels={() => setMenu({ open: true, root: 'models' })}
               onOpenHardware={() => setMenu({ open: true, root: 'hardware' })}
             />
@@ -294,7 +301,10 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                   dispatchErrorAction={dispatchErrorAction}
                   isOverlayActive={isOverlayActive}
                 />
-                <WorkingTimerContainer />
+                <ActivityRailContainer
+                  modelLoadActivity={localModelLoadActivity}
+                  width={chatColumnWidth}
+                />
                 <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
                   <TaskListContainer />
                 </box>

@@ -3,6 +3,7 @@ import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { expect, test, vi } from "vitest"
 import { ModelSlotLoadingLocalModel, PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
+import { deriveLocalModelLoadActivity } from "@magnitudedev/client-common"
 import { GIB, LOCAL_PROVIDER_ID, makeHardware, makeView, TEST_MEMORY_DOMAIN_ID, TEST_MODEL_ID, TEST_REASONING_EFFORT } from "./test-fixtures"
 
 vi.mock("../../hooks/use-theme", () => ({
@@ -29,7 +30,7 @@ test("ready status renders model and resident memory", async () => {
     }),
   })
   const view = await testRender(
-    <LocalInferenceStatusBar state={state} width={100} selectedModelName="Qwen Test" selectedProviderId={LOCAL_PROVIDER_ID} onOpenModels={() => {}} onOpenHardware={() => {}} />,
+    <LocalInferenceStatusBar state={state} width={100} selectedModelName="Qwen Test" selectedProviderId={LOCAL_PROVIDER_ID} selectedSlotId={PRIMARY_SLOT_ID} modelLoadActivity={null} onOpenModels={() => {}} onOpenHardware={() => {}} />,
     { width: 110, height: 5 },
   )
   try {
@@ -54,13 +55,13 @@ test("loading status shows native progress", async () => {
     percentage: 42,
   }) } } }
   const view = await testRender(
-    <LocalInferenceStatusBar state={state} width={100} selectedModelName="Qwen Test" selectedProviderId={LOCAL_PROVIDER_ID} onOpenModels={() => {}} onOpenHardware={() => {}} />,
+    <LocalInferenceStatusBar state={state} width={100} selectedModelName="Qwen Test" selectedProviderId={LOCAL_PROVIDER_ID} selectedSlotId={PRIMARY_SLOT_ID} modelLoadActivity={deriveLocalModelLoadActivity(state.slots, PRIMARY_SLOT_ID)} onOpenModels={() => {}} onOpenHardware={() => {}} />,
     { width: 110, height: 5 },
   )
   try {
     await act(view.renderOnce)
     const frame = view.captureCharFrame()
-    expect(frame).toContain("Loading 42%")
+    expect(frame).toContain("Loading model · 42%")
     expect(frame).not.toContain("Loading Loading")
   } finally {
     await act(async () => view.renderer.destroy())
@@ -69,7 +70,7 @@ test("loading status shows native progress", async () => {
 
 test("cloud selection keeps the model bar visible without local state", async () => {
   const view = await testRender(
-    <LocalInferenceStatusBar state={null} width={100} selectedModelName="Claude Max" selectedProviderId={ProviderIdSchema.make("magnitude")} onOpenModels={() => {}} onOpenHardware={() => {}} />,
+    <LocalInferenceStatusBar state={null} width={100} selectedModelName="Claude Max" selectedProviderId={ProviderIdSchema.make("magnitude")} selectedSlotId={PRIMARY_SLOT_ID} modelLoadActivity={null} onOpenModels={() => {}} onOpenHardware={() => {}} />,
     { width: 110, height: 5 },
   )
   try {

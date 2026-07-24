@@ -1,9 +1,19 @@
 import { memo, useSyncExternalStore } from 'react'
 import { Option } from 'effect'
-import type { DisplayActorWork, InterruptedMessage } from '@magnitudedev/sdk'
+import type {
+  DisplayActorWork,
+  DisplayModelRequestActivity,
+  InterruptedMessage,
+} from '@magnitudedev/sdk'
 import { useTheme } from '../../hooks/use-theme'
-import { slate, subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import {
+  slate,
+  subscribeAnimationTick,
+  getAnimationTickSnapshot,
+  type LocalModelLoadActivity,
+} from '@magnitudedev/client-common'
 import { red } from '../../utils/theme'
+import { modelRequestProgressSegments } from '../chat-timeline/model-request-progress'
 
 const WORKING_PULSE_COLORS = [
   slate[100], slate[200], slate[300], slate[400], slate[500],
@@ -25,11 +35,17 @@ const THINKING_PULSE_COLORS = [
 
 const BRAILLE_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
 
-interface WorkingTimerProps {
+interface ActivityRailProps {
   work: DisplayActorWork | null
+  width: number
+  waitsForGenerationProgress: boolean
+  modelLoadActivity: LocalModelLoadActivity | null
+  modelRequestActivity: DisplayModelRequestActivity | null
   interruptedMessage?: InterruptedMessage | null
   advisorModelName?: string | null
 }
+
+const REQUEST_VISIBILITY_DELAY_MS = 500
 
 function formatElapsed(totalSeconds: number): string {
   const minutes = Math.floor(totalSeconds / 60)
@@ -49,11 +65,15 @@ function buildSummaryLine(durationSeconds: number): string {
   return `Worked for ${formatDuration(durationSeconds)}`
 }
 
-export const WorkingTimer = memo(function WorkingTimer({
+export const ActivityRail = memo(function ActivityRail({
   work,
+  width,
+  waitsForGenerationProgress,
+  modelLoadActivity,
+  modelRequestActivity,
   interruptedMessage,
   advisorModelName,
-}: WorkingTimerProps) {
+}: ActivityRailProps) {
   const theme = useTheme()
   const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
 
@@ -64,25 +84,71 @@ export const WorkingTimer = memo(function WorkingTimer({
   const isAdvisor = activity?.kind === 'advisor'
 
   // Derive animation indices from tick (80ms per tick)
-  // Elapsed: current chain only — no accumulatedMs prefix
-  const elapsedMs = active && work
-    ? Math.max(0, Date.now() - (work.activeSince ?? Date.now()))
-    : 0
-  const elapsedSeconds = Math.floor(elapsedMs / 1000)
   // Thinking pulse: 250ms → ~3 ticks per step
   const thinkingPulseIndex = (hasActivity && (active || isAdvisor)) ? Math.floor(tick / 3) % THINKING_PULSE_COLORS.length : 0
   // Dot pulse: 300ms → ~4 ticks per step
   const dotPulseIndex = active ? Math.floor(tick / 4) % WORKING_PULSE_COLORS.length : 0
   // Braille: 80ms → 1 tick per step
   const brailleIndex = (hasSpinner && active) ? tick % BRAILLE_FRAMES.length : 0
+  const loadingBrailleIndex = tick % BRAILLE_FRAMES.length
+
+  if (modelLoadActivity !== null) {
+    return (
+      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2 }}>
+        <text>
+          <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
+          {' '}
+          <span style={{ fg: theme.foreground }}>Loading model</span>
+          <span style={{ fg: theme.muted }}>{` · ${modelLoadActivity.percentage}%`}</span>
+        </text>
+      </box>
+    )
+  }
+
+  if (modelRequestActivity !== null) {
+    if (Date.now() - modelRequestActivity.startedAt < REQUEST_VISIBILITY_DELAY_MS) {
+      return <box style={{ height: 1, flexShrink: 0 }} />
+    }
+    const progress = modelRequestProgressSegments(modelRequestActivity)
+    const compactLabel = width < 60
+      && progress.label === 'Loading conversation into the model'
+      ? 'Loading conversation'
+      : progress.label
+    return (
+      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2 }}>
+        <text>
+          <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
+          {' '}
+          <span style={{ fg: theme.foreground }}>{compactLabel}</span>
+          {progress.detail && (
+            <span style={{ fg: theme.muted }}>{` · ${progress.detail}`}</span>
+          )}
+          {progress.trailing && width >= 72 && (
+            <span style={{ fg: theme.muted }}>{` · ${progress.trailing}`}</span>
+          )}
+        </text>
+      </box>
+    )
+  }
+
+  if (
+    active
+    && waitsForGenerationProgress
+    && work.respondingSince === undefined
+  ) {
+    return <box style={{ height: 1, flexShrink: 0 }} />
+  }
 
   // Active: show running timer
   if (active) {
+    const respondingSince = work.respondingSince ?? work.activeSince
+    const responseElapsedMs = Math.max(0, Date.now() - (respondingSince ?? Date.now()))
+    const responseElapsedSeconds = Math.floor(responseElapsedMs / 1000)
     return (
-      <box style={{ flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span style={{ fg: isAdvisor ? slate[600] : WORKING_PULSE_COLORS[dotPulseIndex] }}>{'●'}</span>
-          {` Working... ${formatElapsed(elapsedSeconds)}`}
+          {` Working... ${formatElapsed(responseElapsedSeconds)}`}
           {work.activeChildCount > 0 && (
             <>
               {' · '}
@@ -121,7 +187,7 @@ export const WorkingTimer = memo(function WorkingTimer({
   // Chain inactive but activity present — show activity standalone (takes priority over completed/interrupted)
   if (!active && hasActivity) {
     return (
-      <box style={{ flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span style={{ fg: isAdvisor ? theme.muted : THINKING_PULSE_COLORS[thinkingPulseIndex] }}>{'●'}</span>
           {' '}
@@ -144,7 +210,7 @@ export const WorkingTimer = memo(function WorkingTimer({
       interruptText = '■ Lead interrupted. What would you like to do?'
     }
     return (
-      <box style={{ flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
         <text style={{ fg: red[400] }}>{interruptText}</text>
       </box>
     )
@@ -154,7 +220,7 @@ export const WorkingTimer = memo(function WorkingTimer({
   if (!active && work && work.lastWorkMs > 0) {
     const durationSeconds = Math.floor(work.lastWorkMs / 1000)
     return (
-      <box style={{ flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span style={{ fg: slate[600] }}>{'●'}</span>
           {' '}
@@ -164,5 +230,5 @@ export const WorkingTimer = memo(function WorkingTimer({
     )
   }
 
-  return null
+  return <box style={{ height: 1, flexShrink: 0 }} />
 })

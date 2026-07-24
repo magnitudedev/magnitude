@@ -8,7 +8,7 @@ import {
   createAgentClient,
   useLocalInferenceQuery,
 } from "@magnitudedev/client-common"
-import { protocolLayer } from "@magnitudedev/sdk"
+import { PRIMARY_SLOT_ID, protocolLayer } from "@magnitudedev/sdk"
 import { LocalInferenceStatusBar } from "./status-bar"
 
 vi.mock("../../hooks/use-theme", () => ({
@@ -32,7 +32,7 @@ test.skipIf(Option.isNone(acnUrl))("live independent mirrors compose into the lo
     return (
       <box style={{ flexDirection: "column" }}>
         <text>mirror:success</text>
-        <LocalInferenceStatusBar state={result.value} width={100} selectedModelName="Qwen Test" selectedProviderId={null} onOpenModels={() => {}} onOpenHardware={() => {}} />
+        <LocalInferenceStatusBar state={result.value} width={100} selectedModelName="Qwen Test" selectedProviderId={null} selectedSlotId={PRIMARY_SLOT_ID} modelLoadActivity={null} onOpenModels={() => {}} onOpenHardware={() => {}} />
       </box>
     )
   }

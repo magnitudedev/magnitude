@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Ref, Schema } from "effect"
+import { Context, Effect, Exit, Layer, Ref, Schema } from "effect"
 import {
   ProviderClient,
   StreamStartClientCorrectnessViolation,
@@ -133,14 +133,26 @@ export const withModelSlotAdmission = (
         })),
       }
     }
+    const requestProgress = options?.requestAttribution?.requestProgress
+    const markPreparing = requestProgress
+      ? requestProgress({ phase: "preparing", requestId: null })
+      : Effect.void
+    const clearPreparing = requestProgress
+      ? requestProgress({ phase: "cleared", requestId: null })
+      : Effect.void
     return {
       stream: (prompt, tools, requestOptions) => Effect.scoped(
-        modelSlots.acquireLocalModel(attributionKey, providerModelId).pipe(
-          Effect.mapError((cause) => new StreamStartOperationalFailure({
-            call,
-            reason: { _tag: "RequestFailedBeforeResponse", cause: toCauseInfo(cause) },
-          })),
+        markPreparing.pipe(
+          Effect.zipRight(
+            modelSlots.acquireLocalModel(attributionKey, providerModelId).pipe(
+              Effect.mapError((cause) => new StreamStartOperationalFailure({
+                call,
+                reason: { _tag: "RequestFailedBeforeResponse", cause: toCauseInfo(cause) },
+              })),
+            ),
+          ),
           Effect.zipRight(model.stream(prompt, tools, requestOptions)),
+          Effect.onExit((exit) => Exit.isSuccess(exit) ? Effect.void : clearPreparing),
         ),
       ),
     }
