@@ -240,9 +240,11 @@ runtime identity.
 ACN normalizes its reasoning effort against the referenced provider model at the slot boundary,
 using the model default whenever the requested or stored value is unsupported.
 
-A client that assigns a slot must keep the initiating flow alive until the authoritative
-`ModelSlots` mirror confirms that exact normalized selection. Starting an assignment mutation is
-not confirmation and must not advance onboarding or another configuration flow by itself.
+A successful slot-assignment mutation means ACN has durably stored the normalized selection,
+reconciled the authoritative `ModelSlots` mirror, and published the corresponding agent model
+configuration. Clients may advance onboarding or another configuration flow only after that
+mutation succeeds. Invoking the mutation is not success, and a failed mutation leaves the
+initiating flow open.
 
 ### Model favorites
 

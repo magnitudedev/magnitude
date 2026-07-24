@@ -71,6 +71,7 @@ export function useLocalInferenceState() {
   const clearAtom = useMemo(() => client.mutation("ClearSlot"), [client])
   const loadAtom = useMemo(() => client.mutation("LoadModel"), [client])
   const unloadAtom = useMemo(() => client.mutation("UnloadModel"), [client])
+  const slotAssignment = useAtomValue(assignAtom)
   const mutations = [
     useAtomValue(downloadCatalogAtom),
     useAtomValue(cancelCatalogDownloadAtom),
@@ -80,7 +81,7 @@ export function useLocalInferenceState() {
     useAtomValue(cancelAtom),
     useAtomValue(dismissAtom),
     useAtomValue(deleteAtom),
-    useAtomValue(assignAtom),
+    slotAssignment,
     useAtomValue(clearAtom),
     useAtomValue(loadAtom),
     useAtomValue(unloadAtom),
@@ -100,6 +101,7 @@ export function useLocalInferenceState() {
   const modelKeys = [LocalModelsMirror.id, ProviderModelCatalogMirror.id] as const
   return {
     state,
+    slotAssignment,
     mutationFailure: Option.fromNullable(mutations.find(Result.isFailure)),
     downloadCatalogModel: useCallback((id: CatalogCandidateId) =>
       downloadCatalog({

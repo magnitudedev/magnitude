@@ -227,7 +227,9 @@ export interface CreateClientOptions {
    */
   providerClient: ProviderClientShape
 
-  /** Replaying coherent snapshots from ACN's authoritative model state. */
+  /** Reads the latest coherent snapshot from ACN's authoritative model state. */
+  modelConfiguration: Effect.Effect<ConfigState>
+  /** Publishes later authoritative model-state revisions to resident sessions. */
   modelConfigurations: Stream.Stream<ConfigState>
   /** ACN-owned authoritative persistence/publication for a runtime-invalidated bound effort. */
   applyReasoningEffortFallback?: (
@@ -273,6 +275,24 @@ export interface CreateClientOptions {
    */
   systemPromptOverride?: string
 }
+
+export const makeModelConfigurationSynchronizer = (
+  ambientService: AmbientService,
+  modelConfiguration: Effect.Effect<ConfigState>,
+) => Effect.gen(function* () {
+  const lock = yield* Effect.makeSemaphore(1)
+  const apply = (state: ConfigState): Effect.Effect<void> =>
+    lock.withPermits(1)(Effect.suspend(() => {
+      const current = ambientService.getValue(ConfigAmbient)
+      return state.revision <= current.revision
+        ? Effect.void
+        : ambientService.update(ConfigAmbient, state)
+    }))
+  return {
+    apply,
+    sync: modelConfiguration.pipe(Effect.flatMap(apply)),
+  } as const
+})
 
 export class CodingAgentStartupError extends Data.TaggedError('CodingAgentStartupError')<{
   readonly reason: string
@@ -346,15 +366,13 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         )
       }
 
-      const applyConfig = (state: ConfigState): Effect.Effect<void> =>
-        ambientService.update(ConfigAmbient, state)
-      const loadInitialConfig: Effect.Effect<void> = options.modelConfigurations.pipe(
-        Stream.runHead,
-        Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: applyConfig })),
+      const modelConfiguration = yield* makeModelConfigurationSynchronizer(
+        ambientService,
+        options.modelConfiguration,
       )
 
       yield* Effect.acquireRelease(
-        Effect.forkScoped(Stream.runForEach(options.modelConfigurations, applyConfig)),
+        Effect.forkScoped(Stream.runForEach(options.modelConfigurations, modelConfiguration.apply)),
         Fiber.interrupt,
       )
 
@@ -432,6 +450,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
             scratchpadPath,
           }
 
+          yield* modelConfiguration.sync
           yield* engine.send({
             type: 'session_initialized',
             forkId: null,
@@ -449,8 +468,6 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           } else {
             yield* provideAmbient(publishAtifConfig(DEFAULT_ATIF_CONFIG))
           }
-
-          yield* loadInitialConfig
 
           const skills = yield* Effect.tryPromise(() => loadRuntimeSkills(process.cwd())).pipe(
             Effect.catchTag('UnknownException', (error) =>
@@ -484,7 +501,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           yield* provideAmbient(publishAtifConfig(DEFAULT_ATIF_CONFIG))
         }
 
-        yield* loadInitialConfig
+        yield* modelConfiguration.sync
         const skills = yield* Effect.tryPromise(() => loadRuntimeSkills(process.cwd())).pipe(
           Effect.catchTag('UnknownException', (error) =>
             Effect.sync(() => logger.error({
@@ -625,7 +642,9 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         events: engine.events,
         errors: engine.errors,
         initialize,
-        send: (event) => engine.send(event),
+        send: (event) => modelConfiguration.sync.pipe(
+          Effect.zipRight(engine.send(event)),
+        ),
         interrupt: () => engine.interrupt(),
         publishInitialTask: (task) => provideAmbient(publishInitialTaskAmbient(task)),
         introspectionChanges,

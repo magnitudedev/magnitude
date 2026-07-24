@@ -1,4 +1,14 @@
-import { Context, Effect, Layer, Match, Option, Schema, Scope, Stream } from "effect"
+import {
+  Context,
+  Effect,
+  Layer,
+  Match,
+  Option,
+  Schema,
+  Scope,
+  Stream,
+  SubscriptionRef,
+} from "effect"
 import {
   buildConfigStateFromSlots,
   type ConfigState,
@@ -46,6 +56,7 @@ import { ProviderModelCatalog } from "./provider-model-catalog"
 export interface ModelSlotCoordinatorApi {
   readonly snapshot: Effect.Effect<MirroredSnapshot<ModelSlotsState>>
   readonly changes: Stream.Stream<MirroredSnapshot<ModelSlotsState>>
+  readonly agentModelConfiguration: Effect.Effect<ConfigState>
   readonly agentModelConfigurations: Stream.Stream<ConfigState>
   readonly acquireLocalModel: (
     slotId: SlotId,
@@ -80,6 +91,23 @@ const sameOptionalSelection = (
   onNone: () => Option.isNone(right),
   onSome: (selected) => Option.exists(right, (candidate) => sameSelection(selected, candidate)),
 })
+
+const sameAgentConfiguration = (left: ConfigState, right: ConfigState): boolean =>
+  (["primary", "secondary"] as const).every((slotId) => {
+    const a = left.bySlot[slotId]
+    const b = right.bySlot[slotId]
+    if (a._tag !== b._tag) return false
+    if (a._tag === "Unavailable" && b._tag === "Unavailable") return a.reason === b.reason
+    if (a._tag !== "Ready" || b._tag !== "Ready") return false
+    return a.config.providerId === b.config.providerId
+      && a.config.providerModelId === b.config.providerModelId
+      && a.config.reasoningEffort === b.config.reasoningEffort
+      && a.config.profile.contextWindow === b.config.profile.contextWindow
+      && a.config.profile.maxOutputTokens === b.config.profile.maxOutputTokens
+      && a.config.vision === b.config.vision
+      && a.config.hardCap === b.config.hardCap
+      && a.config.softCap === b.config.softCap
+  })
 
 const normalizeSelectionReasoning = (
   selection: SlotSelection,
@@ -405,6 +433,32 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     recentModelIds: persisted.localModelRecency,
     favoriteModels: persisted.favoriteModels,
   })
+  const initialAgentConfiguration = buildConfigStateFromSlots(
+    catalogContents(initialCatalog).models,
+    (yield* mirror.get).state.slots,
+    persisted.contextLimits,
+    1,
+  )
+  const agentConfiguration = yield* SubscriptionRef.make(initialAgentConfiguration)
+  const agentConfigurationLock = yield* Effect.makeSemaphore(1)
+
+  const reconcileAgentConfiguration = agentConfigurationLock.withPermits(1)(
+    Effect.gen(function* () {
+      const current = yield* SubscriptionRef.get(agentConfiguration)
+      const slots = (yield* mirror.get).state.slots
+      const catalogState = (yield* catalog.snapshot).state
+      const configured = yield* configuration.get
+      const next = buildConfigStateFromSlots(
+        catalogContents(catalogState).models,
+        slots,
+        configured.contextLimits,
+        current.revision + 1,
+      )
+      if (!sameAgentConfiguration(current, next)) {
+        yield* SubscriptionRef.set(agentConfiguration, next)
+      }
+    }),
+  )
 
   const updateLocalSlots = (
     update: (slot: ModelSlot) => ModelSlot,
@@ -503,13 +557,14 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
   })
 
   const reconcile = reconciliationLock.withPermits(1)(reconcileUnlocked)
-  yield* Effect.forkIn(configuration.changes.pipe(Stream.runForEach(() => reconcile)), scope)
+  const reconcileAll = reconcile.pipe(Effect.zipRight(reconcileAgentConfiguration))
+  yield* Effect.forkIn(configuration.changes.pipe(Stream.runForEach(() => reconcileAll)), scope)
   yield* Effect.forkIn(localPackages.changes.pipe(
-    Stream.runForEach(() => reconcile),
+    Stream.runForEach(() => reconcileAll),
   ), scope)
   yield* Effect.forkIn(catalog.changes.pipe(
     Stream.dropWhile((snapshot) => snapshot.revision <= initialCatalogSnapshot.revision),
-    Stream.runForEach(() => reconcile),
+    Stream.runForEach(() => reconcileAll),
   ), scope)
 
   const reject = (slotId: SlotId, message: string) => new ModelSlotMutationRejected({ slotId, message })
@@ -607,7 +662,7 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       yield* configuration.updateSlot(slotId, normalizedSelection).pipe(
         Effect.mapError((error) => slotFailure(slotId, "model_slot_persistence_failed", error)),
       )
-      yield* reconcile
+      yield* reconcileAll
       if (previous._tag === "Unassigned"
         || previous.selection.providerId !== LOCAL_PROVIDER_ID
         || previous._tag === "UnloadedLocalModel"
@@ -631,7 +686,7 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
           message: "Failed to save model favorite",
         })),
       )
-      yield* reconcile
+      yield* reconcileAll
     })
 
   const loadSelectedSlotUnlocked = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
@@ -715,44 +770,11 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     () => modelAdmission.release(1),
   ).pipe(Effect.asVoid)
 
-  const sameAgentConfiguration = (left: ConfigState, right: ConfigState): boolean =>
-    (["primary", "secondary"] as const).every((slotId) => {
-      const a = left.bySlot[slotId]
-      const b = right.bySlot[slotId]
-      if (a._tag !== b._tag) return false
-      if (a._tag === "Unavailable" && b._tag === "Unavailable") return a.reason === b.reason
-      if (a._tag !== "Ready" || b._tag !== "Ready") return false
-      return a.config.providerId === b.config.providerId
-        && a.config.providerModelId === b.config.providerModelId
-        && a.config.reasoningEffort === b.config.reasoningEffort
-        && a.config.profile.contextWindow === b.config.profile.contextWindow
-        && a.config.profile.maxOutputTokens === b.config.profile.maxOutputTokens
-        && a.config.vision === b.config.vision
-        && a.config.hardCap === b.config.hardCap
-        && a.config.softCap === b.config.softCap
-    })
-
-  const agentModelConfigurations = Stream.zipLatestAll(
-    mirror.changes,
-    catalog.changes,
-    configuration.changes,
-  ).pipe(
-    Stream.map(([slots, catalogSnapshot, configured]) => buildConfigStateFromSlots(
-      catalogContents(catalogSnapshot.state).models,
-      slots.state.slots,
-      configured.contextLimits,
-    )),
-    Stream.changesWith(sameAgentConfiguration),
-    Stream.mapAccum(0, (revision, state) => [
-      revision + 1,
-      { ...state, revision: revision + 1 },
-    ] as const),
-  )
-
   return ModelSlotCoordinator.of({
     snapshot: mirror.get,
     changes: mirror.changes,
-    agentModelConfigurations,
+    agentModelConfiguration: SubscriptionRef.get(agentConfiguration),
+    agentModelConfigurations: agentConfiguration.changes,
     acquireLocalModel,
     updateModelSlot,
     setModelFavorite,

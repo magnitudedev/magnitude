@@ -2,9 +2,7 @@ import {
   Fragment,
   memo,
   useCallback,
-  useEffect,
   useMemo,
-  useRef,
   useState,
   useSyncExternalStore,
 } from "react"
@@ -64,11 +62,6 @@ const recommendationIntent = (intent: "balanced" | "best_quality" | "fastest" | 
   if (intent === "lightweight") return "Lightweight"
   return "Balanced"
 }
-
-const sameSlotSelection = (left: SlotSelection, right: SlotSelection): boolean =>
-  left.providerId === right.providerId
-  && left.providerModelId === right.providerModelId
-  && left.reasoningEffort === right.reasoningEffort
 
 const blockedSlotMessage = (
   slot: Extract<LocalInferenceView["slots"]["slots"]["primary"], { readonly _tag: "Blocked" }>,
@@ -157,8 +150,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const [details, setDetails] = useState(false)
   const [hoveredAction, setHoveredAction] = useState<LocalSetupHoveredAction | null>(null)
-  const [pendingSelection, setPendingSelection] = useState<Option.Option<SlotSelection>>(Option.none())
-  const completionStarted = useRef(false)
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
   const selectedIndex = selectedInferenceIndex(selections, selectedId)
   const selected = selections[selectedIndex]
@@ -167,20 +158,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     ? Option.some(primarySlot.selection)
     : Option.none<SlotSelection>()
   const mutationFailure = local.mutationFailure
-  const assigning = Option.isSome(pendingSelection)
-
-  useEffect(() => {
-    if (Option.isNone(pendingSelection) || primarySlot._tag === "Unassigned") return
-    if (!sameSlotSelection(primarySlot.selection, pendingSelection.value)) return
-    if (primarySlot._tag === "Blocked") {
-      setPendingSelection(Option.none())
-      return
-    }
-    if (primarySlot._tag === "UnloadingLocalModel" || completionStarted.current) return
-    completionStarted.current = true
-    setPendingSelection(Option.none())
-    onConfigured()
-  }, [onConfigured, pendingSelection, primarySlot])
+  const assigning = Result.isWaiting(local.slotAssignment)
 
   const selectionFor = useCallback((selection: LocalInferenceSelection): Option.Option<SlotSelection> =>
     Option.map(selection.providerModelId, (providerModelId) => ({
@@ -210,14 +188,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     Option.match(selectionFor(selection), {
       onNone: () => undefined,
       onSome: (slotSelection) => {
-        completionStarted.current = false
-        setPendingSelection(Option.some(slotSelection))
-        void local.assignSlot(PRIMARY_SLOT_ID, slotSelection).catch(() => {
-          setPendingSelection((current) => Option.exists(current, (pending) =>
-            sameSlotSelection(pending, slotSelection))
-            ? Option.none()
-            : current)
-        })
+        void local.assignSlot(PRIMARY_SLOT_ID, slotSelection).then(onConfigured, () => undefined)
       },
     })
   }, [assigning, local, onConfigured, selectionFor])
@@ -360,9 +331,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               const loading = primarySlot._tag === "LoadingLocalModel"
                 && Option.exists(selection.providerModelId, (id) =>
                   primarySlot.selection.providerModelId === id)
-              const selecting = Option.exists(pendingSelection, (pending) =>
-                Option.exists(selection.providerModelId, (providerModelId) =>
-                  pending.providerModelId === providerModelId))
+              const selecting = assigning && selection.id === selected?.id
               return <Fragment key={selection.id}>
                 {sectionLabel && <box style={{ flexDirection: "row", paddingTop: index === 0 ? 0 : 1, paddingBottom: 1, width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}>
                   <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{sectionLabel}</text>

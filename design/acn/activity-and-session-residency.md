@@ -73,6 +73,12 @@ Session startup is single-flight. Unloading closes the current runtime before pu
 absent; later work creates a new runtime. A draft stores session intent, not a runtime. Deletion
 blocks new work, waits for current work to finish, closes the runtime, then deletes durable state.
 
+Preloaded and resident sessions consume one ACN-owned, revisioned model configuration. A slot
+mutation publishes its new configuration before it succeeds. Before a session accepts an external
+event, it synchronizes to the latest published revision; delayed subscription delivery or an older
+queued revision cannot replace a newer configuration. Selecting a model therefore makes an
+already-preloaded draft immediately usable without restarting the client or daemon.
+
 ## User bash command history
 
 A user bash command is session work. Completion records one identified session event containing the
