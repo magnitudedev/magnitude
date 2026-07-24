@@ -1,7 +1,7 @@
-import { act } from "react"
+import { act, useState } from "react"
 import { testRender } from "@opentui/react/test-utils"
 import { Result } from "@effect-atom/atom-react"
-import { Option } from "effect"
+import { Cause, Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
 import { GIB, makeModel, makeRecommendation, makeView } from "../local-inference/test-fixtures"
 
@@ -17,12 +17,13 @@ const actions = vi.hoisted(() => ({
   unloadModel: vi.fn(),
 }))
 let state = makeView({ ready: false })
+let mutationFailure: Option.Option<Result.Result<unknown, unknown>> = Option.none()
 
 vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   ...await importOriginal<typeof import("@magnitudedev/client-common")>(),
   useLocalInferenceState: () => ({
     state: Result.success(state),
-    mutationFailure: Option.none(),
+    mutationFailure,
     ...actions,
   }),
 }))
@@ -44,7 +45,9 @@ const textPosition = (frame: string, label: string): { x: number; y: number } =>
 
 beforeEach(() => {
   state = makeView({ ready: false })
+  mutationFailure = Option.none()
   for (const action of Object.values(actions)) action.mockClear()
+  actions.assignSlot.mockResolvedValue(undefined)
 })
 
 test("preserves the local model setup screen instead of introducing a model-selection screen", async () => {
@@ -138,6 +141,72 @@ test("renders consumer recommendation intent and its trade-off explanation", asy
     expect(frame).toContain("Fastest")
     expect(frame).toContain("Prioritizes responsive generation")
     expect(frame).not.toContain("Alternative Option")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("keeps setup open until the selected model is confirmed by the slot mirror", async () => {
+  state = makeView({ ready: false })
+  let refresh: (() => void) | undefined
+  let resolveAssignment: (() => void) | undefined
+  actions.assignSlot.mockReturnValue(new Promise<void>((resolve) => {
+    resolveAssignment = resolve
+  }))
+  const onComplete = vi.fn()
+  const Harness = () => {
+    const [, setRevision] = useState(0)
+    refresh = () => setRevision((revision) => revision + 1)
+    return <ModelSetupScreen mode="onboarding" onExit={() => {}} onComplete={onComplete} />
+  }
+  const view = await testRender(<Harness />, { width: 100, height: 30 })
+  try {
+    await act(view.renderOnce)
+    const position = textPosition(view.captureCharFrame(), "Qwen Test")
+    await act(async () => view.mockMouse.click(position.x, position.y))
+    expect(actions.assignSlot).toHaveBeenCalledTimes(1)
+    expect(onComplete).not.toHaveBeenCalled()
+    expect(view.captureCharFrame()).toContain("Selecting this model")
+
+    await act(async () => view.mockMouse.click(position.x, position.y))
+    expect(actions.assignSlot).toHaveBeenCalledTimes(1)
+
+    resolveAssignment?.()
+    await act(async () => Promise.resolve())
+    expect(onComplete).not.toHaveBeenCalled()
+
+    state = makeView({ ready: true })
+    await act(async () => refresh?.())
+    await act(view.renderOnce)
+    expect(onComplete).toHaveBeenCalledTimes(1)
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("keeps setup open and shows an assignment failure", async () => {
+  state = makeView({ ready: false })
+  actions.assignSlot.mockRejectedValue(new Error("assignment failed"))
+  let refresh: (() => void) | undefined
+  const onComplete = vi.fn()
+  const Harness = () => {
+    const [, setRevision] = useState(0)
+    refresh = () => setRevision((revision) => revision + 1)
+    return <ModelSetupScreen mode="onboarding" onExit={() => {}} onComplete={onComplete} />
+  }
+  const view = await testRender(<Harness />, { width: 100, height: 30 })
+  try {
+    await act(view.renderOnce)
+    const position = textPosition(view.captureCharFrame(), "Qwen Test")
+    await act(async () => view.mockMouse.click(position.x, position.y))
+
+    const failure = Result.failure(Cause.fail(new Error("assignment failed")))
+    mutationFailure = Option.some(failure)
+    await act(async () => refresh?.())
+    await act(view.renderOnce)
+
+    expect(onComplete).not.toHaveBeenCalled()
+    expect(view.captureCharFrame()).toContain("assignment failed")
   } finally {
     await act(async () => view.renderer.destroy())
   }

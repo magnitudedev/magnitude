@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
+  ModelSlotBlocked,
+  ModelSlotLoadingLocalModel,
+  ModelSlotReady,
   ModelSlotUnassigned,
   ModelSlotUnloadedLocalModel,
+  ModelSlotUnloadingLocalModel,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelCatalogReady,
@@ -10,7 +14,7 @@ import {
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
-import { selectedSlotModel } from "./model-slots"
+import { isModelSlotUsableForMessages, selectedSlotModel } from "./model-slots"
 
 const selection = {
   providerId: ProviderIdSchema.make("local"),
@@ -54,5 +58,30 @@ describe("model slot selection", () => {
       PRIMARY_SLOT_ID,
     )
     expect(Option.getOrThrow(result)).toMatchObject({ model: catalogModel, slot: unloaded })
+  })
+
+  it("only treats slots that can admit a message as usable", () => {
+    expect(isModelSlotUsableForMessages(
+      new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }),
+    )).toBe(false)
+    expect(isModelSlotUsableForMessages(unloaded)).toBe(true)
+    expect(isModelSlotUsableForMessages(new ModelSlotLoadingLocalModel({
+      slotId: PRIMARY_SLOT_ID,
+      selection,
+      percentage: 25,
+    }))).toBe(true)
+    expect(isModelSlotUsableForMessages(new ModelSlotReady({
+      slotId: PRIMARY_SLOT_ID,
+      selection,
+    }))).toBe(true)
+    expect(isModelSlotUsableForMessages(new ModelSlotUnloadingLocalModel({
+      slotId: PRIMARY_SLOT_ID,
+      selection,
+    }))).toBe(false)
+    expect(isModelSlotUsableForMessages(new ModelSlotBlocked({
+      slotId: PRIMARY_SLOT_ID,
+      selection,
+      reason: { _tag: "ModelUnavailable", message: "Unavailable" },
+    }))).toBe(false)
   })
 })

@@ -16,6 +16,11 @@ export interface SelectedSlotModel {
   readonly slot: AssignedSlot
 }
 
+export const isModelSlotUsableForMessages = (slot: ModelSlot): boolean =>
+  slot._tag === "UnloadedLocalModel"
+  || slot._tag === "LoadingLocalModel"
+  || slot._tag === "Ready"
+
 export function selectedSlotModel(
   catalog: ProviderModelCatalogState,
   slots: ModelSlotsState,

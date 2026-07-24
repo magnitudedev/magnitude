@@ -231,6 +231,10 @@ runtime identity.
 ACN normalizes its reasoning effort against the referenced provider model at the slot boundary,
 using the model default whenever the requested or stored value is unsupported.
 
+A client that assigns a slot must keep the initiating flow alive until the authoritative
+`ModelSlots` mirror confirms that exact normalized selection. Starting an assignment mutation is
+not confirmation and must not advance onboarding or another configuration flow by itself.
+
 ## Relationships
 
 ```text

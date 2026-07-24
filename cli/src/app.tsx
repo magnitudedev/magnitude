@@ -27,6 +27,7 @@ import {
   getEphemeralMessageSnapshot,
   useFileWatchBridge,
   useLocalInferenceQuery,
+  isModelSlotUsableForMessages,
 } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, type SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
@@ -178,7 +179,8 @@ function OnboardingGate(
   }
 
   const primary = slotsSnapshot.value.state.slots.primary
-  const modelsConfigured = primary.slotId === PRIMARY_SLOT_ID && primary._tag !== 'Unassigned'
+  const modelsConfigured = primary.slotId === PRIMARY_SLOT_ID
+    && isModelSlotUsableForMessages(primary)
 
   return (
     <CliAppContent
