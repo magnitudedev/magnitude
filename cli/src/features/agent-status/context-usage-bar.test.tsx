@@ -8,7 +8,7 @@ mock.module('../hooks/use-theme', () => ({
   }),
 }))
 
-const { ContextUsageBar } = await import('./context-usage-bar')
+const { ContextUsageBar, contextUsageWidth } = await import('./context-usage-bar')
 
 const htmlToText = (html: string): string => html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
 
@@ -37,4 +37,9 @@ test('shows dash when usage and max are unknown', () => {
   const text = htmlToText(render(<ContextUsageBar tokenUsage={null} hardCap={null} />))
   expect(text).toContain('-')
   expect(text).not.toContain('%')
+})
+
+test('reports the exact width reserved by normal and compacting context', () => {
+  expect(contextUsageWidth(5000, 10000, false)).toBe('50% 5k/10k'.length)
+  expect(contextUsageWidth(5000, 10000, true)).toBe('50% 5k/10k'.length + 8)
 })

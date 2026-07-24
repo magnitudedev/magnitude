@@ -4,7 +4,7 @@ import type { ReactNode } from 'react'
 import { Option } from 'effect'
 import type { ChatTheme } from '../../types/theme-system'
 import type { ComposerProps } from './types'
-import type { TaskDisplayRow } from '@magnitudedev/sdk'
+import { PRIMARY_SLOT_ID, type TaskDisplayRow } from '@magnitudedev/sdk'
 
 vi.mock('@opentui/react', async () => {
   const actual = await vi.importActual<typeof import('@opentui/react')>('@opentui/react')
@@ -196,15 +196,15 @@ function makeProps(): ComposerProps {
   return {
     sessionId: null,
     cwd: null,
+    clientWorkingDirectory: '/tmp/default',
     status: 'idle' as const,
     hasRunningForks: false,
     bashMode: false,
     modelsConfigured: true,
-    downloadSummary: null,
     modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
-    tokenUsage: 0,
-    contextHardCap: null,
-    isCompacting: false,
+    localInferenceState: null,
+    selectedProviderId: null,
+    selectedSlotId: PRIMARY_SLOT_ID,
     displayMode: 'default' as const,
     theme,
     modeColor: '#00aaff',
@@ -222,7 +222,7 @@ function makeProps(): ComposerProps {
     interruptFork: noop,
     interruptAll: noop,
     openSettings: noop,
-    openCatalog: noop,
+    openHardware: noop,
     thinkingOptions: [],
     applyThinking: noop,
     handleWidgetKeyEvent: () => false,
@@ -239,9 +239,14 @@ function makeProps(): ComposerProps {
 }
 
 test('composer shell renders without an embedded task list (task list is the AgentStatus feature)', () => {
-  const html = render(<Composer {...makeProps()} />)
+  const html = render(<Composer {...makeProps()} clientWorkingDirectory="/tmp/magnitude" />)
 
-  expect(html).toContain('background-color:#111111;padding-top:1px;padding-left:1px;padding-right:2px')
+  expect(html).toContain('background-color:#111111;padding-left:1px;padding-right:2px')
+  expect(html).not.toContain('padding-top:1px')
+  expect(html).toContain('>model<')
+  expect(html).toContain('>high<')
+  expect(html).toContain('/tmp/magnitude')
+  expect(html).not.toContain('Thinking:')
   expect(html).not.toContain('Assigned To')
 
   expect(html).not.toContain('vertical:╹')

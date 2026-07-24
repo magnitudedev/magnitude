@@ -4,6 +4,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { chatThemes } from '../../utils/theme'
+import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
 
 let latestMultilineProps: {
   onChange: (value: InputValue) => void
@@ -65,15 +66,15 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
   return {
     sessionId: null,
     cwd: null,
+    clientWorkingDirectory: '/tmp/default',
       status: 'idle' as const,
       hasRunningForks: false,
       bashMode: false,
       modelsConfigured: true,
-      downloadSummary: null,
       modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
-      tokenUsage: null,
-      contextHardCap: null,
-      isCompacting: false,
+      localInferenceState: null,
+      selectedProviderId: null,
+      selectedSlotId: PRIMARY_SLOT_ID,
       theme: chatThemes.dark,
       modeColor: '#00aaff',
       attachmentsMaxWidth: 80,
@@ -92,7 +93,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       interruptFork: mock(() => {}),
       interruptAll: mock(() => {}),
       openSettings: mock(() => {}),
-      openCatalog: mock(() => {}),
+      openHardware: mock(() => {}),
       thinkingOptions: [],
       applyThinking: mock(() => {}),
       handleWidgetKeyEvent: mock(() => false),

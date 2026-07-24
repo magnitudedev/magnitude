@@ -1,4 +1,5 @@
-import type { DisplayMessage, DisplayTimeline, RawImageAttachment, RawMentionOccurrence, ReasoningEffort } from '@magnitudedev/sdk'
+import type { LocalInferenceView } from '@magnitudedev/client-common'
+import type { DisplayMessage, DisplayTimeline, ProviderId, RawImageAttachment, RawMentionOccurrence, ReasoningEffort, SlotId } from '@magnitudedev/sdk'
 import type { KeyEvent } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
 
@@ -10,17 +11,17 @@ import type { ChatTheme } from '../../types/theme-system'
 export type ComposerProps = {
   sessionId: string | null
   cwd: string | null
+  clientWorkingDirectory: string
 
   // Display-derived state
   status: DisplayTimeline['mode']
   hasRunningForks: boolean
   bashMode: boolean
   modelsConfigured: boolean
-  downloadSummary: string | null
   modelSummary: { role: string; model: string; thinkingLevel: string } | null
-  tokenUsage: number | null
-  contextHardCap: number | null
-  isCompacting: boolean
+  localInferenceState: LocalInferenceView | null
+  selectedProviderId: ProviderId | null
+  selectedSlotId: SlotId
   displayMode: 'default' | 'transcript'
 
   // Presentation
@@ -49,7 +50,7 @@ export type ComposerProps = {
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void
   openSettings: () => void
-  openCatalog: () => void
+  openHardware: () => void
   thinkingOptions: readonly { value: ReasoningEffort; label: string }[]
   applyThinking: (effort: ReasoningEffort) => void
   handleWidgetKeyEvent: (key: KeyEvent) => boolean

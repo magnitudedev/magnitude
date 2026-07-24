@@ -27,6 +27,7 @@ import {
   reasoningEffortControl,
   selectedSlotModel,
   useModelConfig,
+  useLocalInferenceQuery,
 } from '@magnitudedev/client-common'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
@@ -40,16 +41,16 @@ import { allowProviderMessageSend } from './provider-send-guard'
 
 export function ComposerContainer({
   chatColumnWidth,
+  clientWorkingDirectory,
   widgetNavActive,
   handleWidgetKeyEvent,
   modelsConfigured,
-  downloadSummary,
 }: {
   chatColumnWidth: number
+  clientWorkingDirectory: string
   widgetNavActive: boolean
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
   modelsConfigured: boolean
-  downloadSummary: string | null
 }): ReactNode {
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
@@ -102,8 +103,10 @@ export function ComposerContainer({
   }
 
   const { interrupt, interruptAll } = useInterruptActions()
-  const { rootRoleLabel, rootProfile } = useSlotProfiles()
+  const { rootRoleLabel, rootProfile, rootSlotId } = useSlotProfiles()
   const modelConfig = useModelConfig()
+  const localInference = useLocalInferenceQuery()
+  const localInferenceState = Option.getOrNull(Result.value(localInference))
   const selectedModel = Option.flatMap(
     Option.all({
       catalog: Result.value(modelConfig.catalog),
@@ -128,14 +131,10 @@ export function ComposerContainer({
     () => (rootTimeline ? orderedMessages(rootTimeline.messages) : []),
     [rootTimeline?.messages],
   )
-  const context = rootActor?.context ?? null
-  const contextHardCap = rootProfile?.contextWindow ?? null
-  const tokenUsage = context && context.tokenEstimate > 0 ? context.tokenEstimate : null
-
   // Reserve footer width so attachments don't reflow when hints appear.
   const maxEscHintWidth = 'Press Esc again to interrupt all workers'.length
-  const contextTextWidth = 24
-  const attachmentsMaxWidth = Math.max(0, chatColumnWidth - 4 - maxEscHintWidth - contextTextWidth - 5)
+  const statusTextWidth = 36
+  const attachmentsMaxWidth = Math.max(0, chatColumnWidth - 4 - maxEscHintWidth - statusTextWidth - 5)
 
   const composerCanFocus = !showRecentChats && !menu.open && !usageOpen && expandedForkStack.length === 0
 
@@ -156,6 +155,7 @@ export function ComposerContainer({
     <Composer
       sessionId={sessionId}
       cwd={selectedCwd}
+      clientWorkingDirectory={clientWorkingDirectory}
       status={rootTimeline?.mode ?? 'idle'}
       hasRunningForks={(rootActor?.work.activeChildCount ?? 0) > 0}
       bashMode={composer.bashMode}
@@ -167,9 +167,9 @@ export function ComposerContainer({
           ? rootProfile.reasoningEffort.charAt(0).toUpperCase() + rootProfile.reasoningEffort.slice(1)
           : '-',
       }}
-      tokenUsage={tokenUsage}
-      contextHardCap={contextHardCap}
-      isCompacting={context?.isCompacting ?? false}
+      localInferenceState={localInferenceState}
+      selectedProviderId={rootProfile?.providerId ?? null}
+      selectedSlotId={rootSlotId}
       displayMode={displayMode}
       theme={theme}
       modeColor={theme.modeDefault}
@@ -187,10 +187,9 @@ export function ComposerContainer({
       interruptFork={interrupt}
       interruptAll={interruptAll}
       openSettings={() => setMenu({ open: true, root: 'models' })}
-      openCatalog={() => setMenu({ open: true, root: 'catalog' })}
-      downloadSummary={downloadSummary}
       thinkingOptions={thinkingOptions}
       applyThinking={applyThinking}
+      openHardware={() => setMenu({ open: true, root: 'hardware' })}
       handleWidgetKeyEvent={handleWidgetKeyEvent}
       enterBashMode={() => setBashMode(true)}
       exitBashMode={() => setBashMode(false)}
