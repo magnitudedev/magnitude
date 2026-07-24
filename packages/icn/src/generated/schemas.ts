@@ -193,6 +193,10 @@ export const ChatCompletionChunk = S.Struct({
   id: S.String,
   model: S.String,
   object: S.String,
+  progress: S.optionalWith(
+    S.suspend((): S.Schema<ChatCompletionProgress, ChatCompletionProgressEncoded> => ChatCompletionProgress),
+    { exact: true, as: "Option" },
+  ),
   timings: S.optionalWith(
     S.suspend((): S.Schema<Timings, TimingsEncoded> => Timings),
     { exact: true, as: "Option" },
@@ -204,6 +208,38 @@ export const ChatCompletionChunk = S.Struct({
 })
 export type ChatCompletionChunk = S.Schema.Type<typeof ChatCompletionChunk>
 export type ChatCompletionChunkEncoded = S.Schema.Encoded<typeof ChatCompletionChunk>
+
+export const ChatCompletionProgress = S.Union(
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("Queued"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("Preparing"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("Prefill"),
+      cachedTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      completedTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      totalTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("Generating"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ChatCompletionProgress = S.Schema.Type<typeof ChatCompletionProgress>
+export type ChatCompletionProgressEncoded = S.Schema.Encoded<typeof ChatCompletionProgress>
 
 export const ChatCompletionRequest = S.Struct({
   cache_prompt: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),

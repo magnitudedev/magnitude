@@ -103,6 +103,12 @@ not repair invalid messages, fabricate assistant turns, or hide rejected respons
 Context admission uses the resident configuration's context length. Catalog metadata, compaction,
 load planning, and request admission must agree on that exact configuration.
 
+ICN lifecycle control chunks are process-local request observations, not assistant output. The
+local provider removes them before the provider-neutral response codec and forwards queue,
+preparation, prefill, and generation-start state through optional request attribution. Ending,
+failing, or canceling the response stream clears that attributed state. Providers that do not
+support this observation remain valid and expose no synthetic progress.
+
 ## Speculative decoding
 
 A speculative target is explicit in the offering's configuration. ACN does not attach or remove a

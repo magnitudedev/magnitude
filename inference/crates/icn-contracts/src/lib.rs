@@ -600,6 +600,7 @@ pub struct ModelModalities {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferenceEvent {
+    Progress(InferenceProgress),
     /// Begins the assistant stream for the first sampled-token result.
     ///
     /// Keeping this in the sampled result group lets transports reproduce native timing
@@ -617,6 +618,18 @@ pub enum InferenceEvent {
         name: Option<String>,
         arguments: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceProgress {
+    Queued,
+    Preparing,
+    Prefill {
+        completed_tokens: usize,
+        total_tokens: usize,
+        cached_tokens: usize,
+    },
+    Generating,
 }
 
 #[derive(Debug, Clone)]

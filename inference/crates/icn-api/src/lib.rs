@@ -27,9 +27,9 @@ use icn_contracts::{
     FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
     HardwareProvider, HardwareSnapshot, HuggingFaceModelCatalog, HuggingFaceModelSearchRequest,
     HuggingFaceModelSearchResults, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
-    ImageInput, InferenceError, InferenceEvent, InferenceStreamEvent, InventoryError,
-    ModelModalities, ModelProperties, PreparedChatInfo, ReasoningControl, ResponseFormat,
-    SplitMode, TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
+    ImageInput, InferenceError, InferenceEvent, InferenceProgress, InferenceStreamEvent,
+    InventoryError, ModelModalities, ModelProperties, PreparedChatInfo, ReasoningControl,
+    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -908,6 +908,9 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
+    pub progress: Option<ChatCompletionProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
@@ -915,6 +918,20 @@ pub struct ChatCompletionChunk {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub error: Option<ApiErrorBody>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum ChatCompletionProgress {
+    Queued,
+    Preparing,
+    #[serde(rename_all = "camelCase")]
+    Prefill {
+        completed_tokens: u64,
+        total_tokens: u64,
+        cached_tokens: u64,
+    },
+    Generating,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1625,12 +1642,17 @@ async fn chat_completion_with_lease(
                     delta: event,
                     timings,
                 } = event;
-                let delta = inference_event_delta(event)?;
                 let timings = timings.map(|snapshot| snapshot_timings(&snapshot));
-                if emit_chunk(
-                    &sender,
-                    &choice_chunk(&id, created, &model, delta, None, timings),
-                ) {
+                let chunk = match event {
+                    InferenceEvent::Progress(progress) => {
+                        progress_chunk(&id, created, &model, progress)
+                    }
+                    event => {
+                        let delta = inference_event_delta(event)?;
+                        choice_chunk(&id, created, &model, delta, None, timings)
+                    }
+                };
+                if emit_chunk(&sender, &chunk) {
                     Ok(())
                 } else {
                     Err(InferenceError::Callback(
@@ -1712,6 +1734,7 @@ fn choice_chunk(
             delta,
             finish_reason,
         }],
+        progress: None,
         usage: None,
         timings,
         error: None,
@@ -1732,6 +1755,7 @@ fn usage_chunk(
         created,
         model: model.into(),
         choices: Vec::new(),
+        progress: None,
         usage: Some(Usage {
             prompt_tokens,
             completion_tokens,
@@ -1749,9 +1773,43 @@ fn error_chunk(id: &str, created: u64, model: &str, error: ApiErrorBody) -> Chat
         created,
         model: model.into(),
         choices: Vec::new(),
+        progress: None,
         usage: None,
         timings: None,
         error: Some(error),
+    }
+}
+
+fn progress_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    progress: InferenceProgress,
+) -> ChatCompletionChunk {
+    let progress = match progress {
+        InferenceProgress::Queued => ChatCompletionProgress::Queued,
+        InferenceProgress::Preparing => ChatCompletionProgress::Preparing,
+        InferenceProgress::Prefill {
+            completed_tokens,
+            total_tokens,
+            cached_tokens,
+        } => ChatCompletionProgress::Prefill {
+            completed_tokens: completed_tokens as u64,
+            total_tokens: total_tokens as u64,
+            cached_tokens: cached_tokens as u64,
+        },
+        InferenceProgress::Generating => ChatCompletionProgress::Generating,
+    };
+    ChatCompletionChunk {
+        id: id.into(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.into(),
+        choices: Vec::new(),
+        progress: Some(progress),
+        usage: None,
+        timings: None,
+        error: None,
     }
 }
 
@@ -1816,6 +1874,11 @@ fn rate(tokens: usize, elapsed_ms: f64) -> f64 {
 
 fn inference_event_delta(event: InferenceEvent) -> Result<ChunkDelta, InferenceError> {
     Ok(match event {
+        InferenceEvent::Progress(_) => {
+            return Err(InferenceError::Callback(
+                "progress event reached the semantic delta encoder".into(),
+            ));
+        }
         InferenceEvent::StreamStart => ChunkDelta {
             role: Some("assistant".into()),
             content: Some(None),

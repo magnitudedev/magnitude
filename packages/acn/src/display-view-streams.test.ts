@@ -28,6 +28,7 @@ const displayState = (title: string): DisplayState => ({
   timelines: {},
   agents: {},
   actors: {},
+  modelRequests: {},
   tasks: {
     byId: {},
     order: [],
@@ -54,6 +55,7 @@ const idleAgents: AgentLifecycleState = {
     activity: null,
     activeChildCount: 0,
     _currentTurnId: null,
+    _currentChainId: null,
     _thinkingCharCount: null,
     _activeToolKey: null,
   },

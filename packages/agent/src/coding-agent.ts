@@ -91,6 +91,7 @@ import { collectSessionContext } from './util/collect-session-context'
 // Engine layers
 
 import { AgentModelResolverLive } from './model/model-resolver'
+import { ModelRequestActivityLive } from './model-request-activity'
 
 // Config & Auth
 import { ProviderClient, SlotIdSchema, type ProviderClientShape } from '@magnitudedev/sdk'
@@ -732,6 +733,7 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     providerClientLayer,
     chatTitleServiceLayer,
     ObserverStateLive,
+    ModelRequestActivityLive,
 
     FetchHttpClient.layer,
     FsLive,

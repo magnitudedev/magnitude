@@ -6,6 +6,7 @@ import {
   type DisplayViewSnapshot,
 } from '@magnitudedev/protocol'
 import { buildDisplayViewSnapshot } from './snapshot'
+import { ModelRequestActivity } from '../model-request-activity'
 
 export class DisplayViewNotFoundError extends Data.TaggedError('DisplayViewNotFoundError')<{
   readonly viewId: string
@@ -72,6 +73,7 @@ export const DisplayViewRuntimeLive =
       const ambientService = yield* AmbientServiceTag
       const projectionConsumerService = yield* Projection.consumer.Service
       const projectionBus = yield* ProjectionBusTag<any>()
+      const modelRequestActivity = yield* ModelRequestActivity
       const views = yield* SynchronizedRef.make<ReadonlyMap<string, RuntimeDisplayViewEntry>>(new Map())
 
       const provideRuntimeEffect = <A, E, R>(
@@ -80,7 +82,8 @@ export const DisplayViewRuntimeLive =
         effect.pipe(
           Effect.provideService(AmbientServiceTag, ambientService),
           Effect.provideService(Projection.consumer.Service, projectionConsumerService),
-          Effect.provideService(ProjectionBusTag<any>(), projectionBus)
+          Effect.provideService(ProjectionBusTag<any>(), projectionBus),
+          Effect.provideService(ModelRequestActivity, modelRequestActivity)
         )
 
       const provideRuntimeStream = <A, E, R>(
@@ -89,7 +92,8 @@ export const DisplayViewRuntimeLive =
         stream.pipe(
           Stream.provideService(AmbientServiceTag, ambientService),
           Stream.provideService(Projection.consumer.Service, projectionConsumerService),
-          Stream.provideService(ProjectionBusTag<any>(), projectionBus)
+          Stream.provideService(ProjectionBusTag<any>(), projectionBus),
+          Stream.provideService(ModelRequestActivity, modelRequestActivity)
         )
 
       const publishSnapshotIfCurrent = (
@@ -140,7 +144,16 @@ export const DisplayViewRuntimeLive =
         shape: DisplayViewShape,
         generation: number
       ) =>
-        Projection.consumer.stream(consumer)(buildDisplayViewSnapshot(shape)).pipe(
+        Stream.merge(
+          Projection.consumer.stream(consumer)(buildDisplayViewSnapshot(shape)),
+          modelRequestActivity.changes.pipe(
+            Stream.mapEffect(() =>
+              buildDisplayViewSnapshot(shape).pipe(
+                Projection.consumer.provide(consumer)
+              )
+            )
+          )
+        ).pipe(
           provideRuntimeStream,
           Stream.mapError(displayViewRuntimeError(viewId, 'stream')),
           Stream.runForEach((snapshot) => publishSnapshotIfCurrent(viewId, generation, snapshot)),

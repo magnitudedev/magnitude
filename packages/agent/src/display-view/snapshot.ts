@@ -28,6 +28,7 @@ import {
   materializeDisplayTasks,
 } from './semantic'
 import { type DisplayTimelineWindowShape } from './shape'
+import { ModelRequestActivity } from '../model-request-activity'
 
 const windowBounds = (
   shape: DisplayTimelineWindowShape,
@@ -97,6 +98,8 @@ export const buildDisplayViewSnapshot = (
     const windowState = yield* Projection.consumer.read(WindowProjection)
     const compaction = yield* Projection.consumer.read(CompactionProjection)
     const ambient = yield* AmbientServiceTag
+    const modelRequests = yield* ModelRequestActivity
+    const responseTimings = yield* modelRequests.getResponseTimings
     const sessionOptions = ambient.getValue(SessionOptionsAmbient)
 
     const timelines: Record<string, DisplayTimeline> = {}
@@ -140,10 +143,12 @@ export const buildDisplayViewSnapshot = (
         agentStatus.state,
         taskWorker.state,
         windowState.state,
-        compaction.state
+        compaction.state,
+        responseTimings,
       ),
       agents: materializeDisplayAgents(agentStatus.state),
       tasks: materializeDisplayTasks(taskWorker.state),
+      modelRequests: Object.fromEntries(yield* modelRequests.get),
     }
 
     return { shape: acceptedShape, state }

@@ -22,6 +22,7 @@ export type {
   Provider,
   ProviderModelBindOptions,
   RequestAttribution,
+  ModelRequestProgress,
   WebSearchExtension,
   WebSearchResult,
   UsageExtension,

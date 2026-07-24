@@ -14,7 +14,11 @@ import {
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
-import { isModelSlotUsableForMessages, selectedSlotModel } from "./model-slots"
+import {
+  deriveLocalModelLoadActivity,
+  isModelSlotUsableForMessages,
+  selectedSlotModel,
+} from "./model-slots"
 
 const selection = {
   providerId: ProviderIdSchema.make("local"),
@@ -86,5 +90,26 @@ describe("model slot selection", () => {
       selection,
       reason: { _tag: "ModelUnavailable", message: "Unavailable" },
     }))).toBe(false)
+  })
+
+  it("derives one shared model-loading presentation for a slot", () => {
+    const slots = {
+      slots: {
+        primary: new ModelSlotLoadingLocalModel({
+          slotId: PRIMARY_SLOT_ID,
+          selection,
+          percentage: 42,
+        }),
+        secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
+      },
+      recentModelIds: { primary: [], secondary: [] },
+      favoriteModels: [],
+    }
+
+    expect(deriveLocalModelLoadActivity(slots, PRIMARY_SLOT_ID)).toEqual({
+      percentage: 42,
+      text: "Loading model · 42%",
+    })
+    expect(deriveLocalModelLoadActivity(slots, SECONDARY_SLOT_ID)).toBeNull()
   })
 })

@@ -1,7 +1,7 @@
 /**
  * AgentStatus feature container (spec §5.6) — "what is the agent doing".
  * Reads the root timeline and task rows from display state; renders the
- * working timer and task list. Fork expansion goes through the display
+ * activity rail and task list. Fork expansion goes through the display
  * shape hook so the worker timeline is requested from the agent.
  */
 import { useMemo, type ReactNode } from 'react'
@@ -11,17 +11,27 @@ import {
   useSlotProfiles,
   useDisplayViewController,
   findSlotProfile,
+  type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID } from '@magnitudedev/sdk'
 import { Option } from 'effect'
 import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
-import { WorkingTimer } from './working-timer'
+import { ActivityRail } from './activity-rail'
 import { TaskList } from './task-list'
 
-export function WorkingTimerContainer(): ReactNode {
+export function ActivityRailContainer({
+  modelLoadActivity,
+  width,
+}: {
+  readonly modelLoadActivity: LocalModelLoadActivity | null
+  readonly width: number
+}): ReactNode {
   const timeline = useDisplayState((state) => getFork(state, null) ?? null)
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
-  const { profiles } = useSlotProfiles()
+  const modelRequestActivity = useDisplayState(
+    (state) => state.modelRequests.root ?? null,
+  )
+  const { profiles, rootProfile } = useSlotProfiles()
 
   const interrupted: InterruptedMessage | null = useMemo(() => {
     // Root interrupt from timeline statusSlot
@@ -35,8 +45,6 @@ export function WorkingTimerContainer(): ReactNode {
     return null
   }, [timeline])
 
-  if (!timeline && !rootActor) return null
-
   // Map advisor role to its slot (primary) for model display
   const advisorSlot = ROLE_TO_SLOT.advisor
   const advisorSlotId = advisorSlot === 'primary' ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
@@ -44,8 +52,12 @@ export function WorkingTimerContainer(): ReactNode {
     ? Option.getOrNull(findSlotProfile(profiles, advisorSlotId))
     : null
   return (
-    <WorkingTimer
+    <ActivityRail
       work={rootActor?.work ?? null}
+      width={width}
+      waitsForGenerationProgress={rootProfile?.providerId === "local"}
+      modelLoadActivity={modelLoadActivity}
+      modelRequestActivity={modelRequestActivity}
       interruptedMessage={interrupted}
       advisorModelName={advisorProfile?.modelDisplayName ?? null}
     />

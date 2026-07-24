@@ -17,9 +17,9 @@ use icn_contracts::{
     CompletionBackend, ExecutionConfig, ExecutionConfigReport, ExecutionIntent, FinishReason,
     FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
     HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceEvent,
-    InferenceStreamEvent, ModelModalities, ModelProperties, PreparedChatInfo, ProjectorConfig,
-    ReasoningControl, ResidentMemory, ResidentMemoryDomain, ResponseFormat, SplitMode,
-    TemplateCapabilities, ToolCall, ToolChoice,
+    InferenceProgress, InferenceStreamEvent, ModelModalities, ModelProperties, PreparedChatInfo,
+    ProjectorConfig, ReasoningControl, ResidentMemory, ResidentMemoryDomain, ResponseFormat,
+    SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -245,6 +245,8 @@ struct ActiveRequest<'model> {
     span: tracing::Span,
     cancelled: Arc<AtomicBool>,
     outbound: VecDeque<ExecutorItem>,
+    pending_progress: Option<InferenceProgress>,
+    last_progress_emitted_at: Option<Instant>,
     phase: RequestPhase,
     prompt: Vec<LlamaToken>,
     /// Tokens whose target KV state is known to be committed. The currently
@@ -1515,6 +1517,10 @@ fn handle_command(
             } else if queued.len() + active_count >= max_tracked {
                 let _ = events.try_send(ExecutorItem::Failed(InferenceError::Overloaded));
             } else {
+                let _ = events.try_send(ExecutorItem::Event(InferenceStreamEvent {
+                    delta: InferenceEvent::Progress(InferenceProgress::Queued),
+                    timings: None,
+                }));
                 queued.push_back(QueuedCompletion {
                     request,
                     events,
@@ -1600,6 +1606,12 @@ fn admit_requests<'model>(
             continue;
         }
         let cached = sequence_pool.take_cache(sequence_id);
+        let _ = queued_request
+            .events
+            .try_send(ExecutorItem::Event(InferenceStreamEvent {
+                delta: InferenceEvent::Progress(InferenceProgress::Preparing),
+                timings: None,
+            }));
         match ActiveRequest::admit(
             model,
             chat_templates,
@@ -1640,6 +1652,11 @@ fn admit_requests<'model>(
                         .filter(|_| restored)
                         .map_or(0, |value| value.prefix);
                     request.cached_prompt_tokens = request.prompt_offset;
+                    request.pending_progress = Some(InferenceProgress::Prefill {
+                        completed_tokens: request.prompt_offset,
+                        total_tokens: request.prompt_tokens,
+                        cached_tokens: request.cached_prompt_tokens,
+                    });
                     if clear_sequence_range(
                         context,
                         mtp.as_deref_mut(),
@@ -1945,6 +1962,15 @@ fn decode_batch<'model>(
     if let Some(operations) = mtp.as_mut() {
         operations.process(batch).map_err(backend_error)?;
     }
+    for request in active.iter_mut().filter(|request| {
+        request.sequence_id.is_some() && matches!(request.phase, RequestPhase::Prefill)
+    }) {
+        request.pending_progress = Some(InferenceProgress::Prefill {
+            completed_tokens: request.prompt_offset,
+            total_tokens: request.prompt_tokens,
+            cached_tokens: request.cached_prompt_tokens,
+        });
+    }
     let verification_ms = verification_started.elapsed().as_secs_f64() * 1_000.0;
     for (sequence_id, batch_index) in logits {
         let request = request_by_sequence(active, sequence_id)?;
@@ -2090,6 +2116,11 @@ fn decode_multimodal_prefill<'model>(
     let next_position = result?;
     request.next_position = next_position;
     request.prompt_offset = request.prompt.len();
+    request.pending_progress = Some(InferenceProgress::Prefill {
+        completed_tokens: request.prompt_tokens,
+        total_tokens: request.prompt_tokens,
+        cached_tokens: request.cached_prompt_tokens,
+    });
     request.phase = RequestPhase::ReadyToSample { batch_index: -1 };
     Ok(true)
 }
@@ -2207,6 +2238,39 @@ fn flush_outbound(request: &mut ActiveRequest<'_>) -> FlushOutcome {
             Err(TrySendError::Disconnected(_)) => {
                 request.outbound.clear();
                 return FlushOutcome::Disconnected;
+            }
+        }
+    }
+    if let Some(progress) = request.pending_progress {
+        const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+        let final_prefill = matches!(
+            progress,
+            InferenceProgress::Prefill {
+                completed_tokens,
+                total_tokens,
+                ..
+            } if completed_tokens >= total_tokens
+        );
+        let due = final_prefill
+            || request
+                .last_progress_emitted_at
+                .is_none_or(|last| last.elapsed() >= PROGRESS_INTERVAL);
+        if due {
+            match request
+                .events
+                .try_send(ExecutorItem::Event(InferenceStreamEvent {
+                    delta: InferenceEvent::Progress(progress),
+                    timings: None,
+                })) {
+                Ok(()) => {
+                    request.pending_progress = None;
+                    request.last_progress_emitted_at = Some(Instant::now());
+                }
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => {
+                    request.pending_progress = None;
+                    return FlushOutcome::Disconnected;
+                }
             }
         }
     }
@@ -2803,6 +2867,12 @@ impl<'model> ActiveRequest<'model> {
                 span,
                 cancelled,
                 outbound: VecDeque::new(),
+                pending_progress: Some(InferenceProgress::Prefill {
+                    completed_tokens: cached_prompt_tokens,
+                    total_tokens: prompt_tokens,
+                    cached_tokens: cached_prompt_tokens,
+                }),
+                last_progress_emitted_at: None,
                 phase: RequestPhase::Prefill,
                 cache_history: tokenized.text_tokens.clone(),
                 prompt: tokenized.text_tokens,
@@ -2878,6 +2948,9 @@ impl<'model> ActiveRequest<'model> {
         account_sample(&mut self.generated_tokens);
         self.record_sample(sampled_at);
         let starts_stream = self.generated_tokens == 1;
+        if starts_stream {
+            self.pending_progress = Some(InferenceProgress::Generating);
+        }
         if is_eog && !self.ignore_eos {
             let events = sampled_result_events(Vec::new(), starts_stream);
             let timings = (partial_timing_eligible(self.timings_per_token, false)

@@ -18,6 +18,7 @@ import {
   nativeChatCompletionsCodec,
   type BaseCallOptions,
   ChatCompletionsStreamChunk,
+  type ModelRequestProgress,
   type ProviderModelBindOptions,
   type ProviderId,
   type ProviderModelId,
@@ -198,7 +199,59 @@ const bindIcnModel = (
             Effect.mapError((cause) => generatedStartFailure(call, cause)),
             Effect.map(({ status, headers, events }) => {
               const response = acceptedHttpResponse(status, headers)
-              const chunks = events.pipe(
+              const requestProgress = bindOptions?.requestAttribution?.requestProgress
+              let progressRequestId: string | null = null
+              let semanticStarted = false
+              const reportProgress = (
+                requestId: string,
+                progress: Generated.ChatCompletionProgress,
+              ): Effect.Effect<void> => {
+                if (!requestProgress) return Effect.void
+                progressRequestId = requestId
+                const update: ModelRequestProgress = Match.value(progress).pipe(
+                  Match.tag("Queued", () => ({ phase: "queued" as const, requestId })),
+                  Match.tag("Preparing", () => ({ phase: "preparing" as const, requestId })),
+                  Match.tag("Prefill", (prefill) => ({
+                    phase: "prefill" as const,
+                    requestId,
+                    completedTokens: prefill.completedTokens,
+                    totalTokens: prefill.totalTokens,
+                    cachedTokens: prefill.cachedTokens,
+                  })),
+                  Match.tag("Generating", () => ({ phase: "generating" as const, requestId })),
+                  Match.exhaustive,
+                )
+                return requestProgress(update)
+              }
+              const sourceEvents = events.pipe(
+                Stream.tap((chunk) => Option.match(chunk.progress, {
+                  onSome: (progress) => {
+                    if (progress._tag === "Generating") semanticStarted = true
+                    return reportProgress(chunk.id, progress)
+                  },
+                  onNone: () => {
+                    if (!requestProgress || semanticStarted || chunk.choices.length === 0) {
+                      return Effect.void
+                    }
+                    semanticStarted = true
+                    progressRequestId = chunk.id
+                    return requestProgress({
+                      phase: "generating",
+                      requestId: chunk.id,
+                    })
+                  },
+                })),
+                Stream.ensuring(
+                  requestProgress
+                    ? Effect.suspend(() => requestProgress({
+                        phase: "cleared",
+                        requestId: progressRequestId,
+                      }))
+                    : Effect.void,
+                ),
+              )
+              const chunks = sourceEvents.pipe(
+                Stream.filter((chunk) => Option.isNone(chunk.progress)),
                 Stream.mapEffect((chunk) => Schema.encode(Generated.ChatCompletionChunk)(chunk).pipe(
                   Effect.flatMap(Schema.decodeUnknown(ChatCompletionsStreamChunk)),
                   Effect.mapError((cause) => new GeneratedClientInvalidResponseError({

@@ -48,6 +48,7 @@ describe('createDisplayViewStore', () => {
     actors: {},
     agents: {},
     tasks: { byId: {}, order: [], summary: { totalCount: 0, completedCount: 0, incompleteCount: 0 } },
+    modelRequests: {},
   })
 
   const makeShape = (): DisplayViewShape => ({

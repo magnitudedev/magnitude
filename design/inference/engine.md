@@ -117,6 +117,13 @@ At a high level, a completion follows this path:
 
 Prompt K/V is considered committed only after native decode succeeds. The currently sampled token remains outside committed history until a subsequent decode or verification step commits it. That boundary protects both cache correctness and recovery after speculative or native failure.
 
+The request stream also carries typed, non-semantic lifecycle observations for queueing,
+preparation, prefill, and generation start. Prefill counts advance only after the corresponding
+native decode batch succeeds and distinguish the reusable cached prefix from the total prompt.
+These observations are latest-state signals: the executor coalesces them, emits them at a bounded
+rate, and drops or replaces an update rather than allowing progress reporting to delay inference.
+Semantic output and terminal results retain their existing bounded backpressure guarantees.
+
 ## Prompt state
 
 The engine retains committed prompt state per free native sequence and assigns the longest exact
@@ -151,6 +158,8 @@ Native token results pass through UTF-8 buffering, stop detection, and a semanti
 - speculative draft, acceptance, and verification metrics when MTP is active.
 
 The server reports the effective resolved execution configuration so observed behavior can be tied to the loaded plan.
+The API represents lifecycle observations as typed control chunks with no choices. Provider
+adapters must consume those chunks outside the semantic model-output codec.
 
 ## Failure model
 

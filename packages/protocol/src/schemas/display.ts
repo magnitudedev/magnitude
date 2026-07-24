@@ -402,6 +402,7 @@ export type ContextUsageDisplay = Schema.Schema.Type<typeof ContextUsageDisplay>
 export const DisplayActorWork = Schema.Struct({
   phase: Schema.Literal("idle", "working", "worked", "interrupted"),
   activeSince: Schema.Union(Schema.Number, Schema.Null),
+  respondingSince: Schema.optional(Schema.Number),
   lastWorkMs: Schema.Number,
   accumulatedMs: Schema.Number,
   resumeCount: Schema.Number,
@@ -838,12 +839,25 @@ export const DisplayTasks = Schema.Struct({
 })
 export type DisplayTasks = Schema.Schema.Type<typeof DisplayTasks>
 
+export const DisplayModelRequestActivity = Schema.Struct({
+  requestId: Schema.Union(Schema.String, Schema.Null),
+  turnId: Schema.String,
+  forkId: Schema.Union(Schema.String, Schema.Null),
+  startedAt: Schema.Number,
+  phase: Schema.Literal("queued", "preparing", "prefill"),
+  completedTokens: Schema.Union(Schema.Number, Schema.Null),
+  totalTokens: Schema.Union(Schema.Number, Schema.Null),
+  cachedTokens: Schema.Union(Schema.Number, Schema.Null)
+})
+export type DisplayModelRequestActivity = Schema.Schema.Type<typeof DisplayModelRequestActivity>
+
 export const DisplayState = Schema.Struct({
   session: DisplaySession,
   timelines: Schema.Record({ key: Schema.String, value: DisplayTimeline }),
   actors: Schema.Record({ key: Schema.String, value: DisplayActor }),
   agents: Schema.Record({ key: Schema.String, value: DisplayAgent }),
-  tasks: DisplayTasks
+  tasks: DisplayTasks,
+  modelRequests: Schema.Record({ key: Schema.String, value: DisplayModelRequestActivity })
 })
 export type DisplayState = Schema.Schema.Type<typeof DisplayState>
 

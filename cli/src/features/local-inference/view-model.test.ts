@@ -10,7 +10,6 @@ import {
 import {
   buildLocalInferenceSelections,
   describeLocalHardware,
-  formatModelLoadProgress,
   localInferenceProgressLines,
   selectionCapacityWarning,
   selectionMetadata,
@@ -18,10 +17,6 @@ import {
 import { GIB, makeCatalogCandidate, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
 
 describe("local inference selection view model", () => {
-  it("shows native load progress", () => {
-    expect(formatModelLoadProgress(42)).toBe("Loading 42%")
-  })
-
   it("presents cumulative recommendation progress with authoritative counts and timing", () => {
     expect(localInferenceProgressLines([
       {

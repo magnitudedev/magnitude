@@ -1,18 +1,23 @@
-import { deriveHardwareMemoryView, type LocalInferenceView } from "@magnitudedev/client-common"
-import { ProviderIdSchema } from "@magnitudedev/sdk"
-import type { ProviderId } from "@magnitudedev/sdk"
+import {
+  deriveHardwareMemoryView,
+  type LocalInferenceView,
+  type LocalModelLoadActivity,
+} from "@magnitudedev/client-common"
+import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
+import type { ProviderId, SlotId } from "@magnitudedev/sdk"
 import { TextAttributes } from "@opentui/core"
 import { Button } from "../../components/button"
 import { formatMemoryBytes } from "../../components/hardware-memory-domain"
 import { StackedBar, type StackedBarSegment } from "../../components/stacked-bar"
 import { useTheme } from "../../hooks/use-theme"
-import { formatModelLoadProgress } from "./view-model"
 
 interface LocalInferenceStatusBarProps {
   readonly state: LocalInferenceView | null
   readonly width: number
   readonly selectedModelName: string | null
   readonly selectedProviderId: ProviderId | null
+  readonly selectedSlotId: SlotId
+  readonly modelLoadActivity: LocalModelLoadActivity | null
   readonly onOpenModels: () => void
   readonly onOpenHardware: () => void
 }
@@ -45,6 +50,8 @@ export const LocalInferenceStatusBar = ({
   width,
   selectedModelName,
   selectedProviderId,
+  selectedSlotId,
+  modelLoadActivity,
   onOpenModels,
   onOpenHardware,
 }: LocalInferenceStatusBarProps) => {
@@ -69,10 +76,14 @@ export const LocalInferenceStatusBar = ({
       </box>
     )
   }
-  const slots = [state.slots.slots.primary, state.slots.slots.secondary]
-  const slot = slots.find((candidate) => candidate._tag !== "Unassigned"
-    && candidate.selection.providerId === LOCAL_PROVIDER_ID)
-  const activeModel = slot && slot._tag !== "Unassigned"
+  const selectedSlot = state.slots.slots[
+    selectedSlotId === PRIMARY_SLOT_ID ? "primary" : "secondary"
+  ]
+  const slot = selectedSlot._tag !== "Unassigned"
+    && selectedSlot.selection.providerId === LOCAL_PROVIDER_ID
+    ? selectedSlot
+    : undefined
+  const activeModel = slot
     ? state.models.models.find((model) => model.preparation._tag === "Available"
       && model.preparation.providerModelIds.includes(slot.selection.providerModelId))
     : undefined
@@ -81,7 +92,7 @@ export const LocalInferenceStatusBar = ({
   const model = activeModel ?? downloadModel
   const modelName = selectedModelName ?? model?.displayName ?? "Choose a model"
   const status = slot
-    ? slot._tag === "LoadingLocalModel" ? formatModelLoadProgress(slot.percentage)
+    ? slot._tag === "LoadingLocalModel" ? modelLoadActivity?.text ?? "Loading model"
       : slot._tag === "UnloadedLocalModel" ? "Idle"
         : slot._tag === "UnloadingLocalModel" ? "Unloading"
           : slot._tag === "Blocked" ? "Failed"

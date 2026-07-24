@@ -142,8 +142,6 @@ export const formatContext = (tokens: number): string => tokens < 1_000
     ? `${tokens / 1_024}K`
     : `${Math.round(tokens / 1_000)}K`
 
-export const formatModelLoadProgress = (percentage: number): string => `Loading ${percentage}%`
-
 const progressLabel = (
   id: LocalModelRecommendationProgressStep["id"],
   completed: boolean,

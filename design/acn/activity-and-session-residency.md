@@ -27,6 +27,8 @@ applies_to:
   - packages/agent/src/events.ts
   - packages/agent/src/display/**
   - packages/agent/src/display-view/**
+  - packages/agent/src/model-request-activity.ts
+  - packages/agent/src/model/model-resolver.ts
   - packages/agent/src/index.ts
   - packages/agent/src/execution/execution-manager.ts
   - packages/agent/src/execution/types.ts
@@ -103,6 +105,35 @@ session, reattaches the display, and sends a full snapshot.
 Detachment invalidates the attachment generation before signaling its forwarding fiber to stop.
 Retirement does not wait for that fiber's downstream finalizers: the generation token prevents any
 late event from being published, while cleanup completes asynchronously.
+
+Active local-model request progress is transient session-runtime state, not an app event or chat
+message. It is keyed by fork and included in every live display snapshot, so a reconnect sees the
+current request while it remains active. It disappears when generation begins or the request
+stream ends and is never written to session history. Clients may delay rendering briefly to avoid
+flashing short prefills, but they do not infer token progress or preserve a second copy.
+
+The CLI reserves one fixed-height activity rail below the chat timeline. Root-model loading,
+conversation prefill, and model response activity all occupy that same row, so transitions do not
+move the chat or composer. Model loading is shown immediately. Request preparation and prefill are
+shown only after a short anti-flicker delay. Once generation begins, the row becomes the existing
+composable Working display, including thinking, tools, advisor activity, and worker counts.
+
+While the root slot is loading, the rail may present its authoritative percentage as well as
+persistent model chrome. Both presentations derive from the one mirrored slot lifecycle state;
+readiness hands the rail from model loading to request prefill without a client-owned loading state
+or timer.
+
+Local request admission publishes preparing activity before acquiring the selected model. Its
+request identifier remains absent until ICN accepts the native request, and that handoff preserves
+the activity start time. Consequently a long model load satisfies the client's anti-flicker delay
+and the rail transitions directly into conversation loading when the slot becomes ready.
+
+The activity service records the generation-start timestamp in the same atomic update that removes
+prefill progress. Display snapshots attach that timestamp to root work for the current chain. The
+live Working timer therefore begins when the model starts responding, rather than including model
+admission or prefill time, and the rail can transition from prefill to Working without disappearing
+between snapshots. Providers that do not expose granular request progress continue to use the
+actor's work-start timestamp as a fallback.
 
 Closing the final subscription removes the display registration. There is no separate close RPC.
 
