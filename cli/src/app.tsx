@@ -17,7 +17,6 @@ import {
   useDisplayViewController,
   useDisplayConnectionError,
   useSelectedSessionId,
-  settingsOpenAtom,
   usageOpenAtom,
   selectedFilePathAtom,
   selectedCwdAtom,
@@ -30,7 +29,7 @@ import {
   isModelSlotUsableForMessages,
 } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, type SessionOptions } from '@magnitudedev/sdk'
-import { authSourceAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
+import { authSourceAtom, modelMenuStateAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
 import { useSessionStartup, type SessionStart } from './hooks/use-session-startup'
 import { useTerminalBgDetection } from './hooks/use-terminal-bg-detection'
 import { useTerminalKeyboard } from './hooks/use-terminal-keyboard'
@@ -51,6 +50,7 @@ import { WorkingTimerContainer, TaskListContainer } from './features/agent-statu
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
 import { LocalInferenceStatusBar } from './features/local-inference/status-bar'
+import { ModelMenusContainer } from './features/model-menus/container'
 import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/sessions/container'
 import {
   ModelSetupScreen,
@@ -203,7 +203,8 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
   const selectedCwd = useAtomValue(selectedCwdAtom)
-  const setSettingsOpen = useAtomSet(settingsOpenAtom)
+  const menu = useAtomValue(modelMenuStateAtom)
+  const setMenu = useAtomSet(modelMenuStateAtom)
   const setUsageOpen = useAtomSet(usageOpenAtom)
   const activeOverlay = useActiveOverlay()
   const isOverlayActive = activeOverlay !== 'none'
@@ -217,19 +218,27 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const ephemeralMessage = useSyncExternalStore(subscribeEphemeralMessage, getEphemeralMessageSnapshot)
   const localInference = useLocalInferenceQuery()
   const localInferenceSnapshot = Result.value(localInference)
+  const downloadingModelCount = Option.match(localInferenceSnapshot, {
+    onNone: () => 0,
+    onSome: ({ models }) => models.models.filter((model) => model.download._tag === 'Downloading').length,
+  })
+  const downloadSummary = downloadingModelCount === 0
+    ? null
+    : `${downloadingModelCount} ${downloadingModelCount === 1 ? 'model' : 'models'} downloading`
+  const { rootProfile } = useSlotProfiles()
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
 
   const dispatchErrorAction = useCallback((actionId: ActionId) => {
     switch (actionId) {
       case 'open-settings':
-        setSettingsOpen(true)
+        setMenu({ open: true, root: 'models' })
         return
       case 'open-usage':
         setUsageOpen(true)
         return
     }
-  }, [setSettingsOpen, setUsageOpen])
+  }, [setMenu, setUsageOpen])
 
   useTerminalKeyboard({ dispatchErrorAction })
 
@@ -249,9 +258,9 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
         <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Tip: </text>
         <text style={{ fg: theme.muted }}>Use </text>
         <text style={{ fg: theme.foreground }}>/settings</text>
-        <text style={{ fg: theme.muted }}> to view your connection and roles.</text>
+        <text style={{ fg: theme.muted }}> to choose and manage models.</text>
       </box>
-      {!widget.hasActivity && (
+      {!widget.hasActivity && !(menu.open && sessionId === null) && (
         <box style={{ paddingLeft: 1 }}>
           <RecentChatsWidgetView state={widget} />
         </box>
@@ -269,29 +278,39 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
           style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, position: 'relative', height: '100%' }}
         >
           <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
-            {Option.getOrNull(Option.map(localInferenceSnapshot, (snapshot) => (
-              <LocalInferenceStatusBar
-                state={snapshot}
-                width={chatColumnWidth}
-                onOpenHardware={() => setSettingsOpen(true)}
-              />
-            )))}
-            <ChatTimelineContainer
-              header={startupHeader}
-              chatColumnWidth={chatColumnWidth}
-              dispatchErrorAction={dispatchErrorAction}
-              isOverlayActive={isOverlayActive}
+            <LocalInferenceStatusBar
+              state={Option.getOrNull(localInferenceSnapshot)}
+              width={chatColumnWidth}
+              selectedModelName={rootProfile?.modelDisplayName ?? null}
+              selectedProviderId={rootProfile?.providerId ?? null}
+              onOpenModels={() => setMenu({ open: true, root: 'models' })}
+              onOpenHardware={() => setMenu({ open: true, root: 'hardware' })}
             />
-            <WorkingTimerContainer />
-            <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-              <TaskListContainer />
+            <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
+              <box style={{ flexGrow: 1, flexShrink: 1, minHeight: 0, flexDirection: 'column', overflow: 'hidden' }}>
+                <ChatTimelineContainer
+                  header={startupHeader}
+                  chatColumnWidth={chatColumnWidth}
+                  dispatchErrorAction={dispatchErrorAction}
+                  isOverlayActive={isOverlayActive}
+                />
+                <WorkingTimerContainer />
+                <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
+                  <TaskListContainer />
+                </box>
+              </box>
+              {menu.open
+                ? <ModelMenusContainer downloadSummary={downloadSummary} />
+                : (
+                  <ComposerContainer
+                    chatColumnWidth={chatColumnWidth}
+                    widgetNavActive={widget.widgetNavActive}
+                    handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
+                    modelsConfigured={props.modelsConfigured}
+                    downloadSummary={downloadSummary}
+                  />
+                )}
             </box>
-            <ComposerContainer
-              chatColumnWidth={chatColumnWidth}
-              widgetNavActive={widget.widgetNavActive}
-              handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
-              modelsConfigured={props.modelsConfigured}
-            />
           </box>
 
           {clipboardToast && (

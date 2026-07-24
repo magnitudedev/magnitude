@@ -1522,6 +1522,7 @@ pub(crate) fn build_model(
                     properties: InventoryProperties::Inspected {
                         architecture: inspection.architecture,
                         quantization: inspection.quantization,
+                        quantization_name: inspection.quantization_name,
                         parameter_count: inspection.parameter_count,
                         active_parameter_count: inspection.active_parameter_count,
                         training_context_length: inspection.training_context_length,

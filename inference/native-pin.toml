@@ -5,7 +5,7 @@ checkout_path = "native/llama-cpp-rs"
 crate_path = "native/llama-cpp-rs/llama-cpp-2"
 repository = "https://github.com/magnitudedev/llama-cpp-rs.git"
 upstream_repository = "https://github.com/utilityai/llama-cpp-rs"
-revision = "5871483c305850f2473919acc509bd424b116ea8"
+revision = "dddce4949bbbe9e1e08cf363cedaa0d7153e72dc"
 release = "0.1.151"
 
 [llama_cpp]

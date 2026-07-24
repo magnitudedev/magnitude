@@ -3,7 +3,6 @@ import {
   LocalModelsMirror,
   type LocalModel,
   type LocalInferenceError,
-  type LocalModelRecommendation,
   type LocalModelDownload,
   type LocalModelPreparation,
   type LocalModelsState,
@@ -12,8 +11,6 @@ import {
   type ModelOfferingTargetId,
   type ModelPackageEntry,
   type ProviderModelCatalogEntry,
-  type Recommendation,
-  type RecommendableModel,
   modelOfferingTargetPackageIds,
 } from "@magnitudedev/protocol"
 import type { ProviderModelId } from "@magnitudedev/sdk"
@@ -133,7 +130,7 @@ const aggregatePreparation = (
       failure: {
         code: disabled.availability.reason,
         message: disabled.availability.reason === "insufficient_resources"
-          ? "This model configuration no longer fits the available hardware capacity"
+          ? "This model configuration is no longer compatible with the available hardware capacity"
           : "This model configuration is not available to the local runtime",
         retryable: true,
       },
@@ -147,39 +144,6 @@ const aggregatePreparation = (
     }
   }
   return { _tag: "Preparing" }
-}
-
-const recommendationProjection = (
-  recommendation: Recommendation,
-  recommendable: RecommendableModel,
-): LocalModelRecommendation => {
-  const requiredBytes = recommendation.assessment.memory
-    .reduce((total, memory) => total + memory.requiredBytes, 0)
-  const availableBytes = recommendation.assessment.memory
-    .reduce((total, memory) => total + memory.capacityBytes, 0)
-  return {
-    id: recommendation.id,
-    modelId: recommendation.modelId,
-    displayName: recommendation.displayName,
-    intent: recommendation.intent,
-    explanation: recommendation.explanation,
-    sources: targetPackages(recommendation.configuration.target).map((modelPackage) => ({
-      source: modelPackage.source,
-      files: modelPackage.files.map(({ path, sha256 }) => ({ path, sha256 })),
-    })),
-    qualityScoreProvenance: recommendable.qualityScoreProvenance,
-    fidelityRank: recommendable.fidelityRank,
-    qualityEvidence: recommendable.qualityEvidence,
-    profile: recommendation.configuration.profile,
-    fit: {
-      requiredBytes,
-      availableBytes,
-      estimatedTokensPerSecond: Option.map(
-        recommendation.assessment.performance,
-        ({ estimatedTokensPerSecond }) => estimatedTokensPerSecond,
-      ),
-    },
-  }
 }
 
 export interface LocalModelsApi {
@@ -312,6 +276,11 @@ export const LocalModelsLive: Layer.Layer<
       const modelPackages = targetPackages(projection.target)
       return {
         id: projection.id,
+        catalogCandidateIds: recommendationState._tag === "Ready"
+          ? recommendationState.catalog
+              .filter(({ modelId }) => modelId === projection.id)
+              .map(({ candidate }) => candidate.id)
+          : [],
         displayName: projection.displayName,
         description: projection.description,
         kind: projection.target._tag === "Package" ? "Standalone" : "SpeculativePair",
@@ -333,6 +302,26 @@ export const LocalModelsLive: Layer.Layer<
         ),
       }
     }).sort((left, right) => left.displayName.localeCompare(right.displayName))
+    const catalogCandidates = recommendationState._tag === "Ready"
+      ? recommendationState.catalog.map((entry) => {
+          const model = models.find(({ id }) => id === entry.modelId)
+          const preparation = !model || model.preparation._tag === "NotDownloaded"
+            ? { _tag: "NotDownloaded" as const }
+            : model.preparation._tag === "Preparing"
+              ? { _tag: "Calibrating" as const }
+              : model.preparation._tag === "Available"
+                ? { _tag: "Installed" as const }
+                : { _tag: "Unavailable" as const, failure: model.preparation.failure }
+          return {
+            ...entry.candidate,
+            download: model?.download ?? entry.candidate.download,
+            preparation,
+          }
+        })
+      : []
+    const catalogCandidatesById = new Map(
+      catalogCandidates.map((candidate) => [candidate.id, candidate]),
+    )
     const recommendationLifecycle = recommendationState._tag === "Loading"
       ? {
           _tag: "Loading" as const,
@@ -347,12 +336,21 @@ export const LocalModelsLive: Layer.Layer<
         : {
             _tag: "Ready" as const,
             entries: recommendationState.recommendations.flatMap((recommendation) => {
-              const recommendable = catalogModels.find((model) =>
-                model.id === recommendation.recommendableModelId)
-              return recommendable
-                ? [recommendationProjection(recommendation, recommendable)]
+              const entry = recommendationState.catalog.find(({ configuration }) =>
+                configuration.id === recommendation.configuration.id)
+              const candidate = entry
+                ? catalogCandidatesById.get(entry.candidate.id)
+                : undefined
+              return candidate
+                ? [{
+                    id: recommendation.id,
+                    intent: recommendation.intent,
+                    explanation: recommendation.explanation,
+                    candidate,
+                  }]
                 : []
             }),
+            catalog: catalogCandidates,
             progress: recommendationState.progress,
           }
     yield* mirror.setIfChanged({

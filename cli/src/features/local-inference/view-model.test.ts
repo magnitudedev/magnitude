@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
+  CatalogCandidateIdSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
@@ -14,7 +15,7 @@ import {
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
-import { GIB, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
+import { GIB, makeCatalogCandidate, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
 
 describe("local inference selection view model", () => {
   it("shows native load progress", () => {
@@ -185,15 +186,19 @@ describe("local inference selection view model", () => {
     const recommendation = (
       intent: "balanced" | "best_quality" | "fastest" | "lightweight",
       index: number,
-    ) => makeRecommendation({
-      id: RecommendationIdSchema.make(`recommendation_${intent}`),
-      modelId: ModelOfferingTargetIdSchema.make(`target_${index}`),
-      intent,
-      explanation: `${intent} explanation`,
-    })
+    ) => {
+      const candidateId = CatalogCandidateIdSchema.make(`candidate_${index}`)
+      return makeRecommendation({
+        id: RecommendationIdSchema.make(`recommendation_${intent}`),
+        candidate: makeCatalogCandidate({ id: candidateId }),
+        intent,
+        explanation: `${intent} explanation`,
+      })
+    }
     const intents = ["fastest", "lightweight", "best_quality", "balanced"] as const
     const models = intents.map((intent, index) => makeModel({
       id: ModelOfferingTargetIdSchema.make(`target_${index}`),
+      catalogCandidateIds: [CatalogCandidateIdSchema.make(`candidate_${index}`)],
       displayName: `${intent} model`,
       download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
       preparation: { _tag: "NotDownloaded" },

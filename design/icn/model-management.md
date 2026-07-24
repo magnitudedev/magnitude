@@ -43,8 +43,10 @@ refs, filenames, local paths, display names, and download attempts are not packa
 ICN resolves Hugging Face sources to immutable commits and exact selected files before publishing a
 package. A local package does not claim Hugging Face provenance unless it has an established source.
 
-Package inspection produces `Pending`, `Inspected`, `Invalid`, or `Incompatible`. Invalid and
-incompatible packages retain specific diagnostics and are never loadable.
+Package inspection produces `Pending`, `Inspected`, `Invalid`, or `Incompatible`. Inspected GGUF
+packages carry both llama.cpp's authoritative file-type family name and a coarse user-facing
+bit-width name. Invalid and incompatible packages retain specific diagnostics and are never
+loadable.
 
 ## Recommendable model catalog
 

@@ -3,14 +3,19 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { createHash } from "node:crypto"
 import * as NodePath from "node:path"
 import {
+  CatalogCandidateIdSchema,
+  LocalModelCatalogCandidateSchema,
   ModelFailureSchema,
+  ModelOfferingTargetIdSchema,
+  ModelServingConfigurationSchema,
   LocalModelRecommendationProgressStepSchema,
   RecommendationSchema,
+  RecommendableModelIdSchema,
+  type CatalogCandidateId,
   type LocalModelRecommendationProgressStep,
   type LocalModelRecommendationProgressStepId,
   type ModelFailure,
   type Recommendation,
-  type RecommendationId,
   type RecommendableModel,
 } from "@magnitudedev/protocol"
 import { IcnCatalog, IcnHardware, IcnInstalledModels } from "@magnitudedev/icn"
@@ -22,6 +27,7 @@ import { makeObservedState } from "./mirrored-state"
 import { LocalModelEvaluations } from "./local-model-evaluations"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import {
+  rankCatalogCandidates,
   selectRecommendationPortfolio,
   type RecommendationCandidate,
 } from "./local-model-recommendation-policy"
@@ -34,6 +40,7 @@ type RecommendationState =
   | {
       readonly _tag: "Ready"
       readonly recommendations: readonly Recommendation[]
+      readonly catalog: readonly CatalogEntry[]
       readonly progress: readonly LocalModelRecommendationProgressStep[]
     }
   | {
@@ -47,7 +54,9 @@ export interface LocalModelRecommendationsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: RecommendationState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: RecommendationState }>
   readonly refresh: Effect.Effect<void>
-  readonly get: (id: RecommendationId) => Effect.Effect<Recommendation | undefined>
+  readonly getCatalog: (
+    id: CatalogCandidateId,
+  ) => Effect.Effect<CatalogEntry | undefined>
 }
 
 export class LocalModelRecommendations extends Context.Tag("LocalModelRecommendations")<
@@ -63,6 +72,70 @@ const publishedWeightBytes = (model: RecommendableModel): number => {
     .filter(({ role }) => role === "weights")
     .reduce((total, { sizeBytes }) => total + sizeBytes, 0)
 }
+
+const targetPackages = (model: RecommendableModel) =>
+  model.target._tag === "Package"
+    ? [model.target.package]
+    : [model.target.target, model.target.draft]
+
+const CatalogEntrySchema = Schema.Struct({
+  candidate: LocalModelCatalogCandidateSchema,
+  modelId: ModelOfferingTargetIdSchema,
+  recommendableModelId: RecommendableModelIdSchema,
+  configuration: ModelServingConfigurationSchema,
+  recommendation: Schema.optionalWith(RecommendationSchema, { as: "Option", exact: true }),
+})
+type CatalogEntry = typeof CatalogEntrySchema.Type
+
+const catalogProjection = (
+  candidate: RecommendationCandidate,
+  recommendation: Recommendation | undefined,
+): CatalogEntry => ({
+  candidate: {
+    id: CatalogCandidateIdSchema.make(candidate.assessment.configurationId),
+    displayName: candidate.model.displayName,
+    description: candidate.model.description,
+    license: candidate.model.license,
+    profile: candidate.profile,
+    downloadBytes: candidate.totalDownloadBytes,
+    download: {
+      _tag: "NotDownloaded",
+      completedBytes: 0,
+      totalBytes: candidate.totalDownloadBytes,
+    },
+    preparation: { _tag: "NotDownloaded" },
+    quantization: targetPackages(candidate.model)
+      .map(({ properties }) => properties.quantization)
+      .join(" + "),
+    quantizationName: targetPackages(candidate.model)
+      .map(({ properties }) => properties.quantizationName)
+      .join(" + "),
+    runtimeMemoryBytes: candidate.estimatedRuntimeBytes,
+    availableMemoryBytes: candidate.assessment.memory
+      .reduce((total, domain) => total + domain.capacityBytes, 0),
+    intelligenceScore: candidate.capability?.score ?? 0,
+    intelligenceProvenance: candidate.capability?.provenance ?? "Unavailable",
+    fidelityRank: candidate.fidelityRank,
+    qualityEvidence: candidate.model.qualityEvidence,
+    estimatedTokensPerSecond: Option.map(
+      candidate.assessment.performance,
+      ({ estimatedTokensPerSecond }) => estimatedTokensPerSecond,
+    ),
+    capabilities: candidate.model.capabilities,
+    sources: targetPackages(candidate.model).map((modelPackage) => ({
+      source: modelPackage.source,
+      files: modelPackage.files.map(({ path, sha256 }) => ({ path, sha256 })),
+    })),
+  },
+  modelId: candidate.model.targetId,
+  recommendableModelId: candidate.model.id,
+  configuration: {
+    id: candidate.assessment.configurationId,
+    target: candidate.model.target,
+    profile: candidate.profile,
+  },
+  recommendation: Option.fromNullable(recommendation),
+})
 
 const pendingProgress = (
   id: LocalModelRecommendationProgressStepId,
@@ -99,6 +172,7 @@ const CachedRecommendationPortfolioSchema = Schema.Struct({
   capturedAtMs: NonNegativeSafeInteger,
   inputDigest: Schema.NonEmptyString,
   recommendations: Schema.Array(RecommendationSchema),
+  catalog: Schema.Array(CatalogEntrySchema),
 })
 
 type CachedRecommendationPortfolio = typeof CachedRecommendationPortfolioSchema.Type
@@ -142,6 +216,7 @@ export const makeLocalModelRecommendationsLive = (
   const progressRef = yield* Ref.make(startupProgress)
   const lastInputDigest = yield* Ref.make<Option.Option<string>>(Option.none())
   const recommendationsEquivalent = Schema.equivalence(Schema.Array(RecommendationSchema))
+  const catalogEquivalent = Schema.equivalence(Schema.Array(CatalogEntrySchema))
   const failuresEquivalent = Schema.equivalence(ModelFailureSchema)
   const progressEquivalent = Schema.equivalence(
     Schema.Array(LocalModelRecommendationProgressStepSchema),
@@ -151,7 +226,8 @@ export const makeLocalModelRecommendationsLive = (
     && progressEquivalent(left.progress, right.progress)
     && (left._tag === "Loading"
       || (left._tag === "Ready" && right._tag === "Ready"
-        && recommendationsEquivalent(left.recommendations, right.recommendations))
+        && recommendationsEquivalent(left.recommendations, right.recommendations)
+        && catalogEquivalent(left.catalog, right.catalog))
       || (left._tag === "Failed" && right._tag === "Failed"
         && failuresEquivalent(left.failure, right.failure)))
   const lock = yield* Effect.makeSemaphore(1)
@@ -321,7 +397,10 @@ export const makeLocalModelRecommendationsLive = (
     if (Option.exists(persisted, ({ capturedAtMs, inputDigest: digest }) =>
       digest === inputDigest
       && Date.now() - capturedAtMs <= RECOMMENDATION_PORTFOLIO_MAX_AGE_MS)) {
-      const recommendations = Option.getOrThrow(persisted).recommendations
+      const {
+        recommendations,
+        catalog: catalogCandidates,
+      } = Option.getOrThrow(persisted)
       const reusedAt = Date.now()
       progress = updateProgress(progress, "assessment", {
         status: {
@@ -348,6 +427,7 @@ export const makeLocalModelRecommendationsLive = (
       yield* mirror.setIfChanged({
         _tag: "Ready",
         recommendations,
+        catalog: catalogCandidates,
         progress,
       }, equivalent)
       return
@@ -446,6 +526,23 @@ export const makeLocalModelRecommendationsLive = (
     const selectionStartedAt = Date.now()
     progress = yield* startStep(progress, "selection")
     const selected = selectRecommendationPortfolio(evaluated)
+    const rankedCandidates = rankCatalogCandidates(evaluated)
+    const candidatesByConfiguration = new Map(
+      rankedCandidates.map((candidate) => [candidate.assessment.configurationId, candidate]),
+    )
+    const labeledCandidates = selected.flatMap((recommendation) => {
+      const candidate = candidatesByConfiguration.get(recommendation.configuration.id)
+      return candidate ? [catalogProjection(candidate, recommendation)] : []
+    })
+    const labeledConfigurationIds = new Set(
+      labeledCandidates.map(({ configuration }) => configuration.id),
+    )
+    const catalogCandidates = [
+      ...labeledCandidates,
+      ...rankedCandidates
+        .filter(({ assessment }) => !labeledConfigurationIds.has(assessment.configurationId))
+        .map((candidate) => catalogProjection(candidate, undefined)),
+    ]
     progress = updateProgress(progress, "selection", {
       status: {
         _tag: "Completed",
@@ -462,6 +559,7 @@ export const makeLocalModelRecommendationsLive = (
       capturedAtMs: Date.now(),
       inputDigest,
       recommendations: selected,
+      catalog: catalogCandidates,
     } satisfies CachedRecommendationPortfolio
     yield* Ref.set(cachedPortfolioRef, Option.some(portfolio))
     yield* writeStructuredFileAtomic(
@@ -478,6 +576,7 @@ export const makeLocalModelRecommendationsLive = (
     yield* mirror.setIfChanged({
       _tag: "Ready",
       recommendations: selected,
+      catalog: catalogCandidates,
       progress,
     }, equivalent)
   })).pipe(
@@ -534,8 +633,8 @@ export const makeLocalModelRecommendationsLive = (
     snapshot: mirror.get,
     changes: mirror.changes,
     refresh,
-    get: (id) => mirror.get.pipe(Effect.map(({ state }) => state._tag === "Ready"
-      ? state.recommendations.find((recommendation) => recommendation.id === id)
+    getCatalog: (id) => mirror.get.pipe(Effect.map(({ state }) => state._tag === "Ready"
+      ? state.catalog.find((entry) => entry.candidate.id === id)
       : undefined)),
   })
 }))

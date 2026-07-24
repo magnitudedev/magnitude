@@ -40,6 +40,7 @@ describe('agent model configuration boundary', () => {
       supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
       contextWindow: 8_192,
       maxOutputTokens: 1_024,
+      runtimeMemoryBytes: Option.none(),
       capabilities: {
         vision: false,
         tools: true,

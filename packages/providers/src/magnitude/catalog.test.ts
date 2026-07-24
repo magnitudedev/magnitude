@@ -38,4 +38,17 @@ describe("Magnitude model catalog mapping", () => {
       value: ["none", "low", "medium", "high", "max"],
     })
   })
+
+  it("treats an empty slot list on a user-facing model as generally selectable", () => {
+    const model = toMagnitudeModelInfo(rawModel({ slots: [] }))
+    expect(model.slots).toEqual(["primary"])
+  })
+
+  it("does not expose utility models as selectable", () => {
+    const model = toMagnitudeModelInfo(rawModel({
+      slots: [],
+      type: Option.some("utility"),
+    }))
+    expect(model.slots).toEqual([])
+  })
 })

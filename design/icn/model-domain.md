@@ -8,6 +8,7 @@ applies_to:
   - packages/acn/src/local-provider-**
   - packages/protocol/src/schemas/model-state.ts
   - cli/src/features/local-inference/**
+  - cli/src/features/model-menus/**
   - packages/storage/src/types/config.ts
   - inference/crates/icn-contracts/src/models.rs
   - inference/crates/icn-models/**
@@ -150,7 +151,10 @@ RecommendableModel
   capability evidence
 ```
 
-Package, source, quantization, and speculative-pair facts belong to the target. The recommendable
+Package, source, quantization, and speculative-pair facts belong to the target. ICN resolves GGUF
+file-type families through the pinned llama.cpp binding rather than duplicating their numeric
+values. Package metadata retains llama.cpp's authoritative family name and a coarse user-facing
+bit-width name derived by an exhaustive match over the binding's complete file-type enum. The recommendable
 model adds only recommendation-specific metadata.
 
 Each exact package or speculative pair is a separate recommendable model. Family or checkpoint
@@ -197,6 +201,11 @@ collection work carries completed and total counts. Completed work remains visib
 runs. Presentation may animate a running step from the published start time, but it must not invent
 server progress.
 
+The complete compatible recommendable-candidate projection is published beside the small labeled
+portfolio. Labeled portfolio members retain their intent and order. Remaining compatible
+candidates are ordered by one internal balanced recommendation score. That score is ranking
+metadata, not user-facing model metadata, and clients do not display it.
+
 ### Provider offering
 
 One stable provider-facing choice:
@@ -234,6 +243,16 @@ using the model default whenever the requested or stored value is unsupported.
 A client that assigns a slot must keep the initiating flow alive until the authoritative
 `ModelSlots` mirror confirms that exact normalized selection. Starting an assignment mutation is
 not confirmation and must not advance onboarding or another configuration flow by itself.
+
+### Model favorites
+
+A favorite is a durable user preference identified by the provider identity and provider model
+identity together. Favoriting never selects, loads, installs, or otherwise changes a model.
+
+The model-selection menu marks favorites immediately after the authoritative preference changes and
+places models that were favorites when the menu was entered before non-favorites. Preference,
+selection, and recency changes never reorder an open model list; the next entry into that menu
+captures a new ordering snapshot.
 
 ## Relationships
 

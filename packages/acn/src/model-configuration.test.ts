@@ -17,6 +17,11 @@ const localSelection = (model: string) => ({
   reasoningEffort: ReasoningEffortSchema.make("high"),
 })
 
+const modelIdentity = (provider: string, model: string) => ({
+  providerId: ProviderIdSchema.make(provider),
+  providerModelId: ProviderModelIdSchema.make(model),
+})
+
 const updateStorage = (state: Ref.Ref<MagnitudeConfig>) => ({
   load: () => Ref.get(state),
   update: (update: (current: MagnitudeConfig) => MagnitudeConfig) => Ref.modify(state, (current) => {
@@ -35,6 +40,7 @@ describe("model configuration ownership", () => {
             secondary: Option.some(selection("secondary-old")),
           },
           localModelRecency: { primary: [], secondary: [] },
+          favoriteModels: [],
           localProviderOfferings: [],
           dismissedDownloadFailures: [],
         },
@@ -61,6 +67,7 @@ describe("model configuration ownership", () => {
             primary: [ProviderModelIdSchema.make("local-b"), ProviderModelIdSchema.make("local-a")],
             secondary: [],
           },
+          favoriteModels: [],
           localProviderOfferings: [],
           dismissedDownloadFailures: [],
         },
@@ -72,5 +79,18 @@ describe("model configuration ownership", () => {
 
     expect(state.localModelRecency.primary).toEqual(["local-a", "local-b"])
     expect(state.localModelRecency.secondary).toEqual([])
+  })
+
+  it("persists provider-qualified model favorites", async () => {
+    const state = await Effect.runPromise(Effect.gen(function* () {
+      const stored = yield* Ref.make<MagnitudeConfig>({})
+      const configuration = yield* makeModelConfiguration(updateStorage(stored))
+      yield* configuration.setFavorite(modelIdentity("local", "shared"), true)
+      yield* configuration.setFavorite(modelIdentity("magnitude", "shared"), true)
+      yield* configuration.setFavorite(modelIdentity("local", "shared"), false)
+      return yield* configuration.get
+    }))
+
+    expect(state.favoriteModels).toEqual([modelIdentity("magnitude", "shared")])
   })
 })

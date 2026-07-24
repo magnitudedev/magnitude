@@ -3,6 +3,7 @@ import { ProviderModelIdSchema } from '@magnitudedev/ai'
 import {
   LocalProviderOfferingOriginSchema,
   ModelOfferingTargetIdSchema,
+  ProviderModelIdentitySchema,
   ModelServingConfigurationSchema,
   ModelPackageIdSchema,
   SlotIdSchema,
@@ -54,6 +55,10 @@ export const ModelConfigSchema = Schema.Struct({
   }), {
     default: () => ({ primary: [], secondary: [] }),
   }),
+  favoriteModels: Schema.optionalWith(
+    Schema.Array(ProviderModelIdentitySchema),
+    { default: () => [] },
+  ),
   localProviderOfferings: Schema.optionalWith(
     Schema.Array(PersistedLocalProviderOfferingSchema),
     { default: () => [] },

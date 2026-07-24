@@ -3,10 +3,16 @@ import { testRender } from "@opentui/react/test-utils"
 import { Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
-import { GIB, makeModel, makeRecommendation, makeView } from "../local-inference/test-fixtures"
+import {
+  GIB,
+  makeCatalogCandidate,
+  makeModel,
+  makeRecommendation,
+  makeView,
+} from "../local-inference/test-fixtures"
 
 const actions = vi.hoisted(() => ({
-  downloadRecommendedModel: vi.fn(),
+  downloadCatalogModel: vi.fn(),
   retryModelDownload: vi.fn(),
   cancelModelDownload: vi.fn(),
   dismissModelDownloadFailure: vi.fn(),
@@ -82,7 +88,7 @@ test("clicking an available inventory entry requests its download", async () => 
     await act(view.renderOnce)
     const position = textPosition(view.captureCharFrame(), model.displayName)
     await act(async () => view.mockMouse.click(position.x, position.y))
-    expect(actions.downloadRecommendedModel).toHaveBeenCalledWith(recommendation.id)
+    expect(actions.downloadCatalogModel).toHaveBeenCalledWith(recommendation.candidate.id)
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -124,11 +130,11 @@ test("renders consumer recommendation intent and its trade-off explanation", asy
   const recommendation = makeRecommendation({
     intent: "fastest",
     explanation: "Prioritizes responsive generation at about 42.0 tokens/sec.",
-    fit: {
-      requiredBytes: 12 * GIB,
-      availableBytes: 32 * GIB,
+    candidate: makeCatalogCandidate({
+      runtimeMemoryBytes: 12 * GIB,
+      availableMemoryBytes: 32 * GIB,
       estimatedTokensPerSecond: Option.some(42),
-    },
+    }),
   })
   state = makeView({ models: [model], recommendations: [recommendation], ready: false })
   const view = await testRender(

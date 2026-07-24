@@ -7,11 +7,12 @@ import {
   type ProviderModelCatalogEntry,
   modelOfferingTargetPackageIds,
 } from "@magnitudedev/protocol"
-import { IcnHardware } from "@magnitudedev/icn"
+import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { LocalModelEvaluations } from "./local-model-evaluations"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
+import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import { makeObservedState } from "./mirrored-state"
 
 export interface LocalProviderOfferingProjectionState {
@@ -33,8 +34,9 @@ export class LocalProviderOfferingProjection extends Context.Tag("LocalProviderO
 export const LocalProviderOfferingProjectionLive: Layer.Layer<
   LocalProviderOfferingProjection,
   never,
-  IcnHardware | LocalModelEvaluations | LocalModelPackages | LocalProviderOfferings
+  IcnCatalog | IcnHardware | LocalModelEvaluations | LocalModelPackages | LocalProviderOfferings
 > = Layer.scoped(LocalProviderOfferingProjection, Effect.gen(function* () {
+  const catalog = yield* IcnCatalog
   const evaluations = yield* LocalModelEvaluations
   const hardware = yield* IcnHardware
   const packages = yield* LocalModelPackages
@@ -52,6 +54,11 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
     entriesEquivalent(left.entries, right.entries)
     && Option.getOrUndefined(left.failure)?.message === Option.getOrUndefined(right.failure)?.message
   const compute = Effect.gen(function* () {
+    const recommendableModels = (yield* Effect.forEach(
+      (yield* catalog.get).state.models,
+      (model) => recommendableModelFromIcn(model).pipe(Effect.option),
+    )).flatMap(Option.toArray)
+    const curatedNames = new Map(recommendableModels.map((model) => [model.targetId, model.displayName]))
     const installedIds = yield* packages.installedPackageIds
     const configured = yield* offerings.list
     const installed = configured.map((offering) =>
@@ -81,12 +88,18 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
         providerId: LOCAL_PROVIDER_ID,
         providerModelId: offering.providerModelId,
         modelFamilyId: Option.none(),
-        displayName: target._tag === "Package"
+        displayName: curatedNames.get(offering.modelId) ?? (target._tag === "Package"
           ? `${sourceName} ${targetPackage.properties.quantization}`
-          : `${sourceName} + speculative draft`,
+          : `${sourceName} + speculative draft`),
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
         contextWindow: profile.contextLength,
         maxOutputTokens: Math.min(32_768, profile.contextLength),
+        runtimeMemoryBytes: assessment?._tag === "Fits"
+          ? Option.some(assessment.assessment.memory.reduce(
+              (total, domain) => total + domain.requiredBytes,
+              0,
+            ))
+          : Option.none(),
         capabilities: offering.capabilities,
         availability: !isInstalled
           ? { _tag: "Disabled" as const, reason: "installation_unavailable" as const }
@@ -120,6 +133,7 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
   yield* project
   yield* Stream.mergeAll([
     offerings.changes,
+    catalog.changes.pipe(Stream.map(() => undefined)),
     packages.changes.pipe(Stream.map(() => undefined)),
     hardware.changes.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" }).pipe(

@@ -92,6 +92,7 @@ pub enum ModelFileRelationship {
 pub struct ModelPackageProperties {
     pub format: String,
     pub quantization: String,
+    pub quantization_name: String,
     pub architecture: String,
     pub maximum_context_length: u32,
 }

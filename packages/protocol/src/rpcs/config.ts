@@ -1,7 +1,11 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
-import { ModelSlotUpdateError, SessionError } from "../errors"
+import {
+  ModelPreferenceMutationFailed,
+  ModelSlotUpdateError,
+  SessionError,
+} from "../errors"
 import {
   CloudUsageResponse,
   UsagePeriod,
@@ -10,6 +14,7 @@ import { ProviderAuthSchema } from "../schemas/provider-auth"
 import {
   SlotSelectionSchema,
   SlotIdSchema,
+  ProviderModelIdentitySchema,
   ProviderModelCatalogStateSchema,
   ModelSlotsStateSchema,
 } from "../schemas/model-state"
@@ -85,4 +90,13 @@ export const ClearSlot = Rpc.make("ClearSlot", {
   payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: Schema.Struct({}),
   error: ModelSlotUpdateError,
+})
+
+export const SetModelFavorite = Rpc.make("SetModelFavorite", {
+  payload: Schema.Struct({
+    model: ProviderModelIdentitySchema,
+    favorite: Schema.Boolean,
+  }),
+  success: Schema.Struct({}),
+  error: ModelPreferenceMutationFailed,
 })

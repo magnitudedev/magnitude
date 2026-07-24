@@ -73,6 +73,8 @@ export {
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
   ModelOfferingTargetIdSchema,
+  CatalogCandidateIdSchema,
+  ModelServingConfigurationIdSchema,
   RecommendationIdSchema,
   LocalModelsStateSchema,
 } from "@magnitudedev/protocol"
@@ -87,6 +89,7 @@ export {
 
 export type {
   ModelOfferingTargetId,
+  CatalogCandidateId,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,

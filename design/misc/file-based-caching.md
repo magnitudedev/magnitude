@@ -71,11 +71,12 @@ defaults rather than a global format-version gate. If a historical configuration
 meaning in a way that cannot be inferred from its shape, any required semantic migration must be
 local to that value and must not prevent recovery of unrelated configuration.
 
-The canonical model configuration is only a partial map of branded slot IDs to complete explicit
-slot selections (`providerId`, `providerModelId`, and `reasoningEffort`). A legacy selected local
-profile, raw native model identity, repository/configuration association, or local-slot-intent flag
-has no current meaning and is discarded rather than dual-read. An incomplete selection is removed
-as one invalid leaf; ACN never guesses its missing identity or reasoning value.
+The canonical model configuration contains a partial map of branded slot IDs to complete explicit
+slot selections (`providerId`, `providerModelId`, and `reasoningEffort`) and user preferences such
+as provider-qualified model favorites. A legacy selected local profile, raw native model identity,
+repository/configuration association, or local-slot-intent flag has no current meaning and is
+discarded rather than dual-read. An incomplete selection or favorite identity is removed as one
+invalid leaf; ACN never guesses its missing identity or reasoning value.
 
 ## Granular recovery
 
@@ -178,10 +179,11 @@ intent:
   to a uniquely named recovery copy before the default is published;
 - recovery diagnostics identify affected paths without logging sensitive values.
 
-Model selection persistence exposes one addressed update per branded slot. It does not expose a
-partial model-configuration patch or a second model-only read API. ACN loads the complete
-configuration into one resident source; each update durably writes the addressed slot and then
-publishes that same selection as one interruption-safe critical section.
+Model selection persistence exposes one addressed update per branded slot, and model preference
+persistence exposes one addressed update per provider-qualified model. Neither exposes a partial
+model-configuration patch or a second model-only read API. ACN loads the complete configuration
+into one resident source; each update durably writes the addressed value and then publishes that
+same configuration as one interruption-safe critical section.
 
 Catastrophic configuration conditions are limited to cases where safe recovery cannot be completed:
 the current default itself violates the schema, the original authoritative bytes cannot be preserved

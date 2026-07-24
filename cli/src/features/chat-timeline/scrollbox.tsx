@@ -26,12 +26,16 @@ export function ChatScrollbox({
       }}
       style={{
         flexGrow: 1,
+        flexShrink: 1,
+        minHeight: 0,
         rootOptions: {
           flexGrow: 1,
+          minHeight: 0,
           backgroundColor: 'transparent',
         },
         wrapperOptions: {
           border: false,
+          minHeight: 0,
           backgroundColor: 'transparent',
         },
         contentOptions: {

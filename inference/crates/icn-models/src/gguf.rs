@@ -1,5 +1,6 @@
 //! Bounded GGUF metadata inspection without loading tensor contents.
 
+use llama_cpp_2::gguf::{FileType, FileTypeNameError, UnknownFileType};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -18,6 +19,7 @@ pub struct GgufInspection {
     pub architecture: Option<String>,
     pub name: Option<String>,
     pub quantization: Option<String>,
+    pub quantization_name: Option<String>,
     pub parameter_count: Option<u64>,
     pub active_parameter_count: Option<u64>,
     pub training_context_length: Option<u32>,
@@ -52,6 +54,10 @@ pub enum GgufError {
     Invalid(&'static str),
     #[error("GGUF metadata string is not UTF-8")]
     Utf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    FileTypeName(#[from] FileTypeNameError),
+    #[error(transparent)]
+    UnknownFileType(#[from] UnknownFileType),
 }
 
 #[derive(Debug, Clone)]
@@ -162,7 +168,14 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     } else {
         vec!["text".to_owned()]
     };
-    let quantization = u32_value(&metadata, "general.file_type").map(file_type_name);
+    let file_type = u32_value(&metadata, "general.file_type")
+        .map(FileType::try_from)
+        .transpose()?;
+    let quantization = file_type
+        .map(FileType::name)
+        .transpose()?
+        .map(str::to_owned);
+    let quantization_name = file_type.map(friendly_quantization_name).map(str::to_owned);
     let parameter_count = u64_value(&metadata, "general.parameter_count")
         .or((derived_parameter_count > 0).then_some(derived_parameter_count));
     let tokens = string_array_value(&metadata, "tokenizer.ggml.tokens");
@@ -189,6 +202,7 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
         architecture,
         name: string_value(&metadata, "general.name"),
         quantization,
+        quantization_name,
         parameter_count,
         active_parameter_count,
         training_context_length,
@@ -205,6 +219,47 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
         fingerprint_material,
         execution_role,
     })
+}
+
+const fn friendly_quantization_name(file_type: FileType) -> &'static str {
+    match file_type {
+        FileType::AllF32 => "32-bit",
+        FileType::MostlyF16 | FileType::MostlyBf16 => "16-bit",
+        FileType::MostlyQ8_0 => "8-bit",
+        FileType::MostlyQ6K => "6-bit",
+        FileType::MostlyQ5_0
+        | FileType::MostlyQ5_1
+        | FileType::MostlyQ5KSmall
+        | FileType::MostlyQ5KMedium => "5-bit",
+        FileType::MostlyQ4_0
+        | FileType::MostlyQ4_1
+        | FileType::MostlyQ4KSmall
+        | FileType::MostlyQ4KMedium
+        | FileType::MostlyIq4Nl
+        | FileType::MostlyIq4Xs
+        | FileType::MostlyMxfp4Moe
+        | FileType::MostlyNvfp4 => "4-bit",
+        FileType::MostlyQ3KSmall
+        | FileType::MostlyQ3KMedium
+        | FileType::MostlyQ3KLarge
+        | FileType::MostlyIq3Xs
+        | FileType::MostlyIq3Xxs
+        | FileType::MostlyIq3Small
+        | FileType::MostlyIq3Medium => "3-bit",
+        FileType::MostlyQ2K
+        | FileType::MostlyIq2Xxs
+        | FileType::MostlyIq2Xs
+        | FileType::MostlyQ2KSmall
+        | FileType::MostlyIq2Small
+        | FileType::MostlyIq2Medium
+        | FileType::MostlyTq2_0
+        | FileType::MostlyQ2_0 => "2-bit",
+        FileType::MostlyIq1Small
+        | FileType::MostlyIq1Medium
+        | FileType::MostlyTq1_0
+        | FileType::MostlyQ1_0 => "1-bit",
+        FileType::Guessed => "unknown",
+    }
 }
 
 fn string_value(values: &BTreeMap<String, Value>, key: &str) -> Option<String> {
@@ -239,45 +294,6 @@ fn u64_value(values: &BTreeMap<String, Value>, key: &str) -> Option<u64> {
         Some(Value::I64(value)) => u64::try_from(*value).ok(),
         _ => None,
     }
-}
-
-fn file_type_name(value: u32) -> String {
-    match value {
-        0 => "F32",
-        1 => "F16",
-        2 => "Q4_0",
-        3 => "Q4_1",
-        7 => "Q8_0",
-        8 => "Q5_0",
-        9 => "Q5_1",
-        10 => "Q2_K",
-        11 => "Q3_K_S",
-        12 => "Q3_K_M",
-        13 => "Q3_K_L",
-        14 => "Q4_K_S",
-        15 => "Q4_K_M",
-        16 => "Q5_K_S",
-        17 => "Q5_K_M",
-        18 => "Q6_K",
-        19 => "IQ2_XXS",
-        20 => "IQ2_XS",
-        21 => "IQ3_XXS",
-        22 => "IQ1_S",
-        23 => "IQ4_NL",
-        24 => "IQ3_S",
-        25 => "IQ2_S",
-        26 => "IQ4_XS",
-        27 => "IQ1_M",
-        28 => "BF16",
-        29 => "Q4_0_4_4",
-        30 => "Q4_0_4_8",
-        31 => "Q4_0_8_8",
-        32 => "TQ1_0",
-        33 => "TQ2_0",
-        34 => "MXFP4_MOE",
-        _ => return format!("file_type_{value}"),
-    }
-    .to_owned()
 }
 
 struct CheckedReader<R> {

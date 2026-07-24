@@ -41,7 +41,7 @@ export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWith
     object: raw.object,
     owned_by: raw.owned_by,
     roles: raw.roles,
-    slots: raw.slots,
+    slots: Option.isNone(raw.type) ? ["primary"] : [],
     ...Option.match(raw.type, { onNone: () => ({}), onSome: (type) => ({ type }) }),
   }
 }
@@ -65,9 +65,9 @@ export interface MagnitudeCatalogConfig {
 /**
  * Magnitude-specific model catalog implementation.
  *
- * Fetches models from the Magnitude API, classifies each model into a
- * family using the shared classifier, and filters out any model that
- * cannot be classified (per §4.3 — unidentified models are excluded).
+ * Fetches models from the Magnitude API and enriches models with a family
+ * classification when one is known. Family classification is metadata, not
+ * an availability gate.
  */
 export function createMagnitudeCatalog(config: MagnitudeCatalogConfig): ModelCatalog<MagnitudeModelInfo> {
   const { endpoint, authentication, ttlMs = 5 * 60 * 1000, classify } = config
@@ -115,8 +115,10 @@ export function createMagnitudeCatalog(config: MagnitudeCatalogConfig): ModelCat
       for (const raw of rawModels.data) {
         const model = toMagnitudeModelInfo(raw)
         const familyOption = classify(model)
-        if (Option.isNone(familyOption)) continue
-        classified.push({ ...model, modelFamilyId: ModelFamilyIdSchema.make(familyOption.value) })
+        classified.push(Option.match(familyOption, {
+          onNone: () => model,
+          onSome: (familyId) => ({ ...model, modelFamilyId: ModelFamilyIdSchema.make(familyId) }),
+        }))
       }
 
       return classified

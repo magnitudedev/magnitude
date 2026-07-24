@@ -74,6 +74,11 @@ export const ModelSlotUpdateError = Schema.Union(
 )
 export type ModelSlotUpdateError = Schema.Schema.Type<typeof ModelSlotUpdateError>
 
+export class ModelPreferenceMutationFailed extends Schema.TaggedError<ModelPreferenceMutationFailed>()(
+  "ModelPreferenceMutationFailed",
+  { message: Schema.String },
+) {}
+
 export const LocalInferenceError = Schema.Union(
   LocalModelMutationFailed,
   ModelSlotMutationRejected,

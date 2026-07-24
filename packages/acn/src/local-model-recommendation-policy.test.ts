@@ -72,6 +72,7 @@ const candidate = (input: {
           properties: {
             format: "gguf",
             quantization: `Q${fidelity}`,
+            quantizationName: `${fidelity}-bit`,
             architecture: input.architecture ?? "dense",
             maximumContextLength: context,
           },

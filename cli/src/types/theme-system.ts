@@ -100,6 +100,12 @@ export interface ChatTheme {
   /** Input box background color */
   inputBg: string
 
+  /** Menu background color */
+  menuBg: string
+
+  /** Alternating menu-row background color */
+  menuAltBg: string
+
   // Agent backgrounds (specific states that don't map to semantics)
   /** Agent toggle expanded background */
   agentToggleExpandedBg: string

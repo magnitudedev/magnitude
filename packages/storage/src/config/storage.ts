@@ -33,6 +33,7 @@ const discardRemovedModelConfiguration = (config: MagnitudeConfig): {
   const models = config.models === undefined ? undefined : {
     slots: config.models.slots,
     localModelRecency: config.models.localModelRecency,
+    favoriteModels: config.models.favoriteModels,
     localProviderOfferings: config.models.localProviderOfferings,
     dismissedDownloadFailures: config.models.dismissedDownloadFailures,
   };
@@ -40,6 +41,7 @@ const discardRemovedModelConfiguration = (config: MagnitudeConfig): {
     && Reflect.ownKeys(config.models).some((key) =>
       key !== "slots"
       && key !== "localModelRecency"
+      && key !== "favoriteModels"
       && key !== "localProviderOfferings"
       && key !== "dismissedDownloadFailures");
   const value = models === undefined ? { ...config } : { ...config, models };
@@ -152,6 +154,7 @@ export function makeConfigStorage(): Effect.Effect<
     const emptyModelConfig = () => ({
       slots: { primary: Option.none(), secondary: Option.none() },
       localModelRecency: { primary: [], secondary: [] },
+      favoriteModels: [],
       localProviderOfferings: [],
       dismissedDownloadFailures: [],
     } as const);

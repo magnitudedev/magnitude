@@ -91,7 +91,8 @@ export const buildLocalInferenceSelections = (
     })
   const recommendations = view.models.recommendations._tag === "Ready"
     ? view.models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
-        const model = view.models.models.find(({ id }) => id === recommendation.modelId)
+        const model = view.models.models.find(({ catalogCandidateIds }) =>
+          catalogCandidateIds.includes(recommendation.candidate.id))
         if (!model || model.download._tag === "Downloaded") return []
         return [{
           id: `recommendation:${recommendation.id}`,
@@ -275,7 +276,7 @@ export const selectionMetadata = ({ model, recommendation }: LocalInferenceSelec
   `${model.quantization} · ${formatBytes(model.downloadBytes)} · ${formatContext(
     Option.match(recommendation, {
       onNone: () => model.maximumContextLength,
-      onSome: ({ profile }) => profile.contextLength,
+      onSome: ({ candidate }) => candidate.profile.contextLength,
     }),
   )} context`
 

@@ -58,11 +58,15 @@ fn package_properties(properties: &InventoryProperties) -> ModelPackagePropertie
         InventoryProperties::Inspected {
             architecture,
             quantization,
+            quantization_name,
             training_context_length,
             ..
         } => ModelPackageProperties {
             format: "gguf".to_owned(),
             quantization: quantization.clone().unwrap_or_else(|| "unknown".to_owned()),
+            quantization_name: quantization_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
             architecture: architecture.clone().unwrap_or_else(|| "unknown".to_owned()),
             maximum_context_length: training_context_length.unwrap_or(1).max(1),
         },
@@ -70,6 +74,7 @@ fn package_properties(properties: &InventoryProperties) -> ModelPackagePropertie
             ModelPackageProperties {
                 format: "gguf".to_owned(),
                 quantization: "unknown".to_owned(),
+                quantization_name: "unknown".to_owned(),
                 architecture: "unknown".to_owned(),
                 maximum_context_length: 1,
             }

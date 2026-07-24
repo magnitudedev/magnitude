@@ -1162,6 +1162,7 @@ export const ModelPackageProperties = S.Struct({
   format: S.String,
   maximumContextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   quantization: S.String,
+  quantizationName: S.String,
 })
 export type ModelPackageProperties = S.Schema.Type<typeof ModelPackageProperties>
 export type ModelPackagePropertiesEncoded = S.Schema.Encoded<typeof ModelPackageProperties>

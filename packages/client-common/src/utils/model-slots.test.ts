@@ -45,6 +45,7 @@ describe("model slot selection", () => {
         },
       },
       availability: { _tag: "Available" as const },
+      runtimeMemoryBytes: Option.none(),
       pricing: Option.none(),
     }
     const result = selectedSlotModel(
@@ -54,6 +55,8 @@ describe("model slot selection", () => {
           primary: unloaded,
           secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
         },
+        recentModelIds: { primary: [selection.providerModelId], secondary: [] },
+        favoriteModels: [],
       },
       PRIMARY_SLOT_ID,
     )

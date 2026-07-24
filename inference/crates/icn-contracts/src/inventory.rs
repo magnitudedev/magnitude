@@ -378,6 +378,7 @@ pub enum InventoryProperties {
     Inspected {
         architecture: Option<String>,
         quantization: Option<String>,
+        quantization_name: Option<String>,
         parameter_count: Option<u64>,
         active_parameter_count: Option<u64>,
         training_context_length: Option<u32>,

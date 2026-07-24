@@ -200,7 +200,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       return
     }
     if (Option.isSome(selection.recommendation)) {
-      local.downloadRecommendedModel(selection.recommendation.value.id)
+      local.downloadCatalogModel(selection.recommendation.value.candidate.id)
       return
     }
     if (selection.kind === "running") {
@@ -348,7 +348,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         )}
         <box style={{ flexDirection: "column" }}>
           {state.models.recommendations._tag === "Ready" && selections.length === 0
-            ? <text style={{ fg: theme.warning }}>No curated model currently fits this configuration.</text>
+            ? <text style={{ fg: theme.warning }}>No curated model is currently compatible with this machine.</text>
             : selections.map((selection, index) => {
               const model = selection.model
               const recommendation = selection.recommendation
@@ -380,7 +380,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                   {model.download._tag === "Downloading" && <text style={{ fg: theme.primary }}>Downloading {Math.round(model.download.completedBytes / Math.max(1, model.download.totalBytes) * 100)}% · {formatBytes(model.download.completedBytes)} / {formatBytes(model.download.totalBytes)}</text>}
                   {model.download._tag === "Failed" && <text style={{ fg: theme.error }}>Download failed · {model.download.failure.message}</text>}
                   {model.download._tag === "Downloaded" && model.preparation._tag === "Preparing" && (
-                    <text style={{ fg: theme.primary }}>Choosing a serving profile for this machine…</text>
+                    <text style={{ fg: theme.primary }}>Calibrating this model for this machine…</text>
                   )}
                   {selecting && <text style={{ fg: theme.primary }}>{spinnerFrame} Selecting this model…</text>}
                   {loading && <text style={{ fg: theme.primary }}>{formatModelLoadProgress(primarySlot.percentage)}</text>}
@@ -391,9 +391,10 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           {state.models.recommendations._tag === "Failed" && <text style={{ fg: theme.warning }}>{state.models.recommendations.failure.message}</text>}
           {details && selected && Option.isSome(selected.recommendation) && (() => {
             const recommendation = selected.recommendation.value
+            const candidate = recommendation.candidate
             return <box style={{ flexDirection: "column", paddingLeft: 1 }}>
               <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Exact model files</text>
-              {recommendation.sources.map(({ source, files }) => {
+              {candidate.sources.map(({ source, files }) => {
                 const sourceLabel = source._tag === "HuggingFace"
                   ? `${source.repository}@${source.revision}`
                   : source.path
@@ -404,11 +405,11 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                 </box>
               })}
               <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Quantization fidelity</text>
-              {recommendation.qualityEvidence.map((evidence) => <text key={evidence} style={{ fg: theme.muted }}>{evidence}</text>)}
-              <text style={{ fg: theme.muted }}>{recommendation.qualityScoreProvenance}</text>
-              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Fit</text>
-              <text style={{ fg: theme.muted }}>Estimated {formatBytes(recommendation.fit.requiredBytes)} runtime memory from {formatBytes(recommendation.fit.availableBytes)} available capacity.</text>
-              {Option.isSome(recommendation.fit.estimatedTokensPerSecond) && <text style={{ fg: theme.muted }}>About {recommendation.fit.estimatedTokensPerSecond.value.toFixed(1)} tokens/sec at {formatContext(recommendation.profile.contextLength)} context.</text>}
+              {candidate.qualityEvidence.map((evidence) => <text key={evidence} style={{ fg: theme.muted }}>{evidence}</text>)}
+              <text style={{ fg: theme.muted }}>{candidate.intelligenceProvenance}</text>
+              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Calibration</text>
+              <text style={{ fg: theme.muted }}>Estimated {formatBytes(candidate.runtimeMemoryBytes)} runtime memory from {formatBytes(candidate.availableMemoryBytes)} available capacity.</text>
+              {Option.isSome(candidate.estimatedTokensPerSecond) && <text style={{ fg: theme.muted }}>About {candidate.estimatedTokensPerSecond.value.toFixed(1)} tokens/sec at {formatContext(candidate.profile.contextLength)} context.</text>}
             </box>
           })()}
         </box>

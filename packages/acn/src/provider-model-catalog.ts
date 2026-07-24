@@ -79,6 +79,7 @@ const toCatalogModel = (
     supportedSlots,
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,
+    runtimeMemoryBytes: Option.none(),
     capabilities: {
       vision: vision.value,
       tools: model.servingCapabilities.tools,

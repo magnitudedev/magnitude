@@ -82,6 +82,10 @@ export type RecommendableModelId = typeof RecommendableModelIdSchema.Type
 export const RecommendationIdSchema = NonEmptyString.pipe(Schema.brand("RecommendationId"))
 export type RecommendationId = typeof RecommendationIdSchema.Type
 
+export const CatalogCandidateIdSchema =
+  NonEmptyString.pipe(Schema.brand("CatalogCandidateId"))
+export type CatalogCandidateId = typeof CatalogCandidateIdSchema.Type
+
 export const OfferingAssessmentIdSchema =
   NonEmptyString.pipe(Schema.brand("OfferingAssessmentId"))
 export type OfferingAssessmentId = typeof OfferingAssessmentIdSchema.Type
@@ -133,6 +137,7 @@ export type ModelFileRelationship = typeof ModelFileRelationshipSchema.Type
 export const ModelPackagePropertiesSchema = Schema.Struct({
   format: NonEmptyString,
   quantization: NonEmptyString,
+  quantizationName: NonEmptyString,
   architecture: NonEmptyString,
   maximumContextLength: PositiveSafeInteger,
 })
@@ -364,6 +369,7 @@ export type LocalModelPreparation = typeof LocalModelPreparationSchema.Type
 
 export const LocalModelSchema = Schema.Struct({
   id: ModelOfferingTargetIdSchema,
+  catalogCandidateIds: Schema.Array(CatalogCandidateIdSchema),
   displayName: NonEmptyString,
   description: Schema.String,
   kind: Schema.Literal("Standalone", "SpeculativePair"),
@@ -375,12 +381,38 @@ export const LocalModelSchema = Schema.Struct({
 })
 export type LocalModel = typeof LocalModelSchema.Type
 
-export const LocalModelRecommendationSchema = Schema.Struct({
-  id: RecommendationIdSchema,
-  modelId: ModelOfferingTargetIdSchema,
+export const LocalModelCatalogPreparationSchema = Schema.Union(
+  Schema.TaggedStruct("NotDownloaded", {}),
+  Schema.TaggedStruct("Calibrating", {}),
+  Schema.TaggedStruct("Installed", {}),
+  Schema.TaggedStruct("Unavailable", {
+    failure: ModelFailureSchema,
+  }),
+)
+export type LocalModelCatalogPreparation = typeof LocalModelCatalogPreparationSchema.Type
+
+export const LocalModelCatalogCandidateSchema = Schema.Struct({
+  id: CatalogCandidateIdSchema,
   displayName: NonEmptyString,
-  intent: Schema.Literal("balanced", "best_quality", "fastest", "lightweight"),
-  explanation: Schema.String,
+  description: Schema.String,
+  license: NonEmptyString,
+  profile: ServingProfileSchema,
+  downloadBytes: NonNegativeSafeInteger,
+  download: LocalModelDownloadSchema,
+  preparation: LocalModelCatalogPreparationSchema,
+  quantization: NonEmptyString,
+  quantizationName: NonEmptyString,
+  runtimeMemoryBytes: NonNegativeSafeInteger,
+  availableMemoryBytes: NonNegativeSafeInteger,
+  intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+  intelligenceProvenance: NonEmptyString,
+  fidelityRank: NonNegativeSafeInteger,
+  qualityEvidence: Schema.Array(NonEmptyString),
+  estimatedTokensPerSecond: Schema.optionalWith(
+    Schema.Number.pipe(Schema.finite(), Schema.positive()),
+    { as: "Option", exact: true },
+  ),
+  capabilities: ModelCapabilitiesSchema,
   sources: Schema.Array(Schema.Struct({
     source: ModelPackageSourceSchema,
     files: Schema.Array(Schema.Struct({
@@ -388,18 +420,14 @@ export const LocalModelRecommendationSchema = Schema.Struct({
       sha256: Sha256Digest,
     })),
   })),
-  qualityScoreProvenance: NonEmptyString,
-  fidelityRank: NonNegativeSafeInteger,
-  qualityEvidence: Schema.Array(NonEmptyString),
-  profile: ServingProfileSchema,
-  fit: Schema.Struct({
-    requiredBytes: NonNegativeSafeInteger,
-    availableBytes: NonNegativeSafeInteger,
-    estimatedTokensPerSecond: Schema.optionalWith(
-      Schema.Number.pipe(Schema.finite(), Schema.positive()),
-      { as: "Option", exact: true },
-    ),
-  }),
+})
+export type LocalModelCatalogCandidate = typeof LocalModelCatalogCandidateSchema.Type
+
+export const LocalModelRecommendationSchema = Schema.Struct({
+  id: RecommendationIdSchema,
+  intent: Schema.Literal("balanced", "best_quality", "fastest", "lightweight"),
+  explanation: Schema.String,
+  candidate: LocalModelCatalogCandidateSchema,
 })
 export type LocalModelRecommendation = typeof LocalModelRecommendationSchema.Type
 
@@ -448,6 +476,7 @@ export const LocalModelRecommendationsLifecycleSchema = Schema.Union(
   }),
   Schema.TaggedStruct("Ready", {
     entries: Schema.Array(LocalModelRecommendationSchema),
+    catalog: Schema.Array(LocalModelCatalogCandidateSchema),
     progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
   }),
   Schema.TaggedStruct("Failed", {
@@ -534,6 +563,7 @@ export const ProviderModelCatalogEntrySchema = Schema.Struct({
   supportedSlots: Schema.Array(SlotIdSchema),
   contextWindow: PositiveSafeInteger,
   maxOutputTokens: PositiveSafeInteger,
+  runtimeMemoryBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   capabilities: ModelCapabilitiesSchema,
   availability: Schema.Union(
     Schema.TaggedStruct("Available", {}),
@@ -547,6 +577,12 @@ export const ProviderModelCatalogEntrySchema = Schema.Struct({
 }).pipe(Schema.filter((model) => new Set(model.supportedSlots).size === model.supportedSlots.length,
   { message: () => "supported model slots must be unique" }))
 export type ProviderModelCatalogEntry = typeof ProviderModelCatalogEntrySchema.Type
+
+export const ProviderModelIdentitySchema = Schema.Struct({
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
+})
+export type ProviderModelIdentity = typeof ProviderModelIdentitySchema.Type
 
 export const ProviderCatalogFailureSchema = Schema.Union(
   Schema.TaggedStruct("ProviderFailure", {
@@ -698,6 +734,11 @@ export const ModelSlotsStateSchema = Schema.Struct({
     primary: ModelSlotSchema,
     secondary: ModelSlotSchema,
   }),
+  recentModelIds: Schema.Struct({
+    primary: Schema.Array(ProviderModelIdSchema),
+    secondary: Schema.Array(ProviderModelIdSchema),
+  }),
+  favoriteModels: Schema.Array(ProviderModelIdentitySchema),
 }).pipe(
   Schema.filter((state) => state.slots.primary.slotId === PRIMARY_SLOT_ID
     && state.slots.secondary.slotId === SECONDARY_SLOT_ID,

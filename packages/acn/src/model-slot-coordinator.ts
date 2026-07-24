@@ -13,6 +13,7 @@ import {
   ModelSlotUnloadedLocalModel,
   ModelSlotUnloadingLocalModel,
   ModelSlotsMirror,
+  ModelPreferenceMutationFailed,
   ModelSlotMutationRejected,
   ModelSlotMutationFailed,
   PRIMARY_SLOT_ID,
@@ -28,6 +29,7 @@ import {
   type ProviderCatalogFailure,
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
+  type ProviderModelIdentity,
   type SlotId,
   type SlotSelection,
 } from "@magnitudedev/protocol"
@@ -53,6 +55,10 @@ export interface ModelSlotCoordinatorApi {
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
   ) => Effect.Effect<void, ModelSlotUpdateError>
+  readonly setModelFavorite: (
+    model: ProviderModelIdentity,
+    favorite: boolean,
+  ) => Effect.Effect<void, ModelPreferenceMutationFailed>
   readonly loadModel: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
   readonly unloadModel: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
 }
@@ -396,6 +402,8 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
   const initialSecondary = yield* targetFor(SECONDARY_SLOT_ID, persisted.slots.secondary, initialCatalog, Option.none())
   const mirror = yield* makeMirroredState(ModelSlotsMirror, {
     slots: { primary: initialPrimary, secondary: initialSecondary },
+    recentModelIds: persisted.localModelRecency,
+    favoriteModels: persisted.favoriteModels,
   })
 
   const updateLocalSlots = (
@@ -408,7 +416,10 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       return next
     }
     return {
-      state: { slots: { primary: apply(state.slots.primary), secondary: apply(state.slots.secondary) } },
+      state: {
+        ...state,
+        slots: { primary: apply(state.slots.primary), secondary: apply(state.slots.secondary) },
+      },
       result: undefined,
       changed,
     }
@@ -466,7 +477,8 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
   const reconcileUnlocked = Effect.gen(function* () {
     const catalogState = (yield* catalog.snapshot).state
     const configured = yield* configuration.get
-    const selections = (yield* recoverSelections(configured, catalogState)).slots
+    const recovered = yield* recoverSelections(configured, catalogState)
+    const selections = recovered.slots
     const previous = (yield* mirror.get).state
     const primaryTarget = yield* targetFor(
       PRIMARY_SLOT_ID,
@@ -485,6 +497,8 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
         primary: reconcileSlotState(previous.slots.primary, primaryTarget),
         secondary: reconcileSlotState(previous.slots.secondary, secondaryTarget),
       },
+      recentModelIds: recovered.localModelRecency,
+      favoriteModels: recovered.favoriteModels,
     }, Schema.equivalence(ModelSlotsMirror.stateSchema))
   })
 
@@ -610,6 +624,16 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       )
     })
 
+  const setModelFavorite: ModelSlotCoordinatorApi["setModelFavorite"] = (model, favorite) =>
+    Effect.gen(function* () {
+      yield* configuration.setFavorite(model, favorite).pipe(
+        Effect.mapError(() => new ModelPreferenceMutationFailed({
+          message: "Failed to save model favorite",
+        })),
+      )
+      yield* reconcile
+    })
+
   const loadSelectedSlotUnlocked = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
     Effect.gen(function* () {
       const slot = yield* selectedSlot(slotId)
@@ -731,6 +755,7 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     agentModelConfigurations,
     acquireLocalModel,
     updateModelSlot,
+    setModelFavorite,
     loadModel,
     unloadModel,
   })

@@ -46,6 +46,7 @@ const model = (
   supportedSlots: [slotId],
   contextWindow: 200_000,
   maxOutputTokens: 16_384,
+  runtimeMemoryBytes: Option.none(),
   capabilities: {
     vision: true,
     tools: true,
