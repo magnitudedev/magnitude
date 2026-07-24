@@ -17,7 +17,10 @@ import { TaskAssignmentProjection } from '../projections/task-assignment'
 import { SessionContextProjection } from '../projections/session-context'
 import { WindowProjection } from '../window'
 import { CompactionProjection } from '../projections/compaction'
-import { DisplayTimelineProjection } from '../display/timeline-projection'
+import {
+  DisplayTimelineProjection,
+  ModelRequestActivityProjection,
+} from '../display'
 import type { DisplayTimelineState } from '../display/types'
 import { materializeDisplayTimeline } from './materializer'
 import { buildDisplayTimelinePresentation } from './timeline-presentation'
@@ -28,7 +31,6 @@ import {
   materializeDisplayTasks,
 } from './semantic'
 import { type DisplayTimelineWindowShape } from './shape'
-import { ModelRequestActivity } from '../model-request-activity'
 
 const windowBounds = (
   shape: DisplayTimelineWindowShape,
@@ -97,9 +99,9 @@ export const buildDisplayViewSnapshot = (
     const taskWorker = yield* Projection.consumer.read(TaskAssignmentProjection)
     const windowState = yield* Projection.consumer.read(WindowProjection)
     const compaction = yield* Projection.consumer.read(CompactionProjection)
+    const modelRequestActivity =
+      yield* Projection.consumer.read(ModelRequestActivityProjection)
     const ambient = yield* AmbientServiceTag
-    const modelRequests = yield* ModelRequestActivity
-    const responseTimings = yield* modelRequests.getResponseTimings
     const sessionOptions = ambient.getValue(SessionOptionsAmbient)
 
     const timelines: Record<string, DisplayTimeline> = {}
@@ -144,11 +146,11 @@ export const buildDisplayViewSnapshot = (
         taskWorker.state,
         windowState.state,
         compaction.state,
-        responseTimings,
+        modelRequestActivity.state.responseTimings,
       ),
       agents: materializeDisplayAgents(agentStatus.state),
       tasks: materializeDisplayTasks(taskWorker.state),
-      modelRequests: Object.fromEntries(yield* modelRequests.get),
+      modelRequests: Object.fromEntries(modelRequestActivity.state.requests),
     }
 
     return { shape: acceptedShape, state }

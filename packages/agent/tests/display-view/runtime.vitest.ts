@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { Addressed, EventEngine } from '@magnitudedev/event-core'
+import {
+  Addressed,
+  AmbientServiceTag,
+  EventEngine,
+} from '@magnitudedev/event-core'
 import { Duration, Effect, Fiber, Layer, Queue, Stream } from 'effect'
 import type { DisplayViewShape } from '@magnitudedev/protocol'
 import type { AppEvent } from '../../src/events'
@@ -17,7 +21,11 @@ import { TaskAssignmentProjection } from '../../src/projections/task-assignment'
 import { TurnProjection } from '../../src/projections/turn'
 import { UserMessageResolutionProjection } from '../../src/projections/user-message-resolution'
 import { WorkerActivityProjection } from '../../src/projections/worker-activity'
-import { DisplayTimelineProjection } from '../../src/display'
+import {
+  DisplayTimelineProjection,
+  ModelRequestActivityAmbient,
+  ModelRequestActivityProjection,
+} from '../../src/display'
 import { WindowProjection } from '../../src/window'
 import {
   DisplayViewNotFoundError,
@@ -28,10 +36,6 @@ import {
 import { makeCountingAddressedEntryStore } from '../helpers/counting-addressed-store'
 import { ToolUniverseSource } from '../../src/ambient/tool-universe-ambient'
 import { toolUniverseToolkit } from '../../src/tools/toolkits'
-import {
-  ModelRequestActivity,
-  ModelRequestActivityLive,
-} from '../../src/model-request-activity'
 
 const TestAgent = EventEngine.make<AppEvent>()({
   name: 'DisplayViewRuntimeTestAgent',
@@ -53,6 +57,7 @@ const TestAgent = EventEngine.make<AppEvent>()({
     CompactionProjection,
     ChatTitleProjection,
     DisplayTimelineProjection,
+    ModelRequestActivityProjection,
   ],
   workers: [],
 })
@@ -70,13 +75,13 @@ const rootSmallShape: DisplayViewShape = {
 const provideRuntime = (storeLayer: Layer.Layer<Addressed.AddressedEntryStore>) =>
   Layer.provideMerge(
     DisplayViewRuntimeLive,
-    Layer.merge(
-      Layer.provideMerge(TestAgent.EngineLayer, Layer.merge(
+    Layer.provideMerge(
+      TestAgent.EngineLayer,
+      Layer.merge(
         storeLayer,
         Layer.succeed(ToolUniverseSource, { toolkit: toolUniverseToolkit }),
-      )),
-      ModelRequestActivityLive,
-    )
+      ),
+    ),
   )
 
 describe('display view runtime', () => {
@@ -160,7 +165,7 @@ describe('display view runtime', () => {
 
     const snapshots = await Effect.runPromise(Effect.gen(function* () {
       const runtime = yield* DisplayViewRuntime
-      const activity = yield* ModelRequestActivity
+      const ambient = yield* AmbientServiceTag
       const engine = (yield* EventEngine.Service) as EventEngine.Shape<AppEvent, unknown>
       const queue = yield* Queue.unbounded<any>()
 
@@ -178,25 +183,27 @@ describe('display view runtime', () => {
       )
 
       yield* Queue.take(queue)
-      yield* activity.update(
-        { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
-        {
+      yield* ambient.update(ModelRequestActivityAmbient, {
+        turn: { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
+        observedAt: 1_000,
+        progress: {
           phase: 'prefill',
           requestId: 'request-1',
           completedTokens: 14_020,
           totalTokens: 14_300,
           cachedTokens: 13_200,
         },
-      )
+      })
       let active = yield* Queue.take(queue)
       while (!active.state.modelRequests.root) {
         active = yield* Queue.take(queue)
       }
 
-      yield* activity.update(
-        { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
-        { phase: 'generating', requestId: 'request-1' },
-      )
+      yield* ambient.update(ModelRequestActivityAmbient, {
+        turn: { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
+        observedAt: 2_000,
+        progress: { phase: 'generating', requestId: 'request-1' },
+      })
       let cleared = yield* Queue.take(queue)
       while (cleared.state.modelRequests.root) {
         cleared = yield* Queue.take(queue)
@@ -215,7 +222,7 @@ describe('display view runtime', () => {
       phase: 'prefill',
     })
     expect(snapshots[1].state.modelRequests.root).toBeUndefined()
-    expect(snapshots[1].state.actors.root?.work.respondingSince).toBeTypeOf('number')
+    expect(snapshots[1].state.actors.root?.work.respondingSince).toBe(2_000)
   })
 
   it('closes a runtime view explicitly', async () => {

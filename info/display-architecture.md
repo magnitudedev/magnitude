@@ -17,6 +17,11 @@ from events by projections.
 state stores fork metadata and addressed sequence indexes. Large message bodies
 live in addressed sequence entries.
 
+`ModelRequestActivityProjection` owns transient local-model request activity.
+Timestamped provider progress enters through an ambient and is reduced into
+per-fork activity. Display materialization reads it like any other projection;
+there is no activity-specific side stream into display state.
+
 `Projection.addressed` is the semantic indexing system. An addressed sequence
 index maps item ids, positions, tail windows, range windows, and collection
 sentinels onto physical addressed entries. Sequence reads validate item ids and
