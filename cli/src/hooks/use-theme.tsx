@@ -22,7 +22,7 @@ const initialTheme = layerTheme(
   "dark",
 )
 
-export const themeAtom = Atom.make<ChatTheme>(initialTheme)
+export const themeAtom = Atom.keepAlive(Atom.make<ChatTheme>(initialTheme))
 
 export function useTheme(): ChatTheme {
   return useAtomValue(themeAtom)

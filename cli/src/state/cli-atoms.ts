@@ -15,7 +15,9 @@ export type AuthSource =
   | { source: "env"; key: string; envVarName: string }
   | { source: "none" }
 
-export const authSourceAtom = Atom.make<AuthSource>({ source: "none" })
+export const authSourceAtom = Atom.keepAlive(
+  Atom.make<AuthSource>({ source: "none" }),
+)
 
 /**
  * Recent chats overlay visibility (CLI only — web uses sidebar).

@@ -2,7 +2,8 @@
  * Shared UI atoms — spec §6.3
  *
  * Client-local state shared across web, desktop, and CLI apps.
- * Uses Atom.make(initialValue) for plain writable local state.
+ * Registry-lifetime state uses Atom.keepAlive; intentionally resettable
+ * presentation state uses Atom.make directly.
  *
  * Web-only atoms (sidebar width/visibility/search) live in
  * `web/src/state/web-atoms.ts`. CLI-only atoms live in
@@ -17,7 +18,7 @@ import type { InputMentionSegment } from "../types/store"
  * The agent-host CWD that will be used when creating a new session.
  * null = no working directory selected yet.
  */
-export const selectedCwdAtom = Atom.make<string | null>(null)
+export const selectedCwdAtom = Atom.keepAlive(Atom.make<string | null>(null))
 
 /**
  * Settings panel open flag.
@@ -38,20 +39,20 @@ export const selectedFilePathAtom = Atom.make<string | null>(null)
  * Message history for composer up/down navigation.
  * Array of previously sent message texts, most recent first.
  */
-export const messageHistoryAtom = Atom.make<string[]>([])
+export const messageHistoryAtom = Atom.keepAlive(Atom.make<string[]>([]))
 
 /**
  * Composer text content.
  * The composer reads and writes this atom directly. Restored queued input
  * writes here instead of triggering a reactive sync.
  */
-export const composerTextAtom = Atom.make("")
+export const composerTextAtom = Atom.keepAlive(Atom.make(""))
 
 /**
  * Composer attachment pills.
  * Restored queued input clears attachments by resetting this atom.
  */
-export const composerAttachmentsAtom = Atom.make<InputMentionSegment[]>([])
+export const composerAttachmentsAtom = Atom.keepAlive(Atom.make<InputMentionSegment[]>([]))
 
 /**
  * Composer history navigation index.
@@ -94,4 +95,6 @@ export const pendingUserSubmitAtom = Atom.make(false)
  * Read by useComposerState's CreateSession path — atom-driven so the shared
  * hook has no optional parameters.
  */
-export const sessionCreateOptionsAtom = Atom.make<Option.Option<SessionOptions>>(Option.none())
+export const sessionCreateOptionsAtom = Atom.keepAlive(
+  Atom.make<Option.Option<SessionOptions>>(Option.none()),
+)

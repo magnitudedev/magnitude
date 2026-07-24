@@ -42,7 +42,7 @@ export {
 /**
  * Sidebar width in pixels.
  */
-export const sidebarWidthAtom = Atom.make(260)
+export const sidebarWidthAtom = Atom.keepAlive(Atom.make(260))
 export const apiKeyVerifiedAtom = Atom.make(false)
 
 /**
@@ -55,10 +55,10 @@ export const sidebarVisibleAtom = Atom.make<boolean | null>(null)
 /**
  * Sidebar search query.
  */
-export const sidebarSearchAtom = Atom.make("")
+export const sidebarSearchAtom = Atom.keepAlive(Atom.make(""))
 
 /**
  * Optional CWD filter for the sessions sidebar.
  * null = show sessions from every agent-host CWD.
  */
-export const sidebarCwdFilterAtom = Atom.make<string | null>(null)
+export const sidebarCwdFilterAtom = Atom.keepAlive(Atom.make<string | null>(null))

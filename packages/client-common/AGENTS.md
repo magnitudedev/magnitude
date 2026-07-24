@@ -45,6 +45,20 @@ Classify state before implementing it:
 
 Keep domains independent. A flow may compose several query atoms in a pure view model; do not create a combined server RPC, snapshot, or controller merely because one screen uses those domains together.
 
+## Effect Atom Lifetimes
+
+Every writable client atom MUST choose the correct lifetime:
+
+- `Atom.make(initial)` — when the last consumer unmounts, the registry deletes the
+  current value after its idle TTL. **All writes are lost.** The next read recreates
+  the atom as `initial`. Use this only when that reset is intended.
+- `Atom.keepAlive(Atom.make(initial))` — the registry retains the current value even
+  with zero consumers. **Writes survive** gates, route changes, and component
+  unmounts until the registry is disposed. Use this whenever state must survive them.
+
+`useAtomInitialValues` only writes an initial value; it does not retain it. Never
+root-mount an atom to simulate durability—declare it with `Atom.keepAlive`.
+
 ## AtomRpc Patterns
 
 `AgentClient` is the standard RPC interface. Ordinary client code must not build a raw RPC client, manually run RPC Effects, or maintain a parallel request cache.
