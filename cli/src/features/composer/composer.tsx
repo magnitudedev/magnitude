@@ -237,7 +237,9 @@ export function Composer(props: ComposerProps) {
   const historyNavRef = useRef(false)
   const [nextEscWillKillAll, setNextEscWillKillAll] = useState(false)
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
+  const [memoryLabelHovered, setMemoryLabelHovered] = useState(false)
   const [thinkingOpen, setThinkingOpen] = useState(false)
   const currentThinkingIndex = Math.max(
     0,
@@ -720,9 +722,18 @@ export function Composer(props: ComposerProps) {
             </Button>
           ) : (
             <>
-              <Button onClick={openSettings}>
-                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
-                  {modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'}
+              <Button
+                onClick={openSettings}
+                onMouseOver={() => setModelLabelHovered(true)}
+                onMouseOut={() => setModelLabelHovered(false)}
+              >
+                <text
+                  style={{ fg: modelLabelHovered ? theme.primary : theme.foreground }}
+                  attributes={TextAttributes.BOLD}
+                >
+                  <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                    {modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'}
+                  </span>
                 </text>
               </Button>
               <text style={{ fg: theme.muted }}>{'\u00b7'}</text>
@@ -740,8 +751,16 @@ export function Composer(props: ComposerProps) {
               {modelFooter.memoryLabel && (
                 <>
                   <text style={{ fg: theme.muted }}>{'\u00b7'}</text>
-                  <Button onClick={openHardware}>
-                    <text style={{ fg: theme.muted }}>{modelFooter.memoryLabel}</text>
+                  <Button
+                    onClick={openHardware}
+                    onMouseOver={() => setMemoryLabelHovered(true)}
+                    onMouseOut={() => setMemoryLabelHovered(false)}
+                  >
+                    <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
+                      <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                        {modelFooter.memoryLabel}
+                      </span>
+                    </text>
                   </Button>
                 </>
               )}

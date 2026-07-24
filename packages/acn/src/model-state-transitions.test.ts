@@ -20,6 +20,7 @@ import {
   isModelSlotUnloadSatisfied,
   recoverRecentLocalSelection,
   reconcileAvailableLocalSlot,
+  reconcileSlotState,
 } from "./model-slot-coordinator"
 
 const effort = ReasoningEffortSchema.make("high")
@@ -114,6 +115,27 @@ describe("ACN model-state transitions", () => {
 
     expect(reconcileAvailableLocalSlot(PRIMARY_SLOT_ID, localSelection, Option.some(blocked))).toEqual(
       new ModelSlotUnloadedLocalModel({ slotId: PRIMARY_SLOT_ID, selection: localSelection }),
+    )
+  })
+
+  it("preserves local model residency when only reasoning effort changes", () => {
+    const ready = new ModelSlotReady({
+      slotId: PRIMARY_SLOT_ID,
+      selection: localSelection,
+    })
+    const selection = {
+      ...localSelection,
+      reasoningEffort: ReasoningEffortSchema.make("medium"),
+    }
+    const target = reconcileAvailableLocalSlot(
+      PRIMARY_SLOT_ID,
+      selection,
+      Option.some(ready),
+    )
+
+    expect(target).toEqual(new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection }))
+    expect(reconcileSlotState(ready, target)).toEqual(
+      new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection }),
     )
   })
 

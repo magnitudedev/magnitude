@@ -84,6 +84,10 @@ const sameSelection = (left: SlotSelection, right: SlotSelection): boolean =>
   && left.providerModelId === right.providerModelId
   && left.reasoningEffort === right.reasoningEffort
 
+const sameModel = (left: SlotSelection, right: SlotSelection): boolean =>
+  left.providerId === right.providerId
+  && left.providerModelId === right.providerModelId
+
 const sameOptionalSelection = (
   left: Option.Option<SlotSelection>,
   right: Option.Option<SlotSelection>,
@@ -224,11 +228,11 @@ const initializeSlot = (previous: ModelSlotUnassigned, target: ModelSlot): Model
   }
 }
 
-const reconcileSlotState = (previous: ModelSlot, target: ModelSlot): ModelSlot => {
-  const selectionChanged = previous._tag !== "Unassigned"
+export const reconcileSlotState = (previous: ModelSlot, target: ModelSlot): ModelSlot => {
+  const modelChanged = previous._tag !== "Unassigned"
     && target._tag !== "Unassigned"
-    && !sameSelection(previous.selection, target.selection)
-  if (selectionChanged) {
+    && !sameModel(previous.selection, target.selection)
+  if (modelChanged) {
     const reset = ModelSlotLifecycle.transition(previous, "Unassigned", {})
     return initializeSlot(reset, target)
   }
@@ -331,9 +335,11 @@ export const reconcileAvailableLocalSlot = (
 ): ModelSlot => {
   if (Option.isSome(previous)
     && previous.value._tag !== "Unassigned"
-    && sameSelection(previous.value.selection, selection)
+    && sameModel(previous.value.selection, selection)
     && (previous.value._tag !== "Blocked"
-      || previous.value.reason._tag === "LocalModelLoadFailed")) return previous.value
+      || previous.value.reason._tag === "LocalModelLoadFailed")) {
+    return ModelSlotLifecycle.hold(previous.value, { selection })
+  }
   return new ModelSlotUnloadedLocalModel({ slotId, selection })
 }
 
