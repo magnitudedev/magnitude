@@ -116,6 +116,26 @@ describe("SessionStore", () => {
     })
   })
 
+  test("skips an unreadable session without hiding valid sessions", async () => {
+    const paths = makeGlobalStoragePaths(tmpDir)
+    await mkdir(paths.sessionDir("mqa00001"), { recursive: true })
+    await Bun.write(paths.sessionMetaFile("mqa00001"), "{invalid-json")
+
+    await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage
+        yield* storage.sessions.writeMeta("mqa00000", meta("mqa00000", "2026-01-02T00:00:00.000Z"))
+
+        const store = yield* SessionStore
+        return yield* store.listProtocolMetas({ limit: 10 })
+      }),
+      tmpDir
+    ).then((page) => {
+      expect(page.items.map((session) => session.sessionId)).toEqual(["mqa00000"])
+      expect(page.hasMore).toBe(false)
+    })
+  })
+
   test("lists cwd summaries sorted by recent activity", async () => {
     await run(
       Effect.gen(function* () {

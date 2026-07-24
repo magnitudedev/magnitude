@@ -29,6 +29,8 @@ export interface UsePaginatedSessionsResult {
   sessions: RecentChat[]
   /** Whether the first page is loading and no sessions are available yet. */
   loading: boolean
+  /** A list-level failure while loading the first page. */
+  error: string | null
   /** Whether a subsequent page is currently loading. */
   loadingMore: boolean
   /** Whether more pages can be loaded. */
@@ -155,6 +157,7 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
   return {
     sessions,
     loading,
+    error: firstPage.error,
     loadingMore,
     hasMore,
     loadMore,
