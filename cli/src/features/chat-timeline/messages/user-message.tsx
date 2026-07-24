@@ -6,12 +6,10 @@ import { useTheme } from '../../../hooks/use-theme'
 import { writeTextToClipboard } from '../../../utils/clipboard'
 import { fitAttachments } from '@magnitudedev/client-common'
 import { formatShortTimestamp } from '@magnitudedev/client-common'
-import { BOX_CHARS } from '../../../utils/ui-constants'
 import type { ImageAttachment } from '@magnitudedev/sdk'
+import { UserMessageFrame } from './user-message-frame'
 
 const COPY_FEEDBACK_RESET_MS = 2000
-
-const USER_MESSAGE_BOX_CHARS = { ...BOX_CHARS, vertical: '┃' }
 
 interface UserMessageProps {
   content: string
@@ -94,32 +92,14 @@ export const UserMessage = memo(function UserMessage({ content, timestamp, taskM
       onMouseOver={handleMouseOver}
       onMouseOut={handleMouseOut}
     >
-      {/* Outer box: border only (no background) */}
-      <box
-        style={{
-          borderStyle: 'single',
-          border: ['left'],
-          borderColor: taskMode ? theme.modePlan : theme.primary,
-          customBorderChars: USER_MESSAGE_BOX_CHARS,
-        }}
+      <UserMessageFrame
+        borderColor={taskMode ? theme.modePlan : theme.primary}
+        backgroundColor={isHovered ? theme.userMessageHoverBg : theme.userMessageBg}
       >
-        {/* Inner box: background + padding (no border) */}
-        <box
-          style={{
-            flexDirection: 'row',
-            backgroundColor: isHovered ? theme.userMessageHoverBg : theme.userMessageBg,
-            paddingTop: 1,
-            paddingBottom: 1,
-            paddingLeft: 1,
-            paddingRight: 2,
-            flexGrow: 1,
-          }}
-        >
-          <text style={{ fg: theme.foreground, wrapMode: 'word', flexGrow: 1 }}>
+        <text style={{ fg: theme.foreground, wrapMode: 'word', flexGrow: 1 }}>
 {content}
-          </text>
-        </box>
-      </box>
+        </text>
+      </UserMessageFrame>
 
       {/* Metadata row - attachments left, copy/timestamp right */}
       {showMetadataRow && (
