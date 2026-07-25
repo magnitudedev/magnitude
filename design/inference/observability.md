@@ -2,6 +2,8 @@
 applies_to:
   - inference/crates/icn-server/src/telemetry.rs
   - inference/crates/icn-server/src/main.rs
+  - inference/crates/icn-server/src/inference_worker.rs
+  - inference/crates/icn-server/src/memory_supervisor.rs
   - inference/crates/icn-api/src/lib.rs
   - inference/crates/icn-engine/src/**
 ---
@@ -38,7 +40,9 @@ emits status and latency information.
 
 Important model and inference operations use function spans. Context is carried explicitly across
 blocking task and dedicated executor-thread boundaries; thread changes must not detach request work
-from its originating completion span. Continuous batching may combine several requests, so a shared
+from its originating completion span. Private inference-worker commands carry W3C context in their
+typed envelope, and the worker establishes a child operation span before entering the native
+executor. Continuous batching may combine several requests, so a shared
 native batch must not be falsely represented as the child of only one request.
 
 `tracing` events are exported as real OpenTelemetry log records in addition to appearing as span
@@ -50,7 +54,8 @@ telemetry.
 
 Instrumentation records stable operational metadata such as model and completion identifiers,
 token counts, finish reason, queue duration, prompt duration, decode duration, cache behavior,
-backend selection, status, and stable error diagnostics.
+backend selection, worker generation, system-memory reserve, available physical/commit memory,
+worker footprint, eviction latency, status, and stable error diagnostics.
 
 Instrumentation must never record prompts, generated or reasoning text, image contents,
 authorization values, request headers, token arrays, tool arguments, full request structures, or
@@ -69,8 +74,8 @@ operation boundaries instead.
 - One ICN request produces a server span and correlated log records without exposing request
   content or authorization material.
 - A valid incoming `traceparent` becomes the parent of the ICN server span.
-- Completion work remains correlated across Axum, `spawn_blocking`, and the model executor command
-  boundary.
+- Completion work remains correlated across Axum, private worker IPC, and the model executor
+  command boundary.
 - Trace and log providers flush during graceful shutdown.
 - With OTLP disabled, ICN remains functional and retains standard-error diagnostics.
 - Collector failure never changes an HTTP or inference domain result.

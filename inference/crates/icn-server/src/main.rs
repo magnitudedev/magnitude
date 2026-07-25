@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Context;
@@ -30,9 +31,7 @@ use icn_contracts::{
     ModelHardwareAssessor, ModelPreviewProfile, ProjectorConfig, ResolvedModel, SplitMode,
     TemplateAssessment, TemplateAssessor,
 };
-use icn_engine::{
-    LlamaCompletionBackend, ModelLoadError, ModelLoadObserver, MtpCandidateSelection, NativeBackend,
-};
+use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
     InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
@@ -43,10 +42,15 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
 mod build_identity;
+mod inference_worker;
 mod load_progress;
+mod memory_supervisor;
 mod telemetry;
 
+use inference_worker::{InferenceWorker, LoadEvent, RemoteBackend};
 use load_progress::{LoadProgressEstimator, LoadProgressTracker};
+use memory_supervisor::{IDLE_POLL_INTERVAL, RECOVERY_STABLE_TIME};
+use memory_supervisor::{MONITOR_LOSS_DEADLINE, POLL_INTERVAL, SystemMemoryObserver};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -101,6 +105,8 @@ enum Command {
     PlanWorker,
     #[command(hide = true)]
     TemplateWorker,
+    #[command(hide = true)]
+    InferenceWorker,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -198,7 +204,7 @@ fn execution_intent(
 struct ResidentNativeExecutor {
     generation: u64,
     model_id: String,
-    backend: Arc<LlamaCompletionBackend>,
+    backend: Arc<RemoteBackend>,
 }
 
 struct NativeHardwareAssessor {
@@ -462,17 +468,16 @@ impl NativeHardwareAssessor {
         {
             if let Ok(value) = &calibration
                 && let Some(evidence) = guard.evidence.as_deref()
+                && let Some(cache) = &self.cache
             {
-                if let Some(cache) = &self.cache {
-                    cache.write_index(
-                        ModelIndexKind::Calibration,
-                        evidence,
-                        &PersistedCalibration {
-                            captured_at: unix_time_seconds(),
-                            calibration: value.clone(),
-                        },
-                    );
-                }
+                cache.write_index(
+                    ModelIndexKind::Calibration,
+                    evidence,
+                    &PersistedCalibration {
+                        captured_at: unix_time_seconds(),
+                        calibration: value.clone(),
+                    },
+                );
             }
             guard.result = Some(calibration);
         }
@@ -1628,8 +1633,11 @@ impl HardwareProvider for NativeHardwareAssessor {
 struct NativeRuntimeController {
     backends: BackendRegistry,
     inventory: Arc<ModelManager>,
-    native_backend: NativeBackend,
     native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
+    worker: Arc<tokio::sync::RwLock<Option<InferenceWorker>>>,
+    memory_observer: Arc<SystemMemoryObserver>,
+    next_worker_generation: Arc<AtomicU64>,
+    admission_blocked_until: Arc<Mutex<Option<std::time::Instant>>>,
     defaults: RuntimePlanDefaults,
     load_progress: Arc<LoadProgressEstimator>,
     loaded_configurations: Arc<Mutex<std::collections::BTreeSet<String>>>,
@@ -1639,15 +1647,15 @@ struct NativeRuntimeController {
 
 #[derive(Clone)]
 struct RuntimeFailure {
-    code: &'static str,
+    code: String,
     message: String,
     retryable: bool,
 }
 
 impl RuntimeFailure {
-    fn new(code: &'static str, message: impl Into<String>, retryable: bool) -> Self {
+    fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
         Self {
-            code,
+            code: code.into(),
             message: message.into(),
             retryable,
         }
@@ -1676,24 +1684,6 @@ impl From<InventoryError> for RuntimeTransitionFailure {
 }
 
 impl NativeRuntimeController {
-    fn model_load_failure(error: ModelLoadError) -> RuntimeTransitionFailure {
-        let (code, retryable) = match &error {
-            ModelLoadError::InvalidConfiguration(_) => ("invalid_configuration", false),
-            ModelLoadError::MtpSelection(_) => ("incompatible_auxiliary", false),
-            ModelLoadError::Planning(_) => ("planner_failed", true),
-            ModelLoadError::AssessmentRejected(assessment) => match assessment.as_ref() {
-                HardwareAssessment::DoesNotFit { .. } => ("does_not_fit", false),
-                HardwareAssessment::InvalidArtifact { .. } => ("invalid_artifact", false),
-                HardwareAssessment::IncompatibleArtifact { .. } => ("incompatible_artifact", false),
-                HardwareAssessment::NotAssessed { .. } => ("planner_failed", true),
-                HardwareAssessment::Fits { .. } => ("planner_invariant", true),
-            },
-            ModelLoadError::MemoryAttribution(_) => ("memory_attribution_failed", true),
-            ModelLoadError::Backend(_) => ("backend_load_failed", true),
-        };
-        RuntimeTransitionFailure::new(RuntimeFailure::new(code, error.to_string(), retryable))
-    }
-
     fn load_failure(error: InventoryError) -> DomainModelFailure {
         let (code, retryable) = match &error {
             InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
@@ -1723,7 +1713,6 @@ impl NativeRuntimeController {
     fn new(
         backends: BackendRegistry,
         inventory: Arc<ModelManager>,
-        native_backend: NativeBackend,
         native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
         defaults: RuntimePlanDefaults,
         cache: ModelCache,
@@ -1732,8 +1721,11 @@ impl NativeRuntimeController {
         Self {
             backends,
             inventory,
-            native_backend,
             native_executor,
+            worker: Arc::new(tokio::sync::RwLock::new(None)),
+            memory_observer: Arc::new(SystemMemoryObserver::new()),
+            next_worker_generation: Arc::new(AtomicU64::new(1)),
+            admission_blocked_until: Arc::new(Mutex::new(None)),
             defaults,
             load_progress: Arc::new(LoadProgressEstimator::new(cache, native_build)),
             loaded_configurations: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
@@ -1833,6 +1825,175 @@ impl NativeRuntimeController {
         ))
     }
 
+    fn estimated_incremental_bytes(
+        resolved: &ResolvedModel,
+    ) -> Result<u64, RuntimeTransitionFailure> {
+        const RUNTIME_ALLOWANCE_BYTES: u64 = 1024 * 1024 * 1024;
+        resolved
+            .components
+            .iter()
+            .try_fold(RUNTIME_ALLOWANCE_BYTES, |total, component| {
+                let bytes = std::fs::metadata(&component.path)
+                    .map_err(|error| {
+                        RuntimeTransitionFailure::new(RuntimeFailure::new(
+                            "memory_estimate_failed",
+                            format!(
+                                "failed to inspect {} for memory admission: {error}",
+                                component.path.display()
+                            ),
+                            true,
+                        ))
+                    })?
+                    .len();
+                total.checked_add(bytes).ok_or_else(|| {
+                    RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        "memory_estimate_failed",
+                        "model memory estimate overflowed",
+                        false,
+                    ))
+                })
+            })
+    }
+
+    async fn discard_worker(&self, worker: &InferenceWorker, code: &str, reason: &str) {
+        let pid = worker.pid();
+        let is_current = self
+            .worker
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.pid() == pid);
+        if !is_current {
+            return;
+        }
+        worker.terminate(code, reason);
+        self.backends.clear();
+        if let Ok(mut slot) = self.native_executor.write() {
+            *slot = None;
+        }
+        *self.state.write().await = RuntimeState { resident: None };
+        let mut slot = self.worker.write().await;
+        if slot.as_ref().is_some_and(|current| current.pid() == pid) {
+            *slot = None;
+        }
+    }
+
+    fn block_memory_admission(&self) {
+        if let Ok(mut blocked_until) = self.admission_blocked_until.lock() {
+            *blocked_until = Some(std::time::Instant::now() + RECOVERY_STABLE_TIME);
+        }
+    }
+
+    fn start_idle_memory_observer(&self) {
+        let controller = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(IDLE_POLL_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let blocked = controller
+                    .admission_blocked_until
+                    .lock()
+                    .ok()
+                    .and_then(|blocked_until| *blocked_until);
+                let Some(blocked_until) = blocked else {
+                    // Still sample while idle so observer failures are exercised before admission.
+                    let _ = controller.memory_observer.sample();
+                    continue;
+                };
+                match controller.memory_observer.sample() {
+                    Ok(sample) if sample.recovered() => {
+                        if std::time::Instant::now() >= blocked_until
+                            && let Ok(mut state) = controller.admission_blocked_until.lock()
+                        {
+                            *state = None;
+                        }
+                    }
+                    Ok(_) | Err(_) => controller.block_memory_admission(),
+                }
+            }
+        });
+    }
+
+    fn supervise_worker(&self, worker: InferenceWorker) {
+        let controller = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(POLL_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut observation_failed_at = None;
+            loop {
+                tick.tick().await;
+                match worker.try_wait() {
+                    Ok(Some(status)) => {
+                        controller
+                            .discard_worker(
+                                &worker,
+                                "worker_exited",
+                                &format!("inference worker exited unexpectedly: {status}"),
+                            )
+                            .await;
+                        break;
+                    }
+                    Err(error) => {
+                        controller
+                            .discard_worker(
+                                &worker,
+                                "worker_monitor_failed",
+                                &format!("failed to observe inference worker: {error}"),
+                            )
+                            .await;
+                        break;
+                    }
+                    Ok(None) => {}
+                }
+                match controller.memory_observer.sample() {
+                    Ok(sample) => {
+                        observation_failed_at = None;
+                        if sample.requires_eviction() {
+                            let worker_resident_bytes = worker.pid().and_then(|pid| {
+                                controller.memory_observer.worker_resident_bytes(pid)
+                            });
+                            controller.block_memory_admission();
+                            tracing::warn!(
+                                memory.available_bytes = sample.available_bytes,
+                                memory.reserve_bytes = sample.reserve_bytes(),
+                                memory.available_commit_bytes = ?sample.available_commit_bytes,
+                                memory.commit_limit_bytes = ?sample.commit_limit_bytes,
+                                memory.sample_age_ms = sample.captured_at.elapsed().as_millis(),
+                                worker.resident_bytes = ?worker_resident_bytes,
+                                worker.pid = worker.pid(),
+                                "evicting inference worker under system memory pressure"
+                            );
+                            controller
+                                .discard_worker(
+                                    &worker,
+                                    "memory_pressure_eviction",
+                                    "inference worker evicted under system memory pressure",
+                                )
+                                .await;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let failed_at =
+                            observation_failed_at.get_or_insert_with(std::time::Instant::now);
+                        if failed_at.elapsed() >= MONITOR_LOSS_DEADLINE {
+                            controller.block_memory_admission();
+                            controller
+                                .discard_worker(
+                                    &worker,
+                                    "memory_monitor_unavailable",
+                                    &format!("system memory supervision unavailable: {error}"),
+                                )
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     #[tracing::instrument(
         name = "icn.runtime.load.operation",
         skip_all,
@@ -1858,15 +2019,14 @@ impl NativeRuntimeController {
             .resident
             .as_ref()
             .is_some_and(|resident| resident.model_id == model_id && resident.profile == profile)
+            && let Some(lease) = self.backends.lease()
         {
-            if let Some(lease) = self.backends.lease() {
-                drop(lease);
-                let residency_id = existing
-                    .resident
-                    .expect("matching resident was checked")
-                    .residency_id;
-                return Ok(RuntimeResidencyId(residency_id));
-            }
+            drop(lease);
+            let residency_id = existing
+                .resident
+                .expect("matching resident was checked")
+                .residency_id;
+            return Ok(RuntimeResidencyId(residency_id));
         };
         let _backend_mutation = self.backends.begin_mutation().await;
 
@@ -1876,60 +2036,222 @@ impl NativeRuntimeController {
                 fraction: None,
             });
         }
+        if existing.resident.is_some() || self.worker.read().await.is_some() {
+            self.stop_worker_gracefully().await;
+        }
         *self.state.write().await = RuntimeState { resident: None };
-
         if let Ok(mut slot) = self.native_executor.write() {
             *slot = None;
         }
         self.backends.clear();
 
-        let load_model_id = model_id.clone();
-        let native_backend = self.native_backend.clone();
-        let prepared = match spawn_blocking_traced(move || {
-            native_backend.prepare_load(load_model_id, plan, mtp_selection)
+        let estimated_incremental_bytes = Self::estimated_incremental_bytes(&resolved)?;
+        let recovery_blocked = self
+            .admission_blocked_until
+            .lock()
+            .ok()
+            .and_then(|blocked_until| *blocked_until)
+            .is_some_and(|blocked_until| blocked_until > std::time::Instant::now());
+        if recovery_blocked {
+            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "memory_pressure_recovery",
+                "system memory is still in the post-eviction recovery period",
+                true,
+            )));
+        }
+        let sample = self.memory_observer.sample().map_err(|error| {
+            RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "memory_monitor_unavailable",
+                error,
+                true,
+            ))
+        })?;
+        if self
+            .admission_blocked_until
+            .lock()
+            .ok()
+            .and_then(|blocked_until| *blocked_until)
+            .is_some()
+            && !sample.recovered()
+        {
+            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "memory_pressure_recovery",
+                format!(
+                    "system memory has not recovered above the {} byte reserve and hysteresis margin",
+                    sample.reserve_bytes()
+                ),
+                true,
+            )));
+        }
+        if let Ok(mut blocked_until) = self.admission_blocked_until.lock() {
+            *blocked_until = None;
+        }
+        if !sample.permits_load(estimated_incremental_bytes) {
+            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "insufficient_system_memory",
+                format!(
+                    "model requires an estimated {estimated_incremental_bytes} bytes, but only {} bytes are available with a {} byte system reserve",
+                    sample.available_bytes,
+                    sample.reserve_bytes()
+                ),
+                true,
+            )));
+        }
+
+        let worker_generation = self.next_worker_generation.fetch_add(1, Ordering::Relaxed);
+        let expected_build = build_identity::native_build();
+        let (worker, mut load_events) = tokio::task::spawn_blocking(move || {
+            InferenceWorker::spawn(worker_generation, expected_build)
         })
         .await
-        {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(error)) => return Err(Self::model_load_failure(error)),
-            Err(error) => {
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "load_task_failed",
-                    error.to_string(),
-                    true,
-                )));
-            }
-        };
+        .map_err(|error| {
+            RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "worker_spawn_failed",
+                error.to_string(),
+                true,
+            ))
+        })?
+        .map_err(|error| {
+            RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "worker_spawn_failed",
+                error.to_string(),
+                true,
+            ))
+        })?;
+        *self.worker.write().await = Some(worker.clone());
+        self.supervise_worker(worker.clone());
+        if let Err(error) = worker.start_load(model_id.clone(), plan, mtp_selection) {
+            self.discard_worker(
+                &worker,
+                "worker_protocol_error",
+                "failed to send worker load command",
+            )
+            .await;
+            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "worker_protocol_error",
+                error.to_string(),
+                true,
+            )));
+        }
+
         let previously_loaded_in_process = self
             .loaded_configurations
             .lock()
             .is_ok_and(|loaded| loaded.contains(&model_id));
-        let signature = self.load_progress.signature(
-            &configuration,
-            prepared.acceleration(),
-            prepared.timing_plan_identity(),
-            prepared.phases(),
-            previously_loaded_in_process,
-        );
-        let acceleration = prepared.acceleration().to_owned();
-        let estimates = self.load_progress.estimate(
-            &signature,
-            &configuration,
-            &acceleration,
-            prepared.phases(),
-        );
-        let tracker = LoadProgressTracker::new(estimates);
-        let observer: Arc<dyn ModelLoadObserver> = Arc::new(tracker.clone());
+        let (acceleration, signature, tracker) = match load_events.recv().await {
+            Some(LoadEvent::Prepared {
+                acceleration,
+                timing_plan_identity,
+                phases,
+            }) => {
+                let signature = self.load_progress.signature(
+                    &configuration,
+                    &acceleration,
+                    &timing_plan_identity,
+                    &phases,
+                    previously_loaded_in_process,
+                );
+                let estimates =
+                    self.load_progress
+                        .estimate(&signature, &configuration, &acceleration, &phases);
+                (acceleration, signature, LoadProgressTracker::new(estimates))
+            }
+            Some(LoadEvent::Failed(message)) => {
+                self.discard_worker(&worker, "backend_load_failed", &message)
+                    .await;
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "backend_load_failed",
+                    message,
+                    true,
+                )));
+            }
+            Some(LoadEvent::Lost { code, message }) => {
+                self.discard_worker(&worker, &code, &message).await;
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    code, message, true,
+                )));
+            }
+            Some(LoadEvent::Phase { .. }) | Some(LoadEvent::Loaded(_)) => {
+                self.discard_worker(
+                    &worker,
+                    "worker_protocol_error",
+                    "worker load protocol order violation",
+                )
+                .await;
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "worker_protocol_error",
+                    "worker sent load activity before its prepared plan",
+                    false,
+                )));
+            }
+            None => {
+                self.discard_worker(&worker, "worker_exited", "worker load channel closed")
+                    .await;
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "worker_exited",
+                    "inference worker stopped during load",
+                    true,
+                )));
+            }
+        };
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Loading,
             fraction: Some(0.0),
         });
-        let mut load_task = spawn_blocking_traced(move || prepared.execute(observer));
         let mut progress_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let load_result = loop {
+        let properties = loop {
             tokio::select! {
-                result = &mut load_task => break result,
+                event = load_events.recv() => match event {
+                    Some(LoadEvent::Phase { phase, started }) => {
+                        if started {
+                            tracker.phase_started(phase);
+                        } else {
+                            tracker.phase_completed(phase);
+                        }
+                    }
+                    Some(LoadEvent::Loaded(properties)) => break *properties,
+                    Some(LoadEvent::Failed(message)) => {
+                        self.discard_worker(&worker, "backend_load_failed", &message).await;
+                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                            "backend_load_failed",
+                            message,
+                            true,
+                        )));
+                    }
+                    Some(LoadEvent::Lost { code, message }) => {
+                        self.discard_worker(&worker, &code, &message).await;
+                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                            code,
+                            message,
+                            true,
+                        )));
+                    }
+                    Some(LoadEvent::Prepared { .. }) => {
+                        self.discard_worker(
+                            &worker,
+                            "worker_protocol_error",
+                            "worker sent duplicate prepared event",
+                        ).await;
+                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                            "worker_protocol_error",
+                            "worker sent duplicate prepared event",
+                            false,
+                        )));
+                    }
+                    None => {
+                        self.discard_worker(
+                            &worker,
+                            "worker_exited",
+                            "worker load channel closed",
+                        ).await;
+                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                            "worker_exited",
+                            "inference worker stopped during load",
+                            true,
+                        )));
+                    }
+                },
                 _ = progress_tick.tick() => {
                     let _ = events.send(ModelLoadEvent::Progress {
                         stage: ModelLoadStage::Loading,
@@ -1938,31 +2260,11 @@ impl NativeRuntimeController {
                 }
             }
         };
-        let backend = match load_result {
-            Ok(Ok(backend)) => Arc::new(backend),
-            Ok(Err(error)) => return Err(Self::model_load_failure(error)),
-            Err(error) => {
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "load_task_failed",
-                    error.to_string(),
-                    true,
-                )));
-            }
-        };
+        let backend = Arc::new(worker.backend(model_id.clone(), properties));
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Verifying,
             fraction: Some(tracker.fraction()),
         });
-        match backend.properties() {
-            Ok(_) => {}
-            Err(error) => {
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "verification_failed",
-                    error.to_string(),
-                    false,
-                )));
-            }
-        }
         let mut aliases = std::collections::BTreeSet::new();
         aliases.insert(resolved.model.name.clone());
         let generation = self
@@ -1999,25 +2301,50 @@ impl NativeRuntimeController {
         Ok(RuntimeResidencyId(residency_id))
     }
 
+    async fn stop_worker_gracefully(&self) {
+        let worker = self.worker.write().await.take();
+        let Some(worker) = worker else {
+            return;
+        };
+        worker.shutdown();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match worker.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Ok(None) | Err(_) => {
+                    worker.terminate(
+                        "worker_unresponsive",
+                        "inference worker graceful shutdown timed out",
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     async fn unload_resident_with_admission_closed(
         &self,
         model_id: &str,
         _backend_mutation: BackendMutationGuard,
     ) -> Result<bool, InventoryError> {
         let previous = self.state.read().await.clone();
-        if !previous
+        if previous
             .resident
             .as_ref()
-            .is_some_and(|resident| resident.model_id == model_id)
+            .is_none_or(|resident| resident.model_id != model_id)
         {
             return Ok(false);
         }
 
+        self.backends.clear();
         if let Ok(mut slot) = self.native_executor.write() {
             *slot = None;
         }
-        self.backends.clear();
         *self.state.write().await = RuntimeState { resident: None };
+        self.stop_worker_gracefully().await;
         Ok(true)
     }
 
@@ -2241,15 +2568,16 @@ async fn main() -> anyhow::Result<()> {
                 native_build: native_build.clone(),
             };
             let runtime = (!fake).then(|| {
-                Arc::new(NativeRuntimeController::new(
+                let runtime = Arc::new(NativeRuntimeController::new(
                     backends.clone(),
                     inventory.clone(),
-                    native_backend,
                     native_executor_slot,
                     plan_defaults,
                     inventory.derived_cache().clone(),
                     native_build.clone(),
-                ))
+                ));
+                runtime.start_idle_memory_observer();
+                runtime
             });
             let mut state = AppState::model_free(backends)
                 .with_installed_packages(inventory)
@@ -2310,6 +2638,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::PlanWorker => run_planning_worker()?,
         Command::TemplateWorker => run_template_worker()?,
+        Command::InferenceWorker => inference_worker::run_worker(build_identity::native_build())?,
     }
     Ok(())
 }

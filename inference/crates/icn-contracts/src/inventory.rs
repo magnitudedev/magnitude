@@ -301,27 +301,27 @@ impl NormalizedReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutomaticReasoningBudget {
     Disabled,
     FixedTokens { tokens: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeReasoningControls {
     /// `None` omits the native backend's dedicated control and preserves the authored template default.
     pub enable_thinking: Option<bool>,
     pub template_args: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningEffortMapping {
     pub effort: NormalizedReasoningEffort,
     pub controls: NativeReasoningControls,
     pub automatic_budget: AutomaticReasoningBudget,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningProfile {
     pub default_effort: NormalizedReasoningEffort,
     pub mappings: Vec<ReasoningEffortMapping>,

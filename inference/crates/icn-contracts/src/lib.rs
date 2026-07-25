@@ -16,7 +16,7 @@ pub use inventory::*;
 /// plan: native defaults, compatibility decisions, tensor placement, and final allocation
 /// parameters belong to a process-local backend plan and must never be reconstructed from this
 /// representation.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExecutionIntent {
     pub model_path: PathBuf,
     /// Total context capacity shared by all concurrently resident sequences.
@@ -35,7 +35,7 @@ pub struct ExecutionIntent {
     pub mtp: MtpConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MtpConfig {
     Disabled {
@@ -59,7 +59,7 @@ impl Default for MtpConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MtpSource {
     /// Prediction layers are executable from the target GGUF itself.
@@ -68,7 +68,7 @@ pub enum MtpSource {
     Separate { model_path: PathBuf },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MtpRuntimeProperties {
     Disabled {
         reason: String,
@@ -130,7 +130,7 @@ impl Default for ExecutionConfig {
 /// A requested execution configuration and the concrete native parameters selected at startup.
 ///
 /// `resolved` describes parameters passed to the native backend, not measured physical tensor placement.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExecutionConfigReport {
     pub requested: ExecutionConfig,
     pub resolved: ExecutionConfig,
@@ -226,7 +226,7 @@ impl std::str::FromStr for CacheType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ProjectorConfig {
     pub path: PathBuf,
     pub use_gpu: bool,
@@ -293,14 +293,14 @@ pub struct GenerateRequest {
     pub seed: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum FinishReason {
     Stop,
     Length,
     ToolCalls,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct GenerationMetrics {
     pub queue_ms: f64,
     pub prompt_ms: f64,
@@ -316,7 +316,7 @@ pub struct GenerationMetrics {
     pub verification_ms: f64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct GenerationSnapshot {
     pub cached_prompt_tokens: usize,
     pub prompt_tokens: usize,
@@ -324,7 +324,7 @@ pub struct GenerationSnapshot {
     pub metrics: GenerationMetrics,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Generation {
     pub text: String,
     pub reasoning: String,
@@ -336,7 +336,7 @@ pub struct Generation {
     pub metrics: GenerationMetrics,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ChatRole {
     System,
     User,
@@ -356,7 +356,7 @@ impl ChatRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ChatContentPart {
     Text { text: String },
     Image(ImageInput),
@@ -399,17 +399,57 @@ impl fmt::Debug for ImageInput {
     }
 }
 
+impl serde::Serialize for ImageInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use base64::Engine as _;
+        use serde::ser::SerializeStruct as _;
+
+        let mut image = serializer.serialize_struct("ImageInput", 2)?;
+        image.serialize_field("media_type", &self.media_type)?;
+        image.serialize_field(
+            "data_base64",
+            &base64::engine::general_purpose::STANDARD.encode(&self.bytes),
+        )?;
+        image.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ImageInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use base64::Engine as _;
+
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireImage {
+            media_type: String,
+            data_base64: String,
+        }
+
+        let wire = WireImage::deserialize(deserializer)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(wire.data_base64)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self::new(wire.media_type, bytes))
+    }
+}
+
 /// The encoded shape of a chat message's content.
 ///
 /// Keeping string content distinct from typed parts matters because Jinja templates can advertise
 /// support for one representation but not the other, and the native backend adapts them differently.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ChatContent {
     Text(String),
     Parts(Vec<ChatContentPart>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: Option<ChatContent>,
@@ -446,21 +486,21 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: Option<String>,
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ToolChoice {
     None,
     Auto,
@@ -474,13 +514,13 @@ pub enum ToolChoice {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum AllowedToolsMode {
     Auto,
     Required,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ReasoningControl {
     ModelDefault,
     Disabled,
@@ -496,7 +536,7 @@ pub enum ReasoningControl {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ResponseFormat {
     Text,
     JsonObject,
@@ -510,7 +550,7 @@ pub enum ResponseFormat {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ChatRequest {
     pub template: ChatTemplateRequest,
     pub stop: Vec<String>,
@@ -526,7 +566,7 @@ pub struct ChatRequest {
     pub timings_per_token: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ChatTemplateRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
@@ -537,7 +577,7 @@ pub struct ChatTemplateRequest {
     pub template_args: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum GrammarTrigger {
     Token { value: String, token: i32 },
     Word(String),
@@ -558,7 +598,7 @@ pub struct TemplateCapabilities {
     pub enable_thinking: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct PreparedChatInfo {
     pub prompt: String,
     pub generation_prompt: String,
@@ -573,7 +613,7 @@ pub struct PreparedChatInfo {
     pub template_fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ModelProperties {
     pub model_path: PathBuf,
     pub model_size_bytes: u64,
@@ -591,14 +631,14 @@ pub struct ModelProperties {
     pub template_fingerprint: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ModelModalities {
     pub vision: bool,
     pub audio: bool,
     pub video: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum InferenceEvent {
     Progress(InferenceProgress),
     /// Begins the assistant stream for the first sampled-token result.
@@ -620,7 +660,7 @@ pub enum InferenceEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum InferenceProgress {
     Queued,
     Preparing,
@@ -632,7 +672,7 @@ pub enum InferenceProgress {
     Generating,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct InferenceStreamEvent {
     pub delta: InferenceEvent,
     pub timings: Option<GenerationSnapshot>,
@@ -725,5 +765,15 @@ mod execution_config_tests {
         assert_eq!("tensor".parse::<SplitMode>(), Ok(SplitMode::Tensor));
         assert_eq!("iq4_nl".parse::<CacheType>(), Ok(CacheType::Iq4Nl));
         assert!("q6_k".parse::<CacheType>().is_err());
+    }
+
+    #[test]
+    fn image_input_json_uses_base64_instead_of_integer_arrays() {
+        let image = ImageInput::new("image/png", vec![0, 1, 2, 255]);
+        let encoded = serde_json::to_value(&image).unwrap();
+        assert_eq!(encoded["media_type"], "image/png");
+        assert_eq!(encoded["data_base64"], "AAEC/w==");
+        let decoded: ImageInput = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, image);
     }
 }

@@ -308,7 +308,7 @@ pub struct LlamaCompletionBackend {
     executor: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum MtpCandidateSelection {
     Automatic(Vec<PathBuf>),
     Explicit(PathBuf),
