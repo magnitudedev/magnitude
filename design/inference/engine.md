@@ -6,6 +6,8 @@ applies_to:
   - inference/crates/icn-contracts/src/output.rs
   - inference/crates/icn-api/src/lib.rs
   - inference/crates/icn-server/src/main.rs
+  - inference/crates/icn-server/src/inference_worker.rs
+  - inference/crates/icn-server/src/memory_supervisor.rs
   - inference/native/llama-cpp-rs/llama-cpp-2/**
 ---
 
@@ -27,7 +29,10 @@ state primitives; Magnitude does not duplicate the native KV representation.
 ## System shape
 
 ```text
-API / caller threads
+API / caller threads in persistent ICN
+        │ bounded private IPC
+        ▼
+disposable inference worker process
         │ bounded commands
         ▼
 per-model executor thread
@@ -40,16 +45,17 @@ per-model executor thread
   └── optional MTP target/draft operations
         │ bounded result streams
         ▼
-API / caller threads
+IPC proxy / API caller
 ```
 
 `NativeBackend` is the process-lifetime capability proving that llama.cpp's global backend is
-initialized. ICN creates it once at the server composition root and retains it until shutdown.
-`LlamaCompletionBackend` is the resident-model handle. Preparing a load requires the native
-capability, starts the named executor thread, creates a fresh process-local backend plan on that
-thread, and returns a `PreparedModelLoad` only after the exact plan is fixed. The non-`Send` native
-plan remains on its owner thread; executing the prepared handle releases that thread to consume the
-exact owned plan and initialize the model, context, chat templates, worker
+initialized. Persistent ICN may use a model-free capability for inventory assessment, but resident
+loading initializes a distinct capability only inside a disposable inference worker.
+`LlamaCompletionBackend` is the worker-local resident-model handle; persistent ICN publishes a
+bounded IPC proxy for it. Preparing a load starts the named executor thread, creates a fresh
+worker-process-local backend plan on that thread, and returns a `PreparedModelLoad` only after the
+exact plan is fixed. The non-`Send` native plan remains on its owner thread; executing the prepared
+handle releases that thread to consume the exact owned plan and initialize the model, context, chat templates, worker
 pools, and optional projector or MTP runtime. It then returns a typed readiness result which
 distinguishes invalid or incompatible artifacts, `DoesNotFit`, operational planning failure,
 allocation failure, and success with normalized resolved evidence. The
@@ -72,11 +78,11 @@ claim that any individual phase exposes byte-level completion.
 
 One executor thread exclusively owns each model's mutable native resources. This gives the engine a clear serialization boundary for llama.cpp memory operations, sequence mutations, sampling state, and shutdown. Callers may be concurrent, but they communicate with the owner rather than locking the native context directly.
 
-The ICN process owns exactly one native-backend capability. Model-free hardware observation and
-every resident executor borrow that capability; absence of a resident model never permits another
-backend initialization. The resident executor exclusively owns model, context, and scheduler
-mutation. Load-time MTP selection, fit planning, and model construction occur through the shared
-process backend. The selected MTP configuration remains part of the execution intent passed to fitting, so
+Persistent ICN owns no resident native executor. One disposable worker owns exactly one
+resident-backend capability and its executor; worker exit reclaims the complete resident topology.
+The resident executor exclusively owns model, context, and scheduler mutation. Load-time MTP
+selection, fit planning, and model construction occur inside that worker from the serialized
+execution intent. The selected MTP configuration remains part of the execution intent passed to fitting, so
 target and draft memory are assessed together. A serving-process preflight must never initialize a
 temporary backend. Model-free preview and inventory assessment use isolated worker processes; each
 worker creates one backend capability for its own complete process lifetime.
@@ -84,8 +90,9 @@ The same MTP selector implementation and policy fingerprint are used in isolated
 resident loading. Target identity includes the selected component set and serving-configuration
 revision, and parity tests compare normalized fit evidence with loaded execution evidence.
 
-There are three bounded flows:
+There are four bounded flows:
 
+- the host/worker framed IPC queues bound cross-process demand and retained payload bytes;
 - the model command queue bounds queued demand;
 - each request's native-to-caller event channel bounds transport buffering;
 - each active request's small outbound queue decouples native scheduling from a briefly slow consumer.

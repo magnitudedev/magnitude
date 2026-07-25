@@ -36,14 +36,15 @@ performs bounded shutdown. ACN consumes that scoped client directly; a second se
 it owns a new invariant rather than merely renaming generated operations.
 
 ICN is not a separately discovered daemon. Clients never connect to it directly, and ACN does not
-adopt an ICN started by another process. A model is not a process: the one child starts without a
-loaded model and loads, replaces, or unloads models through model-centric ICN operations.
+adopt an ICN started by another process. A model is not a public process resource: the one ICN
+service starts without a loaded model and privately creates or destroys a disposable inference
+worker behind model-centric load, replace, and unload operations.
 
-The service process may own bounded, private, short-lived native planner workers for isolated
-metadata-only fitting. These workers are an internal implementation detail of that one ICN service:
-they use the same verified executable, communicate only with their parent over private standard
-I/O, expose no listener or public lifecycle, allocate no model tensors, and terminate with the
-request or parent. ACN still owns and observes exactly one ICN service child.
+The service process may own bounded, private native children. Planner workers are short-lived and
+metadata-only. The inference worker owns the one resident model topology and lives only for that
+residency generation. Both use the same verified executable, communicate only with their parent
+over private standard I/O, expose no listener or public lifecycle, and terminate with their request,
+residency, or parent. ACN still owns and observes exactly one ICN service child.
 
 The hardware, fitting, and inventory meanings exposed through this boundary are defined by
 [hardware fitting](./hardware-fitting.md) and [model management](./model-management.md). This
@@ -304,11 +305,17 @@ already-resident identical model and profile is idempotent. Concurrent identical
 serialize, recheck residency, and perform at most one effective successful native load. Concurrent
 incompatible mutations are serialized by the native coordinator; they never race native
 process-global state or rely on ACN-side locking.
-The ICN composition root creates one process-lifetime native-backend capability before readiness.
-The resident executor, load-time planning, and model-free hardware observation all require that
-same capability. Creating or dropping a model executor never initializes or tears down the native
-backend, and runtime orchestration has no operation-level initialization path. Isolated planner and
-template workers each own one separate backend for their complete private process lifetime.
+The ICN composition root creates no resident native backend before readiness. Each resident load
+creates one private `inference-worker` child; that child initializes its own process-lifetime
+native-backend capability, prepares and loads exactly one topology, and owns the executor until it
+exits. Persistent ICN exposes the loaded backend through a bounded framed-IPC proxy. Isolated
+planner and template workers remain separate metadata-only children with one backend for their
+private process lifetime.
+
+Inference-worker lifetime is subordinate to ICN even on abrupt failure. Unix children disable
+core dumps and run a dedicated parent-liveness watchdog; Linux additionally requests
+`PR_SET_PDEATHSIG`. Windows workers are assigned to a kill-on-close Job Object. The retained child
+or Job handle, rather than a later PID lookup, performs forced termination and reaping.
 
 An ordinary chat request names the exact serving-configuration identity and may proceed only when
 that configuration is already resident. ICN acquires a generation lease and holds it until the
@@ -336,9 +343,16 @@ to the active runtime generation they began with and cannot silently continue on
 
 Every inference request holds an exact backend-generation lease through stream end or cancellation.
 Explicit load, replacement, and unload share backend admission and mutation authority. Unload and
-replacement close new inference admission and wait for existing leases to drain. ICN does not
-perform idle unloading or any other autonomous residency transition; a loaded model remains resident
-until an explicit load replaces it, an explicit unload releases it, or the process exits.
+replacement close new inference admission and wait for existing leases to drain. Memory-pressure
+eviction is deliberately different: persistent ICN observes whole-system available memory every
+100 milliseconds while a worker exists, and every second while idle. It immediately terminates
+the inference worker when availability reaches the configured system reserve. After eviction,
+one-second observations must remain above the recovery threshold for the full recovery interval
+before load admission reopens. Eviction does not wait for leases or native cleanup. Worker exit, protocol
+loss, or unavailable memory supervision clears residency and fails affected streams without
+terminating persistent ICN. There is no automatic reload. Outside this safety transition, ICN does
+not perform idle unloading; a loaded model remains resident until explicit replacement, explicit
+unload, pressure eviction, worker loss, or ICN exit.
 
 ICN's pinned runtime is part of the ICN build, so ACN has no separate native-runtime install,
 discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
@@ -402,13 +416,16 @@ The lifecycle conforms when:
   revision counter, or second residency projection;
 - loading one local model unloads every slot selecting a different local model, so two different
   local models can never both be advertised as Ready against the singleton executor;
-- a resident model remains loaded until explicit replacement, explicit unload, or process exit;
+- a resident model remains loaded until explicit replacement, explicit unload, memory-pressure
+  eviction, inference-worker loss, or ICN process exit;
 - replacement, load, and explicit unload serialize through native mutation authority and cannot
   invalidate an admitted inference lease;
 - product model-download, activation, deletion, hardware, and fit operations reach ICN only through
   the generated client, with no alternate model-repository or host-inspection path in ACN;
 - interrupting a consumer stream closes its response without terminating ICN;
-- an unexpected child exit causes the owning ACN to fail closed without an in-process restart;
+- an unexpected ICN service exit causes the owning ACN to fail closed without an in-process
+  restart; an internal inference-worker exit unloads only its runtime generation and leaves ICN
+  available;
 - normal ACN shutdown cancels higher-level work, gives ICN only a short graceful termination window,
   escalates on deadline, and reaps it;
 - termination and interrupt signals both activate native graceful shutdown;

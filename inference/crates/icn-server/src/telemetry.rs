@@ -5,7 +5,7 @@ use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, Request};
 use opentelemetry::global;
 use opentelemetry::logs::LogRecord as _;
-use opentelemetry::propagation::Extractor;
+use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{InstrumentationScope, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -30,6 +30,24 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 pub const SERVICE_NAME: &str = "magnitude-icn";
 const MOTEL_BASE_URL: &str = "http://127.0.0.1:27686";
 const EXPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) type TraceCarrier = std::collections::BTreeMap<String, String>;
+
+pub(crate) fn inject_current_trace() -> TraceCarrier {
+    let mut carrier = TraceCarrier::new();
+    let context = Span::current().context();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut CarrierInjector(&mut carrier));
+    });
+    carrier
+}
+
+pub(crate) fn set_parent_from_carrier(span: &Span, carrier: &TraceCarrier) {
+    let parent = global::get_text_map_propagator(|propagator| {
+        propagator.extract(&CarrierExtractor(carrier))
+    });
+    let _ = span.set_parent(parent);
+}
 
 pub struct TelemetryGuard {
     logger_provider: Option<SdkLoggerProvider>,
@@ -251,6 +269,26 @@ impl Extractor for HeaderExtractor<'_> {
 
     fn keys(&self) -> Vec<&str> {
         self.0.keys().map(|name| name.as_str()).collect()
+    }
+}
+
+struct CarrierInjector<'a>(&'a mut TraceCarrier);
+
+impl Injector for CarrierInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_owned(), value);
+    }
+}
+
+struct CarrierExtractor<'a>(&'a TraceCarrier);
+
+impl Extractor for CarrierExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
     }
 }
 

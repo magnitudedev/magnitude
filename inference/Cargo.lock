@@ -1391,6 +1391,7 @@ dependencies = [
 name = "icn-contracts"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "futures-util",
  "serde",
  "serde_json",
@@ -1532,6 +1533,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sysinfo",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1539,6 +1541,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
