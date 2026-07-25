@@ -3,9 +3,10 @@ applies_to:
   - packages/ai/src/provider/**
   - packages/icn/src/provider/**
   - packages/acn/src/local-provider-**
-  - packages/acn/src/local-model-runtime.ts
-  - packages/acn/src/model-slot-coordinator.ts
+  - packages/acn/src/model-*.ts
   - packages/acn/src/provider-model-catalog.ts
+  - packages/agent/src/model/**
+  - packages/agent/src/errors/model-start.ts
   - packages/protocol/src/schemas/model-state.ts
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
@@ -35,9 +36,12 @@ hashes package or profile data to create another configuration identity.
 An offering exists independently of current installation, fit, slot selection, or residency.
 ACN's local-offering projection combines the durable offering with installed-package and assessment
 observations to produce the provider model catalog entry. This is the only place that derives local
-provider availability. When the exact configuration fits, that catalog entry also carries its
-assessed runtime-memory requirement, summed across the physical memory domains reported by ICN.
-Generic and cloud provider entries do not fabricate a local runtime-memory requirement.
+provider availability. When ICN can assess the exact configuration, that catalog entry carries the
+complete per-domain memory accounting unchanged: capacity, required allocation, compatibility
+reserve, warning reserve, and remaining headroom. Consumers derive aggregate requirements,
+system-domain load admission, and warning presentation from that one value. They do not receive
+parallel aggregate or fit-label fields. Generic and cloud provider entries do not fabricate local
+memory accounting.
 
 The target ID groups every serving configuration of the same standalone package or speculative
 pair into one product model. Provider model IDs continue to distinguish configurations.
@@ -62,8 +66,8 @@ model IDs and does not create, refit, or rewrite offerings.
 
 ICN owns one native runtime coordinator and at most one resident configuration.
 
-ACN's slot coordinator is the product lifecycle authority. A manual load and provider-call
-admission use the same scoped slot transition:
+ACN's slot coordinator is the product lifecycle authority. A manual load and local request
+preparation use the same scoped slot transition:
 
 1. resolve the selected offering;
 2. require all target packages to be installed;
@@ -87,9 +91,11 @@ The ICN runtime coordinator is the sole native mutation and lease authority.
 - Replacement closes new admission and waits for existing generation leases.
 - A completion holds one generation lease until its body completes, fails, or is canceled.
 - A failed mutation does not poison later attempts.
+- Unexpected resident-worker loss is observed with the configuration identity and becomes a typed
+  blocked slot state; it is not inferred from generic provider unavailability.
 
-ACN serializes product slot transitions and rechecks the attributed slot after admission. Progress
-is observation only; terminal operation results drive slot state.
+ACN serializes product slot transitions and rechecks the attributed slot after preparation is
+admitted. Progress is observation only; terminal operation results drive slot state.
 
 ## Prompt and request boundary
 
@@ -97,17 +103,23 @@ The ICN provider encodes prompts once with the shared native chat-completions co
 client validates the request before transport. ICN validates structural inputs before accepting a
 stream and validates tokenizer-dependent constraints under the resident lease.
 
-The provider boundary preserves admission failure separately from response-stream failure. It does
-not repair invalid messages, fabricate assistant turns, or hide rejected response metadata.
+Local-model preparation is a scoped agent-request phase injected by ACN. It is outside the generic
+provider contract: preparation failure is a generic model-not-ready start result, never a fabricated
+provider response or provider rejection. After preparation succeeds, the ordinary provider request
+begins. ACN retains preparation admission until ICN accepts the request and owns its generation
+lease, then releases it. Provider start and response-stream failures keep their existing provider
+semantics and metadata.
 
 Context admission uses the resident configuration's context length. Catalog metadata, compaction,
 load planning, and request admission must agree on that exact configuration.
 
 ICN lifecycle control chunks are process-local request observations, not assistant output. The
-local provider removes them before the provider-neutral response codec and forwards queue,
-preparation, prefill, and generation-start state through optional request attribution. Ending,
-failing, or canceling the response stream clears that attributed state. Providers that do not
-support this observation remain valid and expose no synthetic progress.
+local provider removes them before the provider-neutral response codec and forwards queue, prefill,
+and generation-start state through optional request attribution. ACN's preceding preparation phase
+uses that same progress sink, so the display sees one continuous request lifecycle. A failed or
+canceled start clears preparation progress; after acceptance, ending, failing, or canceling the
+response stream clears provider-owned progress. Providers that do not support granular observation
+remain valid and expose no synthetic progress.
 
 ## Speculative decoding
 
@@ -133,9 +145,11 @@ drafting actually ran.
 - Every local provider call resolves through one durable offering.
 - Runtime load receives the stored ICN configuration unchanged.
 - Local availability is derived in one ACN projection.
-- Every available local provider catalog entry exposes ICN's assessed runtime-memory requirement
+- Every assessed local provider catalog entry exposes ICN's complete per-domain memory accounting
   for that exact serving configuration.
 - Provider binding does not load a model.
+- Local preparation is not represented as a provider response or provider failure.
+- Preparation admission remains held until ICN accepts the request's generation lease.
 - Chat cannot mutate residency.
 - Slot selection and recency refer only to stable provider model IDs.
 - Target/draft composition is identical during assessment, load, and inference.

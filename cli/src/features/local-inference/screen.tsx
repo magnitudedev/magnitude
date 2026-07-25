@@ -14,6 +14,8 @@ import {
   useLocalInferenceState,
   formatModelLoadProgress,
   getAnimationTickSnapshot,
+  memoryCapacityBytes,
+  requiredMemoryBytes,
   subscribeNoop,
   subscribeAnimationTick,
   type LocalInferenceView,
@@ -65,9 +67,7 @@ const recommendationIntent = (intent: "balanced" | "best_quality" | "fastest" | 
 
 const blockedSlotMessage = (
   slot: Extract<LocalInferenceView["slots"]["slots"]["primary"], { readonly _tag: "Blocked" }>,
-): string => slot.reason._tag === "LocalModelLoadFailed"
-  ? slot.reason.error.message
-  : slot.reason.message
+): string => "error" in slot.reason ? slot.reason.error.message : slot.reason.message
 
 type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
 
@@ -377,7 +377,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
               {candidate.qualityEvidence.map((evidence) => <text key={evidence} style={{ fg: theme.muted }}>{evidence}</text>)}
               <text style={{ fg: theme.muted }}>{candidate.intelligenceProvenance}</text>
               <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Calibration</text>
-              <text style={{ fg: theme.muted }}>Estimated {formatBytes(candidate.runtimeMemoryBytes)} runtime memory from {formatBytes(candidate.availableMemoryBytes)} available capacity.</text>
+              <text style={{ fg: theme.muted }}>Estimated {formatBytes(requiredMemoryBytes(candidate.memory))} runtime memory from {formatBytes(memoryCapacityBytes(candidate.memory))} capacity.</text>
               {Option.isSome(candidate.estimatedTokensPerSecond) && <text style={{ fg: theme.muted }}>About {candidate.estimatedTokensPerSecond.value.toFixed(1)} tokens/sec at {formatContext(candidate.profile.contextLength)} context.</text>}
             </box>
           })()}

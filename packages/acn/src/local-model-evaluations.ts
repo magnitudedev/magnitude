@@ -33,6 +33,7 @@ export type LocalModelAssessment =
   | { readonly _tag: "Fits"; readonly assessment: FitsOfferingAssessment }
   | {
       readonly _tag: "DoesNotFit"
+      readonly memory: FitsOfferingAssessment["memory"]
       readonly deficitBytes: number
       readonly limitingResource: string
     }
@@ -58,6 +59,17 @@ const failure = (operation: string, error: unknown) =>
     retryable: true,
   })
 
+const memoryAssessmentFromIcn = (
+  memory: Extract<OfferingAssessment, { readonly _tag: "Fits" }>["memory"][number],
+) => MemoryAssessmentSchema.make({
+  memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(memory.memoryDomainId),
+  capacityBytes: memory.capacityBytes,
+  requiredBytes: memory.requiredBytes,
+  compatibilityReserveBytes: memory.compatibilityReserveBytes,
+  warningReserveBytes: memory.warningReserveBytes,
+  remainingBytes: memory.remainingBytes,
+})
+
 const fitAssessment = (
   assessment: Extract<OfferingAssessment, { readonly _tag: "Fits" }>,
 ) => Effect.gen(function* () {
@@ -66,13 +78,7 @@ const fitAssessment = (
     profile,
     configurationId: ModelServingConfigurationIdSchema.make(assessment.configurationId),
     assessmentId: OfferingAssessmentIdSchema.make(assessment.assessmentId),
-    memory: assessment.memory.map((memory) => MemoryAssessmentSchema.make({
-      memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(memory.memoryDomainId),
-      capacityBytes: memory.capacityBytes,
-      requiredBytes: memory.requiredBytes,
-      requiredReserveBytes: memory.requiredReserveBytes,
-      remainingBytes: memory.remainingBytes,
-    })),
+    memory: assessment.memory.map(memoryAssessmentFromIcn),
     performance: Option.flatMap(assessment.performance, Option.fromNullable),
     performanceUnavailable: Option.flatMap(
       assessment.performanceUnavailable,
@@ -90,6 +96,7 @@ const assessmentFromIcn = (
       )
     : assessment._tag === "DoesNotFit" ? Effect.succeed({
         _tag: "DoesNotFit",
+        memory: assessment.memory.map(memoryAssessmentFromIcn),
         deficitBytes: Number(assessment.deficitBytes),
         limitingResource: String(assessment.limitingResource),
       } as const)

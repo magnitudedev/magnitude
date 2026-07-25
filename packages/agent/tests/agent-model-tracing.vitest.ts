@@ -12,6 +12,7 @@ import {
   type StreamStartFailure,
   type ToolDefinition,
 } from '@magnitudedev/ai'
+import type { AgentModelStartFailure } from '../src/model/model-request-preparation'
 import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/sdk'
 
 const traceMock = vi.hoisted(() => ({
@@ -94,7 +95,7 @@ function makeRawModel() {
   return { model, calls }
 }
 
-function run<A>(effect: Effect.Effect<A, StreamStartFailure, HttpClient.HttpClient>) {
+function run<A>(effect: Effect.Effect<A, AgentModelStartFailure, HttpClient.HttpClient>) {
   return Effect.runPromise(
     effect.pipe(Effect.provideService(HttpClient.HttpClient, {} as HttpClient.HttpClient)),
   )

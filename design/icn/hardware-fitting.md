@@ -42,8 +42,11 @@ A target is either one model package or an explicit target/draft pair. A profile
 - total shared context capacity; and
 - maximum parallel sequence occupancy.
 
-The request also supplies the required memory reserve per physical domain and whether performance
-evidence is requested.
+The request also supplies a product memory reserve per physical domain and whether performance
+evidence is requested. ICN applies the system-only safety floor defined by
+[system memory management](../inference/system-memory-management.md); caller policy may increase
+that floor. Dedicated device domains retain the product reserve rather than inheriting the larger
+system reserve.
 
 Each profile produces one complete result:
 
@@ -56,13 +59,18 @@ Each profile produces one complete result:
 Invalid or incomplete targets are per-target results. Operational failures fail the request.
 Assessment never installs, configures, offers, selects, or loads a model.
 
+Memory accounting is evidence, not a categorical label. Every domain reports its capacity,
+required allocation, compatibility reserve, warning reserve, and remaining compatible headroom.
+Consumers derive warning presentation from that same accounting; ICN does not publish a parallel
+fit label.
+
 ## Automatic fitting
 
 `POST /v1/models/fit` selects a profile for each target under explicit bounds:
 
 1. maximize context length up to the lower of the caller cap, model limit, and 200,000 tokens;
 2. after fixing that context, maximize parallel sequences up to the caller cap;
-3. preserve the requested memory reserve throughout both searches.
+3. preserve the effective memory reserve throughout both searches.
 
 The result contains the exact `ModelServingConfiguration` and its fitting assessment. A target
 that cannot satisfy the minimum context returns `DoesNotFit`; it does not receive an arbitrary
@@ -114,8 +122,10 @@ the target and compute only the missing profiles.
 ## Loading
 
 Loading accepts one exact `ModelServingConfiguration`. ICN resolves and reassesses that
-configuration under current runtime and hardware state before allocating. A cached assessment is
-advisory and cannot authorize a different target, profile, reserve policy, runtime, or topology.
+configuration under current runtime and hardware state before allocating, then applies the fresh
+availability rule in [system memory management](../inference/system-memory-management.md). A
+cached assessment is advisory and cannot authorize a different target, profile, reserve policy,
+runtime, or topology.
 
 Successful load evidence identifies the same configuration that was requested. ACN passes the
 ICN-issued configuration identity unchanged through recommendation, offering, provider resolution,

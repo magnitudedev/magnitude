@@ -185,6 +185,14 @@ export function present(outcome: TurnOutcome): ErrorPresentation {
       return presentSafetyStop(outcome.reason)
     case 'ProviderNotReady':
       return presentProviderNotReady(outcome.detail)
+    case 'ModelNotReady':
+      return {
+        surface: 'inline',
+        severity: 'error',
+        message: outcome.failure.message,
+        llmFeedback: outcome.failure.message,
+        retryable: false,
+      }
     case 'ConnectionFailure':
       return presentConnectionFailure(outcome.detail)
     case 'StreamFailed':

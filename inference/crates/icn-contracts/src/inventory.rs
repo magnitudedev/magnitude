@@ -597,7 +597,10 @@ pub struct HardwareDevice {
 #[serde(deny_unknown_fields)]
 pub struct HardwareSystemMemory {
     pub total_bytes: u64,
-    pub current_available_bytes: Option<u64>,
+    pub current_available_bytes: u64,
+    pub warning_reserve_bytes: u64,
+    pub assess_reserve_bytes: u64,
+    pub abort_reserve_bytes: u64,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -636,6 +639,16 @@ pub struct ResidentMemory {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RuntimeFailureObservation {
+    pub model_id: String,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardwareSnapshot {
     pub captured_at: u64,
     pub platform: String,
@@ -650,6 +663,7 @@ pub struct HardwareSnapshot {
     pub topology_fingerprint: String,
     pub memory_domains: Vec<HardwareMemoryDomain>,
     pub resident_memory: Option<ResidentMemory>,
+    pub runtime_failure: Option<RuntimeFailureObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

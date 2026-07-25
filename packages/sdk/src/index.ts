@@ -247,6 +247,7 @@ export {
   StreamClientCorrectnessViolation,
   StreamStartClientCorrectnessViolation,
   StreamStartProviderCorrectnessViolation,
+  StreamStartProviderRejection,
   StreamStartOperationalFailure,
   acceptedHttpResponse,
   payloadSample,

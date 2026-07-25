@@ -94,12 +94,11 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
         contextWindow: profile.contextLength,
         maxOutputTokens: Math.min(32_768, profile.contextLength),
-        runtimeMemoryBytes: assessment?._tag === "Fits"
-          ? Option.some(assessment.assessment.memory.reduce(
-              (total, domain) => total + domain.requiredBytes,
-              0,
-            ))
-          : Option.none(),
+        memory: assessment?._tag === "Fits"
+          ? Option.some(assessment.assessment.memory)
+          : assessment?._tag === "DoesNotFit"
+            ? Option.some(assessment.memory)
+            : Option.none(),
         capabilities: offering.capabilities,
         availability: !isInstalled
           ? { _tag: "Disabled" as const, reason: "installation_unavailable" as const }

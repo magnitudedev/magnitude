@@ -32,6 +32,29 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 pub const GENERATION_PERFORMANCE_CONTEXTS: [u32; 4] = [8_192, 32_768, 100_000, 200_000];
 pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v5";
+/// Canonical identity for physical system memory in topology and plan assessments.
+pub const SYSTEM_MEMORY_DOMAIN_ID: &str = "system";
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// The system-memory policy shared by stable fitting, load admission, and runtime supervision.
+///
+/// Each reserve is the larger of a fraction of physical memory and an absolute floor. Keeping
+/// these values in the hardware layer gives every caller one authoritative policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemMemoryThresholds {
+    pub warning_reserve_bytes: u64,
+    pub assess_reserve_bytes: u64,
+    pub abort_reserve_bytes: u64,
+}
+
+#[must_use]
+pub fn system_memory_thresholds(total_bytes: u64) -> SystemMemoryThresholds {
+    SystemMemoryThresholds {
+        warning_reserve_bytes: (total_bytes / 5).max(4 * GIB),
+        assess_reserve_bytes: (total_bytes / 10).max(2 * GIB),
+        abort_reserve_bytes: (total_bytes / 20).max(GIB),
+    }
+}
 // Versioned ICN policy for work not represented by the synthetic matrix-operation calibration.
 // Changing any of these constants requires a new GENERATION_PERFORMANCE_METHOD identity.
 const GENERATION_PERFORMANCE_WORKLOAD: &str = "baseline_single_sequence_decode";
@@ -205,6 +228,28 @@ pub enum EstimateError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct CapacityPolicy {
     pub reserve_bytes_per_domain: u64,
+    #[serde(default)]
+    pub system_reserve_bytes: Option<u64>,
+}
+
+impl CapacityPolicy {
+    fn reserve_for_domain(self, domain: &str) -> u64 {
+        if domain == SYSTEM_MEMORY_DOMAIN_ID {
+            self.system_reserve_bytes
+                .unwrap_or(self.reserve_bytes_per_domain)
+        } else {
+            self.reserve_bytes_per_domain
+        }
+    }
+
+    fn reserve_for_device_constraint(self, kind: &HardwareDeviceMemoryLimitKind) -> u64 {
+        if *kind == HardwareDeviceMemoryLimitKind::RecommendedWorkingSet {
+            self.system_reserve_bytes
+                .unwrap_or(self.reserve_bytes_per_domain)
+        } else {
+            self.reserve_bytes_per_domain
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -233,6 +278,7 @@ impl Default for CapacityPolicy {
     fn default() -> Self {
         Self {
             reserve_bytes_per_domain: 1536 * 1024 * 1024,
+            system_reserve_bytes: None,
         }
     }
 }
@@ -249,9 +295,14 @@ pub fn discover_hardware(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
     );
     system.refresh_memory();
+    let total_bytes = system.total_memory();
+    let thresholds = system_memory_thresholds(total_bytes);
     let mut system_memory = HardwareSystemMemory {
-        total_bytes: system.total_memory(),
-        current_available_bytes: Some(system.available_memory()),
+        total_bytes,
+        current_available_bytes: system.available_memory(),
+        warning_reserve_bytes: thresholds.warning_reserve_bytes,
+        assess_reserve_bytes: thresholds.assess_reserve_bytes,
+        abort_reserve_bytes: thresholds.abort_reserve_bytes,
     };
     let devices = llama_cpp_2::list_llama_ggml_backend_devices()
         .into_iter()
@@ -279,6 +330,10 @@ pub fn discover_hardware(
             .map(|device| device.total_bytes)
             .max()
             .unwrap_or(0);
+        let thresholds = system_memory_thresholds(system_memory.total_bytes);
+        system_memory.warning_reserve_bytes = thresholds.warning_reserve_bytes;
+        system_memory.assess_reserve_bytes = thresholds.assess_reserve_bytes;
+        system_memory.abort_reserve_bytes = thresholds.abort_reserve_bytes;
     }
     hardware_snapshot_from_devices(
         devices,
@@ -348,15 +403,16 @@ fn hardware_snapshot_from_devices(
                 .iter()
                 .any(|device| device.kind == HardwareDeviceKind::IntegratedGpu);
         domains.push(HardwareMemoryDomain {
-            id: "system".to_owned(),
+            id: SYSTEM_MEMORY_DOMAIN_ID.to_owned(),
             kind: if unified {
                 HardwareMemoryDomainKind::UnifiedMemory
             } else {
                 HardwareMemoryDomainKind::System
             },
             total_capacity_bytes: total,
-            stable_capacity_bytes: total.saturating_sub(policy.reserve_bytes_per_domain),
-            current_free_bytes: environment.system_memory.current_available_bytes,
+            stable_capacity_bytes: total
+                .saturating_sub(policy.reserve_for_domain(SYSTEM_MEMORY_DOMAIN_ID)),
+            current_free_bytes: Some(environment.system_memory.current_available_bytes),
             shares_system_memory: true,
             devices: shared
                 .into_iter()
@@ -454,6 +510,7 @@ fn hardware_snapshot_from_devices(
         topology_fingerprint,
         memory_domains: domains,
         resident_memory: None,
+        runtime_failure: None,
     }
 }
 
@@ -552,7 +609,7 @@ fn public_device(
             total_bytes: device.total_bytes,
             stable_bytes: device
                 .total_bytes
-                .saturating_sub(policy.reserve_bytes_per_domain),
+                .saturating_sub(policy.reserve_for_domain(SYSTEM_MEMORY_DOMAIN_ID)),
             current_free_bytes: device.free_bytes,
         });
     HardwareDevice {
@@ -2042,7 +2099,7 @@ fn capacity_summary_for_topology(
     for domain in &domains {
         let available = domain
             .total_bytes
-            .saturating_sub(policy.reserve_bytes_per_domain);
+            .saturating_sub(policy.reserve_for_domain(&domain.name));
         let deficit = domain.required_bytes.saturating_sub(available);
         if deficit > 0 {
             fits = false;
@@ -2057,7 +2114,7 @@ fn capacity_summary_for_topology(
     for constraint in &device_constraints {
         let available = constraint
             .total_bytes
-            .saturating_sub(policy.reserve_bytes_per_domain);
+            .saturating_sub(policy.reserve_for_device_constraint(&constraint.kind));
         let deficit = constraint.required_bytes.saturating_sub(available);
         if deficit > 0 {
             fits = false;
@@ -2083,7 +2140,7 @@ fn capacity_summary_for_topology(
             .map(|domain| {
                 let available_bytes = domain
                     .total_bytes
-                    .saturating_sub(policy.reserve_bytes_per_domain);
+                    .saturating_sub(policy.reserve_for_domain(&domain.name));
                 HardwareMemoryDomainAssessment {
                     memory_domain: domain.name,
                     model_bytes: domain.model_bytes,
@@ -2103,7 +2160,7 @@ fn capacity_summary_for_topology(
             .map(|constraint| {
                 let available_bytes = constraint
                     .total_bytes
-                    .saturating_sub(policy.reserve_bytes_per_domain);
+                    .saturating_sub(policy.reserve_for_device_constraint(&constraint.kind));
                 HardwareDeviceMemoryAssessment {
                     device: constraint.name,
                     kind: constraint.kind,
@@ -2235,12 +2292,7 @@ fn add_device_estimate(
                 physical_id: None,
                 shares_host_memory: true,
                 kind: device.kind,
-                name: if unified {
-                    "unified_memory"
-                } else {
-                    "system_memory"
-                }
-                .to_owned(),
+                name: SYSTEM_MEMORY_DOMAIN_ID.to_owned(),
                 total_bytes,
                 model_bytes: estimate.allocations.model_bytes,
                 context_bytes: estimate.allocations.context_bytes,
@@ -2633,6 +2685,37 @@ mod tests {
     use super::*;
     use llama_cpp_2::model::params::fit::{FitAllocations, FitDeviceKind, FitMemoryEstimate};
 
+    #[test]
+    fn system_memory_policy_uses_fractional_reserves_with_absolute_floors() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            system_memory_thresholds(16 * gib),
+            SystemMemoryThresholds {
+                warning_reserve_bytes: 4 * gib,
+                assess_reserve_bytes: 2 * gib,
+                abort_reserve_bytes: gib,
+            },
+        );
+        assert_eq!(
+            system_memory_thresholds(64 * gib),
+            SystemMemoryThresholds {
+                warning_reserve_bytes: 64 * gib / 5,
+                assess_reserve_bytes: 64 * gib / 10,
+                abort_reserve_bytes: 64 * gib / 20,
+            },
+        );
+    }
+
+    #[test]
+    fn system_reserve_does_not_reduce_dedicated_device_capacity() {
+        let policy = CapacityPolicy {
+            reserve_bytes_per_domain: 2,
+            system_reserve_bytes: Some(10),
+        };
+        assert_eq!(policy.reserve_for_domain("system"), 10);
+        assert_eq!(policy.reserve_for_domain("device"), 2);
+    }
+
     fn discovered_device(
         backend: &str,
         name: &str,
@@ -2703,6 +2786,7 @@ mod tests {
             ],
             CapacityPolicy {
                 reserve_bytes_per_domain: 1_000,
+                system_reserve_bytes: None,
             },
             HardwareEnvironment {
                 native_build: "build".to_owned(),
@@ -2713,7 +2797,10 @@ mod tests {
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
-                    current_available_bytes: Some(32_000),
+                    current_available_bytes: 32_000,
+                    warning_reserve_bytes: 0,
+                    assess_reserve_bytes: 0,
+                    abort_reserve_bytes: 0,
                 },
             },
         );
@@ -2782,6 +2869,7 @@ mod tests {
             ],
             CapacityPolicy {
                 reserve_bytes_per_domain: 1_000,
+                system_reserve_bytes: None,
             },
             HardwareEnvironment {
                 native_build: "build".to_owned(),
@@ -2792,7 +2880,10 @@ mod tests {
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
-                    current_available_bytes: Some(32_000),
+                    current_available_bytes: 32_000,
+                    warning_reserve_bytes: 0,
+                    assess_reserve_bytes: 0,
+                    abort_reserve_bytes: 0,
                 },
             },
         );
@@ -2846,7 +2937,10 @@ mod tests {
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
-                    current_available_bytes: Some(40_000),
+                    current_available_bytes: 40_000,
+                    warning_reserve_bytes: 0,
+                    assess_reserve_bytes: 0,
+                    abort_reserve_bytes: 0,
                 },
             },
         );
@@ -2865,7 +2959,10 @@ mod tests {
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
-                    current_available_bytes: Some(1),
+                    current_available_bytes: 1,
+                    warning_reserve_bytes: 0,
+                    assess_reserve_bytes: 0,
+                    abort_reserve_bytes: 0,
                 },
             },
         );
@@ -2927,7 +3024,10 @@ mod tests {
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     total_bytes: 64_000,
-                    current_available_bytes: Some(40_000),
+                    current_available_bytes: 40_000,
+                    warning_reserve_bytes: 0,
+                    assess_reserve_bytes: 0,
+                    abort_reserve_bytes: 0,
                 },
             },
         );
@@ -2994,12 +3094,14 @@ mod tests {
             &[],
             CapacityPolicy {
                 reserve_bytes_per_domain: 100,
+                system_reserve_bytes: None,
             },
         )
         .unwrap();
         assert!(summary.fits);
         assert_eq!(summary.available_bytes, 900);
         assert_eq!(summary.required_bytes, 400);
+        assert_eq!(summary.domains[0].memory_domain, SYSTEM_MEMORY_DOMAIN_ID);
     }
 
     #[test]
@@ -3034,6 +3136,7 @@ mod tests {
             &[],
             CapacityPolicy {
                 reserve_bytes_per_domain: 1_000,
+                system_reserve_bytes: None,
             },
             false,
         )
@@ -3042,6 +3145,69 @@ mod tests {
         assert_eq!(summary.available_bytes, 15_000);
         assert_eq!(summary.required_bytes, 7_000);
         assert_eq!(summary.domains.len(), 1);
+    }
+
+    #[test]
+    fn dedicated_fit_keeps_an_explicit_zero_byte_system_domain() {
+        let device =
+            |index, kind, name: &str, device_id, total_bytes, required_bytes| FitDeviceEstimate {
+                index,
+                kind,
+                backend_type: 0,
+                backend: if kind == FitDeviceKind::Host {
+                    "CPU".to_owned()
+                } else {
+                    "CUDA".to_owned()
+                },
+                device_id,
+                name: name.to_owned(),
+                description: name.to_owned(),
+                initial: Some(FitMemoryEstimate {
+                    total_bytes,
+                    free_bytes: total_bytes,
+                    allocations: FitAllocations {
+                        model_bytes: required_bytes,
+                        context_bytes: 0,
+                        compute_bytes: 0,
+                        total_bytes: required_bytes,
+                    },
+                    target: None,
+                }),
+                fitted: None,
+                margin_bytes: None,
+            };
+        let summary = capacity_summary_for_topology(
+            &[
+                device(
+                    0,
+                    FitDeviceKind::Accelerator,
+                    "CUDA0",
+                    Some("0000:01:00.0".to_owned()),
+                    16_000,
+                    8_000,
+                ),
+                device(1, FitDeviceKind::Host, "CPU", None, 64_000, 0),
+            ],
+            Measurement::Initial,
+            None,
+            false,
+            &[],
+            CapacityPolicy {
+                reserve_bytes_per_domain: 1_000,
+                system_reserve_bytes: Some(2_000),
+            },
+            false,
+        )
+        .expect("capacity summary");
+
+        let system = summary
+            .domains
+            .iter()
+            .find(|domain| domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID)
+            .expect("explicit system-memory domain");
+        assert_eq!(system.required_bytes, 0);
+        assert_eq!(system.available_bytes, 62_000);
+        assert_eq!(summary.domains.len(), 2);
     }
 
     #[test]
@@ -3085,6 +3251,7 @@ mod tests {
             &[],
             CapacityPolicy {
                 reserve_bytes_per_domain: 2_000,
+                system_reserve_bytes: None,
             },
             false,
         )
@@ -3093,6 +3260,7 @@ mod tests {
         assert_eq!(summary.available_bytes, 30_000);
         assert_eq!(summary.required_bytes, 9_000);
         assert_eq!(summary.domains.len(), 1);
+        assert_eq!(summary.domains[0].memory_domain, SYSTEM_MEMORY_DOMAIN_ID);
     }
 
     #[test]
@@ -3135,12 +3303,14 @@ mod tests {
             &[],
             CapacityPolicy {
                 reserve_bytes_per_domain: 4_000,
+                system_reserve_bytes: None,
             },
             true,
         )
         .unwrap();
         assert_eq!(summary.available_bytes, 60_000);
         assert_eq!(summary.required_bytes, 25_000);
+        assert_eq!(summary.domains[0].memory_domain, SYSTEM_MEMORY_DOMAIN_ID);
         assert_eq!(summary.device_constraints.len(), 1);
         assert_eq!(summary.device_constraints[0].available_bytes, 44_000);
         assert_eq!(summary.device_constraints[0].required_bytes, 20_000);
@@ -3185,6 +3355,7 @@ mod tests {
             &[],
             CapacityPolicy {
                 reserve_bytes_per_domain: 2_000,
+                system_reserve_bytes: None,
             },
             true,
         )
@@ -3232,6 +3403,7 @@ mod tests {
             &[],
             CapacityPolicy {
                 reserve_bytes_per_domain: 0,
+                system_reserve_bytes: None,
             },
         )
         .unwrap();

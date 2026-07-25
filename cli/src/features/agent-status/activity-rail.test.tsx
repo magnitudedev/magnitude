@@ -1,9 +1,15 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
-import type {
-  DisplayActorWork,
-  DisplayModelRequestActivity,
+import {
+  ModelSlotBlocked,
+  ModelSlotLoadingLocalModel,
+  PRIMARY_SLOT_ID,
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  type DisplayActorWork,
+  type DisplayModelRequestActivity,
 } from '@magnitudedev/sdk'
 import { ActivityRail } from './activity-rail'
 
@@ -19,6 +25,11 @@ const htmlToText = (html: string): string =>
   html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
 
 const text = (node: ReactNode): string => htmlToText(renderToStaticMarkup(<>{node}</>))
+const selection = {
+  providerId: ProviderIdSchema.make("local"),
+  providerModelId: ProviderModelIdSchema.make("local:test"),
+  reasoningEffort: ReasoningEffortSchema.make("none"),
+}
 
 const work = (overrides: Partial<DisplayActorWork> = {}): DisplayActorWork => ({
   phase: 'working',
@@ -52,10 +63,37 @@ describe('activity rail', () => {
         work={work()}
         width={100}
         waitsForGenerationProgress
-        modelLoadActivity={{ percentage: 42, text: 'Loading model · 42%' }}
+        modelLoadActivity={new ModelSlotLoadingLocalModel({
+          slotId: PRIMARY_SLOT_ID,
+          selection,
+          percentage: 42,
+        })}
         modelRequestActivity={request()}
       />,
     )).toBe('⠋ Loading model · 42%')
+  })
+
+  it('shows the low-memory stopped message without a spinner', () => {
+    expect(text(
+      <ActivityRail
+        work={work()}
+        width={100}
+        waitsForGenerationProgress
+        modelLoadActivity={new ModelSlotBlocked({
+          slotId: PRIMARY_SLOT_ID,
+          selection,
+          reason: {
+            _tag: "LocalModelStoppedLowMemory",
+            error: {
+              code: "low_memory",
+              message: "internal detail",
+              retryable: true,
+            },
+          },
+        })}
+        modelRequestActivity={request()}
+      />,
+    )).toBe("Model stopped · Low memory - close memory-intensive apps and try again")
   })
 
   it('keeps the reserved row blank during the request anti-flicker delay', () => {

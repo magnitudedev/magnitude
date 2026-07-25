@@ -16,31 +16,26 @@ export interface SelectedSlotModel {
   readonly slot: AssignedSlot
 }
 
-export interface LocalModelLoadActivity {
-  readonly percentage: number
-  readonly text: string
-}
-
 export const formatModelLoadProgress = (percentage: number): string =>
   `Loading model · ${percentage}%`
 
 export function deriveLocalModelLoadActivity(
   slots: ModelSlotsState,
   slotId: SlotId,
-): LocalModelLoadActivity | null {
+) {
   const slot = slots.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  return slot._tag === "LoadingLocalModel"
-    ? {
-        percentage: slot.percentage,
-        text: formatModelLoadProgress(slot.percentage),
-      }
-    : null
+  if (slot._tag === "LoadingLocalModel") return slot
+  if (slot._tag === "Blocked"
+    && slot.reason._tag === "LocalModelStoppedLowMemory") return slot
+  return null
 }
 
-export const isModelSlotUsableForMessages = (slot: ModelSlot): boolean =>
-  slot._tag === "UnloadedLocalModel"
-  || slot._tag === "LoadingLocalModel"
-  || slot._tag === "Ready"
+export type LocalModelLoadActivity = NonNullable<
+  ReturnType<typeof deriveLocalModelLoadActivity>
+>
+
+export const isModelSlotConfigured = (slot: ModelSlot): boolean =>
+  slot._tag !== "Unassigned"
 
 export function selectedSlotModel(
   catalog: ProviderModelCatalogState,

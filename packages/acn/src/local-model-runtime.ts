@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Ref, Stream } from "effect"
+import { Context, Effect, Layer, Option, PubSub, Ref, Scope, Stream } from "effect"
 import {
   LocalModelMutationFailed,
   type LocalInferenceError,
@@ -7,6 +7,7 @@ import { IcnClient } from "@magnitudedev/icn"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { offeringTargetToIcn, servingProfileToIcn } from "./local-model-icn-adapter"
+import { LocalInferenceHardware } from "./local-inference-hardware"
 
 const failure = (operation: string, error: unknown) => {
   if (typeof error === "object"
@@ -44,6 +45,12 @@ export interface LocalModelRuntimeApi {
   ) => Effect.Effect<void, LocalInferenceError>
   readonly unload: (providerModelId: ProviderModelId) => Effect.Effect<void, LocalInferenceError>
   readonly isResident: (providerModelId: ProviderModelId) => Effect.Effect<boolean>
+  readonly changes: Stream.Stream<LocalModelRuntimeLoss>
+}
+
+export interface LocalModelRuntimeLoss {
+  readonly providerModelId: ProviderModelId
+  readonly error: LocalModelMutationFailed
 }
 
 export interface LocalModelLoadProgress {
@@ -59,12 +66,32 @@ export class LocalModelRuntime extends Context.Tag("LocalModelRuntime")<
 export const LocalModelRuntimeLive: Layer.Layer<
   LocalModelRuntime,
   never,
-  IcnClient | LocalProviderOfferings
-> = Layer.effect(LocalModelRuntime, Effect.gen(function* () {
+  IcnClient | LocalProviderOfferings | LocalInferenceHardware
+> = Layer.scoped(LocalModelRuntime, Effect.gen(function* () {
   const client = yield* IcnClient
   const offerings = yield* LocalProviderOfferings
+  const hardware = yield* LocalInferenceHardware
+  const scope = yield* Scope.Scope
   const resident = yield* Ref.make<OptionallyResident | undefined>(undefined)
+  const losses = yield* PubSub.unbounded<LocalModelRuntimeLoss>()
   const lock = yield* Effect.makeSemaphore(1)
+  yield* Effect.forkIn(hardware.changes.pipe(
+    Stream.runForEach(({ state }) => Effect.gen(function* () {
+      const current = yield* Ref.get(resident)
+      if (!current) return
+      const observed = Option.getOrUndefined(state.runtimeFailure)
+      if (!observed || observed.modelId !== current.configurationId) return
+      yield* Ref.set(resident, undefined)
+      yield* PubSub.publish(losses, {
+        providerModelId: current.providerModelId,
+        error: new LocalModelMutationFailed({
+          code: observed.code,
+          message: observed.message,
+          retryable: observed.retryable,
+        }),
+      })
+    })),
+  ), scope)
 
   return LocalModelRuntime.of({
     load: (providerModelId, onProgress) => lock.withPermits(1)(Effect.gen(function* () {
@@ -97,6 +124,7 @@ export const LocalModelRuntimeLive: Layer.Layer<
               ready = true
               return Ref.set(resident, {
                 providerModelId,
+                configurationId: offering.configuration.id,
                 residencyId: event.ready.residencyId,
               })
           }
@@ -132,10 +160,12 @@ export const LocalModelRuntimeLive: Layer.Layer<
     isResident: (providerModelId) => Ref.get(resident).pipe(
       Effect.map((current) => current?.providerModelId === providerModelId),
     ),
+    changes: Stream.fromPubSub(losses),
   })
 }))
 
 interface OptionallyResident {
   readonly providerModelId: ProviderModelId
+  readonly configurationId: string
   readonly residencyId: string
 }

@@ -295,7 +295,8 @@ export const MemoryAssessmentSchema = Schema.Struct({
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
   capacityBytes: NonNegativeSafeInteger,
   requiredBytes: NonNegativeSafeInteger,
-  requiredReserveBytes: NonNegativeSafeInteger,
+  compatibilityReserveBytes: NonNegativeSafeInteger,
+  warningReserveBytes: NonNegativeSafeInteger,
   remainingBytes: Schema.Number.pipe(Schema.int()),
 })
 export type MemoryAssessment = typeof MemoryAssessmentSchema.Type
@@ -402,8 +403,7 @@ export const LocalModelCatalogCandidateSchema = Schema.Struct({
   preparation: LocalModelCatalogPreparationSchema,
   quantization: NonEmptyString,
   quantizationName: NonEmptyString,
-  runtimeMemoryBytes: NonNegativeSafeInteger,
-  availableMemoryBytes: NonNegativeSafeInteger,
+  memory: Schema.Array(MemoryAssessmentSchema),
   intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   intelligenceProvenance: NonEmptyString,
   fidelityRank: NonNegativeSafeInteger,
@@ -563,7 +563,7 @@ export const ProviderModelCatalogEntrySchema = Schema.Struct({
   supportedSlots: Schema.Array(SlotIdSchema),
   contextWindow: PositiveSafeInteger,
   maxOutputTokens: PositiveSafeInteger,
-  runtimeMemoryBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+  memory: Schema.optionalWith(Schema.Array(MemoryAssessmentSchema), { as: "Option", exact: true }),
   capabilities: ModelCapabilitiesSchema,
   availability: Schema.Union(
     Schema.TaggedStruct("Available", {}),
@@ -667,6 +667,8 @@ export const ModelSlotBlockedReasonSchema = Schema.Union(
   Schema.TaggedStruct("ModelUnavailable", { message: Schema.String }),
   Schema.TaggedStruct("InvalidConfiguration", { message: Schema.String }),
   Schema.TaggedStruct("LocalModelLoadFailed", { error: ModelFailureSchema }),
+  Schema.TaggedStruct("LocalModelRuntimeLost", { error: ModelFailureSchema }),
+  Schema.TaggedStruct("LocalModelStoppedLowMemory", { error: ModelFailureSchema }),
 )
 export type ModelSlotBlockedReason = typeof ModelSlotBlockedReasonSchema.Type
 
@@ -775,7 +777,10 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   processor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   logicalCores: PositiveSafeInteger,
   totalSystemMemoryBytes: NonNegativeSafeInteger,
-  availableSystemMemoryBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+  availableSystemMemoryBytes: NonNegativeSafeInteger,
+  warningReserveBytes: NonNegativeSafeInteger,
+  assessReserveBytes: NonNegativeSafeInteger,
+  abortReserveBytes: NonNegativeSafeInteger,
   accelerators: Schema.Array(LocalInferenceAcceleratorSchema),
   memoryDomains: Schema.Array(LocalInferenceMemoryDomainSchema),
   residentMemory: Schema.optionalWith(Schema.Struct({
@@ -786,6 +791,12 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
       computeBytes: NonNegativeSafeInteger,
       auxiliaryBytes: NonNegativeSafeInteger,
     })),
+  }), { as: "Option", exact: true }),
+  runtimeFailure: Schema.optionalWith(Schema.Struct({
+    modelId: NonEmptyString,
+    code: NonEmptyString,
+    message: NonEmptyString,
+    retryable: Schema.Boolean,
   }), { as: "Option", exact: true }),
 }).pipe(Schema.filter((hardware) => {
   const memoryDomainIds = hardware.memoryDomains.map(({ memoryDomainId }) => memoryDomainId)

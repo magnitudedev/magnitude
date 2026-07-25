@@ -69,7 +69,10 @@ export const projectLocalInferenceHardware = (
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
     logicalCores: Math.max(1, hardware.logical_cores),
     totalSystemMemoryBytes: hardware.system_memory.total_bytes,
-    availableSystemMemoryBytes: Option.flatMap(hardware.system_memory.current_available_bytes, Option.fromNullable),
+    availableSystemMemoryBytes: hardware.system_memory.current_available_bytes,
+    warningReserveBytes: hardware.system_memory.warning_reserve_bytes,
+    assessReserveBytes: hardware.system_memory.assess_reserve_bytes,
+    abortReserveBytes: hardware.system_memory.abort_reserve_bytes,
     accelerators,
     memoryDomains,
     residentMemory: Option.flatMap(hardware.resident_memory, Option.fromNullable).pipe(
@@ -81,11 +84,20 @@ export const projectLocalInferenceHardware = (
         auxiliaryBytes: domain.auxiliary_bytes,
       })) })),
     ),
+    runtimeFailure: Option.flatMap(hardware.runtime_failure, Option.fromNullable).pipe(
+      Option.map((failure) => ({
+        modelId: failure.model_id,
+        code: failure.code,
+        message: failure.message,
+        retryable: failure.retryable,
+      })),
+    ),
   }
 })
 
 export interface LocalInferenceHardwareApi {
   readonly snapshot: Effect.Effect<MirroredSnapshot<LocalInferenceHardwareState>>
+  readonly changes: Stream.Stream<MirroredSnapshot<LocalInferenceHardwareState>>
   readonly refresh: Effect.Effect<void>
 }
 
@@ -126,6 +138,7 @@ export const LocalInferenceHardwareLive: Layer.Layer<
   ), scope)
   return LocalInferenceHardware.of({
     snapshot: mirror.get,
+    changes: mirror.changes,
     refresh: hardware.refresh.pipe(
       Effect.zipRight(rebuild),
       Effect.asVoid,

@@ -7,7 +7,6 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const MONITOR_LOSS_DEADLINE: Duration = Duration::from_secs(1);
 pub(crate) const RECOVERY_STABLE_TIME: Duration = Duration::from_secs(5);
-pub(crate) const MINIMUM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const RECOVERY_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,29 +19,35 @@ pub(crate) struct MemorySample {
 }
 
 impl MemorySample {
-    pub(crate) fn reserve_bytes(self) -> u64 {
-        MINIMUM_RESERVE_BYTES.max(self.total_bytes / 10)
+    pub(crate) fn abort_reserve_bytes(self) -> u64 {
+        icn_hardware::system_memory_thresholds(self.total_bytes).abort_reserve_bytes
     }
 
-    pub(crate) fn permits_load(self, estimated_incremental_bytes: u64) -> bool {
+    pub(crate) fn permits_load(self, required_system_memory_bytes: u64) -> bool {
         let required = self
-            .reserve_bytes()
-            .saturating_add(estimated_incremental_bytes);
-        self.available_bytes >= required
+            .abort_reserve_bytes()
+            .saturating_add(required_system_memory_bytes);
+        self.available_bytes > required
             && self
                 .available_commit_bytes
-                .is_none_or(|available| available >= required)
+                .is_none_or(|available| available > required)
     }
 
     pub(crate) fn requires_eviction(self) -> bool {
-        self.available_bytes <= self.reserve_bytes()
+        self.available_bytes <= self.abort_reserve_bytes()
             || self
                 .available_commit_bytes
-                .is_some_and(|available| available <= self.reserve_bytes())
+                .is_some_and(|available| available <= self.abort_reserve_bytes())
     }
 
     pub(crate) fn recovered(self) -> bool {
-        self.available_bytes > self.reserve_bytes().saturating_add(RECOVERY_MARGIN_BYTES)
+        let required = self
+            .abort_reserve_bytes()
+            .saturating_add(RECOVERY_MARGIN_BYTES);
+        self.available_bytes > required
+            && self
+                .available_commit_bytes
+                .is_none_or(|available| available > required)
     }
 }
 
@@ -137,14 +142,14 @@ mod tests {
     }
 
     #[test]
-    fn reserve_uses_larger_of_floor_and_fraction() {
+    fn abort_reserve_uses_larger_of_floor_and_fraction() {
         assert_eq!(
-            sample(16 * 1024 * 1024 * 1024, 0).reserve_bytes(),
-            MINIMUM_RESERVE_BYTES
+            sample(16 * 1024 * 1024 * 1024, 0).abort_reserve_bytes(),
+            1024 * 1024 * 1024
         );
         assert_eq!(
-            sample(64 * 1024 * 1024 * 1024, 0).reserve_bytes(),
-            64 * 1024 * 1024 * 1024 / 10
+            sample(64 * 1024 * 1024 * 1024, 0).abort_reserve_bytes(),
+            64 * 1024 * 1024 * 1024 / 20
         );
     }
 
@@ -153,8 +158,8 @@ mod tests {
         let gib = 1024 * 1024 * 1024;
         assert!(sample(16 * gib, 8 * gib).permits_load(6 * gib));
         assert!(!sample(16 * gib, 7 * gib).permits_load(6 * gib));
-        assert!(sample(16 * gib, 2 * gib).requires_eviction());
-        assert!(!sample(16 * gib, 2 * gib + 1).requires_eviction());
+        assert!(sample(16 * gib, gib).requires_eviction());
+        assert!(!sample(16 * gib, gib + 1).requires_eviction());
     }
 
     #[test]
@@ -162,8 +167,12 @@ mod tests {
         let gib = 1024 * 1024 * 1024;
         let mut observation = sample(16 * gib, 12 * gib);
         observation.commit_limit_bytes = Some(20 * gib);
-        observation.available_commit_bytes = Some(2 * gib);
+        observation.available_commit_bytes = Some(gib);
         assert!(observation.requires_eviction());
         assert!(!observation.permits_load(gib));
+        assert!(!observation.recovered());
+
+        observation.available_commit_bytes = Some(2 * gib);
+        assert!(observation.recovered());
     }
 }

@@ -1869,13 +1869,17 @@ mod tests {
                     logical_cores: 1,
                     system_memory: icn_contracts::HardwareSystemMemory {
                         total_bytes: 1,
-                        current_available_bytes: Some(1),
+                        current_available_bytes: 1,
+                        warning_reserve_bytes: 0,
+                        assess_reserve_bytes: 0,
+                        abort_reserve_bytes: 0,
                     },
                     native_build: "native".to_owned(),
                     enabled_backends: vec!["cpu".to_owned()],
                     topology_fingerprint: "topology".to_owned(),
                     memory_domains: Vec::new(),
                     resident_memory: None,
+                    runtime_failure: None,
                 })
             })
         }

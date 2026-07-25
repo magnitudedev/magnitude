@@ -803,6 +803,13 @@ export const HardwareSnapshot = S.Struct({
     ),
     { exact: true, as: "Option" },
   ),
+  runtime_failure: S.optionalWith(
+    S.Union(
+      S.Null,
+      S.suspend((): S.Schema<RuntimeFailureObservation, RuntimeFailureObservationEncoded> => RuntimeFailureObservation),
+    ),
+    { exact: true, as: "Option" },
+  ),
   system_memory: S.suspend((): S.Schema<HardwareSystemMemory, HardwareSystemMemoryEncoded> => HardwareSystemMemory),
   system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   topology_fingerprint: S.String,
@@ -811,11 +818,11 @@ export type HardwareSnapshot = S.Schema.Type<typeof HardwareSnapshot>
 export type HardwareSnapshotEncoded = S.Schema.Encoded<typeof HardwareSnapshot>
 
 export const HardwareSystemMemory = S.Struct({
-  current_available_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
+  abort_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  assess_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  current_available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  warning_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type HardwareSystemMemory = S.Schema.Type<typeof HardwareSystemMemory>
 export type HardwareSystemMemoryEncoded = S.Schema.Encoded<typeof HardwareSystemMemory>
@@ -961,10 +968,11 @@ export type LoadModelRequestEncoded = S.Schema.Encoded<typeof LoadModelRequest>
 
 export const MemoryAssessment = S.Struct({
   capacityBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  compatibilityReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   memoryDomainId: S.String,
   remainingBytes: S.Number.pipe(S.int()),
   requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  requiredReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  warningReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type MemoryAssessment = S.Schema.Type<typeof MemoryAssessment>
 export type MemoryAssessmentEncoded = S.Schema.Encoded<typeof MemoryAssessment>
@@ -1484,6 +1492,15 @@ export const ResponseFormatRequest = S.Union(
 )
 export type ResponseFormatRequest = S.Schema.Type<typeof ResponseFormatRequest>
 export type ResponseFormatRequestEncoded = S.Schema.Encoded<typeof ResponseFormatRequest>
+
+export const RuntimeFailureObservation = S.Struct({
+  code: S.String,
+  message: S.String,
+  model_id: S.String,
+  retryable: S.Boolean,
+})
+export type RuntimeFailureObservation = S.Schema.Type<typeof RuntimeFailureObservation>
+export type RuntimeFailureObservationEncoded = S.Schema.Encoded<typeof RuntimeFailureObservation>
 
 export const RuntimeResidencyId = S.String
 export type RuntimeResidencyId = S.Schema.Type<typeof RuntimeResidencyId>

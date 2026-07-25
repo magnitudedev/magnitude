@@ -26,7 +26,7 @@ import {
   getEphemeralMessageSnapshot,
   useFileWatchBridge,
   useLocalInferenceQuery,
-  isModelSlotUsableForMessages,
+  isModelSlotConfigured,
   deriveLocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, type SessionOptions } from '@magnitudedev/sdk'
@@ -180,7 +180,7 @@ function OnboardingGate(
 
   const primary = slotsSnapshot.value.state.slots.primary
   const modelsConfigured = primary.slotId === PRIMARY_SLOT_ID
-    && isModelSlotUsableForMessages(primary)
+    && isModelSlotConfigured(primary)
 
   return (
     <CliAppContent

@@ -33,9 +33,9 @@ import {
 import { advisorWindowToPrompt } from '../window/render'
 import { AgentModelResolver } from '../model/model-resolver'
 import {
-  finalizeModelAttemptFailure,
-  modelAttemptRetryability,
-  type AgentStreamStartFailure,
+  agentModelStartRetryability,
+  finalizeAgentModelStartFailure,
+  type AgentModelStartFailure,
 } from '../errors'
 import { connectionRetrySchedule, TERMINAL_RETRY_EXHAUSTED_MESSAGE } from '../util/retry-backoff'
 
@@ -115,11 +115,11 @@ export const Autopilot = Worker.define<AppEvent>()({
           Effect.provideService(HttpClient.HttpClient, httpClient),
           Effect.retry({
             schedule: connectionRetrySchedule,
-            while: (err: AgentStreamStartFailure) => modelAttemptRetryability(err)._tag === 'UpstreamRetryable',
+            while: (err: AgentModelStartFailure) => agentModelStartRetryability(err)._tag === 'UpstreamRetryable',
           }),
-          Effect.catchAll((err: AgentStreamStartFailure) =>
+          Effect.catchAll((err: AgentModelStartFailure) =>
             Effect.gen(function* () {
-              const decision = finalizeModelAttemptFailure({
+              const decision = finalizeAgentModelStartFailure({
                 failure: err,
                 retryCount: Number.MAX_SAFE_INTEGER,
                 maxRetries: 0,

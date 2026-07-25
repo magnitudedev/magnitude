@@ -294,7 +294,8 @@ pub struct MemoryAssessment {
     pub memory_domain_id: String,
     pub capacity_bytes: u64,
     pub required_bytes: u64,
-    pub required_reserve_bytes: u64,
+    pub compatibility_reserve_bytes: u64,
+    pub warning_reserve_bytes: u64,
     pub remaining_bytes: i64,
 }
 

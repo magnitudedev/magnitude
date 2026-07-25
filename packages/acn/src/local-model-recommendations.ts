@@ -110,9 +110,7 @@ const catalogProjection = (
     quantizationName: targetPackages(candidate.model)
       .map(({ properties }) => properties.quantizationName)
       .join(" + "),
-    runtimeMemoryBytes: candidate.estimatedRuntimeBytes,
-    availableMemoryBytes: candidate.assessment.memory
-      .reduce((total, domain) => total + domain.capacityBytes, 0),
+    memory: candidate.assessment.memory,
     intelligenceScore: candidate.capability?.score ?? 0,
     intelligenceProvenance: candidate.capability?.provenance ?? "Unavailable",
     fidelityRank: candidate.fidelityRank,
@@ -512,7 +510,7 @@ export const makeLocalModelRecommendationsLive = (
           stableCapacityBudgetBytes: assessment.assessment.memory
             .reduce(
               (total, domain) =>
-                total + Math.max(0, domain.capacityBytes - domain.requiredReserveBytes),
+                total + Math.max(0, domain.capacityBytes - domain.compatibilityReserveBytes),
               0,
             ),
           totalDownloadBytes: model.target._tag === "Package"

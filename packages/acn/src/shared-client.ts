@@ -1,10 +1,7 @@
-import { Context, Effect, Exit, Layer, Ref, Schema } from "effect"
+import { Context, Effect, Layer, Ref, Schema } from "effect"
 import {
   ProviderClient,
-  StreamStartClientCorrectnessViolation,
-  StreamStartOperationalFailure,
   createProviderClient,
-  toCauseInfo,
   type ProviderClientShape,
 } from "@magnitudedev/sdk"
 import {
@@ -13,10 +10,8 @@ import {
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
 import { IcnProvider, createLocalProvider } from "@magnitudedev/icn/provider"
-import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { SlotIdSchema } from "@magnitudedev/protocol"
 import { ModelConfiguration } from "./model-configuration"
-import type { ModelSlotCoordinatorApi } from "./model-slot-coordinator"
+import { SlotIdSchema } from "@magnitudedev/protocol"
 
 const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,
@@ -96,67 +91,6 @@ export const makeDelegatingProviderClient = (
   ),
   usage: (query) => Ref.get(ref).pipe(Effect.flatMap((client) => client.usage(query))),
   runtimeConfig,
-})
-
-export const withModelSlotAdmission = (
-  client: ProviderClientShape,
-  modelSlots: Pick<ModelSlotCoordinatorApi, "acquireLocalModel">,
-): ProviderClientShape => ({
-  ...client,
-  resolveModel: (providerId, providerModelId, options) => client.resolveModel(
-    providerId,
-    providerModelId,
-    options,
-  ).pipe(Effect.map((model) => {
-    if (providerId !== LOCAL_PROVIDER_ID) return model
-    const call = {
-      provider: "local",
-      model: providerModelId,
-      method: "POST" as const,
-      url: `icn://chat/${encodeURIComponent(providerModelId)}`,
-    }
-    const attributionKey = options?.requestAttribution?.key
-    if (!Schema.is(SlotIdSchema)(attributionKey)) {
-      return {
-        stream: () => Effect.fail(new StreamStartClientCorrectnessViolation({
-          call,
-          component: "request_builder",
-          message: "A local model request must be attributed to a model slot",
-          evidence: {
-            _tag: "UnexpectedDefectCaught",
-            cause: {
-              _tag: "ErrorCause",
-              name: "MissingModelSlotAttribution",
-              message: "The local model binding did not identify its model slot",
-            },
-          },
-        })),
-      }
-    }
-    const requestProgress = options?.requestAttribution?.requestProgress
-    const markPreparing = requestProgress
-      ? requestProgress({ phase: "preparing", requestId: null })
-      : Effect.void
-    const clearPreparing = requestProgress
-      ? requestProgress({ phase: "cleared", requestId: null })
-      : Effect.void
-    return {
-      stream: (prompt, tools, requestOptions) => Effect.scoped(
-        markPreparing.pipe(
-          Effect.zipRight(
-            modelSlots.acquireLocalModel(attributionKey, providerModelId).pipe(
-              Effect.mapError((cause) => new StreamStartOperationalFailure({
-                call,
-                reason: { _tag: "RequestFailedBeforeResponse", cause: toCauseInfo(cause) },
-              })),
-            ),
-          ),
-          Effect.zipRight(model.stream(prompt, tools, requestOptions)),
-          Effect.onExit((exit) => Exit.isSuccess(exit) ? Effect.void : clearPreparing),
-        ),
-      ),
-    }
-  })),
 })
 
 export interface ProviderClientRegistryApi {

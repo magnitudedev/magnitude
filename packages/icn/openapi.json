@@ -2556,6 +2556,16 @@
                 "$ref": "#/components/schemas/ResidentMemory"
               }
             ]
+          },
+          "runtime_failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RuntimeFailureObservation"
+              }
+            ]
           }
         },
         "additionalProperties": false
@@ -2563,7 +2573,11 @@
       "HardwareSystemMemory": {
         "type": "object",
         "required": [
-          "total_bytes"
+          "total_bytes",
+          "current_available_bytes",
+          "warning_reserve_bytes",
+          "assess_reserve_bytes",
+          "abort_reserve_bytes"
         ],
         "properties": {
           "total_bytes": {
@@ -2572,10 +2586,22 @@
             "minimum": 0
           },
           "current_available_bytes": {
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "warning_reserve_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "assess_reserve_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "abort_reserve_bytes": {
+            "type": "integer",
             "format": "int64",
             "minimum": 0
           }
@@ -2926,7 +2952,8 @@
           "memoryDomainId",
           "capacityBytes",
           "requiredBytes",
-          "requiredReserveBytes",
+          "compatibilityReserveBytes",
+          "warningReserveBytes",
           "remainingBytes"
         ],
         "properties": {
@@ -2943,7 +2970,12 @@
             "format": "int64",
             "minimum": 0
           },
-          "requiredReserveBytes": {
+          "compatibilityReserveBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "warningReserveBytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -4136,6 +4168,30 @@
             }
           }
         ]
+      },
+      "RuntimeFailureObservation": {
+        "type": "object",
+        "required": [
+          "model_id",
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "model_id": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
       },
       "RuntimeResidencyId": {
         "type": "string"

@@ -108,7 +108,8 @@ const candidate = (input: {
         memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("memory"),
         capacityBytes,
         requiredBytes: runtimeBytes,
-        requiredReserveBytes: 0,
+        compatibilityReserveBytes: 0,
+        warningReserveBytes: 0,
         remainingBytes: capacityBytes - runtimeBytes,
       }],
       performance: Option.some({

@@ -39,7 +39,10 @@ export const makeHardware = (
   processor: Option.some("Test CPU"),
   logicalCores: 16,
   totalSystemMemoryBytes: 64 * GIB,
-  availableSystemMemoryBytes: Option.some(12 * GIB),
+  availableSystemMemoryBytes: 12 * GIB,
+  warningReserveBytes: 13 * GIB,
+  assessReserveBytes: 7 * GIB,
+  abortReserveBytes: 4 * GIB,
   accelerators: [{
     acceleratorId: LocalInferenceAcceleratorIdSchema.make("gpu"),
     name: "Test GPU",
@@ -55,6 +58,7 @@ export const makeHardware = (
     sharesSystemMemory: false,
   }],
   residentMemory: Option.none(),
+  runtimeFailure: Option.none(),
   ...overrides,
 })
 
@@ -85,8 +89,14 @@ export const makeCatalogCandidate = (
   preparation: { _tag: "NotDownloaded" },
   quantization: "Q4_K_M",
   quantizationName: "4-bit",
-  runtimeMemoryBytes: 18 * GIB,
-  availableMemoryBytes: 22 * GIB,
+  memory: [{
+    memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+    capacityBytes: 22 * GIB,
+    requiredBytes: 18 * GIB,
+    compatibilityReserveBytes: 2 * GIB,
+    warningReserveBytes: 4 * GIB,
+    remainingBytes: 2 * GIB,
+  }],
   intelligenceScore: 75,
   intelligenceProvenance: "Test evidence",
   fidelityRank: 75,
@@ -154,7 +164,7 @@ export const makeView = (options: {
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
         contextWindow: 32_768,
         maxOutputTokens: 4_096,
-        runtimeMemoryBytes: Option.none(),
+        memory: Option.none(),
         capabilities: {
           vision: false,
           tools: true,

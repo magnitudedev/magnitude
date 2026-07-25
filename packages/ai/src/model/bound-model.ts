@@ -8,6 +8,7 @@ import type { ModelSpec, ModelStreamResult } from "./model-spec"
 
 export interface BoundModel<
   TCallOptions,
+  TStartFailure = StreamStartFailure,
 > {
   readonly stream: (
     prompt: Prompt,
@@ -15,7 +16,7 @@ export interface BoundModel<
     options?: TCallOptions & { generateToolCallId?: () => ToolCallId },
   ) => Effect.Effect<
     ModelStreamResult,
-    StreamStartFailure,
+    TStartFailure,
     HttpClient.HttpClient
   >
 }

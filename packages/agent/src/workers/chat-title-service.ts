@@ -18,7 +18,7 @@ import { logger } from '@magnitudedev/logger'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import { AgentModelResolver } from '../model/model-resolver'
 import { connectionRetrySchedule } from '../util/retry-backoff'
-import { modelAttemptRetryability } from '../errors'
+import { agentModelStartRetryability } from '../errors'
 import { CHAT_TITLE_PROMPT } from '../util/title-prompts'
 
 export const CHAT_TITLE_MAX_TOKENS = 100
@@ -105,7 +105,7 @@ export const ChatTitleServiceLive = Layer.scoped(
           }),
           Effect.retry({
             schedule: connectionRetrySchedule,
-            while: (err) => modelAttemptRetryability(err)._tag === 'UpstreamRetryable',
+            while: (err) => agentModelStartRetryability(err)._tag === 'UpstreamRetryable',
           }),
           Effect.catchAll((e) => Effect.sync(() => {
             logger.error({ error: String(e) }, '[chat-title-service] Caught error in stream pipeline')

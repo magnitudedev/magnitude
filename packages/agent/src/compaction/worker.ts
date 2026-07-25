@@ -20,7 +20,11 @@ import { TurnProjection } from '../projections/turn'
 import { getForkInfo } from '../agents/registry'
 import { ConfigAmbient, getSlotConfigForRole } from '../ambient/config-ambient'
 
-import { modelAttemptRetryability, presentModelAttemptFailure, type AgentModelAttemptFailure } from '../errors'
+import {
+  agentModelStartRetryability,
+  presentAgentModelStartFailure,
+  type AgentModelStartFailure,
+} from '../errors'
 import { connectionRetrySchedule } from '../util/retry-backoff'
 
 import { computeCompactionSizing } from './estimate'
@@ -36,7 +40,7 @@ import { runCompactionTurn, type CompactionTurnResult } from './turn'
  */
 function isRetryable(error: unknown): boolean {
   if (error && typeof error === 'object' && '_tag' in error) {
-    return modelAttemptRetryability(error as AgentModelAttemptFailure)._tag === 'UpstreamRetryable'
+    return agentModelStartRetryability(error as AgentModelStartFailure)._tag === 'UpstreamRetryable'
   }
   return false
 }
@@ -165,7 +169,7 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
           // Present stream-start failures without going through TurnOutcome.
           let presentation = null
           if (error && typeof error === 'object' && '_tag' in error) {
-            presentation = presentModelAttemptFailure(error as AgentModelAttemptFailure)
+            presentation = presentAgentModelStartFailure(error as AgentModelStartFailure)
           }
 
           const message = error instanceof Error ? error.message : String(error)

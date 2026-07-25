@@ -4279,7 +4279,10 @@ mod tests {
             logical_cores: 8,
             system_memory: HardwareSystemMemory {
                 total_bytes: 64,
-                current_available_bytes: Some(20),
+                current_available_bytes: 20,
+                warning_reserve_bytes: 0,
+                assess_reserve_bytes: 0,
+                abort_reserve_bytes: 0,
             },
             native_build: "test".to_owned(),
             enabled_backends: vec!["MTL".to_owned()],
@@ -4303,6 +4306,7 @@ mod tests {
                 }],
             }],
             resident_memory: None,
+            runtime_failure: None,
         };
         let evidence = vec![
             ResidentAllocation {

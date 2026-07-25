@@ -1,7 +1,6 @@
 import { Option } from 'effect'
 import { describe, expect, it } from 'vitest'
 import {
-  LocalModelIdSchema,
   ModelSlotBlocked,
   ModelSlotLoadingLocalModel,
   ModelSlotUnassigned,
@@ -30,7 +29,7 @@ describe('agent model configuration boundary', () => {
     })],
   ] as const)('keeps a selected %s local model callable through the provider boundary', (_state, makeSlot) => {
     const providerId = ProviderIdSchema.make('local')
-    const providerModelId = ProviderModelIdSchema.make(`local:${LocalModelIdSchema.make('model')}`)
+    const providerModelId = ProviderModelIdSchema.make('local:model')
     const reasoningEffort = ReasoningEffortSchema.make('none')
     const catalog: readonly ProviderModelCatalogEntry[] = [{
       providerId,
@@ -40,7 +39,7 @@ describe('agent model configuration boundary', () => {
       supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
       contextWindow: 8_192,
       maxOutputTokens: 1_024,
-      runtimeMemoryBytes: Option.none(),
+      memory: Option.none(),
       capabilities: {
         vision: false,
         tools: true,

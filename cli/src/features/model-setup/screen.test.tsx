@@ -5,6 +5,7 @@ import { Cause, Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
 import {
   GIB,
+  TEST_MEMORY_DOMAIN_ID,
   makeCatalogCandidate,
   makeModel,
   makeRecommendation,
@@ -134,8 +135,14 @@ test("renders consumer recommendation intent and its trade-off explanation", asy
     intent: "fastest",
     explanation: "Prioritizes responsive generation at about 42.0 tokens/sec.",
     candidate: makeCatalogCandidate({
-      runtimeMemoryBytes: 12 * GIB,
-      availableMemoryBytes: 32 * GIB,
+      memory: [{
+        memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+        capacityBytes: 32 * GIB,
+        requiredBytes: 12 * GIB,
+        compatibilityReserveBytes: 2 * GIB,
+        warningReserveBytes: 4 * GIB,
+        remainingBytes: 18 * GIB,
+      }],
       estimatedTokensPerSecond: Option.some(42),
     }),
   })
