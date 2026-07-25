@@ -97,8 +97,13 @@ vi.mock('./attachment-bar', () => ({
   AttachmentsBar: () => null,
 }))
 
-vi.mock('../agent-status/context-usage-bar', () => ({
-  ContextUsageBar: () => null,
+vi.mock('./context-usage', () => ({
+  ContextUsage: () => <text>[context]</text>,
+  contextUsageWidth: () => '[context]'.length,
+}))
+
+vi.mock('./residency-indicator', () => ({
+  ResidencyIndicator: () => <text>●</text>,
 }))
 
 vi.mock('../../components/button', () => ({
@@ -205,9 +210,13 @@ function makeProps(): ComposerProps {
     localInferenceState: null,
     selectedProviderId: null,
     selectedSlotId: PRIMARY_SLOT_ID,
+    tokenUsage: 5_000,
+    contextHardCap: 100_000,
+    isCompacting: false,
     displayMode: 'default' as const,
     theme,
     modeColor: '#00aaff',
+    chatColumnWidth: 100,
     attachmentsMaxWidth: 60,
     composerCanFocus: false,
     widgetNavActive: false,
@@ -242,6 +251,7 @@ test('composer shell renders without an embedded task list (task list is the Age
   const html = render(<Composer {...makeProps()} clientWorkingDirectory="/tmp/magnitude" />)
 
   expect(html).toContain('background-color:#111111;padding-left:1px;padding-right:2px')
+  expect(html).toContain('height:1px;background-color:#111111;border-style:single;border:left')
   expect(html).not.toContain('padding-top:1px')
   expect(html).toContain('>model<')
   expect(html).toContain('>high<')
@@ -249,8 +259,9 @@ test('composer shell renders without an embedded task list (task list is the Age
   expect(html).not.toContain('Thinking:')
   expect(html).not.toContain('Assigned To')
 
-  expect(html).not.toContain('vertical:╹')
   expect(html).not.toContain('horizontal:▀')
+  expect(html).not.toContain('horizontal:▄')
+  expect(html).toContain('ctx 5k (5%)')
 })
 
 test('shows a single no-provider label instead of model and reasoning effort', () => {

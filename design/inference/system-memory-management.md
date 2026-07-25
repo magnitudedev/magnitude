@@ -14,6 +14,8 @@ applies_to:
   - packages/client-common/src/utils/model-memory.ts
   - packages/client-common/src/utils/model-slots.ts
   - cli/src/app.tsx
+  - cli/src/features/composer/**
+  - cli/src/features/local-inference/footer-status.tsx
   - cli/src/features/model-menus/**
   - cli/src/features/agent-status/**
 ---
@@ -113,6 +115,12 @@ The Models menu keeps `REQUIREMENTS` and uses `STATUS` for:
 low-memory rejection during load or termination during serving appears in the activity rail as:
 
 `Model stopped · Low memory - close memory-intensive apps and try again`
+
+While the selected local model is ready, the composer footer may show its compact resident runtime
+allocation. That value is the sum of the server-published model, context, compute, and auxiliary
+allocations across participating memory domains. It is not whole-system used memory and has no
+capacity denominator. The indicator disappears outside ready residency; the Hardware menu owns
+whole-system, application, free-memory, and per-allocation detail.
 
 While current hardware or system-domain evidence is unavailable, clients do not infer either
 compatibility or available headroom and do not expose load or selection actions. This transient

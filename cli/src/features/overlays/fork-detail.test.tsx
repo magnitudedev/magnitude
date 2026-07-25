@@ -18,8 +18,8 @@ mock.module('../../components/button', () => ({
   Button: ({ children }: { children?: any }) => <>{children}</>,
 }))
 
-mock.module('../agent-status/context-usage-bar', () => ({
-  ContextUsageBar: () => <text>[context]</text>,
+mock.module('../composer/context-usage', () => ({
+  ContextUsage: () => <text>[context]</text>,
 }))
 
 const openFileMock = mock(() => {})

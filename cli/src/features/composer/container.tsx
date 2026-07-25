@@ -131,10 +131,11 @@ export function ComposerContainer({
     () => (rootTimeline ? orderedMessages(rootTimeline.messages) : []),
     [rootTimeline?.messages],
   )
-  // Reserve footer width so attachments don't reflow when hints appear.
-  const maxEscHintWidth = 'Press Esc again to interrupt all workers'.length
-  const statusTextWidth = 36
-  const attachmentsMaxWidth = Math.max(0, chatColumnWidth - 4 - maxEscHintWidth - statusTextWidth - 5)
+  const context = rootActor?.context ?? null
+  const tokenUsage = context && context.tokenEstimate > 0 ? context.tokenEstimate : null
+  const contextHardCap = rootProfile?.contextWindow ?? null
+  const isCompacting = context?.isCompacting ?? false
+  const attachmentsMaxWidth = Math.max(0, chatColumnWidth - 6)
 
   const composerCanFocus = !showRecentChats && !menu.open && !usageOpen && expandedForkStack.length === 0
 
@@ -170,9 +171,13 @@ export function ComposerContainer({
       localInferenceState={localInferenceState}
       selectedProviderId={rootProfile?.providerId ?? null}
       selectedSlotId={rootSlotId}
+      tokenUsage={tokenUsage}
+      contextHardCap={contextHardCap}
+      isCompacting={isCompacting}
       displayMode={displayMode}
       theme={theme}
       modeColor={theme.modeDefault}
+      chatColumnWidth={chatColumnWidth}
       attachmentsMaxWidth={attachmentsMaxWidth}
       composerCanFocus={composerCanFocus}
       widgetNavActive={widgetNavActive}

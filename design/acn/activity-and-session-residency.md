@@ -124,6 +124,15 @@ move the chat or composer. Model loading is shown immediately. Request preparati
 shown only after a short anti-flicker delay. Once generation begins, the row becomes the existing
 composable Working display, including thinking, tools, advisor activity, and worker counts.
 
+The CLI composer keeps a one-line minimum editor inside a full-width input surface with one stable
+row of visual padding above and below it and a tapered mode rail painted within the surface's first
+column; additional visual input lines grow only from actual draft content. Pending attachments render inside that surface rather than competing with persistent
+status. The terminal-background footer below it derives model selection, reasoning effort, local
+residency, working directory, and context usage directly from authoritative mirrors and display
+state. Model and effort form one visual identity, separated from resident memory by a muted middle
+dot. Local residency uses distinct loaded, transitional, and unloaded glyphs; detailed load
+percentage and failures remain in the activity rail.
+
 While the root slot is loading, the rail may present its authoritative percentage as well as
 persistent model chrome. Both presentations derive from the one mirrored slot lifecycle state;
 readiness hands the rail from model loading to request prefill without a client-owned loading state

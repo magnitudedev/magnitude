@@ -40,7 +40,8 @@ mock.module('./chat-surface-keyboard', () => ({ ChatSurfaceKeyboard: () => null 
 mock.module('./mention-menu', () => ({ FileMentionMenu: () => null }))
 mock.module('./slash-menu', () => ({ SlashCommandMenu: () => null }))
 mock.module('./attachment-bar', () => ({ AttachmentsBar: () => null }))
-mock.module('../agent-status/context-usage-bar', () => ({ ContextUsageBar: () => null }))
+mock.module('./context-usage', () => ({ ContextUsage: () => null, contextUsageWidth: () => 0 }))
+mock.module('./residency-indicator', () => ({ ResidencyIndicator: () => null }))
 mock.module('../../components/button', () => ({ Button: ({ children }: { children?: ReactNode }) => <>{children}</> }))
 mock.module('./multiline-input', () => ({
   INPUT_CURSOR_CHAR: '▍',
@@ -75,8 +76,12 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       localInferenceState: null,
       selectedProviderId: null,
       selectedSlotId: PRIMARY_SLOT_ID,
+      tokenUsage: null,
+      contextHardCap: null,
+      isCompacting: false,
       theme: chatThemes.dark,
       modeColor: '#00aaff',
+      chatColumnWidth: 100,
       attachmentsMaxWidth: 80,
       composerCanFocus: false,
       widgetNavActive: false,
