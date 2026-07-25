@@ -11,7 +11,7 @@ import { useFilePanel } from '../../hooks/use-file-panel'
 import { useLocalWidth } from '../../hooks/use-local-width'
 import { Button } from '../../components/button'
 import { ChatTimeline } from '../chat-timeline/timeline'
-import { ContextUsageBar } from '../agent-status/context-usage-bar'
+import { ContextUsage } from '../composer/context-usage'
 
 import { FileViewerPanel } from '../file-viewer/panel'
 import { SelectedFileProvider } from '../../hooks/use-file-viewer'
@@ -221,7 +221,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
           </text>
           <box style={{ flexDirection: 'row', alignItems: 'center' }}>
             <text style={{ fg: theme.muted }}> | </text>
-            <ContextUsageBar
+            <ContextUsage
               tokenUsage={tokenUsage}
               hardCap={contextHardCap}
               isCompacting={isCompacting}

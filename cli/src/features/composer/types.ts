@@ -22,11 +22,15 @@ export type ComposerProps = {
   localInferenceState: LocalInferenceView | null
   selectedProviderId: ProviderId | null
   selectedSlotId: SlotId
+  tokenUsage: number | null
+  contextHardCap: number | null
+  isCompacting: boolean
   displayMode: 'default' | 'transcript'
 
   // Presentation
   theme: ChatTheme
   modeColor: string
+  chatColumnWidth: number
   attachmentsMaxWidth: number
   composerCanFocus: boolean
   widgetNavActive: boolean

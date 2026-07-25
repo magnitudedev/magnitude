@@ -1,4 +1,5 @@
-import { deriveHardwareMemoryView, type LocalInferenceView } from "@magnitudedev/client-common"
+import { Option } from "effect"
+import type { LocalInferenceView } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
 import type { ProviderId, SlotId } from "@magnitudedev/sdk"
 
@@ -8,9 +9,23 @@ const compactGiB = (bytes: number): string =>
 
 export interface LocalInferenceFooterView {
   readonly modelName: string | null
-  /** Resident local memory, shown only while the selected model is loaded. */
+  readonly residency: "loaded" | "loading" | "not_loaded" | null
+  /** Selected runtime allocation, shown only while the local model is loaded. */
   readonly memoryLabel: string | null
 }
+
+const residentRuntimeBytes = (state: LocalInferenceView): number | null =>
+  Option.match(state.hardware.residentMemory, {
+    onNone: () => null,
+    onSome: ({ domains }) => domains.reduce(
+      (total, domain) => total
+        + domain.modelBytes
+        + domain.contextBytes
+        + domain.computeBytes
+        + domain.auxiliaryBytes,
+      0,
+    ),
+  })
 
 export const deriveLocalInferenceFooterView = (
   state: LocalInferenceView | null,
@@ -19,11 +34,12 @@ export const deriveLocalInferenceFooterView = (
   selectedSlotId: SlotId,
 ): LocalInferenceFooterView => {
   if (selectedProviderId !== null && selectedProviderId !== LOCAL_PROVIDER_ID) {
-    return { modelName: selectedModelName ?? "Cloud model", memoryLabel: null }
+    return { modelName: selectedModelName ?? "Cloud model", residency: null, memoryLabel: null }
   }
   if (state === null) {
     return {
       modelName: selectedModelName,
+      residency: selectedProviderId === LOCAL_PROVIDER_ID ? "not_loaded" : null,
       memoryLabel: null,
     }
   }
@@ -41,13 +57,17 @@ export const deriveLocalInferenceFooterView = (
   const downloadModel = state.models.models.find((model) =>
     model.download._tag === "Downloading" || model.download._tag === "Failed")
   const model = activeModel ?? downloadModel
-  const memory = slot?._tag === "Ready"
-    ? deriveHardwareMemoryView(state.hardware, { fallbackToAccelerators: true }).compact
-    : null
+  const residency = slot?._tag === "Ready"
+    ? "loaded" as const
+    : slot?._tag === "LoadingLocalModel" || slot?._tag === "UnloadingLocalModel"
+      ? "loading" as const
+      : "not_loaded" as const
+  const memoryBytes = residency === "loaded" ? residentRuntimeBytes(state) : null
   return {
     modelName: selectedModelName ?? model?.displayName ?? null,
-    memoryLabel: memory
-      ? `${compactGiB(memory.usedBytes)} / ${compactGiB(memory.totalBytes)} GiB`
+    residency,
+    memoryLabel: memoryBytes !== null
+      ? `${compactGiB(memoryBytes)}G mem`
       : null,
   }
 }

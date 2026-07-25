@@ -27,7 +27,8 @@ test("ready status exposes the model and minimal resident memory", () => {
   })
   expect(deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)).toEqual({
     modelName: "Qwen Test",
-    memoryLabel: "18 / 24 GiB",
+    residency: "loaded",
+    memoryLabel: "16G mem",
   })
 })
 
@@ -43,7 +44,7 @@ test("loading hides memory while status remains in the activity rail", () => {
     percentage: 42,
   }) } } }
   const footer = deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)
-  expect(footer).toEqual({ modelName: "Qwen Test", memoryLabel: null })
+  expect(footer).toEqual({ modelName: "Qwen Test", residency: "loading", memoryLabel: null })
 })
 
 test("memory state comes from the selected slot", () => {
@@ -72,6 +73,7 @@ test("memory state comes from the selected slot", () => {
     LOCAL_PROVIDER_ID,
     SECONDARY_SLOT_ID,
   )).toMatchObject({
+    residency: "loading",
     memoryLabel: null,
   })
 })
@@ -95,6 +97,7 @@ test("idle status keeps reasoning available and hides memory", () => {
   }
   expect(deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)).toEqual({
     modelName: "Qwen Test",
+    residency: "not_loaded",
     memoryLabel: null,
   })
 })
@@ -107,6 +110,7 @@ test("cloud selection exposes the model with no local runtime status", () => {
     PRIMARY_SLOT_ID,
   )).toEqual({
     modelName: "Claude Max",
+    residency: null,
     memoryLabel: null,
   })
 })

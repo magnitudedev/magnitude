@@ -1,11 +1,11 @@
-import { RGBA, TextAttributes, type KeyEvent } from '@opentui/core'
+import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useCallback, useRef, useState, useMemo } from 'react'
+import stringWidth from 'string-width'
 import { Effect } from 'effect'
 import { Atom, useAtomMount, useAtomSet, useAtomValue as useAtomValueClientCommon } from '@effect-atom/atom-react'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { filenameWithImageExtension, useAgentClient, mentionOccurrenceFromInputSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
 import { createId } from '@magnitudedev/generate-id'
-import { BOX_CHARS } from '../../utils/ui-constants'
 import { orange } from '../../utils/theme'
 import { Button } from '../../components/button'
 import { ChatSurfaceKeyboard } from './chat-surface-keyboard'
@@ -32,6 +32,8 @@ import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
 import { allowProviderMessageSend } from './provider-send-guard'
+import { ContextUsage, contextUsageWidth } from './context-usage'
+import { ResidencyIndicator } from './residency-indicator'
 
 const displayWorkingDirectory = (cwd: string): string => {
   const home = process.env.HOME
@@ -164,9 +166,13 @@ export function Composer(props: ComposerProps) {
     localInferenceState,
     selectedProviderId,
     selectedSlotId,
+    tokenUsage,
+    contextHardCap,
+    isCompacting,
     displayMode,
     theme,
     modeColor,
+    chatColumnWidth,
     attachmentsMaxWidth,
     composerCanFocus,
     widgetNavActive,
@@ -256,6 +262,29 @@ export function Composer(props: ComposerProps) {
     ),
     [localInferenceState, modelSummary?.model, selectedProviderId, selectedSlotId],
   )
+  const workingDirectoryLabel = displayWorkingDirectory(clientWorkingDirectory)
+  const modelNameLabel = modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'
+  const thinkingLevelLabel = modelSummary?.thinkingLevel ?? '-'
+  const footerTransientWidth = nextEscWillKillAll
+    ? 3 + 'Press Esc again to interrupt all workers'.length
+    : bashMode
+      ? 3 + 'Esc to exit Bash mode'.length
+      : 0
+  const footerLeftWidth = (bashMode
+    ? 'Bash Mode'.length
+    : !modelsConfigured
+      ? 'No provider configured'.length
+      : (modelFooter.residency === null ? 0 : 2)
+        + stringWidth(modelNameLabel)
+        + 1
+        + stringWidth(thinkingLevelLabel)
+        + (modelFooter.memoryLabel === null ? 0 : 3 + stringWidth(modelFooter.memoryLabel)))
+    + footerTransientWidth
+  const footerRightWidth = stringWidth(workingDirectoryLabel)
+    + 3
+    + contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
+    + (displayMode === 'transcript' ? 'Transcript Mode'.length + 3 : 0)
+  const footerStacks = footerLeftWidth + footerRightWidth + 8 > chatColumnWidth
   const openThinking = useCallback(() => {
     if (thinkingOptions.length === 0) return
     setThinkingIndex(currentThinkingIndex)
@@ -602,6 +631,104 @@ export function Composer(props: ComposerProps) {
     }
   }, [inputValue, attachments.length, handleSubmit, setComposerHistoryIndex])
 
+  const footerStatus = (
+    <box style={{ flexDirection: 'row', alignItems: 'center' }}>
+      {bashMode ? (
+        <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
+      ) : !modelsConfigured ? (
+        <Button onClick={openSettings}>
+          <text style={{ fg: theme.foreground }}>No provider configured</text>
+        </Button>
+      ) : (
+        <>
+          {modelFooter.residency !== null && (
+            <box style={{ marginRight: 1 }}>
+              <ResidencyIndicator residency={modelFooter.residency} />
+            </box>
+          )}
+          <Button
+            onClick={openSettings}
+            onMouseOver={() => setModelLabelHovered(true)}
+            onMouseOut={() => setModelLabelHovered(false)}
+          >
+            <text
+              style={{ fg: modelLabelHovered ? theme.primary : theme.foreground }}
+              attributes={TextAttributes.BOLD}
+            >
+              <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                {modelNameLabel}
+              </span>
+            </text>
+          </Button>
+          <box style={{ width: 1, flexShrink: 0 }} />
+          <Button
+            onClick={openThinking}
+            onMouseOver={() => setThinkingLabelHovered(true)}
+            onMouseOut={() => setThinkingLabelHovered(false)}
+          >
+            <text style={{ fg: thinkingLabelHovered ? theme.primary : theme.muted }}>
+              <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                {thinkingLevelLabel}
+              </span>
+            </text>
+          </Button>
+          {modelFooter.memoryLabel && (
+            <>
+              <text style={{ fg: theme.muted }}>{' · '}</text>
+              <Button
+                onClick={openHardware}
+                onMouseOver={() => setMemoryLabelHovered(true)}
+                onMouseOut={() => setMemoryLabelHovered(false)}
+              >
+                <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
+                  <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                    {modelFooter.memoryLabel}
+                  </span>
+                </text>
+              </Button>
+            </>
+          )}
+        </>
+      )}
+      {enableAutopilot && (
+        <AutopilotIndicator
+          enabled={autopilotEnabled}
+          generating={autopilotGenerating}
+          onToggle={toggleAutopilot}
+        />
+      )}
+      {nextEscWillKillAll ? (
+        <>
+          <box style={{ width: 3, flexShrink: 0 }} />
+          <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all workers</text>
+        </>
+      ) : bashMode ? (
+        <>
+          <box style={{ width: 3, flexShrink: 0 }} />
+          <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
+        </>
+      ) : null}
+    </box>
+  )
+
+  const footerEnvironment = (
+    <box style={{ flexDirection: 'row', alignItems: 'center' }}>
+      {displayMode === 'transcript' && (
+        <>
+          <text style={{ fg: theme.info }}>Transcript Mode</text>
+          <box style={{ width: 3, flexShrink: 0 }} />
+        </>
+      )}
+      <text style={{ fg: theme.muted }}>{workingDirectoryLabel}</text>
+      <box style={{ width: 3, flexShrink: 0 }} />
+      <ContextUsage
+        tokenUsage={tokenUsage}
+        hardCap={contextHardCap}
+        isCompacting={isCompacting}
+      />
+    </box>
+  )
+
   return (
     <>
       <ChatSurfaceKeyboard
@@ -630,10 +757,10 @@ export function Composer(props: ComposerProps) {
       />
 
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <box style={{ height: 1, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╻', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
-          <box style={{ height: 1, borderStyle: 'single', border: ['top'], borderColor: theme.inputBg, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: '▄', vertical: ' ', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }} />
+        <box style={{ height: 1, backgroundColor: theme.inputBg, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╻', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
+          <box style={{ height: 1, flexGrow: 1, backgroundColor: theme.inputBg }} />
         </box>
-        <box style={{ borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
+        <box style={{ backgroundColor: theme.inputBg, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '┃', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
           <box style={{ backgroundColor: theme.inputBg, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
             {!bashMode && fileMentions.isOpen && (
               <FileMentionMenu
@@ -683,6 +810,13 @@ export function Composer(props: ComposerProps) {
                 ))}
               </box>
             )}
+            {attachments.length > 0 && (
+              <AttachmentsBar
+                attachments={attachments}
+                onRemove={removeAttachment}
+                maxWidth={attachmentsMaxWidth}
+              />
+            )}
             <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
               <box style={{ flexGrow: 1, minWidth: 0 }}>
                 <MultilineInput
@@ -707,96 +841,21 @@ export function Composer(props: ComposerProps) {
             </box>
           </box>
         </box>
-        <box style={{ height: 1, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╹', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
-          <box style={{ height: 1, borderStyle: 'single', border: ['bottom'], borderColor: theme.inputBg, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: '▀', vertical: ' ', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }} />
+        <box style={{ height: 1, backgroundColor: theme.inputBg, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╹', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
+          <box style={{ height: 1, flexGrow: 1, backgroundColor: theme.inputBg }} />
         </box>
       </box>
 
-      <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
-        <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
-          {bashMode ? (
-            <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
-          ) : !modelsConfigured ? (
-            <Button onClick={openSettings}>
-              <text style={{ fg: theme.foreground }}>No provider configured</text>
-            </Button>
-          ) : (
-            <>
-              <Button
-                onClick={openSettings}
-                onMouseOver={() => setModelLabelHovered(true)}
-                onMouseOut={() => setModelLabelHovered(false)}
-              >
-                <text
-                  style={{ fg: modelLabelHovered ? theme.primary : theme.foreground }}
-                  attributes={TextAttributes.BOLD}
-                >
-                  <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                    {modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'}
-                  </span>
-                </text>
-              </Button>
-              <text style={{ fg: theme.muted }}>{'\u00b7'}</text>
-              <Button
-                onClick={openThinking}
-                onMouseOver={() => setThinkingLabelHovered(true)}
-                onMouseOut={() => setThinkingLabelHovered(false)}
-              >
-                <text style={{ fg: thinkingLabelHovered ? theme.primary : theme.foreground }}>
-                  <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                    {modelSummary?.thinkingLevel ?? '-'}
-                  </span>
-                </text>
-              </Button>
-              {modelFooter.memoryLabel && (
-                <>
-                  <text style={{ fg: theme.muted }}>{'\u00b7'}</text>
-                  <Button
-                    onClick={openHardware}
-                    onMouseOver={() => setMemoryLabelHovered(true)}
-                    onMouseOut={() => setMemoryLabelHovered(false)}
-                  >
-                    <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
-                      <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                        {modelFooter.memoryLabel}
-                      </span>
-                    </text>
-                  </Button>
-                </>
-              )}
-            </>
-          )}
-          {enableAutopilot && (
-            <AutopilotIndicator
-              enabled={autopilotEnabled}
-              generating={autopilotGenerating}
-              onToggle={toggleAutopilot}
-            />
-          )}
-          {attachments.length > 0 ? (
-            <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={attachmentsMaxWidth} />
-          ) : nextEscWillKillAll ? (
-            <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all workers</text>
-          ) : bashMode ? (
-            <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
-          ) : null}
+      <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, flexDirection: 'column' }}>
+        <box style={{ height: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
+          {footerStatus}
+          {!footerStacks && footerEnvironment}
         </box>
-        <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
-          {attachments.length > 0 && (nextEscWillKillAll ? (
-            <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all workers</text>
-          ) : bashMode ? (
-            <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
-          ) : null)}
-          {displayMode === 'transcript' && (
-            <>
-              <text style={{ fg: theme.info }}>Transcript Mode</text>
-              <text style={{ fg: theme.muted }}>{' \u00b7 '}</text>
-            </>
-          )}
-          <text style={{ fg: theme.muted }}>
-            {displayWorkingDirectory(clientWorkingDirectory)}
-          </text>
-        </box>
+        {footerStacks && (
+          <box style={{ height: 1, flexDirection: 'row', justifyContent: 'flex-end' }}>
+            {footerEnvironment}
+          </box>
+        )}
       </box>
 
     </>

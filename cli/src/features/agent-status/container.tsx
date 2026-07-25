@@ -18,7 +18,6 @@ import { Option } from 'effect'
 import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
 import { ActivityRail } from './activity-rail'
 import { TaskList } from './task-list'
-import { ContextUsageBar, contextUsageWidth } from './context-usage-bar'
 
 export function AgentStatusRowContainer({
   modelLoadActivity,
@@ -52,12 +51,7 @@ export function AgentStatusRowContainer({
   const advisorProfile = profiles
     ? Option.getOrNull(findSlotProfile(profiles, advisorSlotId))
     : null
-  const context = rootActor?.context ?? null
-  const contextHardCap = rootProfile?.contextWindow ?? null
-  const tokenUsage = context && context.tokenEstimate > 0 ? context.tokenEstimate : null
-  const isCompacting = context?.isCompacting ?? false
-  const reservedContextWidth = contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
-  const activityWidth = Math.max(0, width - reservedContextWidth - 3)
+  const activityWidth = Math.max(0, width - 2)
 
   return (
     <box style={{
@@ -78,12 +72,6 @@ export function AgentStatusRowContainer({
           advisorModelName={advisorProfile?.modelDisplayName ?? null}
         />
       </box>
-      <box style={{ flexGrow: 1, minWidth: 0 }} />
-      <ContextUsageBar
-        tokenUsage={tokenUsage}
-        hardCap={contextHardCap}
-        isCompacting={isCompacting}
-      />
     </box>
   )
 }
