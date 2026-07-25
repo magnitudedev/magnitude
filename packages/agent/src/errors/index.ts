@@ -17,7 +17,16 @@ export {
   modelAttemptRetryability,
   presentModelAttemptFailure,
   type AgentModelAttemptFailure,
-  type AgentStreamStartFailure,
   type ModelAttemptFinalizerDecision,
   type ModelAttemptFinalizerInput,
 } from './model-attempt'
+
+export {
+  agentModelStartRetryability,
+  finalizeAgentModelStartFailure,
+  formatAgentModelStartFailure,
+  presentAgentModelStartFailure,
+  type AgentModelStartFinalizerDecision,
+  type ModelRequestPreparationFailureSnapshot,
+} from './model-start'
+export type { AgentModelStartFailure } from '../model/model-request-preparation'

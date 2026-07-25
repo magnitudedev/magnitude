@@ -84,6 +84,7 @@ function isMappableTurnOutcome(outcome: AgentTurnOutcome): outcome is MappableAg
     case 'Overthinking':
       return true
     case 'ProviderNotReady':
+    case 'ModelNotReady':
     case 'ConnectionFailure':
     case 'StreamFailed':
     case 'ContextWindowExceeded':

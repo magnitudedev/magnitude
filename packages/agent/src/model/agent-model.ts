@@ -1,4 +1,4 @@
-import { Context, Effect, Option } from 'effect'
+import { Context, Effect, Exit, Option, type Scope } from 'effect'
 import {
   TraceListener,
   type BoundModel,
@@ -19,6 +19,10 @@ import {
 import { TurnContextTag } from '../engine/turn-context'
 import type { RoleId } from '../agents/role-validation'
 import { createId } from '../util/id'
+import type {
+  AgentModelStartFailure,
+  ModelRequestPreparationFailed,
+} from './model-request-preparation'
 
 const { ForkContext } = Fork
 
@@ -53,7 +57,7 @@ export type ModelSource = { readonly slotId: SlotId }
  * and grammar wrapping on top, operating on universal `BaseCallOptions`.
  */
 export interface AgentBoundModel {
-  readonly model: BoundModel<BaseCallOptions>
+  readonly model: BoundModel<BaseCallOptions, AgentModelStartFailure>
   readonly modelSource: ModelSource
   readonly modelId: string
   /**
@@ -72,6 +76,8 @@ export interface AgentBoundModel {
 
 export interface AgentBoundModelConfig {
   readonly rawModel: BoundModel<BaseCallOptions>
+  readonly prepareRequest?: Effect.Effect<void, ModelRequestPreparationFailed, Scope.Scope>
+  readonly clearRequestProgress?: Effect.Effect<void>
   readonly modelId: string
   readonly modelSource: ModelSource
   readonly providerId: string
@@ -208,7 +214,7 @@ function deriveScope(input: {
 // =============================================================================
 
 export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundModel {
-  const model: BoundModel<BaseCallOptions> = {
+  const model: BoundModel<BaseCallOptions, AgentModelStartFailure> = {
     stream: (prompt, tools, options) =>
       Effect.gen(function* () {
         const callOptions = options as CallOptionsWithToolIds | undefined
@@ -221,12 +227,24 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
           onSome: (gc) => ({ ...callOptions, toolChoice: gc }),
           onNone: () => callOptions,
         })
-        const streamEffect = config.rawModel.stream(prompt, tools, effectiveOptions)
+        const streamEffect = Effect.scoped(
+          (config.prepareRequest ?? Effect.void).pipe(
+            Effect.zipRight(config.rawModel.stream(prompt, tools, effectiveOptions)),
+          ),
+        )
+        const clearFailedStart = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          effect.pipe(
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit)
+                ? (config.clearRequestProgress ?? Effect.void)
+                : Effect.void
+            ),
+          )
 
-        if (!config.debug) return yield* streamEffect
+        if (!config.debug) return yield* clearFailedStart(streamEffect)
 
         const sessionId = getTraceSessionId()
-        if (sessionId === null) return yield* streamEffect
+        if (sessionId === null) return yield* clearFailedStart(streamEffect)
 
         const turnOption = yield* Effect.serviceOption(TurnContextTag)
         const forkOption = yield* Effect.serviceOption(ForkContext)
@@ -244,7 +262,7 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
         })
         const scope = deriveScope({ callType, turn, operation })
 
-        return yield* streamEffect.pipe(
+        return yield* clearFailedStart(streamEffect.pipe(
           Effect.provideService(TraceListener, {
             onTrace: (trace) => {
               writeTrace({
@@ -257,7 +275,7 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
               })
             },
           }),
-        )
+        ))
       }),
   }
 

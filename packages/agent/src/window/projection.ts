@@ -523,6 +523,7 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
         case 'ConnectionFailure':
         case 'StreamFailed':
         case 'ProviderNotReady':
+        case 'ModelNotReady':
         case 'ContextWindowExceeded':
         case 'OutputTruncated':
         case 'SafetyStop':

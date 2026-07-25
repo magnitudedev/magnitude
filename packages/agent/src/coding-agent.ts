@@ -94,6 +94,7 @@ import { collectSessionContext } from './util/collect-session-context'
 // Engine layers
 
 import { AgentModelResolverLive } from './model/model-resolver'
+import type { PrepareModelRequest } from './model/model-request-preparation'
 
 // Config & Auth
 import { ProviderClient, SlotIdSchema, type ProviderClientShape } from '@magnitudedev/sdk'
@@ -239,6 +240,11 @@ export interface CreateClientOptions {
   applyReasoningEffortFallback?: (
     input: import('./model/model-resolver').ReasoningEffortFallbackInput,
   ) => Effect.Effect<void, unknown>
+  /**
+   * Scoped preparation performed before a model request reaches its provider.
+   * ACN uses this to admit local models; other runtimes use the no-op default.
+   */
+  prepareModelRequest?: PrepareModelRequest
 
   /**
    * Disable shell command classification safeguards for this runtime only.
@@ -707,7 +713,11 @@ export function createCodingAgentSession(options: CreateClientOptions) {
   // second cache or refresh policy.
   const providerClientLayer = Layer.succeed(ProviderClient, options.providerClient)
   const agentModelResolverLayer = Layer.provide(
-    AgentModelResolverLive(options.debug, options.applyReasoningEffortFallback),
+    AgentModelResolverLive(
+      options.debug,
+      options.applyReasoningEffortFallback,
+      options.prepareModelRequest,
+    ),
     providerClientLayer,
   )
   const chatTitleServiceLayer = Layer.provide(

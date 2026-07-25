@@ -30,7 +30,7 @@ import { WindowProjection, type ForkWindowState } from '../window'
 import { observerWindowToPrompt, getObserverSystemPrompt } from './prompt'
 import { AgentModelResolver } from '../model/model-resolver'
 import { AgentModelOperationContextTag } from '../model/agent-model'
-import { modelAttemptRetryability, type AgentStreamStartFailure } from '../errors'
+import { agentModelStartRetryability, type AgentModelStartFailure } from '../errors'
 import { connectionRetrySchedule } from '../util/retry-backoff'
 import { createId } from '../util/id'
 import { observerToolkit, type EscalateInput } from './schema'
@@ -390,9 +390,9 @@ function observeOnce(
       }),
       Effect.retry({
         schedule: connectionRetrySchedule,
-        while: (err: AgentStreamStartFailure) => modelAttemptRetryability(err)._tag === 'UpstreamRetryable',
+        while: (err: AgentModelStartFailure) => agentModelStartRetryability(err)._tag === 'UpstreamRetryable',
       }),
-      Effect.catchAll((err: AgentStreamStartFailure) =>
+      Effect.catchAll((err: AgentModelStartFailure) =>
         Effect.gen(function* () {
           logger.error({ err, forkId: event.forkId }, '[Observer] Connection error after retries')
           return null

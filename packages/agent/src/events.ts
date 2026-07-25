@@ -7,7 +7,7 @@
  */
 
 
-import { Brand, Option } from 'effect'
+import { Brand, Option, Schema } from 'effect'
 import type { ContextPart } from './content'
 import type { ModelAttemptFailureSnapshot, ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
 import type { ToolLifecycleEvent } from '@magnitudedev/harness'
@@ -231,6 +231,14 @@ export type ConnectionFailureDetail = {
   readonly failure: ModelAttemptFailureSnapshot
 }
 
+export const ModelNotReadyFailureSchema = Schema.Struct({
+  code: Schema.String,
+  message: Schema.String,
+  /** Whether retrying later may succeed; this does not enable automatic retries. */
+  retryable: Schema.Boolean,
+})
+export type ModelNotReadyFailure = Schema.Schema.Type<typeof ModelNotReadyFailureSchema>
+
 export type CancelledReason =
   | { readonly _tag: 'UserInterrupt' }
   | { readonly _tag: 'WorkerKilled' }
@@ -256,6 +264,7 @@ export type TurnOutcome = WithRequestId<
   | { readonly _tag: 'ToolExecutionError'; readonly toolCallId: ToolCallId; readonly providerToolCallId: ProviderToolCallId; readonly toolName: string; readonly toolKey: string; readonly error: { readonly message: string } }
   | { readonly _tag: 'GateRejected'; readonly toolCallId: ToolCallId; readonly providerToolCallId: ProviderToolCallId; readonly toolName: string }
   | { readonly _tag: 'ProviderNotReady'; readonly detail: ProviderNotReadyDetail }
+  | { readonly _tag: 'ModelNotReady'; readonly failure: ModelNotReadyFailure }
   | { readonly _tag: 'ConnectionFailure'; readonly detail: ConnectionFailureDetail }
   | { readonly _tag: 'StreamFailed'; readonly failure: ModelAttemptFailureSnapshot }
   | { readonly _tag: 'ContextWindowExceeded' }

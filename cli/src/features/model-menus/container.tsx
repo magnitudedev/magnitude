@@ -12,6 +12,10 @@ import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import {
   deriveHardwareMemoryView,
+  modelMemoryStatusDetail,
+  modelMemoryStatusLabel,
+  requiredMemoryBytes,
+  providerModelMemoryConditions,
   selectedSlotModel,
   usePlatform,
   useLocalInferenceHardware,
@@ -328,6 +332,10 @@ const ModelsMenu = memo(function ModelsMenu({
   const theme = useTheme()
   const config = useModelConfig()
   const local = useLocalInferenceState()
+  const hardware = Option.map(
+    Result.value(useLocalInferenceHardware()),
+    ({ state }) => state,
+  ).pipe(Option.getOrUndefined)
   const models = catalogModels(config)
   const catalogSnapshot = Result.value(config.catalog)
   const slotsSnapshot = Result.value(config.slots)
@@ -352,7 +360,10 @@ const ModelsMenu = memo(function ModelsMenu({
   const eligible = models
     .filter((model) =>
       model.supportedSlots.includes(PRIMARY_SLOT_ID)
-      && (model.availability._tag === "Available" || providerModelKey(model) === selectedKey))
+      && (model.availability._tag === "Available"
+        || providerModelKey(model) === selectedKey
+        || (model.providerId === LOCAL_PROVIDER_ID
+          && model.availability.reason === "insufficient_resources")))
     .sort((left, right) => {
       const leftFavorite = ordering.favoriteKeys.has(providerModelKey(left))
       const rightFavorite = ordering.favoriteKeys.has(providerModelKey(right))
@@ -386,15 +397,15 @@ const ModelsMenu = memo(function ModelsMenu({
   })
   const requirementFor = (model: ProviderModelCatalogEntry): string => {
     if (model.providerId !== LOCAL_PROVIDER_ID) return "Cloud"
-    return Option.match(model.runtimeMemoryBytes, {
+    return Option.match(model.memory, {
       onNone: () => "—",
-      onSome: formatBytes,
+      onSome: (memory) => formatBytes(requiredMemoryBytes(memory)),
     })
   }
   const calibratingRequirementFor = (model: LocalModel): string => {
     const candidate = localCatalogCandidates.find(({ id }) =>
       model.catalogCandidateIds.includes(id))
-    return candidate ? formatBytes(candidate.runtimeMemoryBytes) : "—"
+    return candidate ? formatBytes(requiredMemoryBytes(candidate.memory)) : "—"
   }
   const calibrating = Option.match(localSnapshot, {
     onNone: () => [] as readonly LocalModel[],
@@ -421,29 +432,50 @@ const ModelsMenu = memo(function ModelsMenu({
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("select" | "load" | "unload" | "catalog")[]
     const actions: ("select" | "load" | "unload" | "catalog")[] = []
+    const memoryConditions = providerModelMemoryConditions(detail, hardware)
     if (!detailIsSelected
       && detail.availability._tag === "Available"
+      && (!detailIsLocal
+        || (!memoryConditions.evidenceUnavailable
+          && !memoryConditions.lacksCurrentHeadroom))
       && detail.supportedSlots.includes(PRIMARY_SLOT_ID)) actions.push("select")
-    if (detailIsLocal && detailIsSelected && primarySlot?._tag === "UnloadedLocalModel") actions.push("load")
+    if (detailIsLocal
+      && detailIsSelected
+      && primarySlot?._tag === "UnloadedLocalModel"
+      && !memoryConditions.evidenceUnavailable
+      && !memoryConditions.exceedsCapacity
+      && !memoryConditions.lacksCurrentHeadroom) actions.push("load")
     if (detailIsLocal && detailIsSelected && primarySlot?._tag === "Ready") actions.push("unload")
     if (detailCatalogCandidate) actions.push("catalog")
     return actions
-  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, primarySlot])
+  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, hardware, primarySlot])
   const focusedDetailAction = detailActions[Math.min(detailActionIndex, Math.max(0, detailActions.length - 1))]
 
   const statusFor = useCallback((model: ProviderModelCatalogEntry): string => {
     const isSelected = providerModelKey(model) === selectedKey
-    if (model.availability._tag === "Disabled") {
-      return "Unavailable"
+    if (model.providerId === LOCAL_PROVIDER_ID) {
+      const memoryConditions = providerModelMemoryConditions(model, hardware)
+      if (isSelected
+        && (primarySlot?._tag === "Ready" || primarySlot?._tag === "LoadingLocalModel")
+        && memoryConditions.lacksCurrentHeadroom) return "Selected"
+      const memoryLabel = modelMemoryStatusLabel(memoryConditions)
+      if (memoryLabel !== "") return memoryLabel
+      if (model.availability._tag === "Disabled") return "Unavailable"
     }
     if (isSelected) return "Selected"
     return model.providerId === LOCAL_PROVIDER_ID ? "Installed" : "Available"
-  }, [selectedKey])
+  }, [hardware, primarySlot, selectedKey])
 
   const choose = useCallback((model: ProviderModelCatalogEntry) => {
     if (!model.supportedSlots.includes(PRIMARY_SLOT_ID)) return
+    if (model.availability._tag !== "Available") return
+    if (model.providerId === LOCAL_PROVIDER_ID) {
+      const memoryConditions = providerModelMemoryConditions(model, hardware)
+      if (memoryConditions.evidenceUnavailable
+        || memoryConditions.lacksCurrentHeadroom) return
+    }
     config.updateSlotModel(PRIMARY_SLOT_ID, model.providerId, model.providerModelId)
-  }, [config])
+  }, [config, hardware])
 
   const toggleFavorite = useCallback((model: ProviderModelCatalogEntry) => {
     config.setModelFavorite({
@@ -549,6 +581,11 @@ const ModelsMenu = memo(function ModelsMenu({
           <text style={{ fg: theme.muted }}>
             {detailIsLocal ? "Local" : "Cloud"} · {formatContextWindow(detail.contextWindow)} context · {statusFor(detail)}
           </text>
+          {detailIsLocal && modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware)) !== "" && (
+            <text style={{ fg: theme.warning }}>
+              {modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware))}
+            </text>
+          )}
           <text style={{ fg: theme.muted }}>
             {detail.capabilities.vision ? "Vision" : "No vision"} · Tools · {detail.capabilities.reasoning.supported ? "Reasoning" : "No reasoning"}
           </text>
@@ -870,7 +907,7 @@ const CatalogMenu = memo(function CatalogMenu({
           )}
           <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>Calibrated for this machine</text>
           <text style={{ fg: theme.muted }}>
-            {formatBytes(detail.runtimeMemoryBytes)} memory · {detail.quantization} · intelligence {Math.round(detail.intelligenceScore)}/100 · {qualityLabel(detail)}
+            {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · intelligence {Math.round(detail.intelligenceScore)}/100 · {qualityLabel(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
             {Option.match(detail.estimatedTokensPerSecond, { onNone: () => "Speed unavailable", onSome: (speed) => `Approximately ${speed.toFixed(1)} tokens/sec` })}
@@ -956,7 +993,7 @@ const CatalogMenu = memo(function CatalogMenu({
                 {candidate.displayName}<span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{` (${candidate.quantizationName})`}</span>
               </text>
               <text style={{ fg: theme.primary, width: 16 }}>{recommendationLabel(recommendationFor(candidate))}</text>
-              <text style={{ fg: theme.muted, width: 12 }}>{formatBytes(candidate.runtimeMemoryBytes)}</text>
+              <text style={{ fg: theme.muted, width: 12 }}>{formatBytes(requiredMemoryBytes(candidate.memory))}</text>
               <text style={{ fg: theme.muted, width: 14 }}>{Math.round(candidate.intelligenceScore)}/100</text>
               <text style={{ fg: theme.muted, width: 14 }}>{qualityLabel(candidate)}</text>
               <text style={{ fg: theme.muted, width: 12 }}>{Option.match(candidate.estimatedTokensPerSecond, { onNone: () => "—", onSome: (speed) => `~${speed.toFixed(0)} t/s` })}</text>

@@ -11,8 +11,9 @@ import type { SessionError } from "@magnitudedev/protocol"
 import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
-import { ProviderClientRegistry, withModelSlotAdmission } from "./shared-client"
+import { ProviderClientRegistry } from "./shared-client"
 import { ModelSlotCoordinator } from "./model-slot-coordinator"
+import { makeModelRequestPreparation } from "./model-request-preparation"
 
 export interface AgentFactoryApi {
   readonly createSession: (input: {
@@ -57,10 +58,7 @@ export const AgentFactoryLive = (options: {
             })).pipe(
               Effect.mapError((cause) => toSessionError(input.sessionId, cause)),
             )
-            const providerClient = withModelSlotAdmission(
-              yield* providerClients.session(input.sessionId),
-              modelSlots,
-            )
+            const providerClient = yield* providerClients.session(input.sessionId)
             yield* Scope.addFinalizer(input.scope, providerClients.remove(input.sessionId))
             return { persistenceLayer, sessionContext, providerClient }
           }).pipe(
@@ -74,6 +72,7 @@ export const AgentFactoryLive = (options: {
             sessionContext: prepared.sessionContext,
             sessionId: input.sessionId,
             providerClient: prepared.providerClient,
+            prepareModelRequest: makeModelRequestPreparation(modelSlots),
             modelConfiguration: modelSlots.agentModelConfiguration,
             modelConfigurations: modelSlots.agentModelConfigurations,
             disableShellSafeguards: input.options.disableShellSafeguards,

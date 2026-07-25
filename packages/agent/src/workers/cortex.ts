@@ -14,7 +14,7 @@ import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
 import { createHarness } from '@magnitudedev/harness'
 import type { AppEvent } from '../events'
-import { finalizeModelAttemptFailure, type AgentStreamStartFailure } from '../errors'
+import { finalizeAgentModelStartFailure, type AgentModelStartFailure } from '../errors'
 import { describeThrown, stackTraceLines } from '../errors/formatters'
 
 import { WindowProjection } from '../window'
@@ -310,10 +310,10 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // ──────────────────────────────────────────────────────────────────────
         const liveTurn = yield* harness.runTurn(prompt, runTurnOptions).pipe(
           Effect.provide(turnLayer),
-          Effect.catchAll((err: AgentStreamStartFailure) => Effect.gen(function* () {
+          Effect.catchAll((err: AgentModelStartFailure) => Effect.gen(function* () {
             logger.error({ forkId, turnId, err }, '[Cortex] Pre-stream failure')
             const turnFork = yield* read(TurnProjection, forkId)
-            const decision = finalizeModelAttemptFailure({
+            const decision = finalizeAgentModelStartFailure({
               failure: err,
               retryCount: turnFork?.connectionRetryCount ?? 0,
               maxRetries: MAX_RETRIES,

@@ -187,7 +187,15 @@ const selectedModelIssue = (
   state: ProviderModelCatalogState,
   slotId: SlotId,
   selection: SlotSelection,
-): Option.Option<Exclude<ModelSlotBlockedReason, { readonly _tag: "LocalModelLoadFailed" }>> => {
+): Option.Option<Exclude<
+  ModelSlotBlockedReason,
+  {
+    readonly _tag:
+      | "LocalModelLoadFailed"
+      | "LocalModelRuntimeLost"
+      | "LocalModelStoppedLowMemory"
+  }
+>> => {
   const unavailable = providerIssue(state, selection.providerId)
   if (Option.isSome(unavailable)) {
     return Option.some({ _tag: "ProviderUnavailable", message: unavailable.value })
@@ -337,7 +345,9 @@ export const reconcileAvailableLocalSlot = (
     && previous.value._tag !== "Unassigned"
     && sameModel(previous.value.selection, selection)
     && (previous.value._tag !== "Blocked"
-      || previous.value.reason._tag === "LocalModelLoadFailed")) {
+      || previous.value.reason._tag === "LocalModelLoadFailed"
+      || previous.value.reason._tag === "LocalModelRuntimeLost"
+      || previous.value.reason._tag === "LocalModelStoppedLowMemory")) {
     return ModelSlotLifecycle.hold(previous.value, { selection })
   }
   return new ModelSlotUnloadedLocalModel({ slotId, selection })
@@ -589,6 +599,13 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       : state.slots.secondary),
   )
 
+  const localModelFailureReason = (
+    fallback: "LocalModelLoadFailed" | "LocalModelRuntimeLost",
+    error: { readonly code: string; readonly message: string; readonly retryable: boolean },
+  ): ModelSlotBlockedReason => error.code === "low_memory"
+    ? { _tag: "LocalModelStoppedLowMemory", error }
+    : { _tag: fallback, error }
+
   const normalizeAndValidateSelection = (
     slotId: SlotId,
     selection: SlotSelection,
@@ -612,14 +629,30 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       if (slot.selection.providerModelId !== providerModelId) {
         return applyReplacedLocalModelStage(slot, providerModelId, "unloaded")
       }
-      const reason: ModelSlotBlockedReason = {
-        _tag: "LocalModelLoadFailed",
-        error,
-      }
+      const reason = localModelFailureReason("LocalModelLoadFailed", error)
       return slot._tag === "Blocked"
         ? ModelSlotLifecycle.hold(slot, { reason })
         : ModelSlotLifecycle.transition(slot, "Blocked", { reason })
     }).pipe(Effect.asVoid)
+
+  const blockRuntimeLoss = (
+    providerModelId: ProviderModelId,
+    error: { readonly code: string; readonly message: string; readonly retryable: boolean },
+  ) =>
+    updateMatchingLocalSlots(providerModelId, (slot) => {
+      const reason = localModelFailureReason("LocalModelRuntimeLost", error)
+      return slot._tag === "Blocked"
+        ? ModelSlotLifecycle.hold(slot, { reason })
+        : ModelSlotLifecycle.transition(slot, "Blocked", { reason })
+    }).pipe(Effect.asVoid)
+
+  yield* Effect.forkIn(localRuntime.changes.pipe(
+    Stream.runForEach(({ providerModelId, error }) => blockRuntimeLoss(providerModelId, {
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable,
+    })),
+  ), scope)
 
   const unloadProviderModel = (
     providerModelId: ProviderModelId,
@@ -702,7 +735,10 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
         return yield* reject(slotId, "The slot does not contain a local model")
       }
       if (slot._tag === "LoadingLocalModel") return
-      if (slot._tag === "Blocked" && slot.reason._tag !== "LocalModelLoadFailed") {
+      if (slot._tag === "Blocked"
+        && slot.reason._tag !== "LocalModelLoadFailed"
+        && slot.reason._tag !== "LocalModelRuntimeLost"
+        && slot.reason._tag !== "LocalModelStoppedLowMemory") {
         return yield* reject(slotId, "The selected local model is not loadable")
       }
       if (slot._tag !== "UnloadedLocalModel" && slot._tag !== "Blocked" && slot._tag !== "Ready") {

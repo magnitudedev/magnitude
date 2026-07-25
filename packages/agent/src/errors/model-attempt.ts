@@ -6,7 +6,6 @@ import {
   type ModelAttemptFailure,
   type ModelAttemptFailureSnapshot,
   type RetryAfter as RetryAfterType,
-  type StreamStartFailure,
   type UpstreamRetryability,
 } from '@magnitudedev/ai'
 import type { AttemptCommitPolicy, TurnOutcome } from '../events'
@@ -14,7 +13,6 @@ import { TERMINAL_RETRY_EXHAUSTED_MESSAGE } from '../util/retry-backoff'
 import { present, type ErrorPresentation } from './present'
 
 export type AgentModelAttemptFailure = ModelAttemptFailure
-export type AgentStreamStartFailure = StreamStartFailure
 
 export interface ModelAttemptFinalizerInput {
   readonly failure: AgentModelAttemptFailure

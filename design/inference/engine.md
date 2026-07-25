@@ -19,6 +19,8 @@ Two subsystem documents carry the detailed policies:
 
 - [KV state reuse](./kv.md) describes standard llama.cpp sequence-state reuse and its safety boundary.
 - [Scheduler design](./scheduler.md) describes admission, batching, request state transitions, fairness, and failure handling.
+- [System memory management](./system-memory-management.md) relates fitting, load admission, and
+  pressure eviction through one safety policy.
 
 ## Influences
 

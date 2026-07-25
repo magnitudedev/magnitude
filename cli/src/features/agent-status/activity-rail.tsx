@@ -46,6 +46,8 @@ interface ActivityRailProps {
 }
 
 const REQUEST_VISIBILITY_DELAY_MS = 500
+const LOW_MEMORY_MODEL_STOPPED_MESSAGE =
+  "Model stopped · Low memory - close memory-intensive apps and try again"
 
 function formatElapsed(totalSeconds: number): string {
   const minutes = Math.floor(totalSeconds / 60)
@@ -93,6 +95,13 @@ export const ActivityRail = memo(function ActivityRail({
   const loadingBrailleIndex = tick % BRAILLE_FRAMES.length
 
   if (modelLoadActivity !== null) {
+    if (modelLoadActivity._tag === "Blocked") {
+      return (
+        <box style={{ height: 1, flexShrink: 0, paddingLeft: 2 }}>
+          <text style={{ fg: theme.warning }}>{LOW_MEMORY_MODEL_STOPPED_MESSAGE}</text>
+        </box>
+      )
+    }
     return (
       <box style={{ height: 1, flexShrink: 0, paddingLeft: 2 }}>
         <text>

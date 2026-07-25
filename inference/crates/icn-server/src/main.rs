@@ -32,7 +32,7 @@ use icn_contracts::{
     TemplateAssessment, TemplateAssessor,
 };
 use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
-use icn_hardware::CapacityPolicy;
+use icn_hardware::{CapacityPolicy, SYSTEM_MEMORY_DOMAIN_ID};
 use icn_models::{
     InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
     ModelPreviewService, NativeRecommendableCatalog, canonical_package_id, offering_target_id,
@@ -212,6 +212,7 @@ struct NativeHardwareAssessor {
     cache: Option<ModelCache>,
     native_backend: NativeBackend,
     native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
+    runtime_failure: Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
     gate: tokio::sync::Mutex<()>,
     planning_slots: Arc<tokio::sync::Semaphore>,
     calibration: tokio::sync::Mutex<CalibrationCache>,
@@ -232,7 +233,7 @@ struct PersistedCalibration {
 
 const ASSESSMENT_RESOLVER_REVISION: &str = "icn-backend-plan-v1";
 const OFFERING_ASSESSMENT_REVISION: &str = "offering-assessment-v3-zero-kv-workload";
-const CAPACITY_POLICY_REVISION: &str = "stable-total-reserve-v1";
+const CAPACITY_POLICY_REVISION: &str = "system-memory-thresholds-v2";
 const MTP_SELECTOR_REVISION: &str = "icn-mtp-selector-v1";
 const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
 const CALIBRATION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -309,6 +310,7 @@ impl TemplateAssessor for NativeTemplateAssessor {
 const PLANNING_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 #[cfg(not(test))]
 const MAX_PLANNING_WORKER_OUTPUT_BYTES: usize = 1024 * 1024;
+const LOW_MEMORY_FAILURE_CODE: &str = "low_memory";
 #[cfg(not(test))]
 const TEMPLATE_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -605,6 +607,9 @@ impl NativeModelEvaluator {
         include_performance: bool,
         environment_id: &AssessmentEnvironmentId,
     ) -> Result<Vec<OfferingAssessment>, InventoryError> {
+        let hardware = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
+        let thresholds = icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes);
+        let system_reserve_bytes = reserve_bytes.max(thresholds.assess_reserve_bytes);
         let evidence = self.assessment_evidence(
             &resolved.target_id,
             profiles,
@@ -643,6 +648,7 @@ impl NativeModelEvaluator {
                 include_performance,
                 CapacityPolicy {
                     reserve_bytes_per_domain: reserve_bytes,
+                    system_reserve_bytes: Some(system_reserve_bytes),
                 },
             )
             .await?;
@@ -651,6 +657,8 @@ impl NativeModelEvaluator {
                 &resolved.target_id,
                 profiles[index].clone(),
                 reserve_bytes,
+                system_reserve_bytes,
+                thresholds.warning_reserve_bytes,
                 assessment,
             );
             self.models
@@ -830,6 +838,8 @@ fn offering_assessment(
     target_id: &icn_contracts::models::ModelOfferingTargetId,
     profile: DomainServingProfile,
     reserve_bytes: u64,
+    system_reserve_bytes: u64,
+    warning_reserve_bytes: u64,
     assessment: ModelExecutionAssessment,
 ) -> OfferingAssessment {
     let context_tokens = profile.context_length;
@@ -841,6 +851,7 @@ fn offering_assessment(
     digest.update(profile.context_length.to_le_bytes());
     digest.update(profile.parallel_sequences.to_le_bytes());
     digest.update(reserve_bytes.to_le_bytes());
+    digest.update(system_reserve_bytes.to_le_bytes());
     let assessment_id = OfferingAssessmentId(format!("assessment_{:x}", digest.finalize()));
     match assessment.hardware {
         HardwareAssessment::Fits { memory, .. } => {
@@ -853,12 +864,26 @@ fn offering_assessment(
                 memory: memory
                     .domains
                     .into_iter()
-                    .map(|domain| MemoryAssessment {
-                        memory_domain_id: domain.memory_domain,
-                        capacity_bytes: domain.available_bytes.saturating_add(reserve_bytes),
-                        required_bytes: domain.required_bytes,
-                        required_reserve_bytes: reserve_bytes,
-                        remaining_bytes: domain.margin_bytes,
+                    .map(|domain| {
+                        let domain_reserve = if domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID {
+                            system_reserve_bytes
+                        } else {
+                            reserve_bytes
+                        };
+                        MemoryAssessment {
+                            compatibility_reserve_bytes: domain_reserve,
+                            warning_reserve_bytes: if domain.memory_domain
+                                == SYSTEM_MEMORY_DOMAIN_ID
+                            {
+                                warning_reserve_bytes
+                            } else {
+                                domain_reserve
+                            },
+                            memory_domain_id: domain.memory_domain,
+                            capacity_bytes: domain.available_bytes.saturating_add(domain_reserve),
+                            required_bytes: domain.required_bytes,
+                            remaining_bytes: domain.margin_bytes,
+                        }
                     })
                     .collect(),
                 performance,
@@ -876,12 +901,24 @@ fn offering_assessment(
             memory: memory
                 .domains
                 .into_iter()
-                .map(|domain| MemoryAssessment {
-                    memory_domain_id: domain.memory_domain,
-                    capacity_bytes: domain.available_bytes.saturating_add(reserve_bytes),
-                    required_bytes: domain.required_bytes,
-                    required_reserve_bytes: reserve_bytes,
-                    remaining_bytes: domain.margin_bytes,
+                .map(|domain| {
+                    let domain_reserve = if domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID {
+                        system_reserve_bytes
+                    } else {
+                        reserve_bytes
+                    };
+                    MemoryAssessment {
+                        compatibility_reserve_bytes: domain_reserve,
+                        warning_reserve_bytes: if domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID {
+                            warning_reserve_bytes
+                        } else {
+                            domain_reserve
+                        },
+                        memory_domain_id: domain.memory_domain,
+                        capacity_bytes: domain.available_bytes.saturating_add(domain_reserve),
+                        required_bytes: domain.required_bytes,
+                        remaining_bytes: domain.margin_bytes,
+                    }
                 })
                 .collect(),
             limiting_resource,
@@ -1604,6 +1641,11 @@ impl HardwareProvider for NativeHardwareAssessor {
                     snapshot.resident_memory = None;
                 }
             }
+            snapshot.runtime_failure = self
+                .runtime_failure
+                .read()
+                .map_err(|_| InventoryError::Internal("runtime failure lock poisoned".to_owned()))?
+                .clone();
             let mut calibration = self.calibration.lock().await;
             let evidence = calibration_evidence(&snapshot)?;
             if calibration.evidence.as_deref() != Some(evidence.as_str()) {
@@ -1633,7 +1675,9 @@ impl HardwareProvider for NativeHardwareAssessor {
 struct NativeRuntimeController {
     backends: BackendRegistry,
     inventory: Arc<ModelManager>,
+    assessor: Arc<NativeHardwareAssessor>,
     native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
+    runtime_failure: Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
     worker: Arc<tokio::sync::RwLock<Option<InferenceWorker>>>,
     memory_observer: Arc<SystemMemoryObserver>,
     next_worker_generation: Arc<AtomicU64>,
@@ -1713,7 +1757,9 @@ impl NativeRuntimeController {
     fn new(
         backends: BackendRegistry,
         inventory: Arc<ModelManager>,
+        assessor: Arc<NativeHardwareAssessor>,
         native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
+        runtime_failure: Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
         defaults: RuntimePlanDefaults,
         cache: ModelCache,
         native_build: String,
@@ -1721,7 +1767,9 @@ impl NativeRuntimeController {
         Self {
             backends,
             inventory,
+            assessor,
             native_executor,
+            runtime_failure,
             worker: Arc::new(tokio::sync::RwLock::new(None)),
             memory_observer: Arc::new(SystemMemoryObserver::new()),
             next_worker_generation: Arc::new(AtomicU64::new(1)),
@@ -1825,33 +1873,76 @@ impl NativeRuntimeController {
         ))
     }
 
-    fn estimated_incremental_bytes(
-        resolved: &ResolvedModel,
+    async fn assess_load_system_memory_requirement(
+        &self,
+        resolved: ResolvedModel,
+        profile: &RuntimeExecutionProfile,
+        abort_reserve_bytes: u64,
     ) -> Result<u64, RuntimeTransitionFailure> {
-        const RUNTIME_ALLOWANCE_BYTES: u64 = 1024 * 1024 * 1024;
-        resolved
-            .components
+        let mut assessments = self
+            .assessor
+            .assess_resolved_plans_with_policy(
+                resolved,
+                vec![ModelPreviewProfile {
+                    id: "load-admission".to_owned(),
+                    context_length: profile.context_length,
+                    parallel_sequences: profile.parallel_sequences,
+                }],
+                false,
+                CapacityPolicy {
+                    reserve_bytes_per_domain: CapacityPolicy::default().reserve_bytes_per_domain,
+                    system_reserve_bytes: Some(abort_reserve_bytes),
+                },
+            )
+            .await
+            .map_err(RuntimeTransitionFailure::from)?;
+        let assessment = assessments.pop().ok_or_else(|| {
+            RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "memory_estimate_failed",
+                "native planner returned no load-admission estimate",
+                true,
+            ))
+        })?;
+        let domains = match assessment.hardware {
+            HardwareAssessment::Fits { memory, .. } => memory.domains,
+            HardwareAssessment::DoesNotFit {
+                limiting_resource,
+                memory,
+                ..
+            } => {
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "insufficient_resources",
+                    format!(
+                        "native load plan does not fit {limiting_resource}: {} byte deficit",
+                        memory.deficit_bytes
+                    ),
+                    false,
+                )));
+            }
+            HardwareAssessment::InvalidArtifact { code, message }
+            | HardwareAssessment::IncompatibleArtifact { code, message } => {
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    code, message, false,
+                )));
+            }
+            HardwareAssessment::NotAssessed { reason } => {
+                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "memory_estimate_failed",
+                    reason,
+                    true,
+                )));
+            }
+        };
+        domains
             .iter()
-            .try_fold(RUNTIME_ALLOWANCE_BYTES, |total, component| {
-                let bytes = std::fs::metadata(&component.path)
-                    .map_err(|error| {
-                        RuntimeTransitionFailure::new(RuntimeFailure::new(
-                            "memory_estimate_failed",
-                            format!(
-                                "failed to inspect {} for memory admission: {error}",
-                                component.path.display()
-                            ),
-                            true,
-                        ))
-                    })?
-                    .len();
-                total.checked_add(bytes).ok_or_else(|| {
-                    RuntimeTransitionFailure::new(RuntimeFailure::new(
-                        "memory_estimate_failed",
-                        "model memory estimate overflowed",
-                        false,
-                    ))
-                })
+            .find(|domain| domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID)
+            .map(|domain| domain.required_bytes)
+            .ok_or_else(|| {
+                RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "memory_assessment_incomplete",
+                    "native planner omitted the system-memory domain",
+                    false,
+                ))
             })
     }
 
@@ -1865,6 +1956,23 @@ impl NativeRuntimeController {
             .is_some_and(|current| current.pid() == pid);
         if !is_current {
             return;
+        }
+        let resident_model_id = self
+            .state
+            .read()
+            .await
+            .resident
+            .as_ref()
+            .map(|resident| resident.model_id.clone());
+        if let Some(model_id) = resident_model_id
+            && let Ok(mut failure) = self.runtime_failure.write()
+        {
+            *failure = Some(icn_contracts::RuntimeFailureObservation {
+                model_id,
+                code: code.to_owned(),
+                message: reason.to_owned(),
+                retryable: true,
+            });
         }
         worker.terminate(code, reason);
         self.backends.clear();
@@ -1956,7 +2064,7 @@ impl NativeRuntimeController {
                             controller.block_memory_admission();
                             tracing::warn!(
                                 memory.available_bytes = sample.available_bytes,
-                                memory.reserve_bytes = sample.reserve_bytes(),
+                                memory.reserve_bytes = sample.abort_reserve_bytes(),
                                 memory.available_commit_bytes = ?sample.available_commit_bytes,
                                 memory.commit_limit_bytes = ?sample.commit_limit_bytes,
                                 memory.sample_age_ms = sample.captured_at.elapsed().as_millis(),
@@ -1967,7 +2075,7 @@ impl NativeRuntimeController {
                             controller
                                 .discard_worker(
                                     &worker,
-                                    "memory_pressure_eviction",
+                                    LOW_MEMORY_FAILURE_CODE,
                                     "inference worker evicted under system memory pressure",
                                 )
                                 .await;
@@ -2044,8 +2152,10 @@ impl NativeRuntimeController {
             *slot = None;
         }
         self.backends.clear();
+        if let Ok(mut failure) = self.runtime_failure.write() {
+            *failure = None;
+        }
 
-        let estimated_incremental_bytes = Self::estimated_incremental_bytes(&resolved)?;
         let recovery_blocked = self
             .admission_blocked_until
             .lock()
@@ -2054,7 +2164,7 @@ impl NativeRuntimeController {
             .is_some_and(|blocked_until| blocked_until > std::time::Instant::now());
         if recovery_blocked {
             return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                "memory_pressure_recovery",
+                LOW_MEMORY_FAILURE_CODE,
                 "system memory is still in the post-eviction recovery period",
                 true,
             )));
@@ -2075,10 +2185,10 @@ impl NativeRuntimeController {
             && !sample.recovered()
         {
             return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                "memory_pressure_recovery",
+                LOW_MEMORY_FAILURE_CODE,
                 format!(
                     "system memory has not recovered above the {} byte reserve and hysteresis margin",
-                    sample.reserve_bytes()
+                    sample.abort_reserve_bytes()
                 ),
                 true,
             )));
@@ -2086,13 +2196,29 @@ impl NativeRuntimeController {
         if let Ok(mut blocked_until) = self.admission_blocked_until.lock() {
             *blocked_until = None;
         }
-        if !sample.permits_load(estimated_incremental_bytes) {
+        let required_system_memory_bytes = self
+            .assess_load_system_memory_requirement(
+                resolved.clone(),
+                &profile,
+                sample.abort_reserve_bytes(),
+            )
+            .await?;
+        // Planning is isolated and can take time. Admission must use a fresh observation taken
+        // immediately before worker creation rather than the sample that selected the policy.
+        let admission_sample = self.memory_observer.sample().map_err(|error| {
+            RuntimeTransitionFailure::new(RuntimeFailure::new(
+                "memory_monitor_unavailable",
+                error,
+                true,
+            ))
+        })?;
+        if !admission_sample.permits_load(required_system_memory_bytes) {
             return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                "insufficient_system_memory",
+                LOW_MEMORY_FAILURE_CODE,
                 format!(
-                    "model requires an estimated {estimated_incremental_bytes} bytes, but only {} bytes are available with a {} byte system reserve",
-                    sample.available_bytes,
-                    sample.reserve_bytes()
+                    "model requires {required_system_memory_bytes} bytes of system memory, but only {} bytes are available with a {} byte system reserve",
+                    admission_sample.available_bytes,
+                    admission_sample.abort_reserve_bytes()
                 ),
                 true,
             )));
@@ -2526,11 +2652,13 @@ async fn main() -> anyhow::Result<()> {
                 .context("failed to initialize model inventory")?,
             );
             let native_executor_slot = Arc::new(RwLock::new(None));
+            let runtime_failure = Arc::new(RwLock::new(None));
             let inventory_hardware_assessor = Arc::new(NativeHardwareAssessor {
                 defaults: plan_defaults.clone(),
                 cache: Some(inventory.derived_cache().clone()),
                 native_backend: native_backend.clone(),
                 native_executor: Arc::clone(&native_executor_slot),
+                runtime_failure: Arc::clone(&runtime_failure),
                 gate: tokio::sync::Mutex::new(()),
                 planning_slots: Arc::new(tokio::sync::Semaphore::new(planner_concurrency())),
                 calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
@@ -2571,7 +2699,9 @@ async fn main() -> anyhow::Result<()> {
                 let runtime = Arc::new(NativeRuntimeController::new(
                     backends.clone(),
                     inventory.clone(),
+                    inventory_hardware_assessor.clone(),
                     native_executor_slot,
+                    runtime_failure,
                     plan_defaults,
                     inventory.derived_cache().clone(),
                     native_build.clone(),
@@ -2824,6 +2954,7 @@ mod tests {
             cache: None,
             native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
+            runtime_failure: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),
             planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
@@ -2837,13 +2968,17 @@ mod tests {
             logical_cores: 1,
             system_memory: icn_contracts::HardwareSystemMemory {
                 total_bytes: 1,
-                current_available_bytes: Some(1),
+                current_available_bytes: 1,
+                warning_reserve_bytes: 0,
+                assess_reserve_bytes: 0,
+                abort_reserve_bytes: 0,
             },
             native_build: "native".to_owned(),
             enabled_backends: vec!["cpu".to_owned()],
             topology_fingerprint: "topology".to_owned(),
             memory_domains: Vec::new(),
             resident_memory: None,
+            runtime_failure: None,
         };
         let equivalent_preview = ModelPreviewProfile {
             id: "caller-correlation-does-not-affect-fit".to_owned(),
@@ -2909,6 +3044,7 @@ mod tests {
             cache: None,
             native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
+            runtime_failure: Arc::new(RwLock::new(None)),
             gate: tokio::sync::Mutex::new(()),
             planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             calibration: tokio::sync::Mutex::new(CalibrationCache::default()),

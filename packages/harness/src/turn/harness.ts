@@ -32,8 +32,9 @@ export interface HarnessConfig<
   TCallOptions = unknown,
   TToolkit extends Toolkit<any> = Toolkit<any>,
   RHooks = never,
+  TStartFailure = StreamStartFailure,
 > {
-  readonly model: BoundModel<TCallOptions>
+  readonly model: BoundModel<TCallOptions, TStartFailure>
   readonly toolkit: TToolkit
   readonly hooks?: HarnessHooks<RHooks>
   readonly layer?: Layer.Layer<ToolkitRequirements<TToolkit> | RHooks>
@@ -45,6 +46,7 @@ export interface HarnessConfig<
 
 export interface Harness<
   TCallOptions,
+  TStartFailure = StreamStartFailure,
 > {
   /** Stream a model response, dispatch tool calls, and produce events.
    *  Returns a LiveTurn whose events stream is driven by the harness —
@@ -54,7 +56,7 @@ export interface Harness<
     options?: TCallOptions,
   ) => Effect.Effect<
     LiveTurn,
-    StreamStartFailure,
+    TStartFailure,
     HttpClient.HttpClient
   >
   /** Create an empty turn for replaying a recorded event sequence.
@@ -123,7 +125,10 @@ export function createHarness<
   TCallOptions,
   TToolkit extends Toolkit<any> = Toolkit<any>,
   RHooks = never,
->(config: HarnessConfig<TCallOptions, TToolkit, RHooks>): Harness<TCallOptions> {
+  TStartFailure = StreamStartFailure,
+>(
+  config: HarnessConfig<TCallOptions, TToolkit, RHooks, TStartFailure>,
+): Harness<TCallOptions, TStartFailure> {
   const { toolkit, hooks, model } = config
 
   // Build tool definitions array from toolkit
@@ -191,7 +196,7 @@ export function createHarness<
     options?: TCallOptions,
   ): Effect.Effect<
     LiveTurn,
-    StreamStartFailure,
+    TStartFailure,
     HttpClient.HttpClient
   > {
     return Effect.gen(function* () {

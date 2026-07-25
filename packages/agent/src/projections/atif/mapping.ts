@@ -105,6 +105,13 @@ function getExtraFromOutcome(outcome: TurnOutcome): JsonRecord | undefined {
       return { error: 'gate_rejected', toolCallId: outcome.toolCallId, toolName: outcome.toolName }
     case 'ProviderNotReady':
       return { error: 'provider_not_ready', detail: outcome.detail._tag }
+    case 'ModelNotReady':
+      return {
+        error: 'model_not_ready',
+        code: outcome.failure.code,
+        message: outcome.failure.message,
+        retryable: outcome.failure.retryable,
+      }
     case 'ConnectionFailure':
       return { error: 'connection_failure', detail: outcome.detail._tag }
     case 'StreamFailed':

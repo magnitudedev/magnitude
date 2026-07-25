@@ -16,7 +16,7 @@ import {
 } from "@magnitudedev/sdk"
 import {
   deriveLocalModelLoadActivity,
-  isModelSlotUsableForMessages,
+  isModelSlotConfigured,
   selectedSlotModel,
 } from "./model-slots"
 
@@ -49,7 +49,7 @@ describe("model slot selection", () => {
         },
       },
       availability: { _tag: "Available" as const },
-      runtimeMemoryBytes: Option.none(),
+      memory: Option.none(),
       pricing: Option.none(),
     }
     const result = selectedSlotModel(
@@ -67,29 +67,29 @@ describe("model slot selection", () => {
     expect(Option.getOrThrow(result)).toMatchObject({ model: catalogModel, slot: unloaded })
   })
 
-  it("only treats slots that can admit a message as usable", () => {
-    expect(isModelSlotUsableForMessages(
+  it("keeps an assigned selection configured across runtime states", () => {
+    expect(isModelSlotConfigured(
       new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }),
     )).toBe(false)
-    expect(isModelSlotUsableForMessages(unloaded)).toBe(true)
-    expect(isModelSlotUsableForMessages(new ModelSlotLoadingLocalModel({
+    expect(isModelSlotConfigured(unloaded)).toBe(true)
+    expect(isModelSlotConfigured(new ModelSlotLoadingLocalModel({
       slotId: PRIMARY_SLOT_ID,
       selection,
       percentage: 25,
     }))).toBe(true)
-    expect(isModelSlotUsableForMessages(new ModelSlotReady({
+    expect(isModelSlotConfigured(new ModelSlotReady({
       slotId: PRIMARY_SLOT_ID,
       selection,
     }))).toBe(true)
-    expect(isModelSlotUsableForMessages(new ModelSlotUnloadingLocalModel({
+    expect(isModelSlotConfigured(new ModelSlotUnloadingLocalModel({
       slotId: PRIMARY_SLOT_ID,
       selection,
-    }))).toBe(false)
-    expect(isModelSlotUsableForMessages(new ModelSlotBlocked({
+    }))).toBe(true)
+    expect(isModelSlotConfigured(new ModelSlotBlocked({
       slotId: PRIMARY_SLOT_ID,
       selection,
       reason: { _tag: "ModelUnavailable", message: "Unavailable" },
-    }))).toBe(false)
+    }))).toBe(true)
   })
 
   it("derives one shared model-loading presentation for a slot", () => {
@@ -106,10 +106,30 @@ describe("model slot selection", () => {
       favoriteModels: [],
     }
 
-    expect(deriveLocalModelLoadActivity(slots, PRIMARY_SLOT_ID)).toEqual({
-      percentage: 42,
-      text: "Loading model · 42%",
-    })
+    expect(deriveLocalModelLoadActivity(slots, PRIMARY_SLOT_ID)).toBe(slots.slots.primary)
     expect(deriveLocalModelLoadActivity(slots, SECONDARY_SLOT_ID)).toBeNull()
+  })
+
+  it("presents load and runtime pressure failures with the same low-memory message", () => {
+    const slots = {
+      slots: {
+        primary: new ModelSlotBlocked({
+          slotId: PRIMARY_SLOT_ID,
+          selection,
+          reason: {
+            _tag: "LocalModelStoppedLowMemory" as const,
+            error: {
+              code: "low_memory",
+              message: "internal detail",
+              retryable: true,
+            },
+          },
+        }),
+        secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
+      },
+      recentModelIds: { primary: [], secondary: [] },
+      favoriteModels: [],
+    }
+    expect(deriveLocalModelLoadActivity(slots, PRIMARY_SLOT_ID)).toBe(slots.slots.primary)
   })
 })

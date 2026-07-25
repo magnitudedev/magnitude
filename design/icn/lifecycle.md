@@ -9,11 +9,10 @@ applies_to:
   - packages/acn/src/serve.ts
   - packages/acn/src/binary.ts
   - packages/acn/src/daemon-lifecycle.ts
-  - packages/acn/src/model-configuration.ts
+  - packages/acn/src/model-*.ts
   - packages/acn/src/provider-model-catalog.ts
   - packages/acn/src/local-model-packages.ts
   - packages/acn/src/local-model-evaluations.ts
-  - packages/acn/src/model-slot-coordinator.ts
   - packages/acn/src/local-inference-hardware.ts
   - packages/protocol/src/schemas/model-state.ts
   - packages/acn/scripts/build-binary.ts
@@ -321,9 +320,10 @@ An ordinary chat request names the exact serving-configuration identity and may 
 that configuration is already resident. ICN acquires a generation lease and holds it until the
 response stream succeeds, fails, or is canceled. A nonresident or differently configured target is
 rejected as not ready; chat never starts a model transition. Before starting a local provider
-request, ACN acquires the selected slot's local-model admission as a scoped resource. That
-acquisition performs or joins the slot's explicit load operation and remains held until ICN accepts
-the chat request and takes its generation lease.
+request, ACN injects a pre-provider preparation phase that acquires the selected slot's local-model
+admission as a scoped resource. That acquisition performs or joins the slot's explicit load
+operation and remains held until ICN accepts the chat request and takes its generation lease.
+Preparation failure remains outside the provider error contract.
 
 ACN consumes the admitted load operation's stream directly. A missing fraction leaves the current
 percentage unchanged, and ACN neither invents phase timers nor maps verification to 100%. Loading
@@ -410,7 +410,7 @@ The lifecycle conforms when:
 - the public local provider ID is exactly `local`, and its bound model streams through the scoped
   ordinary generated chat client rather than an endpoint URL adapter;
 - chat leases only an already-resident matching target and never starts a load or replacement;
-- ACN slot commands and scoped local-provider admission are the only product paths that start
+- ACN slot commands and scoped local-request preparation are the only product paths that start
   explicit ICN load operations; only ACN slot operations start unload;
 - load-stream fractions and terminal events drive the matching slot FSMs without an inventory poll,
   revision counter, or second residency projection;

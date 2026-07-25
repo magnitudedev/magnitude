@@ -111,11 +111,12 @@ current request while it remains active. It disappears when generation begins or
 stream ends and is never written to session history. Clients may delay rendering briefly to avoid
 flashing short prefills, but they do not infer token progress or preserve a second copy.
 
-Provider progress enters the event engine as timestamped ambient observations. A display-owned
-projection reduces those observations into the current per-fork request activity and response
-timing. Display views read that projection through the normal projection-consumer path, so activity
-changes invalidate and rematerialize snapshots without an app event or a separately merged runtime
-stream. Projection evaluation never reads a clock; observation time is fixed at ambient ingress.
+Model-request progress enters the event engine as timestamped ambient observations through one
+progress sink shared by ACN preparation and provider execution. A display-owned projection reduces
+those observations into the current per-fork request activity and response timing. Display views
+read that projection through the normal projection-consumer path, so activity changes invalidate
+and rematerialize snapshots without an app event or a separately merged runtime stream. Projection
+evaluation never reads a clock; observation time is fixed at ambient ingress.
 
 The CLI reserves one fixed-height activity rail below the chat timeline. Root-model loading,
 conversation prefill, and model response activity all occupy that same row, so transitions do not
@@ -126,12 +127,16 @@ composable Working display, including thinking, tools, advisor activity, and wor
 While the root slot is loading, the rail may present its authoritative percentage as well as
 persistent model chrome. Both presentations derive from the one mirrored slot lifecycle state;
 readiness hands the rail from model loading to request prefill without a client-owned loading state
-or timer.
+or timer. A typed low-memory load failure or resident-runtime loss uses that same slot state to
+replace progress with the durable low-memory stopped message until the user retries or changes the
+selection.
 
-Local request admission publishes preparing activity before acquiring the selected model. Its
+Local request preparation publishes preparing activity before acquiring the selected model. Its
 request identifier remains absent until ICN accepts the native request, and that handoff preserves
-the activity start time. Consequently a long model load satisfies the client's anti-flicker delay
-and the rail transitions directly into conversation loading when the slot becomes ready.
+the activity start time. If preparation or provider start fails, orchestration clears the activity;
+after provider acceptance the provider owns all later progress and clearing. Consequently a long
+model load satisfies the client's anti-flicker delay and the rail transitions directly into
+conversation loading when the slot becomes ready.
 
 The activity projection records the generation-start timestamp in the same atomic transition that
 removes prefill progress. Display snapshots attach that timestamp to root work for the current

@@ -11,7 +11,12 @@ import { formatStreamFailureMessage, type FinishReason, type ModelStreamResult, 
 import { advisorPrompt } from '@magnitudedev/roles'
 import { AgentModelResolver } from '../model/model-resolver'
 import { getAgentByForkId, type AgentLifecycleState } from '../projections/agent-lifecycle'
-import { formatModelAttemptFailure, modelAttemptRetryability, presentModelAttemptFailure, type AgentModelAttemptFailure } from '../errors'
+import {
+  agentModelStartRetryability,
+  formatAgentModelStartFailure,
+  presentAgentModelStartFailure,
+  type AgentModelStartFailure,
+} from '../errors'
 import { connectionRetrySchedule } from '../util/retry-backoff'
 import { WindowStateReaderTag } from '../tools/window-reader'
 import { AgentStateReaderTag } from '../tools/fork'
@@ -51,9 +56,9 @@ export function advisorError(message: string): AdvisorError {
   return { _tag: 'AdvisorError', message }
 }
 
-export function streamStartFailureMessage(err: AgentModelAttemptFailure): string {
-  const presented = presentModelAttemptFailure(err)
-  return presented.llmFeedback || presented.message || formatModelAttemptFailure(err)
+export function streamStartFailureMessage(err: AgentModelStartFailure): string {
+  const presented = presentAgentModelStartFailure(err)
+  return presented.llmFeedback || presented.message || formatAgentModelStartFailure(err)
 }
 
 export function streamErrorMessage(failure: StreamFailure): string {
@@ -171,7 +176,7 @@ export function executeMessageAdvisor(input: { readonly message: string }) {
       Effect.provideService(HttpClient.HttpClient, httpClient),
       Effect.retry({
         schedule: connectionRetrySchedule,
-        while: (err) => modelAttemptRetryability(err)._tag === 'UpstreamRetryable',
+        while: (err) => agentModelStartRetryability(err)._tag === 'UpstreamRetryable',
       }),
       Effect.mapError((err) => advisorError(`Advisor call failed: ${streamStartFailureMessage(err)}`)),
     )
@@ -180,5 +185,4 @@ export function executeMessageAdvisor(input: { readonly message: string }) {
     return result.text
   })
 }
-
 
