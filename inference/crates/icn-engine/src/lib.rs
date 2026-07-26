@@ -18,8 +18,8 @@ use icn_contracts::{
     FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
     HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceEvent,
     InferenceProgress, InferenceStreamEvent, ModelModalities, ModelProperties, PreparedChatInfo,
-    ProjectorConfig, ReasoningControl, ResidentMemory, ResidentMemoryDomain, ResponseFormat,
-    SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
+    ProjectorConfig, ReasoningControl, ResidentExecution, ResidentMemory, ResidentMemoryDomain,
+    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -740,6 +740,7 @@ fn timing_plan_identity(config: &ExecutionIntent) -> String {
     });
     let evidence = serde_json::json!({
         "contextSize": config.context_size,
+        "physicalContextSize": config.physical_context_size,
         "batchSize": config.batch_size,
         "ubatchSize": config.ubatch_size,
         "maxSequences": config.max_sequences,
@@ -1257,6 +1258,15 @@ fn resident_memory_state(
     })
 }
 
+fn resident_execution_state(config: &ExecutionIntent, model_id: String) -> ResidentExecution {
+    ResidentExecution {
+        model_id,
+        context_window_tokens: config.context_size,
+        parallel_sequences: config.max_sequences,
+        physical_context_tokens: config.physical_context_size,
+    }
+}
+
 // The scheduler composition root receives each owned runtime subsystem explicitly. Keeping these
 // borrows visible is clearer than hiding them behind a second mutable service-locator struct.
 #[allow(clippy::too_many_arguments)]
@@ -1305,11 +1315,15 @@ fn run_scheduler<'model>(
             let observed = resident_memory_state(
                 &snapshot,
                 &resident_allocations,
-                observation.model_id,
+                observation.model_id.clone(),
                 observation.runtime_generation,
             )
             .map(|resident_memory| {
                 snapshot.resident_memory = Some(resident_memory);
+                snapshot.resident_execution = Some(resident_execution_state(
+                    config,
+                    observation.model_id.clone(),
+                ));
                 snapshot
             });
             let _ = observation.response.try_send(observed);
@@ -2407,6 +2421,11 @@ fn validate_model_config(config: &ExecutionIntent) -> Result<(), InferenceError>
     if config.context_size == 0 {
         return Err(InferenceError::InvalidConfig(
             "context_size must be greater than zero".into(),
+        ));
+    }
+    if config.physical_context_size < config.context_size {
+        return Err(InferenceError::InvalidConfig(
+            "physical_context_size must be at least context_size".into(),
         ));
     }
     if config.batch_size == 0 {
@@ -3812,6 +3831,7 @@ mod tests {
         ExecutionIntent {
             model_path: executable.clone(),
             context_size: 128,
+            physical_context_size: 128 * max_sequences,
             batch_size: 32,
             ubatch_size: 32,
             max_sequences,
@@ -3831,6 +3851,21 @@ mod tests {
         let mut config = model_config_with_projector(1);
         config.projector = None;
         config
+    }
+
+    #[test]
+    fn resident_execution_reports_the_exact_runtime_allocation() {
+        let config = model_config_with_projector(4);
+
+        assert_eq!(
+            resident_execution_state(&config, "configuration_test".to_owned()),
+            ResidentExecution {
+                model_id: "configuration_test".to_owned(),
+                context_window_tokens: 128,
+                parallel_sequences: 4,
+                physical_context_tokens: 512,
+            }
+        );
     }
 
     #[test]
@@ -4306,6 +4341,7 @@ mod tests {
                 }],
             }],
             resident_memory: None,
+            resident_execution: None,
             runtime_failure: None,
         };
         let evidence = vec![

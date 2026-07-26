@@ -84,6 +84,14 @@ export const projectLocalInferenceHardware = (
         auxiliaryBytes: domain.auxiliary_bytes,
       })) })),
     ),
+    residentRuntime: Option.flatMap(hardware.resident_execution, Option.fromNullable).pipe(
+      Option.map((resident) => ({
+        configurationId: resident.model_id,
+        contextWindowTokens: resident.context_window_tokens,
+        parallelSequences: resident.parallel_sequences,
+        physicalContextTokens: resident.physical_context_tokens,
+      })),
+    ),
     runtimeFailure: Option.flatMap(hardware.runtime_failure, Option.fromNullable).pipe(
       Option.map((failure) => ({
         modelId: failure.model_id,

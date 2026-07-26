@@ -45,7 +45,7 @@ const candidate = (input: {
   const downloadBytes = (input.downloadGiB ?? input.runtimeGiB ?? 20) * GIB
   const capacityBytes = (input.capacityGiB ?? 64) * GIB
   const packageId = ModelPackageIdSchema.make(`package_${input.id}`)
-  const profile = { contextLength: context, parallelSequences: 1 }
+  const profile = { contextLength: context }
   const configurationId = ModelServingConfigurationIdSchema.make(`${input.id}:ctx${context}`)
   return {
     model: {

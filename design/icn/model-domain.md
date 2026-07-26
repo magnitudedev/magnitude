@@ -124,11 +124,10 @@ Model-agnostic serving intent:
 ```text
 ServingProfile
   context length
-  parallel sequence count
 ```
 
-Context length is the total shared KV-pool capacity. Parallel sequence count is the maximum
-concurrent occupancy of that pool, not a multiplier or a promise of the full context per sequence.
+Context length is the maximum context for one request. Native physical context and sequence
+capacity are resolved when the configuration is loaded and are not provider intent.
 
 Whether a profile works well is determined only when it is assessed with a target, runtime, and
 hardware.
@@ -146,6 +145,8 @@ ModelServingConfiguration
 
 This is the combination selected by a recommendation, assessed for hardware fit, and exposed
 through a provider. ICN owns its stable identity. ACN stores and passes that identity unchanged.
+Configuration identity depends on target and per-request context, not the load-time native
+sequence capacity.
 
 ### Offering assessment
 

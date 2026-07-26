@@ -710,6 +710,16 @@ pub struct ResidentMemory {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResidentExecution {
+    pub model_id: String,
+    pub context_window_tokens: u32,
+    pub parallel_sequences: u32,
+    pub physical_context_tokens: u32,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeFailureObservation {
     pub model_id: String,
     pub code: String,
@@ -734,6 +744,7 @@ pub struct HardwareSnapshot {
     pub topology_fingerprint: String,
     pub memory_domains: Vec<HardwareMemoryDomain>,
     pub resident_memory: Option<ResidentMemory>,
+    pub resident_execution: Option<ResidentExecution>,
     pub runtime_failure: Option<RuntimeFailureObservation>,
 }
 

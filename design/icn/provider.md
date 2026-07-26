@@ -78,6 +78,10 @@ preparation use the same service-owned slot transition:
 4. wait for terminal readiness; and
 5. admit chat only against that resident configuration.
 
+The submitted configuration fixes per-request context capacity. ICN independently resolves the
+resident parallel allocation and reports it as load execution evidence; ACN does not persist or
+select that allocation.
+
 Loading another configuration replaces the singleton residency through the same serialized
 transition. Unload addresses the returned residency identity and waits for active generation
 leases to drain.

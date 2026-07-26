@@ -462,17 +462,13 @@ fn phase_work(configuration: &ModelServingConfiguration) -> BTreeMap<ModelLoadPh
         .filter(|file| file.role == ModelFileRole::Projector)
         .map(|file| file.size_bytes)
         .sum::<u64>();
-    let context_work = f64::from(configuration.profile.context_length)
-        * f64::from(configuration.profile.parallel_sequences);
+    let context_work = f64::from(configuration.profile.context_length);
     result.insert(ModelLoadPhase::TargetModel, target_bytes as f64);
     result.insert(ModelLoadPhase::TargetContext, context_work);
     result.insert(ModelLoadPhase::DraftModel, draft_bytes as f64);
     result.insert(ModelLoadPhase::DraftContext, context_work);
     result.insert(ModelLoadPhase::Projector, projector_bytes as f64);
-    result.insert(
-        ModelLoadPhase::Runtime,
-        f64::from(configuration.profile.parallel_sequences),
-    );
+    result.insert(ModelLoadPhase::Runtime, 1.0);
     result.insert(ModelLoadPhase::Warmup, target_bytes as f64);
     result.insert(ModelLoadPhase::Finalize, 1.0);
     result

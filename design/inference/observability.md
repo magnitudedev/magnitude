@@ -55,7 +55,8 @@ telemetry.
 Instrumentation records stable operational metadata such as model and completion identifiers,
 token counts, finish reason, queue duration, prompt duration, decode duration, cache behavior,
 backend selection, worker generation, system-memory reserve, available physical/commit memory,
-worker footprint, eviction latency, status, and stable error diagnostics.
+worker footprint, selected parallel sequences, physical context allocation, eviction latency,
+status, and stable error diagnostics.
 
 Instrumentation must never record prompts, generated or reasoning text, image contents,
 authorization values, request headers, token arrays, tool arguments, full request structures, or

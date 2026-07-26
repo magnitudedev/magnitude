@@ -5,11 +5,15 @@ import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
+  ModelServingConfigurationIdSchema,
+  ProviderModelCatalogReady,
+  ProviderModelIdSchema,
   RecommendationIdSchema,
 } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
   describeLocalHardware,
+  describeResidentModel,
   localInferenceProgressLines,
   selectionCapacityWarning,
   selectionMetadata,
@@ -17,6 +21,83 @@ import {
 import { GIB, makeCatalogCandidate, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
 
 describe("local inference selection view model", () => {
+  it("presents the exact resident model allocation", () => {
+    const view = makeView({
+      hardware: makeHardware({
+        residentRuntime: Option.some({
+          configurationId: "configuration_test",
+          contextWindowTokens: 200_000,
+          parallelSequences: 4,
+          physicalContextTokens: 800_000,
+        }),
+      }),
+    })
+
+    expect(describeResidentModel(view.hardware, Option.some(view.catalog))).toEqual(
+      Option.some({
+        displayName: "Qwen Test",
+        contextWindowTokens: 200_000,
+        parallelSequences: 4,
+      }),
+    )
+  })
+
+  it("labels the resident configuration rather than the first local catalog model", () => {
+    const view = makeView()
+    if (view.catalog._tag !== "Ready") throw new Error("expected ready catalog fixture")
+    const residentConfigurationId = ModelServingConfigurationIdSchema.make("resident")
+    const residentProviderModelId = ProviderModelIdSchema.make("local:resident")
+    const otherModel = {
+      ...view.catalog.models[0]!,
+      providerModelId: ProviderModelIdSchema.make("local:other"),
+      displayName: "Other Local Model",
+    }
+    const residentModel = {
+      ...view.catalog.models[0]!,
+      providerModelId: residentProviderModelId,
+      displayName: "Resident Local Model",
+    }
+    const catalog = new ProviderModelCatalogReady({
+      providers: view.catalog.providers,
+      models: [otherModel, residentModel],
+    })
+    const hardware = makeHardware({
+      residentRuntime: Option.some({
+        configurationId: residentConfigurationId,
+        contextWindowTokens: 64_000,
+        parallelSequences: 2,
+        physicalContextTokens: 128_000,
+      }),
+    })
+
+    expect(describeResidentModel(hardware, Option.some(catalog))).toEqual(
+      Option.some({
+        displayName: "Resident Local Model",
+        contextWindowTokens: 64_000,
+        parallelSequences: 2,
+      }),
+    )
+  })
+
+  it("retains resident state while catalog metadata is unavailable", () => {
+    const hardware = makeHardware({
+      residentRuntime: Option.some({
+        configurationId: ModelServingConfigurationIdSchema.make("resident"),
+        contextWindowTokens: 64_000,
+        parallelSequences: 2,
+        physicalContextTokens: 128_000,
+      }),
+    })
+
+    expect(describeResidentModel(hardware, Option.none())).toEqual(
+      Option.some({
+        displayName: "local:resident",
+        contextWindowTokens: 64_000,
+        parallelSequences: 2,
+      }),
+    )
+  })
+
   it("presents cumulative recommendation progress with authoritative counts and timing", () => {
     expect(localInferenceProgressLines([
       {

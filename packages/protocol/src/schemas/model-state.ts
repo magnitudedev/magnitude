@@ -285,7 +285,6 @@ export const modelOfferingTargetPackageIds = (
 
 export const ServingProfileSchema = Schema.Struct({
   contextLength: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
 })
 export type ServingProfile = typeof ServingProfileSchema.Type
 
@@ -817,6 +816,12 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
       computeBytes: NonNegativeSafeInteger,
       auxiliaryBytes: NonNegativeSafeInteger,
     })),
+  }), { as: "Option", exact: true }),
+  residentRuntime: Schema.optionalWith(Schema.Struct({
+    configurationId: NonEmptyString,
+    contextWindowTokens: PositiveSafeInteger,
+    parallelSequences: PositiveSafeInteger,
+    physicalContextTokens: PositiveSafeInteger,
   }), { as: "Option", exact: true }),
   runtimeFailure: Schema.optionalWith(Schema.Struct({
     modelId: NonEmptyString,

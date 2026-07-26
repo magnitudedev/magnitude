@@ -2157,6 +2157,7 @@ mod tests {
                         devices: Vec::new(),
                     }],
                     resident_memory: None,
+                    resident_execution: None,
                     runtime_failure: None,
                 })
             })

@@ -27,7 +27,6 @@ import {
 const REQUIRED_RESERVE_BYTES = 1536 * 1024 * 1024
 const MINIMUM_CONTEXT_LENGTH = 4_096
 const MAXIMUM_CONTEXT_LENGTH = 200_000
-const MAXIMUM_PARALLEL_SEQUENCES = 8
 
 export type LocalModelAssessment =
   | { readonly _tag: "Fits"; readonly assessment: FitsOfferingAssessment }
@@ -223,7 +222,6 @@ export const LocalModelEvaluationsLive: Layer.Layer<
           capacityPolicy: { requiredReserveBytesPerMemoryDomain: REQUIRED_RESERVE_BYTES },
           minimumContextLength: MINIMUM_CONTEXT_LENGTH,
           maximumContextLength: MAXIMUM_CONTEXT_LENGTH,
-          maximumParallelSequences: MAXIMUM_PARALLEL_SEQUENCES,
         },
       })
       const result = response.results[0]

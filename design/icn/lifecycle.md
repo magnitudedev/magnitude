@@ -142,12 +142,13 @@ implicitly discover or adopt a host user's global Hugging Face cache.
 External caches or directories participate only when they are supplied explicitly as read-only
 import/source roots. ACN supplies no such roots for the product-managed ICN.
 
-Context length and sequence count belong to an explicit model serving configuration supplied to
+Per-request context length belongs to an explicit model serving configuration supplied to
 assessment, fitting, and load. ACN persists that configuration inside a provider offering; ICN owns
 its identity and ephemeral residency. Serving configuration is not an installation-manifest, cache,
-or process-launch field. Batching, GPU placement, KV policy, projector, draft, and MTP selection are
-ICN-owned plan resolution. This separation lets one ICN live for one ACN lifetime while models and
-configurations change independently.
+or process-launch field. Native sequence capacity, physical context allocation, batching, GPU
+placement, KV policy, projector, draft, and MTP selection are ICN-owned plan resolution. This
+separation lets one ICN live for one ACN lifetime while models and configurations change
+independently.
 
 Runtime code receives configuration explicitly and uses Effect platform services for command
 execution, filesystem/path work, HTTP, clock, randomness, logging, and scope. Core lifecycle code
@@ -290,9 +291,12 @@ generation leases needed to keep that target alive during inference. ACN owns th
 slots and is the sole policy authority that decides when a selected local model is loaded or
 unloaded. A slot is not an ICN resource and ICN does not expose a separate public runtime resource.
 
-Runtime load accepts one exact model serving configuration. The configuration contains the target,
-context length, and parallel sequence count; ICN owns its stable identity and ACN passes it
-unchanged from the selected provider offering.
+Runtime load accepts one exact model serving configuration. The configuration contains the target
+and per-request context length; ICN owns its stable identity and ACN passes it unchanged from the
+selected provider offering. After proving the exact one-sequence baseline, load selects the largest
+native sequence capacity from one through four whose full-context allocation fits stable and live
+memory policy. That resolved capacity belongs to residency execution evidence and may differ across
+cold loads of the same configuration.
 Load does not accept a planner name, planner version, capacity-policy identifier, or native flags.
 ICN reassesses the exact plan and streams typed progress through resolution, assessment,
 unload/replacement, loading, verification, and ready or failed termination. Loading percentage
@@ -304,6 +308,8 @@ already-resident identical model and profile is idempotent. Concurrent identical
 serialize, recheck residency, and perform at most one effective successful native load. Concurrent
 incompatible mutations are serialized by the native coordinator; they never race native
 process-global state or rely on ACN-side locking.
+The terminal ready event and subsequent live hardware snapshots expose the selected parallelism
+and physical context allocation as execution evidence. That evidence disappears with residency.
 The ICN composition root creates no resident native backend before readiness. Each resident load
 creates one private `inference-worker` child; that child initializes its own process-lifetime
 native-backend capability, prepares and loads exactly one topology, and owns the executor until it

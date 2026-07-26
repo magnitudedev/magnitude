@@ -43,16 +43,20 @@ and native device ordinal distinct. Product identity comes from operating-system
 chip identity comes from the native backend's device description. Generic runtime ordinals such as
 `CUDA0` and `MTL0` are never interpreted as a particular product or chip.
 
+While a model is resident, the live hardware snapshot also reports the resident execution
+allocation: configuration identity, per-request context window, selected parallel sequences, and
+total physical context tokens. This is observed runtime evidence, not a serving-profile input.
+Clients may combine it with the authoritative model-slot catalog to present the resident model
+name, but must not reconstruct the allocation from catalog metadata.
+
 Failure to enumerate or normalize hardware fails the operation. It is never converted into an
 empty topology or “no accelerator” result.
 
 ## Assessment
 
 `POST /v1/models/assess` accepts a batch of exact model targets and explicit serving profiles.
-A target is either one model package or an explicit target/draft pair. A profile supplies:
-
-- total shared context capacity; and
-- maximum parallel sequence occupancy.
+A target is either one model package or an explicit target/draft pair. A profile supplies maximum
+context capacity for one request.
 
 The request also supplies a product memory reserve per physical domain and whether performance
 evidence is requested. ICN applies the system-only safety floor defined by
@@ -80,9 +84,10 @@ fit label.
 
 `POST /v1/models/fit` selects a profile for each target under explicit bounds:
 
-1. maximize context length up to the lower of the caller cap, model limit, and 200,000 tokens;
-2. after fixing that context, maximize parallel sequences up to the caller cap;
-3. preserve the effective memory reserve throughout both searches.
+1. assess exactly one sequence;
+2. maximize its complete context length up to the lower of the caller cap, model limit, and
+   200,000 tokens; and
+3. preserve the effective memory reserve throughout the search.
 
 The result contains the exact `ModelServingConfiguration` and its fitting assessment. A target
 that cannot satisfy the minimum context returns `DoesNotFit`; it does not receive an arbitrary
@@ -103,9 +108,8 @@ Required memory includes every allocation needed by the exact planned target and
 - projector or other auxiliary components; and
 - target and draft allocations for speculative decoding.
 
-Parallel sequences describe occupancy of the shared KV pool. Assessment must follow the pinned
-runtime's actual unified or per-sequence KV behavior rather than multiplying a nominal context by
-parallelism in Bun.
+Product assessment proves the minimum serving guarantee: one sequence with one complete configured
+context. It never persists or promises a parallel count.
 
 Performance evidence is advisory recommendation input. It never changes memory fit or authorizes
 loading.
@@ -144,6 +148,12 @@ availability rule in [system memory management](../inference/system-memory-manag
 cached assessment is advisory and cannot authorize a different target, profile, reserve policy,
 runtime, or topology.
 
+After the exact one-sequence baseline fits, loading evaluates native sequence capacities from one
+through four. Candidate `P` provisions physical context `configured context × P`, preserves the
+baseline target, acceleration, and per-sequence model context, and is selected only when its full
+native allocation fits stable capacity and fresh admission. Selected sequence capacity is resolved
+execution evidence, not serving configuration identity.
+
 Successful load evidence identifies the same configuration that was requested. ACN passes the
 ICN-issued configuration identity unchanged through recommendation, offering, provider resolution,
 slot admission, and runtime load.
@@ -163,7 +173,9 @@ currently fits.
 - A target/profile/reserve combination has one ICN-issued configuration identity everywhere.
 - ACN contains no native memory estimator or configuration-ID hashing.
 - Single-package assessment is never reused for an explicit speculative pair.
-- Context is maximized before parallelism during automatic fitting.
+- Automatic fitting maximizes exact one-sequence context.
+- Loading may select one through four native sequences without changing serving configuration
+  identity or per-request context.
 - Unified physical memory is never double-counted.
 - Discovery, fitting, cached assessment, and residency use the same physical-domain identities.
 - Loading reassesses the exact configuration it realizes.

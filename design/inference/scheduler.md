@@ -17,6 +17,10 @@ Each loaded model has one executor thread and bounded command and result channel
 the sole mutator of the model context, sequence pool, active requests, and sampling state. Native
 work is serialized even though callers and transport work remain concurrent.
 
+The sequence-pool size is resolved load evidence, not configured provider concurrency. Loading
+selects one through four sequences; scheduling may use any available sequence while enforcing the
+configured per-request context independently of total physical context.
+
 ```text
 queued → prefill → ready to sample → decode ─┐
               └──────────────────────────────┘

@@ -2,11 +2,13 @@ import { Option } from "effect"
 import {
   ProviderModelCatalogLifecycle,
   ProviderIdSchema,
+  ProviderModelIdSchema,
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
   type LocalModelRecommendation,
   type LocalModelRecommendationProgressStep,
+  type ProviderModelCatalogState,
   type ProviderModelId,
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
@@ -221,6 +223,40 @@ export interface LocalHardwarePresentation {
   readonly system: { readonly name: string; readonly details: readonly string[] }
   readonly accelerators: readonly { readonly name: string; readonly details: string }[]
 }
+
+export interface ResidentModelPresentation {
+  readonly displayName: string
+  readonly contextWindowTokens: number
+  readonly parallelSequences: number
+}
+
+export const describeResidentModel = (
+  hardware: LocalInferenceHardware,
+  catalog: Option.Option<ProviderModelCatalogState>,
+): Option.Option<ResidentModelPresentation> => Option.map(
+  hardware.residentRuntime,
+  (runtime) => {
+    const residentProviderModelId = ProviderModelIdSchema.make(`local:${runtime.configurationId}`)
+    const models = Option.match(catalog, {
+      onNone: () => [] as const,
+      onSome: (state) => ProviderModelCatalogLifecycle.match(state, {
+        Loading: () => [] as const,
+        Ready: ({ models }) => models,
+        Refreshing: ({ models }) => models,
+        Degraded: ({ models }) => models,
+        Unavailable: () => [] as const,
+      }),
+    })
+    const model = models.find((candidate) =>
+      candidate.providerId === LOCAL_PROVIDER_ID
+      && candidate.providerModelId === residentProviderModelId)
+    return {
+      displayName: model?.displayName ?? residentProviderModelId,
+      contextWindowTokens: runtime.contextWindowTokens,
+      parallelSequences: runtime.parallelSequences,
+    }
+  },
+)
 
 const unique = (values: readonly string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))]

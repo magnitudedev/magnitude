@@ -194,7 +194,6 @@ pub enum ModelOfferingTarget {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServingProfile {
     pub context_length: u32,
-    pub parallel_sequences: u32,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -450,7 +449,6 @@ pub struct FitModelsRequest {
     pub capacity_policy: CapacityPolicy,
     pub minimum_context_length: u32,
     pub maximum_context_length: u32,
-    pub maximum_parallel_sequences: u32,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -554,6 +552,8 @@ pub struct LoadModelReady {
     pub residency_id: RuntimeResidencyId,
     pub configuration_id: ModelServingConfigurationId,
     pub execution_evidence_id: String,
+    pub parallel_sequences: u32,
+    pub physical_context_tokens: u32,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
