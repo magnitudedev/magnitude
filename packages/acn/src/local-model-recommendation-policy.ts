@@ -8,7 +8,7 @@ import {
 } from "@magnitudedev/protocol"
 
 export const RECOMMENDATION_POLICY_VERSION =
-  "local-model-multicriteria-v8-ten-token-floor"
+  "local-model-multicriteria-v10-human-readable-fidelity"
 export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 10
 
 const MAX_RECOMMENDATIONS = 4
@@ -32,6 +32,11 @@ export interface RecommendationCandidate {
   readonly estimatedRuntimeBytes: number
   readonly stableCapacityBudgetBytes: number
   readonly totalDownloadBytes: number
+}
+
+export interface RecommendationCatalogCandidate {
+  readonly candidate: RecommendationCandidate
+  readonly recommendation: Recommendation | undefined
 }
 
 const generationFor = (candidate: RecommendationCandidate) =>
@@ -166,6 +171,28 @@ export const rankCatalogCandidates = (
   [...collapseLargestContext(preferScoredCandidates(input.filter(usable)))]
     .sort(compareBalanced)
 
+export const assembleRecommendationCatalogCandidates = (
+  input: readonly RecommendationCandidate[],
+  recommendations: readonly Recommendation[],
+): readonly RecommendationCatalogCandidate[] => {
+  const candidatesByConfiguration = new Map(
+    input.map((candidate) => [candidate.assessment.configurationId, candidate]),
+  )
+  const selected = recommendations.flatMap((recommendation) => {
+    const candidate = candidatesByConfiguration.get(recommendation.configuration.id)
+    return candidate ? [{ candidate, recommendation }] : []
+  })
+  const selectedArtifactIds = new Set(
+    selected.map(({ candidate }) => candidate.artifactId),
+  )
+  return [
+    ...selected,
+    ...rankCatalogCandidates(input)
+      .filter((candidate) => !selectedArtifactIds.has(candidate.artifactId))
+      .map((candidate) => ({ candidate, recommendation: undefined })),
+  ]
+}
+
 const compareBestQuality = (
   left: RecommendationCandidate,
   right: RecommendationCandidate,
@@ -199,7 +226,7 @@ const qualitySummary = (candidate: RecommendationCandidate): string =>
     : candidate.fidelityRank >= 75 ? "preserves nearly all of the original model's quality"
     : candidate.fidelityRank >= 55 ? "retains very high quality with minimal loss"
     : candidate.fidelityRank >= 45 ? "retains high quality with only minor loss"
-    : "uses substantial compression with some possible quality loss"
+    : "retains good quality with some possible loss"
 
 const qualitySentence = (candidate: RecommendationCandidate): string => {
   const summary = qualitySummary(candidate)

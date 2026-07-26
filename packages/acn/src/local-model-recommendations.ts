@@ -27,7 +27,8 @@ import { makeObservedState } from "./mirrored-state"
 import { LocalModelEvaluations } from "./local-model-evaluations"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import {
-  rankCatalogCandidates,
+  RECOMMENDATION_POLICY_VERSION,
+  assembleRecommendationCatalogCandidates,
   selectRecommendationPortfolio,
   type RecommendationCandidate,
 } from "./local-model-recommendation-policy"
@@ -386,7 +387,7 @@ export const makeLocalModelRecommendationsLive = (
         stableCapacityBytes: domain.stable_capacity_bytes,
         totalCapacityBytes: domain.total_capacity_bytes,
       })),
-      policy: "local-model-recommendations-v4",
+      policy: RECOMMENDATION_POLICY_VERSION,
     })
     const inputDigest = createHash("sha256").update(inputEvidence).digest("hex")
     const previousDigest = yield* Ref.get(lastInputDigest)
@@ -524,23 +525,8 @@ export const makeLocalModelRecommendationsLive = (
     const selectionStartedAt = Date.now()
     progress = yield* startStep(progress, "selection")
     const selected = selectRecommendationPortfolio(evaluated)
-    const rankedCandidates = rankCatalogCandidates(evaluated)
-    const candidatesByConfiguration = new Map(
-      rankedCandidates.map((candidate) => [candidate.assessment.configurationId, candidate]),
-    )
-    const labeledCandidates = selected.flatMap((recommendation) => {
-      const candidate = candidatesByConfiguration.get(recommendation.configuration.id)
-      return candidate ? [catalogProjection(candidate, recommendation)] : []
-    })
-    const labeledConfigurationIds = new Set(
-      labeledCandidates.map(({ configuration }) => configuration.id),
-    )
-    const catalogCandidates = [
-      ...labeledCandidates,
-      ...rankedCandidates
-        .filter(({ assessment }) => !labeledConfigurationIds.has(assessment.configurationId))
-        .map((candidate) => catalogProjection(candidate, undefined)),
-    ]
+    const catalogCandidates = assembleRecommendationCatalogCandidates(evaluated, selected)
+      .map(({ candidate, recommendation }) => catalogProjection(candidate, recommendation))
     progress = updateProgress(progress, "selection", {
       status: {
         _tag: "Completed",
