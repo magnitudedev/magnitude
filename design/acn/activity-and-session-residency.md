@@ -128,8 +128,11 @@ While a root work chain is active, the live activity rail occupies a reserved bo
 the scrollback and directly above the composer. It therefore remains at the bottom on short pages as
 well as overflowing ones; assistant messages and tool output grow and scroll independently above it.
 One blank terminal row separates history from the rail above it. No full blank row follows the live
-rail; the composer surface begins immediately below it. Root-model loading, conversation prefill,
-and model response activity share that same stable row. Model loading is shown
+activity label. Instead, the terminal-background label begins with a cyan `┏━` branch whose
+downstroke meets the composer's left border on the immediately following row. The composer's own
+top padding provides separation from the editor without an additional connector row. This makes
+the activity a header of the input rather than part of conversation history. Root-model loading,
+conversation prefill, and model response activity share that same stable label. Model loading is shown
 immediately. Request preparation and prefill use a short anti-flicker delay. Once generation begins,
 the row becomes the composable Working display, including thinking, tools, advisor activity, and
 worker counts. Manual history detachment never moves or hides the live rail and never causes the
