@@ -194,7 +194,6 @@ export function ComposerContainer({
       openSettings={() => setMenu({ open: true, root: 'models' })}
       thinkingOptions={thinkingOptions}
       applyThinking={applyThinking}
-      openHardware={() => setMenu({ open: true, root: 'hardware' })}
       handleWidgetKeyEvent={handleWidgetKeyEvent}
       enterBashMode={() => setBashMode(true)}
       exitBashMode={() => setBashMode(false)}

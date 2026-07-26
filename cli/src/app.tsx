@@ -55,6 +55,10 @@ import {
   ModelSetupScreen,
   PreparingModelSetupScreen,
 } from './features/model-setup'
+import {
+  deriveInferenceRuntimeBadgeView,
+  InferenceRuntimeBadgeOverlay,
+} from './features/local-inference/runtime-badge'
 import { registerCliCommands } from './commands/register'
 
 registerCliCommands()
@@ -232,6 +236,9 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
   const clientWorkingDirectory = process.cwd()
+  const inferenceRuntimeBadge = deriveInferenceRuntimeBadgeView(
+    Option.getOrNull(localInferenceSnapshot),
+  )
 
   const dispatchErrorAction = useCallback((actionId: ActionId) => {
     switch (actionId) {
@@ -266,6 +273,11 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
           onSizeChange={chatColumn.onSizeChange}
           style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, position: 'relative', height: '100%' }}
         >
+          <InferenceRuntimeBadgeOverlay
+            view={inferenceRuntimeBadge}
+            compact={chatColumnWidth < 44}
+            onOpenHardware={() => setMenu({ open: true, root: 'hardware' })}
+          />
           <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
             <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
               <box style={{ flexGrow: 1, flexShrink: 1, minHeight: 0, flexDirection: 'column', overflow: 'hidden' }}>

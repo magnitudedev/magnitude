@@ -194,7 +194,6 @@ export function Composer(props: ComposerProps) {
     interruptFork,
     interruptAll,
     openSettings,
-    openHardware,
     thinkingOptions,
     applyThinking,
     handleWidgetKeyEvent,
@@ -252,7 +251,6 @@ export function Composer(props: ComposerProps) {
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
-  const [memoryLabelHovered, setMemoryLabelHovered] = useState(false)
   const [thinkingOpen, setThinkingOpen] = useState(false)
   const currentThinkingIndex = Math.max(
     0,
@@ -280,7 +278,7 @@ export function Composer(props: ComposerProps) {
   const footerModeWidth = displayMode === 'transcript'
     ? 3 + 'Transcript Mode'.length
     : 0
-  const footerLeftWidth = (bashMode
+  const footerPrimaryWidth = bashMode
     ? 'Bash Mode'.length
     : !modelsConfigured
       ? 'No provider configured'.length
@@ -291,12 +289,8 @@ export function Composer(props: ComposerProps) {
         + (thinkingOpen
           ? thinkingSelectorWidth(thinkingOptions)
           : 3
-            + contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
-            + (modelFooter.memoryLabel === null
-              ? 0
-              : 3 + 'Memory: '.length + stringWidth(modelFooter.memoryLabel))))
-    + footerModeWidth
-    + footerTransientWidth
+            + contextUsageWidth(tokenUsage, contextHardCap, isCompacting))
+  const footerLeftWidth = footerPrimaryWidth + footerModeWidth + footerTransientWidth
   const footerRightWidth = stringWidth(workingDirectoryLabel)
   const footerStacks = footerLeftWidth + footerRightWidth + 8 > chatColumnWidth
   const openThinking = useCallback(() => {
@@ -697,22 +691,6 @@ export function Composer(props: ComposerProps) {
                 hardCap={contextHardCap}
                 isCompacting={isCompacting}
               />
-              {modelFooter.memoryLabel && (
-                <>
-                  <box style={{ width: 3, flexShrink: 0 }} />
-                  <Button
-                    onClick={openHardware}
-                    onMouseOver={() => setMemoryLabelHovered(true)}
-                    onMouseOut={() => setMemoryLabelHovered(false)}
-                  >
-                    <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
-                      <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                        {`Memory: ${modelFooter.memoryLabel}`}
-                      </span>
-                    </text>
-                  </Button>
-                </>
-              )}
             </>
           )}
         </>

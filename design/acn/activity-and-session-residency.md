@@ -144,19 +144,27 @@ surface and spans its full height; additional visual input lines grow only from 
 content. Pending attachments render inside that surface rather than competing with persistent
 status. The terminal-background footer below it derives model selection, reasoning effort, local
 residency, working directory, and context usage directly from authoritative mirrors and display
-state. Model, effort, context usage, and resident memory form the left group with stable spacing;
-the working directory is the only right-aligned item. Local residency uses distinct loaded,
+state. Model, effort, and context usage form the left group with stable spacing; the working
+directory is the only right-aligned item. Local residency uses distinct loaded,
 transitional, and unloaded glyphs; detailed load percentage and failures remain in the activity
 rail.
 
 Reasoning effort is a violet interactive label rather than muted metadata. Activating it opens a
-horizontal selector immediately to its right in the footer; the selector replaces context and
-memory temporarily while the working directory remains the sole right-aligned item. Available
+horizontal selector immediately to its right in the footer; the selector replaces context
+temporarily while the working directory remains the sole right-aligned item. Available
 choices come from the selected model's catalog control. The selector maintains only an ephemeral
 preview: repeated Ctrl-T, left/right arrows, and other directional keys cycle with wraparound;
 Enter or a clicked choice
 commits through the existing model-configuration mutation, and Escape closes without changing the
 saved effort. It has no timeout and never renders inside the colored composer surface.
+
+A separate local-inference badge is absolutely overlaid at the upper-right of the chat shell and
+inherits the terminal background without reserving layout space. It derives global
+singleton-worker state across both model slots and the server-published resident allocation. Ready
+residency uses a green glyph and compact memory; loading, unloading, and mirror convergence animate
+without memory; idle and runtime-loss states
+remain visible without a memory placeholder. The badge opens the Hardware menu for detailed memory
+accounting. It may overlay timeline content but does not extend across the file viewer.
 
 While the root slot is loading, the rail may present its authoritative percentage as well as
 persistent model chrome. Both presentations derive from the one mirrored slot lifecycle state;

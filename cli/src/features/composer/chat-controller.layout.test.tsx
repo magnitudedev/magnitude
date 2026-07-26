@@ -6,13 +6,7 @@ import { Option } from 'effect'
 import type { ChatTheme } from '../../types/theme-system'
 import type { ComposerProps } from './types'
 import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type TaskDisplayRow } from '@magnitudedev/sdk'
-import {
-  GIB,
-  LOCAL_PROVIDER_ID,
-  makeHardware,
-  makeView,
-  TEST_MEMORY_DOMAIN_ID,
-} from '../local-inference/test-fixtures'
+import { LOCAL_PROVIDER_ID, makeView } from '../local-inference/test-fixtures'
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true
@@ -244,7 +238,6 @@ function makeProps(): ComposerProps {
     interruptFork: noop,
     interruptAll: noop,
     openSettings: noop,
-    openHardware: noop,
     thinkingOptions: [],
     applyThinking: noop,
     handleWidgetKeyEvent: () => false,
@@ -289,19 +282,7 @@ test('shows a single no-provider label instead of model and reasoning effort', (
 
 test('clicking effort opens the footer selector and clicking an option commits it', () => {
   const applied: string[] = []
-  const localInferenceState = makeView({
-    hardware: makeHardware({
-      residentMemory: Option.some({
-        domains: [{
-          memoryDomainId: TEST_MEMORY_DOMAIN_ID,
-          modelBytes: 13 * GIB,
-          contextBytes: 2 * GIB,
-          computeBytes: GIB,
-          auxiliaryBytes: 0,
-        }],
-      }),
-    }),
-  })
+  const localInferenceState = makeView()
   const thinkingOptions = ['none', 'low', 'medium', 'high'].map((value) => ({
     value: ReasoningEffortSchema.make(value),
     label: value.charAt(0).toUpperCase() + value.slice(1),
@@ -329,7 +310,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
 
   const clickableLabels = clickable().map(textOf)
   expect(clickableLabels).toContain('high')
-  expect(JSON.stringify(view.toJSON())).toContain('Memory: 16GB')
+  expect(JSON.stringify(view.toJSON())).not.toContain('Memory:')
   const effort = clickable().find((node) => textOf(node) === 'high')
   expect(effort).toBeDefined()
   act(() => { (effort!.props.onClick as () => void)() })
@@ -339,7 +320,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
   expect(openText).toContain('Medium')
   expect(openText).toContain('Select reasoning level...')
   expect(openText).not.toContain('5k / 100k (5%)')
-  expect(openText).not.toContain('Memory: 16GB')
+  expect(openText).not.toContain('Memory:')
   expect(openText).toContain('/tmp/default')
 
   const low = clickable().find((node) => textOf(node) === 'Low')
@@ -348,6 +329,6 @@ test('clicking effort opens the footer selector and clicking an option commits i
 
   expect(applied).toEqual(['low'])
   expect(JSON.stringify(view.toJSON())).toContain('5k / 100k (5%)')
-  expect(JSON.stringify(view.toJSON())).toContain('Memory: 16GB')
+  expect(JSON.stringify(view.toJSON())).not.toContain('Memory:')
   act(() => { view.unmount() })
 })
