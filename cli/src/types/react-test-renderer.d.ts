@@ -1,5 +1,14 @@
 declare module 'react-test-renderer' {
-  import type { ReactElement } from 'react'
+  import type { ReactNode } from 'react'
+
+  export interface ReactTestInstance {
+    readonly type: unknown
+    readonly props: Record<string, unknown>
+    readonly children: readonly (ReactTestInstance | string)[]
+    findAll(predicate: (node: ReactTestInstance) => boolean): ReactTestInstance[]
+    findByType(type: unknown): ReactTestInstance
+    findAllByType(type: unknown): ReactTestInstance[]
+  }
 
   export interface ReactTestRendererJSON {
     type: string
@@ -10,12 +19,12 @@ declare module 'react-test-renderer' {
   export interface ReactTestRenderer {
     toJSON(): ReactTestRendererJSON | Array<ReactTestRendererJSON> | null
     unmount(): void
-    update(element: ReactElement): void
-    root: { findByType: (type: unknown) => unknown; findAllByType: (type: unknown) => unknown[] }
+    update(element: ReactNode): void
+    root: ReactTestInstance
   }
 
   export function create(
-    nextElement: ReactElement,
+    nextElement: ReactNode,
     options?: Record<string, unknown>,
   ): ReactTestRenderer
 

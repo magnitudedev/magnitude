@@ -6,7 +6,7 @@ import { Atom, useAtomMount, useAtomSet, useAtomValue as useAtomValueClientCommo
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { filenameWithImageExtension, useAgentClient, mentionOccurrenceFromInputSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
 import { createId } from '@magnitudedev/generate-id'
-import { orange } from '../../utils/theme'
+import { orange, violet } from '../../utils/theme'
 import { Button } from '../../components/button'
 import { ChatSurfaceKeyboard } from './chat-surface-keyboard'
 import { FileMentionMenu } from './mention-menu'
@@ -34,6 +34,11 @@ import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
 import { allowProviderMessageSend } from './provider-send-guard'
 import { ContextUsage, contextUsageWidth } from './context-usage'
 import { ResidencyIndicator } from './residency-indicator'
+import {
+  moveThinkingPreview,
+  ThinkingSelector,
+  thinkingSelectorWidth,
+} from './thinking-selector'
 import { BOX_CHARS } from '../../utils/ui-constants'
 
 const displayWorkingDirectory = (cwd: string): string => {
@@ -283,11 +288,13 @@ export function Composer(props: ComposerProps) {
         + stringWidth(modelNameLabel)
         + 2
         + stringWidth(thinkingLevelLabel)
-        + 3
-        + contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
-        + (modelFooter.memoryLabel === null
-          ? 0
-          : 3 + 'Memory: '.length + stringWidth(modelFooter.memoryLabel)))
+        + (thinkingOpen
+          ? thinkingSelectorWidth(thinkingOptions)
+          : 3
+            + contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
+            + (modelFooter.memoryLabel === null
+              ? 0
+              : 3 + 'Memory: '.length + stringWidth(modelFooter.memoryLabel))))
     + footerModeWidth
     + footerTransientWidth
   const footerRightWidth = stringWidth(workingDirectoryLabel)
@@ -297,22 +304,19 @@ export function Composer(props: ComposerProps) {
     setThinkingIndex(currentThinkingIndex)
     setThinkingOpen(true)
   }, [currentThinkingIndex, thinkingOptions.length])
-  const toggleThinking = useCallback(() => {
-    if (thinkingOpen) {
-      setThinkingOpen(false)
-    } else {
-      openThinking()
-    }
-  }, [openThinking, thinkingOpen])
   const moveThinking = useCallback((direction: -1 | 1) => {
-    setThinkingIndex((index) =>
-      (index + direction + thinkingOptions.length) % thinkingOptions.length)
+    setThinkingIndex((index) => moveThinkingPreview(index, direction, thinkingOptions.length))
   }, [thinkingOptions.length])
   const commitThinking = useCallback(() => {
     const option = thinkingOptions[thinkingIndex]
     if (option) applyThinking(option.value)
     setThinkingOpen(false)
   }, [applyThinking, thinkingIndex, thinkingOptions])
+  const commitThinkingIndex = useCallback((index: number) => {
+    const option = thinkingOptions[index]
+    if (option) applyThinking(option.value)
+    setThinkingOpen(false)
+  }, [applyThinking, thinkingOptions])
   const multilineInputRef = useRef<MultilineInputHandle | null>(null)
 
   // Refs to mirror local state so the sync Effect reads the latest values
@@ -672,32 +676,43 @@ export function Composer(props: ComposerProps) {
             onMouseOver={() => setThinkingLabelHovered(true)}
             onMouseOut={() => setThinkingLabelHovered(false)}
           >
-            <text style={{ fg: thinkingLabelHovered ? theme.primary : theme.modePlan }}>
+            <text style={{ fg: thinkingLabelHovered || thinkingOpen ? violet[200] : violet[300] }}>
               <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {thinkingLevelLabel}
               </span>
             </text>
           </Button>
-          <box style={{ width: 3, flexShrink: 0 }} />
-          <ContextUsage
-            tokenUsage={tokenUsage}
-            hardCap={contextHardCap}
-            isCompacting={isCompacting}
-          />
-          {modelFooter.memoryLabel && (
+          {thinkingOpen ? (
+            <ThinkingSelector
+              options={thinkingOptions}
+              previewIndex={thinkingIndex}
+              onPreview={setThinkingIndex}
+              onCommit={commitThinkingIndex}
+            />
+          ) : (
             <>
               <box style={{ width: 3, flexShrink: 0 }} />
-              <Button
-                onClick={openHardware}
-                onMouseOver={() => setMemoryLabelHovered(true)}
-                onMouseOut={() => setMemoryLabelHovered(false)}
-              >
-                <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
-                  <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                    {`Memory: ${modelFooter.memoryLabel}`}
-                  </span>
-                </text>
-              </Button>
+              <ContextUsage
+                tokenUsage={tokenUsage}
+                hardCap={contextHardCap}
+                isCompacting={isCompacting}
+              />
+              {modelFooter.memoryLabel && (
+                <>
+                  <box style={{ width: 3, flexShrink: 0 }} />
+                  <Button
+                    onClick={openHardware}
+                    onMouseOver={() => setMemoryLabelHovered(true)}
+                    onMouseOut={() => setMemoryLabelHovered(false)}
+                  >
+                    <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
+                      <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                        {`Memory: ${modelFooter.memoryLabel}`}
+                      </span>
+                    </text>
+                  </Button>
+                </>
+              )}
             </>
           )}
         </>
@@ -756,7 +771,7 @@ export function Composer(props: ComposerProps) {
         onToggleAutopilot={enableAutopilot ? toggleAutopilot : undefined}
         thinkingOpen={thinkingOpen}
         thinkingOptionCount={thinkingOptions.length}
-        onToggleThinking={toggleThinking}
+        onOpenThinking={openThinking}
         onMoveThinking={moveThinking}
         onApplyThinking={commitThinking}
         onCancelThinking={() => setThinkingOpen(false)}
@@ -798,34 +813,6 @@ export function Composer(props: ComposerProps) {
                 onHoverIndex={slashCommands.setSelectedIndex}
               />
             )}
-            {!bashMode && thinkingOpen && (
-              <box style={{
-                flexDirection: 'column',
-                borderStyle: 'single',
-                borderColor: theme.primary,
-                backgroundColor: theme.inputBg,
-                paddingLeft: 1,
-                paddingRight: 1,
-                marginBottom: 1,
-              }}>
-                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Thinking level</text>
-                <text style={{ fg: theme.muted }}>↑↓ choose · Enter apply · Esc cancel</text>
-                {thinkingOptions.map((option, index) => (
-                  <Button
-                    key={option.value}
-                    onClick={() => {
-                      applyThinking(option.value)
-                      setThinkingOpen(false)
-                    }}
-                    onMouseOver={() => setThinkingIndex(index)}
-                  >
-                    <text style={{ fg: index === thinkingIndex ? theme.primary : theme.foreground }}>
-                      {index === thinkingIndex ? '› ' : '  '}{option.label}
-                    </text>
-                  </Button>
-                ))}
-              </box>
-            )}
             {attachments.length > 0 && (
               <AttachmentsBar
                 attachments={attachments}
@@ -849,7 +836,13 @@ export function Composer(props: ComposerProps) {
                   onKeyIntercept={handleKeyIntercept}
                   focused={composerCanFocus && !thinkingOpen}
                   highlightColor={bashMode ? orange[400] : undefined}
-                  placeholder={bashMode ? 'Enter a command...' : status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
+                  placeholder={thinkingOpen
+                    ? 'Select reasoning level...'
+                    : bashMode
+                      ? 'Enter a command...'
+                      : status === 'streaming'
+                        ? 'Type to queue a message...'
+                        : 'Chat with the agent...'}
                   maxHeight={10}
                   minHeight={1}
                 />

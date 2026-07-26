@@ -18,7 +18,7 @@ interface ChatSurfaceKeyboardProps {
   onToggleAutopilot?: () => void
   thinkingOpen: boolean
   thinkingOptionCount: number
-  onToggleThinking: () => void
+  onOpenThinking: () => void
   onMoveThinking: (direction: -1 | 1) => void
   onApplyThinking: () => void
   onCancelThinking: () => void
@@ -40,7 +40,7 @@ export function ChatSurfaceKeyboard({
   onToggleAutopilot,
   thinkingOpen,
   thinkingOptionCount,
-  onToggleThinking,
+  onOpenThinking,
   onMoveThinking,
   onApplyThinking,
   onCancelThinking,
@@ -57,7 +57,11 @@ export function ChatSurfaceKeyboard({
 
       if (isCtrlT && thinkingOptionCount > 0) {
         key.preventDefault()
-        onToggleThinking()
+        if (thinkingOpen) {
+          onMoveThinking(1)
+        } else {
+          onOpenThinking()
+        }
         return
       }
 
@@ -67,12 +71,12 @@ export function ChatSurfaceKeyboard({
           onCancelThinking()
           return
         }
-        if (key.name === 'up' || key.name === 'k') {
+        if (key.name === 'up' || key.name === 'left' || key.name === 'k') {
           key.preventDefault()
           onMoveThinking(-1)
           return
         }
-        if (key.name === 'down' || key.name === 'j') {
+        if (key.name === 'down' || key.name === 'right' || key.name === 'j') {
           key.preventDefault()
           onMoveThinking(1)
           return
@@ -148,7 +152,7 @@ export function ChatSurfaceKeyboard({
       onToggleAutopilot,
       thinkingOpen,
       thinkingOptionCount,
-      onToggleThinking,
+      onOpenThinking,
       onMoveThinking,
       onApplyThinking,
       onCancelThinking,
