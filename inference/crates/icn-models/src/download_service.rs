@@ -244,6 +244,7 @@ fn legacy_request(package: &ModelPackage) -> Result<DownloadModelRequest, Invent
                 }
                 ModelFileRole::Weights => ComponentRole::Weights,
                 ModelFileRole::Projector => ComponentRole::Projector,
+                ModelFileRole::Draft => ComponentRole::Draft,
                 ModelFileRole::Mtp => ComponentRole::Mtp,
                 ModelFileRole::Auxiliary => ComponentRole::Auxiliary,
             },
@@ -269,6 +270,15 @@ fn legacy_request(package: &ModelPackage) -> Result<DownloadModelRequest, Invent
             } => Some(ComponentRelationship::MtpFor {
                 mtp: path_by_id.get(mtp_file_id)?.clone(),
                 model: path_by_id.get(weights_file_id)?.clone(),
+            }),
+            ModelFileRelationship::DraftFor {
+                draft_file_id,
+                weights_file_id,
+                method,
+            } => Some(ComponentRelationship::DraftFor {
+                draft: path_by_id.get(draft_file_id)?.clone(),
+                model: path_by_id.get(weights_file_id)?.clone(),
+                method: method.clone(),
             }),
         })
         .collect();

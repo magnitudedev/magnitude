@@ -161,6 +161,14 @@ Cache deletion and garbage collection are always safe. Size and age policies may
 the next access regenerates it. Negative or operational results are cached only when they are stable
 domain facts with complete validity evidence; transient failures are never persisted as facts.
 
+Model hardware-assessment entries are interpreted only with the normalized physical-memory
+topology captured for the current assessment environment. Domain identities must be unique,
+reference that topology, include the canonical system domain, and satisfy their aggregate and
+per-domain byte-accounting invariants. Domain usable capacity and canonically identified device
+constraints must exactly match current stable topology limits. Live available/free memory is not
+cached assessment evidence. Failure of any such check is an entry-level miss; readers do not
+recognize historical aliases or add a cache-format revision to force invalidation.
+
 ## Durable configuration behavior
 
 Configuration recovery is intentionally more conservative because the valid portions express user

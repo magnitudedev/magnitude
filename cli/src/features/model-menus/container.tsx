@@ -435,9 +435,6 @@ const ModelsMenu = memo(function ModelsMenu({
     const memoryConditions = providerModelMemoryConditions(detail, hardware)
     if (!detailIsSelected
       && detail.availability._tag === "Available"
-      && (!detailIsLocal
-        || (!memoryConditions.evidenceUnavailable
-          && !memoryConditions.lacksCurrentHeadroom))
       && detail.supportedSlots.includes(PRIMARY_SLOT_ID)) actions.push("select")
     if (detailIsLocal
       && detailIsSelected
@@ -469,13 +466,8 @@ const ModelsMenu = memo(function ModelsMenu({
   const choose = useCallback((model: ProviderModelCatalogEntry) => {
     if (!model.supportedSlots.includes(PRIMARY_SLOT_ID)) return
     if (model.availability._tag !== "Available") return
-    if (model.providerId === LOCAL_PROVIDER_ID) {
-      const memoryConditions = providerModelMemoryConditions(model, hardware)
-      if (memoryConditions.evidenceUnavailable
-        || memoryConditions.lacksCurrentHeadroom) return
-    }
     config.updateSlotModel(PRIMARY_SLOT_ID, model.providerId, model.providerModelId)
-  }, [config, hardware])
+  }, [config])
 
   const toggleFavorite = useCallback((model: ProviderModelCatalogEntry) => {
     config.setModelFavorite({

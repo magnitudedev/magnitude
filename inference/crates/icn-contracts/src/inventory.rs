@@ -1,11 +1,71 @@
 //! Backend-neutral model inventory contracts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+
+/// Stable identity of one physical memory pool.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MemoryDomainId(String);
+
+impl MemoryDomainId {
+    const SYSTEM: &'static str = "system";
+
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn system() -> Self {
+        Self(Self::SYSTEM.to_owned())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_system(&self) -> bool {
+        self.0 == Self::SYSTEM
+    }
+}
+
+impl std::fmt::Display for MemoryDomainId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Stable identity of one native device view and its device-specific limits.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HardwareDeviceId(String);
+
+impl HardwareDeviceId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HardwareDeviceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 /// Source-scoped identity of one runnable model at one local location.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -84,9 +144,19 @@ pub struct ModelComponent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ComponentRelationship {
-    ProjectorFor { projector: PathBuf, model: PathBuf },
-    DraftFor { draft: PathBuf, model: PathBuf },
-    MtpFor { mtp: PathBuf, model: PathBuf },
+    ProjectorFor {
+        projector: PathBuf,
+        model: PathBuf,
+    },
+    DraftFor {
+        draft: PathBuf,
+        model: PathBuf,
+        method: crate::models::SpeculativeMethod,
+    },
+    MtpFor {
+        mtp: PathBuf,
+        model: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,7 +558,7 @@ pub struct HardwareProfile {
 #[serde(deny_unknown_fields)]
 pub struct HardwareMemory {
     pub required_bytes: u64,
-    pub available_bytes: u64,
+    pub usable_capacity_bytes: u64,
     pub headroom_bytes: u64,
     pub domains: Vec<HardwareMemoryDomainAssessment>,
     #[serde(default)]
@@ -499,7 +569,7 @@ pub struct HardwareMemory {
 #[serde(deny_unknown_fields)]
 pub struct HardwareDeficit {
     pub required_bytes: u64,
-    pub available_bytes: u64,
+    pub usable_capacity_bytes: u64,
     pub deficit_bytes: u64,
     pub domains: Vec<HardwareMemoryDomainAssessment>,
     #[serde(default)]
@@ -509,19 +579,20 @@ pub struct HardwareDeficit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareMemoryDomainAssessment {
-    pub memory_domain: String,
+    pub memory_domain: MemoryDomainId,
     pub model_bytes: u64,
     pub context_bytes: u64,
     pub compute_bytes: u64,
     pub auxiliary_bytes: u64,
     pub required_bytes: u64,
-    pub available_bytes: u64,
+    pub usable_capacity_bytes: u64,
     pub margin_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareDeviceMemoryAssessment {
+    pub device_id: HardwareDeviceId,
     pub device: String,
     pub kind: HardwareDeviceMemoryLimitKind,
     pub model_bytes: u64,
@@ -529,7 +600,7 @@ pub struct HardwareDeviceMemoryAssessment {
     pub compute_bytes: u64,
     pub auxiliary_bytes: u64,
     pub required_bytes: u64,
-    pub available_bytes: u64,
+    pub usable_capacity_bytes: u64,
     pub margin_bytes: i64,
 }
 
@@ -581,7 +652,7 @@ pub struct HardwareDeviceMemoryLimit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareDevice {
-    pub id: String,
+    pub id: HardwareDeviceId,
     pub native_index: usize,
     pub backend: String,
     pub physical_id: Option<String>,
@@ -607,7 +678,7 @@ pub struct HardwareSystemMemory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareMemoryDomain {
-    pub id: String,
+    pub id: MemoryDomainId,
     pub kind: HardwareMemoryDomainKind,
     pub total_capacity_bytes: u64,
     pub stable_capacity_bytes: u64,
@@ -620,7 +691,7 @@ pub struct HardwareMemoryDomain {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidentMemoryDomain {
-    pub memory_domain_id: String,
+    pub memory_domain_id: MemoryDomainId,
     pub model_bytes: u64,
     pub context_bytes: u64,
     pub compute_bytes: u64,
@@ -666,6 +737,181 @@ pub struct HardwareSnapshot {
     pub runtime_failure: Option<RuntimeFailureObservation>,
 }
 
+/// Canonical physical memory pools used to interpret persisted assessments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryTopology {
+    capacities: BTreeMap<MemoryDomainId, MemoryDomainCapacity>,
+    device_limits: BTreeMap<HardwareDeviceId, HardwareDeviceMemoryLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryDomainCapacity {
+    total_bytes: u64,
+    stable_bytes: u64,
+}
+
+impl MemoryTopology {
+    #[must_use]
+    pub fn from_snapshot(snapshot: &HardwareSnapshot) -> Option<Self> {
+        Self::from_domains(&snapshot.memory_domains)
+    }
+
+    #[must_use]
+    pub fn from_domains(domains: &[HardwareMemoryDomain]) -> Option<Self> {
+        let mut capacities = BTreeMap::new();
+        let mut device_limits = BTreeMap::new();
+        let mut device_ids = BTreeSet::new();
+        for domain in domains {
+            if domain.id.as_str().is_empty()
+                || domain.id.is_system() != domain.shares_system_memory
+                || domain.stable_capacity_bytes > domain.total_capacity_bytes
+            {
+                return None;
+            }
+            if capacities
+                .insert(
+                    domain.id.clone(),
+                    MemoryDomainCapacity {
+                        total_bytes: domain.total_capacity_bytes,
+                        stable_bytes: domain.stable_capacity_bytes,
+                    },
+                )
+                .is_some()
+            {
+                return None;
+            }
+            for device in &domain.devices {
+                if device.id.as_str().is_empty() || !device_ids.insert(device.id.clone()) {
+                    return None;
+                }
+                let Some(limit) = &device.memory_limit else {
+                    continue;
+                };
+                if limit.stable_bytes > limit.total_bytes
+                    || device_limits
+                        .insert(device.id.clone(), limit.clone())
+                        .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        capacities
+            .contains_key(&MemoryDomainId::system())
+            .then_some(Self {
+                capacities,
+                device_limits,
+            })
+    }
+
+    #[must_use]
+    pub fn capacity(&self, domain: &MemoryDomainId) -> Option<u64> {
+        self.capacities
+            .get(domain)
+            .map(|capacity| capacity.total_bytes)
+    }
+
+    #[must_use]
+    pub fn validates_hardware_assessment(&self, assessment: &HardwareAssessment) -> bool {
+        match assessment {
+            HardwareAssessment::Fits { memory, .. } => {
+                self.validates_hardware_domains(&memory.domains)
+                    && self.validates_device_constraints(&memory.device_constraints)
+                    && memory.required_bytes == sum_required_bytes(&memory.domains)
+                    && memory.usable_capacity_bytes == sum_usable_capacity_bytes(&memory.domains)
+                    && memory.headroom_bytes
+                        == memory
+                            .usable_capacity_bytes
+                            .saturating_sub(memory.required_bytes)
+            }
+            HardwareAssessment::DoesNotFit { memory, .. } => {
+                self.validates_hardware_domains(&memory.domains)
+                    && self.validates_device_constraints(&memory.device_constraints)
+                    && memory.required_bytes == sum_required_bytes(&memory.domains)
+                    && memory.usable_capacity_bytes == sum_usable_capacity_bytes(&memory.domains)
+                    && memory.deficit_bytes
+                        == memory
+                            .domains
+                            .iter()
+                            .map(|domain| {
+                                domain
+                                    .required_bytes
+                                    .saturating_sub(domain.usable_capacity_bytes)
+                            })
+                            .chain(memory.device_constraints.iter().map(|constraint| {
+                                constraint
+                                    .required_bytes
+                                    .saturating_sub(constraint.usable_capacity_bytes)
+                            }))
+                            .max()
+                            .unwrap_or(0)
+            }
+            HardwareAssessment::InvalidArtifact { .. }
+            | HardwareAssessment::IncompatibleArtifact { .. } => true,
+            HardwareAssessment::NotAssessed { .. } => false,
+        }
+    }
+
+    fn validates_hardware_domains(&self, domains: &[HardwareMemoryDomainAssessment]) -> bool {
+        let mut seen = BTreeMap::new();
+        for domain in domains {
+            let Some(capacity) = self.capacities.get(&domain.memory_domain) else {
+                return false;
+            };
+            let expected_required = domain
+                .model_bytes
+                .saturating_add(domain.context_bytes)
+                .saturating_add(domain.compute_bytes)
+                .saturating_add(domain.auxiliary_bytes);
+            let expected_margin =
+                (i128::from(domain.usable_capacity_bytes) - i128::from(domain.required_bytes))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            if seen.insert(domain.memory_domain.clone(), ()).is_some()
+                || domain.usable_capacity_bytes != capacity.stable_bytes
+                || domain.required_bytes != expected_required
+                || domain.margin_bytes != expected_margin
+            {
+                return false;
+            }
+        }
+        seen.contains_key(&MemoryDomainId::system())
+    }
+
+    fn validates_device_constraints(&self, constraints: &[HardwareDeviceMemoryAssessment]) -> bool {
+        let mut seen = BTreeMap::new();
+        constraints.iter().all(|constraint| {
+            let Some(limit) = self.device_limits.get(&constraint.device_id) else {
+                return false;
+            };
+            seen.insert(constraint.device_id.clone(), ()).is_none()
+                && constraint.kind == limit.kind
+                && constraint.usable_capacity_bytes == limit.stable_bytes
+                && constraint.required_bytes
+                    == constraint
+                        .model_bytes
+                        .saturating_add(constraint.context_bytes)
+                        .saturating_add(constraint.compute_bytes)
+                        .saturating_add(constraint.auxiliary_bytes)
+                && constraint.margin_bytes
+                    == (i128::from(constraint.usable_capacity_bytes)
+                        - i128::from(constraint.required_bytes))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        })
+    }
+}
+
+fn sum_required_bytes(domains: &[HardwareMemoryDomainAssessment]) -> u64 {
+    domains.iter().fold(0, |total, domain| {
+        total.saturating_add(domain.required_bytes)
+    })
+}
+
+fn sum_usable_capacity_bytes(domains: &[HardwareMemoryDomainAssessment]) -> u64 {
+    domains.iter().fold(0, |total, domain| {
+        total.saturating_add(domain.usable_capacity_bytes)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelPreviewSource {
@@ -679,7 +925,28 @@ pub struct ModelPreviewSource {
 #[serde(deny_unknown_fields)]
 pub struct ModelPreviewComponentSource {
     pub path: PathBuf,
-    pub role: ComponentRole,
+    pub role: ModelPreviewComponentRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelPreviewComponentRole {
+    Projector,
+    Draft {
+        method: crate::models::SpeculativeMethod,
+    },
+    Mtp,
+}
+
+impl ModelPreviewComponentRole {
+    #[must_use]
+    pub fn component_role(&self) -> ComponentRole {
+        match self {
+            Self::Projector => ComponentRole::Projector,
+            Self::Draft { .. } => ComponentRole::Draft,
+            Self::Mtp => ComponentRole::Mtp,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -966,8 +1233,8 @@ pub trait ModelInventory: Send + Sync + 'static {
 /// the native planner or `icn-hardware`. The cache key covers the canonical execution policy, native build,
 /// backend, and stable hardware topology. Assessment failures are operation failures, never model
 /// properties.
-pub trait InventoryHardwareAssessor: Send + Sync + 'static {
-    fn cache_key(&self) -> BoxFuture<'_, Result<String, InventoryError>>;
+pub trait InventoryHardwareAssessor: HardwareProvider {
+    fn cache_key(&self, snapshot: &HardwareSnapshot) -> Result<String, InventoryError>;
     fn assess(
         &self,
         model: ResolvedModel,
@@ -1093,6 +1360,71 @@ pub enum InventoryError {
 mod tests {
     use super::*;
 
+    fn test_memory_topology() -> MemoryTopology {
+        MemoryTopology::from_domains(&[HardwareMemoryDomain {
+            id: MemoryDomainId::system(),
+            kind: HardwareMemoryDomainKind::UnifiedMemory,
+            total_capacity_bytes: 64,
+            stable_capacity_bytes: 60,
+            current_free_bytes: Some(40),
+            shares_system_memory: true,
+            devices: vec![HardwareDevice {
+                id: HardwareDeviceId::new("metal-0"),
+                native_index: 0,
+                backend: "MTL".to_owned(),
+                physical_id: Some("metal-0".to_owned()),
+                name: "MTL0".to_owned(),
+                description: "Test GPU".to_owned(),
+                kind: HardwareDeviceKind::Gpu,
+                memory_limit: Some(HardwareDeviceMemoryLimit {
+                    kind: HardwareDeviceMemoryLimitKind::RecommendedWorkingSet,
+                    total_bytes: 54,
+                    stable_bytes: 50,
+                    current_free_bytes: Some(30),
+                }),
+            }],
+        }])
+        .expect("valid topology")
+    }
+
+    fn fitting_assessment() -> HardwareAssessment {
+        HardwareAssessment::Fits {
+            profile: HardwareProfile {
+                context_length: 8_192,
+                acceleration: "gpu".to_owned(),
+                device: "system".to_owned(),
+            },
+            memory: HardwareMemory {
+                required_bytes: 20,
+                usable_capacity_bytes: 60,
+                headroom_bytes: 40,
+                domains: vec![HardwareMemoryDomainAssessment {
+                    memory_domain: MemoryDomainId::system(),
+                    model_bytes: 10,
+                    context_bytes: 4,
+                    compute_bytes: 6,
+                    auxiliary_bytes: 0,
+                    required_bytes: 20,
+                    usable_capacity_bytes: 60,
+                    margin_bytes: 40,
+                }],
+                device_constraints: vec![HardwareDeviceMemoryAssessment {
+                    device_id: HardwareDeviceId::new("metal-0"),
+                    device: "MTL0".to_owned(),
+                    kind: HardwareDeviceMemoryLimitKind::RecommendedWorkingSet,
+                    model_bytes: 10,
+                    context_bytes: 4,
+                    compute_bytes: 6,
+                    auxiliary_bytes: 0,
+                    required_bytes: 20,
+                    usable_capacity_bytes: 50,
+                    margin_bytes: 30,
+                }],
+            },
+            recommendation: HardwareRecommendation::Recommended,
+        }
+    }
+
     #[test]
     fn ids_require_the_exact_versioned_prefix_and_lowercase_digest() {
         let digest = "a".repeat(64);
@@ -1142,5 +1474,52 @@ mod tests {
                 message: "generation performance was not requested".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn memory_topology_requires_exact_stable_domain_capacity() {
+        let topology = test_memory_topology();
+        let assessment = fitting_assessment();
+        assert!(topology.validates_hardware_assessment(&assessment));
+
+        let mut corrupted = assessment;
+        let HardwareAssessment::Fits { memory, .. } = &mut corrupted else {
+            unreachable!();
+        };
+        memory.domains[0].usable_capacity_bytes = 59;
+        memory.domains[0].margin_bytes = 39;
+        memory.usable_capacity_bytes = 59;
+        memory.headroom_bytes = 39;
+        assert!(!topology.validates_hardware_assessment(&corrupted));
+    }
+
+    #[test]
+    fn memory_topology_requires_exact_canonical_device_limit() {
+        let topology = test_memory_topology();
+        let assessment = fitting_assessment();
+
+        let mut wrong_limit = assessment.clone();
+        let HardwareAssessment::Fits { memory, .. } = &mut wrong_limit else {
+            unreachable!();
+        };
+        memory.device_constraints[0].usable_capacity_bytes = 49;
+        memory.device_constraints[0].margin_bytes = 29;
+        assert!(!topology.validates_hardware_assessment(&wrong_limit));
+
+        let mut unknown_device = assessment.clone();
+        let HardwareAssessment::Fits { memory, .. } = &mut unknown_device else {
+            unreachable!();
+        };
+        memory.device_constraints[0].device_id = HardwareDeviceId::new("unknown");
+        assert!(!topology.validates_hardware_assessment(&unknown_device));
+
+        let mut duplicate_device = assessment;
+        let HardwareAssessment::Fits { memory, .. } = &mut duplicate_device else {
+            unreachable!();
+        };
+        memory
+            .device_constraints
+            .push(memory.device_constraints[0].clone());
+        assert!(!topology.validates_hardware_assessment(&duplicate_device));
     }
 }

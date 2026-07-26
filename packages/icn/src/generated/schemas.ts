@@ -718,7 +718,7 @@ export type GrammarTriggerResponseEncoded = S.Schema.Encoded<typeof GrammarTrigg
 export const HardwareDevice = S.Struct({
   backend: S.String,
   description: S.String,
-  id: S.String,
+  id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
   kind: S.suspend((): S.Schema<HardwareDeviceKind, HardwareDeviceKindEncoded> => HardwareDeviceKind),
   memory_limit: S.optionalWith(
     S.Union(
@@ -733,6 +733,10 @@ export const HardwareDevice = S.Struct({
 })
 export type HardwareDevice = S.Schema.Type<typeof HardwareDevice>
 export type HardwareDeviceEncoded = S.Schema.Encoded<typeof HardwareDevice>
+
+export const HardwareDeviceId = S.String
+export type HardwareDeviceId = S.Schema.Type<typeof HardwareDeviceId>
+export type HardwareDeviceIdEncoded = S.Schema.Encoded<typeof HardwareDeviceId>
 
 export const HardwareDeviceKind = S.Union(
   S.Literal("cpu"),
@@ -768,7 +772,7 @@ export const HardwareMemoryDomain = S.Struct({
     as: "Option",
   }),
   devices: S.Array(S.suspend((): S.Schema<HardwareDevice, HardwareDeviceEncoded> => HardwareDevice)),
-  id: S.String,
+  id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
   kind: S.suspend((): S.Schema<HardwareMemoryDomainKind, HardwareMemoryDomainKindEncoded> => HardwareMemoryDomainKind),
   shares_system_memory: S.Boolean,
   stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -969,13 +973,17 @@ export type LoadModelRequestEncoded = S.Schema.Encoded<typeof LoadModelRequest>
 export const MemoryAssessment = S.Struct({
   capacityBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   compatibilityReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  memoryDomainId: S.String,
+  memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
   remainingBytes: S.Number.pipe(S.int()),
   requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   warningReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type MemoryAssessment = S.Schema.Type<typeof MemoryAssessment>
 export type MemoryAssessmentEncoded = S.Schema.Encoded<typeof MemoryAssessment>
+
+export const MemoryDomainId = S.String
+export type MemoryDomainId = S.Schema.Type<typeof MemoryDomainId>
+export type MemoryDomainIdEncoded = S.Schema.Encoded<typeof MemoryDomainId>
 
 export const Modalities = S.Struct({
   audio: S.Boolean,
@@ -1057,6 +1065,15 @@ export const ModelFileRelationship = S.Union(
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("DraftFor"),
+      draftFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+      method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+      weightsFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
 )
 export type ModelFileRelationship = S.Schema.Type<typeof ModelFileRelationship>
 export type ModelFileRelationshipEncoded = S.Schema.Encoded<typeof ModelFileRelationship>
@@ -1064,6 +1081,7 @@ export type ModelFileRelationshipEncoded = S.Schema.Encoded<typeof ModelFileRela
 export const ModelFileRole = S.Union(
   S.Literal("weights"),
   S.Literal("projector"),
+  S.Literal("draft"),
   S.Literal("mtp"),
   S.Literal("auxiliary"),
 )
@@ -1456,7 +1474,7 @@ export const ResidentMemoryDomain = S.Struct({
   auxiliary_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   compute_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   context_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  memory_domain_id: S.String,
+  memory_domain_id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
   model_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ResidentMemoryDomain = S.Schema.Type<typeof ResidentMemoryDomain>
@@ -1516,6 +1534,50 @@ export type ServingProfileEncoded = S.Schema.Encoded<typeof ServingProfile>
 export const SpeculativeDecodingPairId = S.String
 export type SpeculativeDecodingPairId = S.Schema.Type<typeof SpeculativeDecodingPairId>
 export type SpeculativeDecodingPairIdEncoded = S.Schema.Encoded<typeof SpeculativeDecodingPairId>
+
+export const SpeculativeMethod = S.Union(
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("Mtp"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("DraftSimple"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("DraftEagle3"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("DraftDFlash"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("Ngram"),
+      method: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      _tag: S.Literal("UnknownNative"),
+      evidence: S.String,
+      method: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type SpeculativeMethod = S.Schema.Type<typeof SpeculativeMethod>
+export type SpeculativeMethodEncoded = S.Schema.Encoded<typeof SpeculativeMethod>
 
 export const SplitModeResponse = S.Union(S.Literal("none"), S.Literal("layer"), S.Literal("row"), S.Literal("tensor"))
 export type SplitModeResponse = S.Schema.Type<typeof SplitModeResponse>

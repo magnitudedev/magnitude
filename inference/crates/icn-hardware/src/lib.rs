@@ -20,11 +20,12 @@ use llama_cpp_2::model::params::fit::{FitReport, FitReportError};
 
 use icn_contracts::{
     ExecutionIntent, GenerationPerformanceAssessment, GenerationPerformanceConfidence,
-    GenerationSpeedPoint, HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceKind,
-    HardwareDeviceMemoryAssessment, HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitKind,
-    HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment, HardwareMemoryDomainKind,
-    HardwareProfile, HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory,
-    ModelExecutionAssessment, MtpConfig, MtpSource,
+    GenerationSpeedPoint, HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceId,
+    HardwareDeviceKind, HardwareDeviceMemoryAssessment, HardwareDeviceMemoryLimit,
+    HardwareDeviceMemoryLimitKind, HardwareMemory, HardwareMemoryDomain,
+    HardwareMemoryDomainAssessment, HardwareMemoryDomainKind, HardwareProfile,
+    HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory, ModelExecutionAssessment,
+    MtpConfig, MtpSource,
 };
 use llama_cpp_2::LlamaBackendDeviceType;
 use sha2::{Digest, Sha256};
@@ -33,7 +34,7 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 pub const GENERATION_PERFORMANCE_CONTEXTS: [u32; 4] = [8_192, 32_768, 100_000, 200_000];
 pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v5";
 /// Canonical identity for physical system memory in topology and plan assessments.
-pub const SYSTEM_MEMORY_DOMAIN_ID: &str = "system";
+use icn_contracts::MemoryDomainId;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// The system-memory policy shared by stable fitting, load admission, and runtime supervision.
@@ -233,8 +234,8 @@ pub struct CapacityPolicy {
 }
 
 impl CapacityPolicy {
-    fn reserve_for_domain(self, domain: &str) -> u64 {
-        if domain == SYSTEM_MEMORY_DOMAIN_ID {
+    fn reserve_for_domain(self, domain: &MemoryDomainId) -> u64 {
+        if domain.is_system() {
             self.system_reserve_bytes
                 .unwrap_or(self.reserve_bytes_per_domain)
         } else {
@@ -367,14 +368,15 @@ fn hardware_snapshot_from_devices(
         {
             shared.push(device);
         } else {
-            let physical_key = device.physical_id.clone().map_or_else(
-                || format!("backend:{}:{}", device.backend, device.native_index),
-                |id| format!("physical:{id}"),
+            let physical_key = dedicated_physical_key(
+                &device.backend,
+                device.native_index,
+                device.physical_id.as_deref(),
             );
             dedicated
                 .entry(physical_key)
                 .or_default()
-                .entry(device.backend.to_ascii_lowercase())
+                .entry(canonical_backend_identity(&device.backend))
                 .or_default()
                 .push(device);
         }
@@ -403,7 +405,7 @@ fn hardware_snapshot_from_devices(
                 .iter()
                 .any(|device| device.kind == HardwareDeviceKind::IntegratedGpu);
         domains.push(HardwareMemoryDomain {
-            id: SYSTEM_MEMORY_DOMAIN_ID.to_owned(),
+            id: MemoryDomainId::system(),
             kind: if unified {
                 HardwareMemoryDomainKind::UnifiedMemory
             } else {
@@ -411,13 +413,12 @@ fn hardware_snapshot_from_devices(
             },
             total_capacity_bytes: total,
             stable_capacity_bytes: total
-                .saturating_sub(policy.reserve_for_domain(SYSTEM_MEMORY_DOMAIN_ID)),
+                .saturating_sub(policy.reserve_for_domain(&MemoryDomainId::system())),
             current_free_bytes: Some(environment.system_memory.current_available_bytes),
             shares_system_memory: true,
             devices: shared
                 .into_iter()
-                .enumerate()
-                .map(|(ordinal, device)| public_device(device, ordinal, unified_platform, policy))
+                .map(|device| public_device(device, unified_platform, policy))
                 .collect(),
         });
     }
@@ -441,8 +442,7 @@ fn hardware_snapshot_from_devices(
                 continue;
             }
             let free = views.iter().filter_map(|device| device.free_bytes).max();
-            let id_material = format!("{physical_key}\0{ordinal}");
-            let id = format!("device-{:x}", Sha256::digest(id_material.as_bytes()));
+            let id = dedicated_memory_domain_id(&physical_key, ordinal);
             domains.push(HardwareMemoryDomain {
                 id,
                 kind: HardwareMemoryDomainKind::PhysicalDevice,
@@ -452,7 +452,7 @@ fn hardware_snapshot_from_devices(
                 shares_system_memory: false,
                 devices: views
                     .into_iter()
-                    .map(|device| public_device(device, ordinal, false, policy))
+                    .map(|device| public_device(device, false, policy))
                     .collect(),
             });
         }
@@ -588,18 +588,39 @@ fn device_order(left: &DiscoveredDevice, right: &DiscoveredDevice) -> std::cmp::
         ))
 }
 
+fn dedicated_memory_domain_id(physical_key: &str, ordinal: usize) -> MemoryDomainId {
+    let identity = format!("{physical_key}\0{ordinal}");
+    MemoryDomainId::new(format!("device-{:x}", Sha256::digest(identity.as_bytes())))
+}
+
+fn dedicated_physical_key(backend: &str, native_index: usize, physical_id: Option<&str>) -> String {
+    physical_id.map_or_else(
+        || {
+            format!(
+                "backend:{}:{native_index}",
+                canonical_backend_identity(backend)
+            )
+        },
+        |id| format!("physical:{id}"),
+    )
+}
+
+fn canonical_backend_identity(backend: &str) -> String {
+    match backend.to_ascii_lowercase().as_str() {
+        "metal" | "mtl" => "metal".to_owned(),
+        value => value.to_owned(),
+    }
+}
+
 fn public_device(
     device: DiscoveredDevice,
-    ordinal: usize,
     apple_unified: bool,
     policy: CapacityPolicy,
 ) -> HardwareDevice {
-    let identity = format!(
-        "{}\0{}\0{}\0{}\0{ordinal}",
-        device.backend,
-        device.physical_id.as_deref().unwrap_or(""),
+    let id = native_device_id(
+        &device.backend,
+        device.physical_id.as_deref(),
         device.native_index,
-        device.name
     );
     let memory_limit = (apple_unified
         && device.kind != HardwareDeviceKind::Cpu
@@ -609,11 +630,11 @@ fn public_device(
             total_bytes: device.total_bytes,
             stable_bytes: device
                 .total_bytes
-                .saturating_sub(policy.reserve_for_domain(SYSTEM_MEMORY_DOMAIN_ID)),
+                .saturating_sub(policy.reserve_for_domain(&MemoryDomainId::system())),
             current_free_bytes: device.free_bytes,
         });
     HardwareDevice {
-        id: format!("native-{:x}", Sha256::digest(identity.as_bytes())),
+        id,
         native_index: device.native_index,
         backend: device.backend,
         physical_id: device.physical_id,
@@ -622,6 +643,19 @@ fn public_device(
         kind: device.kind,
         memory_limit,
     }
+}
+
+fn native_device_id(
+    backend: &str,
+    physical_id: Option<&str>,
+    native_index: usize,
+) -> HardwareDeviceId {
+    let identity = format!(
+        "{}\0{}\0{native_index}",
+        canonical_backend_identity(backend),
+        physical_id.unwrap_or("")
+    );
+    HardwareDeviceId::new(format!("native-{:x}", Sha256::digest(identity.as_bytes())))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -639,13 +673,13 @@ pub enum NativeMemoryLocation {
 pub fn resolve_memory_domain<'a>(
     snapshot: &'a HardwareSnapshot,
     location: &NativeMemoryLocation,
-) -> Option<&'a str> {
+) -> Option<&'a MemoryDomainId> {
     match location {
         NativeMemoryLocation::Host => snapshot
             .memory_domains
             .iter()
             .find(|domain| domain.shares_system_memory)
-            .map(|domain| domain.id.as_str()),
+            .map(|domain| &domain.id),
         NativeMemoryLocation::Device {
             backend,
             physical_id,
@@ -667,7 +701,7 @@ pub fn resolve_memory_domain<'a>(
                         _ => false,
                     },
                 )
-                .then_some(domain.id.as_str())
+                .then_some(&domain.id)
         }),
     }
 }
@@ -860,7 +894,7 @@ fn plan_and_assess(
         profile,
         memory: HardwareDeficit {
             required_bytes: preferred.required_bytes,
-            available_bytes: preferred.available_bytes,
+            usable_capacity_bytes: preferred.usable_capacity_bytes,
             deficit_bytes: preferred.deficit_bytes,
             domains: preferred.domains.clone(),
             device_constraints: preferred.device_constraints.clone(),
@@ -1860,12 +1894,12 @@ fn assess_profiles_impl(
             // Every load must store every tensor exactly once in some physical memory
             // domain. llama_model_size is the native model's exact tensor storage, so
             // exceeding aggregate stable capacity is a proof of non-fit, not an estimate.
-            if report.model.tensor_bytes > preferred.available_bytes {
+            if report.model.tensor_bytes > preferred.usable_capacity_bytes {
                 let hardware = HardwareAssessment::DoesNotFit {
                     profile: hardware_profile(intent, &preferred),
                     memory: HardwareDeficit {
                         required_bytes: preferred.required_bytes,
-                        available_bytes: preferred.available_bytes,
+                        usable_capacity_bytes: preferred.usable_capacity_bytes,
                         deficit_bytes: preferred.deficit_bytes,
                         domains: preferred.domains,
                         device_constraints: preferred.device_constraints,
@@ -1956,7 +1990,7 @@ fn projector_memory(plan: &ExecutionIntent) -> Result<Vec<ProjectorMemory>, Asse
 struct CapacitySummary {
     fits: bool,
     required_bytes: u64,
-    available_bytes: u64,
+    usable_capacity_bytes: u64,
     deficit_bytes: u64,
     limiting_resource: String,
     device: String,
@@ -1967,10 +2001,10 @@ struct CapacitySummary {
 #[derive(Debug)]
 struct CapacityDomain {
     native_indices: Vec<usize>,
-    physical_id: Option<String>,
+    physical_key: Option<String>,
+    backends: BTreeSet<String>,
     shares_host_memory: bool,
-    kind: FitDeviceKind,
-    name: String,
+    id: MemoryDomainId,
     total_bytes: u64,
     model_bytes: u64,
     context_bytes: u64,
@@ -1982,6 +2016,7 @@ struct CapacityDomain {
 #[derive(Debug)]
 struct CapacityDeviceConstraint {
     native_index: usize,
+    device_id: HardwareDeviceId,
     name: String,
     kind: HardwareDeviceMemoryLimitKind,
     total_bytes: u64,
@@ -2092,30 +2127,30 @@ fn capacity_summary_for_topology(
         return Err(AssessmentError::MissingMeasurements);
     }
     let mut required_bytes = 0_u64;
-    let mut available_bytes = 0_u64;
-    let mut limiting_resource = domains[0].name.clone();
+    let mut usable_capacity_bytes = 0_u64;
+    let mut limiting_resource = domains[0].id.to_string();
     let mut largest_deficit = 0_u64;
     let mut fits = true;
     for domain in &domains {
-        let available = domain
+        let usable_capacity = domain
             .total_bytes
-            .saturating_sub(policy.reserve_for_domain(&domain.name));
-        let deficit = domain.required_bytes.saturating_sub(available);
+            .saturating_sub(policy.reserve_for_domain(&domain.id));
+        let deficit = domain.required_bytes.saturating_sub(usable_capacity);
         if deficit > 0 {
             fits = false;
         }
         if deficit >= largest_deficit {
             largest_deficit = deficit;
-            limiting_resource.clone_from(&domain.name);
+            limiting_resource = domain.id.to_string();
         }
         required_bytes = required_bytes.saturating_add(domain.required_bytes);
-        available_bytes = available_bytes.saturating_add(available);
+        usable_capacity_bytes = usable_capacity_bytes.saturating_add(usable_capacity);
     }
     for constraint in &device_constraints {
-        let available = constraint
+        let usable_capacity = constraint
             .total_bytes
             .saturating_sub(policy.reserve_for_device_constraint(&constraint.kind));
-        let deficit = constraint.required_bytes.saturating_sub(available);
+        let deficit = constraint.required_bytes.saturating_sub(usable_capacity);
         if deficit > 0 {
             fits = false;
         }
@@ -2127,30 +2162,31 @@ fn capacity_summary_for_topology(
     Ok(CapacitySummary {
         fits,
         required_bytes,
-        available_bytes,
+        usable_capacity_bytes,
         deficit_bytes: largest_deficit,
         limiting_resource,
         device: domains
             .iter()
-            .map(|domain| domain.name.as_str())
+            .map(|domain| domain.id.as_str())
             .collect::<Vec<_>>()
             .join(" + "),
         domains: domains
             .into_iter()
             .map(|domain| {
-                let available_bytes = domain
+                let usable_capacity_bytes = domain
                     .total_bytes
-                    .saturating_sub(policy.reserve_for_domain(&domain.name));
+                    .saturating_sub(policy.reserve_for_domain(&domain.id));
                 HardwareMemoryDomainAssessment {
-                    memory_domain: domain.name,
+                    memory_domain: domain.id,
                     model_bytes: domain.model_bytes,
                     context_bytes: domain.context_bytes,
                     compute_bytes: domain.compute_bytes,
                     auxiliary_bytes: domain.auxiliary_bytes,
                     required_bytes: domain.required_bytes,
-                    available_bytes,
-                    margin_bytes: (i128::from(available_bytes) - i128::from(domain.required_bytes))
-                        .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                    usable_capacity_bytes,
+                    margin_bytes: (i128::from(usable_capacity_bytes)
+                        - i128::from(domain.required_bytes))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
                         as i64,
                 }
             })
@@ -2158,10 +2194,11 @@ fn capacity_summary_for_topology(
         device_constraints: device_constraints
             .into_iter()
             .map(|constraint| {
-                let available_bytes = constraint
+                let usable_capacity_bytes = constraint
                     .total_bytes
                     .saturating_sub(policy.reserve_for_device_constraint(&constraint.kind));
                 HardwareDeviceMemoryAssessment {
+                    device_id: constraint.device_id,
                     device: constraint.name,
                     kind: constraint.kind,
                     model_bytes: constraint.model_bytes,
@@ -2169,8 +2206,8 @@ fn capacity_summary_for_topology(
                     compute_bytes: constraint.compute_bytes,
                     auxiliary_bytes: constraint.auxiliary_bytes,
                     required_bytes: constraint.required_bytes,
-                    available_bytes,
-                    margin_bytes: (i128::from(available_bytes)
+                    usable_capacity_bytes,
+                    margin_bytes: (i128::from(usable_capacity_bytes)
                         - i128::from(constraint.required_bytes))
                     .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
                         as i64,
@@ -2191,9 +2228,14 @@ fn add_additional_device_estimate(
     let domain = if unified {
         domains.first_mut()
     } else {
+        let physical_key =
+            dedicated_physical_key(&device.backend, device.index, device.device_id.as_deref());
         domains.iter_mut().find(|domain| {
-            (device.device_id.is_some() && domain.physical_id == device.device_id)
-                || (domain.native_indices.contains(&device.index) && domain.kind == device.kind)
+            domain.physical_key.as_deref() == Some(physical_key.as_str())
+                && (domain
+                    .backends
+                    .contains(&canonical_backend_identity(&device.backend))
+                    || domain.native_indices.contains(&device.index))
         })
     }
     .ok_or(AssessmentError::MissingMeasurements)?;
@@ -2258,6 +2300,7 @@ fn add_device_estimate(
     {
         device_constraints.push(CapacityDeviceConstraint {
             native_index: device.index,
+            device_id: native_device_id(&device.backend, device.device_id.as_deref(), device.index),
             name: device.name.clone(),
             kind: HardwareDeviceMemoryLimitKind::RecommendedWorkingSet,
             total_bytes,
@@ -2289,10 +2332,10 @@ fn add_device_estimate(
         } else {
             domains.push(CapacityDomain {
                 native_indices: vec![device.index],
-                physical_id: None,
+                physical_key: None,
+                backends: BTreeSet::from([device.backend.to_ascii_lowercase()]),
                 shares_host_memory: true,
-                kind: device.kind,
-                name: SYSTEM_MEMORY_DOMAIN_ID.to_owned(),
+                id: MemoryDomainId::system(),
                 total_bytes,
                 model_bytes: estimate.allocations.model_bytes,
                 context_bytes: estimate.allocations.context_bytes,
@@ -2301,34 +2344,44 @@ fn add_device_estimate(
                 required_bytes: estimate.allocations.total_bytes,
             });
         }
-    } else if let Some(domain) = device.device_id.as_ref().and_then(|physical_id| {
-        domains
-            .iter_mut()
-            .find(|domain| domain.physical_id.as_ref() == Some(physical_id))
-    }) {
-        domain.native_indices.push(device.index);
-        domain.total_bytes = domain.total_bytes.max(total_bytes);
-        domain.model_bytes = domain
-            .model_bytes
-            .saturating_add(estimate.allocations.model_bytes);
-        domain.context_bytes = domain
-            .context_bytes
-            .saturating_add(estimate.allocations.context_bytes);
-        domain.compute_bytes = domain
-            .compute_bytes
-            .saturating_add(estimate.allocations.compute_bytes);
-        domain.required_bytes = domain
-            .model_bytes
-            .saturating_add(domain.context_bytes)
-            .saturating_add(domain.compute_bytes)
-            .saturating_add(domain.auxiliary_bytes);
     } else {
+        let backend = canonical_backend_identity(&device.backend);
+        let physical_key =
+            dedicated_physical_key(&device.backend, device.index, device.device_id.as_deref());
+        let existing = domains.iter_mut().find(|domain| {
+            domain.physical_key.as_deref() == Some(physical_key.as_str())
+                && !domain.backends.contains(&backend)
+        });
+        if let Some(domain) = existing {
+            domain.backends.insert(backend);
+            domain.native_indices.push(device.index);
+            domain.total_bytes = domain.total_bytes.max(total_bytes);
+            domain.model_bytes = domain
+                .model_bytes
+                .saturating_add(estimate.allocations.model_bytes);
+            domain.context_bytes = domain
+                .context_bytes
+                .saturating_add(estimate.allocations.context_bytes);
+            domain.compute_bytes = domain
+                .compute_bytes
+                .saturating_add(estimate.allocations.compute_bytes);
+            domain.required_bytes = domain
+                .model_bytes
+                .saturating_add(domain.context_bytes)
+                .saturating_add(domain.compute_bytes)
+                .saturating_add(domain.auxiliary_bytes);
+            return Ok(());
+        }
+        let ordinal = domains
+            .iter()
+            .filter(|domain| domain.physical_key.as_deref() == Some(physical_key.as_str()))
+            .count();
         domains.push(CapacityDomain {
             native_indices: vec![device.index],
-            physical_id: device.device_id.clone(),
+            physical_key: Some(physical_key.clone()),
+            backends: BTreeSet::from([backend]),
             shares_host_memory: false,
-            kind: device.kind,
-            name: device.name.clone(),
+            id: dedicated_memory_domain_id(&physical_key, ordinal),
             total_bytes,
             model_bytes: estimate.allocations.model_bytes,
             context_bytes: estimate.allocations.context_bytes,
@@ -2375,9 +2428,9 @@ fn fits_assessment(
         profile: hardware_profile(plan, summary),
         memory: HardwareMemory {
             required_bytes: summary.required_bytes,
-            available_bytes: summary.available_bytes,
+            usable_capacity_bytes: summary.usable_capacity_bytes,
             headroom_bytes: summary
-                .available_bytes
+                .usable_capacity_bytes
                 .saturating_sub(summary.required_bytes),
             domains: summary.domains.clone(),
             device_constraints: summary.device_constraints.clone(),
@@ -2712,8 +2765,8 @@ mod tests {
             reserve_bytes_per_domain: 2,
             system_reserve_bytes: Some(10),
         };
-        assert_eq!(policy.reserve_for_domain("system"), 10);
-        assert_eq!(policy.reserve_for_domain("device"), 2);
+        assert_eq!(policy.reserve_for_domain(&MemoryDomainId::system()), 10);
+        assert_eq!(policy.reserve_for_domain(&MemoryDomainId::new("device")), 2);
     }
 
     fn discovered_device(
@@ -2805,7 +2858,7 @@ mod tests {
             },
         );
         assert_eq!(snapshot.memory_domains.len(), 3);
-        assert_eq!(snapshot.memory_domains[0].id, "system");
+        assert_eq!(snapshot.memory_domains[0].id, MemoryDomainId::system());
         for domain in &snapshot.memory_domains[1..] {
             assert_eq!(domain.total_capacity_bytes, 16_000);
             assert_eq!(domain.stable_capacity_bytes, 15_000);
@@ -2815,7 +2868,7 @@ mod tests {
         assert_eq!(snapshot.system_product_name, None);
         assert_eq!(
             resolve_memory_domain(&snapshot, &NativeMemoryLocation::Host),
-            Some("system"),
+            Some(&MemoryDomainId::system()),
         );
         assert_eq!(
             resolve_memory_domain(
@@ -2826,7 +2879,7 @@ mod tests {
                     native_index: 0,
                 },
             ),
-            Some(snapshot.memory_domains[1].id.as_str()),
+            Some(&snapshot.memory_domains[1].id),
         );
     }
 
@@ -3099,9 +3152,9 @@ mod tests {
         )
         .unwrap();
         assert!(summary.fits);
-        assert_eq!(summary.available_bytes, 900);
+        assert_eq!(summary.usable_capacity_bytes, 900);
         assert_eq!(summary.required_bytes, 400);
-        assert_eq!(summary.domains[0].memory_domain, SYSTEM_MEMORY_DOMAIN_ID);
+        assert_eq!(summary.domains[0].memory_domain, MemoryDomainId::system());
     }
 
     #[test]
@@ -3142,7 +3195,7 @@ mod tests {
         )
         .expect("capacity summary");
 
-        assert_eq!(summary.available_bytes, 15_000);
+        assert_eq!(summary.usable_capacity_bytes, 15_000);
         assert_eq!(summary.required_bytes, 7_000);
         assert_eq!(summary.domains.len(), 1);
     }
@@ -3203,10 +3256,10 @@ mod tests {
         let system = summary
             .domains
             .iter()
-            .find(|domain| domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID)
+            .find(|domain| domain.memory_domain.is_system())
             .expect("explicit system-memory domain");
         assert_eq!(system.required_bytes, 0);
-        assert_eq!(system.available_bytes, 62_000);
+        assert_eq!(system.usable_capacity_bytes, 62_000);
         assert_eq!(summary.domains.len(), 2);
     }
 
@@ -3257,10 +3310,10 @@ mod tests {
         )
         .expect("capacity summary");
 
-        assert_eq!(summary.available_bytes, 30_000);
+        assert_eq!(summary.usable_capacity_bytes, 30_000);
         assert_eq!(summary.required_bytes, 9_000);
         assert_eq!(summary.domains.len(), 1);
-        assert_eq!(summary.domains[0].memory_domain, SYSTEM_MEMORY_DOMAIN_ID);
+        assert_eq!(summary.domains[0].memory_domain, MemoryDomainId::system());
     }
 
     #[test]
@@ -3308,12 +3361,88 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(summary.available_bytes, 60_000);
+        assert_eq!(summary.usable_capacity_bytes, 60_000);
         assert_eq!(summary.required_bytes, 25_000);
-        assert_eq!(summary.domains[0].memory_domain, SYSTEM_MEMORY_DOMAIN_ID);
+        assert_eq!(summary.domains[0].memory_domain, MemoryDomainId::system());
         assert_eq!(summary.device_constraints.len(), 1);
-        assert_eq!(summary.device_constraints[0].available_bytes, 44_000);
+        assert_eq!(
+            summary.device_constraints[0].device_id,
+            native_device_id("MTL", None, 0)
+        );
+        assert_eq!(summary.device_constraints[0].usable_capacity_bytes, 44_000);
         assert_eq!(summary.device_constraints[0].required_bytes, 20_000);
+
+        let snapshot = hardware_snapshot_from_devices(
+            vec![
+                discovered_device(
+                    "CPU",
+                    "CPU",
+                    "Apple CPU",
+                    HardwareDeviceKind::Cpu,
+                    64_000,
+                    50_000,
+                ),
+                discovered_device(
+                    "MTL",
+                    "MTL0",
+                    "Apple GPU",
+                    HardwareDeviceKind::Gpu,
+                    48_000,
+                    40_000,
+                ),
+            ],
+            CapacityPolicy {
+                reserve_bytes_per_domain: 4_000,
+                system_reserve_bytes: None,
+            },
+            HardwareEnvironment {
+                native_build: "build".to_owned(),
+                enabled_backends: vec!["metal".to_owned()],
+                platform: "macos".to_owned(),
+                architecture: "aarch64".to_owned(),
+                system_product_name: Some("Mac".to_owned()),
+                logical_cores: 8,
+                system_memory: HardwareSystemMemory {
+                    total_bytes: 64_000,
+                    current_available_bytes: 50_000,
+                    warning_reserve_bytes: 0,
+                    assess_reserve_bytes: 0,
+                    abort_reserve_bytes: 0,
+                },
+            },
+        );
+        let topology =
+            icn_contracts::MemoryTopology::from_snapshot(&snapshot).expect("valid topology");
+        let assessment = HardwareAssessment::Fits {
+            profile: HardwareProfile {
+                context_length: 8_192,
+                acceleration: "gpu".to_owned(),
+                device: "system".to_owned(),
+            },
+            memory: HardwareMemory {
+                required_bytes: summary.required_bytes,
+                usable_capacity_bytes: summary.usable_capacity_bytes,
+                headroom_bytes: summary
+                    .usable_capacity_bytes
+                    .saturating_sub(summary.required_bytes),
+                domains: summary.domains,
+                device_constraints: summary.device_constraints,
+            },
+            recommendation: HardwareRecommendation::Recommended,
+        };
+        assert!(topology.validates_hardware_assessment(&assessment));
+    }
+
+    #[test]
+    fn native_device_identity_normalizes_backend_aliases() {
+        assert_eq!(
+            native_device_id("MTL", Some("gpu-0"), 1),
+            native_device_id("Metal", Some("gpu-0"), 1)
+        );
+        assert_ne!(
+            native_device_id("Metal", Some("gpu-0"), 1),
+            native_device_id("Metal", Some("gpu-0"), 2)
+        );
     }
 
     #[test]
@@ -3362,7 +3491,7 @@ mod tests {
         .expect("capacity summary");
 
         assert_eq!(summary.required_bytes, 48_000);
-        assert_eq!(summary.available_bytes, 62_000);
+        assert_eq!(summary.usable_capacity_bytes, 62_000);
         assert!(!summary.fits);
         assert_eq!(summary.deficit_bytes, 1_000);
         assert_eq!(summary.limiting_resource, "MTL0");
@@ -4264,7 +4393,7 @@ mod tests {
             },
             memory: HardwareDeficit {
                 required_bytes: 2,
-                available_bytes: 1,
+                usable_capacity_bytes: 1,
                 deficit_bytes: 1,
                 domains: Vec::new(),
                 device_constraints: Vec::new(),

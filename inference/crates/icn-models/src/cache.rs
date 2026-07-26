@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use getrandom::fill;
-use icn_contracts::{ContentId, HardwareAssessment, ModelExecutionAssessment};
+use icn_contracts::{ContentId, HardwareAssessment, MemoryTopology, ModelExecutionAssessment};
 use icn_utils::file_cache::{
     read_bytes, read_json, read_object, write_bytes_atomic, write_json_atomic,
 };
@@ -136,12 +136,13 @@ impl ModelCache {
         &self,
         content_id: &ContentId,
         hardware_evidence: &str,
+        topology: &MemoryTopology,
     ) -> Option<HardwareAssessment> {
         self.read_index::<HardwareAssessment>(
             ModelIndexKind::HardwareAssessment,
             &hardware_assessment_evidence(content_id, hardware_evidence),
         )
-        .filter(is_terminal_assessment)
+        .filter(|assessment| topology.validates_hardware_assessment(assessment))
     }
 
     pub fn write_hardware_assessment(
@@ -163,12 +164,13 @@ impl ModelCache {
         &self,
         content_id: &ContentId,
         execution_evidence: &str,
+        topology: &MemoryTopology,
     ) -> Option<ModelExecutionAssessment> {
         self.read_index::<ModelExecutionAssessment>(
             ModelIndexKind::ExecutionAssessment,
             &hardware_assessment_evidence(content_id, execution_evidence),
         )
-        .filter(|assessment| is_terminal_assessment(&assessment.hardware))
+        .filter(|assessment| topology.validates_hardware_assessment(&assessment.hardware))
     }
 
     pub fn write_execution_assessment(
@@ -331,21 +333,62 @@ mod tests {
             },
             "memory": {
                 "required_bytes": 1,
-                "available_bytes": 2,
+                "usable_capacity_bytes": 2,
                 "headroom_bytes": 1,
-                "domains": []
+                "domains": [{
+                    "memory_domain": "system",
+                    "model_bytes": 1,
+                    "context_bytes": 0,
+                    "compute_bytes": 0,
+                    "auxiliary_bytes": 0,
+                    "required_bytes": 1,
+                    "usable_capacity_bytes": 2,
+                    "margin_bytes": 1
+                }]
             },
             "recommendation": "recommended"
         }))
         .unwrap();
+        let topology = MemoryTopology::from_domains(&[icn_contracts::HardwareMemoryDomain {
+            id: icn_contracts::MemoryDomainId::system(),
+            kind: icn_contracts::HardwareMemoryDomainKind::System,
+            total_capacity_bytes: 2,
+            stable_capacity_bytes: 2,
+            current_free_bytes: Some(2),
+            shares_system_memory: true,
+            devices: Vec::new(),
+        }])
+        .unwrap();
         cache.write_hardware_assessment(&content_id, "hardware", &assessment);
         assert_eq!(
-            cache.read_hardware_assessment(&content_id, "hardware"),
-            Some(assessment)
+            cache.read_hardware_assessment(&content_id, "hardware", &topology),
+            Some(assessment.clone())
+        );
+        let mut capacity_corruption = assessment;
+        let HardwareAssessment::Fits { memory, .. } = &mut capacity_corruption else {
+            unreachable!();
+        };
+        memory.domains[0].usable_capacity_bytes = 1;
+        memory.domains[0].margin_bytes = 0;
+        memory.usable_capacity_bytes = 1;
+        memory.headroom_bytes = 0;
+        cache.write_hardware_assessment(
+            &content_id,
+            "internally-consistent-capacity-corruption",
+            &capacity_corruption,
         );
         assert!(
             cache
-                .read_hardware_assessment(&content_id, "different-hardware")
+                .read_hardware_assessment(
+                    &content_id,
+                    "internally-consistent-capacity-corruption",
+                    &topology,
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .read_hardware_assessment(&content_id, "different-hardware", &topology)
                 .is_none()
         );
 

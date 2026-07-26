@@ -1,7 +1,7 @@
 ---
 applies_to:
   - inference/crates/icn-hardware/**
-  - inference/crates/icn-contracts/src/models.rs
+  - inference/crates/icn-contracts/src/**
   - inference/crates/icn-server/src/main.rs
   - inference/crates/icn-server/src/memory_supervisor.rs
   - packages/acn/src/local-inference-hardware.ts
@@ -56,6 +56,10 @@ It does not persist presentation categories such as comfortable, tight, or too l
 clients derive compatibility and warning presentation directly from those quantities; catalog
 availability is not a second fit signal.
 
+Internal fitting assessments name the post-reserve quantity `usable_capacity_bytes`. The term
+`available` is reserved for live observations such as `current_available_bytes`; it never denotes
+cached compatibility capacity.
+
 Load admission uses a fresh whole-system availability sample `A`, taken again after planning and
 immediately before the worker is created:
 
@@ -68,10 +72,13 @@ snapshot includes a current whole-system availability measurement; inability to 
 the snapshot rather than publishing an unknown value. Windows commit availability is an additional
 independent gate using the same admission, eviction, and recovery boundaries.
 
-The planner and hardware topology use the single canonical physical domain identity `system`.
-Every complete native assessment includes that domain, including an explicit zero-byte requirement
-when all planned allocations are charged to dedicated devices. A missing system domain is
-incomplete evidence and fails closed.
+Memory-domain identity is one typed physical-topology concept shared by discovery, planning,
+assessment, cache validation, and resident allocation accounting. The planner and hardware topology
+use the single canonical identity `system` for memory shared with the operating system. Dedicated
+domain identities are derived from normalized physical-device identity, never display names.
+Every complete native assessment includes the system domain, including an explicit zero-byte
+requirement when all planned allocations are charged to dedicated devices. Missing, duplicate, or
+unknown domain identities are incomplete evidence and fail closed.
 
 The disposable inference worker is supervised from spawn through loading and serving every 100 ms:
 
@@ -123,5 +130,7 @@ capacity denominator. The indicator disappears outside ready residency; the Hard
 whole-system, application, free-memory, and per-allocation detail.
 
 While current hardware or system-domain evidence is unavailable, clients do not infer either
-compatibility or available headroom and do not expose load or selection actions. This transient
-unknown state is not mislabeled as `Free memory`.
+compatibility or available headroom and present memory status as unavailable. Model selection
+remains a durable configuration action; current load admission remains server-authoritative and
+fails closed without complete evidence. This transient unknown state is not mislabeled as
+`Free memory`.

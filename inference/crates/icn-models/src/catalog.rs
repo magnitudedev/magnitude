@@ -19,8 +19,6 @@ use crate::capabilities::model_capabilities;
 use crate::inventory::ModelManager;
 use crate::package_service::{offering_target_id, package_from_resolved};
 
-const CATALOG_RESOLUTION_REVISION: &str = "recommendable-model-catalog-v2-native-template";
-
 #[derive(Clone, Copy, Serialize)]
 struct CatalogModel {
     id: &'static str,
@@ -358,7 +356,6 @@ fn catalog_resolution_evidence(
     template_assessment_identity: &str,
 ) -> Result<String, InventoryError> {
     serde_json::to_string(&(
-        CATALOG_RESOLUTION_REVISION,
         template_assessment_identity,
         declaration,
         format,

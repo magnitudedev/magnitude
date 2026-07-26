@@ -24,7 +24,9 @@ This document defines Magnitude's local-model concepts and their relationships.
 ### Model file
 
 One immutable model-related file, identified by its contents and assigned a role such as weights,
-shard, projector, draft, or MTP.
+shard, projector, draft, or MTP. Draft and MTP are distinct roles. A model-backed draft file also
+records its speculative method; package construction never collapses an ordinary, Eagle3, or
+DFlash draft into MTP.
 
 ### Model package
 
@@ -86,8 +88,22 @@ exhaustion the failure is published.
 
 An ordered combination of a target model package and a draft model package.
 
-MTP weights form the draft package when they are independently packaged. An MTP or projector file
-intrinsic to one package remains a file in that package.
+MTP weights may form the draft package when they are independently packaged. An MTP or projector
+file intrinsic to one package remains a file in that package. Distribution layout and speculative
+method are independent facts: embedded-target MTP, companion MTP, and companion model-backed drafts
+remain distinguishable even when their files are distributed in one package.
+
+Typed package relationships preserve that distinction:
+
+```text
+ProjectorFor(projector, target)
+MtpFor(mtp, target)
+DraftFor(draft, target, method)
+```
+
+The draft method is declared by the package or retained as explicitly unresolved evidence until
+native inspection establishes it. Filenames may propose a relationship during discovery but are
+not authoritative method evidence.
 
 ### Model offering target
 
@@ -157,8 +173,9 @@ values. Package metadata retains llama.cpp's authoritative family name and a coa
 bit-width name derived by an exhaustive match over the binding's complete file-type enum. The recommendable
 model adds only recommendation-specific metadata.
 
-Each exact package or speculative pair is a separate recommendable model. Family or checkpoint
-grouping is presentation metadata, not operational identity.
+Each exact package or speculative pair is a separate recommendable model. A speculative target's
+method and component relationships are part of that exact target and therefore its identity.
+Family or checkpoint grouping is presentation metadata, not operational identity.
 
 ### Recommendable model catalog
 

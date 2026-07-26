@@ -90,7 +90,7 @@ pub fn validate_download_request(request: &DownloadModelRequest) -> Result<(), I
             ComponentRelationship::ProjectorFor { projector, model } => {
                 (projector, model, ComponentRole::Projector)
             }
-            ComponentRelationship::DraftFor { draft, model } => {
+            ComponentRelationship::DraftFor { draft, model, .. } => {
                 (draft, model, ComponentRole::Draft)
             }
             ComponentRelationship::MtpFor { mtp, model } => (mtp, model, ComponentRole::Mtp),

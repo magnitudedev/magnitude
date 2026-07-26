@@ -1209,7 +1209,7 @@ fn resident_memory_state(
     model_id: String,
     runtime_generation: u64,
 ) -> Result<ResidentMemory, HardwareObservationError> {
-    let mut domains = BTreeMap::<String, ResidentMemoryDomain>::new();
+    let mut domains = BTreeMap::<icn_contracts::MemoryDomainId, ResidentMemoryDomain>::new();
     for allocation in allocations {
         let location = match &allocation.location {
             LlamaMemoryLocation::Host => icn_hardware::NativeMemoryLocation::Host,
@@ -1231,9 +1231,9 @@ fn resident_memory_state(
                 }
             })?;
         let domain = domains
-            .entry(domain_id.to_owned())
+            .entry(domain_id.clone())
             .or_insert_with(|| ResidentMemoryDomain {
-                memory_domain_id: domain_id.to_owned(),
+                memory_domain_id: domain_id.clone(),
                 model_bytes: 0,
                 context_bytes: 0,
                 compute_bytes: 0,
@@ -4288,14 +4288,14 @@ mod tests {
             enabled_backends: vec!["MTL".to_owned()],
             topology_fingerprint: "test".to_owned(),
             memory_domains: vec![HardwareMemoryDomain {
-                id: "system".to_owned(),
+                id: icn_contracts::MemoryDomainId::system(),
                 kind: HardwareMemoryDomainKind::UnifiedMemory,
                 total_capacity_bytes: 64,
                 stable_capacity_bytes: 60,
                 current_free_bytes: Some(20),
                 shares_system_memory: true,
                 devices: vec![HardwareDevice {
-                    id: "metal".to_owned(),
+                    id: icn_contracts::HardwareDeviceId::new("metal"),
                     native_index: 1,
                     backend: "MTL".to_owned(),
                     physical_id: Some("metal-0".to_owned()),
@@ -4332,7 +4332,10 @@ mod tests {
         let resident = resident_memory_state(&snapshot, &evidence, "model".to_owned(), 7)
             .expect("exact device identities resolve");
         assert_eq!(resident.domains.len(), 1);
-        assert_eq!(resident.domains[0].memory_domain_id, "system");
+        assert_eq!(
+            resident.domains[0].memory_domain_id,
+            icn_contracts::MemoryDomainId::system()
+        );
         assert_eq!(resident.domains[0].model_bytes, 8);
         assert_eq!(resident.domains[0].context_bytes, 6);
         assert_eq!(resident.domains[0].compute_bytes, 4);

@@ -447,7 +447,12 @@ fn phase_work(configuration: &ModelServingConfiguration) -> BTreeMap<ModelLoadPh
         package
             .files
             .iter()
-            .filter(|file| matches!(file.role, ModelFileRole::Weights | ModelFileRole::Mtp))
+            .filter(|file| {
+                matches!(
+                    file.role,
+                    ModelFileRole::Weights | ModelFileRole::Draft | ModelFileRole::Mtp
+                )
+            })
             .map(|file| file.size_bytes)
             .sum()
     });
