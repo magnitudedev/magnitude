@@ -276,7 +276,7 @@ test('composer shell renders without an embedded task list (task list is the Age
 
   expect(html).not.toContain('horizontal:▀')
   expect(html).not.toContain('horizontal:▄')
-  expect(html).toContain('5k / 100k ctx (5%)')
+  expect(html).toContain('5k / 100k (5%)')
 })
 
 test('shows a single no-provider label instead of model and reasoning effort', () => {
@@ -338,7 +338,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
   expect(openText).toContain('None')
   expect(openText).toContain('Medium')
   expect(openText).toContain('Select reasoning level...')
-  expect(openText).not.toContain('5k / 100k ctx (5%)')
+  expect(openText).not.toContain('5k / 100k (5%)')
   expect(openText).not.toContain('Memory: 16GB')
   expect(openText).toContain('/tmp/default')
 
@@ -347,7 +347,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
   act(() => { (low!.props.onClick as () => void)() })
 
   expect(applied).toEqual(['low'])
-  expect(JSON.stringify(view.toJSON())).toContain('5k / 100k ctx (5%)')
+  expect(JSON.stringify(view.toJSON())).toContain('5k / 100k (5%)')
   expect(JSON.stringify(view.toJSON())).toContain('Memory: 16GB')
   act(() => { view.unmount() })
 })
