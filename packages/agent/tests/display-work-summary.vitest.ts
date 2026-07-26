@@ -160,7 +160,7 @@ describe('persistent root work summaries', () => {
     }])
   })
 
-  it('keeps the first TTFT and weights native decode throughput across continued turns', async () => {
+  it('weights native decode throughput across continued turns', async () => {
     const messages = await runDisplay([
       turnStarted('turn-1', 'chain-1', ts(1_000)),
       generationStarted('turn-1', 'chain-1', ts(1_500)),
@@ -185,7 +185,6 @@ describe('persistent root work summaries', () => {
     if (summary?.type !== 'work_summary') return
     expect(Option.getOrThrow(summary.performance)).toEqual({
       modelDisplayName: 'Qwen3 Coder',
-      timeToFirstTokenMs: 80,
       decodeTokensPerSecond: 40_000 / 1_500,
     })
   })
@@ -205,7 +204,10 @@ describe('persistent root work summaries', () => {
     const summary = messages.find((message) => message.type === 'work_summary')
     expect(summary?.type).toBe('work_summary')
     if (summary?.type !== 'work_summary') return
-    expect(Option.getOrThrow(summary.performance).decodeTokensPerSecond).toBe(24.5)
+    expect(Option.getOrThrow(summary.performance)).toEqual({
+      modelDisplayName: 'Qwen3 Coder',
+      decodeTokensPerSecond: 24.5,
+    })
   })
 
   it('keeps counting an active worker during root prefill, then pauses when it settles', async () => {

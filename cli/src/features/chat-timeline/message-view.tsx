@@ -57,18 +57,12 @@ function formatWorkDuration(durationMs: number): string {
   return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`
 }
 
-function formatTimeToFirstToken(milliseconds: number): string {
-  if (milliseconds < 1_000) return `${Math.round(milliseconds)}ms`
-  return `${(milliseconds / 1_000).toFixed(1)}s`
-}
-
 const WorkSummaryRow = ({ message }: { message: Extract<DisplayMessage, { type: 'work_summary' }> }) => {
   const theme = useTheme()
   const label = Option.match(message.performance, {
     onNone: () => `Worked for ${formatWorkDuration(message.durationMs)}`,
     onSome: (performance) =>
       `${performance.modelDisplayName} worked for ${formatWorkDuration(message.durationMs)}`
-      + ` · ${formatTimeToFirstToken(performance.timeToFirstTokenMs)} ttft`
       + ` · ${performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
   })
   return (

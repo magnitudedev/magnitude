@@ -91,7 +91,6 @@ export type StatusIndicatorMessage = Schema.Schema.Type<typeof StatusIndicatorMe
 
 export const WorkSummaryPerformance = Schema.Struct({
   modelDisplayName: Schema.String,
-  timeToFirstTokenMs: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   decodeTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
 })
 export type WorkSummaryPerformance = Schema.Schema.Type<typeof WorkSummaryPerformance>

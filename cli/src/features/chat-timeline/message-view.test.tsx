@@ -40,31 +40,17 @@ describe('work summary message', () => {
     expect(html).toContain('Worked for 1:05')
   })
 
-  it('renders native model performance with the standard separators', () => {
+  it('renders native model throughput with the standard separator', () => {
     const message: DisplayMessage = {
       ...summary(6_000),
       performance: Option.some({
         modelDisplayName: 'Qwen3 Coder',
-        timeToFirstTokenMs: 6.2,
         decodeTokensPerSecond: 20.46,
       }),
     }
     const html = renderToStaticMarkup(<MessageView message={message} isStreaming={false} />)
 
-    expect(html).toContain('Qwen3 Coder worked for 6 seconds · 6ms ttft · 20.5 tok/s')
-  })
-
-  it('keeps long first-request TTFT values compact and visible', () => {
-    const message: Extract<DisplayMessage, { type: 'work_summary' }> = {
-      ...summary(20_000),
-      performance: Option.some({
-        modelDisplayName: 'Qwen3 Coder',
-        timeToFirstTokenMs: 15_000,
-        decodeTokensPerSecond: 20.5,
-      }),
-    }
-    const html = renderToStaticMarkup(<MessageView message={message} isStreaming={false} />)
-
-    expect(html).toContain('· 15.0s ttft ·')
+    expect(html).toContain('Qwen3 Coder worked for 6 seconds · 20.5 tok/s')
+    expect(html).not.toContain('ttft')
   })
 })
