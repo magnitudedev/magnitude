@@ -8,8 +8,10 @@ import {
   createAgentClient,
   useLocalInferenceQuery,
 } from "@magnitudedev/client-common"
-import { protocolLayer } from "@magnitudedev/sdk"
-import { deriveInferenceRuntimeBadgeView } from "./runtime-badge"
+import { PRIMARY_SLOT_ID, ProviderIdSchema, protocolLayer } from "@magnitudedev/sdk"
+import { deriveLocalInferenceFooterView } from "./footer-status"
+
+const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 
 vi.mock("../../hooks/use-theme", () => ({
   useTheme: () => ({
@@ -29,11 +31,16 @@ test.skipIf(Option.isNone(acnUrl))("live independent mirrors compose into the lo
       return <text>mirror:{result._tag}</text>
     }
     rendered.push("success")
-    const badge = deriveInferenceRuntimeBadgeView(result.value)
+    const footer = deriveLocalInferenceFooterView(
+      result.value,
+      null,
+      LOCAL_PROVIDER_ID,
+      PRIMARY_SLOT_ID,
+    )
     return (
       <box style={{ flexDirection: "column" }}>
         <text>mirror:success</text>
-        <text>{badge.memoryLabel ?? "memory:unavailable"}</text>
+        <text>{footer.memoryLabel ?? "memory:unavailable"}</text>
       </box>
     )
   }

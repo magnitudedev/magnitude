@@ -155,9 +155,9 @@ row of visual padding above and below it. A solid mode border sits immediately o
 surface and spans its full height; additional visual input lines grow only from actual draft
 content. Pending attachments render inside that surface rather than competing with persistent
 status. The terminal-background footer below it derives model selection, reasoning effort, local
-residency, working directory, and context usage directly from authoritative mirrors and display
-state. Model, effort, and context usage form the left group with stable spacing; the working
-directory is the only right-aligned item. Local residency uses distinct loaded,
+residency, working directory, context usage, and resident memory directly from authoritative
+mirrors and display state. Model, effort, context usage, and resident memory form the left group
+with stable spacing; the working directory is the only right-aligned item. Local residency uses distinct loaded,
 transitional, and unloaded glyphs; detailed load percentage and failures remain in the activity
 rail.
 
@@ -170,13 +170,13 @@ Enter or a clicked choice
 commits through the existing model-configuration mutation, and Escape closes without changing the
 saved effort. It has no timeout and never renders inside the colored composer surface.
 
-A separate local-inference badge is absolutely overlaid at the upper-right of the chat shell and
-inherits the terminal background without reserving layout space. It derives global
-singleton-worker state across both model slots and the server-published resident allocation. Ready
-residency uses a green glyph and compact memory; loading, unloading, and mirror convergence animate
-without memory; idle and runtime-loss states
-remain visible without a memory placeholder. The badge opens the Hardware menu for detailed memory
-accounting. It may overlay timeline content but does not extend across the file viewer.
+When the selected local-model slot is ready and its server-published resident allocation is
+available, the composer footer shows one compact memory value exactly three spaces after context,
+for example `24 GB mem`. The value sums model, context, compute, and auxiliary allocations across
+participating memory domains. It uses the same muted presentation as context and is plain,
+non-interactive text. Memory disappears completely for cloud, loading, unloading, unloaded,
+failed, or unavailable states, and while the reasoning selector temporarily replaces context.
+There is no separate local-inference badge or client-owned transition state.
 
 While the root slot is loading, the rail may present its authoritative percentage as well as
 persistent model chrome. Both presentations derive from the one mirrored slot lifecycle state;
