@@ -194,6 +194,7 @@ export function Composer(props: ComposerProps) {
     interruptFork,
     interruptAll,
     openSettings,
+    openHardware,
     thinkingOptions,
     applyThinking,
     handleWidgetKeyEvent,
@@ -251,6 +252,7 @@ export function Composer(props: ComposerProps) {
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
+  const [memoryLabelHovered, setMemoryLabelHovered] = useState(false)
   const [thinkingOpen, setThinkingOpen] = useState(false)
   const currentThinkingIndex = Math.max(
     0,
@@ -697,7 +699,17 @@ export function Composer(props: ComposerProps) {
               {modelFooter.memoryLabel !== null && (
                 <>
                   <box style={{ width: 3, flexShrink: 0 }} />
-                  <text style={{ fg: theme.muted }}>{modelFooter.memoryLabel}</text>
+                  <Button
+                    onClick={openHardware}
+                    onMouseOver={() => setMemoryLabelHovered(true)}
+                    onMouseOut={() => setMemoryLabelHovered(false)}
+                  >
+                    <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
+                      <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                        {modelFooter.memoryLabel}
+                      </span>
+                    </text>
+                  </Button>
                 </>
               )}
             </>

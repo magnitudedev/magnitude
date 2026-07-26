@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { create, type ReactTestInstance } from 'react-test-renderer'
 import { act, type ReactNode } from 'react'
 import { Option } from 'effect'
+import { TextAttributes } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
 import type { ComposerProps } from './types'
 import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type TaskDisplayRow } from '@magnitudedev/sdk'
@@ -244,6 +245,7 @@ function makeProps(): ComposerProps {
     interruptFork: noop,
     interruptAll: noop,
     openSettings: noop,
+    openHardware: noop,
     thinkingOptions: [],
     applyThinking: noop,
     handleWidgetKeyEvent: () => false,
@@ -286,7 +288,8 @@ test('shows a single no-provider label instead of model and reasoning effort', (
   expect(html).not.toContain('>high<')
 })
 
-test('shows resident memory three spaces after context', () => {
+test('shows resident memory three spaces after context and links it to hardware', () => {
+  const openHardware = vi.fn()
   const localInferenceState = makeView({
     hardware: makeHardware({
       residentMemory: Option.some({
@@ -305,12 +308,44 @@ test('shows resident memory three spaces after context', () => {
       {...makeProps()}
       localInferenceState={localInferenceState}
       selectedProviderId={LOCAL_PROVIDER_ID}
+      openHardware={openHardware}
     />,
   )
 
   expect(html).toContain(
-    '5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><text style="fg:#888888">16 GB mem',
+    '5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><box><text style="fg:#888888"><span attributes="0">16 GB mem',
   )
+
+  let view!: ReturnType<typeof create>
+  act(() => {
+    view = create(
+      <Composer
+        {...makeProps()}
+        localInferenceState={localInferenceState}
+        selectedProviderId={LOCAL_PROVIDER_ID}
+        openHardware={openHardware}
+      />,
+    )
+  })
+  const textOf = (node: ReactTestInstance): string => node.children
+    .map((child) => typeof child === 'string' ? child : textOf(child))
+    .join('')
+  const memoryButton = view.root.findAll(
+    (node) => typeof node.props.onClick === 'function',
+  ).find((node) => textOf(node) === '16 GB mem')
+  expect(memoryButton).toBeDefined()
+  act(() => { (memoryButton!.props.onMouseOver as () => void)() })
+  const hoveredMemory = view.root.findAll(
+    (node) => node.type === 'text' && textOf(node) === '16 GB mem',
+  )[0]!
+  expect(hoveredMemory.props.style).toEqual({ fg: theme.primary })
+  expect(hoveredMemory.findByType('span').props.attributes).toBe(TextAttributes.UNDERLINE)
+  act(() => { (memoryButton!.props.onMouseOut as () => void)() })
+  act(() => {
+    (memoryButton!.props.onClick as () => void)()
+  })
+  expect(openHardware).toHaveBeenCalledOnce()
+  act(() => { view.unmount() })
 })
 
 test('clicking effort opens the footer selector and clicking an option commits it', () => {
