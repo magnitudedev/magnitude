@@ -48,12 +48,12 @@ describe("ACN model-state transitions", () => {
     expect(applyLocalModelLoadProgress(loading, 1)).toMatchObject({ percentage: 99 })
   })
 
-  it("treats repeated load and unload commands as already satisfied", () => {
+  it("only treats terminal runtime states as satisfied", () => {
     expect(isModelSlotLoadSatisfied(new ModelSlotLoadingLocalModel({
       slotId: PRIMARY_SLOT_ID,
       selection: localSelection,
       percentage: 0,
-    }))).toBe(true)
+    }))).toBe(false)
     expect(isModelSlotLoadSatisfied(new ModelSlotReady({
       slotId: PRIMARY_SLOT_ID,
       selection: localSelection,
@@ -61,7 +61,7 @@ describe("ACN model-state transitions", () => {
     expect(isModelSlotUnloadSatisfied(new ModelSlotUnloadingLocalModel({
       slotId: PRIMARY_SLOT_ID,
       selection: localSelection,
-    }))).toBe(true)
+    }))).toBe(false)
     expect(isModelSlotUnloadSatisfied(new ModelSlotUnloadedLocalModel({
       slotId: PRIMARY_SLOT_ID,
       selection: localSelection,

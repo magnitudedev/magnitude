@@ -53,6 +53,11 @@ server, registration, and private ICN are ready.
 Finite RPCs keep ACN alive for the full request. Work that continues after a request—such as an
 agent turn or model operation—keeps its own claim until it finishes.
 
+Operation cancellation follows semantic ownership rather than the initiating transport. Shared
+work admitted by a domain service is owned in that service's scope; losing one request cancels only
+that request's wait. Finite mutations become outcome-total at their linearization point. The
+complete classification is defined by [operation ownership](./operation-ownership.md).
+
 Observation does not keep ACN alive. This includes health checks, subscriptions, status and file
 watches, mirrored-state refresh, display streams, ICN observation, telemetry, and introspection.
 
@@ -73,6 +78,9 @@ owned detached processes. Both UI status and runtime lifetime use that status.
 Session startup is single-flight. Unloading closes the current runtime before publishing it as
 absent; later work creates a new runtime. A draft stores session intent, not a runtime. Deletion
 blocks new work, waits for current work to finish, closes the runtime, then deletes durable state.
+Draft preload and claim phases are outcome-total: cancellation removes or restores the phase.
+Claiming linearizes creation; initial message or goal publication and draft promotion or rollback
+then complete before client interruption can take effect.
 
 Preloaded and resident sessions consume one ACN-owned, revisioned model configuration. A slot
 mutation publishes its new configuration before it succeeds. Before a session accepts an external

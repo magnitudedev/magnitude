@@ -1,5 +1,5 @@
 import { FetchHttpClient } from "@effect/platform"
-import { Context, Data, Effect, Either, Layer, Match, Option, Schema, Scope, Stream } from "effect"
+import { Cause, Context, Data, Effect, Either, Exit, Layer, Match, Option, Schema, Scope, Stream } from "effect"
 import {
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
@@ -23,6 +23,8 @@ import {
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 import { LocalProviderOfferingProjection } from "./local-provider-offering-projection"
+import { AcnActivityTracker } from "./activity-tracker"
+import { makeServiceOperationCoordinator } from "./service-operation-coordinator"
 
 class ProviderContractViolation extends Data.TaggedError("ProviderContractViolation")<{
   readonly providerId: ProviderId
@@ -167,15 +169,27 @@ export class ProviderModelCatalog extends Context.Tag("ProviderModelCatalog")<
   ProviderModelCatalogApi
 >() {}
 
+const sameRefreshTarget = (
+  left: Option.Option<ProviderId>,
+  right: Option.Option<ProviderId>,
+): boolean =>
+  Option.isNone(left)
+    ? Option.isNone(right)
+    : Option.isSome(right) && left.value === right.value
+
 export const ProviderModelCatalogLive: Layer.Layer<
   ProviderModelCatalog,
   never,
-  ProviderClient | LocalProviderOfferingProjection | MirroredStateChanges
+  ProviderClient | LocalProviderOfferingProjection | MirroredStateChanges | AcnActivityTracker
 > = Layer.scoped(ProviderModelCatalog, Effect.gen(function* () {
   const client = yield* ProviderClient
   const localProjection = yield* LocalProviderOfferingProjection
   const scope = yield* Scope.Scope
   const lock = yield* Effect.makeSemaphore(1)
+  const refreshOperations = yield* makeServiceOperationCoordinator<
+    Option.Option<ProviderId>,
+    never
+  >(sameRefreshTarget)
   const mirror = yield* makeMirroredState(ProviderModelCatalogMirror, new ProviderModelCatalogLoading({}))
   const equivalent = Schema.equivalence(ProviderModelCatalogMirror.stateSchema)
 
@@ -295,16 +309,72 @@ export const ProviderModelCatalogLive: Layer.Layer<
     }))
 
   yield* refreshNow(false, Option.none())
-  yield* Effect.forkIn(localProjection.changes.pipe(
-    Stream.runForEach(() => lock.withPermits(1)(Effect.gen(function* () {
-      yield* beginRefresh
-      yield* reconcile([])
-    }))),
-  ), scope)
+
+  const terminalizeRefreshFailure = (cause: Cause.Cause<unknown>) => Effect.gen(function* () {
+    yield* beginRefresh
+    const previous = contents((yield* mirror.get).state)
+    yield* publish(
+      previous.providers,
+      previous.models,
+      [
+        ...previous.failures.filter((failure) => failure._tag === "ProviderFailure"),
+        catalogFailure(Cause.pretty(cause).slice(0, 1_000)),
+      ],
+    )
+  })
+
+  const admitRefresh = (
+    providerId: Option.Option<ProviderId>,
+  ) => refreshOperations.admit(Effect.succeed({
+    key: providerId,
+    whenIdle: Effect.succeed(Option.some({
+      activityLabel: "provider-model-catalog:refresh",
+      commit: beginRefresh,
+      operation: refreshNow(true, providerId),
+      terminalize: (exit: Exit.Exit<void, never>) =>
+        Effect.gen(function* () {
+          if (Exit.isFailure(exit)) {
+            yield* lock.withPermits(1)(terminalizeRefreshFailure(exit.cause))
+          }
+        }),
+    })),
+  })).pipe(Effect.orDie)
+
+  const requestRefresh = (
+    providerId: Option.Option<ProviderId>,
+  ): Effect.Effect<void> => Effect.suspend(() => admitRefresh(providerId)).pipe(
+    Effect.flatMap((admission) =>
+      admission._tag === "Satisfied" ? Effect.void : admission.outcome.pipe(
+        Effect.zipRight(admission._tag === "Conflicting"
+          ? Effect.suspend(() => requestRefresh(providerId))
+          : Effect.void),
+      )),
+  )
+
+  const reconcileLocalProjection = lock.withPermits(1)(Effect.gen(function* () {
+    yield* beginRefresh
+    yield* reconcile([])
+  })).pipe(
+    Effect.catchAllCause((cause) =>
+      lock.withPermits(1)(terminalizeRefreshFailure(cause)).pipe(
+        Effect.zipRight(Effect.logError("Unable to reconcile local provider offerings").pipe(
+          Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 1_000) }),
+        )),
+      )),
+  )
+
+  yield* Effect.forkIn(
+    localProjection.changes.pipe(
+      // A local offering change only reprojects cached catalog outcomes. It
+      // must not force remote catalog refresh or hold background activity.
+      Stream.runForEach(() => reconcileLocalProjection),
+    ),
+    scope,
+  )
 
   return ProviderModelCatalog.of({
     snapshot: mirror.get,
     changes: mirror.changes,
-    refresh: (providerId) => refreshNow(true, providerId),
+    refresh: requestRefresh,
   })
 }))

@@ -1,9 +1,12 @@
 import {
+  Cause,
   Context,
   Effect,
+  Exit,
   Layer,
   Match,
   Option,
+  Ref,
   Schema,
   Scope,
   Stream,
@@ -23,6 +26,7 @@ import {
   ModelSlotUnloadedLocalModel,
   ModelSlotUnloadingLocalModel,
   ModelSlotsMirror,
+  LocalModelMutationFailed,
   ModelPreferenceMutationFailed,
   ModelSlotMutationRejected,
   ModelSlotMutationFailed,
@@ -52,6 +56,12 @@ import { LocalModelRuntime } from "./local-model-runtime"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { modelOfferingTargetPackageIds } from "@magnitudedev/protocol"
 import { ProviderModelCatalog } from "./provider-model-catalog"
+import { AcnActivityTracker } from "./activity-tracker"
+import {
+  makeServiceOperationCoordinator,
+  type ServiceOperationAdmission,
+  type ServiceOperationRequest,
+} from "./service-operation-coordinator"
 
 export interface ModelSlotCoordinatorApi {
   readonly snapshot: Effect.Effect<MirroredSnapshot<ModelSlotsState>>
@@ -72,12 +82,26 @@ export interface ModelSlotCoordinatorApi {
   ) => Effect.Effect<void, ModelPreferenceMutationFailed>
   readonly loadModel: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
   readonly unloadModel: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
+  readonly unloadModelAndWait: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
 }
 
 export class ModelSlotCoordinator extends Context.Tag("ModelSlotCoordinator")<
   ModelSlotCoordinator,
   ModelSlotCoordinatorApi
 >() {}
+
+type RuntimeTransitionKey =
+  | {
+      readonly _tag: "Load"
+      readonly providerModelId: ProviderModelId
+    }
+  | {
+      readonly _tag: "Unload"
+      readonly providerModelId: ProviderModelId
+    }
+
+const sameTransition = (left: RuntimeTransitionKey, right: RuntimeTransitionKey): boolean =>
+  left._tag === right._tag && left.providerModelId === right.providerModelId
 
 const sameSelection = (left: SlotSelection, right: SlotSelection): boolean =>
   left.providerId === right.providerId
@@ -150,10 +174,10 @@ export const recoverRecentLocalSelection = (
 })
 
 export const isModelSlotLoadSatisfied = (slot: ModelSlot): boolean =>
-  slot._tag === "Ready" || slot._tag === "LoadingLocalModel"
+  slot._tag === "Ready"
 
 export const isModelSlotUnloadSatisfied = (slot: ModelSlot): boolean =>
-  slot._tag === "UnloadedLocalModel" || slot._tag === "UnloadingLocalModel"
+  slot._tag === "UnloadedLocalModel"
 
 const catalogContents = (state: ProviderModelCatalogState) => ProviderModelCatalogLifecycle.match(state, {
   Loading: () => ({ providers: [] as readonly ProviderCatalogEntry[], models: [] as readonly ProviderModelCatalogEntry[], failures: [] as readonly ProviderCatalogFailure[] }),
@@ -357,7 +381,7 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
   ModelSlotCoordinator,
   never,
   ModelConfiguration | LocalModelPackages | LocalModelRuntime
-    | LocalProviderOfferings | ProviderModelCatalog | MirroredStateChanges
+    | LocalProviderOfferings | ProviderModelCatalog | MirroredStateChanges | AcnActivityTracker
 > = Layer.scoped(ModelSlotCoordinator, Effect.gen(function* () {
   const configuration = yield* ModelConfiguration
   const localPackages = yield* LocalModelPackages
@@ -367,6 +391,10 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
   const scope = yield* Scope.Scope
   const reconciliationLock = yield* Effect.makeSemaphore(1)
   const modelAdmission = yield* Effect.makeSemaphore(1)
+  const transitions = yield* makeServiceOperationCoordinator<
+    RuntimeTransitionKey,
+    LocalInferenceError
+  >(sameTransition)
 
   const localSlotTarget = (
     slotId: SlotId,
@@ -654,10 +682,44 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     })),
   ), scope)
 
-  const unloadProviderModel = (
-    providerModelId: ProviderModelId,
-  ): Effect.Effect<void, LocalInferenceError> => Effect.gen(function* () {
-    yield* updateMatchingLocalSlots(providerModelId, (slot) => {
+  const transitionFailure = (
+    operation: RuntimeTransitionKey,
+    cause: Cause.Cause<LocalInferenceError>,
+  ): LocalInferenceError => Option.getOrElse(Cause.failureOption(cause), () =>
+    new LocalModelMutationFailed({
+      code: Cause.isInterruptedOnly(cause)
+        ? "local_model_transition_interrupted"
+        : "local_model_transition_defect",
+      message: Cause.isInterruptedOnly(cause)
+        ? `The ${operation._tag.toLowerCase()} operation was interrupted`
+        : Cause.pretty(cause).slice(0, 1_000),
+      retryable: true,
+    }))
+
+  const loadFailureDetails = (error: LocalInferenceError) => ({
+    code: "code" in error ? error.code : error._tag,
+    message: error.message,
+    retryable: "retryable" in error ? error.retryable : false,
+  })
+
+  const beginLoadState = (providerModelId: ProviderModelId) =>
+    updateMatchingLocalSlots(providerModelId, (current) => {
+      switch (current._tag) {
+        case "Ready": {
+          const unloaded = ModelSlotLifecycle.transition(current, "UnloadedLocalModel", {})
+          return ModelSlotLifecycle.transition(unloaded, "LoadingLocalModel", { percentage: 0 })
+        }
+        case "UnloadedLocalModel":
+        case "UnloadingLocalModel":
+        case "Blocked":
+          return ModelSlotLifecycle.transition(current, "LoadingLocalModel", { percentage: 0 })
+        case "LoadingLocalModel":
+          return ModelSlotLifecycle.hold(current, { percentage: 0 })
+      }
+    })
+
+  const beginUnloadState = (providerModelId: ProviderModelId) =>
+    updateMatchingLocalSlots(providerModelId, (slot) => {
       switch (slot._tag) {
         case "Ready":
         case "LoadingLocalModel":
@@ -669,13 +731,9 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
           return slot
       }
     })
-    yield* localRuntime.unload(providerModelId).pipe(
-      Effect.tapError(() => updateMatchingLocalSlots(providerModelId, (slot) =>
-        slot._tag === "UnloadingLocalModel"
-          ? ModelSlotLifecycle.transition(slot, "Ready", {})
-          : slot)),
-    )
-    yield* updateMatchingLocalSlots(providerModelId, (slot) => {
+
+  const completeUnload = (providerModelId: ProviderModelId) =>
+    updateMatchingLocalSlots(providerModelId, (slot) => {
       switch (slot._tag) {
         case "UnloadedLocalModel":
           return ModelSlotLifecycle.hold(slot, {})
@@ -687,7 +745,175 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
           return slot
       }
     })
+
+  const restoreFailedUnload = (providerModelId: ProviderModelId) =>
+    updateMatchingLocalSlots(providerModelId, (slot) =>
+      slot._tag === "UnloadingLocalModel"
+        ? ModelSlotLifecycle.transition(slot, "Ready", {})
+        : slot)
+
+  const terminalizeTransition = (
+    operation: RuntimeTransitionKey,
+    exit: Exit.Exit<void, LocalInferenceError>,
+  ) => Effect.gen(function* () {
+    if (Exit.isSuccess(exit)) {
+      if (operation._tag === "Load") {
+        yield* completeLoad(operation.providerModelId)
+      } else {
+        yield* completeUnload(operation.providerModelId)
+      }
+    } else {
+      const error = transitionFailure(operation, exit.cause)
+      if (operation._tag === "Load") {
+        yield* blockLoad(operation.providerModelId, loadFailureDetails(error))
+      } else {
+        yield* restoreFailedUnload(operation.providerModelId)
+      }
+      yield* Effect.logWarning("Owned local-model transition failed").pipe(
+        Effect.annotateLogs({
+          transition: operation._tag,
+          providerModelId: operation.providerModelId,
+          cause: Cause.pretty(exit.cause).slice(0, 1_000),
+        }),
+      )
+    }
   })
+
+  const admitTransition = <AdmissionError>(
+    request: Effect.Effect<
+      ServiceOperationRequest<RuntimeTransitionKey, LocalInferenceError, AdmissionError>,
+      AdmissionError
+    >,
+  ): Effect.Effect<ServiceOperationAdmission<LocalInferenceError>, AdmissionError | LocalInferenceError> =>
+    transitions.admit(request).pipe(
+      Effect.catchTag("ResourceRetired", () => Effect.fail(new LocalModelMutationFailed({
+        code: "local_model_transition_not_admitted",
+        message: "ACN is no longer accepting local model work",
+        retryable: true,
+      }))),
+    )
+
+  const unloadDefinition = (
+    key: Extract<RuntimeTransitionKey, { readonly _tag: "Unload" }>,
+  ) => ({
+    activityLabel: `local-model:unload:${key.providerModelId}`,
+    commit: beginUnloadState(key.providerModelId).pipe(Effect.asVoid),
+    operation: modelAdmission.withPermits(1)(localRuntime.unload(key.providerModelId)),
+    terminalize: (exit: Exit.Exit<void, LocalInferenceError>) =>
+      terminalizeTransition(key, exit),
+  })
+
+  const admitLoad = (slotId: SlotId): Effect.Effect<
+    ServiceOperationAdmission<LocalInferenceError>,
+    LocalInferenceError
+  > => admitTransition(Effect.gen(function* () {
+      const slot = yield* selectedSlot(slotId)
+      if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) {
+        return yield* reject(slotId, "The slot does not contain a local model")
+      }
+      const providerModelId = slot.selection.providerModelId
+      const key = { _tag: "Load" as const, providerModelId }
+      return {
+        key,
+        whenIdle: Effect.gen(function* () {
+          if (slot._tag === "Ready" && (yield* localRuntime.isResident(providerModelId))) {
+            return Option.none()
+          }
+          if (slot._tag === "Blocked"
+            && slot.reason._tag !== "LocalModelLoadFailed"
+            && slot.reason._tag !== "LocalModelRuntimeLost"
+            && slot.reason._tag !== "LocalModelStoppedLowMemory") {
+            return yield* reject(slotId, "The selected local model is not loadable")
+          }
+          if (slot._tag !== "UnloadedLocalModel"
+            && slot._tag !== "Blocked"
+            && slot._tag !== "Ready"
+            && slot._tag !== "LoadingLocalModel") {
+            return yield* reject(slotId, "The selected local model is not loadable")
+          }
+          const catalogModel = catalogContents((yield* catalog.snapshot).state).models.find((model) =>
+            model.providerId === LOCAL_PROVIDER_ID && model.providerModelId === providerModelId)
+          if (!catalogModel) return yield* reject(slotId, "The selected local model is unavailable")
+          return Option.some({
+            activityLabel: `local-model:load:${providerModelId}`,
+            commit: beginLoadState(providerModelId).pipe(Effect.asVoid),
+            operation: modelAdmission.withPermits(1)(localRuntime.load(
+              providerModelId,
+              (progress) => updateLoadProgress(providerModelId, progress),
+            )),
+            terminalize: (exit: Exit.Exit<void, LocalInferenceError>) =>
+              terminalizeTransition(key, exit),
+          })
+        }),
+      }
+    }))
+
+  const admitUnloadProviderModel = (
+    providerModelId: ProviderModelId,
+  ): Effect.Effect<ServiceOperationAdmission<LocalInferenceError>, LocalInferenceError> => {
+    const key = { _tag: "Unload" as const, providerModelId }
+    return admitTransition(Effect.succeed({
+      key,
+      whenIdle: Effect.gen(function* () {
+        if (!(yield* localRuntime.isResident(providerModelId))) return Option.none()
+        return Option.some(unloadDefinition(key))
+      }),
+    }))
+  }
+
+  const admitUnload = (
+    slotId: SlotId,
+  ): Effect.Effect<ServiceOperationAdmission<LocalInferenceError>, LocalInferenceError> =>
+    admitTransition(Effect.gen(function* () {
+      const slot = yield* selectedSlot(slotId)
+      if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) {
+        return yield* reject(slotId, "The slot does not contain a local model")
+      }
+      const providerModelId = slot.selection.providerModelId
+      const key = { _tag: "Unload" as const, providerModelId }
+      return {
+        key,
+        whenIdle: Effect.gen(function* () {
+          if (isModelSlotUnloadSatisfied(slot)) return Option.none()
+          if (slot._tag !== "Ready" && slot._tag !== "UnloadingLocalModel") {
+            return yield* reject(slotId, "The selected local model is not loaded")
+          }
+          if (!(yield* localRuntime.isResident(providerModelId))) return Option.none()
+          return Option.some(unloadDefinition(key))
+        }),
+      }
+    }))
+
+  const awaitAdmission = (
+    retry: Effect.Effect<ServiceOperationAdmission<LocalInferenceError>, LocalInferenceError>,
+    admission: ServiceOperationAdmission<LocalInferenceError>,
+  ): Effect.Effect<void, LocalInferenceError> => {
+    switch (admission._tag) {
+      case "Satisfied":
+        return Effect.void
+      case "Current":
+        return admission.outcome.pipe(Effect.flatMap((exit) =>
+          Exit.isSuccess(exit) ? Effect.void : Effect.failCause(exit.cause)))
+      case "Conflicting":
+        return admission.outcome.pipe(
+          Effect.zipRight(Effect.suspend(() => retry)),
+          Effect.flatMap((next) => awaitAdmission(retry, next)),
+        )
+    }
+  }
+
+  const awaitLoad = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
+    Effect.suspend(() => admitLoad(slotId)).pipe(
+      Effect.flatMap((admission) => awaitAdmission(admitLoad(slotId), admission)),
+    )
+
+  const awaitUnloadProviderModel = (
+    providerModelId: ProviderModelId,
+  ): Effect.Effect<void, LocalInferenceError> =>
+    Effect.suspend(() => admitUnloadProviderModel(providerModelId)).pipe(
+      Effect.flatMap((admission) =>
+        awaitAdmission(admitUnloadProviderModel(providerModelId), admission)),
+    )
 
   const updateModelSlot: ModelSlotCoordinatorApi["updateModelSlot"] = (slotId, selection) =>
     Effect.gen(function* () {
@@ -711,11 +937,20 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
         Option.exists(configuredSelection, (value) => value.providerId === LOCAL_PROVIDER_ID
           && value.providerModelId === previous.selection.providerModelId))
       if (stillSelected) return
-      yield* modelAdmission.withPermits(1)(
-        unloadProviderModel(previous.selection.providerModelId).pipe(
-          Effect.mapError((error) => slotFailure(slotId, "model_slot_followup_unload_failed", error)),
+      yield* Effect.forkIn(
+        awaitUnloadProviderModel(previous.selection.providerModelId).pipe(
+          Effect.catchAll((error) =>
+            Effect.logWarning("Follow-up local model unload failed").pipe(
+              Effect.annotateLogs({
+                slotId,
+                providerModelId: previous.selection.providerModelId,
+                error: error.message,
+              }),
+            ),
+          ),
         ),
-      )
+        scope,
+      ).pipe(Effect.uninterruptible)
     })
 
   const setModelFavorite: ModelSlotCoordinatorApi["setModelFavorite"] = (model, favorite) =>
@@ -728,89 +963,58 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
       yield* reconcileAll
     })
 
-  const loadSelectedSlotUnlocked = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
-    Effect.gen(function* () {
-      const slot = yield* selectedSlot(slotId)
-      if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) {
-        return yield* reject(slotId, "The slot does not contain a local model")
-      }
-      if (slot._tag === "LoadingLocalModel") return
-      if (slot._tag === "Blocked"
-        && slot.reason._tag !== "LocalModelLoadFailed"
-        && slot.reason._tag !== "LocalModelRuntimeLost"
-        && slot.reason._tag !== "LocalModelStoppedLowMemory") {
-        return yield* reject(slotId, "The selected local model is not loadable")
-      }
-      if (slot._tag !== "UnloadedLocalModel" && slot._tag !== "Blocked" && slot._tag !== "Ready") {
-        return yield* reject(slotId, "The selected local model is not loadable")
-      }
-      const providerModelId = slot.selection.providerModelId
-      if (slot._tag === "Ready" && (yield* localRuntime.isResident(providerModelId))) return
-      const catalogModel = catalogContents((yield* catalog.snapshot).state).models.find((model) =>
-        model.providerId === LOCAL_PROVIDER_ID && model.providerModelId === providerModelId)
-      if (!catalogModel) return yield* reject(slotId, "The selected local model is unavailable")
-      yield* updateMatchingLocalSlots(providerModelId, (current) => {
-        switch (current._tag) {
-          case "Ready": {
-            const unloaded = ModelSlotLifecycle.transition(current, "UnloadedLocalModel", {})
-            return ModelSlotLifecycle.transition(unloaded, "LoadingLocalModel", { percentage: 0 })
-          }
-          case "UnloadedLocalModel":
-          case "UnloadingLocalModel":
-          case "Blocked":
-            return ModelSlotLifecycle.transition(current, "LoadingLocalModel", { percentage: 0 })
-          case "LoadingLocalModel":
-            return ModelSlotLifecycle.hold(current, { percentage: 0 })
-        }
-      })
-      yield* localRuntime.load(
-        providerModelId,
-        (progress) => updateLoadProgress(providerModelId, progress),
-      ).pipe(
-        Effect.tapError((error) => blockLoad(providerModelId, {
-          code: "code" in error ? error.code : error._tag,
-          message: error.message,
-          retryable: "retryable" in error ? error.retryable : false,
-        })),
-      )
-      yield* completeLoad(providerModelId)
-    })
-
   const loadModel: ModelSlotCoordinatorApi["loadModel"] = (slotId) =>
-    modelAdmission.withPermits(1)(loadSelectedSlotUnlocked(slotId))
-
-  const unloadModelSlotUnlocked = (slotId: SlotId): Effect.Effect<void, LocalInferenceError> =>
     Effect.gen(function* () {
-      const slot = yield* selectedSlot(slotId)
-      if (slot._tag === "Unassigned" || slot.selection.providerId !== LOCAL_PROVIDER_ID) {
-        return yield* reject(slotId, "The slot does not contain a local model")
+      const admission = yield* admitLoad(slotId)
+      if (admission._tag === "Conflicting") {
+        return yield* reject(slotId, "Another local model transition is already active")
       }
-      if (isModelSlotUnloadSatisfied(slot)) return
-      if (slot._tag !== "Ready") return yield* reject(slotId, "The selected local model is not loaded")
-      yield* unloadProviderModel(slot.selection.providerModelId)
     })
 
   const unloadModel: ModelSlotCoordinatorApi["unloadModel"] = (slotId) =>
-    modelAdmission.withPermits(1)(unloadModelSlotUnlocked(slotId))
+    Effect.gen(function* () {
+      const admission = yield* admitUnload(slotId)
+      if (admission._tag === "Conflicting") {
+        return yield* reject(slotId, "Another local model transition is already active")
+      }
+    })
+
+  const unloadModelAndWait: ModelSlotCoordinatorApi["unloadModelAndWait"] = (slotId) =>
+    Effect.suspend(() => admitUnload(slotId)).pipe(
+      Effect.flatMap((admission) => awaitAdmission(admitUnload(slotId), admission)),
+    )
 
   const acquireLocalModel: ModelSlotCoordinatorApi["acquireLocalModel"] = (
     slotId,
     providerModelId,
-  ) => Effect.acquireRelease(
-    modelAdmission.take(1).pipe(
-      Effect.zipRight(Effect.gen(function* () {
+  ) => {
+    const acquireReadyAdmission: Effect.Effect<void, LocalInferenceError> = Effect.suspend(() =>
+      Effect.gen(function* () {
         const slot = yield* selectedSlot(slotId)
         if (slot._tag === "Unassigned"
           || slot.selection.providerId !== LOCAL_PROVIDER_ID
           || slot.selection.providerModelId !== providerModelId) {
           return yield* reject(slotId, "The local model request no longer matches the selected slot")
         }
-        yield* loadSelectedSlotUnlocked(slotId)
-      })),
-      Effect.onError(() => modelAdmission.release(1)),
-    ),
-    () => modelAdmission.release(1),
-  ).pipe(Effect.asVoid)
+        yield* awaitLoad(slotId)
+        const ready = yield* Effect.uninterruptible(Effect.gen(function* () {
+          yield* modelAdmission.take(1)
+          const current = yield* selectedSlot(slotId)
+          const isReady = current._tag === "Ready"
+            && current.selection.providerId === LOCAL_PROVIDER_ID
+            && current.selection.providerModelId === providerModelId
+            && (yield* localRuntime.isResident(providerModelId))
+          if (!isReady) yield* modelAdmission.release(1)
+          return isReady
+        }))
+        if (!ready) return yield* acquireReadyAdmission
+      }),
+    )
+    return Effect.acquireRelease(
+      acquireReadyAdmission,
+      () => modelAdmission.release(1),
+    ).pipe(Effect.asVoid)
+  }
 
   return ModelSlotCoordinator.of({
     snapshot: mirror.get,
@@ -822,5 +1026,6 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     setModelFavorite,
     loadModel,
     unloadModel,
+    unloadModelAndWait,
   })
 }))

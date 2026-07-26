@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Deferred, Effect, Either, Layer, Option, Ref, Scope, Stream } from "effect"
+import { Deferred, Effect, Either, Fiber, Layer, Option, Ref, Scope, Stream } from "effect"
 import type { CodingAgentSession } from "@magnitudedev/agent"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
 import { AgentRuntime, type AgentRuntimeApi, type RuntimeStartRequest } from "./agent-runtime"
@@ -272,6 +272,43 @@ describe("SessionDrafts", () => {
       }).pipe(Effect.provide(setup.layer))
       expect(results.filter(Either.isRight)).toHaveLength(1)
       expect(results.filter(Either.isLeft)).toHaveLength(1)
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("restores a claim when its caller is interrupted during initialization", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      const releaseStart = yield* Deferred.make<void>()
+      yield* Ref.set(setup.refs.startDelay, releaseStart)
+      const sessionId = yield* Effect.gen(function* () {
+        const drafts = yield* SessionDrafts
+        const first = yield* drafts.claim({ cwd: "/repo", ownerId: "owner" }).pipe(Effect.fork)
+        yield* Deferred.await(setup.refs.startEntered)
+        yield* Fiber.interrupt(first)
+        yield* Ref.set(setup.refs.startDelay, null)
+        return (yield* drafts.claim({ cwd: "/repo", ownerId: "owner" })).sessionId
+      }).pipe(Effect.provide(setup.layer))
+      expect(sessionId).toBe("draft-0")
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("removes a preloading record when its caller is interrupted", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      const releaseStart = yield* Deferred.make<void>()
+      yield* Ref.set(setup.refs.startDelay, releaseStart)
+      const nextId = yield* Effect.gen(function* () {
+        const drafts = yield* SessionDrafts
+        const preload = yield* drafts.preload({ cwd: "/repo", ownerId: "owner" }).pipe(Effect.fork)
+        yield* Deferred.await(setup.refs.startEntered)
+        yield* Fiber.interrupt(preload)
+        yield* Ref.set(setup.refs.startDelay, null)
+        return (yield* drafts.preload({ cwd: "/repo", ownerId: "owner" })).sessionId
+      }).pipe(Effect.provide(setup.layer))
+      expect(nextId).toBe("draft-1")
+      expect(yield* Ref.get(setup.refs.destroyed)).toContain("draft-0")
     })
     await Effect.runPromise(program)
   })

@@ -56,3 +56,8 @@ publishes the new snapshot.
 Client-common owns one watch per client connection and all query invalidation. Query atoms remain
 distinct by Get RPC tag. Screens consume snapshots; they do not reconstruct state or open their own
 operation streams.
+
+A mirrored nonterminal state is valid only while its owning backend service has a live operation
+capable of terminalizing it. The initiating RPC and its progress stream are never the owner.
+Disconnecting every client does not alter admitted shared work; a later client receives the same
+authoritative current snapshot.
