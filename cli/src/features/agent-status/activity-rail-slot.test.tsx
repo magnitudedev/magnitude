@@ -5,26 +5,27 @@ import { describe, expect, it } from 'vitest'
 import { ActivityRailSlot } from './activity-rail-slot'
 
 describe('activity rail slot', () => {
-  it('aligns with assistant output without top padding and reserves one row below', () => {
+  it('aligns with assistant output without reserving a full row below', () => {
     const html = renderToStaticMarkup(
       <ActivityRailSlot width={80}><text>Working</text></ActivityRailSlot>,
     )
 
     expect(html).toContain('id="root-activity-rail"')
-    expect(html).toContain('height:2px')
+    expect(html).toContain('height:1px')
     expect(html).not.toContain('activity-spacing-above')
+    expect(html).not.toContain('activity-spacing-below')
     expect(html).toContain('padding-left:1px')
-    expect(html).toMatch(/root-activity-rail[^>]*><box[^>]*>.*Working.*<\/box><box id="activity-spacing-below"/)
+    expect(html).toMatch(/root-activity-rail[^>]*><box[^>]*>.*Working.*<\/box><\/box>/)
   })
 
-  it('renders exactly one blank row above and below the rail', async () => {
+  it('keeps the history-provided blank row above and places following chrome immediately below', async () => {
     const view = await testRender(
       <box style={{ flexDirection: 'column' }}>
         <box style={{ height: 1, flexShrink: 0, marginBottom: 1 }}><text>Message</text></box>
         <ActivityRailSlot width={30}><text>Working</text></ActivityRailSlot>
         <text>Next</text>
       </box>,
-      { width: 30, height: 6 },
+      { width: 30, height: 5 },
     )
     try {
       await act(view.renderOnce)
@@ -32,8 +33,7 @@ describe('activity rail slot', () => {
       expect(lines[0]?.trim()).toBe('Message')
       expect(lines[1]?.trim()).toBe('')
       expect(lines[2]?.indexOf('Working')).toBe(1)
-      expect(lines[3]?.trim()).toBe('')
-      expect(lines[4]?.trim()).toBe('Next')
+      expect(lines[3]?.trim()).toBe('Next')
     } finally {
       await act(async () => view.renderer.destroy())
     }
@@ -54,8 +54,7 @@ describe('activity rail slot', () => {
       await act(view.renderOnce)
       const lines = view.captureCharFrame().split('\n')
       expect(lines[0]?.trim()).toBe('Message at top')
-      expect(lines[5]?.indexOf('Working')).toBe(1)
-      expect(lines[6]?.trim()).toBe('')
+      expect(lines[6]?.indexOf('Working')).toBe(1)
       expect(lines[7]?.trim()).toBe('Composer')
     } finally {
       await act(async () => view.renderer.destroy())
