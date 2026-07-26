@@ -1,19 +1,21 @@
-import { test, expect, mock } from 'bun:test'
+import { expect, test, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { KeyEvent } from '@opentui/core'
 
-let keyboardHandler: ((key: KeyEvent) => void) | null = null
+const keyboard = vi.hoisted(() => ({
+  handler: null as ((key: KeyEvent) => void) | null,
+}))
 
-mock.module('@opentui/react', () => ({
+vi.mock('@opentui/react', () => ({
   useKeyboard: (handler: (key: KeyEvent) => void) => {
-    keyboardHandler = handler
+    keyboard.handler = handler
   },
 }))
 
 const { ChatSurfaceKeyboard } = await import('./chat-surface-keyboard')
 
 function renderKeyboard(overrides: Partial<Parameters<typeof ChatSurfaceKeyboard>[0]> = {}): (key: KeyEvent) => void {
-  keyboardHandler = null
+  keyboard.handler = null
   renderToStaticMarkup(
     <ChatSurfaceKeyboard
       status="idle"
@@ -30,15 +32,15 @@ function renderKeyboard(overrides: Partial<Parameters<typeof ChatSurfaceKeyboard
       onExitBashMode={() => {}}
       thinkingOpen={false}
       thinkingOptionCount={0}
-      onToggleThinking={() => {}}
+      onOpenThinking={() => {}}
       onMoveThinking={() => {}}
       onApplyThinking={() => {}}
       onCancelThinking={() => {}}
       {...overrides}
     />,
   )
-  if (!keyboardHandler) throw new Error('keyboard handler not registered')
-  return keyboardHandler as (key: KeyEvent) => void
+  if (!keyboard.handler) throw new Error('keyboard handler not registered')
+  return keyboard.handler as (key: KeyEvent) => void
 }
 
 function makeCtrlCKey() {
@@ -174,16 +176,37 @@ test('keyboard handler no-ops when blocking overlay is active', () => {
 })
 
 test('Ctrl-T opens the thinking selector when the model exposes choices', () => {
-  let toggled = 0
+  let opened = 0
   const handler = renderKeyboard({
     thinkingOptionCount: 4,
-    onToggleThinking: () => { toggled += 1 },
+    onOpenThinking: () => { opened += 1 },
   })
 
   const { key, wasPrevented } = makeKey('t', true)
   handler(key)
 
-  expect(toggled).toBe(1)
+  expect(opened).toBe(1)
+  expect(wasPrevented()).toBe(true)
+})
+
+test('Ctrl-T advances the preview instead of closing an open selector', () => {
+  const movements: number[] = []
+  let opened = 0
+  let applied = 0
+  const handler = renderKeyboard({
+    thinkingOpen: true,
+    thinkingOptionCount: 4,
+    onOpenThinking: () => { opened += 1 },
+    onMoveThinking: (direction) => { movements.push(direction) },
+    onApplyThinking: () => { applied += 1 },
+  })
+
+  const { key, wasPrevented } = makeKey('t', true)
+  handler(key)
+
+  expect(movements).toEqual([1])
+  expect(opened).toBe(0)
+  expect(applied).toBe(0)
   expect(wasPrevented()).toBe(true)
 })
 
@@ -191,20 +214,26 @@ test('thinking selector owns arrow, Enter, and Escape keys while open', () => {
   const movements: number[] = []
   let applied = 0
   let cancelled = 0
+  let interrupted = 0
   const handler = renderKeyboard({
+    status: 'streaming',
     thinkingOpen: true,
     thinkingOptionCount: 4,
     onMoveThinking: (direction) => { movements.push(direction) },
     onApplyThinking: () => { applied += 1 },
     onCancelThinking: () => { cancelled += 1 },
+    onInterrupt: () => { interrupted += 1 },
   })
 
   handler(makeKey('up').key)
+  handler(makeKey('left').key)
   handler(makeKey('down').key)
+  handler(makeKey('right').key)
   handler(makeKey('return').key)
   handler(makeEscapeKey().key)
 
-  expect(movements).toEqual([-1, 1])
+  expect(movements).toEqual([-1, -1, 1, 1])
   expect(applied).toBe(1)
   expect(cancelled).toBe(1)
+  expect(interrupted).toBe(0)
 })

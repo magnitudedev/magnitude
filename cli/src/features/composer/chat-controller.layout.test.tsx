@@ -1,10 +1,21 @@
 import { expect, test, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { ReactNode } from 'react'
+import { create, type ReactTestInstance } from 'react-test-renderer'
+import { act, type ReactNode } from 'react'
 import { Option } from 'effect'
 import type { ChatTheme } from '../../types/theme-system'
 import type { ComposerProps } from './types'
-import { PRIMARY_SLOT_ID, type TaskDisplayRow } from '@magnitudedev/sdk'
+import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type TaskDisplayRow } from '@magnitudedev/sdk'
+import {
+  GIB,
+  LOCAL_PROVIDER_ID,
+  makeHardware,
+  makeView,
+  TEST_MEMORY_DOMAIN_ID,
+} from '../local-inference/test-fixtures'
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
+  .IS_REACT_ACT_ENVIRONMENT = true
 
 vi.mock('@opentui/react', async () => {
   const actual = await vi.importActual<typeof import('@opentui/react')>('@opentui/react')
@@ -107,7 +118,9 @@ vi.mock('./residency-indicator', () => ({
 }))
 
 vi.mock('../../components/button', () => ({
-  Button: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  Button: ({ children, ...props }: { children?: ReactNode; [key: string]: unknown }) => (
+    <box {...props}>{children}</box>
+  ),
 }))
 
 vi.mock('./multiline-input', () => ({
@@ -255,7 +268,7 @@ test('composer shell renders without an embedded task list (task list is the Age
   expect(COMPOSER_BORDER_CHARS.vertical).toBe('┃')
   expect(html).toContain('>model<')
   expect(html).toContain('>high<')
-  expect(html).toContain('style="fg:#ffaa00"><span attributes="0">high</span>')
+  expect(html).toContain('style="fg:#c4b5fd"><span attributes="0">high</span>')
   expect(html).toContain('width:2px;flex-shrink:0')
   expect(html).toContain('/tmp/magnitude')
   expect(html).not.toContain('Thinking:')
@@ -272,4 +285,69 @@ test('shows a single no-provider label instead of model and reasoning effort', (
   expect(html).toContain('No provider configured')
   expect(html).not.toContain('>model<')
   expect(html).not.toContain('>high<')
+})
+
+test('clicking effort opens the footer selector and clicking an option commits it', () => {
+  const applied: string[] = []
+  const localInferenceState = makeView({
+    hardware: makeHardware({
+      residentMemory: Option.some({
+        domains: [{
+          memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+          modelBytes: 13 * GIB,
+          contextBytes: 2 * GIB,
+          computeBytes: GIB,
+          auxiliaryBytes: 0,
+        }],
+      }),
+    }),
+  })
+  const thinkingOptions = ['none', 'low', 'medium', 'high'].map((value) => ({
+    value: ReasoningEffortSchema.make(value),
+    label: value.charAt(0).toUpperCase() + value.slice(1),
+  }))
+  let view!: ReturnType<typeof create>
+
+  act(() => {
+    view = create(
+      <Composer
+        {...makeProps()}
+        localInferenceState={localInferenceState}
+        selectedProviderId={LOCAL_PROVIDER_ID}
+        thinkingOptions={thinkingOptions}
+        applyThinking={(effort) => { applied.push(effort) }}
+      />,
+    )
+  })
+
+  const textOf = (node: ReactTestInstance): string => node.children
+    .map((child) => typeof child === 'string' ? child : textOf(child))
+    .join('')
+  const clickable = () => view.root.findAll(
+    (node) => typeof node.props.onClick === 'function',
+  )
+
+  const clickableLabels = clickable().map(textOf)
+  expect(clickableLabels).toContain('high')
+  expect(JSON.stringify(view.toJSON())).toContain('Memory: 16GB')
+  const effort = clickable().find((node) => textOf(node) === 'high')
+  expect(effort).toBeDefined()
+  act(() => { (effort!.props.onClick as () => void)() })
+
+  const openText = JSON.stringify(view.toJSON())
+  expect(openText).toContain('None')
+  expect(openText).toContain('Medium')
+  expect(openText).toContain('Select reasoning level...')
+  expect(openText).not.toContain('5k / 100k ctx (5%)')
+  expect(openText).not.toContain('Memory: 16GB')
+  expect(openText).toContain('/tmp/default')
+
+  const low = clickable().find((node) => textOf(node) === 'Low')
+  expect(low).toBeDefined()
+  act(() => { (low!.props.onClick as () => void)() })
+
+  expect(applied).toEqual(['low'])
+  expect(JSON.stringify(view.toJSON())).toContain('5k / 100k ctx (5%)')
+  expect(JSON.stringify(view.toJSON())).toContain('Memory: 16GB')
+  act(() => { view.unmount() })
 })
