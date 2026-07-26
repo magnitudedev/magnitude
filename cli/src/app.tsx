@@ -46,7 +46,7 @@ import { StartupHeader } from './features/chat-timeline/startup-header'
 import { Button } from './components/button'
 import { ChatTimelineContainer } from './features/chat-timeline/container'
 import { ComposerContainer } from './features/composer/container'
-import { TaskListContainer } from './features/agent-status/container'
+import { ActivityRailContainer, TaskListContainer } from './features/agent-status/container'
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
 import { ModelMenusContainer } from './features/model-menus/container'
@@ -286,11 +286,14 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                   chatColumnWidth={chatColumnWidth}
                   dispatchErrorAction={dispatchErrorAction}
                   isOverlayActive={isOverlayActive}
-                  modelLoadActivity={localModelLoadActivity}
                 />
                 <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
                   <TaskListContainer />
                 </box>
+                <ActivityRailContainer
+                  modelLoadActivity={localModelLoadActivity}
+                  width={chatColumnWidth}
+                />
               </box>
               {menu.open
                 ? <ModelMenusContainer downloadSummary={downloadSummary} />

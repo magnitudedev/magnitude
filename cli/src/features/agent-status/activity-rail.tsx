@@ -55,18 +55,6 @@ function formatElapsed(totalSeconds: number): string {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
 }
 
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`
-  const minutes = Math.floor(seconds / 60)
-  const remainingSeconds = seconds % 60
-  if (remainingSeconds === 0) return `${minutes} minute${minutes === 1 ? '' : 's'}`
-  return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`
-}
-
-function buildSummaryLine(durationSeconds: number): string {
-  return `Worked for ${formatDuration(durationSeconds)}`
-}
-
 export const ActivityRail = memo(function ActivityRail({
   work,
   width,
@@ -221,20 +209,6 @@ export const ActivityRail = memo(function ActivityRail({
     return (
       <box style={{ height: 1, flexShrink: 0 }}>
         <text style={{ fg: red[400] }}>{interruptText}</text>
-      </box>
-    )
-  }
-
-  // Completed: show persistent summary
-  if (!active && work && work.lastWorkMs > 0) {
-    const durationSeconds = Math.floor(work.lastWorkMs / 1000)
-    return (
-      <box style={{ height: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.muted }}>
-          <span style={{ fg: slate[600] }}>{'●'}</span>
-          {' '}
-          {buildSummaryLine(durationSeconds)}
-        </text>
       </box>
     )
   }

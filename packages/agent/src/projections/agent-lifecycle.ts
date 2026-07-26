@@ -116,6 +116,13 @@ export interface SubagentIdleClosedSignal {
   readonly timestamp: number
 }
 
+export interface RootWorkCompletedSignal {
+  readonly chainId: string
+  readonly completedAt: number
+  readonly durationMs: number
+  readonly phase: 'worked' | 'interrupted'
+}
+
 // --- Root work helpers ---
 
 const STATUS_TOOL_ACTIVITIES: Partial<Record<string, DisplayActivity>> = {
@@ -161,20 +168,33 @@ function stopRootWork(
   state: RootWorkState,
   timestamp: number,
   phase: 'worked' | 'interrupted',
-): RootWorkState {
+): {
+  readonly state: RootWorkState
+  readonly completion: RootWorkCompletedSignal | null
+} {
   const chainMs = state.chainStartedAt === null
     ? 0
     : Math.max(0, timestamp - state.chainStartedAt)
   return {
-    ...state,
-    phase,
-    chainStartedAt: null,
-    lastChainMs: chainMs,
-    activity: null,
-    _currentTurnId: null,
-    _currentChainId: null,
-    _thinkingCharCount: null,
-    _activeToolKey: null,
+    state: {
+      ...state,
+      phase,
+      chainStartedAt: null,
+      lastChainMs: chainMs,
+      activity: null,
+      _currentTurnId: null,
+      _currentChainId: null,
+      _thinkingCharCount: null,
+      _activeToolKey: null,
+    },
+    completion: state.chainStartedAt === null || state._currentChainId === null
+      ? null
+      : {
+          chainId: state._currentChainId,
+          completedAt: timestamp,
+          durationMs: chainMs,
+          phase,
+        },
   }
 }
 
@@ -253,12 +273,19 @@ function updateChildCount(state: AgentLifecycleState): AgentLifecycleState {
 function maybeDeferCloseRootWork(
   state: AgentLifecycleState,
   timestamp: number,
-): AgentLifecycleState {
-  if (state.rootWork.phase !== 'working') return state
-  if (state.rootWork._currentTurnId !== null) return state
-  if (countWorkingChildren(state, null) > 0) return state
+): {
+  readonly state: AgentLifecycleState
+  readonly completion: RootWorkCompletedSignal | null
+} {
+  if (state.rootWork.phase !== 'working') return { state, completion: null }
+  if (state.rootWork._currentTurnId !== null) return { state, completion: null }
+  if (countWorkingChildren(state, null) > 0) return { state, completion: null }
   const phase = anyAgentInterrupted(state) ? 'interrupted' : 'worked'
-  return { ...state, rootWork: stopRootWork(state.rootWork, timestamp, phase) }
+  const stopped = stopRootWork(state.rootWork, timestamp, phase)
+  return {
+    state: { ...state, rootWork: stopped.state },
+    completion: stopped.completion,
+  }
 }
 
 export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
@@ -288,6 +315,7 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
     agentKilled: Signal.create<AgentKilledSignal>('AgentLifecycle/agentKilled'),
     subagentUserKilled: Signal.create<SubagentUserKilledSignal>('AgentLifecycle/subagentUserKilled'),
     workerIdleClosed: Signal.create<SubagentIdleClosedSignal>('AgentLifecycle/workerIdleClosed'),
+    rootWorkCompleted: Signal.create<RootWorkCompletedSignal>('AgentLifecycle/rootWorkCompleted'),
   },
 
   eventHandlers: {
@@ -417,7 +445,9 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
         // No workers active — close root work
         const phase = event.outcome._tag === 'Cancelled' ? 'interrupted' : 'worked'
-        return { ...state, rootWork: stopRootWork(state.rootWork, event.timestamp, phase) }
+        const stopped = stopRootWork(state.rootWork, event.timestamp, phase)
+        if (stopped.completion !== null) emit.rootWorkCompleted(stopped.completion)
+        return { ...state, rootWork: stopped.state }
       }
 
       // Worker turn ending
@@ -454,16 +484,19 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
       }
       next = updateChildCount(next)
       // Check deferred root close
-      next = maybeDeferCloseRootWork(next, event.timestamp)
-      return next
+      const deferred = maybeDeferCloseRootWork(next, event.timestamp)
+      if (deferred.completion !== null) emit.rootWorkCompleted(deferred.completion)
+      return deferred.state
     },
 
     interrupt: ({ event, state, emit }) => {
       if (event.forkId === null) {
         // Root interrupt — stop root work
+        const stopped = stopRootWork(state.rootWork, event.timestamp, 'interrupted')
+        if (stopped.completion !== null) emit.rootWorkCompleted(stopped.completion)
         let next: AgentLifecycleState = {
           ...state,
-          rootWork: stopRootWork(state.rootWork, event.timestamp, 'interrupted'),
+          rootWork: stopped.state,
         }
         next = updateChildCount(next)
         return next
@@ -493,8 +526,9 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
         }),
       }
       nextState = updateChildCount(nextState)
-      nextState = maybeDeferCloseRootWork(nextState, event.timestamp)
-      return nextState
+      const deferred = maybeDeferCloseRootWork(nextState, event.timestamp)
+      if (deferred.completion !== null) emit.rootWorkCompleted(deferred.completion)
+      return deferred.state
     },
 
     agent_killed: ({ event, state, emit }) => {
@@ -518,8 +552,9 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
       let next = removed.state
       next = updateChildCount(next)
-      next = maybeDeferCloseRootWork(next, event.timestamp)
-      return next
+      const deferred = maybeDeferCloseRootWork(next, event.timestamp)
+      if (deferred.completion !== null) emit.rootWorkCompleted(deferred.completion)
+      return deferred.state
     },
 
     worker_user_killed: ({ event, state, emit }) => {
@@ -543,8 +578,9 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
       let next = removed.state
       next = updateChildCount(next)
-      next = maybeDeferCloseRootWork(next, event.timestamp)
-      return next
+      const deferred = maybeDeferCloseRootWork(next, event.timestamp)
+      if (deferred.completion !== null) emit.rootWorkCompleted(deferred.completion)
+      return deferred.state
     },
 
     worker_idle_closed: ({ event, state, emit }) => {
@@ -568,8 +604,9 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
       let next = removed.state
       next = updateChildCount(next)
-      next = maybeDeferCloseRootWork(next, event.timestamp)
-      return next
+      const deferred = maybeDeferCloseRootWork(next, event.timestamp)
+      if (deferred.completion !== null) emit.rootWorkCompleted(deferred.completion)
+      return deferred.state
     },
 
     agent_task_changed: ({ event, state }) => {

@@ -107,6 +107,35 @@ const agentCommunication = (id: string, content: string, timestamp: number): Dis
 })
 
 describe('display timeline presentation', () => {
+  it('keeps completed work summaries visible in the default timeline', () => {
+    const messages: DisplayMessage[] = [{
+      id: 'work_summary:chain-1',
+      type: 'work_summary',
+      chainId: 'chain-1',
+      durationMs: 5_000,
+      phase: 'worked',
+      timestamp: 2,
+    }]
+
+    expect(buildDisplayTimelinePresentation({
+      scope: 'root',
+      mode: 'default',
+      timelineMode: 'idle',
+      streamingMessageId: null,
+      messages,
+      window: windowFor(messages),
+    }).entries).toEqual([{
+      kind: 'message',
+      id: 'message:work_summary:chain-1',
+      messageId: 'work_summary:chain-1',
+      timestamp: 2,
+      role: 'system',
+      streaming: false,
+      interrupted: false,
+      nextMessageInterrupted: false,
+    }])
+  })
+
   it('keeps a user bash command as a chronological message entry', () => {
     const messages: DisplayMessage[] = [{
       id: 'bash-1',

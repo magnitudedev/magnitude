@@ -142,7 +142,15 @@ describe('display interrupt finalization', () => {
       'tool',
       'user_bash_command',
       'interrupted',
+      'work_summary',
     ])
+    expect(messages.at(-1)).toMatchObject({
+      type: 'work_summary',
+      chainId: 'chain-1',
+      durationMs: 5,
+      phase: 'interrupted',
+      timestamp: ts(6),
+    })
   })
 
   test('interrupt event stores interrupted presentation from the typed handle', async () => {

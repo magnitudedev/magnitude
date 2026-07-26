@@ -439,7 +439,7 @@ export function TaskList({
     <box
       ref={box.ref}
       onSizeChange={box.onSizeChange}
-      style={{ flexDirection: 'column', flexShrink: 0, borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: slate[500], customBorderChars: BOX_CHARS, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 }}
+      style={{ flexDirection: 'column', flexShrink: 0, marginBottom: 1, borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: slate[500], customBorderChars: BOX_CHARS, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 }}
     >
       {stickyRootSummary && stickyRootSummary.task.kind === 'task' ? (
         <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>

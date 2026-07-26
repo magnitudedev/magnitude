@@ -13,11 +13,13 @@ test('root chat scrollbox uses native overflow-only tail following', async () =>
   expect(source).not.toContain("justifyContent: 'flex-end'")
 })
 
-test('the activity rail is the final real child of the root timeline', async () => {
-  const source = await Bun.file(new URL('./container.tsx', import.meta.url)).text()
+test('the live activity rail is outside history and directly precedes the composer', async () => {
+  const timelineSource = await Bun.file(new URL('./container.tsx', import.meta.url)).text()
+  const appSource = await Bun.file(new URL('../../app.tsx', import.meta.url)).text()
 
-  expect(source.indexOf('<ActivityRailContainer')).toBeGreaterThan(source.indexOf('<ChatTimeline'))
-  expect(source).not.toContain('root-turn-floor')
+  expect(timelineSource).not.toContain('<ActivityRailContainer')
+  expect(appSource.indexOf('<ActivityRailContainer')).toBeGreaterThan(appSource.indexOf('<TaskListContainer'))
+  expect(appSource.indexOf('<ActivityRailContainer')).toBeLessThan(appSource.indexOf('<ComposerContainer'))
 })
 
 test('appended rows stay in place until they overflow the viewport', async () => {

@@ -437,6 +437,7 @@ export function appendMessageToTimeline(
       : message.type === "assistant_message"
       ? "assistant"
       : message.type === "status_indicator" ||
+        message.type === "work_summary" ||
         message.type === "error" ||
         message.type === "interrupted"
       ? "system"

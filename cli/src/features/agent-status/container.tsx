@@ -54,10 +54,9 @@ export function ActivityRailContainer({
     : null
   const activityWidth = Math.max(0, width - 3)
 
-  const hasTimeline = (timeline?.messages.order.length ?? 0) > 0
   const hasWork = rootActor !== null
-    && (rootActor.work.phase !== 'idle' || rootActor.work.lastWorkMs > 0)
-  if (!hasTimeline && !hasWork && modelLoadActivity === null && modelRequestActivity === null && interrupted === null) {
+    && (rootActor.work.phase === 'working' || rootActor.work.activity !== null)
+  if (!hasWork && modelLoadActivity === null && modelRequestActivity === null && interrupted === null) {
     return null
   }
 
