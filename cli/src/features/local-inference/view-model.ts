@@ -38,6 +38,18 @@ const recommendationIntentOrder = {
   lightweight: 3,
 } as const
 
+export type LocalInferenceSetupPhase = "discovering" | "ready" | "failed"
+
+export const localInferenceSetupPhase = (
+  view: LocalInferenceView,
+): LocalInferenceSetupPhase => {
+  if (view.models.recommendations._tag === "Failed") return "failed"
+  if (view.models.recommendations._tag === "Loading" || view.catalog._tag === "Loading") {
+    return "discovering"
+  }
+  return "ready"
+}
+
 const compareSelections = (
   left: LocalInferenceSelection,
   right: LocalInferenceSelection,

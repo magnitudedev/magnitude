@@ -238,8 +238,8 @@ const shorterContextTradeoff = (
   balanced: RecommendationCandidate,
 ): string => candidate.profile.contextLength < balanced.profile.contextLength
   ? candidate.profile.contextLength * 2 === balanced.profile.contextLength
-    ? " It handles half as much code and conversation history at once."
-    : ` It handles ${percentDifference(candidate.profile.contextLength, balanced.profile.contextLength)}% less code and conversation history at once.`
+    ? " It handles half as much context at once."
+    : ` It handles ${percentDifference(candidate.profile.contextLength, balanced.profile.contextLength)}% less context at once.`
   : ""
 
 const describeBalanced = (candidate: RecommendationCandidate): string => {

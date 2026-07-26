@@ -330,7 +330,7 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "best_quality")?.explanation).toContain("more memory than Balanced")
     expect(byIntent(recommendations, "best_quality")?.explanation).toContain("slower than Balanced")
     expect(byIntent(recommendations, "fastest")?.explanation)
-      .toContain("half as much code and conversation history")
+      .toContain("half as much context at once")
     expect(byIntent(recommendations, "fastest")?.explanation)
       .toContain("Retains good quality with some possible loss")
     expect(byIntent(recommendations, "lightweight")?.explanation)
