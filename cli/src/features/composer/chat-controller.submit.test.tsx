@@ -98,6 +98,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       interruptFork: mock(() => {}),
       interruptAll: mock(() => {}),
       openSettings: mock(() => {}),
+      openHardware: mock(() => {}),
       thinkingOptions: [],
       applyThinking: mock(() => {}),
       handleWidgetKeyEvent: mock(() => false),
