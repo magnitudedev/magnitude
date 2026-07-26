@@ -123,11 +123,13 @@ low-memory rejection during load or termination during serving appears in the ac
 
 `Model stopped · Low memory - close memory-intensive apps and try again`
 
-While the selected local model is ready, the composer footer may show its compact resident runtime
-allocation. That value is the sum of the server-published model, context, compute, and auxiliary
-allocations across participating memory domains. It is not whole-system used memory and has no
-capacity denominator. The indicator disappears outside ready residency; the Hardware menu owns
-whole-system, application, free-memory, and per-allocation detail.
+The chat shell keeps a compact local-inference badge overlaid at the upper-right of the scrolling
+timeline. While a local model is ready, the badge shows its resident runtime allocation: the sum of
+the server-published model, context, compute, and auxiliary allocations across participating memory
+domains. It is not whole-system used memory and has no capacity denominator. Memory disappears
+outside ready residency; transitional, idle, and failed badge states remain visible without a
+placeholder. The Hardware menu owns whole-system, application, free-memory, and per-allocation
+detail.
 
 While current hardware or system-domain evidence is unavailable, clients do not infer either
 compatibility or available headroom and present memory status as unavailable. Model selection

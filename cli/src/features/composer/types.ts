@@ -54,7 +54,6 @@ export type ComposerProps = {
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void
   openSettings: () => void
-  openHardware: () => void
   thinkingOptions: readonly { value: ReasoningEffort; label: string }[]
   applyThinking: (effort: ReasoningEffort) => void
   handleWidgetKeyEvent: (key: KeyEvent) => boolean

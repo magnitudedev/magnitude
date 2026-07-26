@@ -11,7 +11,7 @@ import { GIB, LOCAL_PROVIDER_ID, makeHardware, makeView, TEST_MEMORY_DOMAIN_ID, 
 
 const { deriveLocalInferenceFooterView } = await import("./footer-status")
 
-test("ready status exposes the model and minimal resident memory", () => {
+test("ready status exposes the model and residency", () => {
   const state = makeView({
     hardware: makeHardware({
       residentMemory: Option.some({
@@ -28,11 +28,10 @@ test("ready status exposes the model and minimal resident memory", () => {
   expect(deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)).toEqual({
     modelName: "Qwen Test",
     residency: "loaded",
-    memoryLabel: "16GB",
   })
 })
 
-test("loading hides memory while status remains in the activity rail", () => {
+test("loading status remains in the activity rail", () => {
   const ready = makeView()
   const state = { ...ready, slots: { ...ready.slots, slots: { ...ready.slots.slots, primary: new ModelSlotLoadingLocalModel({
     slotId: PRIMARY_SLOT_ID,
@@ -44,7 +43,7 @@ test("loading hides memory while status remains in the activity rail", () => {
     percentage: 42,
   }) } } }
   const footer = deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)
-  expect(footer).toEqual({ modelName: "Qwen Test", residency: "loading", memoryLabel: null })
+  expect(footer).toEqual({ modelName: "Qwen Test", residency: "loading" })
 })
 
 test("memory state comes from the selected slot", () => {
@@ -74,7 +73,6 @@ test("memory state comes from the selected slot", () => {
     SECONDARY_SLOT_ID,
   )).toMatchObject({
     residency: "loading",
-    memoryLabel: null,
   })
 })
 
@@ -98,7 +96,6 @@ test("idle status keeps reasoning available and hides memory", () => {
   expect(deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)).toEqual({
     modelName: "Qwen Test",
     residency: "not_loaded",
-    memoryLabel: null,
   })
 })
 
@@ -111,6 +108,5 @@ test("cloud selection exposes the model with no local runtime status", () => {
   )).toEqual({
     modelName: "Claude Max",
     residency: null,
-    memoryLabel: null,
   })
 })
