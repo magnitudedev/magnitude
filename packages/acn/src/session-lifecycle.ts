@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Option } from "effect"
 import { resolve } from "path"
 import {
   SessionAlreadyExists,
@@ -111,20 +111,22 @@ export const SessionLifecycleLive: Layer.Layer<
               }
             }
 
-            const claim = yield* drafts.claim({
-              cwd: cwd ? resolve(cwd) : process.cwd(),
-              sessionId,
-              options,
-              ownerId: draftOwnerId ?? null,
-            })
-            const promoted = yield* drafts.promote(claim).pipe(
-              Effect.catchAll((error) =>
-                drafts.releaseClaim(claim).pipe(
-                  Effect.andThen(Effect.fail(error)),
-                ),
-              ),
-            )
-            return { _tag: "created" as const, metadata: promoted }
+            return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+              const claim = yield* restore(drafts.claim({
+                cwd: cwd ? resolve(cwd) : process.cwd(),
+                sessionId,
+                options,
+                ownerId: draftOwnerId ?? null,
+              }))
+              const promoted = yield* Effect.exit(drafts.promote(claim))
+              if (Exit.isFailure(promoted)) {
+                yield* drafts.releaseClaim(claim)
+                const failure = Cause.failureOption(promoted.cause)
+                if (Option.isSome(failure)) return yield* failure.value
+                return yield* Effect.failCause(promoted.cause)
+              }
+              return { _tag: "created" as const, metadata: promoted.value }
+            }))
           }
 
           // With initial: check existence first (matching the !initial path),
@@ -141,51 +143,56 @@ export const SessionLifecycleLive: Layer.Layer<
             }
           }
 
-          const claim = yield* drafts.claim({
-            cwd: cwd ? resolve(cwd) : process.cwd(),
-            sessionId,
-            options,
-            ownerId: draftOwnerId ?? null,
-          })
+          return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+            const claim = yield* restore(drafts.claim({
+              cwd: cwd ? resolve(cwd) : process.cwd(),
+              sessionId,
+              options,
+              ownerId: draftOwnerId ?? null,
+            }))
 
-          const sendInitial = Effect.gen(function* () {
-            if (initial?._tag === "message") {
-              yield* commands.sendUserMessage({
+            const sendInitial = Effect.gen(function* () {
+              if (initial?._tag === "message") {
+                yield* commands.sendUserMessage({
+                  sessionId: claim.sessionId,
+                  messageId: Option.getOrUndefined(initial.messageId),
+                  content: initial.content,
+                  taskMode: initial.taskMode,
+                  imageAttachments: initial.imageAttachments,
+                  mentions: initial.mentions,
+                })
+              } else if (initial?._tag === "goal") {
+                yield* commands.startGoal({ sessionId: claim.sessionId, objective: initial.objective })
+              }
+            })
+
+            const sendResult = yield* Effect.exit(sendInitial)
+            if (Exit.isFailure(sendResult)) {
+              yield* drafts.releaseClaim(claim)
+              const failure = Cause.failureOption(sendResult.cause)
+              if (Option.isSome(failure)) {
+                return { _tag: "failed" as const, error: sessionErrorMessage(failure.value) }
+              }
+              return yield* Effect.failCause(sendResult.cause)
+            }
+
+            // Once the initial command commits, promotion and rollback are an
+            // atomic domain transition. Client interruption is observed only
+            // after the draft reaches a terminal owned state.
+            const promoteResult = yield* Effect.exit(drafts.promote(claim))
+            if (Exit.isFailure(promoteResult)) {
+              yield* drafts.releaseClaim(claim)
+              const failure = Cause.failureOption(promoteResult.cause)
+              if (Option.isNone(failure)) return yield* Effect.failCause(promoteResult.cause)
+              return {
+                _tag: "created_message_failed" as const,
                 sessionId: claim.sessionId,
-                messageId: Option.getOrUndefined(initial.messageId),
-                content: initial.content,
-                taskMode: initial.taskMode,
-                imageAttachments: initial.imageAttachments,
-                mentions: initial.mentions,
-              })
-            } else if (initial?._tag === "goal") {
-              yield* commands.startGoal({ sessionId: claim.sessionId, objective: initial.objective })
+                error: sessionErrorMessage(failure.value),
+              }
             }
-          })
 
-          // sendUserMessage failure: message was NOT sent. Release claim
-          // (reverts to ready, scope stays open) and return failed outcome.
-          // The empty draft will be swept.
-          const sendResult = yield* Effect.either(sendInitial)
-          if (sendResult._tag === "Left") {
-            yield* drafts.releaseClaim(claim)
-            return { _tag: "failed" as const, error: sessionErrorMessage(sendResult.left) }
-          }
-
-          // Message was sent. Now promote. If promote fails, the message IS
-          // in the agent — return created_message_failed so the client keeps
-          // the optimistic message and selects the session.
-          const promoteResult = yield* Effect.either(drafts.promote(claim))
-          if (promoteResult._tag === "Left") {
-            yield* drafts.releaseClaim(claim)
-            return {
-              _tag: "created_message_failed" as const,
-              sessionId: claim.sessionId,
-              error: sessionErrorMessage(promoteResult.left),
-            }
-          }
-
-          return { _tag: "created" as const, metadata: promoteResult.right }
+            return { _tag: "created" as const, metadata: promoteResult.value }
+          }))
         }),
         preloadSession: Effect.fn("acn.session-lifecycle.preload-session")(function* (cwd, options, draftOwnerId) {
           return yield* drafts.preload({

@@ -67,7 +67,7 @@ model IDs and does not create, refit, or rewrite offerings.
 ICN owns one native runtime coordinator and at most one resident configuration.
 
 ACN's slot coordinator is the product lifecycle authority. A manual load and local request
-preparation use the same scoped slot transition:
+preparation use the same service-owned slot transition:
 
 1. resolve the selected offering;
 2. require all target packages to be installed;
@@ -87,6 +87,8 @@ not resident fails without mutating runtime state.
 The ICN runtime coordinator is the sole native mutation and lease authority.
 
 - Load and unload mutations serialize.
+- Equivalent callers join one shared completion; caller interruption never cancels the mutation.
+- A loading or unloading slot always has a matching live coordinator owner.
 - An identical load is idempotent after current state is rechecked.
 - Replacement closes new admission and waits for existing generation leases.
 - A completion holds one generation lease until its body completes, fails, or is canceled.
@@ -95,7 +97,8 @@ The ICN runtime coordinator is the sole native mutation and lease authority.
   blocked slot state; it is not inferred from generic provider unavailability.
 
 ACN serializes product slot transitions and rechecks the attributed slot after preparation is
-admitted. Progress is observation only; terminal operation results drive slot state.
+admitted. Preparation joins an in-progress load rather than treating it as ready. Progress is
+observation only; terminal operation results drive slot state.
 
 ## Prompt and request boundary
 

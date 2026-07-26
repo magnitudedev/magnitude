@@ -172,7 +172,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         }
         if (slot._tag === "Ready"
           && targetProviderModelIds.has(slot.selection.providerModelId)) {
-          yield* modelSlots.unloadModel(slot.slotId);
+          yield* modelSlots.unloadModelAndWait(slot.slotId);
         }
       }
       const retainedOfferings = (yield* localProviderOfferings.list)

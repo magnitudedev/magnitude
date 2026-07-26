@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Ref } from "effect"
+import { Context, Effect, Exit, Layer, Option, Ref } from "effect"
 import { resolve } from "node:path"
 import {
   SessionAlreadyExists,
@@ -28,6 +28,8 @@ interface DraftEntry {
   readonly touchedAt: number
   readonly phase: DraftPhase
 }
+
+type DraftIdentity = Pick<DraftEntry, "key" | "cwd" | "options" | "ownerId">
 
 export interface DraftClaim {
   readonly key: string
@@ -142,13 +144,15 @@ export const SessionDraftsLive: Layer.Layer<
             }
           })
 
-    const ensureRecord = Effect.fn("acn.session-drafts.ensure-record")(function* (input: {
-      readonly cwd: string
-      readonly sessionId?: string
-      readonly options?: SessionOptions
-      readonly ownerId?: string | null
-    }) {
-      const derived = yield* deriveKey(input)
+    const ensureRecord = Effect.fn("acn.session-drafts.ensure-record")(function* (
+      input: {
+        readonly cwd: string
+        readonly sessionId?: string
+        readonly options?: SessionOptions
+        readonly ownerId?: string | null
+      },
+      derived: DraftIdentity,
+    ) {
       const now = Date.now()
       const candidate: DraftEntry = {
         ...derived,
@@ -211,22 +215,25 @@ export const SessionDraftsLive: Layer.Layer<
         Effect.annotateLogs({ error: sessionErrorMessage(error) }),
       )
 
-    const preload = Effect.fn("acn.session-drafts.preload")(function* (input: {
+    const preload = Effect.fn("acn.session-drafts.preload")(function (input: {
       readonly cwd: string
       readonly options?: SessionOptions
       readonly ownerId?: string | null
     }) {
-      const entry = yield* ensureRecord(input)
-      const result = yield* Effect.either(initialize(entry))
-      if (result._tag === "Left") {
-        const removed = yield* removeExact(entry, new Set<DraftPhase>(["preloading", "ready"]))
-        if (Option.isSome(removed)) yield* cleanupEmptyDraft(removed.value)
-        return yield* result.left
-      }
-      if (!(yield* markReady(entry))) {
-        return yield* staleDraftError(entry.sessionId, "draft was released during preload")
-      }
-      return { sessionId: entry.sessionId }
+      return Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+        const derived = yield* restore(deriveKey(input))
+        const entry = yield* ensureRecord(input, derived)
+        const result = yield* restore(initialize(entry)).pipe(Effect.exit)
+        if (Exit.isFailure(result)) {
+          const removed = yield* removeExact(entry, new Set<DraftPhase>(["preloading", "ready"]))
+          if (Option.isSome(removed)) yield* cleanupEmptyDraft(removed.value)
+          return yield* Effect.failCause(result.cause)
+        }
+        if (!(yield* markReady(entry))) {
+          return yield* staleDraftError(entry.sessionId, "draft was released during preload")
+        }
+        return { sessionId: entry.sessionId }
+      }))
     })
 
     const release = Effect.fn("acn.session-drafts.release")(function* (input: {
@@ -246,35 +253,39 @@ export const SessionDraftsLive: Layer.Layer<
       }
     })
 
-    const claim = Effect.fn("acn.session-drafts.claim")(function* (input: {
+    const claim = Effect.fn("acn.session-drafts.claim")(function (input: {
       readonly cwd: string
       readonly sessionId?: string
       readonly options?: SessionOptions
       readonly ownerId?: string | null
     }) {
-      const entry = yield* ensureRecord(input)
-      const claimed = yield* Ref.modify(entries, (current) => {
-        const found = current.get(entry.key)
-        if (!found || found.sessionId !== entry.sessionId || found.phase === "claiming") {
-          return [false, current] as const
-        }
-        return [
-          true,
-          new Map(current).set(entry.key, {
-            ...found,
-            phase: "claiming",
-            touchedAt: Date.now(),
-          }),
-        ] as const
-      })
-      if (!claimed) return yield* new SessionAlreadyExists({ sessionId: entry.sessionId })
+      return Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+        const derived = yield* restore(deriveKey(input))
+        const entry = yield* ensureRecord(input, derived)
+        const claimed = yield* Ref.modify(entries, (current) => {
+          const found = current.get(entry.key)
+          if (!found || found.sessionId !== entry.sessionId || found.phase === "claiming") {
+            return [false, current] as const
+          }
+          return [
+            true,
+            new Map(current).set(entry.key, {
+              ...found,
+              phase: "claiming",
+              touchedAt: Date.now(),
+            }),
+          ] as const
+        })
+        if (!claimed) return yield* new SessionAlreadyExists({ sessionId: entry.sessionId })
 
-      const result = yield* Effect.either(initialize(entry))
-      if (result._tag === "Left") {
-        yield* restoreClaim({ key: entry.key, sessionId: entry.sessionId })
-        return yield* result.left
-      }
-      return { key: entry.key, sessionId: entry.sessionId }
+        const claim = { key: entry.key, sessionId: entry.sessionId }
+        const result = yield* restore(initialize(entry)).pipe(Effect.exit)
+        if (Exit.isFailure(result)) {
+          yield* restoreClaim(claim)
+          return yield* Effect.failCause(result.cause)
+        }
+        return claim
+      }))
     })
 
     const promote = Effect.fn("acn.session-drafts.promote")(function* (claim: DraftClaim) {
