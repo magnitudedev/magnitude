@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Match, Option, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Match, Option, Ref, Schema, Stream } from "effect"
 import {
   ModelCatalogError,
   ModelDiscoveryOperationIdSchema,
@@ -18,10 +18,12 @@ import {
   nativeChatCompletionsCodec,
   type BaseCallOptions,
   ChatCompletionsStreamChunk,
+  type GenerationPerformance,
   type ModelRequestProgress,
   type ProviderModelBindOptions,
   type ProviderId,
   type ProviderModelId,
+  type ResponseStreamEvent,
   type StreamFailure,
   type StreamStartFailure,
   type Prompt,
@@ -196,10 +198,11 @@ const bindIcnModel = (
       Effect.tap(() => bindOptions?.requestAttribution?.requestStarted ?? Effect.void),
       Effect.flatMap((payload) =>
         client.chat.createChatCompletion({ payload }).pipe(
-            Effect.mapError((cause) => generatedStartFailure(call, cause)),
-            Effect.map(({ status, headers, events }) => {
+          Effect.mapError((cause) => generatedStartFailure(call, cause)),
+          Effect.flatMap(({ status, headers, events }) => Effect.gen(function* () {
               const response = acceptedHttpResponse(status, headers)
               const requestProgress = bindOptions?.requestAttribution?.requestProgress
+              const performance = yield* Ref.make(Option.none<GenerationPerformance>())
               let progressRequestId: string | null = null
               let semanticStarted = false
               const reportProgress = (
@@ -224,6 +227,15 @@ const bindIcnModel = (
                 return requestProgress(update)
               }
               const sourceEvents = events.pipe(
+                Stream.tap((chunk) => Option.match(chunk.timings, {
+                  onNone: () => Effect.void,
+                  onSome: (timings) => Ref.set(performance, Option.some({
+                    generatedTokens: timings.predicted_n,
+                    decodeDurationMs: timings.predicted_ms,
+                    decodeTokensPerSecond: timings.predicted_per_second,
+                    timeToFirstTokenMs: timings.time_to_first_token_ms,
+                  })),
+                })),
                 Stream.tap((chunk) => Option.match(chunk.progress, {
                   onSome: (progress) => {
                     if (progress._tag === "Generating") semanticStarted = true
@@ -268,12 +280,23 @@ const bindIcnModel = (
                 ...(requestOptions?.generateToolCallId ? { generateToolCallId: requestOptions.generateToolCallId } : {}),
                 toStreamFailure: (cause) => generatedBodyFailure(call, response, cause),
               })
+              const decodedEvents = decoded.events.pipe(
+                Stream.mapEffect((event): Effect.Effect<ResponseStreamEvent> => {
+                  if (event._tag !== "stream_end" || event.terminal._tag !== "StreamCompleted") {
+                    return Effect.succeed(event)
+                  }
+                  return Ref.get(performance).pipe(Effect.map(Option.match({
+                    onNone: () => event,
+                    onSome: (measurement) => ({ ...event, performance: measurement }),
+                  })))
+                }),
+              )
               return {
                 ...decoded,
-                events: decoded.events,
+                events: decodedEvents,
                 requestId: response.requestId,
               }
-            }),
+          })),
         )),
     )
   },

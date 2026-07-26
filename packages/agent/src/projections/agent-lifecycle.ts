@@ -12,7 +12,7 @@ import { outcomeWillChainContinue } from '../events'
 import type { AppEvent } from '../events'
 import { ROLE_IDS, type RoleId } from '../agents/role-validation'
 import { Schema } from 'effect'
-import { DisplayActivity } from '@magnitudedev/protocol'
+import { DisplayActivity, type WorkSummaryPerformance } from '@magnitudedev/protocol'
 
 export const AgentLifecycleSchema = Schema.Literal('working', 'idle', 'killed')
 export type AgentLifecycleStatus = typeof AgentLifecycleSchema.Type
@@ -35,6 +35,16 @@ export const AgentInfoSchema = Schema.Struct({
 export type AgentInfo = typeof AgentInfoSchema.Type
 
 // Root work state — merged from ActorWorkProjection (root only, no per-actor map)
+const RootGenerationAggregateSchema = Schema.Struct({
+  modelDisplayName: Schema.String,
+  generatedTokens: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
+  decodeDurationMs: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+  timeToFirstTokenMs: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+  requestCount: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  singleRequestDecodeTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+})
+type RootGenerationAggregate = typeof RootGenerationAggregateSchema.Type
+
 const RootWorkStateSchema = Schema.Struct({
   phase: Schema.Literal('idle', 'waiting_for_model', 'working', 'waiting_for_workers', 'worked', 'interrupted'),
   accumulatedWorkMs: Schema.Number,
@@ -48,6 +58,9 @@ const RootWorkStateSchema = Schema.Struct({
   }),
   _thinkingCharCount: Schema.NullOr(Schema.Number),
   _activeToolKey: Schema.NullOr(Schema.String),
+  _generation: Schema.optionalWith(Schema.NullOr(RootGenerationAggregateSchema), {
+    default: () => null,
+  }),
 })
 type RootWorkState = typeof RootWorkStateSchema.Type
 
@@ -122,6 +135,7 @@ export interface RootWorkCompletedSignal {
   readonly completedAt: number
   readonly durationMs: number
   readonly phase: 'worked' | 'interrupted'
+  readonly performance: WorkSummaryPerformance | null
 }
 
 // --- Root work helpers ---
@@ -182,7 +196,48 @@ function startRootTurn(state: RootWorkState, timestamp: number, chainId: string)
       ? (state.activeChildCount > 0 ? timestamp : null)
       : state.workingStartedAt,
     _thinkingCharCount: null,
+    _generation: isNewChain ? null : state._generation,
   })
+}
+
+function recordRootGeneration(
+  state: RootWorkState,
+  event: Extract<AppEvent, { type: 'turn_outcome' }>,
+): RootWorkState {
+  const measurement = event.generationPerformance
+  if (measurement == null) return state
+  const current = state._generation
+  const next: RootGenerationAggregate = current === null
+    ? {
+        modelDisplayName: measurement.modelDisplayName,
+        generatedTokens: measurement.generatedTokens,
+        decodeDurationMs: measurement.decodeDurationMs,
+        timeToFirstTokenMs: measurement.timeToFirstTokenMs,
+        requestCount: 1,
+        singleRequestDecodeTokensPerSecond: measurement.decodeTokensPerSecond,
+      }
+    : {
+        ...current,
+        generatedTokens: current.generatedTokens + measurement.generatedTokens,
+        decodeDurationMs: current.decodeDurationMs + measurement.decodeDurationMs,
+        requestCount: current.requestCount + 1,
+      }
+  return { ...state, _generation: next }
+}
+
+function summarizeGeneration(aggregate: RootGenerationAggregate | null): WorkSummaryPerformance | null {
+  if (
+    aggregate === null
+    || aggregate.generatedTokens <= 0
+    || aggregate.decodeDurationMs <= 0
+  ) return null
+  return {
+    modelDisplayName: aggregate.modelDisplayName,
+    timeToFirstTokenMs: aggregate.timeToFirstTokenMs,
+    decodeTokensPerSecond: aggregate.requestCount === 1
+      ? aggregate.singleRequestDecodeTokensPerSecond
+      : aggregate.generatedTokens * 1_000 / aggregate.decodeDurationMs,
+  }
 }
 
 function startRootGeneration(state: RootWorkState, timestamp: number): RootWorkState {
@@ -240,6 +295,7 @@ function stopRootWork(
       _currentChainId: null,
       _thinkingCharCount: null,
       _activeToolKey: null,
+      _generation: null,
     },
     completion: !isRootWorkActive(state) || state._currentChainId === null
       ? null
@@ -248,6 +304,7 @@ function stopRootWork(
           completedAt: timestamp,
           durationMs: chainMs,
           phase,
+          performance: summarizeGeneration(state._generation),
         },
   }
 }
@@ -375,6 +432,7 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
       _currentChainId: null,
       _thinkingCharCount: null,
       _activeToolKey: null,
+      _generation: null,
     },
   },
 
@@ -514,13 +572,17 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
       if (event.forkId === null) {
         // Root turn ending — turn-aware close
         if (state.rootWork._currentTurnId !== event.turnId) return state
+        const nextState = {
+          ...state,
+          rootWork: recordRootGeneration(state.rootWork, event),
+        }
 
         // Chain continues — don't close, just clear turn id
         if (outcomeWillChainContinue(event.outcome)) {
           return {
-            ...state,
+            ...nextState,
             rootWork: {
-              ...pauseRootForModel(state.rootWork, event.timestamp),
+              ...pauseRootForModel(nextState.rootWork, event.timestamp),
               _currentTurnId: null,
             },
           }
@@ -529,9 +591,9 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
         if (countWorkingChildren(state, null) > 0) {
           // Root turn ended but workers still running — deferred close
           return {
-            ...state,
+            ...nextState,
             rootWork: {
-              ...waitForRootWorkers(state.rootWork, event.timestamp),
+              ...waitForRootWorkers(nextState.rootWork, event.timestamp),
               _currentTurnId: null,
             },
           }
@@ -539,9 +601,9 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
         // No workers active — close root work
         const phase = event.outcome._tag === 'Cancelled' ? 'interrupted' : 'worked'
-        const stopped = stopRootWork(state.rootWork, event.timestamp, phase)
+        const stopped = stopRootWork(nextState.rootWork, event.timestamp, phase)
         if (stopped.completion !== null) emit.rootWorkCompleted(stopped.completion)
-        return { ...state, rootWork: stopped.state }
+        return { ...nextState, rootWork: stopped.state }
       }
 
       // Worker turn ending

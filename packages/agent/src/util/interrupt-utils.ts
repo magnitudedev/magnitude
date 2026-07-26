@@ -42,6 +42,7 @@ export const buildInterruptedTurnOutcome = (params: {
     cost: null,
     providerId: null,
     modelId: null,
+    generationPerformance: null,
   }
 
   return event

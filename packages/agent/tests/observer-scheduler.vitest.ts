@@ -224,6 +224,7 @@ function makeModelResolver(escalateOnCalls: Set<number>) {
     rawModel: observerModel,
     modelSource: { slotId: 'secondary' },
     modelId: 'util/observer',
+    modelDisplayName: 'Observer',
     providerId: 'magnitude',
     profile,
     debug: false,

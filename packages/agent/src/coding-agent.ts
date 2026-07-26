@@ -557,6 +557,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
               cost: null,
               providerId: null,
               modelId: null,
+              generationPerformance: null,
             })
           }
         }
@@ -577,6 +578,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
             cost: null,
             providerId: null,
             modelId: null,
+            generationPerformance: null,
           })
         }
 

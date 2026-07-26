@@ -12,7 +12,7 @@ import type {
   HarnessEvent,
   ToolLifecycleEvent,
 } from '@magnitudedev/harness'
-import type { ProviderToolCallId } from '@magnitudedev/ai'
+import type { GenerationPerformance, ProviderToolCallId } from '@magnitudedev/ai'
 import {
   type AppEvent,
   type MessageDestination,
@@ -101,6 +101,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
     requestId: null,
   }
   let turnUsage: ExecuteResult['usage'] = null
+  let generationPerformance: GenerationPerformance | null = null
   let commitPolicy: ExecuteResult['commitPolicy'] = { _tag: 'commitCleanTurn' }
 
   const publishGenerationStarted = (): Effect.Effect<void> => {
@@ -302,6 +303,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
         case 'TurnEnd': {
           const outcome = event.outcome
           const requestId = outcome.requestId
+          generationPerformance = event.performance ?? null
 
           // Capture usage
           if (event.usage) {
@@ -484,6 +486,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
   const getResult = (): ExecuteResult => ({
     result: executionResult,
     commitPolicy,
+    generationPerformance,
     usage: turnUsage,
   })
 

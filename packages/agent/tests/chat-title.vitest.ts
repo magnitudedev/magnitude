@@ -147,6 +147,7 @@ function makeTitleModel(title: string | null, options?: { failAfterOutput?: bool
     },
     modelSource: { slotId: 'primary' },
     modelId: 'local-primary',
+    modelDisplayName: 'Local Primary',
     providerId: 'local',
     profile: {
       contextWindow: 128_000,

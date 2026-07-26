@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Effect, Layer } from 'effect'
+import { Effect, Layer, Option } from 'effect'
 import {
   Addressed,
   FrameworkErrorPubSubLive,
@@ -10,6 +10,7 @@ import {
 } from '@magnitudedev/event-core'
 import type { AppEvent } from '../src/events'
 import type { DisplayMessage } from '../src/display'
+import type { GenerationPerformance } from '@magnitudedev/ai'
 import { DisplayTimelineProjection } from '../src/display'
 import { AgentLifecycleProjection } from '../src/projections/agent-lifecycle'
 import { AgentRoutingProjection } from '../src/projections/agent-routing'
@@ -75,6 +76,7 @@ const turnOutcome = (
   timestamp: number,
   toolCallsCount = 0,
   forkId: string | null = null,
+  generationPerformance: GenerationPerformance | null = null,
 ): AppEvent => ({
   type: 'turn_outcome',
   timestamp,
@@ -99,6 +101,9 @@ const turnOutcome = (
   cost: null,
   providerId: null,
   modelId: null,
+  generationPerformance: generationPerformance
+    ? { ...generationPerformance, modelDisplayName: 'Qwen3 Coder' }
+    : null,
 } as AppEvent)
 
 const userMessage = (messageId: string, timestamp: number, text: string): AppEvent => ({
@@ -150,8 +155,57 @@ describe('persistent root work summaries', () => {
       chainId: 'chain-1',
       durationMs: 2_500,
       phase: 'worked',
+      performance: Option.none(),
       timestamp: ts(6_000),
     }])
+  })
+
+  it('keeps the first TTFT and weights native decode throughput across continued turns', async () => {
+    const messages = await runDisplay([
+      turnStarted('turn-1', 'chain-1', ts(1_000)),
+      generationStarted('turn-1', 'chain-1', ts(1_500)),
+      turnOutcome('turn-1', 'chain-1', ts(3_000), 1, null, {
+        generatedTokens: 10,
+        decodeDurationMs: 500,
+        decodeTokensPerSecond: 20,
+        timeToFirstTokenMs: 80,
+      }),
+      turnStarted('turn-2', 'chain-1', ts(4_000)),
+      generationStarted('turn-2', 'chain-1', ts(5_000)),
+      turnOutcome('turn-2', 'chain-1', ts(6_000), 0, null, {
+        generatedTokens: 30,
+        decodeDurationMs: 1_000,
+        decodeTokensPerSecond: 30,
+        timeToFirstTokenMs: 120,
+      }),
+    ])
+
+    const summary = messages.find((message) => message.type === 'work_summary')
+    expect(summary?.type).toBe('work_summary')
+    if (summary?.type !== 'work_summary') return
+    expect(Option.getOrThrow(summary.performance)).toEqual({
+      modelDisplayName: 'Qwen3 Coder',
+      timeToFirstTokenMs: 80,
+      decodeTokensPerSecond: 40_000 / 1_500,
+    })
+  })
+
+  it('preserves ICN native throughput unchanged for a single root request', async () => {
+    const messages = await runDisplay([
+      turnStarted('turn-1', 'chain-1', ts(1_000)),
+      generationStarted('turn-1', 'chain-1', ts(1_500)),
+      turnOutcome('turn-1', 'chain-1', ts(3_000), 0, null, {
+        generatedTokens: 10,
+        decodeDurationMs: 400,
+        decodeTokensPerSecond: 24.5,
+        timeToFirstTokenMs: 72,
+      }),
+    ])
+
+    const summary = messages.find((message) => message.type === 'work_summary')
+    expect(summary?.type).toBe('work_summary')
+    if (summary?.type !== 'work_summary') return
+    expect(Option.getOrThrow(summary.performance).decodeTokensPerSecond).toBe(24.5)
   })
 
   it('keeps counting an active worker during root prefill, then pauses when it settles', async () => {

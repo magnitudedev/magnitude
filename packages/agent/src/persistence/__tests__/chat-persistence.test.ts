@@ -287,8 +287,15 @@ describe('ChatPersistenceService - JSON Backend', () => {
         cacheReadTokens: null,
         cacheWriteTokens: null,
         cost: null,
-        providerId: null,
-        modelId: null
+        providerId: 'local',
+        modelId: 'local:model',
+        generationPerformance: {
+          modelDisplayName: 'Qwen3 Coder',
+          generatedTokens: 41,
+          decodeDurationMs: 2_000,
+          decodeTokensPerSecond: 20.5,
+          timeToFirstTokenMs: 400,
+        },
       }
 
       await persistence.persistNewEvents(sessionId, [event])

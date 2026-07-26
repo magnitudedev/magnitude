@@ -114,6 +114,7 @@ describe('display timeline presentation', () => {
       chainId: 'chain-1',
       durationMs: 5_000,
       phase: 'worked',
+      performance: Option.none(),
       timestamp: 2,
     }]
 

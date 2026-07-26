@@ -7,7 +7,7 @@
 
 import { Effect, Context, Layer, Stream } from 'effect'
 import type { AttemptCommitPolicy, TurnOutcome } from '../events'
-import type { ResponseUsage } from '@magnitudedev/ai'
+import type { GenerationPerformance, ResponseUsage } from '@magnitudedev/ai'
 import type { Projection, WorkerBusService } from '@magnitudedev/event-core'
 import type { RoleId } from '../agents/role-validation'
 import type { AgentRoutingProjection } from '../projections/agent-routing'
@@ -85,6 +85,7 @@ type ExecutionProjectionRequirements =
 export interface ExecuteResult {
   readonly result: TurnOutcome
   readonly commitPolicy?: AttemptCommitPolicy
+  readonly generationPerformance: GenerationPerformance | null
   readonly usage: {
     readonly inputTokens: number | null
     readonly outputTokens: number | null

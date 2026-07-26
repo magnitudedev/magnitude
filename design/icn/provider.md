@@ -1,6 +1,9 @@
 ---
 applies_to:
   - packages/ai/src/provider/**
+  - packages/ai/src/response/**
+  - packages/harness/src/events.ts
+  - packages/harness/src/turn/dispatcher.ts
   - packages/icn/src/provider/**
   - packages/acn/src/local-provider-**
   - packages/acn/src/model-*.ts
@@ -123,6 +126,12 @@ uses that same progress sink, so the display sees one continuous request lifecyc
 canceled start clears preparation progress; after acceptance, ending, failing, or canceling the
 response stream clears provider-owned progress. Providers that do not support granular observation
 remain valid and expose no synthetic progress.
+
+ICN also publishes one final cumulative timing snapshot for every accepted generation. The local
+provider translates its generated-token count, decode duration, native decode rate, and time to
+first token into the optional provider-neutral generation-performance contract. This final
+measurement is independent of transient request progress and requires no per-token timing stream.
+Generic agent code consumes the optional capability without branching on the local provider ID.
 
 ## Speculative decoding
 

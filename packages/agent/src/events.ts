@@ -9,6 +9,7 @@
 
 import { Brand, Option, Schema } from 'effect'
 import type { ContextPart } from './content'
+import { GenerationPerformanceSchema } from '@magnitudedev/ai'
 import type { ModelAttemptFailureSnapshot, ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
 import type { ToolLifecycleEvent } from '@magnitudedev/harness'
 import type { ValidationIssue } from '@magnitudedev/ai'
@@ -38,6 +39,12 @@ export type {
 // =============================================================================
 
 export type StrategyId = 'native'
+
+export const AttributedGenerationPerformanceSchema = Schema.Struct({
+  ...GenerationPerformanceSchema.fields,
+  modelDisplayName: Schema.String,
+})
+export type AttributedGenerationPerformance = typeof AttributedGenerationPerformanceSchema.Type
 
 // =============================================================================
 // Work Agent Types
@@ -186,6 +193,8 @@ export interface TurnOutcomeEvent {
   readonly providerId: string | null
   /** Model ID used for this turn. Null when unavailable. */
   readonly modelId: string | null
+  /** Native generation performance attributed by the agent. Absent on older events and when unavailable. */
+  readonly generationPerformance?: AttributedGenerationPerformance | null
 }
 
 /** @deprecated xml-act paradigm only — kept for orphaned xml-act code. Use toolCallsCount on native path. */

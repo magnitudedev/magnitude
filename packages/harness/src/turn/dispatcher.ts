@@ -480,6 +480,7 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
             _tag: "TurnEnd",
             outcome,
             usage,
+            ...(event.performance ? { performance: event.performance } : {}),
           })
         })
       }

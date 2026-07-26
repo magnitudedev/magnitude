@@ -113,6 +113,7 @@ describe('display view materializer', () => {
       _currentChainId: null,
       _thinkingCharCount: null,
       _activeToolKey: null,
+      _generation: null,
     }
 
     const actors = materializeDisplayActors(

@@ -19,7 +19,7 @@ const ToolkitProjectionAgent = EventEngine.make<AppEvent>()({
 
 function slot(slotId: 'primary' | 'secondary', vision: boolean | undefined): SlotConfig {
   return {
-    slotId, providerId: 'test', providerModelId: slotId,
+    slotId, providerId: 'test', providerModelId: slotId, modelDisplayName: slotId,
     profile: { contextWindow: 100_000, maxOutputTokens: 4_000 },
     vision, hardCap: 96_000, softCap: 80_000, reasoningEffort: ReasoningEffortSchema.make('medium'),
     isUserOverride: false, isFallback: false,

@@ -124,6 +124,7 @@ export const AgentModelResolverLive = (
             }),
             modelSource: { slotId: slotConfig.slotId },
             modelId: slotConfig.providerModelId,
+            modelDisplayName: slotConfig.modelDisplayName,
             providerId: slotConfig.providerId,
             profile: slotConfig.profile,
             debug: debug ?? false,

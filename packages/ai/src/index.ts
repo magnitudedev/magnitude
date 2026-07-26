@@ -47,6 +47,8 @@ export { defineTool } from "./tools/tool-definition"
 // Response
 export type { ResponseStreamEvent, ValidationIssue, FinishReason, StreamEnd, RawLogprobEntry, RawInputToken, RawOutputToken } from "./response/events"
 export type { ResponseUsage } from "./response/usage"
+export { GenerationPerformanceSchema } from "./response/performance"
+export type { GenerationPerformance } from "./response/performance"
 export { formatValidationIssue } from "./response/validation-issue"
 
 export {

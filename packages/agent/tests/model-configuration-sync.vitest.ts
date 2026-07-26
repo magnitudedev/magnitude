@@ -15,6 +15,7 @@ const config = (revision: number, providerModelId: string): ConfigState => ({
         slotId: 'primary',
         providerId: 'local',
         providerModelId,
+        modelDisplayName: providerModelId,
         profile: { contextWindow: 100_000, maxOutputTokens: 4_000 },
         vision: false,
         hardCap: 96_000,

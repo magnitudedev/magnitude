@@ -17,6 +17,8 @@ export function makeTestModelResolver(config: TestModelConfig = {}): Layer.Layer
       rawModel: bound,
       modelSource: { slotId },
       modelId,
+      modelDisplayName: modelId,
+      providerId: 'test',
       profile: DEFAULT_TEST_PROFILE,
       debug: false,
       agentId: 'test',

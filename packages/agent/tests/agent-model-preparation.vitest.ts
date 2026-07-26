@@ -22,6 +22,7 @@ const result: ModelStreamResult = {
 const config = {
   modelSource: { slotId: 'primary' as const },
   modelId: 'model',
+  modelDisplayName: 'Model',
   providerId: 'local',
   profile: { contextWindow: 8192, maxOutputTokens: 1024 },
   debug: false,
