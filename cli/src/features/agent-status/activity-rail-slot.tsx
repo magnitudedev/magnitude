@@ -1,11 +1,15 @@
 import type { ReactNode } from 'react'
 
-/** Aligns the live rail with assistant output; composer chrome supplies its lower separation. */
+const ACTIVITY_HEADER_PREFIX = '┏━ '
+
+/** Renders live activity as a terminal-background header attached directly to the composer rail. */
 export function ActivityRailSlot({
   width,
+  color,
   children,
 }: {
   readonly width: number
+  readonly color: string
   readonly children: ReactNode
 }): ReactNode {
   return (
@@ -16,8 +20,11 @@ export function ActivityRailSlot({
       paddingLeft: 1,
       paddingRight: 2,
     }}>
-      <box style={{ width, minWidth: 0, height: 1, flexShrink: 0, overflow: 'hidden' }}>
-        {children}
+      <box style={{ width, minWidth: 0, height: 1, flexShrink: 0, flexDirection: 'row', overflow: 'hidden' }}>
+        <text style={{ fg: color }}>{ACTIVITY_HEADER_PREFIX}</text>
+        <box style={{ flexGrow: 1, minWidth: 0, height: 1, overflow: 'hidden' }}>
+          {children}
+        </box>
       </box>
     </box>
   )

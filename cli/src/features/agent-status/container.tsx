@@ -20,6 +20,7 @@ import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
 import { ActivityRail } from './activity-rail'
 import { ActivityRailSlot } from './activity-rail-slot'
 import { TaskList } from './task-list'
+import { useTheme } from '../../hooks/use-theme'
 
 export function ActivityRailContainer({
   modelLoadActivity,
@@ -28,6 +29,7 @@ export function ActivityRailContainer({
   readonly modelLoadActivity: LocalModelLoadActivity | null
   readonly width: number
 }): ReactNode {
+  const theme = useTheme()
   const timeline = useDisplayState((state) => getFork(state, null) ?? null)
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
   const modelRequestActivity = useDisplayState(
@@ -53,7 +55,8 @@ export function ActivityRailContainer({
   const advisorProfile = profiles
     ? Option.getOrNull(findSlotProfile(profiles, advisorSlotId))
     : null
-  const activityWidth = Math.max(0, width - 3)
+  const slotWidth = Math.max(0, width - 3)
+  const activityWidth = Math.max(0, slotWidth - 3)
 
   const hasWork = rootActor !== null
     && (isDisplayActorWorkActive(rootActor.work) || rootActor.work.activity !== null)
@@ -62,7 +65,7 @@ export function ActivityRailContainer({
   }
 
   return (
-    <ActivityRailSlot width={activityWidth}>
+    <ActivityRailSlot width={slotWidth} color={theme.modeDefault}>
       <ActivityRail
         work={rootActor?.work ?? null}
         width={activityWidth}
