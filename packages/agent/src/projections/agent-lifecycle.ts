@@ -1,5 +1,3 @@
-import { Option } from 'effect'
-
 /**
  * AgentLifecycleProjection
  *
@@ -11,7 +9,7 @@ import { Projection, Signal } from '@magnitudedev/event-core'
 import { outcomeWillChainContinue } from '../events'
 import type { AppEvent } from '../events'
 import { ROLE_IDS, type RoleId } from '../agents/role-validation'
-import { Schema } from 'effect'
+import { Option, Schema } from 'effect'
 import { DisplayActivity, type WorkSummaryPerformance } from '@magnitudedev/protocol'
 
 export const AgentLifecycleSchema = Schema.Literal('working', 'idle', 'killed')
@@ -39,7 +37,6 @@ const RootGenerationAggregateSchema = Schema.Struct({
   modelDisplayName: Schema.String,
   generatedTokens: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
   decodeDurationMs: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
-  timeToFirstTokenMs: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   requestCount: Schema.Number.pipe(Schema.int(), Schema.positive()),
   singleRequestDecodeTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
 })
@@ -212,7 +209,6 @@ function recordRootGeneration(
         modelDisplayName: measurement.modelDisplayName,
         generatedTokens: measurement.generatedTokens,
         decodeDurationMs: measurement.decodeDurationMs,
-        timeToFirstTokenMs: measurement.timeToFirstTokenMs,
         requestCount: 1,
         singleRequestDecodeTokensPerSecond: measurement.decodeTokensPerSecond,
       }
@@ -233,7 +229,6 @@ function summarizeGeneration(aggregate: RootGenerationAggregate | null): WorkSum
   ) return null
   return {
     modelDisplayName: aggregate.modelDisplayName,
-    timeToFirstTokenMs: aggregate.timeToFirstTokenMs,
     decodeTokensPerSecond: aggregate.requestCount === 1
       ? aggregate.singleRequestDecodeTokensPerSecond
       : aggregate.generatedTokens * 1_000 / aggregate.decodeDurationMs,
