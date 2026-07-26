@@ -1,3 +1,4 @@
+import { Option } from "effect"
 import type { LocalInferenceView } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
 import type { ProviderId, SlotId } from "@magnitudedev/sdk"
@@ -6,7 +7,27 @@ const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 export interface LocalInferenceFooterView {
   readonly modelName: string | null
   readonly residency: "loaded" | "loading" | "not_loaded" | null
+  readonly memoryLabel: string | null
 }
+
+const compactGiB = (bytes: number): string =>
+  (bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, "")
+
+const residentMemoryLabel = (state: LocalInferenceView): string | null =>
+  Option.match(state.hardware.residentMemory, {
+    onNone: () => null,
+    onSome: ({ domains }) => {
+      const bytes = domains.reduce(
+        (total, domain) => total
+          + domain.modelBytes
+          + domain.contextBytes
+          + domain.computeBytes
+          + domain.auxiliaryBytes,
+        0,
+      )
+      return `${compactGiB(bytes)} GB mem`
+    },
+  })
 
 export const deriveLocalInferenceFooterView = (
   state: LocalInferenceView | null,
@@ -15,12 +36,13 @@ export const deriveLocalInferenceFooterView = (
   selectedSlotId: SlotId,
 ): LocalInferenceFooterView => {
   if (selectedProviderId !== null && selectedProviderId !== LOCAL_PROVIDER_ID) {
-    return { modelName: selectedModelName ?? "Cloud model", residency: null }
+    return { modelName: selectedModelName ?? "Cloud model", residency: null, memoryLabel: null }
   }
   if (state === null) {
     return {
       modelName: selectedModelName,
       residency: selectedProviderId === LOCAL_PROVIDER_ID ? "not_loaded" : null,
+      memoryLabel: null,
     }
   }
   const selectedSlot = state.slots.slots[
@@ -45,5 +67,6 @@ export const deriveLocalInferenceFooterView = (
   return {
     modelName: selectedModelName ?? model?.displayName ?? null,
     residency,
+    memoryLabel: residency === "loaded" ? residentMemoryLabel(state) : null,
   }
 }

@@ -289,7 +289,10 @@ export function Composer(props: ComposerProps) {
         + (thinkingOpen
           ? thinkingSelectorWidth(thinkingOptions)
           : 3
-            + contextUsageWidth(tokenUsage, contextHardCap, isCompacting))
+            + contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
+            + (modelFooter.memoryLabel === null
+              ? 0
+              : 3 + stringWidth(modelFooter.memoryLabel)))
   const footerLeftWidth = footerPrimaryWidth + footerModeWidth + footerTransientWidth
   const footerRightWidth = stringWidth(workingDirectoryLabel)
   const footerStacks = footerLeftWidth + footerRightWidth + 8 > chatColumnWidth
@@ -691,6 +694,12 @@ export function Composer(props: ComposerProps) {
                 hardCap={contextHardCap}
                 isCompacting={isCompacting}
               />
+              {modelFooter.memoryLabel !== null && (
+                <>
+                  <box style={{ width: 3, flexShrink: 0 }} />
+                  <text style={{ fg: theme.muted }}>{modelFooter.memoryLabel}</text>
+                </>
+              )}
             </>
           )}
         </>
