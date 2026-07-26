@@ -52,6 +52,9 @@ loadable.
 
 `GET /v1/models/catalog` returns the recommendable model catalog. Every entry contains an exact
 package target or speculative pair, eligible serving profiles, capabilities, and curation evidence.
+An eligible serving profile identifies the per-request context capacity only. Parallel execution
+capacity is resolved from current hardware when the installed configuration is loaded and is not
+part of catalog or configuration identity.
 
 Catalog membership means only that Magnitude may assess and recommend the target. It does not mean
 the target fits, is recommended, is installed, is offered, or is resident.
@@ -159,10 +162,10 @@ ICN uses the shared `.magnitude/cache` root for source resolution, inspection, a
 evidence. The authoritative `.magnitude/models` store contains installed artifacts and the managed
 Hugging Face hub, never disposable derived-cache namespaces.
 Successful model loads also retain bounded, disposable phase-duration evidence for adaptive loading
-progress. Exact observations are keyed by content, serving profile, native build, path-independent
-resolved plan identity, selected acceleration, phase shape, and process-residency class; cross-model
-observations from the same native environment are workload-scaled fallbacks. Failed or canceled
-loads never train this cache.
+progress. Exact observations are keyed by content, context-only serving profile, resolved physical
+context and parallel allocation, native build, path-independent resolved plan identity, selected
+acceleration, phase shape, and process-residency class; cross-model observations from the same
+native environment are workload-scaled fallbacks. Failed or canceled loads never train this cache.
 Keys include immutable package identity and every behavior-changing runtime or hardware input.
 
 Malformed, missing, stale, or unreadable entries are misses at the smallest independent unit.

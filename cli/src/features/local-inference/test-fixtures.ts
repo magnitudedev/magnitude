@@ -23,7 +23,7 @@ import type { LocalInferenceView } from "@magnitudedev/client-common"
 
 export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
-export const TEST_MODEL_ID = ProviderModelIdSchema.make("local:test-model")
+export const TEST_MODEL_ID = ProviderModelIdSchema.make("local:configuration_test")
 export const TEST_TARGET_ID = ModelOfferingTargetIdSchema.make("target_test")
 export const TEST_CONFIGURATION_ID = ModelServingConfigurationIdSchema.make("configuration_test")
 export const TEST_CANDIDATE_ID = CatalogCandidateIdSchema.make("candidate_test")
@@ -58,6 +58,7 @@ export const makeHardware = (
     sharesSystemMemory: false,
   }],
   residentMemory: Option.none(),
+  residentRuntime: Option.none(),
   runtimeFailure: Option.none(),
   ...overrides,
 })
@@ -83,7 +84,7 @@ export const makeCatalogCandidate = (
   displayName: "Qwen Test",
   description: "Test model",
   license: "Apache-2.0",
-  profile: { contextLength: 32_768, parallelSequences: 1 },
+  profile: { contextLength: 32_768 },
   downloadBytes: 16 * GIB,
   download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
   preparation: { _tag: "NotDownloaded" },

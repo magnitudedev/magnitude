@@ -30,6 +30,7 @@ const hardware: LocalInferenceHardware = {
     sharesSystemMemory: true,
   }],
   residentMemory: Option.none(),
+  residentRuntime: Option.none(),
   runtimeFailure: Option.none(),
 }
 

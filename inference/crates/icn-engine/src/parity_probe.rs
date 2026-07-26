@@ -167,6 +167,7 @@ fn configuration_inspect(input: &Map<String, Value>) -> Result<Value, ProbeError
     let config = ExecutionIntent {
         model_path: input.model_path.clone(),
         context_size: input.context.context_tokens,
+        physical_context_size: input.context.context_tokens,
         batch_size: input.context.batch_tokens,
         ubatch_size: input.context.micro_batch_tokens,
         max_sequences: input.context.sequences,
@@ -912,6 +913,7 @@ fn llama_batched_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
     let config = ExecutionIntent {
         model_path: input.model_path.clone(),
         context_size: input.context_tokens,
+        physical_context_size: input.context_tokens,
         batch_size: input.batch_tokens,
         ubatch_size: input.micro_batch_tokens,
         max_sequences: input.parallel_sequences,
@@ -1239,6 +1241,7 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
     let config = ExecutionIntent {
         model_path: input.model_path.clone(),
         context_size: requested_context,
+        physical_context_size: requested_context,
         batch_size: input.batch_tokens,
         ubatch_size: input.micro_batch_tokens,
         max_sequences: 1,

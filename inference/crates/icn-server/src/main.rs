@@ -112,6 +112,7 @@ enum Command {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct RuntimePlanDefaults {
     context_size: u32,
+    physical_context_size: u32,
     batch_size: u32,
     ubatch_size: u32,
     max_sequences: u32,
@@ -126,7 +127,6 @@ struct RuntimePlanDefaults {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeExecutionProfile {
     context_length: u32,
-    parallel_sequences: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +135,8 @@ struct ResidentTarget {
     residency_id: String,
     profile: RuntimeExecutionProfile,
     package_ids: Vec<ModelPackageId>,
+    parallel_sequences: u32,
+    physical_context_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -142,12 +144,31 @@ struct RuntimeState {
     resident: Option<ResidentTarget>,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeAllocation {
+    residency_id: RuntimeResidencyId,
+    parallel_sequences: u32,
+    physical_context_tokens: u32,
+}
+
+fn select_runtime_allocation(
+    candidates: &[(u32, u64)],
+    sample: memory_supervisor::MemorySample,
+) -> Option<(u32, u64)> {
+    candidates
+        .iter()
+        .rev()
+        .copied()
+        .find(|(_, required)| sample.permits_load(*required))
+}
+
 fn runtime_plan_defaults() -> RuntimePlanDefaults {
     RuntimePlanDefaults {
-        // Managed product models always overwrite context and parallelism from their persisted
-        // serving configuration. This conservative value is only the discovery/migration fallback
-        // for unmanaged local artifacts that predate serving configurations.
+        // Managed product models always overwrite context from their persisted serving
+        // configuration. This conservative value is only the discovery/migration fallback for
+        // unmanaged local artifacts that predate serving configurations.
         context_size: 4096,
+        physical_context_size: 4096,
         batch_size: 512,
         ubatch_size: 512,
         max_sequences: 1,
@@ -163,7 +184,7 @@ fn runtime_plan_defaults() -> RuntimePlanDefaults {
             offload_kqv: true,
             operation_offload: true,
             swa_full: false,
-            kv_unified: true,
+            kv_unified: false,
             threads: None,
             threads_batch: None,
             flash_attention: FlashAttention::Auto,
@@ -183,6 +204,7 @@ fn execution_intent(
     Ok(ExecutionIntent {
         model_path,
         context_size: defaults.context_size,
+        physical_context_size: defaults.physical_context_size,
         batch_size: defaults.batch_size,
         ubatch_size: defaults.ubatch_size,
         max_sequences: defaults.max_sequences,
@@ -316,6 +338,11 @@ impl NativeHardwareAssessor {
         if let Some(profile) = profile {
             defaults.context_size = profile.context_length;
             defaults.max_sequences = profile.parallel_sequences;
+            defaults.physical_context_size = profile
+                .context_length
+                .checked_mul(profile.parallel_sequences)
+                .unwrap_or(u32::MAX);
+            defaults.execution.kv_unified = false;
         }
         defaults
     }
@@ -571,7 +598,6 @@ impl NativeModelEvaluator {
                     &environment.id.0,
                     &target_id.0,
                     profile.context_length,
-                    profile.parallel_sequences,
                     reserve_bytes,
                     include_performance,
                 ))
@@ -646,7 +672,7 @@ impl NativeModelEvaluator {
             .map(|index| ModelPreviewProfile {
                 id: format!("assessment-{index}"),
                 context_length: profiles[*index].context_length,
-                parallel_sequences: profiles[*index].parallel_sequences,
+                parallel_sequences: 1,
             })
             .collect::<Vec<_>>();
         let assessed = self
@@ -722,7 +748,6 @@ impl NativeModelEvaluator {
                 resolved,
                 &[DomainServingProfile {
                     context_length: upper,
-                    parallel_sequences: 1,
                 }],
                 reserve,
                 false,
@@ -739,7 +764,6 @@ impl NativeModelEvaluator {
                     resolved,
                     &[DomainServingProfile {
                         context_length: lower,
-                        parallel_sequences: 1,
                     }],
                     reserve,
                     false,
@@ -779,7 +803,6 @@ impl NativeModelEvaluator {
                         resolved,
                         &[DomainServingProfile {
                             context_length: middle,
-                            parallel_sequences: 1,
                         }],
                         reserve,
                         false,
@@ -797,25 +820,18 @@ impl NativeModelEvaluator {
             }
         }
         let context_length = best_context.expect("minimum fitting context was recorded");
-        let parallel_profiles = (1..=request.maximum_parallel_sequences)
-            .map(|parallel_sequences| DomainServingProfile {
-                context_length,
-                parallel_sequences,
-            })
-            .collect::<Vec<_>>();
-        let assessments = self
-            .assess_profiles(resolved, &parallel_profiles, reserve, true, &environment)
-            .await?;
-        let Some((profile, assessment)) = parallel_profiles
-            .into_iter()
-            .zip(assessments)
-            .rev()
-            .find(|(_, assessment)| matches!(assessment, OfferingAssessment::Fits { .. }))
-        else {
-            return Err(InventoryError::Internal(
-                "a previously fitting context no longer fits".to_owned(),
-            ));
-        };
+        let profile = DomainServingProfile { context_length };
+        let assessment = self
+            .assess_profiles(
+                resolved,
+                std::slice::from_ref(&profile),
+                reserve,
+                true,
+                &environment,
+            )
+            .await?
+            .pop()
+            .ok_or_else(|| InventoryError::Internal("fit assessment was omitted".to_owned()))?;
         let configuration_id = serving_configuration_id(&resolved.target_id, &profile);
         Ok(FitModelResult::Fitted {
             request_id: icn_contracts::models::ModelAssessmentRequestId(String::new()),
@@ -837,7 +853,6 @@ fn serving_configuration_id(
     let mut digest = Sha256::new();
     digest.update(target_id.0.as_bytes());
     digest.update(profile.context_length.to_le_bytes());
-    digest.update(profile.parallel_sequences.to_le_bytes());
     ModelServingConfigurationId(format!("configuration_{:x}", digest.finalize()))
 }
 
@@ -854,7 +869,6 @@ fn offering_assessment(
     let mut digest = Sha256::new();
     digest.update(target_id.0.as_bytes());
     digest.update(profile.context_length.to_le_bytes());
-    digest.update(profile.parallel_sequences.to_le_bytes());
     digest.update(reserve_bytes.to_le_bytes());
     digest.update(system_reserve_bytes.to_le_bytes());
     let assessment_id = OfferingAssessmentId(format!("assessment_{:x}", digest.finalize()));
@@ -1141,7 +1155,6 @@ impl ModelEvaluator for NativeModelEvaluator {
         Box::pin(async move {
             if request.minimum_context_length == 0
                 || request.minimum_context_length > request.maximum_context_length
-                || request.maximum_parallel_sequences == 0
             {
                 return Err(InventoryError::InvalidRequest(
                     "fit bounds must be positive and ordered".to_owned(),
@@ -1544,7 +1557,7 @@ impl InventoryHardwareAssessor for NativeHardwareAssessor {
                 Some(&ModelPreviewProfile {
                     id: "serving".to_owned(),
                     context_length: profile.context_length,
-                    parallel_sequences: profile.parallel_sequences,
+                    parallel_sequences: 1,
                 }),
             )
             .await
@@ -1641,6 +1654,7 @@ impl HardwareProvider for NativeHardwareAssessor {
                     });
                 if !unchanged {
                     snapshot.resident_memory = None;
+                    snapshot.resident_execution = None;
                 }
             }
             snapshot.runtime_failure = self
@@ -1790,7 +1804,9 @@ impl NativeRuntimeController {
     ) -> Result<RuntimePlanDefaults, InventoryError> {
         let mut defaults = self.defaults.clone();
         defaults.context_size = profile.context_length;
-        defaults.max_sequences = profile.parallel_sequences;
+        defaults.physical_context_size = profile.context_length;
+        defaults.max_sequences = 1;
+        defaults.execution.kv_unified = false;
         Ok(defaults)
     }
 
@@ -1862,7 +1878,6 @@ impl NativeRuntimeController {
             .collect();
         let defaults = self.profile_defaults(&RuntimeExecutionProfile {
             context_length: configuration.profile.context_length,
-            parallel_sequences: configuration.profile.parallel_sequences,
         })?;
         let plan = execution_intent(primary, projector, &defaults).map_err(|error| {
             InventoryError::Internal(format!("failed to resolve runtime intent: {error:#}"))
@@ -1875,77 +1890,98 @@ impl NativeRuntimeController {
         ))
     }
 
-    async fn assess_load_system_memory_requirement(
+    async fn assess_load_candidates(
         &self,
         resolved: ResolvedModel,
         profile: &RuntimeExecutionProfile,
-        abort_reserve_bytes: u64,
-    ) -> Result<u64, RuntimeTransitionFailure> {
-        let mut assessments = self
+    ) -> Result<Vec<(u32, u64)>, RuntimeTransitionFailure> {
+        const MAX_DYNAMIC_PARALLEL_SEQUENCES: u32 = 4;
+        let hardware = HardwareProvider::snapshot(self.assessor.as_ref())
+            .await
+            .map_err(RuntimeTransitionFailure::from)?;
+        let assess_reserve =
+            icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes)
+                .assess_reserve_bytes;
+        let maximum = if resolved
+            .components
+            .iter()
+            .any(|component| component.role == ComponentRole::Projector)
+        {
+            1
+        } else {
+            MAX_DYNAMIC_PARALLEL_SEQUENCES
+        };
+        let profiles = (1..=maximum)
+            .map(|parallel_sequences| ModelPreviewProfile {
+                id: format!("load-allocation-{parallel_sequences}"),
+                context_length: profile.context_length,
+                parallel_sequences,
+            })
+            .collect::<Vec<_>>();
+        let assessments = self
             .assessor
             .assess_resolved_plans_with_policy(
                 resolved,
-                vec![ModelPreviewProfile {
-                    id: "load-admission".to_owned(),
-                    context_length: profile.context_length,
-                    parallel_sequences: profile.parallel_sequences,
-                }],
+                profiles,
                 false,
                 CapacityPolicy {
                     reserve_bytes_per_domain: CapacityPolicy::default().reserve_bytes_per_domain,
-                    system_reserve_bytes: Some(abort_reserve_bytes),
+                    system_reserve_bytes: Some(assess_reserve),
                 },
             )
             .await
             .map_err(RuntimeTransitionFailure::from)?;
-        let assessment = assessments.pop().ok_or_else(|| {
-            RuntimeTransitionFailure::new(RuntimeFailure::new(
-                "memory_estimate_failed",
-                "native planner returned no load-admission estimate",
-                true,
-            ))
-        })?;
-        let domains = match assessment.hardware {
-            HardwareAssessment::Fits { memory, .. } => memory.domains,
-            HardwareAssessment::DoesNotFit {
-                limiting_resource,
-                memory,
-                ..
-            } => {
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "insufficient_resources",
-                    format!(
-                        "native load plan does not fit {limiting_resource}: {} byte deficit",
-                        memory.deficit_bytes
-                    ),
-                    false,
-                )));
+        let mut candidates = Vec::new();
+        for (index, assessment) in assessments.into_iter().enumerate() {
+            let parallel_sequences = u32::try_from(index + 1).expect("four candidates fit u32");
+            match assessment.hardware {
+                HardwareAssessment::Fits { memory, .. } => {
+                    let required = memory
+                        .domains
+                        .iter()
+                        .find(|domain| domain.memory_domain.is_system())
+                        .map(|domain| domain.required_bytes)
+                        .ok_or_else(|| {
+                            RuntimeTransitionFailure::new(RuntimeFailure::new(
+                                "memory_assessment_incomplete",
+                                "native planner omitted the system-memory domain",
+                                false,
+                            ))
+                        })?;
+                    candidates.push((parallel_sequences, required));
+                }
+                HardwareAssessment::DoesNotFit { .. } if parallel_sequences > 1 => break,
+                HardwareAssessment::DoesNotFit {
+                    limiting_resource,
+                    memory,
+                    ..
+                } => {
+                    return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        "insufficient_resources",
+                        format!(
+                            "native baseline does not fit {limiting_resource}: {} byte deficit",
+                            memory.deficit_bytes
+                        ),
+                        false,
+                    )));
+                }
+                HardwareAssessment::InvalidArtifact { code, message }
+                | HardwareAssessment::IncompatibleArtifact { code, message } => {
+                    return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        code, message, false,
+                    )));
+                }
+                HardwareAssessment::NotAssessed { reason } if parallel_sequences == 1 => {
+                    return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        "memory_estimate_failed",
+                        reason,
+                        true,
+                    )));
+                }
+                HardwareAssessment::NotAssessed { .. } => break,
             }
-            HardwareAssessment::InvalidArtifact { code, message }
-            | HardwareAssessment::IncompatibleArtifact { code, message } => {
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    code, message, false,
-                )));
-            }
-            HardwareAssessment::NotAssessed { reason } => {
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "memory_estimate_failed",
-                    reason,
-                    true,
-                )));
-            }
-        };
-        domains
-            .iter()
-            .find(|domain| domain.memory_domain.is_system())
-            .map(|domain| domain.required_bytes)
-            .ok_or_else(|| {
-                RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "memory_assessment_incomplete",
-                    "native planner omitted the system-memory domain",
-                    false,
-                ))
-            })
+        }
+        Ok(candidates)
     }
 
     async fn discard_worker(&self, worker: &InferenceWorker, code: &str, reason: &str) {
@@ -2113,15 +2149,14 @@ impl NativeRuntimeController {
         self,
         configuration: ModelServingConfiguration,
         resolved: ResolvedModel,
-        plan: ExecutionIntent,
+        mut plan: ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
         package_ids: Vec<ModelPackageId>,
         events: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
-    ) -> Result<RuntimeResidencyId, RuntimeTransitionFailure> {
+    ) -> Result<RuntimeAllocation, RuntimeTransitionFailure> {
         let model_id = configuration.id.0.clone();
         let profile = RuntimeExecutionProfile {
             context_length: configuration.profile.context_length,
-            parallel_sequences: configuration.profile.parallel_sequences,
         };
         let existing = self.state.read().await.clone();
 
@@ -2132,11 +2167,12 @@ impl NativeRuntimeController {
             && let Some(lease) = self.backends.lease()
         {
             drop(lease);
-            let residency_id = existing
-                .resident
-                .expect("matching resident was checked")
-                .residency_id;
-            return Ok(RuntimeResidencyId(residency_id));
+            let resident = existing.resident.expect("matching resident was checked");
+            return Ok(RuntimeAllocation {
+                residency_id: RuntimeResidencyId(resident.residency_id),
+                parallel_sequences: resident.parallel_sequences,
+                physical_context_tokens: resident.physical_context_tokens,
+            });
         };
         let _backend_mutation = self.backends.begin_mutation().await;
 
@@ -2198,12 +2234,8 @@ impl NativeRuntimeController {
         if let Ok(mut blocked_until) = self.admission_blocked_until.lock() {
             *blocked_until = None;
         }
-        let required_system_memory_bytes = self
-            .assess_load_system_memory_requirement(
-                resolved.clone(),
-                &profile,
-                sample.abort_reserve_bytes(),
-            )
+        let candidates = self
+            .assess_load_candidates(resolved.clone(), &profile)
             .await?;
         // Planning is isolated and can take time. Admission must use a fresh observation taken
         // immediately before worker creation rather than the sample that selected the policy.
@@ -2214,17 +2246,42 @@ impl NativeRuntimeController {
                 true,
             ))
         })?;
-        if !admission_sample.permits_load(required_system_memory_bytes) {
+        let Some((parallel_sequences, required_system_memory_bytes)) =
+            select_runtime_allocation(&candidates, admission_sample)
+        else {
+            let minimum_required = candidates
+                .first()
+                .map(|(_, required)| *required)
+                .unwrap_or_default();
             return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
                 LOW_MEMORY_FAILURE_CODE,
                 format!(
-                    "model requires {required_system_memory_bytes} bytes of system memory, but only {} bytes are available with a {} byte system reserve",
+                    "model requires at least {minimum_required} bytes of system memory at parallelism 1, but only {} bytes are available with a {} byte system reserve",
                     admission_sample.available_bytes,
                     admission_sample.abort_reserve_bytes()
                 ),
                 true,
             )));
-        }
+        };
+        let physical_context_tokens = plan
+            .context_size
+            .checked_mul(parallel_sequences)
+            .ok_or_else(|| {
+                RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    "invalid_runtime_allocation",
+                    "context length multiplied by selected parallelism exceeds u32",
+                    false,
+                ))
+            })?;
+        plan.max_sequences = parallel_sequences;
+        plan.physical_context_size = physical_context_tokens;
+        plan.execution.kv_unified = false;
+        tracing::info!(
+            parallel_sequences,
+            physical_context_tokens,
+            required_system_memory_bytes,
+            "selected runtime allocation"
+        );
 
         let worker_generation = self.next_worker_generation.fetch_add(1, Ordering::Relaxed);
         let expected_build = build_identity::native_build();
@@ -2412,6 +2469,8 @@ impl NativeRuntimeController {
                 residency_id: residency_id.clone(),
                 profile,
                 package_ids,
+                parallel_sequences,
+                physical_context_tokens,
             }),
         };
         *self.state.write().await = state.clone();
@@ -2426,7 +2485,11 @@ impl NativeRuntimeController {
         self.load_progress
             .record_success(&signature, &acceleration, &tracker);
         tracing::info!("runtime model ready");
-        Ok(RuntimeResidencyId(residency_id))
+        Ok(RuntimeAllocation {
+            residency_id: RuntimeResidencyId(residency_id),
+            parallel_sequences,
+            physical_context_tokens,
+        })
     }
 
     async fn stop_worker_gracefully(&self) {
@@ -2509,7 +2572,7 @@ impl RuntimeController for NativeRuntimeController {
                         return;
                     }
                 };
-            let residency_id = match controller
+            let allocation = match controller
                 .clone()
                 .perform_prepared_transition(
                     configuration,
@@ -2521,7 +2584,7 @@ impl RuntimeController for NativeRuntimeController {
                 )
                 .await
             {
-                Ok(residency_id) => residency_id,
+                Ok(allocation) => allocation,
                 Err(failure) => {
                     let _ = events.send(ModelLoadEvent::Failed {
                         failure: DomainModelFailure {
@@ -2537,12 +2600,17 @@ impl RuntimeController for NativeRuntimeController {
             digest.update(b"magnitude-runtime-execution-evidence-v1\0");
             digest.update(configuration_id.0.as_bytes());
             digest.update(b"\0");
-            digest.update(residency_id.0.as_bytes());
+            digest.update(allocation.residency_id.0.as_bytes());
+            digest.update(b"\0");
+            digest.update(allocation.parallel_sequences.to_le_bytes());
+            digest.update(allocation.physical_context_tokens.to_le_bytes());
             let _ = events.send(ModelLoadEvent::Ready {
                 ready: LoadModelReady {
-                    residency_id,
+                    residency_id: allocation.residency_id,
                     configuration_id,
                     execution_evidence_id: format!("execution_{:x}", digest.finalize()),
+                    parallel_sequences: allocation.parallel_sequences,
+                    physical_context_tokens: allocation.physical_context_tokens,
                 },
             });
         });
@@ -2937,16 +3005,62 @@ mod tests {
     fn parity_test_defaults() -> RuntimePlanDefaults {
         RuntimePlanDefaults {
             context_size: 128,
+            physical_context_size: 128,
             batch_size: 128,
             ubatch_size: 64,
             max_sequences: 1,
             prefill_quantum: 128,
-            execution: ExecutionConfig::default(),
+            execution: ExecutionConfig {
+                kv_unified: false,
+                ..ExecutionConfig::default()
+            },
             projector_use_gpu: true,
             projector_warmup: true,
             image_min_tokens: None,
             image_max_tokens: None,
         }
+    }
+
+    #[test]
+    fn preview_parallelism_reserves_one_full_context_partition_per_sequence() {
+        let assessor = NativeHardwareAssessor {
+            defaults: parity_test_defaults(),
+            cache: None,
+            native_backend: test_native_backend(),
+            native_executor: Arc::new(RwLock::new(None)),
+            runtime_failure: Arc::new(RwLock::new(None)),
+            gate: tokio::sync::Mutex::new(()),
+            planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
+        };
+
+        let defaults = assessor.effective_defaults(Some(&ModelPreviewProfile {
+            id: "p4".to_owned(),
+            context_length: 32_768,
+            parallel_sequences: 4,
+        }));
+
+        assert_eq!(defaults.context_size, 32_768);
+        assert_eq!(defaults.physical_context_size, 131_072);
+        assert_eq!(defaults.max_sequences, 4);
+        assert!(!defaults.execution.kv_unified);
+    }
+
+    #[test]
+    fn load_allocation_descends_to_the_highest_freshly_permitted_parallelism() {
+        let gib = 1024 * 1024 * 1024;
+        let sample = memory_supervisor::MemorySample {
+            captured_at: std::time::Instant::now(),
+            total_bytes: 16 * gib,
+            available_bytes: 7 * gib,
+            commit_limit_bytes: None,
+            available_commit_bytes: None,
+        };
+
+        assert_eq!(
+            select_runtime_allocation(&[(1, gib), (2, 4 * gib), (3, 6 * gib)], sample),
+            Some((2, 4 * gib))
+        );
     }
 
     #[test]
@@ -2980,6 +3094,7 @@ mod tests {
             topology_fingerprint: "topology".to_owned(),
             memory_domains: Vec::new(),
             resident_memory: None,
+            resident_execution: None,
             runtime_failure: None,
         };
         let equivalent_preview = ModelPreviewProfile {

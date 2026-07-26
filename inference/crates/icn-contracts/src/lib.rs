@@ -19,8 +19,10 @@ pub use inventory::*;
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExecutionIntent {
     pub model_path: PathBuf,
-    /// Total context capacity shared by all concurrently resident sequences.
+    /// Maximum context capacity exposed to one request.
     pub context_size: u32,
+    /// Physical native context allocation across all sequence partitions.
+    pub physical_context_size: u32,
     pub batch_size: u32,
     pub ubatch_size: u32,
     /// Maximum number of independently owned native sequence IDs.

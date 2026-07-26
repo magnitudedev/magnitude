@@ -321,7 +321,6 @@ impl NativeRecommendableCatalog {
                 .iter()
                 .map(|context_length| ServingProfile {
                     context_length: *context_length,
-                    parallel_sequences: 1,
                 })
                 .collect(),
             display_name: declaration.display_name.to_owned(),

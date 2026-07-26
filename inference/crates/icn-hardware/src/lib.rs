@@ -510,6 +510,7 @@ fn hardware_snapshot_from_devices(
         topology_fingerprint,
         memory_domains: domains,
         resident_memory: None,
+        resident_execution: None,
         runtime_failure: None,
     }
 }
@@ -963,8 +964,8 @@ fn fit_request(plan: &ExecutionIntent, mtp_context: bool) -> Result<FitRequest, 
     Ok(FitRequest {
         model,
         options: FitOptions {
-            context_tokens: NonZeroU32::new(plan.context_size),
-            minimum_context_tokens: 4_096.min(plan.context_size).max(1),
+            context_tokens: NonZeroU32::new(plan.physical_context_size),
+            minimum_context_tokens: plan.physical_context_size,
             margins_bytes: vec![0],
             batch_tokens: plan.batch_size,
             micro_batch_tokens: plan.ubatch_size,
@@ -2403,7 +2404,7 @@ fn assessed_intent(
         Measurement::Fitted => report.fitted,
     };
     let mut plan = requested.clone();
-    plan.context_size = configuration.resolved_context_tokens;
+    plan.physical_context_size = configuration.resolved_context_tokens;
     plan
 }
 

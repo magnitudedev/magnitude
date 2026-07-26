@@ -603,7 +603,6 @@ export type FitModelResultEncoded = S.Schema.Encoded<typeof FitModelResult>
 export const FitModelsRequest = S.Struct({
   capacityPolicy: S.suspend((): S.Schema<CapacityPolicy, CapacityPolicyEncoded> => CapacityPolicy),
   maximumContextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  maximumParallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   minimumContextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   targets: S.Array(S.suspend((): S.Schema<FitModelTarget, FitModelTargetEncoded> => FitModelTarget)),
 })
@@ -800,6 +799,13 @@ export const HardwareSnapshot = S.Struct({
   ),
   native_build: S.String,
   platform: S.String,
+  resident_execution: S.optionalWith(
+    S.Union(
+      S.Null,
+      S.suspend((): S.Schema<ResidentExecution, ResidentExecutionEncoded> => ResidentExecution),
+    ),
+    { exact: true, as: "Option" },
+  ),
   resident_memory: S.optionalWith(
     S.Union(
       S.Null,
@@ -957,6 +963,8 @@ export const LoadModelReady = S.Struct({
     (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
   ),
   executionEvidenceId: S.String,
+  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   residencyId: S.suspend((): S.Schema<RuntimeResidencyId, RuntimeResidencyIdEncoded> => RuntimeResidencyId),
 })
 export type LoadModelReady = S.Schema.Type<typeof LoadModelReady>
@@ -1462,6 +1470,15 @@ export const RemoveInstalledModelPackageResponse = S.extend(
 export type RemoveInstalledModelPackageResponse = S.Schema.Type<typeof RemoveInstalledModelPackageResponse>
 export type RemoveInstalledModelPackageResponseEncoded = S.Schema.Encoded<typeof RemoveInstalledModelPackageResponse>
 
+export const ResidentExecution = S.Struct({
+  context_window_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  model_id: S.String,
+  parallel_sequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  physical_context_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ResidentExecution = S.Schema.Type<typeof ResidentExecution>
+export type ResidentExecutionEncoded = S.Schema.Encoded<typeof ResidentExecution>
+
 export const ResidentMemory = S.Struct({
   domains: S.Array(S.suspend((): S.Schema<ResidentMemoryDomain, ResidentMemoryDomainEncoded> => ResidentMemoryDomain)),
   model_id: S.String,
@@ -1526,7 +1543,6 @@ export type RuntimeResidencyIdEncoded = S.Schema.Encoded<typeof RuntimeResidency
 
 export const ServingProfile = S.Struct({
   contextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ServingProfile = S.Schema.Type<typeof ServingProfile>
 export type ServingProfileEncoded = S.Schema.Encoded<typeof ServingProfile>

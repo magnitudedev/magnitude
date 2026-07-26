@@ -53,7 +53,6 @@ export const servingProfileFromIcn = (
 
 export const servingProfileToIcn = (profile: ServingProfile): NativeServingProfile => ({
   contextLength: profile.contextLength,
-  parallelSequences: profile.parallelSequences,
 })
 
 export const offeringTargetFromIcn = (

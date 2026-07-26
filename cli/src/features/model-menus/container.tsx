@@ -42,6 +42,7 @@ import {
 } from "../../state/cli-atoms"
 import { SingleLineInput } from "../composer/single-line-input"
 import {
+  describeResidentModel,
   describeLocalHardware,
   formatBytes,
   localInferenceProgressLines,
@@ -1017,6 +1018,7 @@ const HardwareMenu = memo(function HardwareMenu({
 }: MenuRootProps) {
   const theme = useTheme()
   const hardwareState = useLocalInferenceHardware()
+  const config = useModelConfig()
   const snapshot = Result.value(hardwareState)
 
   bindMenuKeyHandler(useCallback(() => {}, []))
@@ -1044,6 +1046,10 @@ const HardwareMenu = memo(function HardwareMenu({
           onSome: ({ state: detectedHardware }) => {
             const hardware = describeLocalHardware(detectedHardware)
             const memory = deriveHardwareMemoryView(detectedHardware)
+            const resident = describeResidentModel(
+              detectedHardware,
+              Option.map(Result.value(config.catalog), ({ state }) => state),
+            )
             return (
               <>
                 <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
@@ -1054,6 +1060,42 @@ const HardwareMenu = memo(function HardwareMenu({
                 {hardware.accelerators.length === 0 && !detectedHardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory") && (
                   <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
                 )}
+                {Option.match(resident, {
+                  onNone: () => (
+                    <box style={{
+                      borderStyle: "single",
+                      borderColor: theme.muted,
+                      flexDirection: "column",
+                      paddingLeft: 1,
+                      paddingRight: 1,
+                      marginTop: 1,
+                    }}>
+                      <text style={{ fg: theme.muted }}>No local model is running</text>
+                    </box>
+                  ),
+                  onSome: (model) => (
+                    <box style={{
+                      borderStyle: "single",
+                      borderColor: theme.primary,
+                      flexDirection: "column",
+                      paddingLeft: 1,
+                      paddingRight: 1,
+                      marginTop: 1,
+                    }}>
+                      <box style={{ flexDirection: "row" }}>
+                        <text style={{ fg: theme.muted, flexGrow: 1 }} attributes={TextAttributes.BOLD}>RUNNING MODEL</text>
+                        <text style={{ fg: theme.primary }}>● ACTIVE</text>
+                      </box>
+                      <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{model.displayName}</text>
+                      <box style={{ flexDirection: "row", paddingTop: 1 }}>
+                        <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
+                        <text style={{ fg: theme.foreground, width: 16 }}>{formatContextWindow(model.contextWindowTokens)} tokens</text>
+                        <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
+                        <text style={{ fg: theme.foreground }}>{model.parallelSequences}</text>
+                      </box>
+                    </box>
+                  ),
+                })}
                 <box style={{ flexDirection: "column", paddingTop: 1 }}>
                   {memory.domains.map((domain) => <HardwareMemoryDomain key={domain.id} domain={domain} />)}
                 </box>

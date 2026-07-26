@@ -166,6 +166,9 @@ Preview caches the composite profile assessment through the model-management cac
 batch cache hit is checked from the target identity before remote sparse-header materialization, so
 reusing an assessment does not restart template or fit workers. The hardware environment identity
 is captured once per assessment or fit request and shared across every target/profile operation.
+Product assessment and fitting estimate one full per-request context at parallelism one.
+Load-time expansion to additional full context partitions is a memory-allocation decision and does
+not change this single-user throughput evidence.
 Cache reads and writes retain the no-fail behavior of disposable caches. Persisted calibration is
 recomputable evidence, not a durable authority. Loading always replans, and installed-model runtime
 timing remains authoritative for observed performance.

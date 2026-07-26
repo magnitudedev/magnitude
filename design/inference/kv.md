@@ -19,6 +19,11 @@ sequence operation, and prefills the remainder. A sequence with no useful prefix
 reuse. Model, tokenizer, context, adapter, and process isolation follow naturally because state never
 leaves its owning native context.
 
+Dynamic allocation provisions one complete configured context partition per selected native
+sequence. Version one uses partitioned KV because the pinned unified-KV API cannot independently
+express physical pool size and model-visible per-sequence context. A future return to unified
+pooling requires an authoritative native capability and a separate approved design change.
+
 Prompt state becomes reusable only after native decode succeeds. The sampled token is not committed
 until a later decode or speculative-verification step accepts it. Cancellation and request failure
 clear or restore sequence state through standard llama.cpp APIs; failed cleanup quarantines the

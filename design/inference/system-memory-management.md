@@ -41,6 +41,12 @@ For a serving profile, `M` is the native planner's complete predicted system-dom
 weights, context and KV, compute buffers, projector allocations, and target/draft allocations.
 File size plus a fixed allowance is not valid evidence.
 
+Stable product compatibility uses the exact one-sequence, one-complete-context baseline. During
+load, ICN evaluates native sequence capacities from one through four. Candidate `P` uses complete
+physical context `configured context × P`; ICN selects the greatest candidate that satisfies
+stable compatibility and fresh live admission. Current pressure may reduce selected `P`, but never
+configured per-request context.
+
 ## Decisions
 
 Stable compatibility ignores current activity:

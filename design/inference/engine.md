@@ -28,6 +28,11 @@ The engine keeps **llama.cpp** as its native model runtime while Magnitude owns 
 batching, streaming, and sequence assignment. Prompt reuse stays within llama.cpp's standard sequence
 state primitives; Magnitude does not duplicate the native KV representation.
 
+The engine receives per-request context separately from native physical context. A load resolved
+at sequence capacity `P` provisions `configured context × P` physical context while every request
+remains capped at the configured context. Version-one dynamic allocation uses partitioned native
+KV so llama.cpp's model-visible per-sequence context remains exact.
+
 ## System shape
 
 ```text

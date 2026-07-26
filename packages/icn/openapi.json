@@ -2089,8 +2089,7 @@
           "targets",
           "capacityPolicy",
           "minimumContextLength",
-          "maximumContextLength",
-          "maximumParallelSequences"
+          "maximumContextLength"
         ],
         "properties": {
           "targets": {
@@ -2108,11 +2107,6 @@
             "minimum": 0
           },
           "maximumContextLength": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "maximumParallelSequences": {
             "type": "integer",
             "format": "int32",
             "minimum": 0
@@ -2561,6 +2555,16 @@
               }
             ]
           },
+          "resident_execution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResidentExecution"
+              }
+            ]
+          },
           "runtime_failure": {
             "oneOf": [
               {
@@ -2923,7 +2927,9 @@
         "required": [
           "residencyId",
           "configurationId",
-          "executionEvidenceId"
+          "executionEvidenceId",
+          "parallelSequences",
+          "physicalContextTokens"
         ],
         "properties": {
           "residencyId": {
@@ -2934,6 +2940,16 @@
           },
           "executionEvidenceId": {
             "type": "string"
+          },
+          "parallelSequences": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "physicalContextTokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -4075,6 +4091,36 @@
           }
         }
       },
+      "ResidentExecution": {
+        "type": "object",
+        "required": [
+          "model_id",
+          "context_window_tokens",
+          "parallel_sequences",
+          "physical_context_tokens"
+        ],
+        "properties": {
+          "model_id": {
+            "type": "string"
+          },
+          "context_window_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "parallel_sequences": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "physical_context_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "ResidentMemory": {
         "type": "object",
         "required": [
@@ -4234,16 +4280,10 @@
       "ServingProfile": {
         "type": "object",
         "required": [
-          "contextLength",
-          "parallelSequences"
+          "contextLength"
         ],
         "properties": {
           "contextLength": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "parallelSequences": {
             "type": "integer",
             "format": "int32",
             "minimum": 0
