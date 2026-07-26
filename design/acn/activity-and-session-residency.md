@@ -118,15 +118,30 @@ read that projection through the normal projection-consumer path, so activity ch
 and rematerialize snapshots without an app event or a separately merged runtime stream. Projection
 evaluation never reads a clock; observation time is fixed at ambient ingress.
 
-The CLI reserves one fixed-height activity rail below the chat timeline. Root-model loading,
-conversation prefill, and model response activity all occupy that same row, so transitions do not
-move the chat or composer. Model loading is shown immediately. Request preparation and prefill are
-shown only after a short anti-flicker delay. Once generation begins, the row becomes the existing
-composable Working display, including thinking, tools, advisor activity, and worker counts.
+The CLI timeline follows appended tail content while the user remains attached to the bottom. New
+messages do not reposition a short page: they occupy the next available rows, and the viewport moves
+only by the amount that real content overflows it. Manual scrolling detaches this behavior. The
+terminal scroll surface provides the tail-following primitive, while the shared scroll controller
+continues to own history loading, prepend anchoring, and overlay restoration.
+
+The complete activity rail is the final real content of the live turn. Assistant messages and tool
+output are always inserted before it, pushing it downward. One blank terminal row surrounds the
+rail above and below. Root-model loading, conversation prefill, and model response activity share
+that same stable row. Model loading is shown immediately. Request preparation and prefill use a
+short anti-flicker delay. Once generation begins, the row becomes the composable Working display,
+including thinking, tools, advisor activity, and worker counts. Completion replaces it in place with
+the persistent work summary rather than collapsing the tail geometry.
+
+The startup identity is a non-persisted prefix at the true beginning of the timeline. It remains
+the first visual content, uses a proportionally reduced complete Magnitude mark beside its identity
+and directory details when width permits, stacks at narrow widths, and scrolls away naturally with
+conversation history. It is not a chat message and is absent when the loaded window does not reach
+the beginning of the session.
 
 The CLI composer keeps a one-line minimum editor inside a full-width input surface with one stable
-row of visual padding above and below it and a tapered mode rail painted within the surface's first
-column; additional visual input lines grow only from actual draft content. Pending attachments render inside that surface rather than competing with persistent
+row of visual padding above and below it. A solid mode border sits immediately outside the colored
+surface and spans its full height; additional visual input lines grow only from actual draft
+content. Pending attachments render inside that surface rather than competing with persistent
 status. The terminal-background footer below it derives model selection, reasoning effort, local
 residency, working directory, and context usage directly from authoritative mirrors and display
 state. Model and effort form one visual identity, separated from resident memory by a muted middle

@@ -13,7 +13,7 @@ export function AnimatedLogo() {
       ))}
       <text>{' '}</text>
       <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Magnitude</text>
-      <text style={{ fg: theme.muted }}>Frontier coding without frontier prices</text>
+      <text style={{ fg: theme.muted }}>Everything you need to code with local models</text>
     </box>
   )
 }

@@ -97,13 +97,13 @@ export const ActivityRail = memo(function ActivityRail({
   if (modelLoadActivity !== null) {
     if (modelLoadActivity._tag === "Blocked") {
       return (
-        <box style={{ height: 1, flexShrink: 0, paddingLeft: 2 }}>
+        <box style={{ height: 1, flexShrink: 0 }}>
           <text style={{ fg: theme.warning }}>{LOW_MEMORY_MODEL_STOPPED_MESSAGE}</text>
         </box>
       )
     }
     return (
-      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2 }}>
+      <box style={{ height: 1, flexShrink: 0 }}>
         <text>
           <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
           {' '}
@@ -124,7 +124,7 @@ export const ActivityRail = memo(function ActivityRail({
       ? 'Loading conversation'
       : progress.label
     return (
-      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2 }}>
+      <box style={{ height: 1, flexShrink: 0 }}>
         <text>
           <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
           {' '}
@@ -154,7 +154,7 @@ export const ActivityRail = memo(function ActivityRail({
     const responseElapsedMs = Math.max(0, Date.now() - (respondingSince ?? Date.now()))
     const responseElapsedSeconds = Math.floor(responseElapsedMs / 1000)
     return (
-      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span style={{ fg: isAdvisor ? slate[600] : WORKING_PULSE_COLORS[dotPulseIndex] }}>{'●'}</span>
           {` Working... ${formatElapsed(responseElapsedSeconds)}`}
@@ -196,7 +196,7 @@ export const ActivityRail = memo(function ActivityRail({
   // Chain inactive but activity present — show activity standalone (takes priority over completed/interrupted)
   if (!active && hasActivity) {
     return (
-      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span style={{ fg: isAdvisor ? theme.muted : THINKING_PULSE_COLORS[thinkingPulseIndex] }}>{'●'}</span>
           {' '}
@@ -219,7 +219,7 @@ export const ActivityRail = memo(function ActivityRail({
       interruptText = '■ Lead interrupted. What would you like to do?'
     }
     return (
-      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0 }}>
         <text style={{ fg: red[400] }}>{interruptText}</text>
       </box>
     )
@@ -229,7 +229,7 @@ export const ActivityRail = memo(function ActivityRail({
   if (!active && work && work.lastWorkMs > 0) {
     const durationSeconds = Math.floor(work.lastWorkMs / 1000)
     return (
-      <box style={{ height: 1, flexShrink: 0, paddingLeft: 2, paddingTop: 0, paddingBottom: 0 }}>
+      <box style={{ height: 1, flexShrink: 0 }}>
         <text style={{ fg: theme.muted }}>
           <span style={{ fg: slate[600] }}>{'●'}</span>
           {' '}

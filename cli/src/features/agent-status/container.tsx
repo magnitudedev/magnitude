@@ -17,9 +17,10 @@ import { PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID } from '@magnitudedev/
 import { Option } from 'effect'
 import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
 import { ActivityRail } from './activity-rail'
+import { ActivityRailSlot } from './activity-rail-slot'
 import { TaskList } from './task-list'
 
-export function AgentStatusRowContainer({
+export function ActivityRailContainer({
   modelLoadActivity,
   width,
 }: {
@@ -51,28 +52,27 @@ export function AgentStatusRowContainer({
   const advisorProfile = profiles
     ? Option.getOrNull(findSlotProfile(profiles, advisorSlotId))
     : null
-  const activityWidth = Math.max(0, width - 2)
+  const activityWidth = Math.max(0, width - 3)
+
+  const hasTimeline = (timeline?.messages.order.length ?? 0) > 0
+  const hasWork = rootActor !== null
+    && (rootActor.work.phase !== 'idle' || rootActor.work.lastWorkMs > 0)
+  if (!hasTimeline && !hasWork && modelLoadActivity === null && modelRequestActivity === null && interrupted === null) {
+    return null
+  }
 
   return (
-    <box style={{
-      flexDirection: 'row',
-      flexShrink: 0,
-      alignItems: 'center',
-      width: '100%',
-      paddingRight: 2,
-    }}>
-      <box style={{ width: activityWidth, minWidth: 0, overflow: 'hidden' }}>
-        <ActivityRail
-          work={rootActor?.work ?? null}
-          width={activityWidth}
-          waitsForGenerationProgress={rootProfile?.providerId === "local"}
-          modelLoadActivity={modelLoadActivity}
-          modelRequestActivity={modelRequestActivity}
-          interruptedMessage={interrupted}
-          advisorModelName={advisorProfile?.modelDisplayName ?? null}
-        />
-      </box>
-    </box>
+    <ActivityRailSlot width={activityWidth}>
+      <ActivityRail
+        work={rootActor?.work ?? null}
+        width={activityWidth}
+        waitsForGenerationProgress={rootProfile?.providerId === "local"}
+        modelLoadActivity={modelLoadActivity}
+        modelRequestActivity={modelRequestActivity}
+        interruptedMessage={interrupted}
+        advisorModelName={advisorProfile?.modelDisplayName ?? null}
+      />
+    </ActivityRailSlot>
   )
 }
 

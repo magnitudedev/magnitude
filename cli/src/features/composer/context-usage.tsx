@@ -17,11 +17,15 @@ export const formatContextUsage = (
   tokenUsage: number | null,
   hardCap: number | null,
 ): string => {
-  if (tokenUsage === null) return 'ctx —'
+  if (tokenUsage === null) {
+    return hardCap === null
+      ? '— ctx'
+      : `— / ${formatTokensCompact(hardCap)} ctx`
+  }
   const used = formatTokensCompact(tokenUsage)
   return hardCap === null
-    ? `ctx ${used}`
-    : `ctx ${used} (${Math.round((tokenUsage / hardCap) * 100)}%)`
+    ? `${used} ctx`
+    : `${used} / ${formatTokensCompact(hardCap)} ctx (${Math.round((tokenUsage / hardCap) * 100)}%)`
 }
 
 export const contextUsageWidth = (

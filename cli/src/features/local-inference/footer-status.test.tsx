@@ -28,7 +28,7 @@ test("ready status exposes the model and minimal resident memory", () => {
   expect(deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)).toEqual({
     modelName: "Qwen Test",
     residency: "loaded",
-    memoryLabel: "16G mem",
+    memoryLabel: "16GB",
   })
 })
 

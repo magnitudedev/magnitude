@@ -34,6 +34,7 @@ import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
 import { allowProviderMessageSend } from './provider-send-guard'
 import { ContextUsage, contextUsageWidth } from './context-usage'
 import { ResidencyIndicator } from './residency-indicator'
+import { BOX_CHARS } from '../../utils/ui-constants'
 
 const displayWorkingDirectory = (cwd: string): string => {
   const home = process.env.HOME
@@ -56,6 +57,7 @@ const EMPTY_INPUT: InputValue = {
 
 const INLINE_PASTE_PILL_CHAR_LIMIT = 1000
 const MAX_HISTORY = 200
+export const COMPOSER_BORDER_CHARS = { ...BOX_CHARS, vertical: '┃' } as const
 
 export async function handleChatControllerPaste(args: {
   eventText?: string
@@ -270,20 +272,25 @@ export function Composer(props: ComposerProps) {
     : bashMode
       ? 3 + 'Esc to exit Bash mode'.length
       : 0
+  const footerModeWidth = displayMode === 'transcript'
+    ? 3 + 'Transcript Mode'.length
+    : 0
   const footerLeftWidth = (bashMode
     ? 'Bash Mode'.length
     : !modelsConfigured
       ? 'No provider configured'.length
       : (modelFooter.residency === null ? 0 : 2)
         + stringWidth(modelNameLabel)
-        + 1
+        + 2
         + stringWidth(thinkingLevelLabel)
-        + (modelFooter.memoryLabel === null ? 0 : 3 + stringWidth(modelFooter.memoryLabel)))
+        + 3
+        + contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
+        + (modelFooter.memoryLabel === null
+          ? 0
+          : 3 + 'Memory: '.length + stringWidth(modelFooter.memoryLabel)))
+    + footerModeWidth
     + footerTransientWidth
   const footerRightWidth = stringWidth(workingDirectoryLabel)
-    + 3
-    + contextUsageWidth(tokenUsage, contextHardCap, isCompacting)
-    + (displayMode === 'transcript' ? 'Transcript Mode'.length + 3 : 0)
   const footerStacks = footerLeftWidth + footerRightWidth + 8 > chatColumnWidth
   const openThinking = useCallback(() => {
     if (thinkingOptions.length === 0) return
@@ -653,28 +660,33 @@ export function Composer(props: ComposerProps) {
           >
             <text
               style={{ fg: modelLabelHovered ? theme.primary : theme.foreground }}
-              attributes={TextAttributes.BOLD}
             >
               <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {modelNameLabel}
               </span>
             </text>
           </Button>
-          <box style={{ width: 1, flexShrink: 0 }} />
+          <box style={{ width: 2, flexShrink: 0 }} />
           <Button
             onClick={openThinking}
             onMouseOver={() => setThinkingLabelHovered(true)}
             onMouseOut={() => setThinkingLabelHovered(false)}
           >
-            <text style={{ fg: thinkingLabelHovered ? theme.primary : theme.muted }}>
+            <text style={{ fg: thinkingLabelHovered ? theme.primary : theme.modePlan }}>
               <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {thinkingLevelLabel}
               </span>
             </text>
           </Button>
+          <box style={{ width: 3, flexShrink: 0 }} />
+          <ContextUsage
+            tokenUsage={tokenUsage}
+            hardCap={contextHardCap}
+            isCompacting={isCompacting}
+          />
           {modelFooter.memoryLabel && (
             <>
-              <text style={{ fg: theme.muted }}>{' · '}</text>
+              <box style={{ width: 3, flexShrink: 0 }} />
               <Button
                 onClick={openHardware}
                 onMouseOver={() => setMemoryLabelHovered(true)}
@@ -682,12 +694,18 @@ export function Composer(props: ComposerProps) {
               >
                 <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
                   <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-                    {modelFooter.memoryLabel}
+                    {`Memory: ${modelFooter.memoryLabel}`}
                   </span>
                 </text>
               </Button>
             </>
           )}
+        </>
+      )}
+      {displayMode === 'transcript' && (
+        <>
+          <box style={{ width: 3, flexShrink: 0 }} />
+          <text style={{ fg: theme.info }}>Transcript Mode</text>
         </>
       )}
       {enableAutopilot && (
@@ -713,19 +731,7 @@ export function Composer(props: ComposerProps) {
 
   const footerEnvironment = (
     <box style={{ flexDirection: 'row', alignItems: 'center' }}>
-      {displayMode === 'transcript' && (
-        <>
-          <text style={{ fg: theme.info }}>Transcript Mode</text>
-          <box style={{ width: 3, flexShrink: 0 }} />
-        </>
-      )}
       <text style={{ fg: theme.muted }}>{workingDirectoryLabel}</text>
-      <box style={{ width: 3, flexShrink: 0 }} />
-      <ContextUsage
-        tokenUsage={tokenUsage}
-        hardCap={contextHardCap}
-        isCompacting={isCompacting}
-      />
     </box>
   )
 
@@ -757,11 +763,21 @@ export function Composer(props: ComposerProps) {
       />
 
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <box style={{ height: 1, backgroundColor: theme.inputBg, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╻', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
-          <box style={{ height: 1, flexGrow: 1, backgroundColor: theme.inputBg }} />
-        </box>
-        <box style={{ backgroundColor: theme.inputBg, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '┃', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
-          <box style={{ backgroundColor: theme.inputBg, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
+        <box style={{
+          borderStyle: 'single',
+          border: ['left'],
+          borderColor: bashMode ? orange[400] : modeColor,
+          customBorderChars: COMPOSER_BORDER_CHARS,
+        }}>
+          <box style={{
+            backgroundColor: theme.inputBg,
+            paddingTop: 1,
+            paddingBottom: 1,
+            paddingLeft: 1,
+            paddingRight: 2,
+            flexDirection: 'column',
+            flexGrow: 1,
+          }}>
             {!bashMode && fileMentions.isOpen && (
               <FileMentionMenu
                 isOpen={fileMentions.isOpen}
@@ -840,9 +856,6 @@ export function Composer(props: ComposerProps) {
               </box>
             </box>
           </box>
-        </box>
-        <box style={{ height: 1, backgroundColor: theme.inputBg, borderStyle: 'single', border: ['left'], borderColor: bashMode ? orange[400] : modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╹', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
-          <box style={{ height: 1, flexGrow: 1, backgroundColor: theme.inputBg }} />
         </box>
       </box>
 

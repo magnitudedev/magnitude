@@ -119,7 +119,7 @@ vi.mock('../../hooks/use-theme', () => ({
   useTheme: () => theme,
 }))
 
-const { Composer } = await import('./composer')
+const { Composer, COMPOSER_BORDER_CHARS } = await import('./composer')
 
 const noop = () => {}
 
@@ -250,18 +250,20 @@ function makeProps(): ComposerProps {
 test('composer shell renders without an embedded task list (task list is the AgentStatus feature)', () => {
   const html = render(<Composer {...makeProps()} clientWorkingDirectory="/tmp/magnitude" />)
 
-  expect(html).toContain('background-color:#111111;padding-left:1px;padding-right:2px')
-  expect(html).toContain('height:1px;background-color:#111111;border-style:single;border:left')
-  expect(html).not.toContain('padding-top:1px')
+  expect(html).toContain('background-color:#111111;padding-top:1px;padding-bottom:1px;padding-left:1px;padding-right:2px')
+  expect(html).toContain('border-style:single;border:left')
+  expect(COMPOSER_BORDER_CHARS.vertical).toBe('┃')
   expect(html).toContain('>model<')
   expect(html).toContain('>high<')
+  expect(html).toContain('style="fg:#ffaa00"><span attributes="0">high</span>')
+  expect(html).toContain('width:2px;flex-shrink:0')
   expect(html).toContain('/tmp/magnitude')
   expect(html).not.toContain('Thinking:')
   expect(html).not.toContain('Assigned To')
 
   expect(html).not.toContain('horizontal:▀')
   expect(html).not.toContain('horizontal:▄')
-  expect(html).toContain('ctx 5k (5%)')
+  expect(html).toContain('5k / 100k ctx (5%)')
 })
 
 test('shows a single no-provider label instead of model and reasoning effort', () => {

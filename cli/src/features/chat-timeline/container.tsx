@@ -3,10 +3,11 @@
  * history, streaming, and pagination via display-view reshaping.
  *
  * Scroll behavior lives in TimelineScrollController (plain TS, no React):
- * OpenTUI owns interactive scrolling; the controller declares the data
- * window, follows the bottom, and holds the viewport's bottom-distance across
- * window changes. This component builds the metrics adapter and ties the
- * controller's lifetime to the scrollbox via a callback ref.
+ * The terminal scroll surface follows appended tail content until the user
+ * manually detaches. The controller declares the data window and holds the
+ * viewport's bottom-distance across window changes. This component builds the
+ * platform adapter and ties the controller lifetime to the scrollbox via a
+ * callback ref.
  *
  * The `header` slot (logo, tip, recent-chats) renders only when the loaded
  * window truly starts at the beginning of the session. While older history
@@ -29,6 +30,7 @@ import {
   getSystemMessagesSnapshot,
   TimelineScrollController,
   type TimelineScrollAdapter,
+  type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { safeRenderableAccess } from '../../utils/safe-renderable-access'
 import { subscribeScrollboxActivity } from '../../utils/scroll-helpers'
@@ -37,17 +39,20 @@ import type { ActionId } from '../../types/ui-actions'
 import { useOpenFile } from '../file-viewer/container'
 import { ChatScrollbox } from './scrollbox'
 import { ChatTimeline } from './timeline'
+import { ActivityRailContainer } from '../agent-status/container'
 
 export function ChatTimelineContainer({
   header,
   chatColumnWidth,
   dispatchErrorAction,
   isOverlayActive,
+  modelLoadActivity,
 }: {
   header: ReactNode
   chatColumnWidth: number
   dispatchErrorAction: (actionId: ActionId) => void
   isOverlayActive: boolean
+  modelLoadActivity: LocalModelLoadActivity | null
 }): ReactNode {
   const theme = useTheme()
   const { pushFork } = useDisplayViewController()
@@ -118,8 +123,8 @@ export function ChatTimelineContainer({
 
   // Suspend/resume the scroll controller when an overlay hides the timeline.
   // This is view lifecycle management (not scroll behavior): while suspended,
-  // the controller preserves all state — window position, scroll distance,
-  // followingBottom — so the user returns to exactly what they left.
+  // the controller preserves window position and scroll distance so the user
+  // returns to exactly what they left.
   const suspendResumeAtom = useMemo(
     () =>
       Atom.make(
@@ -143,7 +148,7 @@ export function ChatTimelineContainer({
   useAtomMount(suspendResumeAtom)
 
   return (
-    <ChatScrollbox scrollRef={attachScrollbox} hasMoreBefore={hasMoreBefore}>
+    <ChatScrollbox scrollRef={attachScrollbox}>
       {hasMoreBefore ? (
         // Fixed-height slot: one centered loading line + one blank row below.
         // Constant height whether or not a load is in flight, so the text
@@ -166,6 +171,10 @@ export function ChatTimelineContainer({
         onFileClick={openFile}
         onForkExpand={pushFork}
         onErrorAction={dispatchErrorAction}
+      />
+      <ActivityRailContainer
+        modelLoadActivity={modelLoadActivity}
+        width={chatColumnWidth}
       />
     </ChatScrollbox>
   )

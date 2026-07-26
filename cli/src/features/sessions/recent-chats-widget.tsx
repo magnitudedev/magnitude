@@ -28,7 +28,7 @@ export const RecentChatsWidget = memo(function RecentChatsWidget({
 
   if (chats.length === 0 && loading) {
     return (
-      <box style={{ flexDirection: 'column', paddingTop: 1, paddingBottom: 1 }}>
+      <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
         <text style={{ fg: theme.muted }}>
           <span attributes={TextAttributes.DIM}>Loading recent chats...</span>
         </text>
@@ -39,7 +39,7 @@ export const RecentChatsWidget = memo(function RecentChatsWidget({
   if (chats.length === 0) return null
 
   return (
-    <box style={{ flexDirection: 'column', paddingTop: 1, paddingBottom: 1 }}>
+    <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
       <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
         <text style={{ fg: theme.muted }}>
           <span attributes={TextAttributes.DIM}>Recent conversations · </span>
