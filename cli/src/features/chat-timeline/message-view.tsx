@@ -9,7 +9,7 @@ import { AgentCommunicationCard } from './messages/agent-communication-card'
 import { ErrorMessage } from './messages/error-message'
 import { BashOutput } from './messages/bash-output'
 import { useTheme } from '../../hooks/use-theme'
-import { green, red, violet } from '../../utils/theme'
+import { green, red, slate, violet } from '../../utils/theme'
 import { TextAttributes } from '@opentui/core'
 
 interface MessageViewProps {
@@ -43,6 +43,28 @@ const StatusIndicatorRow = ({ message }: { message: Extract<DisplayMessage, { ty
     <box style={{ marginBottom: 1 }}>
       <text attributes={TextAttributes.DIM}>
         <span style={{ fg: theme.muted }}>{message.message}</span>
+      </text>
+    </box>
+  )
+}
+
+function formatWorkDuration(durationMs: number): string {
+  const totalSeconds = Math.floor(durationMs / 1000)
+  if (totalSeconds < 60) return `${totalSeconds} second${totalSeconds === 1 ? '' : 's'}`
+  const minutes = Math.floor(totalSeconds / 60)
+  const remainingSeconds = totalSeconds % 60
+  if (remainingSeconds === 0) return `${minutes} minute${minutes === 1 ? '' : 's'}`
+  return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`
+}
+
+const WorkSummaryRow = ({ message }: { message: Extract<DisplayMessage, { type: 'work_summary' }> }) => {
+  const theme = useTheme()
+  return (
+    <box style={{ height: 1, flexShrink: 0, marginBottom: 1 }}>
+      <text style={{ fg: theme.muted }}>
+        <span style={{ fg: slate[600] }}>{'●'}</span>
+        {' '}
+        {`Worked for ${formatWorkDuration(message.durationMs)}`}
       </text>
     </box>
   )
@@ -121,6 +143,9 @@ export const MessageView = memo(function MessageView({
 
       case 'status_indicator':
         return <StatusIndicatorRow message={message} />
+
+      case 'work_summary':
+        return <WorkSummaryRow message={message} />
 
       case 'goal_status':
         return <GoalStatusRow message={message} />

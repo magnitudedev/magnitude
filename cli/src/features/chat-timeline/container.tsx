@@ -30,7 +30,6 @@ import {
   getSystemMessagesSnapshot,
   TimelineScrollController,
   type TimelineScrollAdapter,
-  type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { safeRenderableAccess } from '../../utils/safe-renderable-access'
 import { subscribeScrollboxActivity } from '../../utils/scroll-helpers'
@@ -39,20 +38,17 @@ import type { ActionId } from '../../types/ui-actions'
 import { useOpenFile } from '../file-viewer/container'
 import { ChatScrollbox } from './scrollbox'
 import { ChatTimeline } from './timeline'
-import { ActivityRailContainer } from '../agent-status/container'
 
 export function ChatTimelineContainer({
   header,
   chatColumnWidth,
   dispatchErrorAction,
   isOverlayActive,
-  modelLoadActivity,
 }: {
   header: ReactNode
   chatColumnWidth: number
   dispatchErrorAction: (actionId: ActionId) => void
   isOverlayActive: boolean
-  modelLoadActivity: LocalModelLoadActivity | null
 }): ReactNode {
   const theme = useTheme()
   const { pushFork } = useDisplayViewController()
@@ -171,10 +167,6 @@ export function ChatTimelineContainer({
         onFileClick={openFile}
         onForkExpand={pushFork}
         onErrorAction={dispatchErrorAction}
-      />
-      <ActivityRailContainer
-        modelLoadActivity={modelLoadActivity}
-        width={chatColumnWidth}
       />
     </ChatScrollbox>
   )

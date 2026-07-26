@@ -124,13 +124,23 @@ only by the amount that real content overflows it. Manual scrolling detaches thi
 terminal scroll surface provides the tail-following primitive, while the shared scroll controller
 continues to own history loading, prepend anchoring, and overlay restoration.
 
-The complete activity rail is the final real content of the live turn. Assistant messages and tool
-output are always inserted before it, pushing it downward. One blank terminal row surrounds the
-rail above and below. Root-model loading, conversation prefill, and model response activity share
-that same stable row. Model loading is shown immediately. Request preparation and prefill use a
-short anti-flicker delay. Once generation begins, the row becomes the composable Working display,
-including thinking, tools, advisor activity, and worker counts. Completion replaces it in place with
-the persistent work summary rather than collapsing the tail geometry.
+While a root work chain is active, the live activity rail occupies a reserved bottom slot outside
+the scrollback and directly above the composer. It therefore remains at the bottom on short pages as
+well as overflowing ones; assistant messages and tool output grow and scroll independently above it.
+One blank terminal row surrounds the rail above and below. Root-model loading, conversation prefill,
+and model response activity share that same stable row. Model loading is shown immediately. Request
+preparation and prefill use a short anti-flicker delay. Once generation begins, the row becomes the
+composable Working display, including thinking, tools, advisor activity, and worker counts. Manual
+history detachment never moves or hides the live rail and never causes the rail to force the history
+back to its tail.
+
+When the root work chain becomes stable, the transient rail is replaced at the same tail position by
+a durable work summary immediately after the chain's final assistant, tool, or worker output and
+before any queued follow-up user activity. A chain spanning multiple internal turns or workers
+produces exactly one summary whose duration covers the chain's first root turn through final
+stability. The summary is projected from session events, survives replay and pagination, and scrolls
+with conversation history. Starting a later chain creates a new transient rail at the new live tail;
+clients never preserve completed rail state independently.
 
 The startup identity is a non-persisted prefix at the true beginning of the timeline. It remains
 the first visual content, uses a proportionally reduced complete Magnitude mark beside its identity

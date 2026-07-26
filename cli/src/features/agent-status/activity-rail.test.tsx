@@ -181,4 +181,16 @@ describe('activity rail', () => {
     )).toBe('● Working... 0:05')
     vi.restoreAllMocks()
   })
+
+  it('does not render completed work from client-local actor state', () => {
+    expect(text(
+      <ActivityRail
+        work={work({ phase: 'worked', lastWorkMs: 5_000 })}
+        width={100}
+        waitsForGenerationProgress={false}
+        modelLoadActivity={null}
+        modelRequestActivity={null}
+      />,
+    )).toBe('')
+  })
 })

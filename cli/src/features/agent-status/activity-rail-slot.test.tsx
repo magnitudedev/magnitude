@@ -38,4 +38,27 @@ describe('activity rail slot', () => {
       await act(async () => view.renderer.destroy())
     }
   })
+
+  it('stays at the bottom when the history above it is short', async () => {
+    const view = await testRender(
+      <box style={{ flexDirection: 'column', height: 8 }}>
+        <box style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }}>
+          <text>Message at top</text>
+        </box>
+        <ActivityRailSlot width={30}><text>Working</text></ActivityRailSlot>
+        <box style={{ height: 1, flexShrink: 0 }}><text>Composer</text></box>
+      </box>,
+      { width: 30, height: 8 },
+    )
+    try {
+      await act(view.renderOnce)
+      const lines = view.captureCharFrame().split('\n')
+      expect(lines[0]?.trim()).toBe('Message at top')
+      expect(lines[5]?.indexOf('Working')).toBe(1)
+      expect(lines[6]?.trim()).toBe('')
+      expect(lines[7]?.trim()).toBe('Composer')
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
 })

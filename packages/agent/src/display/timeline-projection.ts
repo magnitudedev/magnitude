@@ -33,6 +33,7 @@ import {
   ThinkingMessage,
   ToolMessage,
   StatusIndicatorMessage,
+  WorkSummaryMessage,
   GoalStatusMessage,
   WorkerResumedMessage,
   WorkerFinishedMessage,
@@ -1107,6 +1108,26 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
   },
 
   signalHandlers: (on) => [
+    on(AgentLifecycleProjection.signals.rootWorkCompleted, ({ value, state, addressed }) => Effect.gen(function* () {
+      const rootFork = state.forks.get(null)
+      if (!rootFork) return state
+
+      const summary: WorkSummaryMessage = {
+        id: `work_summary:${value.chainId}`,
+        type: 'work_summary',
+        chainId: value.chainId,
+        durationMs: value.durationMs,
+        phase: value.phase,
+        timestamp: value.completedAt,
+      }
+      const nextRootFork = yield* insertMessageIntoFork(
+        addressed.forFork(null).messages,
+        rootFork,
+        summary,
+      )
+      return setForkInState(state, null, nextRootFork)
+    })),
+
     on(AgentLifecycleProjection.signals.agentCreated, ({ value, state, addressed }) => Effect.gen(function* () {
       const { forkId, parentForkId, name, role } = value
       const parentState = state.forks.get(parentForkId)

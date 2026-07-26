@@ -89,6 +89,16 @@ export const StatusIndicatorMessage = Schema.Struct({
 })
 export type StatusIndicatorMessage = Schema.Schema.Type<typeof StatusIndicatorMessage>
 
+export const WorkSummaryMessage = Schema.Struct({
+  id: Schema.String,
+  type: Schema.Literal("work_summary"),
+  chainId: Schema.String,
+  durationMs: Schema.Number,
+  phase: Schema.Literal("worked", "interrupted"),
+  timestamp: Schema.Number
+})
+export type WorkSummaryMessage = Schema.Schema.Type<typeof WorkSummaryMessage>
+
 export const GoalStatusMessage = Schema.Struct({
   id: Schema.String,
   type: Schema.Literal("goal_status"),
@@ -236,6 +246,7 @@ export const DisplayMessage = Schema.Union(
   ThinkingMessage,
   ToolMessage,
   StatusIndicatorMessage,
+  WorkSummaryMessage,
   GoalStatusMessage,
   WorkerResumedMessage,
   WorkerFinishedMessage,
