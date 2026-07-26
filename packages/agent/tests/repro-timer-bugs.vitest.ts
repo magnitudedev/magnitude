@@ -1,7 +1,7 @@
 /**
  * Tests for the fixed display/actor-work projection system.
  * Originally repro tests for three regressions, now verifies the fixes:
- * 1. Working timer resets per chain (chainStartedAt, lastChainMs)
+ * 1. Working timer resets per chain and excludes model waiting time
  * 2. Worker count only counts working workers
  * 3. Worker interrupt state is shown (phase = 'interrupted', deferred close)
  */
@@ -73,6 +73,10 @@ const turnStarted = (forkId: string | null, turnId: string, chainId: string, tim
   type: 'turn_started', timestamp, forkId, turnId, chainId,
 } as AppEvent)
 
+const generationStarted = (turnId: string, chainId: string, timestamp: number): AppEvent => ({
+  type: 'model_generation_started', timestamp, forkId: null, turnId, chainId,
+} as AppEvent)
+
 const completedTurnOutcome = (forkId: string | null, turnId: string, chainId: string, timestamp: number): AppEvent => ({
   type: 'turn_outcome', timestamp, forkId, turnId, chainId, strategyId: 'native',
   outcome: { _tag: 'Completed', requestId: null, completion: { toolCallsCount: 0, finishReason: 'stop', feedback: [], yieldTarget: null } },
@@ -135,43 +139,49 @@ const rootWork = (state: AgentLifecycleState) => state.rootWork
 // ============================================================================
 
 describe('FIX 1 — Working timer resets per chain', () => {
-  it('chainStartedAt resets on each new chain', async () => {
+  it('starts each new chain with a paused work clock', async () => {
     const result = await runWithEvents([
       turnStarted(null, 'turn-1', 'chain-1', ts(1000)),
+      generationStarted('turn-1', 'chain-1', ts(2000)),
       completedTurnOutcome(null, 'turn-1', 'chain-1', ts(5000)),
       turnStarted(null, 'turn-2', 'chain-2', ts(6000)),
     ])
 
     const work = rootWork(result.agentStatus)
-    expect(work.phase).toBe('working')
-    expect(work.chainStartedAt).toBe(ts(6000)) // reset to chain-2 start
-    expect(work.lastChainMs).toBe(4000) // chain-1 duration saved
+    expect(work.phase).toBe('waiting_for_model')
+    expect(work.accumulatedWorkMs).toBe(0)
+    expect(work.workingStartedAt).toBeNull()
+    expect(work.lastChainMs).toBe(3000)
   })
 
   it('completed summary shows last chain duration, not accumulated total', async () => {
     const result = await runWithEvents([
       turnStarted(null, 'turn-1', 'chain-1', ts(1000)),
+      generationStarted('turn-1', 'chain-1', ts(2000)),
       completedTurnOutcome(null, 'turn-1', 'chain-1', ts(5000)),
       turnStarted(null, 'turn-2', 'chain-2', ts(6000)),
+      generationStarted('turn-2', 'chain-2', ts(7000)),
       completedTurnOutcome(null, 'turn-2', 'chain-2', ts(8000)),
     ])
 
     const work = rootWork(result.agentStatus)
     expect(work.phase).toBe('worked')
-    expect(work.lastChainMs).toBe(2000) // chain-2 only, not 6000
+    expect(work.lastChainMs).toBe(1000)
   })
 
   it('display actor lastWorkMs matches lastChainMs', async () => {
     const result = await runWithEvents([
       turnStarted(null, 'turn-1', 'chain-1', ts(1000)),
+      generationStarted('turn-1', 'chain-1', ts(2000)),
       completedTurnOutcome(null, 'turn-1', 'chain-1', ts(5000)),
       turnStarted(null, 'turn-2', 'chain-2', ts(6000)),
+      generationStarted('turn-2', 'chain-2', ts(7000)),
       completedTurnOutcome(null, 'turn-2', 'chain-2', ts(8000)),
     ])
 
     const rootActor = result.displayActors['root']
     expect(rootActor.work.phase).toBe('worked')
-    expect(rootActor.work.lastWorkMs).toBe(2000) // last chain only
+    expect(rootActor.work.lastWorkMs).toBe(1000)
   })
 })
 
@@ -184,6 +194,7 @@ describe('FIX 2 — Worker count only counts working workers', () => {
     const result1 = await runWithEvents([
       agentCreated('worker-1', null, 'agent-worker-1', 'Worker 1', ts(1000)),
       turnStarted(null, 'root-turn-1', 'chain-1', ts(1000)),
+      generationStarted('root-turn-1', 'chain-1', ts(1050)),
       turnStarted('worker-1', 'worker-turn-1', 'chain-1', ts(1100)),
     ])
     expect(rootWork(result1.agentStatus).activeChildCount).toBe(1)
@@ -191,6 +202,7 @@ describe('FIX 2 — Worker count only counts working workers', () => {
     const result2 = await runWithEvents([
       agentCreated('worker-1', null, 'agent-worker-1', 'Worker 1', ts(1000)),
       turnStarted(null, 'root-turn-1', 'chain-1', ts(1000)),
+      generationStarted('root-turn-1', 'chain-1', ts(1050)),
       turnStarted('worker-1', 'worker-turn-1', 'chain-1', ts(1100)),
       completedTurnOutcome('worker-1', 'worker-turn-1', 'chain-1', ts(3000)),
     ])
@@ -207,6 +219,7 @@ describe('FIX 3a — Root work stays working while root is streaming', () => {
     const result = await runWithEvents([
       agentCreated('worker-1', null, 'agent-worker-1', 'Worker 1', ts(1000)),
       turnStarted(null, 'root-turn-1', 'chain-1', ts(1000)),
+      generationStarted('root-turn-1', 'chain-1', ts(1050)),
       turnStarted('worker-1', 'worker-turn-1', 'chain-1', ts(1100)),
       completedTurnOutcome('worker-1', 'worker-turn-1', 'chain-1', ts(3000)),
     ])
@@ -221,6 +234,7 @@ describe('FIX 3a — Root work stays working while root is streaming', () => {
     const result = await runWithEvents([
       agentCreated('worker-1', null, 'agent-worker-1', 'Worker 1', ts(1000)),
       turnStarted(null, 'root-turn-1', 'chain-1', ts(1000)),
+      generationStarted('root-turn-1', 'chain-1', ts(1050)),
       turnStarted('worker-1', 'worker-turn-1', 'chain-1', ts(1100)),
       interruptEvent('worker-1', ts(2000), false),
     ])

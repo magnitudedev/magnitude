@@ -411,9 +411,8 @@ export const ContextUsageDisplay = Schema.Struct({
 export type ContextUsageDisplay = Schema.Schema.Type<typeof ContextUsageDisplay>
 
 export const DisplayActorWork = Schema.Struct({
-  phase: Schema.Literal("idle", "working", "worked", "interrupted"),
+  phase: Schema.Literal("idle", "waiting_for_model", "working", "waiting_for_workers", "worked", "interrupted"),
   activeSince: Schema.Union(Schema.Number, Schema.Null),
-  respondingSince: Schema.optional(Schema.Number),
   lastWorkMs: Schema.Number,
   accumulatedMs: Schema.Number,
   resumeCount: Schema.Number,

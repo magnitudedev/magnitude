@@ -146,7 +146,6 @@ export const buildDisplayViewSnapshot = (
         taskWorker.state,
         windowState.state,
         compaction.state,
-        modelRequestActivity.state.responseTimings,
       ),
       agents: materializeDisplayAgents(agentStatus.state),
       tasks: materializeDisplayTasks(taskWorker.state),

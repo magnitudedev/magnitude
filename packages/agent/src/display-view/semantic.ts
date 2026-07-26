@@ -29,20 +29,13 @@ const idleActorWork = (): DisplayActorWork => ({
   activeChildCount: 0,
 })
 
-/**
- * Root actor work from AgentLifecycleState.rootWork directly.
- * The chain timer remains the fallback; local inference may supply the first
- * generation timestamp separately so clients do not count admission/prefill.
- */
 const materializeRootWork = (
   rootWork: AgentLifecycleState['rootWork'],
-  respondingSince?: number,
 ): DisplayActorWork => ({
   phase: rootWork.phase,
-  activeSince: rootWork.chainStartedAt,
-  ...(respondingSince === undefined ? {} : { respondingSince }),
+  activeSince: rootWork.workingStartedAt,
   lastWorkMs: rootWork.lastChainMs,
-  accumulatedMs: rootWork.lastChainMs,
+  accumulatedMs: rootWork.accumulatedWorkMs,
   resumeCount: 0,
   activity: rootWork.activity,
   activeChildCount: rootWork.activeChildCount,
@@ -103,16 +96,7 @@ export const materializeDisplayActors = (
   taskWorker: TaskAssignmentState,
   windowState: { readonly forks: ReadonlyMap<string | null, { readonly tokenEstimate: number }> },
   compactionState: { readonly forks: ReadonlyMap<string | null, { readonly _tag: string }> },
-  responseTimings: ReadonlyMap<string, {
-    readonly chainId: string
-    readonly respondingSince: number
-  }> = new Map(),
 ): Record<string, DisplayActor> => {
-  const rootResponseTiming = responseTimings.get(ROOT_ACTOR_KEY)
-  const rootRespondingSince = agentStatus.rootWork.phase === 'working'
-    && rootResponseTiming?.chainId === agentStatus.rootWork._currentChainId
-    ? rootResponseTiming.respondingSince
-    : undefined
   const actors: Record<string, DisplayActor> = {
     [ROOT_ACTOR_KEY]: {
       kind: 'root',
@@ -120,7 +104,7 @@ export const materializeDisplayActors = (
       role: 'leader',
       parentActorKey: null,
       taskId: null,
-      work: materializeRootWork(agentStatus.rootWork, rootRespondingSince),
+      work: materializeRootWork(agentStatus.rootWork),
       context: materializeActorContext(null, windowState, compactionState),
     },
   }

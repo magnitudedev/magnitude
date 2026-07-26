@@ -113,7 +113,7 @@ flashing short prefills, but they do not infer token progress or preserve a seco
 
 Model-request progress enters the event engine as timestamped ambient observations through one
 progress sink shared by ACN preparation and provider execution. A display-owned projection reduces
-those observations into the current per-fork request activity and response timing. Display views
+those observations into the current per-fork request activity. Display views
 read that projection through the normal projection-consumer path, so activity changes invalidate
 and rematerialize snapshots without an app event or a separately merged runtime stream. Projection
 evaluation never reads a clock; observation time is fixed at ambient ingress.
@@ -137,10 +137,12 @@ back to its tail.
 When the root work chain becomes stable, the transient rail is replaced at the same tail position by
 a durable work summary immediately after the chain's final assistant, tool, or worker output and
 before any queued follow-up user activity. A chain spanning multiple internal turns or workers
-produces exactly one summary whose duration covers the chain's first root turn through final
-stability. The summary is projected from session events, survives replay and pagination, and scrolls
-with conversation history. Starting a later chain creates a new transient rail at the new live tail;
-clients never preserve completed rail state independently.
+produces exactly one summary. Its duration accumulates the union of productive root generation,
+tool execution, and worker time, while excluding intervals spent only on model admission, model
+loading, conversation prefill, or retry waits. The summary is projected from session events,
+survives replay and pagination, and scrolls with conversation history. Starting a later chain
+creates a new transient rail at the new live tail; clients never preserve completed rail state
+independently.
 
 The startup identity is a non-persisted prefix at the true beginning of the timeline. It remains
 the first visual content, uses a proportionally reduced complete Magnitude mark beside its identity
@@ -190,12 +192,21 @@ after provider acceptance the provider owns all later progress and clearing. Con
 model load satisfies the client's anti-flicker delay and the rail transitions directly into
 conversation loading when the slot becomes ready.
 
-The activity projection records the generation-start timestamp in the same atomic transition that
-removes prefill progress. Display snapshots attach that timestamp to root work for the current
-chain. The live Working timer therefore begins when the model starts responding, rather than
-including model admission or prefill time, and the rail can transition from prefill to Working
-without disappearing between snapshots. Providers that do not expose granular request progress
-continue to use the actor's work-start timestamp as a fallback.
+Root work is a durable phase machine. A root turn begins in a waiting-for-model phase. The execution
+adapter records one generation-start event for the turn before its first semantic thinking,
+assistant-message, or tool-input event; this moves the root into working and starts the clock.
+A chain-continuing outcome closes that productive interval and returns to waiting-for-model before
+the next turn. An active worker keeps the productive clock running across that root-model wait; if
+the final worker settles before generation begins, the clock pauses until generation. A terminal
+root outcome either completes the chain or moves to waiting-for-workers, whose elapsed time remains
+productive until the final root worker settles. Interrupts close the current interval without
+manufacturing time for a wait-only turn.
+
+The root projection owns accumulated productive milliseconds and the current running interval.
+Display snapshots expose that authoritative state, and clients only add the current clock delta
+while that interval is open. Transient request progress controls loading and prefill copy but never
+owns, reconstructs, or adjusts the work timer. This keeps live and replayed completed timing
+identical even when a chain crosses several model requests.
 
 Closing the final subscription removes the display registration. There is no separate close RPC.
 

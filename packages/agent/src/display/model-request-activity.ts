@@ -38,25 +38,10 @@ export type ActiveModelRequest = typeof ActiveModelRequestSchema.Type
 
 export type ActiveModelRequests = ReadonlyMap<string, ActiveModelRequest>
 
-const ModelResponseTimingSchema = Schema.Struct({
-  turnId: Schema.String,
-  chainId: Schema.String,
-  forkId: Schema.NullOr(Schema.String),
-  respondingSince: Schema.Number,
-})
-
-export type ModelResponseTiming = typeof ModelResponseTimingSchema.Type
-
-export type ModelResponseTimings = ReadonlyMap<string, ModelResponseTiming>
-
 export const ModelRequestActivityStateSchema = Schema.Struct({
   requests: Schema.ReadonlyMap({
     key: Schema.String,
     value: ActiveModelRequestSchema,
-  }),
-  responseTimings: Schema.ReadonlyMap({
-    key: Schema.String,
-    value: ModelResponseTimingSchema,
   }),
 })
 
@@ -65,7 +50,6 @@ export type ModelRequestActivityState =
 
 export const initialModelRequestActivityState = (): ModelRequestActivityState => ({
   requests: new Map(),
-  responseTimings: new Map(),
 })
 
 export function reduceModelRequestActivity(
@@ -87,17 +71,7 @@ export function reduceModelRequestActivity(
     }
     const requests = new Map(current.requests)
     requests.delete(key)
-    const responseTimings = new Map(current.responseTimings)
-    const timing = responseTimings.get(key)
-    if (timing?.chainId !== turn.chainId) {
-      responseTimings.set(key, {
-        turnId: turn.turnId,
-        chainId: turn.chainId,
-        forkId: turn.forkId,
-        respondingSince: observedAt,
-      })
-    }
-    return { requests, responseTimings }
+    return { requests }
   }
 
   if (progress.phase === 'cleared') {
@@ -132,16 +106,7 @@ export function reduceModelRequestActivity(
   }
   const requests = new Map(current.requests)
   requests.set(key, nextActivity)
-  const responseTiming = current.responseTimings.get(key)
-  if (
-    active?.turnId === turn.turnId
-    || responseTiming?.chainId === turn.chainId
-  ) {
-    return { ...current, requests }
-  }
-  const responseTimings = new Map(current.responseTimings)
-  responseTimings.delete(key)
-  return { requests, responseTimings }
+  return { requests }
 }
 
 export const ModelRequestActivityProjection = Projection.define<AppEvent>()({

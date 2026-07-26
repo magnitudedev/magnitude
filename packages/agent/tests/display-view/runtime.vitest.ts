@@ -222,7 +222,11 @@ describe('display view runtime', () => {
       phase: 'prefill',
     })
     expect(snapshots[1].state.modelRequests.root).toBeUndefined()
-    expect(snapshots[1].state.actors.root?.work.respondingSince).toBe(2_000)
+    expect(snapshots[1].state.actors.root?.work).toMatchObject({
+      phase: 'waiting_for_model',
+      activeSince: null,
+      accumulatedMs: 0,
+    })
   })
 
   it('closes a runtime view explicitly', async () => {

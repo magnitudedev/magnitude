@@ -62,7 +62,6 @@ describe('activity rail', () => {
       <ActivityRail
         work={work()}
         width={100}
-        waitsForGenerationProgress
         modelLoadActivity={new ModelSlotLoadingLocalModel({
           slotId: PRIMARY_SLOT_ID,
           selection,
@@ -81,7 +80,6 @@ describe('activity rail', () => {
       <ActivityRail
         work={work()}
         width={100}
-        waitsForGenerationProgress
         modelLoadActivity={new ModelSlotBlocked({
           slotId: PRIMARY_SLOT_ID,
           selection,
@@ -105,7 +103,6 @@ describe('activity rail', () => {
       <ActivityRail
         work={work()}
         width={100}
-        waitsForGenerationProgress
         modelLoadActivity={null}
         modelRequestActivity={request()}
       />,
@@ -121,7 +118,6 @@ describe('activity rail', () => {
       <ActivityRail
         work={work()}
         width={100}
-        waitsForGenerationProgress
         modelLoadActivity={null}
         modelRequestActivity={request({
           completedTokens: 14_020,
@@ -139,7 +135,6 @@ describe('activity rail', () => {
       <ActivityRail
         work={work()}
         width={60}
-        waitsForGenerationProgress
         modelLoadActivity={null}
         modelRequestActivity={request({
           completedTokens: 14_020,
@@ -156,11 +151,10 @@ describe('activity rail', () => {
     expect(text(
       <ActivityRail
         work={work({
-          respondingSince: 11_000,
+          activeSince: 11_000,
           activity: { kind: 'thinking', message: 'Thinking' },
         })}
         width={100}
-        waitsForGenerationProgress
         modelLoadActivity={null}
         modelRequestActivity={null}
       />,
@@ -168,17 +162,51 @@ describe('activity rail', () => {
     vi.restoreAllMocks()
   })
 
-  it('keeps the actor timer fallback for providers without generation progress', () => {
+  it('adds the current productive interval to accumulated work', () => {
     vi.spyOn(Date, 'now').mockReturnValue(6_000)
     expect(text(
       <ActivityRail
-        work={work({ activeSince: 1_000 })}
+        work={work({ activeSince: 4_000, accumulatedMs: 3_000 })}
         width={100}
-        waitsForGenerationProgress={false}
         modelLoadActivity={null}
         modelRequestActivity={null}
       />,
     )).toBe('● Working... 0:05')
+    vi.restoreAllMocks()
+  })
+
+  it('keeps the timer paused during a model-only wait', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    expect(text(
+      <ActivityRail
+        work={work({
+          phase: 'waiting_for_model',
+          activeSince: null,
+          accumulatedMs: 3_000,
+        })}
+        width={100}
+        modelLoadActivity={null}
+        modelRequestActivity={null}
+      />,
+    )).toBe('● Working... 0:03')
+    vi.restoreAllMocks()
+  })
+
+  it('keeps the timer running when a worker overlaps a model wait', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    expect(text(
+      <ActivityRail
+        work={work({
+          phase: 'waiting_for_model',
+          activeSince: 8_000,
+          accumulatedMs: 3_000,
+          activeChildCount: 1,
+        })}
+        width={100}
+        modelLoadActivity={null}
+        modelRequestActivity={null}
+      />,
+    )).toBe('● Working... 0:05 · 1 worker running')
     vi.restoreAllMocks()
   })
 
@@ -187,7 +215,6 @@ describe('activity rail', () => {
       <ActivityRail
         work={work({ phase: 'worked', lastWorkMs: 5_000 })}
         width={100}
-        waitsForGenerationProgress={false}
         modelLoadActivity={null}
         modelRequestActivity={null}
       />,

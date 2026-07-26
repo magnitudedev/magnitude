@@ -47,6 +47,7 @@ export * from './utils/model-properties'
 export * from './utils/model-slots'
 export * from './utils/model-memory'
 export * from './utils/hardware-memory'
+export * from './utils/actor-work'
 export * from './attachments/images'
 
 // Commands

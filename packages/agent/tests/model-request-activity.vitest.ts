@@ -80,47 +80,5 @@ describe('model request activity', () => {
     })
 
     expect(result.requests.has('root')).toBe(false)
-    expect(result.responseTimings.get('root')).toMatchObject({
-      turnId: 'turn-1',
-      forkId: null,
-      respondingSince: 2_000,
-    })
-  })
-
-  it('retains the first response time across later requests in the same chain', () => {
-    const turn = { turnId: 'turn-1', chainId: 'chain-1', forkId: null }
-    const preparing = reduceModelRequestActivity(
-      initialModelRequestActivityState(),
-      {
-        turn,
-        progress: { phase: 'preparing', requestId: null },
-        observedAt: 1_000,
-      },
-    )
-    const firstResponse = reduceModelRequestActivity(preparing, {
-      turn,
-      progress: { phase: 'generating', requestId: 'request-1' },
-      observedAt: 2_000,
-    })
-    const nextTurn = { ...turn, turnId: 'turn-2' }
-    const nextPreparing = reduceModelRequestActivity(firstResponse, {
-      turn: nextTurn,
-      progress: { phase: 'preparing', requestId: null },
-      observedAt: 3_000,
-    })
-    const secondResponse = reduceModelRequestActivity(nextPreparing, {
-      turn: nextTurn,
-      progress: { phase: 'generating', requestId: 'request-2' },
-      observedAt: 4_000,
-    })
-    const responseTimings = {
-      first: firstResponse.responseTimings.get('root'),
-      second: secondResponse.responseTimings.get('root'),
-    }
-
-    expect(responseTimings.first?.respondingSince).toBe(2_000)
-    expect(responseTimings.second?.respondingSince).toBe(
-      responseTimings.first?.respondingSince,
-    )
   })
 })

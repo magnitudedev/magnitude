@@ -106,6 +106,14 @@ const rootTurnStarted = (turnId: string, timestamp: number): AppEvent => ({
   chainId: 'root-chain',
 } as AppEvent)
 
+const rootGenerationStarted = (turnId: string, timestamp: number): AppEvent => ({
+  type: 'model_generation_started',
+  timestamp,
+  forkId: null,
+  turnId,
+  chainId: 'root-chain',
+} as AppEvent)
+
 const rootTurnOutcome = (turnId: string, timestamp: number): AppEvent =>
   completedTurnOutcome(null, turnId, 'root-chain', timestamp)
 
@@ -122,7 +130,8 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
   it('root work is working while root turn is active', async () => {
     const state = await runWithEvents([
       rootTurnStarted('root-turn-1', ts(1)),
-      { type: 'agent_created', timestamp: ts(2), forkId: 'worker-a', parentForkId: null, agentId: 'agent-worker-a', name: 'Worker A', role: 'engineer', context: 'worker context', mode: 'spawn', taskId: 'task-worker-a', message: 'starting work' } as AppEvent,
+      rootGenerationStarted('root-turn-1', ts(2)),
+      { type: 'agent_created', timestamp: ts(3), forkId: 'worker-a', parentForkId: null, agentId: 'agent-worker-a', name: 'Worker A', role: 'engineer', context: 'worker context', mode: 'spawn', taskId: 'task-worker-a', message: 'starting work' } as AppEvent,
     ])
 
     expect(rootWork(state).phase).toBe('working')
@@ -132,11 +141,12 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
   it('root work transitions to worked when root turn ends and no workers active', async () => {
     const state = await runWithEvents([
       rootTurnStarted('root-turn-1', ts(1)),
-      rootTurnOutcome('root-turn-1', ts(2)),
+      rootGenerationStarted('root-turn-1', ts(2)),
+      rootTurnOutcome('root-turn-1', ts(4)),
     ])
 
     expect(rootWork(state).phase).toBe('worked')
-    expect(rootWork(state).lastChainMs).toBe(ts(2) - ts(1))
+    expect(rootWork(state).lastChainMs).toBe(ts(4) - ts(2))
   })
 
   it('root work stays working when root turn ends but workers still running (deferred close)', async () => {
@@ -144,11 +154,12 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
       rootTurnStarted('root-turn-1', ts(1)),
       { type: 'agent_created', timestamp: ts(2), forkId: 'worker-a', parentForkId: null, agentId: 'agent-worker-a', name: 'Worker A', role: 'engineer', context: 'worker context', mode: 'spawn', taskId: 'task-worker-a', message: 'starting work' } as AppEvent,
       { type: 'turn_started', timestamp: ts(3), forkId: 'worker-a', turnId: 'worker-turn-1', chainId: 'chain-1' } as AppEvent,
+      rootGenerationStarted('root-turn-1', ts(3)),
       rootTurnOutcome('root-turn-1', ts(4)),
     ])
 
-    // Root turn ended but worker still running — root stays working
-    expect(rootWork(state).phase).toBe('working')
+    // Root turn ended but worker still running — root remains active and counts worker time.
+    expect(rootWork(state).phase).toBe('waiting_for_workers')
   })
 
   it('root work closes (worked) when last worker goes idle after root turn already ended', async () => {
@@ -156,6 +167,7 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
       rootTurnStarted('root-turn-1', ts(1)),
       { type: 'agent_created', timestamp: ts(2), forkId: 'worker-a', parentForkId: null, agentId: 'agent-worker-a', name: 'Worker A', role: 'engineer', context: 'worker context', mode: 'spawn', taskId: 'task-worker-a', message: 'starting work' } as AppEvent,
       { type: 'turn_started', timestamp: ts(3), forkId: 'worker-a', turnId: 'worker-turn-1', chainId: 'chain-1' } as AppEvent,
+      rootGenerationStarted('root-turn-1', ts(3)),
       rootTurnOutcome('root-turn-1', ts(4)),
       completedTurnOutcome('worker-a', 'worker-turn-1', 'chain-1', ts(5)),
     ])
@@ -171,17 +183,30 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
     ])
 
     expect(rootWork(state).phase).toBe('interrupted')
+    expect(rootWork(state).lastChainMs).toBe(0)
+  })
+
+  it('does not count model wait before generation', async () => {
+    const state = await runWithEvents([
+      rootTurnStarted('root-turn-1', ts(1)),
+      rootGenerationStarted('root-turn-1', ts(101)),
+      rootTurnOutcome('root-turn-1', ts(151)),
+    ])
+
+    expect(rootWork(state).lastChainMs).toBe(50)
   })
 
   it('chain timer resets each chain', async () => {
     const state = await runWithEvents([
       rootTurnStarted('root-turn-1', ts(100)),
+      rootGenerationStarted('root-turn-1', ts(120)),
       rootTurnOutcome('root-turn-1', ts(200)),
       rootTurnStarted('root-turn-2', ts(300)),
+      rootGenerationStarted('root-turn-2', ts(300)),
       rootTurnOutcome('root-turn-2', ts(350)),
     ])
 
-    // Chain 1: 200-100 = 100ms. Chain 2: 350-300 = 50ms.
+    // Chain 1 excludes 20ms of prefill. Chain 2 has no prefill delay.
     // lastChainMs should be chain 2 duration (50ms), not accumulated (150ms).
     expect(rootWork(state).phase).toBe('worked')
     expect(rootWork(state).lastChainMs).toBe(50)
