@@ -12,6 +12,7 @@ import {
 } from "@magnitudedev/protocol"
 import {
   MINIMUM_EXPECTED_TOKENS_PER_SECOND,
+  assembleRecommendationCatalogCandidates,
   conservativeGenerationSpeed,
   selectRecommendationPortfolio,
   type RecommendationCandidate,
@@ -248,12 +249,19 @@ describe("local model multicriteria recommendation policy", () => {
   })
 
   it("lets Fastest select a materially quicker 100K profile", () => {
-    const recommendations = selectRecommendationPortfolio([
+    const candidates = [
       candidate({ id: "balanced", score: 50, expected: 30, context: 200_000, runtimeGiB: 30 }),
       candidate({ id: "quick-100", checkpoint: "quick", artifact: "quick:q6", score: 45, expected: 50, context: 100_000, runtimeGiB: 28 }),
       candidate({ id: "quick-200", checkpoint: "quick", artifact: "quick:q6", score: 45, expected: 32, context: 200_000, runtimeGiB: 30 }),
-    ])
+    ]
+    const recommendations = selectRecommendationPortfolio(candidates)
     expect(byIntent(recommendations, "fastest")?.configuration.profile.contextLength).toBe(100_000)
+
+    const catalog = assembleRecommendationCatalogCandidates(candidates, recommendations)
+    const fastest = catalog.find(({ recommendation }) => recommendation?.intent === "fastest")
+    expect(fastest?.candidate.profile.contextLength).toBe(100_000)
+    expect(catalog.filter(({ candidate: entry }) => entry.artifactId === "quick:q6"))
+      .toHaveLength(1)
   })
 
   it("uses confidence-aware conservative speed for Fastest", () => {
@@ -324,7 +332,7 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "fastest")?.explanation)
       .toContain("half as much code and conversation history")
     expect(byIntent(recommendations, "fastest")?.explanation)
-      .toContain("substantial compression")
+      .toContain("Retains good quality with some possible loss")
     expect(byIntent(recommendations, "lightweight")?.explanation)
       .toContain("less capable on difficult coding tasks")
     expect(byIntent(recommendations, "lightweight")?.explanation)
@@ -354,6 +362,6 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "fastest")?.explanation)
       .not.toContain("lower precision than Balanced")
     expect(byIntent(recommendations, "lightweight")?.explanation)
-      .toContain("substantial compression with some possible quality loss")
+      .toContain("Retains good quality with some possible loss")
   })
 })
