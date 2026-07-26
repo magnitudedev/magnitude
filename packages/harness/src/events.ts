@@ -1,5 +1,5 @@
 import type { JsonValue } from "@magnitudedev/utils/schema"
-import type { ProviderToolCallId, ResponseUsage, ToolCallId, ValidationIssue, ModelStreamTerminal } from "@magnitudedev/ai"
+import type { GenerationPerformance, ProviderToolCallId, ResponseUsage, ToolCallId, ValidationIssue, ModelStreamTerminal } from "@magnitudedev/ai"
 
 // ── Tool Error ───────────────────────────────────────────────────────
 
@@ -247,12 +247,14 @@ interface TurnEndErased {
   readonly _tag: "TurnEnd"
   readonly outcome: TurnOutcome
   readonly usage: ResponseUsage | null
+  readonly performance?: GenerationPerformance
 }
 
 interface TurnEndConcrete<TInput> {
   readonly _tag: "TurnEnd"
   readonly outcome: TurnOutcome<TInput>
   readonly usage: ResponseUsage | null
+  readonly performance?: GenerationPerformance
 }
 
 export type TurnEnd<TInput = never> =

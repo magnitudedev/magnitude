@@ -89,12 +89,20 @@ export const StatusIndicatorMessage = Schema.Struct({
 })
 export type StatusIndicatorMessage = Schema.Schema.Type<typeof StatusIndicatorMessage>
 
+export const WorkSummaryPerformance = Schema.Struct({
+  modelDisplayName: Schema.String,
+  timeToFirstTokenMs: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+  decodeTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+})
+export type WorkSummaryPerformance = Schema.Schema.Type<typeof WorkSummaryPerformance>
+
 export const WorkSummaryMessage = Schema.Struct({
   id: Schema.String,
   type: Schema.Literal("work_summary"),
   chainId: Schema.String,
   durationMs: Schema.Number,
   phase: Schema.Literal("worked", "interrupted"),
+  performance: Schema.optionalWith(WorkSummaryPerformance, { as: 'Option', exact: true }),
   timestamp: Schema.Number
 })
 export type WorkSummaryMessage = Schema.Schema.Type<typeof WorkSummaryMessage>

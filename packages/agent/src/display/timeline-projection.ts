@@ -1118,6 +1118,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
         chainId: value.chainId,
         durationMs: value.durationMs,
         phase: value.phase,
+        performance: Option.fromNullable(value.performance),
         timestamp: value.completedAt,
       }
       const nextRootFork = yield* insertMessageIntoFork(

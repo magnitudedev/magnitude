@@ -17,6 +17,7 @@ export interface SlotConfig {
   readonly slotId: SlotId
   readonly providerId: string
   readonly providerModelId: string
+  readonly modelDisplayName: string
   readonly profile: { readonly contextWindow: number; readonly maxOutputTokens: number }
   readonly vision: boolean | undefined
   readonly hardCap: number
@@ -106,6 +107,7 @@ export function buildConfigStateFromSlots(
         slotId,
         providerId: slot.selection.providerId,
         providerModelId: slot.selection.providerModelId,
+        modelDisplayName: selectedModel.displayName,
         profile: {
           contextWindow: selectedModel.contextWindow,
           maxOutputTokens: selectedModel.maxOutputTokens,

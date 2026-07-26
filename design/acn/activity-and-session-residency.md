@@ -156,6 +156,15 @@ survives replay and pagination, and scrolls with conversation history. Starting 
 creates a new transient rail at the new live tail; clients never preserve completed rail state
 independently.
 
+When native generation performance is available, the durable summary also records the root model's
+display name, the first root request's time to first token, and decode throughput. A chain with one
+root request preserves the provider-reported decode rate unchanged. A chain with multiple root
+requests weights throughput by their native generated-token counts and decode durations; it never
+averages request rates or includes model loading, prefill, tools, workers, or wait time in tok/s.
+Worker generations do not enter the root-model performance aggregate because they may use a
+different model. Providers that report no native performance produce the ordinary duration-only
+summary, without client-side timing, tokenization, or provider-identity branching.
+
 The startup identity is a non-persisted prefix at the true beginning of the timeline. It remains
 the first visual content, uses a proportionally reduced complete Magnitude mark beside its identity
 and directory details when width permits, stacks at narrow widths, and scrolls away naturally with

@@ -4458,6 +4458,7 @@
           "cache_n",
           "prompt_n",
           "prompt_ms",
+          "time_to_first_token_ms",
           "prompt_per_token_ms",
           "prompt_per_second",
           "predicted_n",
@@ -4479,6 +4480,10 @@
             "minimum": 0
           },
           "prompt_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "time_to_first_token_ms": {
             "type": "number",
             "format": "double"
           },

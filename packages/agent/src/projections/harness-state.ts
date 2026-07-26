@@ -158,6 +158,7 @@ export function translateTurnOutcome(event: MappableTurnOutcomeEvent): HarnessEv
     _tag: 'TurnEnd',
     outcome: harnessOutcome,
     usage,
+    ...(event.generationPerformance ? { performance: event.generationPerformance } : {}),
   }
 }
 

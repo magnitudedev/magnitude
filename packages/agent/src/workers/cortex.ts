@@ -196,6 +196,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             cacheReadTokens: null, cacheWriteTokens: null,
             cost: null,
             providerId: agentModel.providerId, modelId: agentModel.modelId,
+            generationPerformance: null,
           })
           return
         }
@@ -328,6 +329,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               cacheReadTokens: null, cacheWriteTokens: null,
               cost: null,
               providerId: agentModel.providerId, modelId: agentModel.modelId,
+              generationPerformance: null,
             })
             return null
           })),
@@ -376,6 +378,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           cost:             executeResult.usage?.cost ?? null,
           providerId: agentModel.providerId,
           modelId:    agentModel.modelId,
+          generationPerformance: executeResult.generationPerformance === null
+            ? null
+            : { ...executeResult.generationPerformance, modelDisplayName: agentModel.modelDisplayName },
         })
       }).pipe(
         Effect.onInterrupt(() => Effect.gen(function* () {
@@ -394,6 +399,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             cacheReadTokens: null, cacheWriteTokens: null,
             cost: null,
             providerId: null, modelId: null,
+            generationPerformance: null,
           })
         })),
       )

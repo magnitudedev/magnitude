@@ -2,6 +2,7 @@ import type { ProviderToolCallId, ToolCallId } from "../prompt/ids"
 import type { JsonValue } from "../prompt/parts"
 import type { ModelStreamTerminal } from "../errors/failure"
 import type { ResponseUsage } from "./usage"
+import type { GenerationPerformance } from "./performance"
 
 /** A single logprob candidate for a generated token. */
 export type RawLogprobEntry = {
@@ -39,6 +40,7 @@ export type FinishReason = "stop" | "tool_calls" | "end_turn" | "length" | "cont
 export type StreamEnd = {
   readonly _tag: "stream_end"
   readonly terminal: ModelStreamTerminal
+  readonly performance?: GenerationPerformance
   readonly rawInput?: ReadonlyArray<RawInputToken>
   readonly rawOutput?: ReadonlyArray<RawOutputToken>
 }

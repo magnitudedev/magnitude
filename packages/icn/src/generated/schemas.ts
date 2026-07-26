@@ -1639,6 +1639,7 @@ export const Timings = S.Struct({
   prompt_per_second: S.Number,
   prompt_per_token_ms: S.Number,
   sampler_ms: S.Number,
+  time_to_first_token_ms: S.Number,
 })
 export type Timings = S.Schema.Type<typeof Timings>
 export type TimingsEncoded = S.Schema.Encoded<typeof Timings>

@@ -107,7 +107,6 @@ describe("ICN local provider", () => {
         choices: [{
           index: 0,
           delta: { role: "assistant", content: null },
-          finish_reason: null,
         }],
       },
       {
@@ -115,7 +114,6 @@ describe("ICN local provider", () => {
         choices: [{
           index: 0,
           delta: { content: "hello" },
-          finish_reason: null,
         }],
       },
       {
@@ -126,6 +124,20 @@ describe("ICN local provider", () => {
         ...chunk,
         choices: [],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        timings: {
+          cache_n: 0,
+          prompt_n: 1,
+          prompt_ms: 3,
+          time_to_first_token_ms: 6,
+          prompt_per_token_ms: 3,
+          prompt_per_second: 333.3,
+          predicted_n: 1,
+          predicted_ms: 50,
+          predicted_per_token_ms: 50,
+          predicted_per_second: 20,
+          sampler_ms: 0.1,
+          parser_ms: 0.1,
+        },
       },
     ])))
     const progress: ModelRequestProgress[] = []
@@ -145,7 +157,20 @@ describe("ICN local provider", () => {
       return yield* Stream.runCollect(result.events)
     }).pipe(Effect.provide(makeTestLayer(http, modelId))))
 
-    expect(Array.from(output).map((event) => event._tag)).toEqual(["stream_end"])
+    expect(Array.from(output).map((event) => event._tag)).toEqual([
+      "message_start",
+      "message_delta",
+      "message_end",
+      "stream_end",
+    ])
+    expect(Array.from(output).at(-1)).toMatchObject({
+      performance: {
+        generatedTokens: 1,
+        decodeDurationMs: 50,
+        decodeTokensPerSecond: 20,
+        timeToFirstTokenMs: 6,
+      },
+    })
     expect(progress).toEqual([
       { phase: "queued", requestId: "request-1" },
       { phase: "generating", requestId: "request-1" },

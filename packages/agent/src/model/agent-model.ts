@@ -60,6 +60,7 @@ export interface AgentBoundModel {
   readonly model: BoundModel<BaseCallOptions, AgentModelStartFailure>
   readonly modelSource: ModelSource
   readonly modelId: string
+  readonly modelDisplayName: string
   /**
    * Provider ID, carried for event attribution/logging only.
    *
@@ -79,6 +80,7 @@ export interface AgentBoundModelConfig {
   readonly prepareRequest?: Effect.Effect<void, ModelRequestPreparationFailed, Scope.Scope>
   readonly clearRequestProgress?: Effect.Effect<void>
   readonly modelId: string
+  readonly modelDisplayName: string
   readonly modelSource: ModelSource
   readonly providerId: string
   readonly profile: { readonly contextWindow: number; readonly maxOutputTokens: number }
@@ -283,6 +285,7 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
     model,
     modelSource: config.modelSource,
     modelId: config.modelId,
+    modelDisplayName: config.modelDisplayName,
     providerId: config.providerId,
     profile: config.profile,
     ...(config.maxToolCalls !== undefined ? { maxToolCalls: config.maxToolCalls } : {}),

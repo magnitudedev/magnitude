@@ -1000,6 +1000,7 @@ pub struct Timings {
     pub cache_n: u64,
     pub prompt_n: u64,
     pub prompt_ms: f64,
+    pub time_to_first_token_ms: f64,
     pub prompt_per_token_ms: f64,
     pub prompt_per_second: f64,
     pub predicted_n: u64,
@@ -1842,6 +1843,7 @@ fn timing_values(
         cache_n: cached_prompt_tokens as u64,
         prompt_n: prompt_n as u64,
         prompt_ms: metrics.prompt_ms,
+        time_to_first_token_ms: metrics.time_to_first_token_ms,
         prompt_per_token_ms: per_token_ms(prompt_n, metrics.prompt_ms),
         prompt_per_second: rate(prompt_n, metrics.prompt_ms),
         predicted_n: generated_tokens as u64,
@@ -4048,11 +4050,13 @@ mod tests {
                 "prompt_per_second",
                 "prompt_per_token_ms",
                 "sampler_ms",
+                "time_to_first_token_ms",
             ])
         );
         assert_eq!(terminal["timings"]["cache_n"], 0);
         assert_eq!(terminal["timings"]["prompt_n"], 11);
         assert_eq!(terminal["timings"]["prompt_per_second"], 5_500.0);
+        assert_eq!(terminal["timings"]["time_to_first_token_ms"], 4.0);
         assert!(
             (terminal["timings"]["prompt_per_token_ms"].as_f64().unwrap() - 2.0 / 11.0).abs()
                 < f64::EPSILON
