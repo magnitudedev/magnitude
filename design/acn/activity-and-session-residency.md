@@ -127,12 +127,13 @@ continues to own history loading, prepend anchoring, and overlay restoration.
 While a root work chain is active, the live activity rail occupies a reserved bottom slot outside
 the scrollback and directly above the composer. It therefore remains at the bottom on short pages as
 well as overflowing ones; assistant messages and tool output grow and scroll independently above it.
-One blank terminal row surrounds the rail above and below. Root-model loading, conversation prefill,
-and model response activity share that same stable row. Model loading is shown immediately. Request
-preparation and prefill use a short anti-flicker delay. Once generation begins, the row becomes the
-composable Working display, including thinking, tools, advisor activity, and worker counts. Manual
-history detachment never moves or hides the live rail and never causes the rail to force the history
-back to its tail.
+One blank terminal row separates history from the rail above it. No full blank row follows the live
+rail; the composer surface begins immediately below it. Root-model loading, conversation prefill,
+and model response activity share that same stable row. Model loading is shown
+immediately. Request preparation and prefill use a short anti-flicker delay. Once generation begins,
+the row becomes the composable Working display, including thinking, tools, advisor activity, and
+worker counts. Manual history detachment never moves or hides the live rail and never causes the
+rail to force the history back to its tail.
 
 When the root work chain becomes stable, the transient rail is replaced at the same tail position by
 a durable work summary immediately after the chain's final assistant, tool, or worker output and
@@ -150,7 +151,7 @@ and directory details when width permits, stacks at narrow widths, and scrolls a
 conversation history. It is not a chat message and is absent when the loaded window does not reach
 the beginning of the session.
 
-The CLI composer keeps a one-line minimum editor inside a full-width input surface with one stable
+The CLI composer keeps a one-line minimum editor inside a full-width input surface with one full
 row of visual padding above and below it. A solid mode border sits immediately outside the colored
 surface and spans its full height; additional visual input lines grow only from actual draft
 content. Pending attachments render inside that surface rather than competing with persistent

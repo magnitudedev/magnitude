@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 
-/** Aligns the rail with assistant output; the preceding entry supplies the top gap. */
+/** Aligns the live rail with assistant output; composer chrome supplies its lower separation. */
 export function ActivityRailSlot({
   width,
   children,
@@ -10,7 +10,7 @@ export function ActivityRailSlot({
 }): ReactNode {
   return (
     <box id="root-activity-rail" style={{
-      height: 2,
+      height: 1,
       flexShrink: 0,
       flexDirection: 'column',
       paddingLeft: 1,
@@ -19,7 +19,6 @@ export function ActivityRailSlot({
       <box style={{ width, minWidth: 0, height: 1, flexShrink: 0, overflow: 'hidden' }}>
         {children}
       </box>
-      <box id="activity-spacing-below" style={{ height: 1, flexShrink: 0 }} />
     </box>
   )
 }
