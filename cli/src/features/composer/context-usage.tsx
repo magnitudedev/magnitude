@@ -1,7 +1,6 @@
 import { TextAttributes } from '@opentui/core'
 import { useSyncExternalStore } from 'react'
 import {
-  formatTokensCompact,
   getAnimationTickSnapshot,
   subscribeAnimationTick,
 } from '@magnitudedev/client-common'
@@ -13,19 +12,23 @@ interface ContextUsageProps {
   readonly isCompacting?: boolean
 }
 
+const formatContextTokens = (tokens: number): string => tokens >= 1000
+  ? `${Math.round(tokens / 1000)}k`
+  : `${Math.round(tokens)}`
+
 export const formatContextUsage = (
   tokenUsage: number | null,
   hardCap: number | null,
 ): string => {
   if (tokenUsage === null) {
     return hardCap === null
-      ? '— ctx'
-      : `— / ${formatTokensCompact(hardCap)} ctx`
+      ? '—'
+      : `— / ${formatContextTokens(hardCap)}`
   }
-  const used = formatTokensCompact(tokenUsage)
+  const used = formatContextTokens(tokenUsage)
   return hardCap === null
-    ? `${used} ctx`
-    : `${used} / ${formatTokensCompact(hardCap)} ctx (${Math.round((tokenUsage / hardCap) * 100)}%)`
+    ? used
+    : `${used} / ${formatContextTokens(hardCap)} (${Math.round((tokenUsage / hardCap) * 100)}%)`
 }
 
 export const contextUsageWidth = (
