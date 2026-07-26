@@ -34,6 +34,7 @@ import {
   describeLocalHardware,
   formatBytes,
   formatContext,
+  localInferenceSetupPhase,
   localInferenceProgressLines,
   selectedInferenceIndex,
   selectionCapacityWarning,
@@ -43,7 +44,6 @@ import {
 } from "./view-model"
 
 interface LocalInferenceScreenProps {
-  readonly management: boolean
   readonly onExit: () => void
   readonly onSkip: () => void
   readonly onConfigured: () => void
@@ -65,11 +65,135 @@ const recommendationIntent = (intent: "balanced" | "best_quality" | "fastest" | 
   return "Balanced"
 }
 
-const blockedSlotMessage = (
-  slot: Extract<LocalInferenceView["slots"]["slots"]["primary"], { readonly _tag: "Blocked" }>,
-): string => "error" in slot.reason ? slot.reason.error.message : slot.reason.message
-
 type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
+
+const LocalInferenceSetupOverview = ({
+  state,
+  nowMs,
+  spinnerFrame,
+  showHardware,
+  finalizingAvailability,
+}: {
+  readonly state: LocalInferenceView
+  readonly nowMs: number
+  readonly spinnerFrame: string
+  readonly showHardware: boolean
+  readonly finalizingAvailability: boolean
+}) => {
+  const theme = useTheme()
+  const hardware = describeLocalHardware(state.hardware)
+  const progress = localInferenceProgressLines(state.models.recommendations.progress, nowMs)
+  return <>
+    <box style={{ flexDirection: "column", paddingTop: 1, paddingBottom: 1 }}>
+      <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
+      <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
+    </box>
+    {showHardware && (
+      <box style={{ flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH, paddingBottom: 1 }}>
+        <box style={{ flexDirection: "row", paddingBottom: 1 }}>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>HARDWARE DETECTED</text>
+          <text style={{ fg: theme.border }}>{"  "}{localModelSectionRule("HARDWARE DETECTED")}</text>
+        </box>
+        <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: "column", width: "100%" }}>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
+          {hardware.system.details.map((detail) => <text key={detail} style={{ fg: theme.muted }}>{detail}</text>)}
+          {hardware.accelerators.map((accelerator) => (
+            <box key={`${accelerator.name}:${accelerator.details}`} style={{ flexDirection: "column", paddingTop: 1 }}>
+              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{accelerator.name}</text>
+              <text style={{ fg: theme.muted }}>{accelerator.details}</text>
+            </box>
+          ))}
+          {hardware.accelerators.length === 0 && !state.hardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory") && (
+            <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
+          )}
+        </box>
+      </box>
+    )}
+    {(progress.length > 0 || finalizingAvailability) && (
+      <box style={{
+        flexDirection: "column",
+        width: "100%",
+        maxWidth: LOCAL_MODEL_SECTION_WIDTH,
+        paddingBottom: 1,
+      }}>
+        <box style={{ flexDirection: "row", paddingBottom: 1 }}>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
+            SETUP PROGRESS
+          </text>
+          <text style={{ fg: theme.border }}>
+            {"  "}{localModelSectionRule("SETUP PROGRESS")}
+          </text>
+        </box>
+        {progress.map((line) => (
+          <text
+            key={line.id}
+            style={{ fg: line.state === "pending" ? theme.muted : theme.foreground }}
+          >
+            <span fg={line.state === "completed"
+              ? theme.success
+              : line.state === "running"
+                ? theme.primary
+                : line.state === "failed"
+                  ? theme.error
+                  : theme.muted}>
+              {line.state === "completed"
+                ? "✓ "
+                : line.state === "running"
+                  ? `${spinnerFrame} `
+                  : line.state === "failed"
+                    ? "! "
+                    : "○ "}
+            </span>
+            <span fg={line.state === "pending" ? theme.muted : theme.foreground}>
+              {line.label}
+            </span>
+            {line.metadata && (
+              <span fg={line.state === "failed" ? theme.error : theme.muted}>
+                {line.metadata}
+              </span>
+            )}
+          </text>
+        ))}
+        {finalizingAvailability && (
+          <text style={{ fg: theme.foreground }}>
+            <span fg={theme.primary}>{spinnerFrame} </span>
+            Finalizing model availability
+          </text>
+        )}
+      </box>
+    )}
+  </>
+}
+
+const LocalInferenceProgressScreen = ({
+  state,
+  nowMs,
+  spinnerFrame,
+}: {
+  readonly state: LocalInferenceView
+  readonly nowMs: number
+  readonly spinnerFrame: string
+}) => {
+  const theme = useTheme()
+  const hardwareReady = state.models.recommendations.progress.some((step) =>
+    step.id === "hardware" && step.status._tag === "Completed")
+  const finalizingAvailability = state.models.recommendations._tag === "Ready"
+    && state.catalog._tag === "Loading"
+  return (
+    <scrollbox key="local-models-discovering" scrollX={false} scrollbarOptions={{ visible: false }} verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }} style={{ height: "100%", rootOptions: { backgroundColor: "transparent" }, wrapperOptions: { border: false, backgroundColor: "transparent" }, contentOptions: { flexDirection: "column" } }}>
+      <box style={{ flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
+        <LocalInferenceSetupOverview
+          state={state}
+          nowMs={nowMs}
+          spinnerFrame={spinnerFrame}
+          showHardware={hardwareReady}
+          finalizingAvailability={finalizingAvailability}
+        />
+        <text style={{ fg: theme.muted, marginTop: 1 }}>Esc skip for now</text>
+      </box>
+    </scrollbox>
+  )
+}
 
 export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: LocalInferenceScreenProps) {
   const theme = useTheme()
@@ -79,7 +203,8 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
   const trackingProgress = Option.match(snapshot, {
     onNone: () => true,
     onSome: (state) => state.models.recommendations.progress
-      .some(({ status }) => status._tag === "Running"),
+      .some(({ status }) => status._tag === "Running")
+      || (state.models.recommendations._tag === "Ready" && state.catalog._tag === "Loading"),
   })
   const animationTick = useSyncExternalStore(
     trackingProgress ? subscribeAnimationTick : subscribeNoop,
@@ -94,7 +219,9 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
       props.onExit()
       return
     }
-    if (Option.isNone(snapshot) && key.name === "escape") {
+    const phase = Option.map(snapshot, localInferenceSetupPhase)
+    if (key.name === "escape" && (Option.isNone(phase)
+      || Option.exists(phase, (value) => value === "discovering" || value === "failed"))) {
       key.preventDefault()
       props.onSkip()
     }
@@ -121,15 +248,23 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
         </box>
       </box>
     ),
-    onSome: (state) => (
-      <ReadyLocalInferenceScreen
+    onSome: (state) => {
+      const phase = localInferenceSetupPhase(state)
+      if (phase === "discovering" || phase === "failed") {
+        return <LocalInferenceProgressScreen
+          state={state}
+          nowMs={nowMs}
+          spinnerFrame={spinnerFrame}
+        />
+      }
+      return <ReadyLocalInferenceScreen
         {...props}
         state={state}
         local={local}
         nowMs={nowMs}
         spinnerFrame={spinnerFrame}
       />
-    ),
+    },
   })
 })
 
@@ -238,8 +373,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     if (key.name === "escape") { key.preventDefault(); onSkip() }
   }, [activeBinding, assigning, confirmSelection, local, onConfigured, onSkip, primarySlot._tag, selected, selectedIndex, selections]))
 
-  const hardware = describeLocalHardware(state.hardware)
-  const progress = localInferenceProgressLines(state.models.recommendations.progress, nowMs)
   const firstRunningIndex = selections.findIndex((selection) => selection.kind === "running")
   const firstStoredIndex = selections.findIndex((selection) => selection.kind === "stored")
   const firstRecommendationIndex = selections.findIndex((selection) => selection.kind === "recommendation")
@@ -247,76 +380,13 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   return (
     <scrollbox key="local-models" scrollX={false} scrollbarOptions={{ visible: false }} verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }} style={{ height: "100%", rootOptions: { backgroundColor: "transparent" }, wrapperOptions: { border: false, backgroundColor: "transparent" }, contentOptions: { flexDirection: "column" } }}>
       <box style={{ flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
-        <box style={{ flexDirection: "column", paddingTop: 1, paddingBottom: 1 }}>
-          <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
-        </box>
-        <box style={{ flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH, paddingBottom: 1 }}>
-          <box style={{ flexDirection: "row", paddingBottom: 1 }}>
-            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>HARDWARE DETECTED</text>
-            <text style={{ fg: theme.border }}>{"  "}{localModelSectionRule("HARDWARE DETECTED")}</text>
-          </box>
-          <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: "column", width: "100%" }}>
-            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
-            {hardware.system.details.map((detail) => <text key={detail} style={{ fg: theme.muted }}>{detail}</text>)}
-            {hardware.accelerators.map((accelerator) => (
-              <box key={`${accelerator.name}:${accelerator.details}`} style={{ flexDirection: "column", paddingTop: 1 }}>
-                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{accelerator.name}</text>
-                <text style={{ fg: theme.muted }}>{accelerator.details}</text>
-              </box>
-            ))}
-            {hardware.accelerators.length === 0 && !state.hardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory") && (
-              <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
-            )}
-          </box>
-        </box>
-        {progress.length > 0 && (
-          <box style={{
-            flexDirection: "column",
-            width: "100%",
-            maxWidth: LOCAL_MODEL_SECTION_WIDTH,
-            paddingBottom: 1,
-          }}>
-            <box style={{ flexDirection: "row", paddingBottom: 1 }}>
-              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
-                SETUP PROGRESS
-              </text>
-              <text style={{ fg: theme.border }}>
-                {"  "}{localModelSectionRule("SETUP PROGRESS")}
-              </text>
-            </box>
-            {progress.map((line) => (
-              <text
-                key={line.id}
-                style={{ fg: line.state === "pending" ? theme.muted : theme.foreground }}
-              >
-                <span fg={line.state === "completed"
-                  ? theme.success
-                  : line.state === "running"
-                    ? theme.primary
-                    : line.state === "failed"
-                      ? theme.error
-                      : theme.muted}>
-                  {line.state === "completed"
-                    ? "✓ "
-                    : line.state === "running"
-                      ? `${spinnerFrame} `
-                      : line.state === "failed"
-                        ? "! "
-                        : "○ "}
-                </span>
-                <span fg={line.state === "pending" ? theme.muted : theme.foreground}>
-                  {line.label}
-                </span>
-                {line.metadata && (
-                  <span fg={line.state === "failed" ? theme.error : theme.muted}>
-                    {line.metadata}
-                  </span>
-                )}
-              </text>
-            ))}
-          </box>
-        )}
+        <LocalInferenceSetupOverview
+          state={state}
+          nowMs={nowMs}
+          spinnerFrame={spinnerFrame}
+          showHardware
+          finalizingAvailability={false}
+        />
         <box style={{ flexDirection: "column" }}>
           {state.models.recommendations._tag === "Ready" && selections.length === 0
             ? <text style={{ fg: theme.warning }}>No curated model is currently compatible with this machine.</text>
@@ -357,7 +427,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                 </Button>
               </Fragment>
             })}
-          {state.models.recommendations._tag === "Failed" && <text style={{ fg: theme.warning }}>{state.models.recommendations.failure.message}</text>}
           {details && selected && Option.isSome(selected.recommendation) && (() => {
             const recommendation = selected.recommendation.value
             const candidate = recommendation.candidate
@@ -383,9 +452,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           })()}
         </box>
         {Option.isSome(mutationFailure) && <text style={{ fg: theme.error }}>{Cause.pretty(mutationFailure.value.cause)}</text>}
-        {primarySlot._tag === "Blocked" && (
-          <text style={{ fg: theme.error }}>Unable to use this model · {blockedSlotMessage(primarySlot)}</text>
-        )}
         <text style={{ fg: theme.muted, marginTop: 1 }}>
           ↑/↓ choose · D details
           {selected?.model.download._tag === "Downloading"

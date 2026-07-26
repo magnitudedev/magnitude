@@ -6,7 +6,9 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
   ModelServingConfigurationIdSchema,
+  ProviderModelCatalogLoading,
   ProviderModelCatalogReady,
+  ProviderModelCatalogRefreshing,
   ProviderModelIdSchema,
   RecommendationIdSchema,
 } from "@magnitudedev/sdk"
@@ -14,11 +16,67 @@ import {
   buildLocalInferenceSelections,
   describeLocalHardware,
   describeResidentModel,
+  localInferenceSetupPhase,
   localInferenceProgressLines,
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
 import { GIB, makeCatalogCandidate, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
+
+describe("local inference onboarding presentation", () => {
+  const loadingRecommendations = {
+    _tag: "Loading" as const,
+    progress: [],
+  }
+
+  it("keeps onboarding in discovery while recommendations are loading", () => {
+    const view = makeView()
+    expect(localInferenceSetupPhase({
+      ...view,
+      models: { ...view.models, recommendations: loadingRecommendations },
+    })).toBe("discovering")
+  })
+
+  it("keeps onboarding in discovery until the initial provider catalog settles", () => {
+    const view = makeView()
+    expect(localInferenceSetupPhase({
+      ...view,
+      catalog: new ProviderModelCatalogLoading(),
+    })).toBe("discovering")
+  })
+
+  it("uses retained catalog data during a refresh", () => {
+    const view = makeView()
+    if (view.catalog._tag !== "Ready") throw new Error("expected ready catalog fixture")
+    expect(localInferenceSetupPhase({
+      ...view,
+      catalog: new ProviderModelCatalogRefreshing({
+        providers: view.catalog.providers,
+        models: view.catalog.models,
+        failures: [],
+      }),
+    })).toBe("ready")
+  })
+
+  it("classifies a terminal recommendation failure separately from discovery", () => {
+    const view = makeView()
+    expect(localInferenceSetupPhase({
+      ...view,
+      models: {
+        ...view.models,
+        recommendations: {
+          _tag: "Failed",
+          failure: {
+            code: "recommendations_unavailable",
+            message: "Recommendation setup failed",
+            retryable: true,
+          },
+          progress: [],
+        },
+      },
+    })).toBe("failed")
+  })
+})
 
 describe("local inference selection view model", () => {
   it("presents the exact resident model allocation", () => {

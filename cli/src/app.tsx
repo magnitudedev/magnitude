@@ -156,7 +156,6 @@ function OnboardingGate(
   if (onboardingRequired || (props.forceSetup && !forcedSetupComplete)) {
     return (
       <ModelSetupScreen
-        mode="onboarding"
         onExit={props.onExitApp}
         onComplete={() => onboarding.complete("model_setup")}
       />

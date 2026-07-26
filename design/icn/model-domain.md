@@ -219,6 +219,13 @@ collection work carries completed and total counts. Completed work remains visib
 runs. Presentation may animate a running step from the published start time, but it must not invent
 server progress.
 
+Local-model onboarding presents that lifecycle as one coherent discovery flow. While the initial
+recommendation lifecycle or provider-model catalog is loading, onboarding shows authoritative
+progress but does not expose partial target projections, provisional model names, preparation
+failures, or blocked slot state. Model choices appear only after recommendations are ready and the
+initial provider catalog has settled. A terminal discovery failure appears once in progress, while
+failures from a user-initiated download or selection remain immediate and attached to that action.
+
 The complete compatible recommendable-candidate projection is published beside the small labeled
 portfolio. Labeled portfolio members retain their intent and order. Remaining compatible
 candidates are ordered by one internal balanced recommendation score. That score is ranking

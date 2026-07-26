@@ -3,12 +3,9 @@ import { TextAttributes } from "@opentui/core"
 import { useTheme } from "../../hooks/use-theme"
 import { LocalInferenceScreen } from "../local-inference"
 
-export type ModelSetupMode = "onboarding" | "management"
-
 interface ModelSetupScreenProps {
   readonly onExit: () => void
   readonly onComplete?: () => void
-  readonly mode?: ModelSetupMode
 }
 
 export const PreparingModelSetupScreen = memo(function PreparingModelSetupScreen() {
@@ -26,7 +23,6 @@ export const PreparingModelSetupScreen = memo(function PreparingModelSetupScreen
 export const ModelSetupScreen = memo(function ModelSetupScreen({
   onExit,
   onComplete,
-  mode = "onboarding",
 }: ModelSetupScreenProps) {
   const finish = useCallback(() => {
     (onComplete ?? onExit)()
@@ -34,11 +30,9 @@ export const ModelSetupScreen = memo(function ModelSetupScreen({
 
   return (
     <LocalInferenceScreen
-      management={mode === "management"}
       onExit={onExit}
       onSkip={finish}
       onConfigured={finish}
     />
   )
 })
-
