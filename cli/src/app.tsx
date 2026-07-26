@@ -8,7 +8,6 @@
  * boxes and the startup header slot.
  */
 import { useCallback, useSyncExternalStore, type ReactNode } from 'react'
-import { TextAttributes } from '@opentui/core'
 import { Option } from 'effect'
 import { useAtomValue, useAtomSet, useAtomInitialValues, Result } from '@effect-atom/atom-react'
 import {
@@ -43,11 +42,11 @@ import type { ActionId } from './types/ui-actions'
 
 import { FatalErrorScreen } from './features/app-shell/connection-error'
 import { WindowsWarningScreen } from './features/app-shell/windows-warning'
-import { AnimatedLogo } from './components/animated-logo'
+import { StartupHeader } from './features/chat-timeline/startup-header'
 import { Button } from './components/button'
 import { ChatTimelineContainer } from './features/chat-timeline/container'
 import { ComposerContainer } from './features/composer/container'
-import { AgentStatusRowContainer, TaskListContainer } from './features/agent-status/container'
+import { TaskListContainer } from './features/agent-status/container'
 import { AppOverlaysContainer, useActiveOverlay } from './features/overlays/container'
 import { FileViewerPanelContainer } from './features/file-viewer/container'
 import { ModelMenusContainer } from './features/model-menus/container'
@@ -249,28 +248,13 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
 
   // Startup header content — rendered inside the timeline scrollback.
   const startupHeader = (
-    <>
-      <box style={{ paddingLeft: 1, paddingBottom: 1 }}>
-        <AnimatedLogo />
-      </box>
-      <box style={{ paddingLeft: 1, flexDirection: 'row' }}>
-        <text style={{ fg: theme.muted }}>Current directory: </text>
-        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>
-          {clientWorkingDirectory.replace(process.env.HOME || '', '~')}
-        </text>
-      </box>
-      <box style={{ paddingLeft: 1, paddingBottom: widget.hasActivity ? 1 : 0, flexDirection: 'row' }}>
-        <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Tip: </text>
-        <text style={{ fg: theme.muted }}>Use </text>
-        <text style={{ fg: theme.foreground }}>/settings</text>
-        <text style={{ fg: theme.muted }}> to choose and manage models.</text>
-      </box>
-      {!widget.hasActivity && !(menu.open && sessionId === null) && (
-        <box style={{ paddingLeft: 1 }}>
-          <RecentChatsWidgetView state={widget} />
-        </box>
-      )}
-    </>
+    <StartupHeader
+      width={chatColumnWidth}
+      workingDirectory={clientWorkingDirectory.replace(process.env.HOME || '', '~')}
+      recentChats={!widget.hasActivity && !(menu.open && sessionId === null)
+        ? <RecentChatsWidgetView state={widget} />
+        : null}
+    />
   )
 
   return (
@@ -290,10 +274,7 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                   chatColumnWidth={chatColumnWidth}
                   dispatchErrorAction={dispatchErrorAction}
                   isOverlayActive={isOverlayActive}
-                />
-                <AgentStatusRowContainer
                   modelLoadActivity={localModelLoadActivity}
-                  width={chatColumnWidth}
                 />
                 <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
                   <TaskListContainer />

@@ -58,7 +58,7 @@ const request = (
 
 describe('activity rail', () => {
   it('shows model loading immediately instead of Working', () => {
-    expect(text(
+    const html = renderToStaticMarkup(
       <ActivityRail
         work={work()}
         width={100}
@@ -70,7 +70,10 @@ describe('activity rail', () => {
         })}
         modelRequestActivity={request()}
       />,
-    )).toBe('⠋ Loading model · 42%')
+    )
+    expect(htmlToText(html)).toBe('⠋ Loading model · 42%')
+    expect(html).not.toContain('padding-left')
+    expect(html).not.toContain('padding-top')
   })
 
   it('shows the low-memory stopped message without a spinner', () => {

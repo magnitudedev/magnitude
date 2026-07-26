@@ -1,17 +1,17 @@
 /**
  * ChatScrollbox — OpenTUI scrollbox wrapper for the root scrollback.
- * The shared TimelineScrollController owns sticky-bottom and anchoring.
+ * Native sticky-tail behavior appends content in place until the viewport
+ * overflows, then advances only by the overflow. The shared controller still
+ * owns history loading, manual-detach tracking, and prepend anchoring.
  */
 import type { ReactNode, Ref } from 'react'
 import type { ScrollBoxRenderable } from '@opentui/core'
 
 export function ChatScrollbox({
   scrollRef,
-  hasMoreBefore,
   children,
 }: {
   scrollRef: Ref<ScrollBoxRenderable | null>
-  hasMoreBefore: boolean
   children: ReactNode
 }): ReactNode {
   return (
@@ -19,6 +19,8 @@ export function ChatScrollbox({
       ref={scrollRef}
       focusable={false}
       scrollX={false}
+      stickyScroll={true}
+      stickyStart="bottom"
       scrollbarOptions={{ visible: false }}
       verticalScrollbarOptions={{
         visible: true,
@@ -42,7 +44,7 @@ export function ChatScrollbox({
           paddingLeft: 1,
           paddingRight: 1,
           paddingTop: 1,
-          justifyContent: hasMoreBefore ? 'flex-start' : 'flex-end',
+          justifyContent: 'flex-start',
         },
       }}
     >

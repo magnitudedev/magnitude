@@ -67,7 +67,7 @@ export const deriveLocalInferenceFooterView = (
     modelName: selectedModelName ?? model?.displayName ?? null,
     residency,
     memoryLabel: memoryBytes !== null
-      ? `${compactGiB(memoryBytes)}G mem`
+      ? `${compactGiB(memoryBytes)}GB`
       : null,
   }
 }
