@@ -130,6 +130,33 @@ pub fn canonical_package_id(
     ModelPackageId(format!("package_{:x}", digest.finalize()))
 }
 
+fn package_relationship(
+    relationship: &ComponentRelationship,
+    ids_by_declared_path: &BTreeMap<PathBuf, ModelFileId>,
+) -> Option<ModelFileRelationship> {
+    match relationship {
+        ComponentRelationship::ProjectorFor { projector, model } => {
+            Some(ModelFileRelationship::ProjectorFor {
+                projector_file_id: ids_by_declared_path.get(projector)?.clone(),
+                weights_file_id: ids_by_declared_path.get(model)?.clone(),
+            })
+        }
+        ComponentRelationship::MtpFor { mtp, model } => Some(ModelFileRelationship::MtpFor {
+            mtp_file_id: ids_by_declared_path.get(mtp)?.clone(),
+            weights_file_id: ids_by_declared_path.get(model)?.clone(),
+        }),
+        ComponentRelationship::DraftFor {
+            draft,
+            model,
+            method,
+        } => Some(ModelFileRelationship::DraftFor {
+            draft_file_id: ids_by_declared_path.get(draft)?.clone(),
+            weights_file_id: ids_by_declared_path.get(model)?.clone(),
+            method: method.clone(),
+        }),
+    }
+}
+
 fn package_from_resolved_with(
     resolved: &ResolvedModel,
     digest: impl Fn(&Path) -> Result<String, InventoryError>,
@@ -169,8 +196,9 @@ fn package_from_resolved_with(
             role: match declared.role {
                 ComponentRole::Weights | ComponentRole::Shard => ModelFileRole::Weights,
                 ComponentRole::Projector => ModelFileRole::Projector,
+                ComponentRole::Draft => ModelFileRole::Draft,
                 ComponentRole::Mtp => ModelFileRole::Mtp,
-                ComponentRole::Auxiliary | ComponentRole::Draft => ModelFileRole::Auxiliary,
+                ComponentRole::Auxiliary => ModelFileRole::Auxiliary,
             },
             size_bytes: declared.size_bytes,
             sha256,
@@ -197,31 +225,12 @@ fn package_from_resolved_with(
                 count: shard_count.max(1),
             });
         }
-        match &component.relationship {
-            Some(ComponentRelationship::ProjectorFor { projector, model }) => {
-                if let (Some(projector_file_id), Some(weights_file_id)) = (
-                    ids_by_declared_path.get(projector),
-                    ids_by_declared_path.get(model),
-                ) {
-                    relationships.push(ModelFileRelationship::ProjectorFor {
-                        projector_file_id: projector_file_id.clone(),
-                        weights_file_id: weights_file_id.clone(),
-                    });
-                }
-            }
-            Some(ComponentRelationship::MtpFor { mtp, model })
-            | Some(ComponentRelationship::DraftFor { draft: mtp, model }) => {
-                if let (Some(mtp_file_id), Some(weights_file_id)) = (
-                    ids_by_declared_path.get(mtp),
-                    ids_by_declared_path.get(model),
-                ) {
-                    relationships.push(ModelFileRelationship::MtpFor {
-                        mtp_file_id: mtp_file_id.clone(),
-                        weights_file_id: weights_file_id.clone(),
-                    });
-                }
-            }
-            None => {}
+        if let Some(relationship) = component
+            .relationship
+            .as_ref()
+            .and_then(|relationship| package_relationship(relationship, &ids_by_declared_path))
+        {
+            relationships.push(relationship);
         }
     }
     relationships.sort_by_key(|relationship| format!("{relationship:?}"));
@@ -361,9 +370,14 @@ impl ModelManager {
     }
 
     #[must_use]
-    pub fn read_offering_assessment(&self, evidence: &str) -> Option<OfferingAssessment> {
+    pub fn read_offering_assessment(
+        &self,
+        evidence: &str,
+        topology: &icn_contracts::MemoryTopology,
+    ) -> Option<OfferingAssessment> {
         self.cache
             .read_index(ModelIndexKind::OfferingAssessment, evidence)
+            .filter(|assessment: &OfferingAssessment| assessment.is_valid_for(topology))
     }
 
     pub fn write_offering_assessment(&self, evidence: &str, assessment: &OfferingAssessment) {
@@ -456,17 +470,48 @@ impl ModelManager {
                     .filter(|file| file.id != primary.id)
                     .filter_map(|file| {
                         let role = match file.role {
-                            ModelFileRole::Projector => ComponentRole::Projector,
-                            ModelFileRole::Mtp => ComponentRole::Mtp,
-                            ModelFileRole::Auxiliary => ComponentRole::Auxiliary,
+                            ModelFileRole::Projector => {
+                                icn_contracts::ModelPreviewComponentRole::Projector
+                            }
+                            ModelFileRole::Draft => {
+                                let method =
+                                    package.relationships.iter().find_map(|relationship| {
+                                        match relationship {
+                                            ModelFileRelationship::DraftFor {
+                                                draft_file_id,
+                                                weights_file_id,
+                                                method,
+                                            } if draft_file_id == &file.id
+                                                && weights_file_id == &primary.id =>
+                                            {
+                                                Some(method.clone())
+                                            }
+                                            _ => None,
+                                        }
+                                    });
+                                let Some(method) = method else {
+                                    return Some(Err(InventoryError::InvalidRequest(format!(
+                                        "draft file {} has no typed relationship to target {}",
+                                        file.id.0, primary.id.0
+                                    ))));
+                                };
+                                return Some(Ok(ModelPreviewComponentSource {
+                                    path: file.path.clone(),
+                                    role: icn_contracts::ModelPreviewComponentRole::Draft {
+                                        method,
+                                    },
+                                }));
+                            }
+                            ModelFileRole::Mtp => icn_contracts::ModelPreviewComponentRole::Mtp,
+                            ModelFileRole::Auxiliary => return None,
                             ModelFileRole::Weights => return None,
                         };
-                        Some(ModelPreviewComponentSource {
+                        Some(Ok(ModelPreviewComponentSource {
                             path: file.path.clone(),
                             role,
-                        })
+                        }))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, InventoryError>>()?;
                 let prepared = self
                     .prepare_preview(&ModelPreviewSource {
                         repository: repository.clone(),
@@ -609,11 +654,44 @@ impl InstalledModelPackages for ModelManager {
 
 #[cfg(test)]
 mod tests {
-    use super::shard_count;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use icn_contracts::ComponentRelationship;
+    use icn_contracts::models::{ModelFileId, ModelFileRelationship, SpeculativeMethod};
+
+    use super::{package_relationship, shard_count};
 
     #[test]
     fn shard_count_uses_one_based_component_indices() {
         assert_eq!(shard_count([Some(1), Some(2), Some(3)]), 3);
         assert_eq!(shard_count([None, None]), 0);
+    }
+
+    #[test]
+    fn draft_relationship_preserves_method_and_does_not_collapse_to_mtp() {
+        let target = PathBuf::from("target.gguf");
+        let draft = PathBuf::from("dflash.gguf");
+        let ids = BTreeMap::from([
+            (target.clone(), ModelFileId("target".to_owned())),
+            (draft.clone(), ModelFileId("draft".to_owned())),
+        ]);
+
+        let relationship = package_relationship(
+            &ComponentRelationship::DraftFor {
+                draft,
+                model: target,
+                method: SpeculativeMethod::DraftDFlash,
+            },
+            &ids,
+        );
+
+        assert!(matches!(
+            relationship,
+            Some(ModelFileRelationship::DraftFor {
+                method: SpeculativeMethod::DraftDFlash,
+                ..
+            })
+        ));
     }
 }

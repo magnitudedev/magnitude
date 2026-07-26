@@ -111,24 +111,30 @@ export const modelMemoryStatusLabel = ({
   exceedsCapacity,
   lacksCurrentHeadroom,
   belowWarningReserve,
+  evidenceUnavailable,
 }: ModelMemoryConditions): string =>
-  exceedsCapacity
-    ? "Too large"
-    : lacksCurrentHeadroom
-      ? "Free memory"
-      : belowWarningReserve
-        ? "Tight fit"
-        : ""
+  evidenceUnavailable
+    ? "Unavailable"
+    : exceedsCapacity
+      ? "Too large"
+      : lacksCurrentHeadroom
+        ? "Free memory"
+        : belowWarningReserve
+          ? "Tight fit"
+          : ""
 
 export const modelMemoryStatusDetail = ({
   exceedsCapacity,
   lacksCurrentHeadroom,
   belowWarningReserve,
+  evidenceUnavailable,
 }: ModelMemoryConditions): string =>
-  exceedsCapacity
-    ? "Requires more memory than this system has"
-    : lacksCurrentHeadroom
-      ? "Not enough memory available - close memory-intensive apps"
-      : belowWarningReserve
-        ? "High memory use"
-        : ""
+  evidenceUnavailable
+    ? "Memory information is unavailable"
+    : exceedsCapacity
+      ? "Requires more memory than this system has"
+      : lacksCurrentHeadroom
+        ? "Not enough memory available - close memory-intensive apps"
+        : belowWarningReserve
+          ? "High memory use"
+          : ""

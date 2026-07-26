@@ -2345,7 +2345,7 @@
         ],
         "properties": {
           "id": {
-            "type": "string"
+            "$ref": "#/components/schemas/HardwareDeviceId"
           },
           "native_index": {
             "type": "integer",
@@ -2381,6 +2381,10 @@
           }
         },
         "additionalProperties": false
+      },
+      "HardwareDeviceId": {
+        "type": "string",
+        "description": "Stable identity of one native device view and its device-specific limits."
       },
       "HardwareDeviceKind": {
         "type": "string",
@@ -2442,7 +2446,7 @@
         ],
         "properties": {
           "id": {
-            "type": "string"
+            "$ref": "#/components/schemas/MemoryDomainId"
           },
           "kind": {
             "$ref": "#/components/schemas/HardwareMemoryDomainKind"
@@ -2958,7 +2962,7 @@
         ],
         "properties": {
           "memoryDomainId": {
-            "type": "string"
+            "$ref": "#/components/schemas/MemoryDomainId"
           },
           "capacityBytes": {
             "type": "integer",
@@ -2986,6 +2990,10 @@
           }
         },
         "additionalProperties": false
+      },
+      "MemoryDomainId": {
+        "type": "string",
+        "description": "Stable identity of one physical memory pool."
       },
       "Modalities": {
         "type": "object",
@@ -3176,6 +3184,32 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "draftFileId",
+              "weightsFileId",
+              "method",
+              "_tag"
+            ],
+            "properties": {
+              "draftFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "weightsFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DraftFor"
+                ]
+              }
+            }
           }
         ]
       },
@@ -3184,6 +3218,7 @@
         "enum": [
           "weights",
           "projector",
+          "draft",
           "mtp",
           "auxiliary"
         ]
@@ -4076,7 +4111,7 @@
         ],
         "properties": {
           "memory_domain_id": {
-            "type": "string"
+            "$ref": "#/components/schemas/MemoryDomainId"
           },
           "model_bytes": {
             "type": "integer",
@@ -4218,6 +4253,107 @@
       },
       "SpeculativeDecodingPairId": {
         "type": "string"
+      },
+      "SpeculativeMethod": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Mtp"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DraftSimple"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DraftEagle3"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DraftDFlash"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "method",
+              "_tag"
+            ],
+            "properties": {
+              "method": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ngram"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "method",
+              "evidence",
+              "_tag"
+            ],
+            "properties": {
+              "method": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnknownNative"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent: MTP may be embedded in the target\nor supplied by a companion, while model-backed draft methods use companion artifacts."
       },
       "SplitModeResponse": {
         "type": "string",

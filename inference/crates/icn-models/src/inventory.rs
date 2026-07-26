@@ -350,7 +350,7 @@ impl ModelManager {
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
             let mut discovered = scan_result.models;
-            let (assessor, hardware_key) = if assess_hardware {
+            let (assessor, hardware_key, memory_topology) = if assess_hardware {
                 let has_inspected = discovered
                     .values()
                     .any(|model| matches!(model.properties, InventoryProperties::Inspected { .. }));
@@ -362,17 +362,26 @@ impl ModelManager {
                     })?
                     .clone();
                 let hardware_key = match assessor.as_ref() {
-                    Some(assessor) => assessor.cache_key().await?,
+                    Some(assessor) => {
+                        let snapshot = assessor.snapshot().await?;
+                        let topology = icn_contracts::MemoryTopology::from_snapshot(&snapshot)
+                            .ok_or_else(|| {
+                                InventoryError::Internal(
+                                    "hardware snapshot has an invalid memory topology".to_owned(),
+                                )
+                            })?;
+                        (assessor.cache_key(&snapshot)?, Some(topology))
+                    }
                     None if has_inspected => {
                         return Err(InventoryError::Internal(
                             "inventory hardware assessor is not configured".to_owned(),
                         ));
                     }
-                    None => String::new(),
+                    None => (String::new(), None),
                 };
-                (assessor, hardware_key)
+                (assessor, hardware_key.0, hardware_key.1)
             } else {
-                (None, String::new())
+                (None, String::new(), None)
             };
 
             let mut next_evidence = BTreeMap::new();
@@ -406,7 +415,13 @@ impl ModelManager {
                     )?;
                     model.hardware = self
                         .cache
-                        .read_hardware_assessment(&model.content_id, &assessment_key)
+                        .read_hardware_assessment(
+                            &model.content_id,
+                            &assessment_key,
+                            memory_topology
+                                .as_ref()
+                                .expect("hardware assessment has a topology"),
+                        )
                         .unwrap_or(HardwareAssessment::NotAssessed {
                             reason: "cache_miss".to_owned(),
                         });
@@ -595,7 +610,8 @@ impl ModelManager {
                         "inventory hardware assessor is not configured".to_owned(),
                     )
                 })?;
-            let hardware_key = assessor.cache_key().await?;
+            let snapshot = assessor.snapshot().await?;
+            let hardware_key = assessor.cache_key(&snapshot)?;
             let resolved = icn_contracts::ResolvedModel {
                 model: model.clone(),
                 components: crate::service::resolve_components(&self.config.root, &model)?,
@@ -2032,9 +2048,11 @@ mod tests {
     use futures_util::future::BoxFuture;
     use icn_contracts::models::{InstalledModelPackages, ModelPackageInspection};
     use icn_contracts::{
-        CapabilityEvidence, HardwareMemory, HardwareProfile, HardwareRecommendation,
-        InventoryHardwareAssessor, ModelInventory, ReasoningControlDomain, ReasoningDelimiters,
-        ReasoningVisibility, ResolvedModel, TemplateAssessment, TemplateCapabilities,
+        CapabilityEvidence, HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment,
+        HardwareMemoryDomainKind, HardwareProfile, HardwareProvider, HardwareRecommendation,
+        HardwareSnapshot, HardwareSystemMemory, InventoryHardwareAssessor, MemoryDomainId,
+        ModelInventory, ReasoningControlDomain, ReasoningDelimiters, ReasoningVisibility,
+        ResolvedModel, TemplateAssessment, TemplateCapabilities,
     };
 
     #[test]
@@ -2109,9 +2127,45 @@ mod tests {
 
     struct CountingHardwareAssessor(AtomicUsize);
 
+    impl HardwareProvider for CountingHardwareAssessor {
+        fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>> {
+            Box::pin(async {
+                Ok(HardwareSnapshot {
+                    captured_at: 1,
+                    platform: "test".to_owned(),
+                    architecture: "test".to_owned(),
+                    system_product_name: None,
+                    cpu_model: None,
+                    logical_cores: 1,
+                    system_memory: HardwareSystemMemory {
+                        total_bytes: 2,
+                        current_available_bytes: 2,
+                        warning_reserve_bytes: 0,
+                        assess_reserve_bytes: 0,
+                        abort_reserve_bytes: 0,
+                    },
+                    native_build: "test".to_owned(),
+                    enabled_backends: vec!["cpu".to_owned()],
+                    topology_fingerprint: "test".to_owned(),
+                    memory_domains: vec![HardwareMemoryDomain {
+                        id: MemoryDomainId::system(),
+                        kind: HardwareMemoryDomainKind::System,
+                        total_capacity_bytes: 2,
+                        stable_capacity_bytes: 2,
+                        current_free_bytes: Some(2),
+                        shares_system_memory: true,
+                        devices: Vec::new(),
+                    }],
+                    resident_memory: None,
+                    runtime_failure: None,
+                })
+            })
+        }
+    }
+
     impl InventoryHardwareAssessor for CountingHardwareAssessor {
-        fn cache_key(&self) -> BoxFuture<'_, Result<String, InventoryError>> {
-            Box::pin(async { Ok("hardware-v1".to_owned()) })
+        fn cache_key(&self, _snapshot: &HardwareSnapshot) -> Result<String, InventoryError> {
+            Ok("hardware-v1".to_owned())
         }
 
         fn assess(
@@ -2127,10 +2181,19 @@ mod tests {
                         device: "test".to_owned(),
                     },
                     memory: HardwareMemory {
-                        domains: Vec::new(),
+                        domains: vec![HardwareMemoryDomainAssessment {
+                            memory_domain: MemoryDomainId::system(),
+                            model_bytes: 1,
+                            context_bytes: 0,
+                            compute_bytes: 0,
+                            auxiliary_bytes: 0,
+                            required_bytes: 1,
+                            usable_capacity_bytes: 2,
+                            margin_bytes: 1,
+                        }],
                         device_constraints: Vec::new(),
                         required_bytes: 1,
-                        available_bytes: 2,
+                        usable_capacity_bytes: 2,
                         headroom_bytes: 1,
                     },
                     recommendation: HardwareRecommendation::Recommended,
@@ -2175,7 +2238,8 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         write_minimal_gguf(&source.join("model.gguf"));
 
-        let mut config = InventoryConfig::with_root(store).unwrap();
+        let mut config =
+            InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.clear();
         config.model_sources.push(source);
         let manager = ModelManager::open_with_template_assessor(
@@ -2224,7 +2288,8 @@ mod tests {
             .write_all(&[0])
             .unwrap();
 
-        let mut config = InventoryConfig::with_root(store).unwrap();
+        let mut config =
+            InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.clear();
         config.model_sources.push(source);
         let manager = ModelManager::open_with_template_assessor(

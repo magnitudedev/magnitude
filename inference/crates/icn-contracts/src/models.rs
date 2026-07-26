@@ -34,8 +34,25 @@ string_id!(RuntimeResidencyId);
 pub enum ModelFileRole {
     Weights,
     Projector,
+    Draft,
     Mtp,
     Auxiliary,
+}
+
+/// Native algorithm used by a speculative decoding stage.
+///
+/// Method and artifact packaging are intentionally independent: MTP may be embedded in the target
+/// or supplied by a companion, while model-backed draft methods use companion artifacts.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum SpeculativeMethod {
+    Mtp,
+    DraftSimple,
+    DraftEagle3,
+    DraftDFlash,
+    Ngram { method: String },
+    UnknownNative { method: String, evidence: String },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -83,6 +100,12 @@ pub enum ModelFileRelationship {
     MtpFor {
         mtp_file_id: ModelFileId,
         weights_file_id: ModelFileId,
+    },
+    #[serde(rename_all = "camelCase")]
+    DraftFor {
+        draft_file_id: ModelFileId,
+        weights_file_id: ModelFileId,
+        method: SpeculativeMethod,
     },
 }
 
@@ -291,7 +314,7 @@ pub struct AssessModelsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemoryAssessment {
-    pub memory_domain_id: String,
+    pub memory_domain_id: crate::MemoryDomainId,
     pub capacity_bytes: u64,
     pub required_bytes: u64,
     pub compatibility_reserve_bytes: u64,
@@ -359,6 +382,31 @@ pub enum OfferingAssessment {
         configuration_id: ModelServingConfigurationId,
         failure: ModelFailure,
     },
+}
+
+impl OfferingAssessment {
+    #[must_use]
+    pub fn is_valid_for(&self, topology: &crate::MemoryTopology) -> bool {
+        match self {
+            Self::Fits { memory, .. } | Self::DoesNotFit { memory, .. } => {
+                let mut seen = std::collections::BTreeSet::new();
+                memory.iter().all(|assessment| {
+                    let Some(capacity) = topology.capacity(&assessment.memory_domain_id) else {
+                        return false;
+                    };
+                    seen.insert(assessment.memory_domain_id.clone())
+                        && assessment.capacity_bytes == capacity
+                        && assessment.remaining_bytes
+                            == (i128::from(assessment.capacity_bytes)
+                                - i128::from(assessment.compatibility_reserve_bytes)
+                                - i128::from(assessment.required_bytes))
+                            .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                                as i64
+                }) && seen.contains(&crate::MemoryDomainId::system())
+            }
+            Self::Incompatible { .. } => true,
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

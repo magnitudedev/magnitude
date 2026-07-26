@@ -32,7 +32,7 @@ use icn_contracts::{
     TemplateAssessment, TemplateAssessor,
 };
 use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
-use icn_hardware::{CapacityPolicy, SYSTEM_MEMORY_DOMAIN_ID};
+use icn_hardware::CapacityPolicy;
 use icn_models::{
     InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
     ModelPreviewService, NativeRecommendableCatalog, canonical_package_id, offering_target_id,
@@ -231,10 +231,6 @@ struct PersistedCalibration {
     calibration: llama_cpp_2::model::params::fit::FitCalibration,
 }
 
-const ASSESSMENT_RESOLVER_REVISION: &str = "icn-backend-plan-v1";
-const OFFERING_ASSESSMENT_REVISION: &str = "offering-assessment-v3-zero-kv-workload";
-const CAPACITY_POLICY_REVISION: &str = "system-memory-thresholds-v2";
-const MTP_SELECTOR_REVISION: &str = "icn-mtp-selector-v1";
 const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
 const CALIBRATION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 
@@ -492,10 +488,7 @@ impl NativeHardwareAssessor {
         snapshot: &HardwareSnapshot,
     ) -> Result<String, InventoryError> {
         serde_json::to_string(&(
-            ASSESSMENT_RESOLVER_REVISION,
-            CAPACITY_POLICY_REVISION,
-            CapacityPolicy::default().reserve_bytes_per_domain,
-            MTP_SELECTOR_REVISION,
+            CapacityPolicy::default(),
             icn_hardware::GENERATION_PERFORMANCE_METHOD,
             llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
             llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
@@ -513,22 +506,36 @@ struct NativeModelEvaluator {
     assessor: Arc<NativeHardwareAssessor>,
 }
 
+#[derive(Clone)]
+struct AssessmentEnvironment {
+    id: AssessmentEnvironmentId,
+    snapshot: HardwareSnapshot,
+    topology: icn_contracts::MemoryTopology,
+}
+
 impl NativeModelEvaluator {
     fn new(models: Arc<ModelManager>, assessor: Arc<NativeHardwareAssessor>) -> Self {
         Self { models, assessor }
     }
 
-    async fn environment_id(&self) -> Result<AssessmentEnvironmentId, InventoryError> {
+    async fn environment(&self) -> Result<AssessmentEnvironment, InventoryError> {
         let snapshot = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
+        let topology =
+            icn_contracts::MemoryTopology::from_snapshot(&snapshot).ok_or_else(|| {
+                InventoryError::Internal(
+                    "hardware snapshot has an invalid memory topology".to_owned(),
+                )
+            })?;
         let mut digest = Sha256::new();
-        digest.update(b"magnitude-assessment-environment-v1\0");
-        digest.update(snapshot.native_build.as_bytes());
-        digest.update(b"\0");
-        digest.update(snapshot.topology_fingerprint.as_bytes());
-        Ok(AssessmentEnvironmentId(format!(
-            "environment_{:x}",
-            digest.finalize()
-        )))
+        let identity =
+            serde_json::to_vec(&(&snapshot.native_build, &snapshot.topology_fingerprint))
+                .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        digest.update(identity);
+        Ok(AssessmentEnvironment {
+            id: AssessmentEnvironmentId(format!("environment_{:x}", digest.finalize())),
+            snapshot,
+            topology,
+        })
     }
 
     fn resolved_for_planning(
@@ -552,20 +559,16 @@ impl NativeModelEvaluator {
         profiles: &[DomainServingProfile],
         reserve_bytes: u64,
         include_performance: bool,
-        environment_id: &AssessmentEnvironmentId,
+        environment: &AssessmentEnvironment,
     ) -> Result<Vec<String>, InventoryError> {
         profiles
             .iter()
             .map(|profile| {
                 serde_json::to_string(&(
-                    ASSESSMENT_RESOLVER_REVISION,
-                    OFFERING_ASSESSMENT_REVISION,
-                    CAPACITY_POLICY_REVISION,
-                    MTP_SELECTOR_REVISION,
                     icn_hardware::GENERATION_PERFORMANCE_METHOD,
                     llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
                     llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
-                    &environment_id.0,
+                    &environment.id.0,
                     &target_id.0,
                     profile.context_length,
                     profile.parallel_sequences,
@@ -583,18 +586,21 @@ impl NativeModelEvaluator {
         profiles: &[DomainServingProfile],
         reserve_bytes: u64,
         include_performance: bool,
-        environment_id: &AssessmentEnvironmentId,
+        environment: &AssessmentEnvironment,
     ) -> Result<Option<Vec<OfferingAssessment>>, InventoryError> {
         let evidence = self.assessment_evidence(
             target_id,
             profiles,
             reserve_bytes,
             include_performance,
-            environment_id,
+            environment,
         )?;
         let results = evidence
             .iter()
-            .map(|key| self.models.read_offering_assessment(key))
+            .map(|key| {
+                self.models
+                    .read_offering_assessment(key, &environment.topology)
+            })
             .collect::<Option<Vec<_>>>();
         Ok(results)
     }
@@ -605,9 +611,9 @@ impl NativeModelEvaluator {
         profiles: &[DomainServingProfile],
         reserve_bytes: u64,
         include_performance: bool,
-        environment_id: &AssessmentEnvironmentId,
+        environment: &AssessmentEnvironment,
     ) -> Result<Vec<OfferingAssessment>, InventoryError> {
-        let hardware = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
+        let hardware = &environment.snapshot;
         let thresholds = icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes);
         let system_reserve_bytes = reserve_bytes.max(thresholds.assess_reserve_bytes);
         let evidence = self.assessment_evidence(
@@ -615,11 +621,14 @@ impl NativeModelEvaluator {
             profiles,
             reserve_bytes,
             include_performance,
-            environment_id,
+            environment,
         )?;
         let mut results = evidence
             .iter()
-            .map(|key| self.models.read_offering_assessment(key))
+            .map(|key| {
+                self.models
+                    .read_offering_assessment(key, &environment.topology)
+            })
             .collect::<Vec<_>>();
         let missing = results
             .iter()
@@ -676,7 +685,7 @@ impl NativeModelEvaluator {
         resolved: &icn_contracts::models::ResolvedModelTarget,
         request: &FitModelsRequest,
     ) -> Result<FitModelResult, InventoryError> {
-        let environment_id = self.environment_id().await?;
+        let environment = self.environment().await?;
         let target_limit = match &resolved.target {
             icn_contracts::models::ModelOfferingTarget::Package { package } => {
                 package.properties.maximum_context_length
@@ -717,7 +726,7 @@ impl NativeModelEvaluator {
                 }],
                 reserve,
                 false,
-                &environment_id,
+                &environment,
             )
             .await?
             .pop()
@@ -734,7 +743,7 @@ impl NativeModelEvaluator {
                     }],
                     reserve,
                     false,
-                    &environment_id,
+                    &environment,
                 )
                 .await?
                 .pop()
@@ -774,7 +783,7 @@ impl NativeModelEvaluator {
                         }],
                         reserve,
                         false,
-                        &environment_id,
+                        &environment,
                     )
                     .await?
                     .pop()
@@ -795,7 +804,7 @@ impl NativeModelEvaluator {
             })
             .collect::<Vec<_>>();
         let assessments = self
-            .assess_profiles(resolved, &parallel_profiles, reserve, true, &environment_id)
+            .assess_profiles(resolved, &parallel_profiles, reserve, true, &environment)
             .await?;
         let Some((profile, assessment)) = parallel_profiles
             .into_iter()
@@ -826,9 +835,7 @@ fn serving_configuration_id(
     profile: &DomainServingProfile,
 ) -> ModelServingConfigurationId {
     let mut digest = Sha256::new();
-    digest.update(b"magnitude-serving-configuration-v1\0");
     digest.update(target_id.0.as_bytes());
-    digest.update(b"\0");
     digest.update(profile.context_length.to_le_bytes());
     digest.update(profile.parallel_sequences.to_le_bytes());
     ModelServingConfigurationId(format!("configuration_{:x}", digest.finalize()))
@@ -845,9 +852,7 @@ fn offering_assessment(
     let context_tokens = profile.context_length;
     let configuration_id = serving_configuration_id(target_id, &profile);
     let mut digest = Sha256::new();
-    digest.update(b"magnitude-offering-assessment-v1\0");
     digest.update(target_id.0.as_bytes());
-    digest.update(b"\0");
     digest.update(profile.context_length.to_le_bytes());
     digest.update(profile.parallel_sequences.to_le_bytes());
     digest.update(reserve_bytes.to_le_bytes());
@@ -865,22 +870,22 @@ fn offering_assessment(
                     .domains
                     .into_iter()
                     .map(|domain| {
-                        let domain_reserve = if domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID {
+                        let domain_reserve = if domain.memory_domain.is_system() {
                             system_reserve_bytes
                         } else {
                             reserve_bytes
                         };
                         MemoryAssessment {
                             compatibility_reserve_bytes: domain_reserve,
-                            warning_reserve_bytes: if domain.memory_domain
-                                == SYSTEM_MEMORY_DOMAIN_ID
-                            {
+                            warning_reserve_bytes: if domain.memory_domain.is_system() {
                                 warning_reserve_bytes
                             } else {
                                 domain_reserve
                             },
                             memory_domain_id: domain.memory_domain,
-                            capacity_bytes: domain.available_bytes.saturating_add(domain_reserve),
+                            capacity_bytes: domain
+                                .usable_capacity_bytes
+                                .saturating_add(domain_reserve),
                             required_bytes: domain.required_bytes,
                             remaining_bytes: domain.margin_bytes,
                         }
@@ -902,20 +907,20 @@ fn offering_assessment(
                 .domains
                 .into_iter()
                 .map(|domain| {
-                    let domain_reserve = if domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID {
+                    let domain_reserve = if domain.memory_domain.is_system() {
                         system_reserve_bytes
                     } else {
                         reserve_bytes
                     };
                     MemoryAssessment {
                         compatibility_reserve_bytes: domain_reserve,
-                        warning_reserve_bytes: if domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID {
+                        warning_reserve_bytes: if domain.memory_domain.is_system() {
                             warning_reserve_bytes
                         } else {
                             domain_reserve
                         },
                         memory_domain_id: domain.memory_domain,
-                        capacity_bytes: domain.available_bytes.saturating_add(domain_reserve),
+                        capacity_bytes: domain.usable_capacity_bytes.saturating_add(domain_reserve),
                         required_bytes: domain.required_bytes,
                         remaining_bytes: domain.margin_bytes,
                     }
@@ -1050,14 +1055,14 @@ impl ModelEvaluator for NativeModelEvaluator {
         request: AssessModelsRequest,
     ) -> BoxFuture<'_, Result<AssessModelsResponse, InventoryError>> {
         Box::pin(async move {
-            let environment_id = self.environment_id().await?;
+            let environment = self.environment().await?;
             let reserve_bytes = request
                 .capacity_policy
                 .required_reserve_bytes_per_memory_domain;
             let include_performance = request.include_performance;
             let evaluated = futures_util::stream::iter(request.requests.into_iter().enumerate())
                 .map(|(index, item)| {
-                    let environment_id = environment_id.clone();
+                    let environment = environment.clone();
                     async move {
                         let request_id = item.request_id;
                         let target_id = match target_input_id(&item.target) {
@@ -1081,7 +1086,7 @@ impl ModelEvaluator for NativeModelEvaluator {
                             &item.profiles,
                             reserve_bytes,
                             include_performance,
-                            &environment_id,
+                            &environment,
                         )?;
                         let result = if let Some(profiles) = cached {
                             AssessModelResult::Assessed {
@@ -1100,7 +1105,7 @@ impl ModelEvaluator for NativeModelEvaluator {
                                             &item.profiles,
                                             reserve_bytes,
                                             include_performance,
-                                            &environment_id,
+                                            &environment,
                                         )
                                         .await?,
                                 },
@@ -1123,7 +1128,7 @@ impl ModelEvaluator for NativeModelEvaluator {
             let mut results = evaluated.into_iter().collect::<Result<Vec<_>, _>>()?;
             results.sort_unstable_by_key(|(index, _)| *index);
             Ok(AssessModelsResponse {
-                environment_id,
+                environment_id: environment.id,
                 results: results.into_iter().map(|(_, result)| result).collect(),
             })
         })
@@ -1142,7 +1147,7 @@ impl ModelEvaluator for NativeModelEvaluator {
                     "fit bounds must be positive and ordered".to_owned(),
                 ));
             }
-            let environment_id = self.environment_id().await?;
+            let environment = self.environment().await?;
             let mut results = Vec::with_capacity(request.targets.len());
             for item in &request.targets {
                 let request_id = item.request_id.clone();
@@ -1176,7 +1181,7 @@ impl ModelEvaluator for NativeModelEvaluator {
                 }
             }
             Ok(FitModelsResponse {
-                environment_id,
+                environment_id: environment.id,
                 results,
             })
         })
@@ -1517,11 +1522,8 @@ fn run_template_worker() -> anyhow::Result<()> {
 }
 
 impl InventoryHardwareAssessor for NativeHardwareAssessor {
-    fn cache_key(&self) -> BoxFuture<'_, Result<String, InventoryError>> {
-        Box::pin(async move {
-            let snapshot = HardwareProvider::snapshot(self).await?;
-            ModelHardwareAssessor::cache_key(self, None, &snapshot)
-        })
+    fn cache_key(&self, snapshot: &HardwareSnapshot) -> Result<String, InventoryError> {
+        ModelHardwareAssessor::cache_key(self, None, snapshot)
     }
 
     fn assess(
@@ -1935,7 +1937,7 @@ impl NativeRuntimeController {
         };
         domains
             .iter()
-            .find(|domain| domain.memory_domain == SYSTEM_MEMORY_DOMAIN_ID)
+            .find(|domain| domain.memory_domain.is_system())
             .map(|domain| domain.required_bytes)
             .ok_or_else(|| {
                 RuntimeTransitionFailure::new(RuntimeFailure::new(

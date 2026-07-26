@@ -94,7 +94,13 @@ export const AssessmentEnvironmentIdSchema =
   NonEmptyString.pipe(Schema.brand("AssessmentEnvironmentId"))
 export type AssessmentEnvironmentId = typeof AssessmentEnvironmentIdSchema.Type
 
-export const ModelFileRoleSchema = Schema.Literal("weights", "projector", "mtp", "auxiliary")
+export const ModelFileRoleSchema = Schema.Literal(
+  "weights",
+  "projector",
+  "draft",
+  "mtp",
+  "auxiliary",
+)
 export type ModelFileRole = typeof ModelFileRoleSchema.Type
 
 export const ModelFileSchema = Schema.Struct({
@@ -117,6 +123,21 @@ export const ModelPackageSourceSchema = Schema.Union(
 )
 export type ModelPackageSource = typeof ModelPackageSourceSchema.Type
 
+export const SpeculativeMethodSchema = Schema.Union(
+  Schema.TaggedStruct("Mtp", {}),
+  Schema.TaggedStruct("DraftSimple", {}),
+  Schema.TaggedStruct("DraftEagle3", {}),
+  Schema.TaggedStruct("DraftDFlash", {}),
+  Schema.TaggedStruct("Ngram", {
+    method: NonEmptyString,
+  }),
+  Schema.TaggedStruct("UnknownNative", {
+    method: NonEmptyString,
+    evidence: NonEmptyString,
+  }),
+)
+export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
+
 export const ModelFileRelationshipSchema = Schema.Union(
   Schema.TaggedStruct("Shard", {
     fileId: ModelFileIdSchema,
@@ -130,6 +151,11 @@ export const ModelFileRelationshipSchema = Schema.Union(
   Schema.TaggedStruct("MtpFor", {
     mtpFileId: ModelFileIdSchema,
     weightsFileId: ModelFileIdSchema,
+  }),
+  Schema.TaggedStruct("DraftFor", {
+    draftFileId: ModelFileIdSchema,
+    weightsFileId: ModelFileIdSchema,
+    method: SpeculativeMethodSchema,
   }),
 )
 export type ModelFileRelationship = typeof ModelFileRelationshipSchema.Type

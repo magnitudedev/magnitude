@@ -117,13 +117,16 @@ impl ModelPreviewService {
             "{}:{}:{}",
             artifact.repository, artifact.commit, content_id.0
         );
+        let Some(topology) = icn_contracts::MemoryTopology::from_snapshot(snapshot) else {
+            return Ok(None);
+        };
         let mut assessments = Vec::with_capacity(profiles.len());
         for profile in profiles {
             let hardware_key = self.assessor.cache_key(Some(profile), snapshot)?;
-            let Some(assessment) = self
-                .models
-                .cache
-                .read_execution_assessment(&content_id, &hardware_key)
+            let Some(assessment) =
+                self.models
+                    .cache
+                    .read_execution_assessment(&content_id, &hardware_key, &topology)
             else {
                 return Ok(None);
             };
@@ -162,14 +165,18 @@ impl ModelPreviewService {
         snapshot: &icn_contracts::HardwareSnapshot,
     ) -> Result<Vec<ModelPreviewAssessment>, InventoryError> {
         let content_id = &prepared.model.model.content_id;
+        let topology = icn_contracts::MemoryTopology::from_snapshot(snapshot).ok_or_else(|| {
+            InventoryError::Internal("hardware snapshot has an invalid memory topology".to_owned())
+        })?;
         let mut entries = profiles
             .into_iter()
             .map(|profile| {
                 let hardware_key = self.assessor.cache_key(Some(&profile), snapshot)?;
-                let assessment = self
-                    .models
-                    .cache
-                    .read_execution_assessment(content_id, &hardware_key);
+                let assessment = self.models.cache.read_execution_assessment(
+                    content_id,
+                    &hardware_key,
+                    &topology,
+                );
                 Ok((profile, hardware_key, assessment))
             })
             .collect::<Result<Vec<_>, InventoryError>>()?;
@@ -196,10 +203,11 @@ impl ModelPreviewService {
         let mut missing_indices = Vec::new();
         for (index, (_, hardware_key, assessment)) in entries.iter_mut().enumerate() {
             if assessment.is_none() {
-                *assessment = self
-                    .models
-                    .cache
-                    .read_execution_assessment(content_id, hardware_key);
+                *assessment = self.models.cache.read_execution_assessment(
+                    content_id,
+                    hardware_key,
+                    &topology,
+                );
             }
             if assessment.is_none() {
                 missing_indices.push(index);
@@ -1146,10 +1154,6 @@ fn validate_source(source: &ModelPreviewSource) -> Result<(), InventoryError> {
         && source.additional_components.iter().all(|component| {
             valid_gguf_path(&component.path)
                 && !is_split_path(&component.path)
-                && matches!(
-                    component.role,
-                    ComponentRole::Projector | ComponentRole::Draft | ComponentRole::Mtp
-                )
                 && selected_paths.insert(&component.path)
         });
     if valid_repository && valid_revision && valid_path && valid_additional {
@@ -1246,7 +1250,7 @@ fn artifact_matches_source(artifact: &CachedArtifact, source: &ModelPreviewSourc
     let additional_valid = source.additional_components.iter().all(|expected| {
         artifact.components.iter().any(|cached| {
             cached.component.path == expected.path
-                && cached.component.role == expected.role
+                && cached.component.role == expected.role.component_role()
                 && cached.component.shard_index.is_none()
                 && cached.component.relationship
                     == Some(component_relationship(expected, &source.primary_gguf))
@@ -1331,7 +1335,7 @@ fn select_artifact_components<'a>(
             })?;
         selected.push(SelectedComponent {
             sibling,
-            role: additional.role.clone(),
+            role: additional.role.component_role(),
             shard_index: None,
             relationship: Some(component_relationship(additional, &source.primary_gguf)),
         });
@@ -1398,7 +1402,7 @@ fn select_repository_snapshot_components(
             })?;
         selected.push(ModelComponent {
             path: file.path.clone(),
-            role: additional.role.clone(),
+            role: additional.role.component_role(),
             size_bytes: file.size_bytes,
             content: file.content.clone(),
             shard_index: None,
@@ -1417,20 +1421,24 @@ fn component_relationship(
     component: &icn_contracts::ModelPreviewComponentSource,
     primary: &Path,
 ) -> ComponentRelationship {
-    match component.role {
-        ComponentRole::Projector => ComponentRelationship::ProjectorFor {
-            projector: component.path.clone(),
-            model: primary.to_path_buf(),
-        },
-        ComponentRole::Draft => ComponentRelationship::DraftFor {
-            draft: component.path.clone(),
-            model: primary.to_path_buf(),
-        },
-        ComponentRole::Mtp => ComponentRelationship::MtpFor {
+    match &component.role {
+        icn_contracts::ModelPreviewComponentRole::Projector => {
+            ComponentRelationship::ProjectorFor {
+                projector: component.path.clone(),
+                model: primary.to_path_buf(),
+            }
+        }
+        icn_contracts::ModelPreviewComponentRole::Draft { method } => {
+            ComponentRelationship::DraftFor {
+                draft: component.path.clone(),
+                model: primary.to_path_buf(),
+                method: method.clone(),
+            }
+        }
+        icn_contracts::ModelPreviewComponentRole::Mtp => ComponentRelationship::MtpFor {
             mtp: component.path.clone(),
             model: primary.to_path_buf(),
         },
-        _ => unreachable!("preview source validation restricts auxiliary roles"),
     }
 }
 
@@ -1877,7 +1885,15 @@ mod tests {
                     native_build: "native".to_owned(),
                     enabled_backends: vec!["cpu".to_owned()],
                     topology_fingerprint: "topology".to_owned(),
-                    memory_domains: Vec::new(),
+                    memory_domains: vec![icn_contracts::HardwareMemoryDomain {
+                        id: icn_contracts::MemoryDomainId::system(),
+                        kind: icn_contracts::HardwareMemoryDomainKind::System,
+                        total_capacity_bytes: 2,
+                        stable_capacity_bytes: 2,
+                        current_free_bytes: Some(2),
+                        shares_system_memory: true,
+                        devices: Vec::new(),
+                    }],
                     resident_memory: None,
                     runtime_failure: None,
                 })
@@ -1913,10 +1929,19 @@ mod tests {
                         device: "system".to_owned(),
                     },
                     memory: icn_contracts::HardwareMemory {
-                        domains: Vec::new(),
+                        domains: vec![icn_contracts::HardwareMemoryDomainAssessment {
+                            memory_domain: icn_contracts::MemoryDomainId::system(),
+                            model_bytes: 1,
+                            context_bytes: 0,
+                            compute_bytes: 0,
+                            auxiliary_bytes: 0,
+                            required_bytes: 1,
+                            usable_capacity_bytes: 2,
+                            margin_bytes: 1,
+                        }],
                         device_constraints: Vec::new(),
                         required_bytes: 1,
-                        available_bytes: 2,
+                        usable_capacity_bytes: 2,
                         headroom_bytes: 1,
                     },
                     recommendation: icn_contracts::HardwareRecommendation::Recommended,
@@ -2102,11 +2127,13 @@ mod tests {
             additional_components: vec![
                 icn_contracts::ModelPreviewComponentSource {
                     path: PathBuf::from("projector.gguf"),
-                    role: ComponentRole::Projector,
+                    role: icn_contracts::ModelPreviewComponentRole::Projector,
                 },
                 icn_contracts::ModelPreviewComponentSource {
                     path: PathBuf::from("draft.gguf"),
-                    role: ComponentRole::Draft,
+                    role: icn_contracts::ModelPreviewComponentRole::Draft {
+                        method: icn_contracts::models::SpeculativeMethod::DraftDFlash,
+                    },
                 },
             ],
         };
@@ -2126,7 +2153,7 @@ mod tests {
         let duplicate = ModelPreviewSource {
             additional_components: vec![icn_contracts::ModelPreviewComponentSource {
                 path: PathBuf::from("model.gguf"),
-                role: ComponentRole::Mtp,
+                role: icn_contracts::ModelPreviewComponentRole::Mtp,
             }],
             ..source
         };
@@ -2194,14 +2221,34 @@ mod tests {
                 device: "system".to_owned(),
             },
             memory: icn_contracts::HardwareMemory {
-                domains: Vec::new(),
+                domains: vec![icn_contracts::HardwareMemoryDomainAssessment {
+                    memory_domain: icn_contracts::MemoryDomainId::system(),
+                    model_bytes: 10,
+                    context_bytes: 0,
+                    compute_bytes: 0,
+                    auxiliary_bytes: 0,
+                    required_bytes: 10,
+                    usable_capacity_bytes: 20,
+                    margin_bytes: 10,
+                }],
                 device_constraints: Vec::new(),
                 required_bytes: 10,
-                available_bytes: 20,
+                usable_capacity_bytes: 20,
                 headroom_bytes: 10,
             },
             recommendation: icn_contracts::HardwareRecommendation::Recommended,
         };
+        let topology =
+            icn_contracts::MemoryTopology::from_domains(&[icn_contracts::HardwareMemoryDomain {
+                id: icn_contracts::MemoryDomainId::system(),
+                kind: icn_contracts::HardwareMemoryDomainKind::System,
+                total_capacity_bytes: 20,
+                stable_capacity_bytes: 20,
+                current_free_bytes: Some(20),
+                shares_system_memory: true,
+                devices: Vec::new(),
+            }])
+            .unwrap();
         let content_id = icn_contracts::ContentId("artifact".to_owned());
         manager
             .cache
@@ -2209,13 +2256,13 @@ mod tests {
         assert_eq!(
             manager
                 .cache
-                .read_hardware_assessment(&content_id, "profile:hardware"),
+                .read_hardware_assessment(&content_id, "profile:hardware", &topology),
             Some(assessment.clone())
         );
         assert!(
             manager
                 .cache
-                .read_hardware_assessment(&content_id, "other-profile:hardware")
+                .read_hardware_assessment(&content_id, "other-profile:hardware", &topology,)
                 .is_none()
         );
 
@@ -2229,7 +2276,7 @@ mod tests {
         assert!(
             manager
                 .cache
-                .read_hardware_assessment(&content_id, "operational-failure")
+                .read_hardware_assessment(&content_id, "operational-failure", &topology)
                 .is_none()
         );
 
@@ -2247,7 +2294,7 @@ mod tests {
         assert_eq!(
             manager
                 .cache
-                .read_execution_assessment(&content_id, "profile:execution"),
+                .read_execution_assessment(&content_id, "profile:execution", &topology),
             Some(execution)
         );
     }

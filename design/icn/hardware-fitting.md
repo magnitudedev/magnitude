@@ -22,9 +22,21 @@ results. Bun never estimates native memory or reconstructs a native plan.
 ICN reports physical memory domains, their stable capacity, member devices, and applicable device
 limits. Fit uses stable capacity rather than volatile free memory.
 
+The byte vocabulary is explicit: `total_capacity_bytes` is physical capacity,
+`usable_capacity_bytes` is the stable fitting capacity after policy reserves, and
+`current_available_bytes`/`current_free_bytes` are live observations used only for admission and
+runtime supervision. Cached fitting assessments never use a live observation as capacity evidence.
+
 Unified-memory machines expose one physical memory domain. CPU and accelerator allocations are
 charged to that domain once. Device-specific working-set limits remain additional constraints; they
 are not reported as independent physical capacity.
+
+Physical-domain identity is canonical across discovery, native fitting, persisted assessment,
+runtime residency, and clients. The system domain has one reserved identity. Dedicated-domain
+identity is derived from exact physical-device evidence and backend-scoped native identity when no
+physical identity exists. Device names are presentation only and never domain identity.
+Device-specific working-set constraints use a separate canonical native-device identity derived
+from normalized backend, physical identity when available, and native ordinal.
 
 Hardware presentation keeps system-product identity, accelerator chip identity, runtime backend,
 and native device ordinal distinct. Product identity comes from operating-system firmware data;
@@ -110,8 +122,13 @@ every behavior-changing input:
 - native build and backend; and
 - normalized hardware topology.
 
-A missing, corrupt, or stale entry is a cache miss. Cache failure never becomes a model-fit result.
-ACN may retain product projections, but it does not persist or recreate ICN assessment evidence.
+A missing, corrupt, or stale entry is a cache miss. On read, the assessment's domain identities and
+byte-accounting invariants are validated against the same normalized topology captured for its
+environment. An unknown or duplicate domain, a missing system domain, or inconsistent totals
+invalidates only that assessment entry. Domain availability must equal the topology's stable
+capacity, and each device constraint must identify one current device and exactly match its stable
+limit. Cache failure never becomes a model-fit result. ACN may retain product projections, but it
+does not persist or recreate ICN assessment evidence.
 
 Batch assessment captures one normalized hardware environment identity and reuses it for every
 target and profile in that request. Before resolving a source-backed target, ICN derives its stable
@@ -148,5 +165,6 @@ currently fits.
 - Single-package assessment is never reused for an explicit speculative pair.
 - Context is maximized before parallelism during automatic fitting.
 - Unified physical memory is never double-counted.
+- Discovery, fitting, cached assessment, and residency use the same physical-domain identities.
 - Loading reassesses the exact configuration it realizes.
 - Deleting assessment caches changes only latency and recomputation.

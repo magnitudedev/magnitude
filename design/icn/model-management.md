@@ -79,7 +79,8 @@ Discovery prefers authoritative GGUF role evidence (`eagle3` architecture or DFl
 metadata), then exact role tokens in filenames. The `mtp`, `eagle3`, and `dflash` tokens follow
 the GGUF naming convention or llama.cpp's own companion discovery; `draft` is a compatibility
 fallback for older or vendor-specific conversions. File size is never used to infer a model's
-execution role.
+execution role. Package materialization preserves `DraftFor(target, method)` separately from
+`MtpFor(target)`; neither relationship is rewritten as the other.
 
 Product startup does not wait for external-source reconciliation. The installed-package observer
 publishes an empty initial snapshot, starts reconciliation immediately in the background, and
