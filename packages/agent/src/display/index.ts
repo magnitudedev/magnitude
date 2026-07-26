@@ -6,8 +6,6 @@ export {
   type ActiveModelRequests,
   type ModelRequestActivityObservation,
   type ModelRequestActivityState,
-  type ModelResponseTiming,
-  type ModelResponseTimings,
 } from './model-request-activity'
 export type {
   UserMessageDisplay,

@@ -10,6 +10,8 @@ import {
   slate,
   subscribeAnimationTick,
   getAnimationTickSnapshot,
+  displayActorWorkElapsedMs,
+  isDisplayActorWorkActive,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { red } from '../../utils/theme'
@@ -38,7 +40,6 @@ const BRAILLE_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 interface ActivityRailProps {
   work: DisplayActorWork | null
   width: number
-  waitsForGenerationProgress: boolean
   modelLoadActivity: LocalModelLoadActivity | null
   modelRequestActivity: DisplayModelRequestActivity | null
   interruptedMessage?: InterruptedMessage | null
@@ -58,7 +59,6 @@ function formatElapsed(totalSeconds: number): string {
 export const ActivityRail = memo(function ActivityRail({
   work,
   width,
-  waitsForGenerationProgress,
   modelLoadActivity,
   modelRequestActivity,
   interruptedMessage,
@@ -67,7 +67,7 @@ export const ActivityRail = memo(function ActivityRail({
   const theme = useTheme()
   const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
 
-  const active = work?.phase === 'working'
+  const active = work !== null && isDisplayActorWorkActive(work)
   const activity = work?.activity ?? null
   const hasSpinner = activity?.kind === 'tool' && Option.getOrNull(activity.decorator) === 'spinner'
   const hasActivity = activity !== null
@@ -128,18 +128,9 @@ export const ActivityRail = memo(function ActivityRail({
     )
   }
 
-  if (
-    active
-    && waitsForGenerationProgress
-    && work.respondingSince === undefined
-  ) {
-    return <box style={{ height: 1, flexShrink: 0 }} />
-  }
-
   // Active: show running timer
-  if (active) {
-    const respondingSince = work.respondingSince ?? work.activeSince
-    const responseElapsedMs = Math.max(0, Date.now() - (respondingSince ?? Date.now()))
+  if (active && work !== null) {
+    const responseElapsedMs = displayActorWorkElapsedMs(work, Date.now())
     const responseElapsedSeconds = Math.floor(responseElapsedMs / 1000)
     return (
       <box style={{ height: 1, flexShrink: 0 }}>

@@ -50,7 +50,8 @@ const idleAgents: AgentLifecycleState = {
   agentByForkId: new Map(),
   rootWork: {
     phase: "idle",
-    chainStartedAt: null,
+    accumulatedWorkMs: 0,
+    workingStartedAt: null,
     lastChainMs: 0,
     activity: null,
     activeChildCount: 0,

@@ -43,6 +43,7 @@ export type {
   GitContext,
   UserMessage,
   TurnStarted,
+  ModelGenerationStarted,
   TurnOutcomeEvent,
   ObservedResult,
 

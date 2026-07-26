@@ -134,6 +134,13 @@ export interface TurnStarted {
   readonly chainId: string  // Groups turns within user→stable cycle
 }
 
+export interface ModelGenerationStarted {
+  readonly type: 'model_generation_started'
+  readonly forkId: string | null
+  readonly turnId: string
+  readonly chainId: string
+}
+
 export interface TurnToolCall {
   readonly toolKey: ToolKeyErased
   readonly group: string
@@ -730,6 +737,7 @@ export type AppEvent =
   | UserBashCommand
   | UserMessageReady
   | TurnStarted
+  | ModelGenerationStarted
   | TurnOutcomeEvent
   | MessageStart
   | MessageChunkEvent

@@ -11,6 +11,7 @@ import {
   useSlotProfiles,
   useDisplayViewController,
   findSlotProfile,
+  isDisplayActorWorkActive,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID } from '@magnitudedev/sdk'
@@ -32,7 +33,7 @@ export function ActivityRailContainer({
   const modelRequestActivity = useDisplayState(
     (state) => state.modelRequests.root ?? null,
   )
-  const { profiles, rootProfile } = useSlotProfiles()
+  const { profiles } = useSlotProfiles()
 
   const interrupted: InterruptedMessage | null = useMemo(() => {
     // Root interrupt from timeline statusSlot
@@ -55,7 +56,7 @@ export function ActivityRailContainer({
   const activityWidth = Math.max(0, width - 3)
 
   const hasWork = rootActor !== null
-    && (rootActor.work.phase === 'working' || rootActor.work.activity !== null)
+    && (isDisplayActorWorkActive(rootActor.work) || rootActor.work.activity !== null)
   if (!hasWork && modelLoadActivity === null && modelRequestActivity === null && interrupted === null) {
     return null
   }
@@ -65,7 +66,6 @@ export function ActivityRailContainer({
       <ActivityRail
         work={rootActor?.work ?? null}
         width={activityWidth}
-        waitsForGenerationProgress={rootProfile?.providerId === "local"}
         modelLoadActivity={modelLoadActivity}
         modelRequestActivity={modelRequestActivity}
         interruptedMessage={interrupted}

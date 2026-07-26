@@ -147,7 +147,7 @@ describe('display interrupt finalization', () => {
     expect(messages.at(-1)).toMatchObject({
       type: 'work_summary',
       chainId: 'chain-1',
-      durationMs: 5,
+      durationMs: 4,
       phase: 'interrupted',
       timestamp: ts(6),
     })

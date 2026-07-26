@@ -57,6 +57,18 @@ const turnStarted = (
   chainId,
 } as AppEvent)
 
+const generationStarted = (
+  turnId: string,
+  chainId: string,
+  timestamp: number,
+): AppEvent => ({
+  type: 'model_generation_started',
+  timestamp,
+  forkId: null,
+  turnId,
+  chainId,
+} as AppEvent)
+
 const turnOutcome = (
   turnId: string,
   chainId: string,
@@ -124,8 +136,10 @@ describe('persistent root work summaries', () => {
   it('records one total duration across continued turns in the same chain', async () => {
     const messages = await runDisplay([
       turnStarted('turn-1', 'chain-1', ts(1_000)),
+      generationStarted('turn-1', 'chain-1', ts(1_500)),
       turnOutcome('turn-1', 'chain-1', ts(3_000), 1),
       turnStarted('turn-2', 'chain-1', ts(4_000)),
+      generationStarted('turn-2', 'chain-1', ts(5_000)),
       turnOutcome('turn-2', 'chain-1', ts(6_000)),
     ])
 
@@ -134,10 +148,43 @@ describe('persistent root work summaries', () => {
       id: 'work_summary:chain-1',
       type: 'work_summary',
       chainId: 'chain-1',
-      durationMs: 5_000,
+      durationMs: 2_500,
       phase: 'worked',
       timestamp: ts(6_000),
     }])
+  })
+
+  it('keeps counting an active worker during root prefill, then pauses when it settles', async () => {
+    const messages = await runDisplay([
+      turnStarted('turn-1', 'chain-1', ts(0)),
+      generationStarted('turn-1', 'chain-1', ts(10)),
+      {
+        type: 'agent_created',
+        timestamp: ts(12),
+        forkId: 'worker-1',
+        parentForkId: null,
+        agentId: 'agent-1',
+        name: 'Worker',
+        role: 'engineer',
+        context: 'context',
+        mode: 'spawn',
+        taskId: 'task-1',
+        message: 'work',
+      } as AppEvent,
+      turnStarted('worker-turn', 'worker-chain', ts(13), 'worker-1'),
+      turnOutcome('turn-1', 'chain-1', ts(20), 1),
+      turnStarted('turn-2', 'chain-1', ts(21)),
+      turnOutcome('worker-turn', 'worker-chain', ts(35), 0, 'worker-1'),
+      generationStarted('turn-2', 'chain-1', ts(40)),
+      turnOutcome('turn-2', 'chain-1', ts(50)),
+    ])
+
+    const summary = messages.find((message) => message.type === 'work_summary')
+    expect(summary).toMatchObject({
+      chainId: 'chain-1',
+      durationMs: 35,
+      phase: 'worked',
+    })
   })
 
   it('places the completed summary before a queued follow-up message', async () => {
@@ -172,6 +219,7 @@ describe('persistent root work summaries', () => {
         message: 'work',
       } as AppEvent,
       turnStarted('worker-turn', 'worker-chain', ts(3), 'worker-1'),
+      generationStarted('root-turn', 'root-chain', ts(3)),
       turnOutcome('root-turn', 'root-chain', ts(4)),
       turnOutcome('worker-turn', 'worker-chain', ts(9), 0, 'worker-1'),
     ])
@@ -179,7 +227,7 @@ describe('persistent root work summaries', () => {
     const summary = messages.find((message) => message.type === 'work_summary')
     expect(summary).toMatchObject({
       chainId: 'root-chain',
-      durationMs: 8,
+      durationMs: 7,
       phase: 'worked',
       timestamp: ts(9),
     })

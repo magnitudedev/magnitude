@@ -66,6 +66,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
   const {
     forkId,
     turnId,
+    chainId,
     defaultProseDest,
     publish,
     resolveToolKey,
@@ -82,6 +83,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
   let lastToolKey: ToolKey | null = null
   let hasToolErrors = false
   let hasAnyResponseContent = false
+  let generationStarted = false
 
   // toolCallId → ToolKey tracking
   const toolCallKeys = new Map<string, ToolKey>()
@@ -100,6 +102,17 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
   }
   let turnUsage: ExecuteResult['usage'] = null
   let commitPolicy: ExecuteResult['commitPolicy'] = { _tag: 'commitCleanTurn' }
+
+  const publishGenerationStarted = (): Effect.Effect<void> => {
+    if (generationStarted) return Effect.void
+    generationStarted = true
+    return publish({
+      type: 'model_generation_started',
+      forkId,
+      turnId,
+      chainId,
+    })
+  }
 
   // Circuit breaker state (mutated, returned via getter)
   let trackerState = config.identicalResponseTracker
@@ -131,6 +144,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
         // ── Thinking ─────────────────────────────────────────────
         case 'ThoughtStart': {
           hasAnyResponseContent = true
+          yield* publishGenerationStarted()
           yield* publish({
             type: 'thinking_start',
             forkId,
@@ -162,6 +176,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
         // ── Messages ─────────────────────────────────────────────
         case 'MessageStart': {
           hasAnyResponseContent = true
+          yield* publishGenerationStarted()
           messageCounter++
           const messageId = `${turnId}-msg-${messageCounter}`
           currentMessageId = messageId
@@ -206,6 +221,7 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
         // ── Tool Input Lifecycle ─────────────────────────────────
         case 'ToolInputStarted': {
           hasAnyResponseContent = true
+          yield* publishGenerationStarted()
           const toolKey = resolveToolKey(event.toolName)
           if (!toolKey) break
           toolCallKeys.set(event.toolCallId, toolKey)
