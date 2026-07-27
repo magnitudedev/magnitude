@@ -31,7 +31,7 @@ mod planner_bundle;
 use planner_bundle::PlannerBundle;
 
 const CATALOG_SOURCE: &str = include_str!("../../../catalog/models.json");
-const RELEASE_CATALOG: &str = include_str!("../../../catalog/generated/recommendable-models.json");
+const RELEASE_CATALOG: &str = include_str!("../../../catalog/generated/release-catalog.lock.json");
 const RELEASE_PLANNER_BUNDLE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/planner-headers.bin"));
 

@@ -55,7 +55,7 @@ struct HeaderSource {
 
 fn main() {
     let crate_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let manifest_path = crate_dir.join("../../catalog/generated/recommendable-models.json");
+    let manifest_path = crate_dir.join("../../catalog/generated/release-catalog.lock.json");
     let bundle_source = crate_dir.join("../../catalog/planner_bundle.rs");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     println!("cargo:rerun-if-changed={}", bundle_source.display());
