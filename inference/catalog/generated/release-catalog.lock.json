@@ -1,8 +1,8 @@
 {
-  "sourceDigest": "fb73105ad51ad347a9c5a0bf73a0d058cbda3474f3d41c4f4c98c6de72abe483",
+  "sourceDigest": "b8e07c973209ab6edd44feff4d0f6b8337acc82f1483436bd3100d0a0d60b005",
   "templateIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
   "plannerIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v2",
-  "plannerBundleDigest": "6eba3edeeef9e9ce52c3b8ed920bec423b9a0ff9adf963abb33f401aa2abce5f",
+  "plannerBundleDigest": "3412c6cd0bacc31fbef95feedf735aa80dcdf2526163b507120053ca5b67dcff",
   "plannerArtifacts": [
     {
       "targetId": "target_7e29bbf4930748686de85c45afadbddfaeae7266cc1c4894a7d67fed7bcd1079",
@@ -1577,10 +1577,10 @@
       ]
     },
     {
-      "targetId": "target_cac2636d5b019d1d9537fde503758c5f315c7f424e2bd04d50cb105bee8a0b6d",
-      "modelId": "mdl_45e4f473b1b7b570a849eb815a085d3cd86d1b82a5e08ceda07b1fdf34dd4c73",
-      "contentId": "content_9afd232bbb54585945ae79ee5ac5410a0263254be8c8bca569c60becdcd7e719",
-      "name": "Laguna S 2.1",
+      "targetId": "target_10750bcdda677b6645125686db2d42edd3753192c0ca0e2c19c712576348b76c",
+      "modelId": "mdl_401bcee0abbf5dbd28a804c70bd02a2089a2b6a6786cc10d6c7b02977d146983",
+      "contentId": "content_706539f913d49205a75a4999eb027d5ee3f58f3e2b9ec5065cf75ef9e3d0ccf0",
+      "name": "Laguna-S-2.1",
       "supportedParameters": [
         "tools",
         "reasoning_effort"
@@ -1588,93 +1588,18 @@
       "properties": {
         "type": "inspected",
         "architecture": "laguna",
-        "quantization": "Q8_0",
-        "quantization_name": "8-bit",
-        "parameter_count": 117561977600,
-        "active_parameter_count": null,
-        "training_context_length": 1048576,
-        "tokenizer": "gpt2",
-        "modalities": [
-          "text"
-        ],
-        "base_models": [],
-        "tools": {
-          "type": "supported",
-          "parallel": true
-        },
-        "structured_output": {
-          "type": "supported",
-          "parallel": null
-        },
-        "reasoning": {
-          "type": "supported",
-          "control": {
-            "type": "effort",
-            "levels": [
-              "none",
-              "high"
-            ],
-            "default": "high"
-          },
-          "visibility": "preserved",
-          "delimiters": {
-            "type": "known",
-            "start": "<think>",
-            "end": "</think>"
-          },
-          "evidence": {
-            "type": "bounded_template_probe",
-            "fingerprint": "sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
-          }
-        },
-        "evidence_fingerprint": "sha256:193ac8101612b1099516c8ec8c70d11739d682fc0759d069c0b0157f7a87abf8+sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
-      },
-      "source": {
-        "type": "hugging_face",
-        "repository": "poolside/Laguna-S-2.1-GGUF",
-        "requested_revision": "fc4e481289523cf7d0df668da6d1d391616141ca",
-        "commit": "fc4e481289523cf7d0df668da6d1d391616141ca"
-      },
-      "primaryGguf": "laguna-s-2.1-Q4_K_M.gguf",
-      "components": [
-        {
-          "component": {
-            "path": "laguna-s-2.1-Q4_K_M.gguf",
-            "role": "weights",
-            "size_bytes": 96031829760,
-            "content": {
-              "type": "sha256",
-              "value": "a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4"
-            },
-            "shard_index": null
-          },
-          "headerDigest": "1380f60e1e8266b0d5a3d094de53a9e274634d33b8b7ee6ae73841a4dec9c228",
-          "headerSizeBytes": 3734272
-        }
-      ]
-    },
-    {
-      "targetId": "target_4616d1df5e81f856355f2e9b05589bbf7bd053a2bb42976b2dce59d88af151a0",
-      "modelId": "mdl_8588684df9027ecf967da18901ae10d16ad5507ef6f162f65e1cb5884d39c034",
-      "contentId": "content_434ae6f0d8193cefeb43ffa969b92845a0b8159c92664454cc2fb95ca17223ef",
-      "name": "Laguna S 2.1",
-      "supportedParameters": [
-        "tools",
-        "reasoning_effort"
-      ],
-      "properties": {
-        "type": "inspected",
-        "architecture": "laguna",
-        "quantization": "Q8_0",
-        "quantization_name": "8-bit",
-        "parameter_count": 117561977600,
+        "quantization": "Q4_K - Medium",
+        "quantization_name": "4-bit",
+        "parameter_count": null,
         "active_parameter_count": null,
         "training_context_length": 262144,
         "tokenizer": "gpt2",
         "modalities": [
           "text"
         ],
-        "base_models": [],
+        "base_models": [
+          "Laguna S 2.1"
+        ],
         "tools": {
           "type": "supported",
           "parallel": true
@@ -1704,29 +1629,299 @@
             "fingerprint": "sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
           }
         },
-        "evidence_fingerprint": "sha256:193ac8101612b1099516c8ec8c70d11739d682fc0759d069c0b0157f7a87abf8+sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+        "evidence_fingerprint": "sha256:df543329009a3e742efc1e5b59304481770b9d19ecc0068f61ed90d02e4a7355+sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
       },
       "source": {
         "type": "hugging_face",
-        "repository": "poolside/Laguna-S-2.1-GGUF",
-        "requested_revision": "fc4e481289523cf7d0df668da6d1d391616141ca",
-        "commit": "fc4e481289523cf7d0df668da6d1d391616141ca"
+        "repository": "unsloth/Laguna-S-2.1-GGUF",
+        "requested_revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+        "commit": "750f92f90cf54159c4d7a610cb7b3e74498e75c6"
       },
-      "primaryGguf": "laguna-s-2.1-Q8_0.gguf",
+      "primaryGguf": "UD-Q4_K_XL/Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf",
       "components": [
         {
           "component": {
-            "path": "laguna-s-2.1-Q8_0.gguf",
-            "role": "weights",
-            "size_bytes": 128750823168,
+            "path": "UD-Q4_K_XL/Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 3683648,
             "content": {
               "type": "sha256",
-              "value": "d946b221d69f2c5f87a986952bcd3cfb75831e5a6a2184e626e361663e1bfe2b"
+              "value": "0cfaf46917260d253773e5e2fab64329fa5c9c60fdf0db0f59f31205b5f5dd32"
             },
-            "shard_index": null
+            "shard_index": 1
           },
-          "headerDigest": "85f7f22b5cad26d01ccd279cd1d037701034aa1426d2e2437b1c28319e78dde0",
-          "headerSizeBytes": 3734272
+          "headerDigest": "0cfaf46917260d253773e5e2fab64329fa5c9c60fdf0db0f59f31205b5f5dd32",
+          "headerSizeBytes": 3683648
+        },
+        {
+          "component": {
+            "path": "UD-Q4_K_XL/Laguna-S-2.1-UD-Q4_K_XL-00002-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 49971821312,
+            "content": {
+              "type": "sha256",
+              "value": "2296102462b02edca70163121ac62bacf7a82078c0eafc91625c8822850769bf"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "6c29650ac21af7881c338a4b0b0e001c648a867b29ae2c611296274a852b1435",
+          "headerSizeBytes": 35584
+        },
+        {
+          "component": {
+            "path": "UD-Q4_K_XL/Laguna-S-2.1-UD-Q4_K_XL-00003-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 23419667040,
+            "content": {
+              "type": "sha256",
+              "value": "9150e2338f7690af29685b6a2ca621a8fda7ecf9724678266c4b04b7c6dd0ef3"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "13a1c2312a47a870ec12a6d770b0b65c1c1b3a5cda3e93c37551eadcb2b6c7cc",
+          "headerSizeBytes": 15968
+        }
+      ]
+    },
+    {
+      "targetId": "target_8c43f5a08849b91024f0b4fb1a863949b4a35dd69401f77e98384e5410fa97cd",
+      "modelId": "mdl_cc0b7a983aa35d93c672fd8e0bc7f71cfa6d7da155cce76f951f32081bdb9957",
+      "contentId": "content_78fe4611ef50edee929e5b7d9abc95bc785b1c098adfc2b8fdc39e2e53125953",
+      "name": "Laguna-S-2.1",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "laguna",
+        "quantization": "Q6_K",
+        "quantization_name": "6-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Laguna S 2.1"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+          }
+        },
+        "evidence_fingerprint": "sha256:df543329009a3e742efc1e5b59304481770b9d19ecc0068f61ed90d02e4a7355+sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Laguna-S-2.1-GGUF",
+        "requested_revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+        "commit": "750f92f90cf54159c4d7a610cb7b3e74498e75c6"
+      },
+      "primaryGguf": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00001-of-00004.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00001-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 3683648,
+            "content": {
+              "type": "sha256",
+              "value": "e7fe690509db46d9303c2e27ad251c7439376d34d22241dbc085b2f5c96965c6"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "e7fe690509db46d9303c2e27ad251c7439376d34d22241dbc085b2f5c96965c6",
+          "headerSizeBytes": 3683648
+        },
+        {
+          "component": {
+            "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00002-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 49714573632,
+            "content": {
+              "type": "sha256",
+              "value": "a6c8bf20cde41c8b6d43418f8b1326afaf3aac3184fb5056c9da61dbcf6aacc7"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "7fc3d2584da7814b8460fd975b883bfbb4abf8b387a7167f6ba196cc7e9d3301",
+          "headerSizeBytes": 24384
+        },
+        {
+          "component": {
+            "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00003-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 49535976704,
+            "content": {
+              "type": "sha256",
+              "value": "eb92c5ac517257413418c9a064ca1ec0b83a7c9454352693cd4bedf16fa95fcb"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "5899894557e9bf20cc8e08d14b06d91f88c31bde0e0b4de057c36ded8731b48c",
+          "headerSizeBytes": 23808
+        },
+        {
+          "component": {
+            "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00004-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 7825393568,
+            "content": {
+              "type": "sha256",
+              "value": "faa6e791d9a5067f7ad1ff5fd4f45e8db58ee29bcc8ad95e6eaadaa924b28ce1"
+            },
+            "shard_index": 4
+          },
+          "headerDigest": "fd68626a5d82c18eb8c19ef20d8e23440e73c8f8c0ca98868d18a118a5a69f92",
+          "headerSizeBytes": 3488
+        }
+      ]
+    },
+    {
+      "targetId": "target_6427c47e214bbced32d314b0cdc6834bdf111b1d46b9b43ed2a28595038e5ccc",
+      "modelId": "mdl_9d982df12f59f5df89562059186aec4b4537fcf9c80ca8c363f8b3bf34d51e16",
+      "contentId": "content_98b0d47b663bd1f140859e5263d6b9d7c127e13dc234c3b424a467626ce50315",
+      "name": "Laguna-S-2.1",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "laguna",
+        "quantization": "Q8_0",
+        "quantization_name": "8-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Laguna S 2.1"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+          }
+        },
+        "evidence_fingerprint": "sha256:df543329009a3e742efc1e5b59304481770b9d19ecc0068f61ed90d02e4a7355+sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Laguna-S-2.1-GGUF",
+        "requested_revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+        "commit": "750f92f90cf54159c4d7a610cb7b3e74498e75c6"
+      },
+      "primaryGguf": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00001-of-00004.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00001-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 3683648,
+            "content": {
+              "type": "sha256",
+              "value": "0c3a90890963fe61b4b09ad9f16d894f31918f038ee11323449c9040c05f5289"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "0c3a90890963fe61b4b09ad9f16d894f31918f038ee11323449c9040c05f5289",
+          "headerSizeBytes": 3683648
+        },
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00002-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 49317489568,
+            "content": {
+              "type": "sha256",
+              "value": "8bf26fce82066f509d169d2e74c45ce62b94e9c2ed128784c367d9ca3979c77f"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "a4ba6c013557a33786e730ef09f45f2952b73cde5473b285c99810a8c2cbbb7a",
+          "headerSizeBytes": 20896
+        },
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00003-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 49337085920,
+            "content": {
+              "type": "sha256",
+              "value": "1aca2966d50c8ddc81a96644a6e3494aa6ee9fc554505972a95c12454e838608"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "70a7773a112caa72c77f36daf7a4e7ed3dcdc8a47d237018badffb5bdb43a89e",
+          "headerSizeBytes": 20448
+        },
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00004-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 29452536960,
+            "content": {
+              "type": "sha256",
+              "value": "94e4c36777f341912a5503be8bdcb2339cc6243a0c470509ddcdc03470b117c4"
+            },
+            "shard_index": 4
+          },
+          "headerDigest": "c8b72baa59315d20ba341387940bfc28c53209d753d06bc5034cd47ed0e93bbc",
+          "headerSizeBytes": 10368
         }
       ]
     },
@@ -4185,34 +4380,67 @@
         ]
       },
       {
-        "id": "laguna-s-2.1:Q4_K_M",
+        "id": "laguna-s-2.1:UD-Q4_K_XL",
         "checkpointId": "laguna-s-2.1",
-        "targetId": "target_cac2636d5b019d1d9537fde503758c5f315c7f424e2bd04d50cb105bee8a0b6d",
+        "targetId": "target_10750bcdda677b6645125686db2d42edd3753192c0ca0e2c19c712576348b76c",
         "target": {
           "_tag": "Package",
           "package": {
-            "id": "package_548bc06bf66c0d687508f065adc59913cf9c4b2c5c8abf98a81adf09b7d086d3",
+            "id": "package_f54d578a26720728676fb07e9f73eef927f189c5fb96250b06d4110a235732e4",
             "source": {
               "_tag": "HuggingFace",
-              "repository": "poolside/Laguna-S-2.1-GGUF",
-              "revision": "fc4e481289523cf7d0df668da6d1d391616141ca"
+              "repository": "unsloth/Laguna-S-2.1-GGUF",
+              "revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6"
             },
             "files": [
               {
-                "id": "file_a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4",
-                "path": "laguna-s-2.1-Q4_K_M.gguf",
+                "id": "file_0cfaf46917260d253773e5e2fab64329fa5c9c60fdf0db0f59f31205b5f5dd32",
+                "path": "UD-Q4_K_XL/Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf",
                 "role": "weights",
-                "sizeBytes": 96031829760,
-                "sha256": "a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4"
+                "sizeBytes": 3683648,
+                "sha256": "0cfaf46917260d253773e5e2fab64329fa5c9c60fdf0db0f59f31205b5f5dd32"
+              },
+              {
+                "id": "file_2296102462b02edca70163121ac62bacf7a82078c0eafc91625c8822850769bf",
+                "path": "UD-Q4_K_XL/Laguna-S-2.1-UD-Q4_K_XL-00002-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 49971821312,
+                "sha256": "2296102462b02edca70163121ac62bacf7a82078c0eafc91625c8822850769bf"
+              },
+              {
+                "id": "file_9150e2338f7690af29685b6a2ca621a8fda7ecf9724678266c4b04b7c6dd0ef3",
+                "path": "UD-Q4_K_XL/Laguna-S-2.1-UD-Q4_K_XL-00003-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 23419667040,
+                "sha256": "9150e2338f7690af29685b6a2ca621a8fda7ecf9724678266c4b04b7c6dd0ef3"
               }
             ],
-            "relationships": [],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_0cfaf46917260d253773e5e2fab64329fa5c9c60fdf0db0f59f31205b5f5dd32",
+                "index": 1,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_2296102462b02edca70163121ac62bacf7a82078c0eafc91625c8822850769bf",
+                "index": 2,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_9150e2338f7690af29685b6a2ca621a8fda7ecf9724678266c4b04b7c6dd0ef3",
+                "index": 3,
+                "count": 3
+              }
+            ],
             "properties": {
               "format": "gguf",
-              "quantization": "Q8_0",
-              "quantizationName": "8-bit",
+              "quantization": "Q4_K - Medium",
+              "quantizationName": "4-bit",
               "architecture": "laguna",
-              "maximumContextLength": 1048576
+              "maximumContextLength": 262144
             }
           }
         },
@@ -4251,28 +4479,186 @@
         ]
       },
       {
-        "id": "laguna-s-2.1:Q8_0",
+        "id": "laguna-s-2.1:UD-Q6_K_XL",
         "checkpointId": "laguna-s-2.1",
-        "targetId": "target_4616d1df5e81f856355f2e9b05589bbf7bd053a2bb42976b2dce59d88af151a0",
+        "targetId": "target_8c43f5a08849b91024f0b4fb1a863949b4a35dd69401f77e98384e5410fa97cd",
         "target": {
           "_tag": "Package",
           "package": {
-            "id": "package_41e81822e4ca3bfc906302f80a97b82ab5bcbd8d11ac79e243c618e52d2acb9f",
+            "id": "package_0f41e571969545a29a7861f9bb60033185cbcf50a816b2e123b1e5ae39b3d8ee",
             "source": {
               "_tag": "HuggingFace",
-              "repository": "poolside/Laguna-S-2.1-GGUF",
-              "revision": "fc4e481289523cf7d0df668da6d1d391616141ca"
+              "repository": "unsloth/Laguna-S-2.1-GGUF",
+              "revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6"
             },
             "files": [
               {
-                "id": "file_d946b221d69f2c5f87a986952bcd3cfb75831e5a6a2184e626e361663e1bfe2b",
-                "path": "laguna-s-2.1-Q8_0.gguf",
+                "id": "file_e7fe690509db46d9303c2e27ad251c7439376d34d22241dbc085b2f5c96965c6",
+                "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00001-of-00004.gguf",
                 "role": "weights",
-                "sizeBytes": 128750823168,
-                "sha256": "d946b221d69f2c5f87a986952bcd3cfb75831e5a6a2184e626e361663e1bfe2b"
+                "sizeBytes": 3683648,
+                "sha256": "e7fe690509db46d9303c2e27ad251c7439376d34d22241dbc085b2f5c96965c6"
+              },
+              {
+                "id": "file_a6c8bf20cde41c8b6d43418f8b1326afaf3aac3184fb5056c9da61dbcf6aacc7",
+                "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00002-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 49714573632,
+                "sha256": "a6c8bf20cde41c8b6d43418f8b1326afaf3aac3184fb5056c9da61dbcf6aacc7"
+              },
+              {
+                "id": "file_eb92c5ac517257413418c9a064ca1ec0b83a7c9454352693cd4bedf16fa95fcb",
+                "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00003-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 49535976704,
+                "sha256": "eb92c5ac517257413418c9a064ca1ec0b83a7c9454352693cd4bedf16fa95fcb"
+              },
+              {
+                "id": "file_faa6e791d9a5067f7ad1ff5fd4f45e8db58ee29bcc8ad95e6eaadaa924b28ce1",
+                "path": "UD-Q6_K_XL/Laguna-S-2.1-UD-Q6_K_XL-00004-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 7825393568,
+                "sha256": "faa6e791d9a5067f7ad1ff5fd4f45e8db58ee29bcc8ad95e6eaadaa924b28ce1"
               }
             ],
-            "relationships": [],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_a6c8bf20cde41c8b6d43418f8b1326afaf3aac3184fb5056c9da61dbcf6aacc7",
+                "index": 2,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_e7fe690509db46d9303c2e27ad251c7439376d34d22241dbc085b2f5c96965c6",
+                "index": 1,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_eb92c5ac517257413418c9a064ca1ec0b83a7c9454352693cd4bedf16fa95fcb",
+                "index": 3,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_faa6e791d9a5067f7ad1ff5fd4f45e8db58ee29bcc8ad95e6eaadaa924b28ce1",
+                "index": 4,
+                "count": 4
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q6_K",
+              "quantizationName": "6-bit",
+              "architecture": "laguna",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Laguna S 2.1 118B-A8B",
+        "description": "High-capability MoE model designed for agentic coding and long-horizon software work.",
+        "license": "openmdw-1.1",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 70.2,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 60,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Publisher-measured Terminal-Bench v2.1 checkpoint result; not an exact GGUF quantization measurement.",
+          "https://huggingface.co/poolside/Laguna-S-2.1",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "laguna-s-2.1:UD-Q8_K_XL",
+        "checkpointId": "laguna-s-2.1",
+        "targetId": "target_6427c47e214bbced32d314b0cdc6834bdf111b1d46b9b43ed2a28595038e5ccc",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_0faba03c5292bca50103b34186c534aca499e06254d81a9abd558d430558c7d1",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Laguna-S-2.1-GGUF",
+              "revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6"
+            },
+            "files": [
+              {
+                "id": "file_0c3a90890963fe61b4b09ad9f16d894f31918f038ee11323449c9040c05f5289",
+                "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00001-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 3683648,
+                "sha256": "0c3a90890963fe61b4b09ad9f16d894f31918f038ee11323449c9040c05f5289"
+              },
+              {
+                "id": "file_8bf26fce82066f509d169d2e74c45ce62b94e9c2ed128784c367d9ca3979c77f",
+                "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00002-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 49317489568,
+                "sha256": "8bf26fce82066f509d169d2e74c45ce62b94e9c2ed128784c367d9ca3979c77f"
+              },
+              {
+                "id": "file_1aca2966d50c8ddc81a96644a6e3494aa6ee9fc554505972a95c12454e838608",
+                "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00003-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 49337085920,
+                "sha256": "1aca2966d50c8ddc81a96644a6e3494aa6ee9fc554505972a95c12454e838608"
+              },
+              {
+                "id": "file_94e4c36777f341912a5503be8bdcb2339cc6243a0c470509ddcdc03470b117c4",
+                "path": "UD-Q8_K_XL/Laguna-S-2.1-UD-Q8_K_XL-00004-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 29452536960,
+                "sha256": "94e4c36777f341912a5503be8bdcb2339cc6243a0c470509ddcdc03470b117c4"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_0c3a90890963fe61b4b09ad9f16d894f31918f038ee11323449c9040c05f5289",
+                "index": 1,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_1aca2966d50c8ddc81a96644a6e3494aa6ee9fc554505972a95c12454e838608",
+                "index": 3,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_8bf26fce82066f509d169d2e74c45ce62b94e9c2ed128784c367d9ca3979c77f",
+                "index": 2,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_94e4c36777f341912a5503be8bdcb2339cc6243a0c470509ddcdc03470b117c4",
+                "index": 4,
+                "count": 4
+              }
+            ],
             "properties": {
               "format": "gguf",
               "quantization": "Q8_0",

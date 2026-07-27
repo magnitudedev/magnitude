@@ -775,7 +775,10 @@ mod tests {
                 .formats
                 .clone()
         };
-        assert_eq!(formats("laguna-s-2.1"), ["Q4_K_M", "Q8_0"]);
+        assert_eq!(
+            formats("laguna-s-2.1"),
+            ["UD-Q4_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
+        );
         assert_eq!(formats("qwen3.5-122b-a10b"), ["Q4_K_M"]);
         assert_eq!(
             formats("nemotron-3-super-120b-a12b"),
