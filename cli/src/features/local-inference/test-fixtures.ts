@@ -66,6 +66,7 @@ export const makeHardware = (
 export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
   id: TEST_TARGET_ID,
   catalogCandidateIds: [TEST_CANDIDATE_ID],
+  providerModelIds: [TEST_MODEL_ID],
   displayName: "Qwen Test",
   description: "Test model",
   kind: "Standalone",
@@ -81,6 +82,7 @@ export const makeCatalogCandidate = (
   overrides: Partial<LocalModelCatalogCandidate> = {},
 ): LocalModelCatalogCandidate => ({
   id: TEST_CANDIDATE_ID,
+  providerModelId: TEST_MODEL_ID,
   displayName: "Qwen Test",
   description: "Test model",
   license: "Apache-2.0",

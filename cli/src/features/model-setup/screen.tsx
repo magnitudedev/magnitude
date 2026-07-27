@@ -2,10 +2,14 @@ import { memo, useCallback } from "react"
 import { TextAttributes } from "@opentui/core"
 import { useTheme } from "../../hooks/use-theme"
 import { LocalInferenceScreen } from "../local-inference"
+import type { CatalogCandidateId } from "@magnitudedev/sdk"
 
 interface ModelSetupScreenProps {
   readonly onExit: () => void
   readonly onComplete?: () => void
+  readonly onSelectCatalogModel: (id: CatalogCandidateId) => void
+  readonly selectionPending: boolean
+  readonly selectionError: string | null
 }
 
 export const PreparingModelSetupScreen = memo(function PreparingModelSetupScreen() {
@@ -23,6 +27,9 @@ export const PreparingModelSetupScreen = memo(function PreparingModelSetupScreen
 export const ModelSetupScreen = memo(function ModelSetupScreen({
   onExit,
   onComplete,
+  onSelectCatalogModel,
+  selectionPending,
+  selectionError,
 }: ModelSetupScreenProps) {
   const finish = useCallback(() => {
     (onComplete ?? onExit)()
@@ -33,6 +40,9 @@ export const ModelSetupScreen = memo(function ModelSetupScreen({
       onExit={onExit}
       onSkip={finish}
       onConfigured={finish}
+      onSelectCatalogModel={onSelectCatalogModel}
+      selectionPending={selectionPending}
+      selectionError={selectionError}
     />
   )
 })

@@ -238,6 +238,13 @@ failures, or blocked slot state. Model choices appear only after recommendations
 initial provider catalog has settled. A terminal discovery failure appears once in progress, while
 failures from a user-initiated download or selection remain immediate and attached to that action.
 
+Choosing a curated model is one onboarding-domain mutation: it persists the provider offering,
+admits or joins the package download, stores the primary slot selection, and completes onboarding.
+The coding surface may therefore open while the selected offering is still installing. Confirmed
+cancellation terminalizes every target-package attempt, clears that matching selection, and reopens
+model onboarding before returning the chooser. Neither transition is reconstructed from client
+presentation state.
+
 The complete compatible recommendable-candidate projection is published beside the small labeled
 portfolio. Labeled portfolio members retain their intent and order. Remaining compatible
 candidates are ordered by one internal balanced recommendation score. That score is ranking
@@ -277,11 +284,16 @@ runtime identity.
 ACN normalizes its reasoning effort against the referenced provider model at the slot boundary,
 using the model default whenever the requested or stored value is unsupported.
 
+A valid local offering may be selected while its exact packages are absent or downloading. The slot
+then remains authoritatively blocked as unavailable until package and catalog reconciliation make
+the offering usable. This expected installation state does not make an incompatible, unsupported,
+or otherwise invalid selection acceptable.
+
 A successful slot-assignment mutation means ACN has durably stored the normalized selection,
 reconciled the authoritative `ModelSlots` mirror, and published the corresponding agent model
-configuration. Clients may advance onboarding or another configuration flow only after that
-mutation succeeds. Invoking the mutation is not success, and a failed mutation leaves the
-initiating flow open.
+configuration. Clients may advance onboarding or another configuration flow only after the
+containing server mutation succeeds. Invoking a client mutation is not success, and a failed
+mutation leaves the initiating flow open.
 
 ### Model favorites
 

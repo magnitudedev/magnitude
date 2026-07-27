@@ -234,8 +234,15 @@ impl ModelManager {
         })
         .await
         .map_err(|error| InventoryError::Internal(error.to_string()))??;
-        let client = HFClient::builder()
-            .cache_dir(config.root.join("hub"))
+        let client_builder = HFClient::builder().cache_dir(config.root.join("hub"));
+        let explicit_token = std::env::var("HF_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty());
+        let client_builder = match explicit_token {
+            Some(token) => client_builder.token(token),
+            None => client_builder,
+        };
+        let client = client_builder
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
         let cache = ModelCache::new(&config.cache_root);

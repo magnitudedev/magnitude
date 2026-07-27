@@ -59,6 +59,7 @@ const idleAgents: AgentLifecycleState = {
     _currentChainId: null,
     _thinkingCharCount: null,
     _activeToolKey: null,
+    _generation: null,
   },
 }
 

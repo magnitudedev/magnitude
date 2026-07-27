@@ -31,6 +31,7 @@ const actions = vi.hoisted(() => ({
   loadModel: vi.fn(),
   unloadModel: vi.fn(),
 }))
+const selectOnboardingModel = vi.fn()
 let state = makeView({ ready: false })
 let mutationFailure: Option.Option<Result.Result<unknown, unknown>> = Option.none()
 let slotAssignment: Result.Result<unknown, unknown> = Result.initial()
@@ -53,6 +54,13 @@ vi.mock("../../hooks/use-theme", () => ({
 
 const { ModelSetupScreen } = await import("./screen")
 
+const setupProps = {
+  onExit: () => {},
+  onSelectCatalogModel: selectOnboardingModel,
+  selectionPending: false,
+  selectionError: null,
+}
+
 const textPosition = (frame: string, label: string): { x: number; y: number } => {
   const lines = frame.split("\n")
   const y = lines.findIndex((line) => line.includes(label))
@@ -65,6 +73,7 @@ beforeEach(() => {
   mutationFailure = Option.none()
   slotAssignment = Result.initial()
   for (const action of Object.values(actions)) action.mockClear()
+  selectOnboardingModel.mockClear()
   actions.assignSlot.mockResolvedValue(undefined)
 })
 
@@ -134,7 +143,7 @@ test("withholds provisional models and errors until curated setup is coherent", 
   const Harness = () => {
     const [, setRevision] = useState(0)
     refresh = () => setRevision((revision) => revision + 1)
-    return <ModelSetupScreen onExit={() => {}} />
+    return <ModelSetupScreen {...setupProps} onExit={() => {}} />
   }
   const view = await testRender(<Harness />, { width: 100, height: 30 })
   try {
@@ -205,7 +214,7 @@ test("renders a terminal discovery failure exactly once and no partial model car
     },
   }
   const view = await testRender(
-    <ModelSetupScreen onExit={() => {}} />,
+    <ModelSetupScreen {...setupProps} />,
     { width: 100, height: 30 },
   )
   try {
@@ -229,7 +238,7 @@ test("shows a neutral finalizing state while the initial provider catalog settle
     catalog: new ProviderModelCatalogLoading(),
   }
   const view = await testRender(
-    <ModelSetupScreen onExit={() => {}} />,
+    <ModelSetupScreen {...setupProps} />,
     { width: 100, height: 30 },
   )
   try {
@@ -244,7 +253,7 @@ test("shows a neutral finalizing state while the initial provider catalog settle
 
 test("preserves the local model setup screen instead of introducing a model-selection screen", async () => {
   const view = await testRender(
-    <ModelSetupScreen onExit={() => {}} />,
+    <ModelSetupScreen {...setupProps} />,
     { width: 100, height: 30 },
   )
   try {
@@ -259,7 +268,7 @@ test("preserves the local model setup screen instead of introducing a model-sele
   }
 })
 
-test("clicking an available inventory entry requests its download", async () => {
+test("clicking an available inventory entry requests onboarding selection", async () => {
   const model = makeModel({
     download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
     preparation: { _tag: "NotDownloaded" },
@@ -267,14 +276,57 @@ test("clicking an available inventory entry requests its download", async () => 
   const recommendation = makeRecommendation()
   state = makeView({ models: [model], recommendations: [recommendation], ready: false })
   const view = await testRender(
-    <ModelSetupScreen onExit={() => {}} />,
+    <ModelSetupScreen {...setupProps} />,
     { width: 100, height: 30 },
   )
   try {
     await act(view.renderOnce)
     const position = textPosition(view.captureCharFrame(), model.displayName)
     await act(async () => view.mockMouse.click(position.x, position.y))
-    expect(actions.downloadCatalogModel).toHaveBeenCalledWith(recommendation.candidate.id)
+    expect(selectOnboardingModel).toHaveBeenCalledWith(recommendation.candidate.id)
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test.each([
+  {
+    label: "failed",
+    download: {
+      _tag: "Failed" as const,
+      completedBytes: 0,
+      totalBytes: 16 * GIB,
+      failure: {
+        code: "transport_failed",
+        message: "Previous attempt failed",
+        retryable: true,
+      },
+    },
+  },
+  {
+    label: "already downloading",
+    download: {
+      _tag: "Downloading" as const,
+      stage: "downloading" as const,
+      completedBytes: GIB,
+      totalBytes: 16 * GIB,
+      bytesPerSecond: Option.some(42 * 1024 * 1024),
+    },
+  },
+])("clicking a $label recommendation completes selection through onboarding", async ({ download }) => {
+  const model = makeModel({ download, preparation: { _tag: "NotDownloaded" } })
+  const recommendation = makeRecommendation()
+  state = makeView({ models: [model], recommendations: [recommendation], ready: false })
+  const view = await testRender(
+    <ModelSetupScreen {...setupProps} />,
+    { width: 100, height: 30 },
+  )
+  try {
+    await act(view.renderOnce)
+    const position = textPosition(view.captureCharFrame(), model.displayName)
+    await act(async () => view.mockMouse.click(position.x, position.y))
+    expect(selectOnboardingModel).toHaveBeenCalledWith(recommendation.candidate.id)
+    expect(actions.retryModelDownload).not.toHaveBeenCalled()
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -287,15 +339,17 @@ test("renders download progress as one label followed by percentage", async () =
       ...model,
       download: {
         _tag: "Downloading",
+        stage: "downloading",
         completedBytes: model.downloadBytes / 4,
         totalBytes: model.downloadBytes,
+        bytesPerSecond: Option.some(42 * 1024 * 1024),
       },
       preparation: { _tag: "NotDownloaded" },
     }],
     ready: false,
   })
   const view = await testRender(
-    <ModelSetupScreen onExit={() => {}} />,
+    <ModelSetupScreen {...setupProps} />,
     { width: 100, height: 30 },
   )
   try {
@@ -330,7 +384,7 @@ test("renders consumer recommendation intent and its trade-off explanation", asy
   })
   state = makeView({ models: [model], recommendations: [recommendation], ready: false })
   const view = await testRender(
-    <ModelSetupScreen onExit={() => {}} />,
+    <ModelSetupScreen {...setupProps} />,
     { width: 100, height: 30 },
   )
   try {
@@ -355,7 +409,7 @@ test("keeps setup open until the slot-assignment mutation succeeds", async () =>
   const Harness = () => {
     const [, setRevision] = useState(0)
     refresh = () => setRevision((revision) => revision + 1)
-    return <ModelSetupScreen onExit={() => {}} onComplete={onComplete} />
+    return <ModelSetupScreen {...setupProps} onExit={() => {}} onComplete={onComplete} />
   }
   const view = await testRender(<Harness />, { width: 100, height: 30 })
   try {
@@ -389,7 +443,7 @@ test("keeps setup open and shows an assignment failure", async () => {
   const Harness = () => {
     const [, setRevision] = useState(0)
     refresh = () => setRevision((revision) => revision + 1)
-    return <ModelSetupScreen onExit={() => {}} onComplete={onComplete} />
+    return <ModelSetupScreen {...setupProps} onExit={() => {}} onComplete={onComplete} />
   }
   const view = await testRender(<Harness />, { width: 100, height: 30 })
   try {

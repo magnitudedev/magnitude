@@ -14,6 +14,7 @@ const FLOW_VERSIONS = {
 export interface OnboardingApi {
   readonly state: Effect.Effect<OnboardingState, OnboardingError>
   readonly complete: (flowId: OnboardingFlowId) => Effect.Effect<void, OnboardingError>
+  readonly reopen: (flowId: OnboardingFlowId) => Effect.Effect<void, OnboardingError>
 }
 
 export class Onboarding extends Context.Tag("Onboarding")<Onboarding, OnboardingApi>() {}
@@ -26,7 +27,7 @@ const onboardingError = (operation: string, cause: unknown): OnboardingError =>
 
 type OnboardingStorage = Pick<
   ConfigStorageShape,
-  "getOnboardingConfig" | "completeOnboardingFlow"
+  "getOnboardingConfig" | "completeOnboardingFlow" | "reopenOnboardingFlow"
 >
 
 export const makeOnboarding = (storage: OnboardingStorage): OnboardingApi => {
@@ -56,6 +57,9 @@ export const makeOnboarding = (storage: OnboardingStorage): OnboardingApi => {
       new Date().toISOString(),
     ).pipe(
       Effect.mapError((cause) => onboardingError("complete onboarding flow", cause)),
+    ),
+    reopen: (flowId) => storage.reopenOnboardingFlow(flowId).pipe(
+      Effect.mapError((cause) => onboardingError("reopen onboarding flow", cause)),
     ),
   })
 }

@@ -47,6 +47,9 @@ export interface ConfigStorageShape {
     version: number,
     completedAt: string,
   ) => Effect.Effect<void, PlatformError | JsonError>
+  readonly reopenOnboardingFlow: (
+    flowId: OnboardingFlowId,
+  ) => Effect.Effect<void, PlatformError | JsonError>
 }
 
 export const ConfigStorage = Context.GenericTag<ConfigStorageShape>('ConfigStorage')

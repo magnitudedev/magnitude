@@ -44,11 +44,13 @@ export function ChatTimelineContainer({
   chatColumnWidth,
   dispatchErrorAction,
   isOverlayActive,
+  emptyState,
 }: {
   header: ReactNode
   chatColumnWidth: number
   dispatchErrorAction: (actionId: ActionId) => void
   isOverlayActive: boolean
+  emptyState?: ReactNode
 }): ReactNode {
   const theme = useTheme()
   const { pushFork } = useDisplayViewController()
@@ -61,6 +63,8 @@ export function ChatTimelineContainer({
   const hasMoreBefore = rootTimeline?.window.hasMoreBefore ?? false
 
   const systemMessages = useSyncExternalStore(subscribeSystemMessages, getSystemMessagesSnapshot)
+  const timelineIsEmpty = (rootTimeline?.messages.order.length ?? 0) === 0
+    && systemMessages.length === 0
 
   // ── Scroll: TimelineScrollController over a metrics adapter ─────────────
   const scrollboxRef = useRef<ScrollBoxRenderable | null>(null)
@@ -159,6 +163,7 @@ export function ChatTimelineContainer({
       ) : (
         header
       )}
+      {timelineIsEmpty && emptyState}
       <ChatTimeline
         timeline={rootTimeline}
         chatColumnWidth={chatColumnWidth}

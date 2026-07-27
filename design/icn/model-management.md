@@ -35,6 +35,10 @@ mutate them.
 Downloaded model artifacts are authoritative data. Derived indexes, inspections, resolutions, and
 assessments are disposable caches.
 
+Hub access uses only credentials explicitly supplied to Magnitude. Ambient credentials from a
+host Hugging Face login are not inherited, so an expired or unrelated cached login cannot break a
+public curated-model download. An explicit `HF_TOKEN` remains available for authenticated sources.
+
 ## Model packages
 
 A model package is an immutable manifest of exact files, roles, relationships, properties, and one
@@ -128,7 +132,10 @@ Pending -> Downloading -> Completed
 ```
 
 `POST /v1/models/downloads` starts an attempt. List, detail, and cancel operations return
-authoritative attempt snapshots.
+authoritative attempt snapshots. Active snapshots retain transfer stage, completed and total bytes,
+and the measured current-attempt transfer rate when sufficient evidence exists. Resumed bytes never
+count as bytes transferred during the current attempt. Product clients may derive a remaining-time
+estimate from those authoritative values but never measure transfer speed themselves.
 
 Failure and cancellation are terminal attempt results, not package states. Retry creates a new
 attempt. ACN projects only the latest relevant attempt into package UI state and stores dismissal
@@ -155,7 +162,8 @@ ACN builds `ModelPackageEntry` values by joining:
 
 This join changes only product presentation. The immutable `ModelPackage` value is reused unchanged.
 An entry's local state is `NotInstalled`, `Downloading`, or `Installed`; its last surfaced download
-failure and retained progress are separate.
+failure and retained progress are separate. The target-level product projection aggregates progress
+and concurrent transfer rates across every package required by that target.
 
 Installed packages appear even when catalog resolution or assessment is unavailable. Catalog-only
 packages appear as not installed. Download progress does not require inventory-wide reconciliation.

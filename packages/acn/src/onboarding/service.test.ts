@@ -12,6 +12,7 @@ describe("Onboarding", () => {
         completeOnboardingFlow: (flowId, version, completedAt) => Ref.set(stored, {
           completions: { [flowId]: { version, completedAt } },
         }),
+        reopenOnboardingFlow: () => Ref.set(stored, { completions: {} }),
       })
       const before = yield* onboarding.state
       yield* onboarding.complete("model_setup")
@@ -38,5 +39,27 @@ describe("Onboarding", () => {
         },
       },
     })
+  })
+
+  it("reopens a completed flow", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const stored = yield* Ref.make<OnboardingConfig | null>({
+        completions: {
+          model_setup: { version: 1, completedAt: "2026-07-26T00:00:00.000Z" },
+        },
+      })
+      const onboarding = makeOnboarding({
+        getOnboardingConfig: () => Ref.get(stored),
+        completeOnboardingFlow: (flowId, version, completedAt) => Ref.set(stored, {
+          completions: { [flowId]: { version, completedAt } },
+        }),
+        reopenOnboardingFlow: () => Ref.set(stored, { completions: {} }),
+      })
+      yield* onboarding.reopen("model_setup")
+      return yield* onboarding.state
+    }))
+
+    expect(result.flows.model_setup.required).toBe(true)
+    expect(result.flows.model_setup.completedVersion).toBeNull()
   })
 })

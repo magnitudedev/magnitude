@@ -65,6 +65,23 @@ describe("config storage onboarding state", () => {
     })
   })
 
+  test("reopens one onboarding flow without replacing other configuration", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const config = yield* makeConfigStorage()
+      yield* config.update((current) => ({
+        ...current,
+        futureDomain: { enabled: true },
+      }))
+      yield* config.completeOnboardingFlow("model_setup", 1, "2026-07-26T00:00:00.000Z")
+      yield* config.reopenOnboardingFlow("model_setup")
+      return yield* config.load()
+    }).pipe(Effect.provide(makeBase())))
+
+    expect(result.onboarding?.completions?.model_setup).toBeUndefined()
+    const persisted = await Bun.file(makeGlobalStoragePaths(root).configFile).json()
+    expect(persisted.futureDomain).toEqual({ enabled: true })
+  })
+
   test("recovers stale onboarding and discards incomplete canonical selections", async () => {
     const paths = makeGlobalStoragePaths(root)
     await Bun.write(paths.configFile, JSON.stringify({

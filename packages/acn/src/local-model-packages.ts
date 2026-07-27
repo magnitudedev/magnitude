@@ -181,10 +181,14 @@ export const LocalModelPackagesLive: Layer.Layer<
               onSome: (attempt): ModelPackageEntry["localState"] =>
                 attempt._tag === "Pending" || attempt._tag === "Downloading"
                   ? ({
-                _tag: "Downloading" as const,
-                attemptId: attempt.id,
-                completedBytes: attempt._tag === "Downloading" ? attempt.completedBytes : 0,
-                totalBytes: attempt._tag === "Downloading" ? attempt.totalBytes : 0,
+                      _tag: "Downloading" as const,
+                      attemptId: attempt.id,
+                      stage: attempt._tag === "Downloading" ? attempt.stage : "queued",
+                      completedBytes: attempt._tag === "Downloading" ? attempt.completedBytes : 0,
+                      totalBytes: attempt._tag === "Downloading" ? attempt.totalBytes : 0,
+                      bytesPerSecond: attempt._tag === "Downloading"
+                        ? Option.fromNullable(attempt.bytesPerSecond)
+                        : Option.none(),
                     })
                   : ({ _tag: "NotInstalled" as const }),
             })
@@ -256,6 +260,7 @@ export const LocalModelPackagesLive: Layer.Layer<
           ? Effect.void
           : startDownload(modelPackage).pipe(Effect.asVoid)
       }, { concurrency: "unbounded", discard: true })
+      yield* project
     }),
     cancelTargetDownload: (target) => Effect.gen(function* () {
       const entries = (yield* mirror.get).state.entries
@@ -271,6 +276,7 @@ export const LocalModelPackagesLive: Layer.Layer<
       yield* downloads.refresh.pipe(
         Effect.mapError((error) => mutationFailure("refresh_model_downloads_failed", error)),
       )
+      yield* project
     }),
     dismissTargetFailure: (target) => Effect.forEach(
       targetPackages(target),

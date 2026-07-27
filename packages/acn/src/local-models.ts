@@ -68,7 +68,26 @@ const aggregateDownload = (
       : 0),
     0,
   )
-  if (downloading.length > 0) return { _tag: "Downloading", completedBytes, totalBytes }
+  if (downloading.length > 0) {
+    const active = downloading.flatMap((entry) =>
+      entry?.localState._tag === "Downloading" ? [entry.localState] : [])
+    const stages = active.map(({ stage }) => stage)
+    const stage = stages.every((value) => value === "verifying" || value === "publishing")
+      ? "verifying" as const
+      : stages.some((value) => value === "downloading")
+        ? "downloading" as const
+        : stages[0] ?? "queued"
+    const rates = active.flatMap(({ bytesPerSecond }) => Option.toArray(bytesPerSecond))
+    return {
+      _tag: "Downloading",
+      stage,
+      completedBytes,
+      totalBytes,
+      bytesPerSecond: rates.length === 0
+        ? Option.none()
+        : Option.some(rates.reduce((total, rate) => total + rate, 0)),
+    }
+  }
   const failed = packageEntries.flatMap((entry) =>
     entry
       && entry.localState._tag !== "Installed"
@@ -281,6 +300,7 @@ export const LocalModelsLive: Layer.Layer<
               .filter(({ modelId }) => modelId === projection.id)
               .map(({ candidate }) => candidate.id)
           : [],
+        providerModelIds: providerIdsByTarget.get(projection.id) ?? [],
         displayName: projection.displayName,
         description: projection.description,
         kind: projection.target._tag === "Package" ? "Standalone" : "SpeculativePair",

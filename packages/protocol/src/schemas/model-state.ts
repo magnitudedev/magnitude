@@ -63,6 +63,16 @@ export type ModelPackageId = typeof ModelPackageIdSchema.Type
 export const DownloadAttemptIdSchema = NonEmptyString.pipe(Schema.brand("DownloadAttemptId"))
 export type DownloadAttemptId = typeof DownloadAttemptIdSchema.Type
 
+export const ModelDownloadStageSchema = Schema.Literal(
+  "queued",
+  "resolving",
+  "checking_space",
+  "downloading",
+  "verifying",
+  "publishing",
+)
+export type ModelDownloadStage = typeof ModelDownloadStageSchema.Type
+
 export const SpeculativeDecodingPairIdSchema =
   NonEmptyString.pipe(Schema.brand("SpeculativeDecodingPairId"))
 export type SpeculativeDecodingPairId = typeof SpeculativeDecodingPairIdSchema.Type
@@ -211,8 +221,10 @@ export const ModelPackageLocalStateSchema = Schema.Union(
   Schema.TaggedStruct("NotInstalled", {}),
   Schema.TaggedStruct("Downloading", {
     attemptId: DownloadAttemptIdSchema,
+    stage: ModelDownloadStageSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
+    bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Installed", { path: NonEmptyString }),
 )
@@ -239,8 +251,10 @@ export const DownloadAttemptSchema = Schema.Union(
   Schema.TaggedStruct("Downloading", {
     id: DownloadAttemptIdSchema,
     packageId: ModelPackageIdSchema,
+    stage: ModelDownloadStageSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
+    bytesPerSecond: Schema.NullOr(NonNegativeSafeInteger),
   }),
   Schema.TaggedStruct("Completed", {
     id: DownloadAttemptIdSchema,
@@ -366,8 +380,10 @@ export const LocalModelDownloadSchema = Schema.Union(
     totalBytes: NonNegativeSafeInteger,
   }),
   Schema.TaggedStruct("Downloading", {
+    stage: ModelDownloadStageSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
+    bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Failed", {
     completedBytes: NonNegativeSafeInteger,
@@ -396,6 +412,7 @@ export type LocalModelPreparation = typeof LocalModelPreparationSchema.Type
 export const LocalModelSchema = Schema.Struct({
   id: ModelOfferingTargetIdSchema,
   catalogCandidateIds: Schema.Array(CatalogCandidateIdSchema),
+  providerModelIds: Schema.Array(ProviderModelIdSchema),
   displayName: NonEmptyString,
   description: Schema.String,
   kind: Schema.Literal("Standalone", "SpeculativePair"),
@@ -419,6 +436,7 @@ export type LocalModelCatalogPreparation = typeof LocalModelCatalogPreparationSc
 
 export const LocalModelCatalogCandidateSchema = Schema.Struct({
   id: CatalogCandidateIdSchema,
+  providerModelId: ProviderModelIdSchema,
   displayName: NonEmptyString,
   description: Schema.String,
   license: NonEmptyString,

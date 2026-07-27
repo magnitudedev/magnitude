@@ -1,4 +1,4 @@
-import { Effect, ParseResult, Schema } from "effect"
+import { Effect, Option, ParseResult, Schema } from "effect"
 import type {
   DownloadAttempt,
   ModelOfferingTarget,
@@ -73,7 +73,12 @@ export const recommendableModelFromIcn = (
 export const downloadAttemptFromIcn = (
   attempt: NativeDownloadAttempt,
 ): Effect.Effect<DownloadAttempt, ParseResult.ParseError> =>
-  Schema.validate(DownloadAttemptSchema)(attempt)
+  Schema.validate(DownloadAttemptSchema)(attempt._tag === "Downloading"
+    ? {
+        ...attempt,
+        bytesPerSecond: Option.getOrNull(attempt.bytesPerSecond),
+      }
+    : attempt)
 
 export const targetToIcn = (
   target: ModelOfferingTarget,

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use crate::{InventoryError, ResolvedModel};
+use crate::{DownloadStage, InventoryError, ResolvedModel};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -503,8 +503,10 @@ pub enum DownloadAttempt {
     Downloading {
         id: DownloadAttemptId,
         package_id: ModelPackageId,
+        stage: DownloadStage,
         completed_bytes: u64,
         total_bytes: u64,
+        bytes_per_second: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
     Completed {
