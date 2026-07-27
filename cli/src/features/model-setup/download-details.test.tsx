@@ -77,7 +77,7 @@ test("shows compact download details with progress, rate, and ETA", async () => 
     const frame = view.captureCharFrame()
     expect(frame).toContain("Downloading Qwen Test · Q6_K")
     expect(frame).toContain("63%")
-    expect(frame).toContain("19 GB / 30 GB")
+    expect(frame).toContain("20.4 GB / 32.2 GB")
     expect(frame).toContain("48 MB/s · about 4 minutes remaining")
     expect(frame).toContain("Cancel (Esc)")
   } finally {

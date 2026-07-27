@@ -17,6 +17,7 @@ import {
   describeLocalHardware,
   describeLocalHardwareSummary,
   describeResidentModel,
+  formatDownloadBytes,
   localInferenceSetupPhase,
   localInferenceProgressLines,
   selectionCapacityWarning,
@@ -29,6 +30,10 @@ describe("local inference onboarding presentation", () => {
     _tag: "Loading" as const,
     progress: [],
   }
+
+  it("formats model artifacts in decimal gigabytes", () => {
+    expect(formatDownloadBytes(73_395_172_000)).toBe("73.4 GB")
+  })
 
   it("keeps onboarding in discovery while recommendations are loading", () => {
     const view = makeView()
