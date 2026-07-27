@@ -321,6 +321,8 @@ fn calibration_evidence(snapshot: &HardwareSnapshot) -> Result<String, Inventory
         &snapshot.topology_fingerprint,
         &snapshot.platform,
         &snapshot.architecture,
+        sysinfo::System::long_os_version(),
+        sysinfo::System::kernel_long_version(),
     ))
     .map_err(|error| InventoryError::Internal(error.to_string()))
 }
@@ -558,6 +560,20 @@ impl NativeHardwareAssessor {
                 && let Some(evidence) = guard.evidence.as_deref()
                 && let Some(cache) = &self.cache
             {
+                let stable_metrics = value.metrics.iter().filter(|metric| metric.stable).count();
+                let total_samples = value
+                    .metrics
+                    .iter()
+                    .map(|metric| u64::from(metric.sample_count))
+                    .sum::<u64>();
+                tracing::info!(
+                    method = value.method,
+                    elapsed_microseconds = value.elapsed_microseconds,
+                    metrics = value.metrics.len(),
+                    stable_metrics,
+                    total_samples,
+                    "hardware calibration completed"
+                );
                 cache.write_index(
                     ModelIndexKind::Calibration,
                     evidence,

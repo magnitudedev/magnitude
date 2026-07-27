@@ -1,8 +1,8 @@
 {
   "sourceDigest": "fb73105ad51ad347a9c5a0bf73a0d058cbda3474f3d41c4f4c98c6de72abe483",
   "templateIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
-  "plannerIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v1",
-  "plannerBundleDigest": "29a026ff65c95bb538330453d7c9e7ee46dd3b50f38e9bba61e4b5129c9e3a95",
+  "plannerIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v2",
+  "plannerBundleDigest": "6eba3edeeef9e9ce52c3b8ed920bec423b9a0ff9adf963abb33f401aa2abce5f",
   "plannerArtifacts": [
     {
       "targetId": "target_7e29bbf4930748686de85c45afadbddfaeae7266cc1c4894a7d67fed7bcd1079",
@@ -1577,9 +1577,9 @@
       ]
     },
     {
-      "targetId": "target_3db0a66a1114359f7130447eb5f84c21d091b55736bb37c4d9a06ad59f592c0c",
-      "modelId": "mdl_c486ec3ab4e5e002dea3ec519147a13efee37168915ca6252ee268ebbd14f85f",
-      "contentId": "content_424d6d2e7954f213fbf2e5febba08a87af6da2e9f03290ed62543c50b4ae2a01",
+      "targetId": "target_cac2636d5b019d1d9537fde503758c5f315c7f424e2bd04d50cb105bee8a0b6d",
+      "modelId": "mdl_45e4f473b1b7b570a849eb815a085d3cd86d1b82a5e08ceda07b1fdf34dd4c73",
+      "contentId": "content_9afd232bbb54585945ae79ee5ac5410a0263254be8c8bca569c60becdcd7e719",
       "name": "Laguna S 2.1",
       "supportedParameters": [
         "tools",
@@ -1592,7 +1592,7 @@
         "quantization_name": "8-bit",
         "parameter_count": 117561977600,
         "active_parameter_count": null,
-        "training_context_length": 262144,
+        "training_context_length": 1048576,
         "tokenizer": "gpt2",
         "modalities": [
           "text"
@@ -1632,8 +1632,8 @@
       "source": {
         "type": "hugging_face",
         "repository": "poolside/Laguna-S-2.1-GGUF",
-        "requested_revision": "edd093522473dc7313b0738d8b4116b7f8b9745f",
-        "commit": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+        "requested_revision": "fc4e481289523cf7d0df668da6d1d391616141ca",
+        "commit": "fc4e481289523cf7d0df668da6d1d391616141ca"
       },
       "primaryGguf": "laguna-s-2.1-Q4_K_M.gguf",
       "components": [
@@ -1641,21 +1641,21 @@
           "component": {
             "path": "laguna-s-2.1-Q4_K_M.gguf",
             "role": "weights",
-            "size_bytes": 68248760064,
+            "size_bytes": 96031829760,
             "content": {
               "type": "sha256",
-              "value": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
+              "value": "a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4"
             },
             "shard_index": null
           },
-          "headerDigest": "0701893576fd857c9904379f213e2680d4c2543e4f9952715339daa07f12cf0a",
+          "headerDigest": "1380f60e1e8266b0d5a3d094de53a9e274634d33b8b7ee6ae73841a4dec9c228",
           "headerSizeBytes": 3734272
         }
       ]
     },
     {
       "targetId": "target_4616d1df5e81f856355f2e9b05589bbf7bd053a2bb42976b2dce59d88af151a0",
-      "modelId": "mdl_baed15125b791b21bde80b0ce4d603f13918ddb2cbdb6c090e2fb7fcc2833679",
+      "modelId": "mdl_8588684df9027ecf967da18901ae10d16ad5507ef6f162f65e1cb5884d39c034",
       "contentId": "content_434ae6f0d8193cefeb43ffa969b92845a0b8159c92664454cc2fb95ca17223ef",
       "name": "Laguna S 2.1",
       "supportedParameters": [
@@ -1709,8 +1709,8 @@
       "source": {
         "type": "hugging_face",
         "repository": "poolside/Laguna-S-2.1-GGUF",
-        "requested_revision": "edd093522473dc7313b0738d8b4116b7f8b9745f",
-        "commit": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+        "requested_revision": "fc4e481289523cf7d0df668da6d1d391616141ca",
+        "commit": "fc4e481289523cf7d0df668da6d1d391616141ca"
       },
       "primaryGguf": "laguna-s-2.1-Q8_0.gguf",
       "components": [
@@ -4187,23 +4187,23 @@
       {
         "id": "laguna-s-2.1:Q4_K_M",
         "checkpointId": "laguna-s-2.1",
-        "targetId": "target_3db0a66a1114359f7130447eb5f84c21d091b55736bb37c4d9a06ad59f592c0c",
+        "targetId": "target_cac2636d5b019d1d9537fde503758c5f315c7f424e2bd04d50cb105bee8a0b6d",
         "target": {
           "_tag": "Package",
           "package": {
-            "id": "package_99a17b8f2fdd7535a8f61e16762f1a71a13e806f9f6dabd29d1f7bb7585fef9f",
+            "id": "package_548bc06bf66c0d687508f065adc59913cf9c4b2c5c8abf98a81adf09b7d086d3",
             "source": {
               "_tag": "HuggingFace",
               "repository": "poolside/Laguna-S-2.1-GGUF",
-              "revision": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+              "revision": "fc4e481289523cf7d0df668da6d1d391616141ca"
             },
             "files": [
               {
-                "id": "file_a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff",
+                "id": "file_a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4",
                 "path": "laguna-s-2.1-Q4_K_M.gguf",
                 "role": "weights",
-                "sizeBytes": 68248760064,
-                "sha256": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
+                "sizeBytes": 96031829760,
+                "sha256": "a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4"
               }
             ],
             "relationships": [],
@@ -4212,7 +4212,7 @@
               "quantization": "Q8_0",
               "quantizationName": "8-bit",
               "architecture": "laguna",
-              "maximumContextLength": 262144
+              "maximumContextLength": 1048576
             }
           }
         },
@@ -4261,7 +4261,7 @@
             "source": {
               "_tag": "HuggingFace",
               "repository": "poolside/Laguna-S-2.1-GGUF",
-              "revision": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+              "revision": "fc4e481289523cf7d0df668da6d1d391616141ca"
             },
             "files": [
               {
