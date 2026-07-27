@@ -157,25 +157,23 @@ export const formatContext = (tokens: number): string => tokens < 1_000
     : `${Math.round(tokens / 1_000)}K`
 
 const progressLabel = (
-  id: LocalModelRecommendationProgressStep["id"],
+  step: LocalModelRecommendationProgressStep,
   completed: boolean,
 ): string => {
-  if (id === "hardware") return completed ? "Detected hardware" : "Detecting your hardware"
-  if (id === "inventory") {
-    return completed ? "Checked for downloaded models" : "Checking for downloaded models"
+  if (step.id === "hardware") return completed ? "Detected hardware" : "Detecting hardware"
+  if (step.id === "inventory") {
+    if (!completed) return "Checking downloaded models"
+    const count = Option.getOrElse(step.completedItems, () => 0)
+    return `Found ${count} downloaded ${count === 1 ? "model" : "models"}`
   }
-  if (id === "catalog") {
-    return completed
-      ? "Loaded curated Hugging Face model details"
-      : "Loading curated Hugging Face model details"
+  if (step.id === "analysis") {
+    if (!completed) return "Evaluating models for this machine"
+    const count = Option.getOrElse(step.completedItems, () => 0)
+    return `Evaluated ${count} models for this machine`
   }
-  if (id === "metadata") {
-    return completed ? "Prepared model details" : "Preparing model details"
-  }
-  if (id === "assessment") {
-    return completed ? "Evaluated models for this machine" : "Evaluating models for this machine"
-  }
-  return completed ? "Prepared recommendations" : "Choosing recommendations"
+  if (!completed) return "Preparing recommendations"
+  const count = Option.getOrElse(step.completedItems, () => 0)
+  return `Prepared ${count} recommendations`
 }
 
 const formatDurationMs = (durationMs: number): string => durationMs < 1_000
@@ -193,26 +191,30 @@ export interface LocalInferenceProgressLine {
 
 export const localInferenceProgressLines = (
   steps: readonly LocalModelRecommendationProgressStep[],
-  nowMs: number,
 ): readonly LocalInferenceProgressLine[] => steps.map((step) => {
   const completed = step.status._tag === "Completed"
-  const label = progressLabel(step.id, completed)
-  const count = Option.match(step.totalItems, {
+  const label = progressLabel(step, completed)
+  const showCount = step.id === "analysis" && step.status._tag === "Running"
+  const count = showCount ? Option.match(step.totalItems, {
     onNone: () => "",
     onSome: (total) => Option.match(step.completedItems, {
       onNone: () => ` · ${total}`,
       onSome: (value) => ` · ${value}/${total}`,
     }),
-  })
+  }) : ""
   if (step.status._tag === "Pending") {
     return { id: step.id, state: "pending", label, metadata: "" }
   }
   if (step.status._tag === "Running") {
+    const estimate = Option.match(step.estimatedRemainingMs, {
+      onNone: () => "",
+      onSome: (remainingMs) => ` · about ${formatDurationMs(remainingMs)} left`,
+    })
     return {
       id: step.id,
       state: "running",
       label,
-      metadata: `${count} · ${formatDurationMs(Math.max(0, nowMs - step.status.startedAtMs))}`,
+      metadata: `${count}${estimate}`,
     }
   }
   if (step.status._tag === "Failed") {
@@ -227,7 +229,9 @@ export const localInferenceProgressLines = (
     id: step.id,
     state: "completed",
     label,
-    metadata: `${count}${step.status.cached ? " · cached" : ` · ${formatDurationMs(step.status.durationMs)}`}`,
+    metadata: step.id === "analysis" && !step.status.cached
+      ? ` · ${formatDurationMs(step.status.durationMs)}`
+      : "",
   }
 })
 

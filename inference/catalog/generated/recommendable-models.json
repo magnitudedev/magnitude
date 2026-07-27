@@ -1,0 +1,5391 @@
+{
+  "sourceDigest": "fb73105ad51ad347a9c5a0bf73a0d058cbda3474f3d41c4f4c98c6de72abe483",
+  "templateIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
+  "plannerIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v1",
+  "plannerBundleDigest": "29a026ff65c95bb538330453d7c9e7ee46dd3b50f38e9bba61e4b5129c9e3a95",
+  "plannerArtifacts": [
+    {
+      "targetId": "target_7e29bbf4930748686de85c45afadbddfaeae7266cc1c4894a7d67fed7bcd1079",
+      "modelId": "mdl_1d4e2697f8013596b39695960b0b3646e7913e96073e4606952ff7673483ea8a",
+      "contentId": "content_7f5031a196517efae59b23934463a378e52e73afcf122ecdd6ba383db03e079f",
+      "name": "Qwen3.5-4B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q4_K - Medium",
+        "quantization_name": "4-bit",
+        "parameter_count": 4205751296,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 4B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:134b98bf660002088b539b46c89b88876663783398d3e7860060f5f3ac50cda3+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-4B-GGUF",
+        "requested_revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+        "commit": "e87f176479d0855a907a41277aca2f8ee7a09523"
+      },
+      "primaryGguf": "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 2912109728,
+            "content": {
+              "type": "sha256",
+              "value": "b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "e3b1b60d1bf94ce11f80233347afe1b01153fa1e94cf6f1e2795da5edc9bb6c0",
+          "headerSizeBytes": 10968224
+        }
+      ]
+    },
+    {
+      "targetId": "target_5fa8be7db0e00521469cdb7a5e8f8687350e3164224a89d3dd5541d33f56a51e",
+      "modelId": "mdl_90453dca3d2168c3e24fd12da4374e14123018f0b802831a07729385c18cfb1c",
+      "contentId": "content_050781b89a05e56226d91bcf31be2750a750db2e51cd1e61893258e6623abd99",
+      "name": "Qwen3.5-4B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q5_K - Medium",
+        "quantization_name": "5-bit",
+        "parameter_count": 4205751296,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 4B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:134b98bf660002088b539b46c89b88876663783398d3e7860060f5f3ac50cda3+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-4B-GGUF",
+        "requested_revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+        "commit": "e87f176479d0855a907a41277aca2f8ee7a09523"
+      },
+      "primaryGguf": "Qwen3.5-4B-UD-Q5_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-4B-UD-Q5_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 3250869408,
+            "content": {
+              "type": "sha256",
+              "value": "b4c36a8e14a80c21bcab5a067ce342b2e70e28f60b4aa95ad12203fa17b87426"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "3737c3627401d2932f59c5525d774b8dd7d2e9658e7f5d52022914ed4fecab96",
+          "headerSizeBytes": 10968224
+        }
+      ]
+    },
+    {
+      "targetId": "target_d8e06ab0b45064219dd4a9866f8aaa573f86dc451570d78b7b1a9ea1009ec112",
+      "modelId": "mdl_a1600e035de31e854f6aa122e0884aa67b88cede60ccffebcdf8c49dd128c550",
+      "contentId": "content_508d935146ba950e100a5f6ac03e40d0c0e34a2181e4a5fd5024ddb319ea4041",
+      "name": "Qwen3.5-4B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q6_K",
+        "quantization_name": "6-bit",
+        "parameter_count": 4205751296,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 4B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:134b98bf660002088b539b46c89b88876663783398d3e7860060f5f3ac50cda3+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-4B-GGUF",
+        "requested_revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+        "commit": "e87f176479d0855a907a41277aca2f8ee7a09523"
+      },
+      "primaryGguf": "Qwen3.5-4B-UD-Q6_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-4B-UD-Q6_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 4145548448,
+            "content": {
+              "type": "sha256",
+              "value": "87f58d94410b81429268d8389a3d686e6c6bffecf7852772720fbea059cbbb9d"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "93f6529142eaa5c823dc19b3b44d4683a76caecd998a37e096c4e4ff6b1d13cc",
+          "headerSizeBytes": 10968224
+        }
+      ]
+    },
+    {
+      "targetId": "target_b3fad6a1848e76245f2ef2e2c266ec3a4170578d69857657433410bd45ce1b5c",
+      "modelId": "mdl_1a62e489433c294210fcf1a6e00851600d0e69c2d81cd62f7d784589ab689d5d",
+      "contentId": "content_f2baf2b7b7e0886dbc84eba8f6f09cce234d901668fb3318174620fd4446ab7e",
+      "name": "Qwen3.5-4B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q8_0",
+        "quantization_name": "8-bit",
+        "parameter_count": 4205751296,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 4B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:134b98bf660002088b539b46c89b88876663783398d3e7860060f5f3ac50cda3+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-4B-GGUF",
+        "requested_revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+        "commit": "e87f176479d0855a907a41277aca2f8ee7a09523"
+      },
+      "primaryGguf": "Qwen3.5-4B-UD-Q8_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-4B-UD-Q8_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 5952048288,
+            "content": {
+              "type": "sha256",
+              "value": "e786a3c6570474c3885199bfb5adc54325aa7521a314e10b0aaefe16a54ba42f"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "2dc833f51fa6ccce725708127dfe8a4dbad8f1ce618f2cd21cb9f91048107faa",
+          "headerSizeBytes": 10968224
+        }
+      ]
+    },
+    {
+      "targetId": "target_0ebd756e79262f1ba507f8a531e965f91fccb812c18da47a5e4dac4c91c984fb",
+      "modelId": "mdl_92164ca61ce43fabcf654dcc07c5e4fe705c1a2ffff4be8d517243b8d5bbd947",
+      "contentId": "content_80ab56273185772bdb5fad99ab8e3ea3ae46a7a1068f1d981626530ffc790c75",
+      "name": "Qwen3.5-9B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q4_K - Medium",
+        "quantization_name": "4-bit",
+        "parameter_count": 8953803264,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 9B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:17338d4062d2015d69a0e2eb1f47a9e9fa68b8f7d26fb73647fca8d44e022c83+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-9B-GGUF",
+        "requested_revision": "3885219b6810b007914f3a7950a8d1b469d598a5",
+        "commit": "3885219b6810b007914f3a7950a8d1b469d598a5"
+      },
+      "primaryGguf": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 5966095584,
+            "content": {
+              "type": "sha256",
+              "value": "6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "38c057330bbdb42d5092128536075db28df4f908ac8049c036ff11b3df1a22b0",
+          "headerSizeBytes": 10968288
+        }
+      ]
+    },
+    {
+      "targetId": "target_4564bc6fdad936fc9f0cb30fe17b142f5a4a7fa6f35b3b8ebdaaad52b80228dc",
+      "modelId": "mdl_c7a924d34244c42f78a4b609c486be15d4615a38a793e731f0ac956e67d83efd",
+      "contentId": "content_926d2957f3cd868c85058282ac5103cc3f2426a8f3b34645396d14bc2e45ba6c",
+      "name": "Qwen3.5-9B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q5_K - Medium",
+        "quantization_name": "5-bit",
+        "parameter_count": 8953803264,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 9B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:17338d4062d2015d69a0e2eb1f47a9e9fa68b8f7d26fb73647fca8d44e022c83+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-9B-GGUF",
+        "requested_revision": "3885219b6810b007914f3a7950a8d1b469d598a5",
+        "commit": "3885219b6810b007914f3a7950a8d1b469d598a5"
+      },
+      "primaryGguf": "Qwen3.5-9B-UD-Q5_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-9B-UD-Q5_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 6743680224,
+            "content": {
+              "type": "sha256",
+              "value": "96cf42ddb97f9572410a72b9ed6f2299b1e887ee08da4c2a6c01e897cfa9f673"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "95d3729f785626a251ee19a228834928ac98c24e095172d739eb8249a52474e4",
+          "headerSizeBytes": 10968288
+        }
+      ]
+    },
+    {
+      "targetId": "target_6677dc9406580917535cce2941d7c4b04967b7b0f103ecc5267d83160ee316da",
+      "modelId": "mdl_b231fb70da24188f4490a060aa2b6589162b0d5a7146813650896335087055ce",
+      "contentId": "content_e8a6ab93e26b840446edf4e823b1d5858dd88dfe717bce4c99217938a2613ba9",
+      "name": "Qwen3.5-9B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q6_K",
+        "quantization_name": "6-bit",
+        "parameter_count": 8953803264,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 9B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:17338d4062d2015d69a0e2eb1f47a9e9fa68b8f7d26fb73647fca8d44e022c83+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-9B-GGUF",
+        "requested_revision": "3885219b6810b007914f3a7950a8d1b469d598a5",
+        "commit": "3885219b6810b007914f3a7950a8d1b469d598a5"
+      },
+      "primaryGguf": "Qwen3.5-9B-UD-Q6_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-9B-UD-Q6_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 8756929760,
+            "content": {
+              "type": "sha256",
+              "value": "33b0050fb9c19abcf815647a78464dad959a06dadaecb0b96af798669f9074d4"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "21f71f5e9b1b4a718e61b62d7a9629816704d5791025eafef526aa50da0c23be",
+          "headerSizeBytes": 10968288
+        }
+      ]
+    },
+    {
+      "targetId": "target_c40f4a82b463ac99eeadf1dbbbe5cf584a3d03b263d54c0385496665eaeed68e",
+      "modelId": "mdl_9ba3ea5f444c419c3b1f02e53e9117c5e7b66382559cf29525c26d3d2d3e19d3",
+      "contentId": "content_0cca097cae95838a80f0671d8e7b44a47f61e74f6207aa66a0f6f5c51a0ff1d3",
+      "name": "Qwen3.5-9B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q8_0",
+        "quantization_name": "8-bit",
+        "parameter_count": 8953803264,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 9B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          }
+        },
+        "evidence_fingerprint": "sha256:17338d4062d2015d69a0e2eb1f47a9e9fa68b8f7d26fb73647fca8d44e022c83+sha256:7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-9B-GGUF",
+        "requested_revision": "3885219b6810b007914f3a7950a8d1b469d598a5",
+        "commit": "3885219b6810b007914f3a7950a8d1b469d598a5"
+      },
+      "primaryGguf": "Qwen3.5-9B-UD-Q8_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.5-9B-UD-Q8_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 12974040288,
+            "content": {
+              "type": "sha256",
+              "value": "2c4e08e0e72c68d8c1835a26f5be4075894df9ea5be9cc20a246517afd6a0cb6"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "d6f66701a4bb5138c2cd197855ed3f96e800e1ce3fe0f2f4edf839ae84e26820",
+          "headerSizeBytes": 10968288
+        }
+      ]
+    },
+    {
+      "targetId": "target_f2703c6c355ee8665611e6c3d498c8988960cefbc779247984c5be89eb8e9e79",
+      "modelId": "mdl_38380ac1ce4c9f9a3cf7b06bc5e681bcca0a7052faa6c7d74878a7564cd14a96",
+      "contentId": "content_5fbd1f373228c712b45f9c7e0a6d67fb8831f1c65c294b21723b585535b674e1",
+      "name": "Qwen3.6-27B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q4_K - Medium",
+        "quantization_name": "4-bit",
+        "parameter_count": 26895998464,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 27B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:f30298e3bc109e1e0d2bc2308e782ded02aacc32e76260b7ecdaba64e13761d3+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-27B-GGUF",
+        "requested_revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
+        "commit": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+      },
+      "primaryGguf": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 17612564704,
+            "content": {
+              "type": "sha256",
+              "value": "ff6941ded525b34eb159496762c29dd0ec6e71dc31b74d57e75d871a03eec259"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "554cca37a35a1143dd75edc0451b344cb81e518c7a780e6ba5d972d588e7d21e",
+          "headerSizeBytes": 10993888
+        }
+      ]
+    },
+    {
+      "targetId": "target_7bd54747394f3daa2443138a80e3ff55696bd3ad123f0cee1a8a4f3ad331bf8a",
+      "modelId": "mdl_43847a2e98c4f1e00dd15294868823da9be9618e925f1cd134dd38c61e36bf45",
+      "contentId": "content_71f6fbc79dc7f40451b9f6e4173fe31a6bf06fcd6b4ca316daeb3135ff3406c9",
+      "name": "Qwen3.6-27B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q5_K - Medium",
+        "quantization_name": "5-bit",
+        "parameter_count": 26895998464,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 27B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:f30298e3bc109e1e0d2bc2308e782ded02aacc32e76260b7ecdaba64e13761d3+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-27B-GGUF",
+        "requested_revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
+        "commit": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+      },
+      "primaryGguf": "Qwen3.6-27B-UD-Q5_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-27B-UD-Q5_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 20038256864,
+            "content": {
+              "type": "sha256",
+              "value": "ac310abf2895aa397121bad6c0be89466af41f0f1606a21c1131b110eeb19d0e"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "18122c29e92f4c4e7279238a2e1b90989658c3f69678a03c8d927a972e12d85a",
+          "headerSizeBytes": 10993888
+        }
+      ]
+    },
+    {
+      "targetId": "target_735f5b65523d21f521737b3b0705ccd9f28bb707e475083d63ac7c8b518a18c7",
+      "modelId": "mdl_45003b6c826cae22afddb60be1e289be9f9aab70da52c6a5d7d21ed42f2c9e47",
+      "contentId": "content_8db65a89fea26eb1e633c53c43828104dc0e07fa91a12c2060f40410e361566a",
+      "name": "Qwen3.6-27B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q6_K",
+        "quantization_name": "6-bit",
+        "parameter_count": 26895998464,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 27B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:f30298e3bc109e1e0d2bc2308e782ded02aacc32e76260b7ecdaba64e13761d3+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-27B-GGUF",
+        "requested_revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
+        "commit": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+      },
+      "primaryGguf": "Qwen3.6-27B-UD-Q6_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-27B-UD-Q6_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 25636485344,
+            "content": {
+              "type": "sha256",
+              "value": "8746881d40f280b1b6b858c656a347c754ed3d9cc8d2e1ad46b3635b87f611f8"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "f538250359991c7385070d42ff8988a179e50233226bbd1a1ca5e5868fa2ddeb",
+          "headerSizeBytes": 10993888
+        }
+      ]
+    },
+    {
+      "targetId": "target_ebae4a73d54c40a9bf5ecd8e07bc8ed0217ed873f659dea9d8425d7ba5b825c0",
+      "modelId": "mdl_649c64425d024487f993951ed8873cbba62d7040db6635d8e3057599b2c2e6ac",
+      "contentId": "content_7ae4c1edc182ffb830cfd3c0afbf7663bcef8feaf39b4537f8b08a58125901a6",
+      "name": "Qwen3.6-27B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35",
+        "quantization": "Q8_0",
+        "quantization_name": "8-bit",
+        "parameter_count": 26895998464,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 27B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:f30298e3bc109e1e0d2bc2308e782ded02aacc32e76260b7ecdaba64e13761d3+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-27B-GGUF",
+        "requested_revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
+        "commit": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+      },
+      "primaryGguf": "Qwen3.6-27B-UD-Q8_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-27B-UD-Q8_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 35325163744,
+            "content": {
+              "type": "sha256",
+              "value": "19a2f4733a863088bc06665bf307dca95f7d4370b4d8690340cdff9992fe48c6"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "d06a375a8d75f8b700385e380bc9cfe7e7e83175dd90faf600c11c0ff89db329",
+          "headerSizeBytes": 10993888
+        }
+      ]
+    },
+    {
+      "targetId": "target_6602121fa5fa148c28eff6d2b9ccc517d488910a54c6cbfc2de53777b9d1589d",
+      "modelId": "mdl_c4deb7f23d063a2e4d3d306bc126d2a9dde9b05e49aa60c5e9dc93ae6386cbe9",
+      "contentId": "content_25707270496ce4192b25a682e2fa0eb9e5753f36c5945199bc460cf07f670c95",
+      "name": "Qwen3.6-35B-A3B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35moe",
+        "quantization": "Q4_K - Medium",
+        "quantization_name": "4-bit",
+        "parameter_count": 34660610688,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 35B A3B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:978753040c505b5c96be5b49705dfc7a385e0e57c0543b3918a3acec70a28aa6+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "requested_revision": "a483e9e6cbd595906af30beda3187c2663a1118c",
+        "commit": "a483e9e6cbd595906af30beda3187c2663a1118c"
+      },
+      "primaryGguf": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 22360456160,
+            "content": {
+              "type": "sha256",
+              "value": "707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "f7bda52ef2489389a9dd1f5da6e00253a8ede822d7f7d0967c2fd134f0f6bb2c",
+          "headerSizeBytes": 10990048
+        }
+      ]
+    },
+    {
+      "targetId": "target_2a07211159e82f78f7510515a1c5cdc15b7eefc66a3e29cf3eaeb575a368eb0e",
+      "modelId": "mdl_c25106b493169a12ba9d33d71eb8effe50d377f8fab4cc4789d72fa58c237c5d",
+      "contentId": "content_73c0b3e5fc6c510405cdae89d6766f1cd7355f309e37309491dd57038ea6b452",
+      "name": "Qwen3.6-35B-A3B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35moe",
+        "quantization": "Q5_K - Medium",
+        "quantization_name": "5-bit",
+        "parameter_count": 34660610688,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 35B A3B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:978753040c505b5c96be5b49705dfc7a385e0e57c0543b3918a3acec70a28aa6+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "requested_revision": "a483e9e6cbd595906af30beda3187c2663a1118c",
+        "commit": "a483e9e6cbd595906af30beda3187c2663a1118c"
+      },
+      "primaryGguf": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 26592508896,
+            "content": {
+              "type": "sha256",
+              "value": "25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "96c357b0c439dfa64761fd5b26ce95b6033cef22a1798de4f976df819ede93a3",
+          "headerSizeBytes": 10990048
+        }
+      ]
+    },
+    {
+      "targetId": "target_69a25374e3b85a59a433930ae7caec08910b4ca9e80d1e1f61b59334563fe11f",
+      "modelId": "mdl_42b6c7b7eb532acdc74ba734376321d5f31cff166e717dab381cdfdab03ec502",
+      "contentId": "content_2193138ac8f14630593c93aae1bb223919291150d3abdd4380f25599e8a03eea",
+      "name": "Qwen3.6-35B-A3B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35moe",
+        "quantization": "Q6_K",
+        "quantization_name": "6-bit",
+        "parameter_count": 34660610688,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 35B A3B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:978753040c505b5c96be5b49705dfc7a385e0e57c0543b3918a3acec70a28aa6+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "requested_revision": "a483e9e6cbd595906af30beda3187c2663a1118c",
+        "commit": "a483e9e6cbd595906af30beda3187c2663a1118c"
+      },
+      "primaryGguf": "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 31843777504,
+            "content": {
+              "type": "sha256",
+              "value": "f6b6c6d5cfa6f00d964eeb7add28eb14ce7481734d506b90681007678cd2c484"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "82704c8de0755b87550202fe892ca23cd6b8fb3fc4c682e0672993b0ab14fe3c",
+          "headerSizeBytes": 10990048
+        }
+      ]
+    },
+    {
+      "targetId": "target_24cfa6959503d454a26ff04c78d1beb88edec994214f8690f9f0ed22391aaf39",
+      "modelId": "mdl_3ef6251d7fdc52cef13474d1c3a78893484b4e30d4d734b4eedf0c57f4e95617",
+      "contentId": "content_fe21d041c1ccffa811495a41b0d881e26cb3bdddfdb027684ef6d5fbc7461216",
+      "name": "Qwen3.6-35B-A3B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35moe",
+        "quantization": "Q8_0",
+        "quantization_name": "8-bit",
+        "parameter_count": 34660610688,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.6 35B A3B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          }
+        },
+        "evidence_fingerprint": "sha256:978753040c505b5c96be5b49705dfc7a385e0e57c0543b3918a3acec70a28aa6+sha256:55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "requested_revision": "a483e9e6cbd595906af30beda3187c2663a1118c",
+        "commit": "a483e9e6cbd595906af30beda3187c2663a1118c"
+      },
+      "primaryGguf": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 38451182560,
+            "content": {
+              "type": "sha256",
+              "value": "b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "8b778b769e9ac21808015ea68b07cb98b91f6567408a586e4a2ff91d4756f5e1",
+          "headerSizeBytes": 10990048
+        }
+      ]
+    },
+    {
+      "targetId": "target_0c3786ab9a4be510555153269fcdafb71324803f43f958a4b066181c5b37ad3d",
+      "modelId": "mdl_01b292c91cc95c679ab6e1da06c398cc8998149c4bf6fbc02894fa41db077f86",
+      "contentId": "content_1276efdaaa248da498d7ff914196df893af3b287e917179486ae75cf025526c7",
+      "name": "Gemma-4 E2B IT (smart Q4_0, QAT-lossless)",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "gemma4",
+        "quantization": "Q4_0",
+        "quantization_name": "4-bit",
+        "parameter_count": 4628569635,
+        "active_parameter_count": null,
+        "training_context_length": 131072,
+        "tokenizer": "gemma4",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<|channel>thought",
+            "end": "<channel|>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:74a88f94c57c14e22dcdbe08e94127f42b87c6f584cb73838e73e32126f3f6b3"
+          }
+        },
+        "evidence_fingerprint": "sha256:2841be01d308b6443b675c0aced363ad5debc2b298859e0f3b0188c81a037d39+sha256:74a88f94c57c14e22dcdbe08e94127f42b87c6f584cb73838e73e32126f3f6b3"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
+        "requested_revision": "66a399f68ddd113b06dff02fca9523e55465d11d",
+        "commit": "66a399f68ddd113b06dff02fca9523e55465d11d"
+      },
+      "primaryGguf": "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 2620370976,
+            "content": {
+              "type": "sha256",
+              "value": "e531007218dfab990486a5de7676a6932d6ea8dea233d1f698d7c21cf8a16889"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "32ecff53daaba25c1fc6454d682469228ae4202961b34467b6ec95a2c217b124",
+          "headerSizeBytes": 15815616
+        }
+      ]
+    },
+    {
+      "targetId": "target_37b896518b64d4bd12bd37785b54890d703f6cf8aecdf32bc35010cfa94d735c",
+      "modelId": "mdl_edf378a8f3f87fae99018dc8f89e61ce90800491c3e1d9f0b897fdb51a1915c6",
+      "contentId": "content_903e6bff71784ff546fbe7a87cb6535defbae49991fe7dd843bf173e3f5c8547",
+      "name": "Gemma-4 12B IT (smart Q4_0, QAT-lossless)",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "gemma4",
+        "quantization": "Q4_0",
+        "quantization_name": "4-bit",
+        "parameter_count": 11907350576,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gemma4",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<|channel>thought",
+            "end": "<channel|>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:aa3185dfc65051046349995de1cfc2fbb275491b9a3832b71595f1ff5b31d61b"
+          }
+        },
+        "evidence_fingerprint": "sha256:c019d663b5aa465725e3c3d2101214503c00fac0d830ad7cd3ba7e5516226739+sha256:aa3185dfc65051046349995de1cfc2fbb275491b9a3832b71595f1ff5b31d61b"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/gemma-4-12B-it-qat-GGUF",
+        "requested_revision": "980b060c40a8539ac159e0501a3e0f66a6365af3",
+        "commit": "980b060c40a8539ac159e0501a3e0f66a6365af3"
+      },
+      "primaryGguf": "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 6716356800,
+            "content": {
+              "type": "sha256",
+              "value": "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "3fc9665c2654f09cfde2bd4c5050c9cfe0c6c16328b5dbfbe99162d418ec0eb1",
+          "headerSizeBytes": 15823552
+        }
+      ]
+    },
+    {
+      "targetId": "target_5d506e8e96d6a253a87bec465f49ae7f71fc55a716b56e86fc79de90f14e05b0",
+      "modelId": "mdl_3f7b60d891754d8f6af6e67d434bba8d8c7e1dab5b75ed1339a47b519f186233",
+      "contentId": "content_a9f813bd8de93015301d5ecac6f4e6d6306519242955b0d89c4f6d1b8c3418e1",
+      "name": "Gemma-4 26B-A4B IT (smart Q4_0, QAT-lossless)",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "gemma4",
+        "quantization": "Q4_0",
+        "quantization_name": "4-bit",
+        "parameter_count": 25233142046,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gemma4",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<|channel>thought",
+            "end": "<channel|>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:aa3185dfc65051046349995de1cfc2fbb275491b9a3832b71595f1ff5b31d61b"
+          }
+        },
+        "evidence_fingerprint": "sha256:6efa635e5cb3a699afac19544605446641c50e3547c9ce365c3c6ec7026d4f5f+sha256:aa3185dfc65051046349995de1cfc2fbb275491b9a3832b71595f1ff5b31d61b"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+        "requested_revision": "7b92b5b28818151e8669af2e45e88d6086f490dd",
+        "commit": "7b92b5b28818151e8669af2e45e88d6086f490dd"
+      },
+      "primaryGguf": "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 14249047104,
+            "content": {
+              "type": "sha256",
+              "value": "a7c5bc715f5ff8e99a3e8901ce7d2b42b402c669bf24f7c5250747633d0f5891"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "cdd80c3a403700d06b52b7f77448a84ad8ec63f8ab50cc4596462e64e8cc7fcb",
+          "headerSizeBytes": 15824000
+        }
+      ]
+    },
+    {
+      "targetId": "target_a3fc5c692a521f0e5b2b3d48a78ad35128530876ce2c07a4ded5774082fd947b",
+      "modelId": "mdl_30ebd49cff9a1b60e22549a53b64e60c033f4fb92a3649d85185ef88fb8a209f",
+      "contentId": "content_574c084d3b18bdec58b9f847a88864dee87f5fbb53f93e3d42dc022ecfbff9cb",
+      "name": "Gemma-4 31B IT (smart Q4_0, QAT-lossless)",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "gemma4",
+        "quantization": "Q4_0",
+        "quantization_name": "4-bit",
+        "parameter_count": 30697345596,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gemma4",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<|channel>thought",
+            "end": "<channel|>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:aa3185dfc65051046349995de1cfc2fbb275491b9a3832b71595f1ff5b31d61b"
+          }
+        },
+        "evidence_fingerprint": "sha256:6e98265755cab129d55eb7c93cf96ed220e901b974dd2dff70908499481ee841+sha256:aa3185dfc65051046349995de1cfc2fbb275491b9a3832b71595f1ff5b31d61b"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
+        "requested_revision": "43cc1aeb31adf47ec06a854507ce552cd9862e6f",
+        "commit": "43cc1aeb31adf47ec06a854507ce552cd9862e6f"
+      },
+      "primaryGguf": "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+            "role": "weights",
+            "size_bytes": 17287670048,
+            "content": {
+              "type": "sha256",
+              "value": "00b5a7c497f0c8934033088c10a7fa9a4c015e46ee6d89e9c6890650ba5d0e71"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "cbf7fb32512c7cd8b8e79c2e286a24c2466ab1609781486a9d51a8b139c1a370",
+          "headerSizeBytes": 15833504
+        }
+      ]
+    },
+    {
+      "targetId": "target_3db0a66a1114359f7130447eb5f84c21d091b55736bb37c4d9a06ad59f592c0c",
+      "modelId": "mdl_c486ec3ab4e5e002dea3ec519147a13efee37168915ca6252ee268ebbd14f85f",
+      "contentId": "content_424d6d2e7954f213fbf2e5febba08a87af6da2e9f03290ed62543c50b4ae2a01",
+      "name": "Laguna S 2.1",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "laguna",
+        "quantization": "Q8_0",
+        "quantization_name": "8-bit",
+        "parameter_count": 117561977600,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+          }
+        },
+        "evidence_fingerprint": "sha256:193ac8101612b1099516c8ec8c70d11739d682fc0759d069c0b0157f7a87abf8+sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "poolside/Laguna-S-2.1-GGUF",
+        "requested_revision": "edd093522473dc7313b0738d8b4116b7f8b9745f",
+        "commit": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+      },
+      "primaryGguf": "laguna-s-2.1-Q4_K_M.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "laguna-s-2.1-Q4_K_M.gguf",
+            "role": "weights",
+            "size_bytes": 68248760064,
+            "content": {
+              "type": "sha256",
+              "value": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "0701893576fd857c9904379f213e2680d4c2543e4f9952715339daa07f12cf0a",
+          "headerSizeBytes": 3734272
+        }
+      ]
+    },
+    {
+      "targetId": "target_4616d1df5e81f856355f2e9b05589bbf7bd053a2bb42976b2dce59d88af151a0",
+      "modelId": "mdl_baed15125b791b21bde80b0ce4d603f13918ddb2cbdb6c090e2fb7fcc2833679",
+      "contentId": "content_434ae6f0d8193cefeb43ffa969b92845a0b8159c92664454cc2fb95ca17223ef",
+      "name": "Laguna S 2.1",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "laguna",
+        "quantization": "Q8_0",
+        "quantization_name": "8-bit",
+        "parameter_count": 117561977600,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+          }
+        },
+        "evidence_fingerprint": "sha256:193ac8101612b1099516c8ec8c70d11739d682fc0759d069c0b0157f7a87abf8+sha256:444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "poolside/Laguna-S-2.1-GGUF",
+        "requested_revision": "edd093522473dc7313b0738d8b4116b7f8b9745f",
+        "commit": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+      },
+      "primaryGguf": "laguna-s-2.1-Q8_0.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "laguna-s-2.1-Q8_0.gguf",
+            "role": "weights",
+            "size_bytes": 128750823168,
+            "content": {
+              "type": "sha256",
+              "value": "d946b221d69f2c5f87a986952bcd3cfb75831e5a6a2184e626e361663e1bfe2b"
+            },
+            "shard_index": null
+          },
+          "headerDigest": "85f7f22b5cad26d01ccd279cd1d037701034aa1426d2e2437b1c28319e78dde0",
+          "headerSizeBytes": 3734272
+        }
+      ]
+    },
+    {
+      "targetId": "target_c27690be560d335e2bcba507fb8dbb1524f1425206db266426c436dbef74d1fe",
+      "modelId": "mdl_728752415ede96296ef7b69d6b0cc32e0f1962e54135f261693267309101ef0b",
+      "contentId": "content_d78575a7776f5d0c1064271b116c8357471ec24595500a70dd6f6f6f9ef30762",
+      "name": "Qwen3.5-122B-A10B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "qwen35moe",
+        "quantization": "Q4_K - Medium",
+        "quantization_name": "4-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 262144,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "Qwen3.5 122B A10B"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:e60df41481b6ad20571cda7e2e1290cfee25670f1b50973f74576c9354c66336"
+          }
+        },
+        "evidence_fingerprint": "sha256:d36398e610b0cd7609ff9b3d103f268a9d6a6170b4bf3de7d6f7b63863c5799e+sha256:e60df41481b6ad20571cda7e2e1290cfee25670f1b50973f74576c9354c66336"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+        "requested_revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+        "commit": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+      },
+      "primaryGguf": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 10943552,
+            "content": {
+              "type": "sha256",
+              "value": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3",
+          "headerSizeBytes": 10943552
+        },
+        {
+          "component": {
+            "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00002-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 49968146912,
+            "content": {
+              "type": "sha256",
+              "value": "90db14846413aebdac365b57206441437cac5f7e5037d94b325f0167f902e6e7"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "efa0829bd883aad6cbb3f173fe2d8ca5a66ddd20410f48ccb238212eb9d47f2f",
+          "headerSizeBytes": 36320
+        },
+        {
+          "component": {
+            "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00003-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 26557874144,
+            "content": {
+              "type": "sha256",
+              "value": "e3c24b8ebec070bb4f69ea0aca25a16531da7440cd515529953e046882901f97"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "d7fed639dfb05751fe36fb6337c4fb7fd179a20ccc27788ad4f3e4da2096142e",
+          "headerSizeBytes": 19424
+        }
+      ]
+    },
+    {
+      "targetId": "target_634bc720087d302d9a200df137430fd2bea02eba9051f13f06b548b21f77168f",
+      "modelId": "mdl_527ea4dd2ba5b69afbc067c70e2ae366e27a1d37457054f8cdf7d4a6bc9a486a",
+      "contentId": "content_0bc412e2a3b8a6899b75f86d3c576a4e4641724a8c04bcf852524f5417e6bfed",
+      "name": "Nvidia-Nemotron-3-Super-120B-A12B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "nemotron_h_moe",
+        "quantization": "Q4_K - Medium",
+        "quantization_name": "4-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 1048576,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:87a34ddfa6ce7312700bad6aa606c839e2b16efcd95666a0a9f38d18abfd8a9e"
+          }
+        },
+        "evidence_fingerprint": "sha256:e563f76a78ec04e9c8946ffeeadcdb7251e579dc5cb02ba8a98fdbb56fbcb5ce+sha256:87a34ddfa6ce7312700bad6aa606c839e2b16efcd95666a0a9f38d18abfd8a9e"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+        "requested_revision": "036038fb30334a2d56a146c6f0d4871ab5edccbb",
+        "commit": "036038fb30334a2d56a146c6f0d4871ab5edccbb"
+      },
+      "primaryGguf": "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00001-of-00003.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00001-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 7872576,
+            "content": {
+              "type": "sha256",
+              "value": "f22083eb6b15acb52905308ab083e8b0cc38897005cc45e8881abd164580aac2"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "f22083eb6b15acb52905308ab083e8b0cc38897005cc45e8881abd164580aac2",
+          "headerSizeBytes": 7872576
+        },
+        {
+          "component": {
+            "path": "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00002-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 49911512480,
+            "content": {
+              "type": "sha256",
+              "value": "a53810e8e9c2baf8e2598c4c503c10e0b9361ced72313d441e2f6f5e93b33de3"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "440cf983ba736c14fecd079dbb626628c9aee26a7280a74ee53152e648151c08",
+          "headerSizeBytes": 28064
+        },
+        {
+          "component": {
+            "path": "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00003-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 33857923456,
+            "content": {
+              "type": "sha256",
+              "value": "276c72d16eeaef4404a32747f054292e11484ee20988b1446846a0cdb6049ea5"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "df8f2cbfbef4d8b0f3b6b51bf87e763cb8407b7eb90a75f72224466dcb352610",
+          "headerSizeBytes": 18816
+        }
+      ]
+    },
+    {
+      "targetId": "target_58f117dc0bf4ca14dd86cb9810d4cbc020f718074b09f69ca68109c31af4e61d",
+      "modelId": "mdl_01c4585f42b069383a13dafeb7090a69e2f1aa5b084f3964266cd171a51a550e",
+      "contentId": "content_a857fe6784236b0db5d1e4088571d38f7d2eb62c5e434cee3b86324854fb97cc",
+      "name": "Nvidia-Nemotron-3-Super-120B-A12B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "nemotron_h_moe",
+        "quantization": "MXFP4 MoE",
+        "quantization_name": "4-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 1048576,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:87a34ddfa6ce7312700bad6aa606c839e2b16efcd95666a0a9f38d18abfd8a9e"
+          }
+        },
+        "evidence_fingerprint": "sha256:e563f76a78ec04e9c8946ffeeadcdb7251e579dc5cb02ba8a98fdbb56fbcb5ce+sha256:87a34ddfa6ce7312700bad6aa606c839e2b16efcd95666a0a9f38d18abfd8a9e"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+        "requested_revision": "036038fb30334a2d56a146c6f0d4871ab5edccbb",
+        "commit": "036038fb30334a2d56a146c6f0d4871ab5edccbb"
+      },
+      "primaryGguf": "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00001-of-00003.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00001-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 7872576,
+            "content": {
+              "type": "sha256",
+              "value": "1891b15a4e3e11f5dfb0050062c35fc2eeee9e7a37bc8f407c3886491c21bb30"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "1891b15a4e3e11f5dfb0050062c35fc2eeee9e7a37bc8f407c3886491c21bb30",
+          "headerSizeBytes": 7872576
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00002-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 49831407232,
+            "content": {
+              "type": "sha256",
+              "value": "62ead0ba22b3a4a4ac9277d6845fa09c7860933dd0060c51819c2b751d086923"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "e76ccc65308a292f00b5345e0512329d8e90a406793c136164306ee323dbcbcf",
+          "headerSizeBytes": 28800
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00003-of-00003.gguf",
+            "role": "shard",
+            "size_bytes": 32220461216,
+            "content": {
+              "type": "sha256",
+              "value": "cfb638b699befba01199d70a4e44ace39cb7f144d9edc651eadd369f6d43c60c"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "1cac7059daf21fe1429cc33ebf7998975a429a7c6d645df80d5a860118831712",
+          "headerSizeBytes": 18080
+        }
+      ]
+    },
+    {
+      "targetId": "target_d4d8f2cd49368a5e0ac3f772d337f4bf6f48f14e2c7588112e6c05f9da36d025",
+      "modelId": "mdl_d22036866d1190f26d58915e3c620f6285d12c75179be46d1a89efba89fa2075",
+      "contentId": "content_de40d96078ec008a1c9b710ce0789282fb70e1abe46394fb19d945d4e2c33508",
+      "name": "Deepseek-V4-Flash",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "deepseek4",
+        "quantization": "Q3_K - Medium",
+        "quantization_name": "3-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 1048576,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "DeepSeek V4 Flash"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "max"
+            ],
+            "default": "none"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:d05566ebe26667ec54f4ef7a3dbc114ce2e00aefc40e0c62286374eee0e22080"
+          }
+        },
+        "evidence_fingerprint": "sha256:2338b7f11bd9f7d0e2fb8ceb887cbd1f6e8dfc2e32a637f7bf5af4a9e5e8188f+sha256:d05566ebe26667ec54f4ef7a3dbc114ce2e00aefc40e0c62286374eee0e22080"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/DeepSeek-V4-Flash-GGUF",
+        "requested_revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+        "commit": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0"
+      },
+      "primaryGguf": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 5256864,
+            "content": {
+              "type": "sha256",
+              "value": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
+          "headerSizeBytes": 5256864
+        },
+        {
+          "component": {
+            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00002-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 49222528448,
+            "content": {
+              "type": "sha256",
+              "value": "18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "44fa1c970a02656d467a7918b2bf45a90b1b2a2ad28beaf349989b47a25b33be",
+          "headerSizeBytes": 32384
+        },
+        {
+          "component": {
+            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00003-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 49189072672,
+            "content": {
+              "type": "sha256",
+              "value": "9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "9f2b871af97cdeaff7cd5def1cdb0173290fcffc8bf00a569eca80275402fc00",
+          "headerSizeBytes": 32544
+        },
+        {
+          "component": {
+            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00004-of-00004.gguf",
+            "role": "shard",
+            "size_bytes": 30903139232,
+            "content": {
+              "type": "sha256",
+              "value": "2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea"
+            },
+            "shard_index": 4
+          },
+          "headerDigest": "23f344cddb983f4291a48e0d58a2091f9fe541dec0c884d5a99dcb1ba6c0eb43",
+          "headerSizeBytes": 21152
+        }
+      ]
+    },
+    {
+      "targetId": "target_3e637075ad542bbcda474eb34b27928263b98e6a6fd62a7d8465116f58d0a5f0",
+      "modelId": "mdl_d2a28de50747bc7733169bc55e892ec0e5df45a0a14361bbf5f7504d0287397c",
+      "contentId": "content_55cbc3b393bcc1653e1566e6decd7f683c295a29bce08f4b1d441c5688c46407",
+      "name": "Nvidia-Nemotron-3-Ultra-550B-A55B",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "nemotron_h_moe",
+        "quantization": "MXFP4 MoE",
+        "quantization_name": "4-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 1048576,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:60913bcf6062ec957a7db30f3c7b92e08b499cdb6e937e2de724d15bdde9289a"
+          }
+        },
+        "evidence_fingerprint": "sha256:514ae872bf287ffef595112408647c2d67120c82df9f1fea545203fa10b80fd2+sha256:60913bcf6062ec957a7db30f3c7b92e08b499cdb6e937e2de724d15bdde9289a"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
+        "requested_revision": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6",
+        "commit": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6"
+      },
+      "primaryGguf": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00001-of-00009.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00001-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 7872128,
+            "content": {
+              "type": "sha256",
+              "value": "564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39",
+          "headerSizeBytes": 7872128
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00002-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 46357384032,
+            "content": {
+              "type": "sha256",
+              "value": "49bb6d0075c1926583a88b2cb7fa0c07e24918ae2c0505c200a8f93cb618453d"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "c3d834cb98843987346648f5eea286a8b015cf12633fc5dde0fc784c039a15d3",
+          "headerSizeBytes": 8032
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00003-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 47312721120,
+            "content": {
+              "type": "sha256",
+              "value": "e34d245dd2a370a487eea8e1818f59b6c827ca53603508f5e17760a6d7df5698"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "7ed4ca968a6d320b7a2bcc4e06c90ac0186dad0e56413ac3cf7615a927dc03f1",
+          "headerSizeBytes": 7392
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00004-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 47016905632,
+            "content": {
+              "type": "sha256",
+              "value": "789888c578495adfc18fdd4540d08dd5ef5a01ee1fb9b0e97081249eb8c2695d"
+            },
+            "shard_index": 4
+          },
+          "headerDigest": "79efb4026f38c4cfe174c64fa2d701be5e3d0b9e419641396dec5ebce1c10046",
+          "headerSizeBytes": 8096
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00005-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 47459816960,
+            "content": {
+              "type": "sha256",
+              "value": "6d3fc88758edc68796fbab8e08dc069756bf8479574c342faa884266a95f7c91"
+            },
+            "shard_index": 5
+          },
+          "headerDigest": "29cf8d4d9342fa8f726c22f73ff325c7547c2ed34a24f536a0621cfc37e29e2a",
+          "headerSizeBytes": 7680
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00006-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 47016905632,
+            "content": {
+              "type": "sha256",
+              "value": "39c6bb6da37e3c278ce1dbef64e82abccaeec192563ce3ec37aeea6e14333d2c"
+            },
+            "shard_index": 6
+          },
+          "headerDigest": "b9b58f5013fd24aa4f8be53c2373a9045e5a6a60f958dee7c4b0803b53f7bccb",
+          "headerSizeBytes": 8096
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00007-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 47312721120,
+            "content": {
+              "type": "sha256",
+              "value": "e9f7b068f256bf41b5265955fe7bb38eb6a1edbd9da67887d7f5675a789fdccc"
+            },
+            "shard_index": 7
+          },
+          "headerDigest": "99a79952b7bd03c08a2ddfe7f842f5ab4fd81f0f9bec2fe312c572e0a3281f4a",
+          "headerSizeBytes": 7392
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00008-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 47016905664,
+            "content": {
+              "type": "sha256",
+              "value": "c950f4810dc569df2d3fafef790a4299a6ce8872c51b81c6b469720cf6017629"
+            },
+            "shard_index": 8
+          },
+          "headerDigest": "eb7ff2a079fd49c81f930a26dfd0dff74d7372b444fa635c6310b89c35d95ce4",
+          "headerSizeBytes": 8128
+        },
+        {
+          "component": {
+            "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00009-of-00009.gguf",
+            "role": "shard",
+            "size_bytes": 22770053920,
+            "content": {
+              "type": "sha256",
+              "value": "e88987d3747eddec4190373fd9628d6bd4f307d54ad2f42f509c52e76ccd13b9"
+            },
+            "shard_index": 9
+          },
+          "headerDigest": "d8644105e0cff34ce7e6e439e1d1122df14bca12f1eb37f08d274b36e947ae0a",
+          "headerSizeBytes": 2848
+        }
+      ]
+    },
+    {
+      "targetId": "target_2ac3407b442fba7bf7c53716579bde07ae8f0ce474866dad34593b3d71ffded1",
+      "modelId": "mdl_d0c37bca9694d6fd0f7fffc5dc4b22c19e75162224c83e989de6c942fafa8d4b",
+      "contentId": "content_5c4ff96c9c7f592832753335c7bc59cc68971fb61e24bf6669514ac2f24e60e9",
+      "name": "Glm-5.2",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "glm-dsa",
+        "quantization": "BF16",
+        "quantization_name": "16-bit",
+        "parameter_count": 22478522368,
+        "active_parameter_count": null,
+        "training_context_length": 1048576,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "GLM 5.2"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high"
+            ],
+            "default": "high"
+          },
+          "visibility": "preserved",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:34cbbed68ee1b7f53e077c22a18d04a10e2ca46cdf1a9de0034ac218fb961218"
+          }
+        },
+        "evidence_fingerprint": "sha256:ad14d2f7b1671eefd7e30b61e22f25e44bd6eaa2555372673adda189dbd3cfcd+sha256:34cbbed68ee1b7f53e077c22a18d04a10e2ca46cdf1a9de0034ac218fb961218"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/GLM-5.2-GGUF",
+        "requested_revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+        "commit": "abc55e72527792c6e77069c99b4cb7de16fa9f23"
+      },
+      "primaryGguf": "BF16/GLM-5.2-BF16-00001-of-00033.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00001-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 44974080544,
+            "content": {
+              "type": "sha256",
+              "value": "3c5ddaa0fd80caef31d10c1b96ee982e3fb2abd150a3413797a1b37c9de33f11"
+            },
+            "shard_index": 1
+          },
+          "headerDigest": "c982a71b4e1a52494534fd41a6839644d10940782349797bc02cc773295c3052",
+          "headerSizeBytes": 9429536
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00002-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "4fee983cbc0224f06b032694a968e9c1c2b9c00c5977e2a243efdc3d43bf1962"
+            },
+            "shard_index": 2
+          },
+          "headerDigest": "3e479edf5ff72ebacd27c742c57625288f2104834a25906c1cba5ffc0683ce0e",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00003-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "be743351e47c9a084fd065b83fef8969a082ceb0bad5ec12a0e2d5ad01cfda81"
+            },
+            "shard_index": 3
+          },
+          "headerDigest": "e00425b0061c36b460056d8d1ed8ee40a8107beb593b18cfc40a0107d3b0145c",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00004-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46408197792,
+            "content": {
+              "type": "sha256",
+              "value": "40272b7b58ba56c5a49329d0d1dafc0b2eafc77564591db7e699a53fdac87088"
+            },
+            "shard_index": 4
+          },
+          "headerDigest": "4f8972f635c2c6d8d3373b91107e35584a1e3da459172d4c3f961736cc49c343",
+          "headerSizeBytes": 4768
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00005-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46779392512,
+            "content": {
+              "type": "sha256",
+              "value": "0f3449cfe80b651cb3e6277714d1fbd6fc059db53c1841e7ae3a2f0e783e21e3"
+            },
+            "shard_index": 5
+          },
+          "headerDigest": "dc261f62ed58ed13ad7e878a6a5886204b74894551b27c64669af1952d557619",
+          "headerSizeBytes": 4608
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00006-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "22d0dbe4dea0dafe413b0d0f9335595a0d9b83cef96b2997dd38ef4c4ba8af6f"
+            },
+            "shard_index": 6
+          },
+          "headerDigest": "68212875b54ba1958ff4b7f2f0777938c3f016a1c8c2b229166698be59762fff",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00007-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46332826016,
+            "content": {
+              "type": "sha256",
+              "value": "1aaf935b5b6a7d336cf203a39fec1a9e8c2fd10a43dfb5d445e4d36b171d35d1"
+            },
+            "shard_index": 7
+          },
+          "headerDigest": "b1134c7d937295fe03e6cd3422c157f6517918815ac5b779cf1c0bd6386ad93f",
+          "headerSizeBytes": 3488
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00008-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "d64c844afd7f638d0d0c83a416e33674f04b286fce0e09bea07aa7b0762e34d0"
+            },
+            "shard_index": 8
+          },
+          "headerDigest": "e2ba8ac5a0aa935a52d8a54f9ec5a5fa70fe18088915e18585814c4c3f74ed04",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00009-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "2a7fd44066c3966b59d2ba8e998b90b3b2f2e8d945f7950ed0f541a55997d4d4"
+            },
+            "shard_index": 9
+          },
+          "headerDigest": "45fb534681c53222dd215fc851179f280c10f0a1d4b812f76ea7ba5765e623cd",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00010-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46408197792,
+            "content": {
+              "type": "sha256",
+              "value": "02ffddd2bafb8d801e47ea85513d328b18ed3cbd63acb95d870a85f970c1d1b5"
+            },
+            "shard_index": 10
+          },
+          "headerDigest": "de83c5f0e388172219022ef008144b71391cc3b9b48a4fc2f640dc0a157c3eb2",
+          "headerSizeBytes": 4768
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00011-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "a2773f2fd076592c238f1a4a4af0dc3fbbbb9cb7068749bdc5666d434442e1ac"
+            },
+            "shard_index": 11
+          },
+          "headerDigest": "97367e7edd493c391cb74c707800d043d0858bbfece5c28fbfd8d841face08a9",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00012-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "6de08d8c2f62b343cc7d577951c4d1a98a56e18538fe554252ed504700522985"
+            },
+            "shard_index": 12
+          },
+          "headerDigest": "6f27e1b43b49c5ed22c37040f71f454be781d3071c6d5a517cdb82497fb11318",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00013-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46408197792,
+            "content": {
+              "type": "sha256",
+              "value": "021621fa0d7d36517f58a18f619ac0a16a45c4f8d362420c804dba82ac6f4359"
+            },
+            "shard_index": 13
+          },
+          "headerDigest": "2670d8c0eb21ee74b56742a09a5ecd79b43175e7a35899c31cabf0bf1706cc44",
+          "headerSizeBytes": 4768
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00014-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "7f94ca0e339707a248f77aef4ce4cae49536a9fd126ee6e2a926b5aa7369921f"
+            },
+            "shard_index": 14
+          },
+          "headerDigest": "145a1f1e9960534db8abea052e1834e784547a16619628e091123d33c8200dee",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00015-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "e9a61e362c0814a421c52d701cb7ad5e2759a56e3637d048fa330e54c00e29c0"
+            },
+            "shard_index": 15
+          },
+          "headerDigest": "b1a611f35dc4f5457e18eab44ff89e29c0f5a16f71bb4c2f2c65b26ada04fc8f",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00016-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46408197792,
+            "content": {
+              "type": "sha256",
+              "value": "445af48926edbbe07c50c60aeb6fee7bc61304adfd5465ee51b31ea620b4d43d"
+            },
+            "shard_index": 16
+          },
+          "headerDigest": "a52d33b2d6a319842a551d18e49ad8a050ab43e56e5a422a35f3ec1aff8bcd3d",
+          "headerSizeBytes": 4768
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00017-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "ceabd9b63d7ad269853e5157fb184a323e90f312923d3f0fedf7b83659e1de25"
+            },
+            "shard_index": 17
+          },
+          "headerDigest": "4bdfd13b927d390cb6e99cc1cfe141a6868803a11f5d590e541fd96b93b0ae1d",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00018-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "e0d1381d089ebf063cb29a71c4280c283e5e5611116311d0ac7b4043d3a61ea7"
+            },
+            "shard_index": 18
+          },
+          "headerDigest": "6fab68b9790a187c57a68573592582308f2c288ee6c1b727e11ec327bf3ebe3c",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00019-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46408197760,
+            "content": {
+              "type": "sha256",
+              "value": "7f90f958d3da370b6565de794de29d9f51864b1c18ff8f1446339fd6aa04fd70"
+            },
+            "shard_index": 19
+          },
+          "headerDigest": "e9757281d4693cb16359dd7a908a0a17870c6802eb99d7ab6e553fd4b7c5f8fd",
+          "headerSizeBytes": 4736
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00020-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "abf6cb86ad8348c5fc68f9e5b2881756083162833b85635ad8a80bd4c68050c4"
+            },
+            "shard_index": 20
+          },
+          "headerDigest": "ab8ab2d94687c9dd1e4d33ae1fc1c091ceabfa77e257e692c25b2d752e2aebef",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00021-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "3aea56006856790a92268c8151be7d7bd548bd48bdb66d3513a56ead266e096b"
+            },
+            "shard_index": 21
+          },
+          "headerDigest": "75e5f0a258c6e7efe3a8d8f6ab887293abf0f4f02b718142916e031f0240dc8f",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00022-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46332826016,
+            "content": {
+              "type": "sha256",
+              "value": "ae15732104d3364f71262ceb81965201b682e4192a60182ed09ea18e879f7c96"
+            },
+            "shard_index": 22
+          },
+          "headerDigest": "7c7fb48fec96df1948445445eadaf7549eb4ac91ec604bd3ce7cde2f7d4d2fd6",
+          "headerSizeBytes": 3488
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00023-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308192,
+            "content": {
+              "type": "sha256",
+              "value": "051b714be1700f458751d64c041b7642232392820ff405802c3d098ed1c1ac8a"
+            },
+            "shard_index": 23
+          },
+          "headerDigest": "63547a2b3de5fe89ed8e5c36bab8afe0dba8fd24708f84b0b9939f494c6e3fc5",
+          "headerSizeBytes": 3808
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00024-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308160,
+            "content": {
+              "type": "sha256",
+              "value": "447eca36139945c45c7d2f408f8acb99f3f95993febb39252ede639d4457f148"
+            },
+            "shard_index": 24
+          },
+          "headerDigest": "81603402d6011a2ed5bf0e94d235303d67bfad60c1a6d746e6b1398b161739d8",
+          "headerSizeBytes": 3776
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00025-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46408197792,
+            "content": {
+              "type": "sha256",
+              "value": "f4b663351f131ee7bae9787ac18de822fa5e975f3a51d42a7bb11bc985bd7ddf"
+            },
+            "shard_index": 25
+          },
+          "headerDigest": "ecc24ad7af1e490ea238bc22c2052565f1d2ad67560ecaf032e53e404406f8d7",
+          "headerSizeBytes": 4768
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00026-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "5830fa329f46d3a44ad5d9c0b038a0104b3cb1e47b158f59407747ed7ff7d713"
+            },
+            "shard_index": 26
+          },
+          "headerDigest": "d5001a229bfe463a8a2b60dd89b57fe826bdf9926479a97bbae2bb6fcf34786e",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00027-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "1365a227d9a2f361a6dbdd49d3b2628465d8d6b247b94f3261ce447214a4640e"
+            },
+            "shard_index": 27
+          },
+          "headerDigest": "ff698942533abc07acb7dee4edc1ce76ce107c2ccb37f8ae456c385629736b4c",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00028-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46332825984,
+            "content": {
+              "type": "sha256",
+              "value": "c1734989ad370ec0d3114302f57720125aed75b7f68c210b6583fc0b9deef740"
+            },
+            "shard_index": 28
+          },
+          "headerDigest": "264dccaf9ddced8d169404bcdcb30880ed831b6d938dadf8c4afe638adeaf749",
+          "headerSizeBytes": 3456
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00029-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45996308224,
+            "content": {
+              "type": "sha256",
+              "value": "5467d86c3c3257b4c094e4ae1c4bb428922f88a688ceac6c03e811aaf3dd59c8"
+            },
+            "shard_index": 29
+          },
+          "headerDigest": "cacfbab642820ad5dbaa8a8f8ba26a48c2ee5d7f0e883222a0ea1e3c792c7bf7",
+          "headerSizeBytes": 3840
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00030-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 45920936416,
+            "content": {
+              "type": "sha256",
+              "value": "91960f9dfce7e81a1d9e42566a816e2c72b6d895f587603ce7f0a8b5d2eb2c2f"
+            },
+            "shard_index": 30
+          },
+          "headerDigest": "202a5f24cc3a0ebb3eabd9ff30e0670c908037a523c8006b5dc13b8451aa69eb",
+          "headerSizeBytes": 2528
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00031-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46408197792,
+            "content": {
+              "type": "sha256",
+              "value": "0ac1b708f51bcfc995e08f73e4be87170b048c418cbb89807486e9ceef8982ea"
+            },
+            "shard_index": 31
+          },
+          "headerDigest": "5b2cc273ee329b87bd01a5fbb85450fa409578a927eccd9db47f9be61ac1dccf",
+          "headerSizeBytes": 4768
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00032-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 46091143200,
+            "content": {
+              "type": "sha256",
+              "value": "3b8b9492eb2b90ebc00de0ab005fa35b07f180f240279d11ef36a34f21619ce0"
+            },
+            "shard_index": 32
+          },
+          "headerDigest": "9f64de7f09cff85841da08bde4e03e37e80515c68313f0bc8c1a08636d537a42",
+          "headerSizeBytes": 3104
+        },
+        {
+          "component": {
+            "path": "BF16/GLM-5.2-BF16-00033-of-00033.gguf",
+            "role": "shard",
+            "size_bytes": 33036034336,
+            "content": {
+              "type": "sha256",
+              "value": "7ef960fc2b20a6a0e262c0fa68f598dd9f412a36deddc1e133083107b5ffb206"
+            },
+            "shard_index": 33
+          },
+          "headerDigest": "bf051a178c0248ed635894fc05574a187aec049e6abc0e9b0e3e8f647cf64a0b",
+          "headerSizeBytes": 2336
+        }
+      ]
+    }
+  ],
+  "catalog": {
+    "models": [
+      {
+        "id": "qwen3.5-4b:UD-Q4_K_XL",
+        "checkpointId": "qwen3.5-4b",
+        "targetId": "target_7e29bbf4930748686de85c45afadbddfaeae7266cc1c4894a7d67fed7bcd1079",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_907c1a5b6a2a973f373ce6823c0eb03180b595e395b19159013f0b4b5d1d187e",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-4B-GGUF",
+              "revision": "e87f176479d0855a907a41277aca2f8ee7a09523"
+            },
+            "files": [
+              {
+                "id": "file_b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7",
+                "path": "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 2912109728,
+                "sha256": "b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_K - Medium",
+              "quantizationName": "4-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 4B",
+        "description": "Compact dense model for machines where responsiveness and footprint matter most.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 25.8,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-4b:UD-Q5_K_XL",
+        "checkpointId": "qwen3.5-4b",
+        "targetId": "target_5fa8be7db0e00521469cdb7a5e8f8687350e3164224a89d3dd5541d33f56a51e",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_dc476e84352df43fcf55e0c415db8700695765045373247ee265bdeebc24a6de",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-4B-GGUF",
+              "revision": "e87f176479d0855a907a41277aca2f8ee7a09523"
+            },
+            "files": [
+              {
+                "id": "file_b4c36a8e14a80c21bcab5a067ce342b2e70e28f60b4aa95ad12203fa17b87426",
+                "path": "Qwen3.5-4B-UD-Q5_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 3250869408,
+                "sha256": "b4c36a8e14a80c21bcab5a067ce342b2e70e28f60b4aa95ad12203fa17b87426"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q5_K - Medium",
+              "quantizationName": "5-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 4B",
+        "description": "Compact dense model for machines where responsiveness and footprint matter most.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 25.8,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 50,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-4b:UD-Q6_K_XL",
+        "checkpointId": "qwen3.5-4b",
+        "targetId": "target_d8e06ab0b45064219dd4a9866f8aaa573f86dc451570d78b7b1a9ea1009ec112",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_daabfda339e7c8b09c74f63ec343bd33830a1c061c23088823e540cbf221fd7d",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-4B-GGUF",
+              "revision": "e87f176479d0855a907a41277aca2f8ee7a09523"
+            },
+            "files": [
+              {
+                "id": "file_87f58d94410b81429268d8389a3d686e6c6bffecf7852772720fbea059cbbb9d",
+                "path": "Qwen3.5-4B-UD-Q6_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 4145548448,
+                "sha256": "87f58d94410b81429268d8389a3d686e6c6bffecf7852772720fbea059cbbb9d"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q6_K",
+              "quantizationName": "6-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 4B",
+        "description": "Compact dense model for machines where responsiveness and footprint matter most.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 25.8,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 60,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-4b:UD-Q8_K_XL",
+        "checkpointId": "qwen3.5-4b",
+        "targetId": "target_b3fad6a1848e76245f2ef2e2c266ec3a4170578d69857657433410bd45ce1b5c",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_c128fc6a2cf149d5069a4365763bf9fc88ef619578cdf5d0bc7b3e0250550311",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-4B-GGUF",
+              "revision": "e87f176479d0855a907a41277aca2f8ee7a09523"
+            },
+            "files": [
+              {
+                "id": "file_e786a3c6570474c3885199bfb5adc54325aa7521a314e10b0aaefe16a54ba42f",
+                "path": "Qwen3.5-4B-UD-Q8_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 5952048288,
+                "sha256": "e786a3c6570474c3885199bfb5adc54325aa7521a314e10b0aaefe16a54ba42f"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q8_0",
+              "quantizationName": "8-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 4B",
+        "description": "Compact dense model for machines where responsiveness and footprint matter most.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 25.8,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 80,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-9b:UD-Q4_K_XL",
+        "checkpointId": "qwen3.5-9b",
+        "targetId": "target_0ebd756e79262f1ba507f8a531e965f91fccb812c18da47a5e4dac4c91c984fb",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_ee6df4b7f5996508c2b7c29743304e3df8c74bcda151f651d3abc589e250f964",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-9B-GGUF",
+              "revision": "3885219b6810b007914f3a7950a8d1b469d598a5"
+            },
+            "files": [
+              {
+                "id": "file_6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293",
+                "path": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 5966095584,
+                "sha256": "6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_K - Medium",
+              "quantizationName": "4-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 9B",
+        "description": "Small dense model with a substantial capability gain over the 4B tier.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 29.2,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-9b:UD-Q5_K_XL",
+        "checkpointId": "qwen3.5-9b",
+        "targetId": "target_4564bc6fdad936fc9f0cb30fe17b142f5a4a7fa6f35b3b8ebdaaad52b80228dc",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_20f055bb483ecea98709003ace38d7410b29e75b439500f2e77bb7a241056798",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-9B-GGUF",
+              "revision": "3885219b6810b007914f3a7950a8d1b469d598a5"
+            },
+            "files": [
+              {
+                "id": "file_96cf42ddb97f9572410a72b9ed6f2299b1e887ee08da4c2a6c01e897cfa9f673",
+                "path": "Qwen3.5-9B-UD-Q5_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 6743680224,
+                "sha256": "96cf42ddb97f9572410a72b9ed6f2299b1e887ee08da4c2a6c01e897cfa9f673"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q5_K - Medium",
+              "quantizationName": "5-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 9B",
+        "description": "Small dense model with a substantial capability gain over the 4B tier.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 29.2,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 50,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-9b:UD-Q6_K_XL",
+        "checkpointId": "qwen3.5-9b",
+        "targetId": "target_6677dc9406580917535cce2941d7c4b04967b7b0f103ecc5267d83160ee316da",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_7857d35ffbcd54550618840e5593d646d0c9c7ec9e2a6d39ef39bf7673de4cd7",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-9B-GGUF",
+              "revision": "3885219b6810b007914f3a7950a8d1b469d598a5"
+            },
+            "files": [
+              {
+                "id": "file_33b0050fb9c19abcf815647a78464dad959a06dadaecb0b96af798669f9074d4",
+                "path": "Qwen3.5-9B-UD-Q6_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 8756929760,
+                "sha256": "33b0050fb9c19abcf815647a78464dad959a06dadaecb0b96af798669f9074d4"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q6_K",
+              "quantizationName": "6-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 9B",
+        "description": "Small dense model with a substantial capability gain over the 4B tier.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 29.2,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 60,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-9b:UD-Q8_K_XL",
+        "checkpointId": "qwen3.5-9b",
+        "targetId": "target_c40f4a82b463ac99eeadf1dbbbe5cf584a3d03b263d54c0385496665eaeed68e",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_4d914bb409b0f15921813fbe5134b20055a61596139f2e8384b0da61d250ee26",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-9B-GGUF",
+              "revision": "3885219b6810b007914f3a7950a8d1b469d598a5"
+            },
+            "files": [
+              {
+                "id": "file_2c4e08e0e72c68d8c1835a26f5be4075894df9ea5be9cc20a246517afd6a0cb6",
+                "path": "Qwen3.5-9B-UD-Q8_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 12974040288,
+                "sha256": "2c4e08e0e72c68d8c1835a26f5be4075894df9ea5be9cc20a246517afd6a0cb6"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q8_0",
+              "quantizationName": "8-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 9B",
+        "description": "Small dense model with a substantial capability gain over the 4B tier.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 29.2,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 80,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-27b:UD-Q4_K_XL",
+        "checkpointId": "qwen3.6-27b",
+        "targetId": "target_f2703c6c355ee8665611e6c3d498c8988960cefbc779247984c5be89eb8e9e79",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_02423aa0c3a2eb411fa78232528713afafa3159419ca1fc5c9aea8daa03e9506",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-27B-GGUF",
+              "revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+            },
+            "files": [
+              {
+                "id": "file_ff6941ded525b34eb159496762c29dd0ec6e71dc31b74d57e75d871a03eec259",
+                "path": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 17612564704,
+                "sha256": "ff6941ded525b34eb159496762c29dd0ec6e71dc31b74d57e75d871a03eec259"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_K - Medium",
+              "quantizationName": "4-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 27B",
+        "description": "Large dense coding model with strong agent and coding capability.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 60.7,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-27b:UD-Q5_K_XL",
+        "checkpointId": "qwen3.6-27b",
+        "targetId": "target_7bd54747394f3daa2443138a80e3ff55696bd3ad123f0cee1a8a4f3ad331bf8a",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_73966ac185c86f78447ce57084bf55aac45eb29c90e2bf6b7887ee345e8dcfa9",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-27B-GGUF",
+              "revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+            },
+            "files": [
+              {
+                "id": "file_ac310abf2895aa397121bad6c0be89466af41f0f1606a21c1131b110eeb19d0e",
+                "path": "Qwen3.6-27B-UD-Q5_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 20038256864,
+                "sha256": "ac310abf2895aa397121bad6c0be89466af41f0f1606a21c1131b110eeb19d0e"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q5_K - Medium",
+              "quantizationName": "5-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 27B",
+        "description": "Large dense coding model with strong agent and coding capability.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 60.7,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 50,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-27b:UD-Q6_K_XL",
+        "checkpointId": "qwen3.6-27b",
+        "targetId": "target_735f5b65523d21f521737b3b0705ccd9f28bb707e475083d63ac7c8b518a18c7",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_644c9662faa805742e2ead00c980e648cbf8707118fbd6f0e28df80b96c0bdd1",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-27B-GGUF",
+              "revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+            },
+            "files": [
+              {
+                "id": "file_8746881d40f280b1b6b858c656a347c754ed3d9cc8d2e1ad46b3635b87f611f8",
+                "path": "Qwen3.6-27B-UD-Q6_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 25636485344,
+                "sha256": "8746881d40f280b1b6b858c656a347c754ed3d9cc8d2e1ad46b3635b87f611f8"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q6_K",
+              "quantizationName": "6-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 27B",
+        "description": "Large dense coding model with strong agent and coding capability.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 60.7,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 60,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-27b:UD-Q8_K_XL",
+        "checkpointId": "qwen3.6-27b",
+        "targetId": "target_ebae4a73d54c40a9bf5ecd8e07bc8ed0217ed873f659dea9d8425d7ba5b825c0",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_a6ed6747eddfdc141f9aa9502cbda41090744dbfae06827268b20385d285cb76",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-27B-GGUF",
+              "revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf"
+            },
+            "files": [
+              {
+                "id": "file_19a2f4733a863088bc06665bf307dca95f7d4370b4d8690340cdff9992fe48c6",
+                "path": "Qwen3.6-27B-UD-Q8_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 35325163744,
+                "sha256": "19a2f4733a863088bc06665bf307dca95f7d4370b4d8690340cdff9992fe48c6"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q8_0",
+              "quantizationName": "8-bit",
+              "architecture": "qwen35",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 27B",
+        "description": "Large dense coding model with strong agent and coding capability.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 60.7,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 80,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-35b-a3b:UD-Q4_K_XL",
+        "checkpointId": "qwen3.6-35b-a3b",
+        "targetId": "target_6602121fa5fa148c28eff6d2b9ccc517d488910a54c6cbfc2de53777b9d1589d",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_721372a50a2cae0307bd13655e89ce80b434415b0f0f36c1390e98d8b25c0d54",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+              "revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+            },
+            "files": [
+              {
+                "id": "file_707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450",
+                "path": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 22360456160,
+                "sha256": "707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_K - Medium",
+              "quantizationName": "4-bit",
+              "architecture": "qwen35moe",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 35B-A3B",
+        "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 44.9,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-35b-a3b:UD-Q5_K_XL",
+        "checkpointId": "qwen3.6-35b-a3b",
+        "targetId": "target_2a07211159e82f78f7510515a1c5cdc15b7eefc66a3e29cf3eaeb575a368eb0e",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_20283de4d767f8ce7c7fad5e4f2de1ce5e53aeb083f8412bfe76c3b8f430c0fa",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+              "revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+            },
+            "files": [
+              {
+                "id": "file_25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506",
+                "path": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 26592508896,
+                "sha256": "25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q5_K - Medium",
+              "quantizationName": "5-bit",
+              "architecture": "qwen35moe",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 35B-A3B",
+        "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 44.9,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 50,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-35b-a3b:UD-Q6_K_XL",
+        "checkpointId": "qwen3.6-35b-a3b",
+        "targetId": "target_69a25374e3b85a59a433930ae7caec08910b4ca9e80d1e1f61b59334563fe11f",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_22de57fbe193a9fa77a0b0eaa306d81abd6f2a931d94518ce9281d9e89587bb2",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+              "revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+            },
+            "files": [
+              {
+                "id": "file_f6b6c6d5cfa6f00d964eeb7add28eb14ce7481734d506b90681007678cd2c484",
+                "path": "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 31843777504,
+                "sha256": "f6b6c6d5cfa6f00d964eeb7add28eb14ce7481734d506b90681007678cd2c484"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q6_K",
+              "quantizationName": "6-bit",
+              "architecture": "qwen35moe",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 35B-A3B",
+        "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 44.9,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 60,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.6-35b-a3b:UD-Q8_K_XL",
+        "checkpointId": "qwen3.6-35b-a3b",
+        "targetId": "target_24cfa6959503d454a26ff04c78d1beb88edec994214f8690f9f0ed22391aaf39",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_28cefb91972677309417f55323a0070cae71299eccd064505e1a11e3bf46784d",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+              "revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+            },
+            "files": [
+              {
+                "id": "file_b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8",
+                "path": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 38451182560,
+                "sha256": "b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q8_0",
+              "quantizationName": "8-bit",
+              "architecture": "qwen35moe",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.6 35B-A3B",
+        "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 44.9,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 80,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "gemma-4-e2b-it-qat:UD-Q4_K_XL",
+        "checkpointId": "gemma-4-e2b-it-qat",
+        "targetId": "target_0c3786ab9a4be510555153269fcdafb71324803f43f958a4b066181c5b37ad3d",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_553347c60ce9e5aaeeda81de5a1fe2c722512e313fef77a59e3fa8c0605d69c5",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
+              "revision": "66a399f68ddd113b06dff02fca9523e55465d11d"
+            },
+            "files": [
+              {
+                "id": "file_e531007218dfab990486a5de7676a6932d6ea8dea233d1f698d7c21cf8a16889",
+                "path": "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 2620370976,
+                "sha256": "e531007218dfab990486a5de7676a6932d6ea8dea233d1f698d7c21cf8a16889"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_0",
+              "quantizationName": "4-bit",
+              "architecture": "gemma4",
+              "maximumContextLength": 131072
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          }
+        ],
+        "displayName": "Gemma 4 E2B",
+        "description": "Very small dense model optimized for on-device use.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 15.0,
+        "qualityScoreProvenance": "estimated_terminal_bench_2.1",
+        "fidelityRank": 58,
+        "quantizationAware": true,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "gemma-4-12b-it-qat:UD-Q4_K_XL",
+        "checkpointId": "gemma-4-12b-it-qat",
+        "targetId": "target_37b896518b64d4bd12bd37785b54890d703f6cf8aecdf32bc35010cfa94d735c",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_e7ab699ce4213aeed466ff7954e704f10ada53403625752000f1957932e8d34a",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/gemma-4-12B-it-qat-GGUF",
+              "revision": "980b060c40a8539ac159e0501a3e0f66a6365af3"
+            },
+            "files": [
+              {
+                "id": "file_90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370",
+                "path": "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 6716356800,
+                "sha256": "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_0",
+              "quantizationName": "4-bit",
+              "architecture": "gemma4",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Gemma 4 12B",
+        "description": "Mid-size dense model with native tool use, reasoning, and multimodal capability.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 21.0,
+        "qualityScoreProvenance": "estimated_terminal_bench_2.1",
+        "fidelityRank": 58,
+        "quantizationAware": true,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "gemma-4-26b-a4b-it-qat:UD-Q4_K_XL",
+        "checkpointId": "gemma-4-26b-a4b-it-qat",
+        "targetId": "target_5d506e8e96d6a253a87bec465f49ae7f71fc55a716b56e86fc79de90f14e05b0",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_be9658e9858904ce6a288fdcb2840bf5a5d744b9e8ca707c82f8f4fc855f47a3",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+              "revision": "7b92b5b28818151e8669af2e45e88d6086f490dd"
+            },
+            "files": [
+              {
+                "id": "file_a7c5bc715f5ff8e99a3e8901ce7d2b42b402c669bf24f7c5250747633d0f5891",
+                "path": "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 14249047104,
+                "sha256": "a7c5bc715f5ff8e99a3e8901ce7d2b42b402c669bf24f7c5250747633d0f5891"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_0",
+              "quantizationName": "4-bit",
+              "architecture": "gemma4",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Gemma 4 26B-A4B",
+        "description": "Mid-size MoE model balancing a substantial weight footprint with low active compute.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 39.0,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 58,
+        "quantizationAware": true,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "gemma-4-31b-it-qat:UD-Q4_K_XL",
+        "checkpointId": "gemma-4-31b-it-qat",
+        "targetId": "target_a3fc5c692a521f0e5b2b3d48a78ad35128530876ce2c07a4ded5774082fd947b",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_279fec17aa373588694ef15ae59e847c57fee7a7bf4050a4815f0647e1b4bed2",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
+              "revision": "43cc1aeb31adf47ec06a854507ce552cd9862e6f"
+            },
+            "files": [
+              {
+                "id": "file_00b5a7c497f0c8934033088c10a7fa9a4c015e46ee6d89e9c6890650ba5d0e71",
+                "path": "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+                "role": "weights",
+                "sizeBytes": 17287670048,
+                "sha256": "00b5a7c497f0c8934033088c10a7fa9a4c015e46ee6d89e9c6890650ba5d0e71"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_0",
+              "quantizationName": "4-bit",
+              "architecture": "gemma4",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Gemma 4 31B",
+        "description": "Large dense Gemma model with the strongest measured coding score in its family.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 43.4,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 58,
+        "quantizationAware": true,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "laguna-s-2.1:Q4_K_M",
+        "checkpointId": "laguna-s-2.1",
+        "targetId": "target_3db0a66a1114359f7130447eb5f84c21d091b55736bb37c4d9a06ad59f592c0c",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_99a17b8f2fdd7535a8f61e16762f1a71a13e806f9f6dabd29d1f7bb7585fef9f",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "poolside/Laguna-S-2.1-GGUF",
+              "revision": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+            },
+            "files": [
+              {
+                "id": "file_a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff",
+                "path": "laguna-s-2.1-Q4_K_M.gguf",
+                "role": "weights",
+                "sizeBytes": 68248760064,
+                "sha256": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q8_0",
+              "quantizationName": "8-bit",
+              "architecture": "laguna",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Laguna S 2.1 118B-A8B",
+        "description": "High-capability MoE model designed for agentic coding and long-horizon software work.",
+        "license": "openmdw-1.1",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 70.2,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Publisher-measured Terminal-Bench v2.1 checkpoint result; not an exact GGUF quantization measurement.",
+          "https://huggingface.co/poolside/Laguna-S-2.1",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "laguna-s-2.1:Q8_0",
+        "checkpointId": "laguna-s-2.1",
+        "targetId": "target_4616d1df5e81f856355f2e9b05589bbf7bd053a2bb42976b2dce59d88af151a0",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_41e81822e4ca3bfc906302f80a97b82ab5bcbd8d11ac79e243c618e52d2acb9f",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "poolside/Laguna-S-2.1-GGUF",
+              "revision": "edd093522473dc7313b0738d8b4116b7f8b9745f"
+            },
+            "files": [
+              {
+                "id": "file_d946b221d69f2c5f87a986952bcd3cfb75831e5a6a2184e626e361663e1bfe2b",
+                "path": "laguna-s-2.1-Q8_0.gguf",
+                "role": "weights",
+                "sizeBytes": 128750823168,
+                "sha256": "d946b221d69f2c5f87a986952bcd3cfb75831e5a6a2184e626e361663e1bfe2b"
+              }
+            ],
+            "relationships": [],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q8_0",
+              "quantizationName": "8-bit",
+              "architecture": "laguna",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Laguna S 2.1 118B-A8B",
+        "description": "High-capability MoE model designed for agentic coding and long-horizon software work.",
+        "license": "openmdw-1.1",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 70.2,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 80,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Publisher-measured Terminal-Bench v2.1 checkpoint result; not an exact GGUF quantization measurement.",
+          "https://huggingface.co/poolside/Laguna-S-2.1",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "qwen3.5-122b-a10b:Q4_K_M",
+        "checkpointId": "qwen3.5-122b-a10b",
+        "targetId": "target_c27690be560d335e2bcba507fb8dbb1524f1425206db266426c436dbef74d1fe",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_b789a81f4c6e8c96c8f6ae95d86956b8bdd9d9d36becc6f78d86388588a099a7",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+              "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+            },
+            "files": [
+              {
+                "id": "file_467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3",
+                "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 10943552,
+                "sha256": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3"
+              },
+              {
+                "id": "file_90db14846413aebdac365b57206441437cac5f7e5037d94b325f0167f902e6e7",
+                "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00002-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 49968146912,
+                "sha256": "90db14846413aebdac365b57206441437cac5f7e5037d94b325f0167f902e6e7"
+              },
+              {
+                "id": "file_e3c24b8ebec070bb4f69ea0aca25a16531da7440cd515529953e046882901f97",
+                "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00003-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 26557874144,
+                "sha256": "e3c24b8ebec070bb4f69ea0aca25a16531da7440cd515529953e046882901f97"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3",
+                "index": 1,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_90db14846413aebdac365b57206441437cac5f7e5037d94b325f0167f902e6e7",
+                "index": 2,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_e3c24b8ebec070bb4f69ea0aca25a16531da7440cd515529953e046882901f97",
+                "index": 3,
+                "count": 3
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_K - Medium",
+              "quantizationName": "4-bit",
+              "architecture": "qwen35moe",
+              "maximumContextLength": 262144
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "Qwen3.5 122B-A10B",
+        "description": "Workstation-class MoE model with a large knowledge footprint and moderate active compute.",
+        "license": "apache-2.0",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 47.6,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "nemotron-3-super-120b-a12b:UD-Q4_K_XL",
+        "checkpointId": "nemotron-3-super-120b-a12b",
+        "targetId": "target_634bc720087d302d9a200df137430fd2bea02eba9051f13f06b548b21f77168f",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_5f9956f07f837201699716f416f437e24e5ac2c774e6adf110b5fe9cd6d836d8",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+              "revision": "036038fb30334a2d56a146c6f0d4871ab5edccbb"
+            },
+            "files": [
+              {
+                "id": "file_f22083eb6b15acb52905308ab083e8b0cc38897005cc45e8881abd164580aac2",
+                "path": "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00001-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 7872576,
+                "sha256": "f22083eb6b15acb52905308ab083e8b0cc38897005cc45e8881abd164580aac2"
+              },
+              {
+                "id": "file_a53810e8e9c2baf8e2598c4c503c10e0b9361ced72313d441e2f6f5e93b33de3",
+                "path": "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00002-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 49911512480,
+                "sha256": "a53810e8e9c2baf8e2598c4c503c10e0b9361ced72313d441e2f6f5e93b33de3"
+              },
+              {
+                "id": "file_276c72d16eeaef4404a32747f054292e11484ee20988b1446846a0cdb6049ea5",
+                "path": "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00003-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 33857923456,
+                "sha256": "276c72d16eeaef4404a32747f054292e11484ee20988b1446846a0cdb6049ea5"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_276c72d16eeaef4404a32747f054292e11484ee20988b1446846a0cdb6049ea5",
+                "index": 3,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_a53810e8e9c2baf8e2598c4c503c10e0b9361ced72313d441e2f6f5e93b33de3",
+                "index": 2,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_f22083eb6b15acb52905308ab083e8b0cc38897005cc45e8881abd164580aac2",
+                "index": 1,
+                "count": 3
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q4_K - Medium",
+              "quantizationName": "4-bit",
+              "architecture": "nemotron_h_moe",
+              "maximumContextLength": 1048576
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "NVIDIA Nemotron 3 Super 120B-A12B",
+        "description": "Workstation-class hybrid MoE model designed for agentic workflows.",
+        "license": "nvidia-nemotron-open-model-license",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 38.6,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 58,
+        "quantizationAware": true,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "nemotron-3-super-120b-a12b:MXFP4_MOE",
+        "checkpointId": "nemotron-3-super-120b-a12b",
+        "targetId": "target_58f117dc0bf4ca14dd86cb9810d4cbc020f718074b09f69ca68109c31af4e61d",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_42b6ab9e5ca18399f19186ee9357d5e8ca08dad006297e52a371e1dbbc9b0545",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+              "revision": "036038fb30334a2d56a146c6f0d4871ab5edccbb"
+            },
+            "files": [
+              {
+                "id": "file_1891b15a4e3e11f5dfb0050062c35fc2eeee9e7a37bc8f407c3886491c21bb30",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00001-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 7872576,
+                "sha256": "1891b15a4e3e11f5dfb0050062c35fc2eeee9e7a37bc8f407c3886491c21bb30"
+              },
+              {
+                "id": "file_62ead0ba22b3a4a4ac9277d6845fa09c7860933dd0060c51819c2b751d086923",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00002-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 49831407232,
+                "sha256": "62ead0ba22b3a4a4ac9277d6845fa09c7860933dd0060c51819c2b751d086923"
+              },
+              {
+                "id": "file_cfb638b699befba01199d70a4e44ace39cb7f144d9edc651eadd369f6d43c60c",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00003-of-00003.gguf",
+                "role": "weights",
+                "sizeBytes": 32220461216,
+                "sha256": "cfb638b699befba01199d70a4e44ace39cb7f144d9edc651eadd369f6d43c60c"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_1891b15a4e3e11f5dfb0050062c35fc2eeee9e7a37bc8f407c3886491c21bb30",
+                "index": 1,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_62ead0ba22b3a4a4ac9277d6845fa09c7860933dd0060c51819c2b751d086923",
+                "index": 2,
+                "count": 3
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_cfb638b699befba01199d70a4e44ace39cb7f144d9edc651eadd369f6d43c60c",
+                "index": 3,
+                "count": 3
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "MXFP4 MoE",
+              "quantizationName": "4-bit",
+              "architecture": "nemotron_h_moe",
+              "maximumContextLength": 1048576
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "NVIDIA Nemotron 3 Super 120B-A12B",
+        "description": "Workstation-class hybrid MoE model designed for agentic workflows.",
+        "license": "nvidia-nemotron-open-model-license",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 38.6,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 58,
+        "quantizationAware": true,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "deepseek-v4-flash:UD-Q3_K_M",
+        "checkpointId": "deepseek-v4-flash",
+        "targetId": "target_d4d8f2cd49368a5e0ac3f772d337f4bf6f48f14e2c7588112e6c05f9da36d025",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_1b4785d96c19203870e1158cfec083d0d51eda6ba09b4039638aed7583c0c8a9",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/DeepSeek-V4-Flash-GGUF",
+              "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0"
+            },
+            "files": [
+              {
+                "id": "file_951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
+                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 5256864,
+                "sha256": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396"
+              },
+              {
+                "id": "file_18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034",
+                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00002-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 49222528448,
+                "sha256": "18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034"
+              },
+              {
+                "id": "file_9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc",
+                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00003-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 49189072672,
+                "sha256": "9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc"
+              },
+              {
+                "id": "file_2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea",
+                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00004-of-00004.gguf",
+                "role": "weights",
+                "sizeBytes": 30903139232,
+                "sha256": "2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034",
+                "index": 2,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea",
+                "index": 4,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
+                "index": 1,
+                "count": 4
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc",
+                "index": 3,
+                "count": 4
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "Q3_K - Medium",
+              "quantizationName": "3-bit",
+              "architecture": "deepseek4",
+              "maximumContextLength": 1048576
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "DeepSeek V4 Flash 284B-A13B",
+        "description": "Frontier MoE model with a very large weight footprint and low active compute.",
+        "license": "mit",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "max"
+            ],
+            "defaultEffort": "none"
+          }
+        },
+        "qualityScore": 61.8,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "nemotron-3-ultra-550b-a55b:MXFP4_MOE",
+        "checkpointId": "nemotron-3-ultra-550b-a55b",
+        "targetId": "target_3e637075ad542bbcda474eb34b27928263b98e6a6fd62a7d8465116f58d0a5f0",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_9e533e02011635a046ba4fc1108558fe8b1b763f794de08000f2eb065733b161",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
+              "revision": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6"
+            },
+            "files": [
+              {
+                "id": "file_564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00001-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 7872128,
+                "sha256": "564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39"
+              },
+              {
+                "id": "file_49bb6d0075c1926583a88b2cb7fa0c07e24918ae2c0505c200a8f93cb618453d",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00002-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 46357384032,
+                "sha256": "49bb6d0075c1926583a88b2cb7fa0c07e24918ae2c0505c200a8f93cb618453d"
+              },
+              {
+                "id": "file_e34d245dd2a370a487eea8e1818f59b6c827ca53603508f5e17760a6d7df5698",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00003-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 47312721120,
+                "sha256": "e34d245dd2a370a487eea8e1818f59b6c827ca53603508f5e17760a6d7df5698"
+              },
+              {
+                "id": "file_789888c578495adfc18fdd4540d08dd5ef5a01ee1fb9b0e97081249eb8c2695d",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00004-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 47016905632,
+                "sha256": "789888c578495adfc18fdd4540d08dd5ef5a01ee1fb9b0e97081249eb8c2695d"
+              },
+              {
+                "id": "file_6d3fc88758edc68796fbab8e08dc069756bf8479574c342faa884266a95f7c91",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00005-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 47459816960,
+                "sha256": "6d3fc88758edc68796fbab8e08dc069756bf8479574c342faa884266a95f7c91"
+              },
+              {
+                "id": "file_39c6bb6da37e3c278ce1dbef64e82abccaeec192563ce3ec37aeea6e14333d2c",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00006-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 47016905632,
+                "sha256": "39c6bb6da37e3c278ce1dbef64e82abccaeec192563ce3ec37aeea6e14333d2c"
+              },
+              {
+                "id": "file_e9f7b068f256bf41b5265955fe7bb38eb6a1edbd9da67887d7f5675a789fdccc",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00007-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 47312721120,
+                "sha256": "e9f7b068f256bf41b5265955fe7bb38eb6a1edbd9da67887d7f5675a789fdccc"
+              },
+              {
+                "id": "file_c950f4810dc569df2d3fafef790a4299a6ce8872c51b81c6b469720cf6017629",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00008-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 47016905664,
+                "sha256": "c950f4810dc569df2d3fafef790a4299a6ce8872c51b81c6b469720cf6017629"
+              },
+              {
+                "id": "file_e88987d3747eddec4190373fd9628d6bd4f307d54ad2f42f509c52e76ccd13b9",
+                "path": "MXFP4_MOE/NVIDIA-Nemotron-3-Ultra-550B-A55B-MXFP4_MOE-00009-of-00009.gguf",
+                "role": "weights",
+                "sizeBytes": 22770053920,
+                "sha256": "e88987d3747eddec4190373fd9628d6bd4f307d54ad2f42f509c52e76ccd13b9"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_39c6bb6da37e3c278ce1dbef64e82abccaeec192563ce3ec37aeea6e14333d2c",
+                "index": 6,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_49bb6d0075c1926583a88b2cb7fa0c07e24918ae2c0505c200a8f93cb618453d",
+                "index": 2,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_564f53d41fb4059d0afe24a78d529f61fa7f0ea667429a7a8dbb158948454a39",
+                "index": 1,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_6d3fc88758edc68796fbab8e08dc069756bf8479574c342faa884266a95f7c91",
+                "index": 5,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_789888c578495adfc18fdd4540d08dd5ef5a01ee1fb9b0e97081249eb8c2695d",
+                "index": 4,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_c950f4810dc569df2d3fafef790a4299a6ce8872c51b81c6b469720cf6017629",
+                "index": 8,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_e34d245dd2a370a487eea8e1818f59b6c827ca53603508f5e17760a6d7df5698",
+                "index": 3,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_e88987d3747eddec4190373fd9628d6bd4f307d54ad2f42f509c52e76ccd13b9",
+                "index": 9,
+                "count": 9
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_e9f7b068f256bf41b5265955fe7bb38eb6a1edbd9da67887d7f5675a789fdccc",
+                "index": 7,
+                "count": 9
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "MXFP4 MoE",
+              "quantizationName": "4-bit",
+              "architecture": "nemotron_h_moe",
+              "maximumContextLength": 1048576
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "NVIDIA Nemotron 3 Ultra 550B-A55B",
+        "description": "Frontier workstation/server MoE model for exceptionally high-memory systems.",
+        "license": "openmdw-1.1",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 53.9,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 58,
+        "quantizationAware": true,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "glm-5.2:BF16",
+        "checkpointId": "glm-5.2",
+        "targetId": "target_2ac3407b442fba7bf7c53716579bde07ae8f0ce474866dad34593b3d71ffded1",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_7f695762a9cbd2865e79ddd96c8efbeb751ef4ad2f3c7fd017e3c6e9efb910ee",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/GLM-5.2-GGUF",
+              "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23"
+            },
+            "files": [
+              {
+                "id": "file_3c5ddaa0fd80caef31d10c1b96ee982e3fb2abd150a3413797a1b37c9de33f11",
+                "path": "BF16/GLM-5.2-BF16-00001-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 44974080544,
+                "sha256": "3c5ddaa0fd80caef31d10c1b96ee982e3fb2abd150a3413797a1b37c9de33f11"
+              },
+              {
+                "id": "file_4fee983cbc0224f06b032694a968e9c1c2b9c00c5977e2a243efdc3d43bf1962",
+                "path": "BF16/GLM-5.2-BF16-00002-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "4fee983cbc0224f06b032694a968e9c1c2b9c00c5977e2a243efdc3d43bf1962"
+              },
+              {
+                "id": "file_be743351e47c9a084fd065b83fef8969a082ceb0bad5ec12a0e2d5ad01cfda81",
+                "path": "BF16/GLM-5.2-BF16-00003-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "be743351e47c9a084fd065b83fef8969a082ceb0bad5ec12a0e2d5ad01cfda81"
+              },
+              {
+                "id": "file_40272b7b58ba56c5a49329d0d1dafc0b2eafc77564591db7e699a53fdac87088",
+                "path": "BF16/GLM-5.2-BF16-00004-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46408197792,
+                "sha256": "40272b7b58ba56c5a49329d0d1dafc0b2eafc77564591db7e699a53fdac87088"
+              },
+              {
+                "id": "file_0f3449cfe80b651cb3e6277714d1fbd6fc059db53c1841e7ae3a2f0e783e21e3",
+                "path": "BF16/GLM-5.2-BF16-00005-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46779392512,
+                "sha256": "0f3449cfe80b651cb3e6277714d1fbd6fc059db53c1841e7ae3a2f0e783e21e3"
+              },
+              {
+                "id": "file_22d0dbe4dea0dafe413b0d0f9335595a0d9b83cef96b2997dd38ef4c4ba8af6f",
+                "path": "BF16/GLM-5.2-BF16-00006-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "22d0dbe4dea0dafe413b0d0f9335595a0d9b83cef96b2997dd38ef4c4ba8af6f"
+              },
+              {
+                "id": "file_1aaf935b5b6a7d336cf203a39fec1a9e8c2fd10a43dfb5d445e4d36b171d35d1",
+                "path": "BF16/GLM-5.2-BF16-00007-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46332826016,
+                "sha256": "1aaf935b5b6a7d336cf203a39fec1a9e8c2fd10a43dfb5d445e4d36b171d35d1"
+              },
+              {
+                "id": "file_d64c844afd7f638d0d0c83a416e33674f04b286fce0e09bea07aa7b0762e34d0",
+                "path": "BF16/GLM-5.2-BF16-00008-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "d64c844afd7f638d0d0c83a416e33674f04b286fce0e09bea07aa7b0762e34d0"
+              },
+              {
+                "id": "file_2a7fd44066c3966b59d2ba8e998b90b3b2f2e8d945f7950ed0f541a55997d4d4",
+                "path": "BF16/GLM-5.2-BF16-00009-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "2a7fd44066c3966b59d2ba8e998b90b3b2f2e8d945f7950ed0f541a55997d4d4"
+              },
+              {
+                "id": "file_02ffddd2bafb8d801e47ea85513d328b18ed3cbd63acb95d870a85f970c1d1b5",
+                "path": "BF16/GLM-5.2-BF16-00010-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46408197792,
+                "sha256": "02ffddd2bafb8d801e47ea85513d328b18ed3cbd63acb95d870a85f970c1d1b5"
+              },
+              {
+                "id": "file_a2773f2fd076592c238f1a4a4af0dc3fbbbb9cb7068749bdc5666d434442e1ac",
+                "path": "BF16/GLM-5.2-BF16-00011-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "a2773f2fd076592c238f1a4a4af0dc3fbbbb9cb7068749bdc5666d434442e1ac"
+              },
+              {
+                "id": "file_6de08d8c2f62b343cc7d577951c4d1a98a56e18538fe554252ed504700522985",
+                "path": "BF16/GLM-5.2-BF16-00012-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "6de08d8c2f62b343cc7d577951c4d1a98a56e18538fe554252ed504700522985"
+              },
+              {
+                "id": "file_021621fa0d7d36517f58a18f619ac0a16a45c4f8d362420c804dba82ac6f4359",
+                "path": "BF16/GLM-5.2-BF16-00013-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46408197792,
+                "sha256": "021621fa0d7d36517f58a18f619ac0a16a45c4f8d362420c804dba82ac6f4359"
+              },
+              {
+                "id": "file_7f94ca0e339707a248f77aef4ce4cae49536a9fd126ee6e2a926b5aa7369921f",
+                "path": "BF16/GLM-5.2-BF16-00014-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "7f94ca0e339707a248f77aef4ce4cae49536a9fd126ee6e2a926b5aa7369921f"
+              },
+              {
+                "id": "file_e9a61e362c0814a421c52d701cb7ad5e2759a56e3637d048fa330e54c00e29c0",
+                "path": "BF16/GLM-5.2-BF16-00015-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "e9a61e362c0814a421c52d701cb7ad5e2759a56e3637d048fa330e54c00e29c0"
+              },
+              {
+                "id": "file_445af48926edbbe07c50c60aeb6fee7bc61304adfd5465ee51b31ea620b4d43d",
+                "path": "BF16/GLM-5.2-BF16-00016-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46408197792,
+                "sha256": "445af48926edbbe07c50c60aeb6fee7bc61304adfd5465ee51b31ea620b4d43d"
+              },
+              {
+                "id": "file_ceabd9b63d7ad269853e5157fb184a323e90f312923d3f0fedf7b83659e1de25",
+                "path": "BF16/GLM-5.2-BF16-00017-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "ceabd9b63d7ad269853e5157fb184a323e90f312923d3f0fedf7b83659e1de25"
+              },
+              {
+                "id": "file_e0d1381d089ebf063cb29a71c4280c283e5e5611116311d0ac7b4043d3a61ea7",
+                "path": "BF16/GLM-5.2-BF16-00018-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "e0d1381d089ebf063cb29a71c4280c283e5e5611116311d0ac7b4043d3a61ea7"
+              },
+              {
+                "id": "file_7f90f958d3da370b6565de794de29d9f51864b1c18ff8f1446339fd6aa04fd70",
+                "path": "BF16/GLM-5.2-BF16-00019-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46408197760,
+                "sha256": "7f90f958d3da370b6565de794de29d9f51864b1c18ff8f1446339fd6aa04fd70"
+              },
+              {
+                "id": "file_abf6cb86ad8348c5fc68f9e5b2881756083162833b85635ad8a80bd4c68050c4",
+                "path": "BF16/GLM-5.2-BF16-00020-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "abf6cb86ad8348c5fc68f9e5b2881756083162833b85635ad8a80bd4c68050c4"
+              },
+              {
+                "id": "file_3aea56006856790a92268c8151be7d7bd548bd48bdb66d3513a56ead266e096b",
+                "path": "BF16/GLM-5.2-BF16-00021-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "3aea56006856790a92268c8151be7d7bd548bd48bdb66d3513a56ead266e096b"
+              },
+              {
+                "id": "file_ae15732104d3364f71262ceb81965201b682e4192a60182ed09ea18e879f7c96",
+                "path": "BF16/GLM-5.2-BF16-00022-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46332826016,
+                "sha256": "ae15732104d3364f71262ceb81965201b682e4192a60182ed09ea18e879f7c96"
+              },
+              {
+                "id": "file_051b714be1700f458751d64c041b7642232392820ff405802c3d098ed1c1ac8a",
+                "path": "BF16/GLM-5.2-BF16-00023-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308192,
+                "sha256": "051b714be1700f458751d64c041b7642232392820ff405802c3d098ed1c1ac8a"
+              },
+              {
+                "id": "file_447eca36139945c45c7d2f408f8acb99f3f95993febb39252ede639d4457f148",
+                "path": "BF16/GLM-5.2-BF16-00024-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308160,
+                "sha256": "447eca36139945c45c7d2f408f8acb99f3f95993febb39252ede639d4457f148"
+              },
+              {
+                "id": "file_f4b663351f131ee7bae9787ac18de822fa5e975f3a51d42a7bb11bc985bd7ddf",
+                "path": "BF16/GLM-5.2-BF16-00025-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46408197792,
+                "sha256": "f4b663351f131ee7bae9787ac18de822fa5e975f3a51d42a7bb11bc985bd7ddf"
+              },
+              {
+                "id": "file_5830fa329f46d3a44ad5d9c0b038a0104b3cb1e47b158f59407747ed7ff7d713",
+                "path": "BF16/GLM-5.2-BF16-00026-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "5830fa329f46d3a44ad5d9c0b038a0104b3cb1e47b158f59407747ed7ff7d713"
+              },
+              {
+                "id": "file_1365a227d9a2f361a6dbdd49d3b2628465d8d6b247b94f3261ce447214a4640e",
+                "path": "BF16/GLM-5.2-BF16-00027-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "1365a227d9a2f361a6dbdd49d3b2628465d8d6b247b94f3261ce447214a4640e"
+              },
+              {
+                "id": "file_c1734989ad370ec0d3114302f57720125aed75b7f68c210b6583fc0b9deef740",
+                "path": "BF16/GLM-5.2-BF16-00028-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46332825984,
+                "sha256": "c1734989ad370ec0d3114302f57720125aed75b7f68c210b6583fc0b9deef740"
+              },
+              {
+                "id": "file_5467d86c3c3257b4c094e4ae1c4bb428922f88a688ceac6c03e811aaf3dd59c8",
+                "path": "BF16/GLM-5.2-BF16-00029-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45996308224,
+                "sha256": "5467d86c3c3257b4c094e4ae1c4bb428922f88a688ceac6c03e811aaf3dd59c8"
+              },
+              {
+                "id": "file_91960f9dfce7e81a1d9e42566a816e2c72b6d895f587603ce7f0a8b5d2eb2c2f",
+                "path": "BF16/GLM-5.2-BF16-00030-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 45920936416,
+                "sha256": "91960f9dfce7e81a1d9e42566a816e2c72b6d895f587603ce7f0a8b5d2eb2c2f"
+              },
+              {
+                "id": "file_0ac1b708f51bcfc995e08f73e4be87170b048c418cbb89807486e9ceef8982ea",
+                "path": "BF16/GLM-5.2-BF16-00031-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46408197792,
+                "sha256": "0ac1b708f51bcfc995e08f73e4be87170b048c418cbb89807486e9ceef8982ea"
+              },
+              {
+                "id": "file_3b8b9492eb2b90ebc00de0ab005fa35b07f180f240279d11ef36a34f21619ce0",
+                "path": "BF16/GLM-5.2-BF16-00032-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 46091143200,
+                "sha256": "3b8b9492eb2b90ebc00de0ab005fa35b07f180f240279d11ef36a34f21619ce0"
+              },
+              {
+                "id": "file_7ef960fc2b20a6a0e262c0fa68f598dd9f412a36deddc1e133083107b5ffb206",
+                "path": "BF16/GLM-5.2-BF16-00033-of-00033.gguf",
+                "role": "weights",
+                "sizeBytes": 33036034336,
+                "sha256": "7ef960fc2b20a6a0e262c0fa68f598dd9f412a36deddc1e133083107b5ffb206"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_021621fa0d7d36517f58a18f619ac0a16a45c4f8d362420c804dba82ac6f4359",
+                "index": 13,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_02ffddd2bafb8d801e47ea85513d328b18ed3cbd63acb95d870a85f970c1d1b5",
+                "index": 10,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_051b714be1700f458751d64c041b7642232392820ff405802c3d098ed1c1ac8a",
+                "index": 23,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_0ac1b708f51bcfc995e08f73e4be87170b048c418cbb89807486e9ceef8982ea",
+                "index": 31,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_0f3449cfe80b651cb3e6277714d1fbd6fc059db53c1841e7ae3a2f0e783e21e3",
+                "index": 5,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_1365a227d9a2f361a6dbdd49d3b2628465d8d6b247b94f3261ce447214a4640e",
+                "index": 27,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_1aaf935b5b6a7d336cf203a39fec1a9e8c2fd10a43dfb5d445e4d36b171d35d1",
+                "index": 7,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_22d0dbe4dea0dafe413b0d0f9335595a0d9b83cef96b2997dd38ef4c4ba8af6f",
+                "index": 6,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_2a7fd44066c3966b59d2ba8e998b90b3b2f2e8d945f7950ed0f541a55997d4d4",
+                "index": 9,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_3aea56006856790a92268c8151be7d7bd548bd48bdb66d3513a56ead266e096b",
+                "index": 21,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_3b8b9492eb2b90ebc00de0ab005fa35b07f180f240279d11ef36a34f21619ce0",
+                "index": 32,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_3c5ddaa0fd80caef31d10c1b96ee982e3fb2abd150a3413797a1b37c9de33f11",
+                "index": 1,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_40272b7b58ba56c5a49329d0d1dafc0b2eafc77564591db7e699a53fdac87088",
+                "index": 4,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_445af48926edbbe07c50c60aeb6fee7bc61304adfd5465ee51b31ea620b4d43d",
+                "index": 16,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_447eca36139945c45c7d2f408f8acb99f3f95993febb39252ede639d4457f148",
+                "index": 24,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_4fee983cbc0224f06b032694a968e9c1c2b9c00c5977e2a243efdc3d43bf1962",
+                "index": 2,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_5467d86c3c3257b4c094e4ae1c4bb428922f88a688ceac6c03e811aaf3dd59c8",
+                "index": 29,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_5830fa329f46d3a44ad5d9c0b038a0104b3cb1e47b158f59407747ed7ff7d713",
+                "index": 26,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_6de08d8c2f62b343cc7d577951c4d1a98a56e18538fe554252ed504700522985",
+                "index": 12,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_7ef960fc2b20a6a0e262c0fa68f598dd9f412a36deddc1e133083107b5ffb206",
+                "index": 33,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_7f90f958d3da370b6565de794de29d9f51864b1c18ff8f1446339fd6aa04fd70",
+                "index": 19,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_7f94ca0e339707a248f77aef4ce4cae49536a9fd126ee6e2a926b5aa7369921f",
+                "index": 14,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_91960f9dfce7e81a1d9e42566a816e2c72b6d895f587603ce7f0a8b5d2eb2c2f",
+                "index": 30,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_a2773f2fd076592c238f1a4a4af0dc3fbbbb9cb7068749bdc5666d434442e1ac",
+                "index": 11,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_abf6cb86ad8348c5fc68f9e5b2881756083162833b85635ad8a80bd4c68050c4",
+                "index": 20,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_ae15732104d3364f71262ceb81965201b682e4192a60182ed09ea18e879f7c96",
+                "index": 22,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_be743351e47c9a084fd065b83fef8969a082ceb0bad5ec12a0e2d5ad01cfda81",
+                "index": 3,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_c1734989ad370ec0d3114302f57720125aed75b7f68c210b6583fc0b9deef740",
+                "index": 28,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_ceabd9b63d7ad269853e5157fb184a323e90f312923d3f0fedf7b83659e1de25",
+                "index": 17,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_d64c844afd7f638d0d0c83a416e33674f04b286fce0e09bea07aa7b0762e34d0",
+                "index": 8,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_e0d1381d089ebf063cb29a71c4280c283e5e5611116311d0ac7b4043d3a61ea7",
+                "index": 18,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_e9a61e362c0814a421c52d701cb7ad5e2759a56e3637d048fa330e54c00e29c0",
+                "index": 15,
+                "count": 33
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_f4b663351f131ee7bae9787ac18de822fa5e975f3a51d42a7bb11bc985bd7ddf",
+                "index": 25,
+                "count": 33
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "BF16",
+              "quantizationName": "16-bit",
+              "architecture": "glm-dsa",
+              "maximumContextLength": 1048576
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "GLM 5.2 753B-A40B",
+        "description": "Largest catalog tier, intended only for exceptionally high-memory systems.",
+        "license": "mit",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 77.9,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 100,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      }
+    ],
+    "diagnostics": []
+  }
+}

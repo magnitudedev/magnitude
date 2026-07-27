@@ -168,6 +168,7 @@ describe("local inference selection view model", () => {
         },
         completedItems: Option.some(1),
         totalItems: Option.some(1),
+        estimatedRemainingMs: Option.none(),
       },
       {
         id: "inventory",
@@ -179,52 +180,95 @@ describe("local inference selection view model", () => {
         },
         completedItems: Option.some(2),
         totalItems: Option.some(2),
+        estimatedRemainingMs: Option.none(),
       },
       {
-        id: "assessment",
+        id: "analysis",
         status: { _tag: "Running", startedAtMs: 2_000 },
         completedItems: Option.some(8),
         totalItems: Option.some(28),
+        estimatedRemainingMs: Option.some(5_000),
       },
-    ], 4_000)).toEqual([
+      {
+        id: "analysis",
+        status: {
+          _tag: "Completed",
+          startedAtMs: 2_000,
+          durationMs: 7_600,
+          cached: false,
+        },
+        completedItems: Option.some(20),
+        totalItems: Option.some(20),
+        estimatedRemainingMs: Option.none(),
+      },
+    ])).toEqual([
       {
         id: "hardware",
         state: "completed",
         label: "Detected hardware",
-        metadata: " · 1/1 · 1s",
+        metadata: "",
       },
       {
         id: "inventory",
         state: "completed",
-        label: "Checked for downloaded models",
-        metadata: " · 2/2 · 0.5s",
+        label: "Found 2 downloaded models",
+        metadata: "",
       },
       {
-        id: "assessment",
+        id: "analysis",
         state: "running",
         label: "Evaluating models for this machine",
-        metadata: " · 8/28 · 2s",
+        metadata: " · 8/28 · about 5s left",
+      },
+      {
+        id: "analysis",
+        state: "completed",
+        label: "Evaluated 20 models for this machine",
+        metadata: " · 8s",
       },
     ])
   })
 
-  it("identifies reused recommendation work without implying a network refresh", () => {
-    expect(localInferenceProgressLines([{
-      id: "selection",
-      status: {
-        _tag: "Completed",
-        startedAtMs: 1_000,
-        durationMs: 0,
-        cached: true,
+  it("keeps cache reuse and recommendation timing out of presentation", () => {
+    expect(localInferenceProgressLines([
+      {
+        id: "analysis",
+        status: {
+          _tag: "Completed",
+          startedAtMs: 1_000,
+          durationMs: 0,
+          cached: true,
+        },
+        completedItems: Option.some(20),
+        totalItems: Option.some(20),
+        estimatedRemainingMs: Option.none(),
       },
-      completedItems: Option.some(4),
-      totalItems: Option.some(4),
-    }], 1_000)[0]).toEqual({
-      id: "selection",
-      state: "completed",
-      label: "Prepared recommendations",
-      metadata: " · 4/4 · cached",
-    })
+      {
+        id: "recommendations",
+        status: {
+          _tag: "Completed",
+          startedAtMs: 1_000,
+          durationMs: 500,
+          cached: true,
+        },
+        completedItems: Option.some(4),
+        totalItems: Option.some(4),
+        estimatedRemainingMs: Option.none(),
+      },
+    ])).toEqual([
+      {
+        id: "analysis",
+        state: "completed",
+        label: "Evaluated 20 models for this machine",
+        metadata: "",
+      },
+      {
+        id: "recommendations",
+        state: "completed",
+        label: "Prepared 4 recommendations",
+        metadata: "",
+      },
+    ])
   })
 
   it("presents unified memory from the hardware contract", () => {

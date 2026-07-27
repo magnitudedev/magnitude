@@ -15,6 +15,7 @@ base64 = "0.22.1"
 bytes = "1.12.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 encoding_rs = "0.8.35"
+flate2 = "1.1"
 futures-util = "0.3.31"
 fs2 = "0.4.3"
 getrandom = "0.4.3"

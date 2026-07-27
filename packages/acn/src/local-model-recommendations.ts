@@ -143,15 +143,14 @@ const pendingProgress = (
   status: { _tag: "Pending" },
   completedItems: Option.none(),
   totalItems: Option.none(),
+  estimatedRemainingMs: Option.none(),
 })
 
 const initialProgress = (): readonly LocalModelRecommendationProgressStep[] => [
   pendingProgress("hardware"),
   pendingProgress("inventory"),
-  pendingProgress("catalog"),
-  pendingProgress("metadata"),
-  pendingProgress("assessment"),
-  pendingProgress("selection"),
+  pendingProgress("analysis"),
+  pendingProgress("recommendations"),
 ]
 
 const updateProgress = (
@@ -255,6 +254,7 @@ export const makeLocalModelRecommendationsLive = (
       status: { _tag: "Running", startedAtMs: Date.now() },
       completedItems: counts ? Option.some(counts.completed) : Option.none(),
       totalItems: counts ? Option.some(counts.total) : Option.none(),
+      estimatedRemainingMs: Option.none(),
     })
     return publishProgress(next).pipe(Effect.as(next))
   }
@@ -275,6 +275,7 @@ export const makeLocalModelRecommendationsLive = (
       },
       completedItems: counts ? Option.some(counts.completed) : Option.none(),
       totalItems: counts ? Option.some(counts.total) : Option.none(),
+      estimatedRemainingMs: Option.none(),
     })
     return publishProgress(next).pipe(Effect.as(next))
   }
@@ -323,38 +324,11 @@ export const makeLocalModelRecommendationsLive = (
       },
     )
 
-    const catalogStep = progress.find(({ id }) => id === "catalog")
-    const catalogStartedAt = catalogStep?.status._tag === "Running"
-      ? catalogStep.status.startedAtMs
-      : Date.now()
-    if (catalogStep?.status._tag !== "Running") {
-      progress = yield* startStep(progress, "catalog")
-    }
     if (!(yield* catalog.ready)) return
     const catalogState = (yield* catalog.get).state
-    progress = yield* completeStep(
-      progress,
-      "catalog",
-      catalogStartedAt,
-      false,
-      { completed: catalogState.models.length, total: catalogState.models.length },
-    )
-
-    const metadataStartedAt = Date.now()
-    progress = yield* startStep(progress, "metadata", {
-      completed: 0,
-      total: catalogState.models.length,
-    })
     const catalogModels = yield* Effect.forEach(
       catalogState.models,
       recommendableModelFromIcn,
-    )
-    progress = yield* completeStep(
-      progress,
-      "metadata",
-      metadataStartedAt,
-      false,
-      { completed: catalogModels.length, total: catalogState.models.length },
     )
     const stableCapacityBytes = hardwareSnapshot.memory_domains
       .reduce((total, domain) => total + domain.stable_capacity_bytes, 0)
@@ -401,7 +375,7 @@ export const makeLocalModelRecommendationsLive = (
         catalog: catalogCandidates,
       } = Option.getOrThrow(persisted)
       const reusedAt = Date.now()
-      progress = updateProgress(progress, "assessment", {
+      progress = updateProgress(progress, "analysis", {
         status: {
           _tag: "Completed",
           startedAtMs: reusedAt,
@@ -410,8 +384,9 @@ export const makeLocalModelRecommendationsLive = (
         },
         completedItems: Option.some(models.length),
         totalItems: Option.some(models.length),
+        estimatedRemainingMs: Option.none(),
       })
-      progress = updateProgress(progress, "selection", {
+      progress = updateProgress(progress, "recommendations", {
         status: {
           _tag: "Completed",
           startedAtMs: reusedAt,
@@ -420,6 +395,7 @@ export const makeLocalModelRecommendationsLive = (
         },
         completedItems: Option.some(recommendations.length),
         totalItems: Option.some(4),
+        estimatedRemainingMs: Option.none(),
       })
       yield* Ref.set(progressRef, progress)
       yield* Ref.set(lastInputDigest, Option.some(inputDigest))
@@ -434,7 +410,7 @@ export const makeLocalModelRecommendationsLive = (
     if (Option.exists(previousDigest, (digest) => digest === inputDigest)
       && currentState._tag === "Ready") {
       const reusedAt = Date.now()
-      progress = updateProgress(progress, "assessment", {
+      progress = updateProgress(progress, "analysis", {
         status: {
           _tag: "Completed",
           startedAtMs: reusedAt,
@@ -443,8 +419,9 @@ export const makeLocalModelRecommendationsLive = (
         },
         completedItems: Option.some(models.length),
         totalItems: Option.some(models.length),
+        estimatedRemainingMs: Option.none(),
       })
-      progress = updateProgress(progress, "selection", {
+      progress = updateProgress(progress, "recommendations", {
         status: {
           _tag: "Completed",
           startedAtMs: reusedAt,
@@ -453,6 +430,7 @@ export const makeLocalModelRecommendationsLive = (
         },
         completedItems: Option.some(currentState.recommendations.length),
         totalItems: Option.some(4),
+        estimatedRemainingMs: Option.none(),
       })
       yield* Ref.set(progressRef, progress)
       yield* mirror.setIfChanged({ ...currentState, progress }, equivalent)
@@ -460,10 +438,11 @@ export const makeLocalModelRecommendationsLive = (
     }
 
     const assessmentStartedAt = Date.now()
-    progress = yield* startStep(progress, "assessment", {
+    progress = yield* startStep(progress, "analysis", {
       completed: 0,
       total: models.length,
     })
+    yield* publishProgress(progress)
     const requests = models.map((model) => ({
       target: model.target,
       profiles: model.eligibleServingProfiles,
@@ -471,16 +450,23 @@ export const makeLocalModelRecommendationsLive = (
     const results = yield* evaluations.assessManyWithProgress(
       requests,
       (completed, total) => Effect.gen(function* () {
-        progress = updateProgress(progress, "assessment", {
+        const elapsedMs = Math.max(0, Date.now() - assessmentStartedAt)
+        const estimatedRemainingMs = completed > 0
+          ? Math.max(0, Math.round(elapsedMs / completed * (total - completed)))
+          : 0
+        progress = updateProgress(progress, "analysis", {
           completedItems: Option.some(completed),
           totalItems: Option.some(total),
+          estimatedRemainingMs: completed > 0
+            ? Option.some(estimatedRemainingMs)
+            : Option.none(),
         })
         yield* publishProgress(progress)
       }),
     )
     progress = yield* completeStep(
       progress,
-      "assessment",
+      "analysis",
       assessmentStartedAt,
       false,
       { completed: models.length, total: models.length },
@@ -523,11 +509,11 @@ export const makeLocalModelRecommendationsLive = (
       )
     })
     const selectionStartedAt = Date.now()
-    progress = yield* startStep(progress, "selection")
+    progress = yield* startStep(progress, "recommendations")
     const selected = selectRecommendationPortfolio(evaluated)
     const catalogCandidates = assembleRecommendationCatalogCandidates(evaluated, selected)
       .map(({ candidate, recommendation }) => catalogProjection(candidate, recommendation))
-    progress = updateProgress(progress, "selection", {
+    progress = updateProgress(progress, "recommendations", {
       status: {
         _tag: "Completed",
         startedAtMs: selectionStartedAt,
@@ -536,6 +522,7 @@ export const makeLocalModelRecommendationsLive = (
       },
       completedItems: Option.some(selected.length),
       totalItems: Option.some(4),
+      estimatedRemainingMs: Option.none(),
     })
     yield* Ref.set(progressRef, progress)
     yield* Ref.set(lastInputDigest, Option.some(inputDigest))
@@ -576,6 +563,7 @@ export const makeLocalModelRecommendationsLive = (
       step.status._tag === "Running"
         ? {
             ...step,
+            estimatedRemainingMs: Option.none(),
             status: {
               _tag: "Failed" as const,
               startedAtMs: step.status.startedAtMs,

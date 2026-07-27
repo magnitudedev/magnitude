@@ -34,8 +34,9 @@ use icn_contracts::{
 use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
-    ModelPreviewService, NativeRecommendableCatalog, canonical_package_id, offering_target_id,
+    EmbeddedReleaseCatalog, InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind,
+    ModelManager, ModelPreviewService, ReleaseRecommendableCatalog, ResolvingRecommendableCatalog,
+    canonical_package_id, embedded_release_catalog, offering_target_id, release_catalog_manifest,
 };
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -96,6 +97,12 @@ enum Command {
         #[arg(long = "hf-cache", visible_alias = "hf-cache-dir")]
         hf_caches: Vec<PathBuf>,
     },
+    /// Maintains the release-bound curated model catalog.
+    #[command(hide = true)]
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
     Doctor,
     Version {
         #[arg(long)]
@@ -107,6 +114,23 @@ enum Command {
     TemplateWorker,
     #[command(hide = true)]
     InferenceWorker,
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogCommand {
+    /// Resolve the curated source catalog with the production model parser.
+    Generate {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        model_store: PathBuf,
+        #[arg(long)]
+        cache_root: PathBuf,
+        #[arg(long = "hf-cache")]
+        hf_caches: Vec<PathBuf>,
+    },
+    /// Validate the catalog embedded in this binary.
+    Check,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -247,6 +271,32 @@ struct CalibrationCache {
     result: Option<Result<llama_cpp_2::model::params::fit::FitCalibration, String>>,
 }
 
+type NativeAssessorServices = (
+    Arc<NativeHardwareAssessor>,
+    Arc<RwLock<Option<ResidentNativeExecutor>>>,
+    Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
+);
+
+fn native_assessor_services(
+    inventory: &Arc<ModelManager>,
+    native_backend: NativeBackend,
+    defaults: RuntimePlanDefaults,
+) -> NativeAssessorServices {
+    let native_executor = Arc::new(RwLock::new(None));
+    let runtime_failure = Arc::new(RwLock::new(None));
+    let assessor = Arc::new(NativeHardwareAssessor {
+        defaults,
+        cache: Some(inventory.derived_cache().clone()),
+        native_backend,
+        native_executor: Arc::clone(&native_executor),
+        runtime_failure: Arc::clone(&runtime_failure),
+        gate: tokio::sync::Mutex::new(()),
+        planning_slots: Arc::new(tokio::sync::Semaphore::new(planner_concurrency())),
+        calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
+    });
+    (assessor, native_executor, runtime_failure)
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct PersistedCalibration {
     captured_at: u64,
@@ -301,16 +351,29 @@ struct TemplateWorkerRequest {
 #[derive(Debug, Default)]
 struct NativeTemplateAssessor;
 
+fn native_template_identity() -> &'static str {
+    concat!(
+        "icn-native-model-template:",
+        env!("CARGO_PKG_VERSION"),
+        ":",
+        env!("ICN_BINDINGS_REVISION"),
+        ":",
+        env!("ICN_NATIVE_BACKEND_REVISION")
+    )
+}
+
+fn native_planner_identity() -> String {
+    format!(
+        "{}:{}:{}",
+        native_template_identity(),
+        llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
+        llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
+    )
+}
+
 impl TemplateAssessor for NativeTemplateAssessor {
     fn cache_identity(&self) -> &str {
-        concat!(
-            "icn-native-model-template:",
-            env!("CARGO_PKG_VERSION"),
-            ":",
-            env!("ICN_BINDINGS_REVISION"),
-            ":",
-            env!("ICN_NATIVE_BACKEND_REVISION")
-        )
+        native_template_identity()
     }
 
     fn assess(
@@ -531,6 +594,7 @@ impl NativeHardwareAssessor {
 struct NativeModelEvaluator {
     models: Arc<ModelManager>,
     assessor: Arc<NativeHardwareAssessor>,
+    release_catalog: Arc<EmbeddedReleaseCatalog>,
 }
 
 #[derive(Clone)]
@@ -541,8 +605,16 @@ struct AssessmentEnvironment {
 }
 
 impl NativeModelEvaluator {
-    fn new(models: Arc<ModelManager>, assessor: Arc<NativeHardwareAssessor>) -> Self {
-        Self { models, assessor }
+    fn new(
+        models: Arc<ModelManager>,
+        assessor: Arc<NativeHardwareAssessor>,
+        release_catalog: Arc<EmbeddedReleaseCatalog>,
+    ) -> Self {
+        Self {
+            models,
+            assessor,
+            release_catalog,
+        }
     }
 
     async fn environment(&self) -> Result<AssessmentEnvironment, InventoryError> {
@@ -1063,6 +1135,18 @@ fn target_input_id(
     }
 }
 
+fn target_uses_only_installed_packages(target: &ModelTargetInput) -> bool {
+    match target {
+        ModelTargetInput::Package { package } => {
+            matches!(package, ModelPackageOperand::Installed { .. })
+        }
+        ModelTargetInput::SpeculativeDecodingPair { target, draft } => {
+            matches!(target, ModelPackageOperand::Installed { .. })
+                && matches!(draft, ModelPackageOperand::Installed { .. })
+        }
+    }
+}
+
 impl ModelEvaluator for NativeModelEvaluator {
     fn assess(
         &self,
@@ -1074,9 +1158,11 @@ impl ModelEvaluator for NativeModelEvaluator {
                 .capacity_policy
                 .required_reserve_bytes_per_memory_domain;
             let include_performance = request.include_performance;
+            let release_catalog = Arc::clone(&self.release_catalog);
             let evaluated = futures_util::stream::iter(request.requests.into_iter().enumerate())
                 .map(|(index, item)| {
                     let environment = environment.clone();
+                    let release_catalog = Arc::clone(&release_catalog);
                     async move {
                         let request_id = item.request_id;
                         let target_id = match target_input_id(&item.target) {
@@ -1109,7 +1195,28 @@ impl ModelEvaluator for NativeModelEvaluator {
                                 profiles,
                             }
                         } else {
-                            match self.models.resolve_target(item.target).await {
+                            let release_target_id = target_id.clone();
+                            let release_target = spawn_blocking_traced(move || {
+                                release_catalog.resolve_target(&release_target_id)
+                            })
+                            .await
+                            .map_err(|error| {
+                                InventoryError::Internal(format!(
+                                    "release model preparation task failed for {}: {error}",
+                                    target_id.0
+                                ))
+                            })??;
+                            let resolved = match release_target {
+                                Some(resolved) => Ok(resolved),
+                                None if target_uses_only_installed_packages(&item.target) => {
+                                    self.models.resolve_target(item.target).await
+                                }
+                                None => Err(InventoryError::InvalidRequest(format!(
+                                    "target {} is not installed or part of the release catalog",
+                                    target_id.0
+                                ))),
+                            };
+                            match resolved {
                                 Ok(resolved) => AssessModelResult::Assessed {
                                     request_id,
                                     target_id: resolved.target_id.clone(),
@@ -2678,6 +2785,62 @@ impl RuntimeController for NativeRuntimeController {
     }
 }
 
+async fn generate_release_catalog(
+    output: PathBuf,
+    model_store: PathBuf,
+    cache_root: PathBuf,
+    hf_caches: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let mut config = InventoryConfig::with_roots(model_store, cache_root)
+        .context("invalid catalog generation inventory configuration")?;
+    config.hf_cache_dirs.extend(hf_caches);
+    let native_backend = NativeBackend::initialize()
+        .context("failed to initialize the native backend for catalog generation")?;
+    let inventory = Arc::new(
+        ModelManager::open_with_template_assessor(config, Some(Arc::new(NativeTemplateAssessor)))
+            .await
+            .context("failed to initialize catalog generation inventory")?,
+    );
+    let (assessor, _, _) =
+        native_assessor_services(&inventory, native_backend, runtime_plan_defaults());
+    inventory
+        .set_hardware_assessor(assessor.clone())
+        .context("failed to configure catalog generation hardware assessment")?;
+    let repositories = Arc::new(ModelPreviewService::new(inventory.clone(), assessor));
+    let resolver = ResolvingRecommendableCatalog::new(inventory, repositories);
+    let generated = resolver
+        .resolve_release_catalog()
+        .await
+        .context("failed to resolve the curated model catalog")?;
+    let planner_bundle = generated
+        .encode_planner_bundle()
+        .context("failed to encode release planner inputs")?;
+    let manifest = release_catalog_manifest(
+        &generated,
+        native_template_identity(),
+        native_planner_identity(),
+        &planner_bundle,
+    )
+    .context("refusing to publish an incomplete release catalog")?;
+    let encoded =
+        serde_json::to_vec_pretty(&manifest).context("failed to encode the release catalog")?;
+    let parent = output
+        .parent()
+        .context("catalog output must have a parent directory")?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .context("failed to create the catalog output directory")?;
+    let temporary = output.with_extension("json.tmp");
+    tokio::fs::write(&temporary, [&encoded[..], b"\n"].concat())
+        .await
+        .context("failed to write the generated catalog")?;
+    tokio::fs::rename(&temporary, &output)
+        .await
+        .context("failed to publish the generated catalog")?;
+    println!("generated {}", output.display());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _telemetry = telemetry::init()?;
@@ -2721,32 +2884,22 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("failed to initialize model inventory")?,
             );
-            let native_executor_slot = Arc::new(RwLock::new(None));
-            let runtime_failure = Arc::new(RwLock::new(None));
-            let inventory_hardware_assessor = Arc::new(NativeHardwareAssessor {
-                defaults: plan_defaults.clone(),
-                cache: Some(inventory.derived_cache().clone()),
-                native_backend: native_backend.clone(),
-                native_executor: Arc::clone(&native_executor_slot),
-                runtime_failure: Arc::clone(&runtime_failure),
-                gate: tokio::sync::Mutex::new(()),
-                planning_slots: Arc::new(tokio::sync::Semaphore::new(planner_concurrency())),
-                calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
-            });
+            let (inventory_hardware_assessor, native_executor_slot, runtime_failure) =
+                native_assessor_services(&inventory, native_backend.clone(), plan_defaults.clone());
             inventory
                 .set_hardware_assessor(inventory_hardware_assessor.clone())
                 .context("failed to configure inventory hardware assessment")?;
-            let previewer = Arc::new(ModelPreviewService::new(
-                inventory.clone(),
-                inventory_hardware_assessor.clone(),
-            ));
-            let recommendable_catalog = Arc::new(NativeRecommendableCatalog::new(
-                inventory.clone(),
-                previewer.clone(),
+            let release_catalog = Arc::new(
+                embedded_release_catalog(native_template_identity(), &native_planner_identity())
+                    .context("failed to validate the embedded release catalog")?,
+            );
+            let recommendable_catalog = Arc::new(ReleaseRecommendableCatalog::new(
+                release_catalog.catalog().clone(),
             ));
             let model_evaluator = Arc::new(NativeModelEvaluator::new(
                 inventory.clone(),
                 inventory_hardware_assessor.clone(),
+                release_catalog,
             ));
             let model_downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()));
             let backends = BackendRegistry::empty();
@@ -2784,7 +2937,6 @@ async fn main() -> anyhow::Result<()> {
                 .with_hardware(inventory_hardware_assessor)
                 .with_model_evaluator(model_evaluator)
                 .with_model_downloads(model_downloads)
-                .with_hugging_face_catalog(previewer)
                 .with_recommendable_catalog(recommendable_catalog)
                 .with_identity(identity);
             if let Some(runtime) = runtime {
@@ -2828,6 +2980,25 @@ async fn main() -> anyhow::Result<()> {
             serve_result?;
             tracing::info!("ICN server stopped");
         }
+        Command::Catalog { command } => match command {
+            CatalogCommand::Generate {
+                output,
+                model_store,
+                cache_root,
+                hf_caches,
+            } => generate_release_catalog(output, model_store, cache_root, hf_caches).await?,
+            CatalogCommand::Check => {
+                let catalog = embedded_release_catalog(
+                    native_template_identity(),
+                    &native_planner_identity(),
+                )
+                .context("embedded release catalog validation failed")?;
+                println!(
+                    "validated {} release catalog models",
+                    catalog.catalog().models.len()
+                );
+            }
+        },
         Command::Doctor => println!("ICN runtime and native backend loaded successfully"),
         Command::Version { json } => {
             if json {

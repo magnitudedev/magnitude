@@ -135,10 +135,12 @@ limit. Cache failure never becomes a model-fit result. ACN may retain product pr
 does not persist or recreate ICN assessment evidence.
 
 Batch assessment captures one normalized hardware environment identity and reuses it for every
-target and profile in that request. Before resolving a source-backed target, ICN derives its stable
-offering-target identity and checks whether every requested profile has valid cached evidence.
-Complete hits return without remote header materialization or native planning. Partial hits resolve
-the target and compute only the missing profiles.
+target and profile in that request. ICN derives the stable offering-target identity before preparing
+model inputs and checks whether every requested profile has valid cached evidence. Complete hits
+return without planner-input materialization or native planning. On a miss, an installed target is
+planned from its local files and a release-catalog target is planned from embedded, integrity-checked
+GGUF metadata. A non-catalog remote source target is not an assessable runtime input. Partial hits
+prepare the target and compute only the missing profiles.
 
 ## Loading
 
@@ -180,3 +182,4 @@ currently fits.
 - Discovery, fitting, cached assessment, and residency use the same physical-domain identities.
 - Loading reassesses the exact configuration it realizes.
 - Deleting assessment caches changes only latency and recomputation.
+- Assessing release-catalog targets never requires network access or a remote-header cache.

@@ -32,3 +32,6 @@ web/dist
 web/node_modules
 desktop/out
 desktop/node_modules
+
+# Generated from pinned catalog metadata during ICN builds.
+inference/catalog/generated/planner-headers.bin

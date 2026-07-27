@@ -21,6 +21,7 @@ applies_to:
   - package.json
   - scripts/dev.ts
   - scripts/build-release-artifacts.ts
+  - inference/catalog/**
   - .github/workflows/release.yml
 ---
 
@@ -75,6 +76,13 @@ The native ICN process owns hardware discovery, model acquisition and inventory,
 inspection, model fitting, the pinned inference runtime, active-model state, and inference request
 execution. The native binary is acquired by `@magnitudedev/icn` from the matching Magnitude release;
 it is not downloaded from a model repository and is not selected from a user-installed runtime.
+That binary also embeds the release-bound recommendable-model catalog and the hardware-independent
+GGUF metadata needed to plan every catalog target. It validates source, native-template and planner
+identities, bundle integrity, and exact catalog coverage before becoming ready. Ordinary startup
+and setup therefore do not depend on a remote catalog service, model-header fetch, or user cache;
+only machine-specific topology, calibration, fit, and speed remain runtime work. Development and
+release builds obtain the metadata from immutable catalog revisions, validate its committed
+digests, and embed it; the packed metadata is build output rather than a checked-in binary.
 
 ACN owns the parent scope and application policy. It supplies ICN's storage roots and supported
 binary identity and translates private ICN observations into product-owned inventory, hardware,

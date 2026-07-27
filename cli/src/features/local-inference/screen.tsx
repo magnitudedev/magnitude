@@ -69,20 +69,18 @@ type LocalInferenceController = ReturnType<typeof useLocalInferenceState>
 
 const LocalInferenceSetupOverview = ({
   state,
-  nowMs,
   spinnerFrame,
   showHardware,
   finalizingAvailability,
 }: {
   readonly state: LocalInferenceView
-  readonly nowMs: number
   readonly spinnerFrame: string
   readonly showHardware: boolean
   readonly finalizingAvailability: boolean
 }) => {
   const theme = useTheme()
   const hardware = describeLocalHardware(state.hardware)
-  const progress = localInferenceProgressLines(state.models.recommendations.progress, nowMs)
+  const progress = localInferenceProgressLines(state.models.recommendations.progress)
   return <>
     <box style={{ flexDirection: "column", paddingTop: 1, paddingBottom: 1 }}>
       <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>LOCAL MODEL SETUP</text>
@@ -167,11 +165,9 @@ const LocalInferenceSetupOverview = ({
 
 const LocalInferenceProgressScreen = ({
   state,
-  nowMs,
   spinnerFrame,
 }: {
   readonly state: LocalInferenceView
-  readonly nowMs: number
   readonly spinnerFrame: string
 }) => {
   const theme = useTheme()
@@ -184,7 +180,6 @@ const LocalInferenceProgressScreen = ({
       <box style={{ flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
         <LocalInferenceSetupOverview
           state={state}
-          nowMs={nowMs}
           spinnerFrame={spinnerFrame}
           showHardware={hardwareReady}
           finalizingAvailability={finalizingAvailability}
@@ -199,7 +194,6 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
   const theme = useTheme()
   const local = useLocalInferenceState()
   const snapshot = Result.value(local.state)
-  const [loadingStartedAt] = useState(() => Date.now())
   const trackingProgress = Option.match(snapshot, {
     onNone: () => true,
     onSome: (state) => state.models.recommendations.progress
@@ -212,7 +206,6 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
     getAnimationTickSnapshot,
   )
   const spinnerFrame = SPINNER_FRAMES[animationTick % SPINNER_FRAMES.length]
-  const nowMs = Date.now()
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c" && !key.meta && !key.option) {
       key.preventDefault()
@@ -238,13 +231,11 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
         <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Choose what this machine should run</text>
         <box style={{ flexDirection: "column", paddingTop: 2 }}>
           <text style={{ fg: theme.primary }}>
-            {spinnerFrame} Detecting your hardware · {Math.max(0, Math.floor((nowMs - loadingStartedAt) / 1_000))}s
+            {spinnerFrame} Detecting hardware
           </text>
-          <text style={{ fg: theme.muted }}>○ Checking for downloaded models</text>
-          <text style={{ fg: theme.muted }}>○ Loading curated Hugging Face model details</text>
-          <text style={{ fg: theme.muted }}>○ Preparing model details</text>
+          <text style={{ fg: theme.muted }}>○ Checking downloaded models</text>
           <text style={{ fg: theme.muted }}>○ Evaluating models for this machine</text>
-          <text style={{ fg: theme.muted }}>○ Choosing recommendations</text>
+          <text style={{ fg: theme.muted }}>○ Preparing recommendations</text>
         </box>
       </box>
     ),
@@ -253,7 +244,6 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
       if (phase === "discovering" || phase === "failed") {
         return <LocalInferenceProgressScreen
           state={state}
-          nowMs={nowMs}
           spinnerFrame={spinnerFrame}
         />
       }
@@ -261,7 +251,6 @@ export const LocalInferenceScreen = memo(function LocalInferenceScreen(props: Lo
         {...props}
         state={state}
         local={local}
-        nowMs={nowMs}
         spinnerFrame={spinnerFrame}
       />
     },
@@ -273,12 +262,10 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   local,
   onSkip,
   onConfigured,
-  nowMs,
   spinnerFrame,
 }: LocalInferenceScreenProps & {
   readonly state: LocalInferenceView
   readonly local: LocalInferenceController
-  readonly nowMs: number
   readonly spinnerFrame: string
 }) {
   const theme = useTheme()
@@ -382,7 +369,6 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
       <box style={{ flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
         <LocalInferenceSetupOverview
           state={state}
-          nowMs={nowMs}
           spinnerFrame={spinnerFrame}
           showHardware
           finalizingAvailability={false}
