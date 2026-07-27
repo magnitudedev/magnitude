@@ -179,7 +179,8 @@ model identity, quantization, stage, byte progress, transfer rate, and remaining
 from authoritative local-model mirrors; it is not a session event or activity rail. Its confirmation
 state is presentation-only, while confirmed cancellation is one server mutation that returns to the
 onboarding chooser. The composer remains visible but cannot submit while the selected model is not
-usable.
+usable. Its model, reasoning-effort, and resident-memory footer controls also remain visible but
+have no hover or activation behavior until the download finishes.
 
 The CLI composer keeps a one-line minimum editor inside a full-width input surface with one full
 row of visual padding above and below it. A solid mode border sits immediately outside the colored

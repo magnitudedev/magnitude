@@ -141,7 +141,7 @@ export function OnboardingModelDownloadCard({
         borderColor: theme.border,
         customBorderChars: BOX_CHARS,
         paddingTop: 1,
-        paddingBottom: 1,
+        paddingBottom: 0,
         paddingLeft: 2,
         paddingRight: 2,
         flexDirection: "column",

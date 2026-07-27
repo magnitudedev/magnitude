@@ -79,6 +79,10 @@ test("shows one centered download summary with progress, rate, and ETA", async (
     expect(frame).toContain("19 GB / 30 GB")
     expect(frame).toContain("48 MB/s · about 4 minutes remaining")
     expect(frame).toContain("Cancel (Esc)")
+    const lines = frame.split("\n")
+    const actionRow = lines.findIndex((line) => line.includes("Cancel (Esc)"))
+    const bottomBorder = lines.findIndex((line, index) => index > actionRow && line.includes("╰"))
+    expect(bottomBorder - actionRow).toBe(2)
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -100,7 +104,14 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
     await act(view.renderOnce)
     await act(async () => press("escape"))
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("Are you sure you want to cancel?")
+    const confirmationFrame = view.captureCharFrame()
+    expect(confirmationFrame).toContain("Are you sure you want to cancel?")
+    const confirmationLines = confirmationFrame.split("\n")
+    const choicesRow = confirmationLines.findIndex((line) => line.includes("Yes") && line.includes("No"))
+    const bottomBorder = confirmationLines.findIndex(
+      (line, index) => index > choicesRow && line.includes("╰"),
+    )
+    expect(bottomBorder - choicesRow).toBe(1)
     expect(onCancel).not.toHaveBeenCalled()
 
     await act(async () => press("right"))
@@ -112,6 +123,44 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
     await act(async () => press("escape"))
     await act(async () => press("return"))
     expect(onCancel).toHaveBeenCalledTimes(1)
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("keeps one empty row beneath failed-download actions", async () => {
+  const failedCandidate = makeCatalogCandidate({
+    downloadBytes: 30 * GIB,
+    download: {
+      _tag: "Failed",
+      completedBytes: 19 * GIB,
+      totalBytes: 30 * GIB,
+      failure: {
+        code: "transport_failed",
+        message: "Download failed",
+        retryable: true,
+      },
+    },
+  })
+  const view = await testRender(
+    <OnboardingModelDownloadCard
+      candidate={failedCandidate}
+      width={100}
+      cancelling={false}
+      cancelError={null}
+      onCancel={onCancel}
+      onRetry={onRetry}
+    />,
+    { width: 100, height: 24 },
+  )
+  try {
+    await act(view.renderOnce)
+    const lines = view.captureCharFrame().split("\n")
+    const actionRow = lines.findIndex(
+      (line) => line.includes("Retry") && line.includes("Choose another model"),
+    )
+    const bottomBorder = lines.findIndex((line, index) => index > actionRow && line.includes("╰"))
+    expect(bottomBorder - actionRow).toBe(2)
   } finally {
     await act(async () => view.renderer.destroy())
   }
