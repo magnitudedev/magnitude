@@ -5,6 +5,7 @@ import { act, type ReactNode } from 'react'
 import { Option } from 'effect'
 import { TextAttributes } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
+import { violet } from '../../utils/theme'
 import type { ComposerProps } from './types'
 import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type TaskDisplayRow } from '@magnitudedev/sdk'
 import {
@@ -24,6 +25,7 @@ vi.mock('@opentui/react', async () => {
     ...actual,
     useRenderer: () => ({
       requestRender: () => {},
+      setMousePointer: () => {},
     }),
   }
 })
@@ -412,5 +414,74 @@ test('clicking effort opens the footer selector and clicking an option commits i
   expect(applied).toEqual(['low'])
   expect(JSON.stringify(view.toJSON())).toContain('5k / 100k (5%)')
   expect(JSON.stringify(view.toJSON())).toContain('16 GB mem')
+  act(() => { view.unmount() })
+})
+
+test('disables footer settings controls while onboarding downloads a model', () => {
+  const openSettings = vi.fn()
+  const openHardware = vi.fn()
+  const applyThinking = vi.fn()
+  const localInferenceState = makeView({
+    hardware: makeHardware({
+      residentMemory: Option.some({
+        domains: [{
+          memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+          modelBytes: 16 * GIB,
+          contextBytes: 0,
+          computeBytes: 0,
+          auxiliaryBytes: 0,
+        }],
+      }),
+    }),
+  })
+  const thinkingOptions = ['none', 'low', 'medium', 'high'].map((value) => ({
+    value: ReasoningEffortSchema.make(value),
+    label: value.charAt(0).toUpperCase() + value.slice(1),
+  }))
+  let view!: ReturnType<typeof create>
+
+  act(() => {
+    view = create(
+      <Composer
+        {...makeProps()}
+        modelSetupInProgress
+        localInferenceState={localInferenceState}
+        selectedProviderId={LOCAL_PROVIDER_ID}
+        thinkingOptions={thinkingOptions}
+        openSettings={openSettings}
+        openHardware={openHardware}
+        applyThinking={applyThinking}
+      />,
+    )
+  })
+
+  const textOf = (node: ReactTestInstance): string => node.children
+    .map((child) => typeof child === 'string' ? child : textOf(child))
+    .join('')
+  const expectedColors = new Map([
+    ['model', theme.foreground],
+    ['high', violet[300]],
+    ['16 GB mem', theme.muted],
+  ])
+  for (const label of expectedColors.keys()) {
+    const control = view.root.findAll((node) => textOf(node) === label)
+      .find((node) => node.type === 'box')
+    expect(control).toBeDefined()
+    act(() => {
+      ;(control!.props.onMouseOver as () => void)()
+      ;(control!.props.onMouseDown as () => void)()
+      ;(control!.props.onMouseUp as () => void)()
+    })
+    const labelText = view.root.findAll(
+      (node) => node.type === 'text' && textOf(node) === label,
+    )[0]!
+    expect(labelText.props.style).toEqual({ fg: expectedColors.get(label) })
+    expect(labelText.findByType('span').props.attributes).toBe(TextAttributes.NONE)
+  }
+
+  expect(openSettings).not.toHaveBeenCalled()
+  expect(openHardware).not.toHaveBeenCalled()
+  expect(applyThinking).not.toHaveBeenCalled()
+  expect(JSON.stringify(view.toJSON())).not.toContain('Select reasoning level...')
   act(() => { view.unmount() })
 })

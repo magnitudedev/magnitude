@@ -274,6 +274,7 @@ export function Composer(props: ComposerProps) {
   const workingDirectoryLabel = displayWorkingDirectory(clientWorkingDirectory)
   const modelNameLabel = modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'
   const thinkingLevelLabel = modelSummary?.thinkingLevel ?? '-'
+  const footerControlsDisabled = modelSetupInProgress
   const footerTransientWidth = nextEscWillKillAll
     ? 3 + 'Press Esc again to interrupt all workers'.length
     : bashMode
@@ -660,26 +661,28 @@ export function Composer(props: ComposerProps) {
             </box>
           )}
           <Button
-            onClick={openSettings}
-            onMouseOver={() => setModelLabelHovered(true)}
-            onMouseOut={() => setModelLabelHovered(false)}
+            onClick={footerControlsDisabled ? undefined : openSettings}
+            onMouseOver={footerControlsDisabled ? undefined : () => setModelLabelHovered(true)}
+            onMouseOut={footerControlsDisabled ? undefined : () => setModelLabelHovered(false)}
+            cursor={footerControlsDisabled ? 'default' : undefined}
           >
             <text
-              style={{ fg: modelLabelHovered ? theme.primary : theme.foreground }}
+              style={{ fg: !footerControlsDisabled && modelLabelHovered ? theme.primary : theme.foreground }}
             >
-              <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+              <span attributes={!footerControlsDisabled && modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {modelNameLabel}
               </span>
             </text>
           </Button>
           <box style={{ width: 2, flexShrink: 0 }} />
           <Button
-            onClick={openThinking}
-            onMouseOver={() => setThinkingLabelHovered(true)}
-            onMouseOut={() => setThinkingLabelHovered(false)}
+            onClick={footerControlsDisabled ? undefined : openThinking}
+            onMouseOver={footerControlsDisabled ? undefined : () => setThinkingLabelHovered(true)}
+            onMouseOut={footerControlsDisabled ? undefined : () => setThinkingLabelHovered(false)}
+            cursor={footerControlsDisabled ? 'default' : undefined}
           >
-            <text style={{ fg: thinkingLabelHovered || thinkingOpen ? violet[200] : violet[300] }}>
-              <span attributes={thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+            <text style={{ fg: !footerControlsDisabled && (thinkingLabelHovered || thinkingOpen) ? violet[200] : violet[300] }}>
+              <span attributes={!footerControlsDisabled && thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {thinkingLevelLabel}
               </span>
             </text>
@@ -703,12 +706,13 @@ export function Composer(props: ComposerProps) {
                 <>
                   <box style={{ width: 3, flexShrink: 0 }} />
                   <Button
-                    onClick={openHardware}
-                    onMouseOver={() => setMemoryLabelHovered(true)}
-                    onMouseOut={() => setMemoryLabelHovered(false)}
+                    onClick={footerControlsDisabled ? undefined : openHardware}
+                    onMouseOver={footerControlsDisabled ? undefined : () => setMemoryLabelHovered(true)}
+                    onMouseOut={footerControlsDisabled ? undefined : () => setMemoryLabelHovered(false)}
+                    cursor={footerControlsDisabled ? 'default' : undefined}
                   >
-                    <text style={{ fg: memoryLabelHovered ? theme.primary : theme.muted }}>
-                      <span attributes={memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                    <text style={{ fg: !footerControlsDisabled && memoryLabelHovered ? theme.primary : theme.muted }}>
+                      <span attributes={!footerControlsDisabled && memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                         {modelFooter.memoryLabel}
                       </span>
                     </text>
