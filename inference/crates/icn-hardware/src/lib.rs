@@ -1442,6 +1442,7 @@ fn estimate_generation_performance(
     let mut weight_seconds = 0.0_f64;
     let mut weight_uncertainty_seconds = 0.0_f64;
     let mut used_fallback_calibration = false;
+    let mut used_unstable_calibration = false;
     for tensor in &workload.tensors {
         if tensor.stored_bytes == 0
             || tensor.operation_bytes == 0
@@ -1490,6 +1491,7 @@ fn estimate_generation_performance(
             routed,
         )?;
         used_fallback_calibration |= !selection.exact;
+        used_unstable_calibration |= !selection.metric.stable;
         let seconds = operation_seconds(active_bytes, selection.metric);
         weight_seconds += seconds;
         weight_uncertainty_seconds += seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
@@ -1514,7 +1516,7 @@ fn estimate_generation_performance(
     } else {
         GenerationPerformanceConfidence::High
     };
-    if used_fallback_calibration || cross_memory_domain_placement {
+    if used_fallback_calibration || used_unstable_calibration || cross_memory_domain_placement {
         confidence = GenerationPerformanceConfidence::Low;
     }
 
@@ -1583,6 +1585,9 @@ fn estimate_generation_performance(
                     false,
                 )?;
                 if !selection.exact {
+                    confidence = GenerationPerformanceConfidence::Low;
+                }
+                if !selection.metric.stable {
                     confidence = GenerationPerformanceConfidence::Low;
                 }
                 let seconds = operation_seconds(state_bytes, selection.metric);
@@ -1659,6 +1664,9 @@ fn estimate_generation_performance(
                 if !selection.exact {
                     confidence = GenerationPerformanceConfidence::Low;
                 }
+                if !selection.metric.stable {
+                    confidence = GenerationPerformanceConfidence::Low;
+                }
                 let seconds = operation_seconds(bytes, selection.metric);
                 kv_seconds += seconds;
                 kv_uncertainty_seconds +=
@@ -1702,6 +1710,9 @@ fn estimate_generation_performance(
                     if !selection.exact {
                         confidence = GenerationPerformanceConfidence::Low;
                     }
+                    if !selection.metric.stable {
+                        confidence = GenerationPerformanceConfidence::Low;
+                    }
                     let seconds = operation_seconds(index_bytes, selection.metric);
                     kv_seconds += seconds;
                     kv_uncertainty_seconds +=
@@ -1723,6 +1734,9 @@ fn estimate_generation_performance(
                         false,
                     )?;
                     if !selection.exact {
+                        confidence = GenerationPerformanceConfidence::Low;
+                    }
+                    if !selection.metric.stable {
                         confidence = GenerationPerformanceConfidence::Low;
                     }
                     let seconds = operation_seconds(attention_state_bytes, selection.metric);
@@ -3556,6 +3570,9 @@ mod tests {
             bytes_per_second,
             launch_microseconds: 0.0,
             relative_spread: 0.0,
+            sample_count: 1,
+            measured_microseconds: 1,
+            stable: true,
         }
     }
 
@@ -3775,6 +3792,34 @@ mod tests {
             point.lower_tokens_per_second <= point.expected_tokens_per_second
                 && point.expected_tokens_per_second <= point.upper_tokens_per_second
         }));
+    }
+
+    #[test]
+    fn unstable_calibration_lowers_generation_confidence() {
+        let workload = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                800,
+                800,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 10, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let mut metric = calibration_metric("Metal", "MTL0", 1, false, 1_000.0);
+        metric.stable = false;
+        metric.relative_spread = 0.2;
+        let calibration = calibration(vec![metric]);
+
+        let (confidence, ..) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 20, &[20], false).unwrap(),
+        );
+
+        assert_eq!(confidence, GenerationPerformanceConfidence::Low);
     }
 
     #[test]

@@ -114,15 +114,24 @@ supported by the curated catalog. Each sample includes the backend's actual arit
 reads, dequantization, dispatch, and synchronization cost for the synthetic operation.
 Synthetic weight buffers exceed typical consumer shared-cache working sets, so calibration measures
 streaming operation throughput rather than repeatedly crediting a small cache-resident tensor.
+For each operation class, native calibration first warms the backend, uses a pilot operation to
+choose a timed-block repetition count, and then records independent timed blocks. It requires a
+minimum evidence duration and sample count, uses the median as the central estimate, and measures
+dispersion with robust median-absolute-deviation and interquartile statistics. Sampling stops after
+two consecutive stable checks or at versioned sample and measurement budgets. A metric that reaches
+its budget without convergence remains usable evidence but is explicitly marked unstable.
 
 Calibration is performed at most once for one native-build, enabled-backend, topology, and
 calibration-policy identity while valid evidence is available. Successful calibration is stored in
 the shared disposable derived cache so daemon restarts and isolated planner workers reuse it.
 Evidence includes the native build, enabled backends, normalized topology, platform, architecture,
-and native calibration method. A missing, malformed, mismatched, or older-than-policy entry is a
-cache miss. Transient calibration failures are never persisted. Calibration failure is non-fatal:
-memory fitting continues and performance is reported as unavailable. Calibration has explicit time
-and temporary-allocation bounds and releases all native resources before returning.
+operating-system and kernel versions, and native calibration method. A missing, malformed,
+mismatched, or older-than-policy entry is a cache miss. Transient calibration failures are never
+persisted. Calibration failure is non-fatal: memory fitting continues and performance is reported
+as unavailable. Calibration has explicit sample, measurement, and temporary-allocation bounds and
+releases all native resources before returning. Recommendation and assessment caches can be cleared
+without deleting compatible machine calibration; deleting all derived cache remains safe and causes
+the calibration to be measured again.
 
 ## Estimate and confidence
 
@@ -144,6 +153,8 @@ and widens routed and cross-memory-domain estimates further. Confidence is high,
 and is lowered by missing exact operation calibration, routed-expert uncertainty,
 cross-memory-domain placement, or architecture work represented by a conservative related
 calibration. Unified CPU/accelerator device ownership is not itself a reason to lower confidence.
+An adaptive calibration metric that did not converge within its native budget also lowers
+confidence.
 When exact routed or quant calibration is absent but the same fitted device has valid related
 calibration, ICN returns a bounded hardware-specific estimate with lower confidence rather than
 suppressing the model. Structurally malformed workloads still return a typed unavailable result;
@@ -191,7 +202,8 @@ timing remains authoritative for observed performance.
 - Sparse index scans continue to scale with their indexed history after the gathered attention
   depth reaches top-K; compressed histories scale by their native compression ratio.
 - Calibration is bounded, reusable across profiles and artifacts, and never runs concurrently for
-  the same evidence identity.
+  the same evidence identity. Stable inputs use robust central estimates; measurements that do not
+  converge retain explicit unstable evidence and lower downstream confidence.
 - Malformed native values and incomplete MoE metadata produce typed unavailable results. Missing
   exact operation calibration uses a conservative same-device fallback and lowers confidence.
 - Remote sparse and complete local forms of the same artifact produce identical model workloads.
