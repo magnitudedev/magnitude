@@ -6,11 +6,9 @@ import type { LocalModelCatalogCandidate } from "@magnitudedev/sdk"
 import { truncateToDisplayWidth } from "@magnitudedev/client-common"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
+import { formatDownloadBytes } from "../local-inference/view-model"
 
-const GIB = 1024 ** 3
 const MIB = 1024 ** 2
-
-const formatGigabytes = (bytes: number): string => `${Math.round(bytes / GIB)} GB`
 
 const formatRate = (bytesPerSecond: number): string => {
   const mebibytes = bytesPerSecond / MIB
@@ -158,7 +156,7 @@ export function OnboardingModelDownloadDetails({
         <box style={{ height: 1 }} />
         {(downloading || failed) && (
           <text style={{ fg: theme.muted }}>
-            {formatGigabytes(download.completedBytes)} / {formatGigabytes(download.totalBytes)}
+            {formatDownloadBytes(download.completedBytes)} / {formatDownloadBytes(download.totalBytes)}
           </text>
         )}
         <text style={{ fg: failed ? theme.error : theme.muted }}>{detail}</text>

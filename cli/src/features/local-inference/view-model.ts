@@ -150,6 +150,13 @@ export const formatBytes = (bytes: number): string => {
   return gib >= 1 ? `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`
 }
 
+export const formatDownloadBytes = (bytes: number): string => {
+  const gigabytes = bytes / 1_000_000_000
+  return gigabytes >= 1
+    ? `${gigabytes.toFixed(gigabytes >= 10 ? 1 : 2)} GB`
+    : `${(bytes / 1_000_000).toFixed(0)} MB`
+}
+
 export const formatContext = (tokens: number): string => tokens < 1_000
   ? String(tokens)
   : tokens % 1_024 === 0
@@ -375,7 +382,7 @@ export const describeLocalHardware = (
 export const selectionTitle = ({ model }: LocalInferenceSelection): string => model.displayName
 
 export const selectionMetadata = ({ model, recommendation }: LocalInferenceSelection): string =>
-  `${model.quantization} · ${formatBytes(model.downloadBytes)} · ${formatContext(
+  `${model.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
     Option.match(recommendation, {
       onNone: () => model.maximumContextLength,
       onSome: ({ candidate }) => candidate.profile.contextLength,
