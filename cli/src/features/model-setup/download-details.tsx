@@ -6,7 +6,6 @@ import type { LocalModelCatalogCandidate } from "@magnitudedev/sdk"
 import { truncateToDisplayWidth } from "@magnitudedev/client-common"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
-import { BOX_CHARS } from "../../utils/ui-constants"
 
 const GIB = 1024 ** 3
 const MIB = 1024 ** 2
@@ -30,9 +29,10 @@ const progressBar = (fraction: number, width: number): string => {
 
 type ConfirmationChoice = "yes" | "no"
 
-export function OnboardingModelDownloadCard({
+export function OnboardingModelDownloadDetails({
   candidate,
   width,
+  height,
   cancelling,
   cancelError,
   onCancel,
@@ -40,6 +40,7 @@ export function OnboardingModelDownloadCard({
 }: {
   readonly candidate: LocalModelCatalogCandidate
   readonly width: number
+  readonly height: number
   readonly cancelling: boolean
   readonly cancelError: string | null
   readonly onCancel: () => void
@@ -49,8 +50,7 @@ export function OnboardingModelDownloadCard({
   const [confirming, setConfirming] = useState(false)
   const [choice, setChoice] = useState<ConfirmationChoice>("yes")
   const [hovered, setHovered] = useState<string | null>(null)
-  const cardWidth = Math.max(1, Math.min(66, width - 2))
-  const contentWidth = Math.max(1, cardWidth - 6)
+  const contentWidth = Math.max(1, width)
   const download = candidate.download
   const downloading = download._tag === "Downloading"
   const failed = download._tag === "Failed"
@@ -134,18 +134,15 @@ export function OnboardingModelDownloadCard({
   )
 
   return (
-    <box style={{ width: "100%", flexGrow: 1, alignItems: "center", justifyContent: "center" }}>
-      <box style={{
-        width: cardWidth,
-        borderStyle: "single",
-        borderColor: theme.border,
-        customBorderChars: BOX_CHARS,
-        paddingTop: 1,
-        paddingBottom: 0,
-        paddingLeft: 2,
-        paddingRight: 2,
-        flexDirection: "column",
-      }}>
+    <box style={{
+      width: contentWidth,
+      height,
+      minHeight: height,
+      maxHeight: height,
+      flexShrink: 0,
+      flexDirection: "column",
+      overflow: "hidden",
+    }}>
         <text
           style={{ fg: theme.foreground }}
           attributes={TextAttributes.BOLD}
@@ -205,7 +202,6 @@ export function OnboardingModelDownloadCard({
           ) : null}
           {cancelError && <text style={{ fg: theme.error }}>{cancelError}</text>}
         </box>
-      </box>
     </box>
   )
 }

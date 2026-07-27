@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest"
-import { Effect, Ref } from "effect"
-import type { OnboardingConfig } from "@magnitudedev/storage"
-import { makeOnboarding } from "./service"
+import { Effect, Layer, Ref } from "effect"
+import {
+  MagnitudeStorage,
+  type MagnitudeStorageShape,
+  type OnboardingConfig,
+} from "@magnitudedev/storage"
+import { MirroredStateChangesLive } from "../mirrored-state"
+import { makeOnboarding, Onboarding, OnboardingLive } from "./service"
 
 describe("Onboarding", () => {
   it("persists only the registered generic completion marker", async () => {
@@ -61,5 +66,38 @@ describe("Onboarding", () => {
 
     expect(result.flows.model_setup.required).toBe(true)
     expect(result.flows.model_setup.completedVersion).toBeNull()
+  })
+
+  it("publishes background completion through the onboarding mirror", async () => {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const stored = yield* Ref.make<OnboardingConfig | null>(null)
+      const config = {
+        getOnboardingConfig: () => Ref.get(stored),
+        completeOnboardingFlow: (flowId: "model_setup", version: number, completedAt: string) =>
+          Ref.set(stored, { completions: { [flowId]: { version, completedAt } } }),
+        reopenOnboardingFlow: () => Ref.set(stored, { completions: {} }),
+      }
+      const storage = { config } as unknown as MagnitudeStorageShape
+      const layer = OnboardingLive.pipe(Layer.provide(Layer.mergeAll(
+        Layer.succeed(MagnitudeStorage, storage),
+        MirroredStateChangesLive,
+      )))
+      return yield* Effect.gen(function* () {
+        const onboarding = yield* Onboarding
+        const before = yield* onboarding.snapshot
+        yield* onboarding.complete("model_setup")
+        const after = yield* onboarding.snapshot
+        return { before, after }
+      }).pipe(Effect.provide(layer))
+    })))
+
+    expect(result.before).toMatchObject({
+      revision: 0,
+      state: { flows: { model_setup: { required: true } } },
+    })
+    expect(result.after).toMatchObject({
+      revision: 1,
+      state: { flows: { model_setup: { required: false } } },
+    })
   })
 })

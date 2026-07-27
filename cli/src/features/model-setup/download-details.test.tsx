@@ -24,7 +24,7 @@ vi.mock("../../hooks/use-theme", () => ({
   }),
 }))
 
-const { OnboardingModelDownloadCard } = await import("./download-card")
+const { OnboardingModelDownloadDetails } = await import("./download-details")
 
 const onCancel = vi.fn()
 const onRetry = vi.fn()
@@ -59,11 +59,12 @@ const press = (name: string) => keyboard.handler?.(new KeyEvent({
   source: "raw",
 }))
 
-test("shows one centered download summary with progress, rate, and ETA", async () => {
+test("shows compact download details with progress, rate, and ETA", async () => {
   const view = await testRender(
-    <OnboardingModelDownloadCard
+    <OnboardingModelDownloadDetails
       candidate={candidate}
-      width={100}
+      width={56}
+      height={11}
       cancelling={false}
       cancelError={null}
       onCancel={onCancel}
@@ -79,10 +80,6 @@ test("shows one centered download summary with progress, rate, and ETA", async (
     expect(frame).toContain("19 GB / 30 GB")
     expect(frame).toContain("48 MB/s · about 4 minutes remaining")
     expect(frame).toContain("Cancel (Esc)")
-    const lines = frame.split("\n")
-    const actionRow = lines.findIndex((line) => line.includes("Cancel (Esc)"))
-    const bottomBorder = lines.findIndex((line, index) => index > actionRow && line.includes("╰"))
-    expect(bottomBorder - actionRow).toBe(2)
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -90,9 +87,10 @@ test("shows one centered download summary with progress, rate, and ETA", async (
 
 test("requires confirmation before cancelling and supports keyboard choice", async () => {
   const view = await testRender(
-    <OnboardingModelDownloadCard
+    <OnboardingModelDownloadDetails
       candidate={candidate}
-      width={100}
+      width={56}
+      height={11}
       cancelling={false}
       cancelError={null}
       onCancel={onCancel}
@@ -106,12 +104,7 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
     await act(view.renderOnce)
     const confirmationFrame = view.captureCharFrame()
     expect(confirmationFrame).toContain("Are you sure you want to cancel?")
-    const confirmationLines = confirmationFrame.split("\n")
-    const choicesRow = confirmationLines.findIndex((line) => line.includes("Yes") && line.includes("No"))
-    const bottomBorder = confirmationLines.findIndex(
-      (line, index) => index > choicesRow && line.includes("╰"),
-    )
-    expect(bottomBorder - choicesRow).toBe(1)
+    expect(confirmationFrame).toMatch(/Yes\s+No/)
     expect(onCancel).not.toHaveBeenCalled()
 
     await act(async () => press("right"))
@@ -128,7 +121,7 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
   }
 })
 
-test("keeps one empty row beneath failed-download actions", async () => {
+test("shows failed-download actions in the details pane", async () => {
   const failedCandidate = makeCatalogCandidate({
     downloadBytes: 30 * GIB,
     download: {
@@ -143,9 +136,10 @@ test("keeps one empty row beneath failed-download actions", async () => {
     },
   })
   const view = await testRender(
-    <OnboardingModelDownloadCard
+    <OnboardingModelDownloadDetails
       candidate={failedCandidate}
-      width={100}
+      width={56}
+      height={11}
       cancelling={false}
       cancelError={null}
       onCancel={onCancel}
@@ -155,12 +149,9 @@ test("keeps one empty row beneath failed-download actions", async () => {
   )
   try {
     await act(view.renderOnce)
-    const lines = view.captureCharFrame().split("\n")
-    const actionRow = lines.findIndex(
-      (line) => line.includes("Retry") && line.includes("Choose another model"),
-    )
-    const bottomBorder = lines.findIndex((line, index) => index > actionRow && line.includes("╰"))
-    expect(bottomBorder - actionRow).toBe(2)
+    const frame = view.captureCharFrame()
+    expect(frame).toContain("Download failed")
+    expect(frame).toMatch(/Retry\s+Choose another model/)
   } finally {
     await act(async () => view.renderer.destroy())
   }

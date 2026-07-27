@@ -240,6 +240,11 @@ export interface LocalHardwarePresentation {
   readonly accelerators: readonly { readonly name: string; readonly details: string }[]
 }
 
+export interface LocalHardwareSummaryRow {
+  readonly name: string
+  readonly details: readonly string[]
+}
+
 export interface ResidentModelPresentation {
   readonly displayName: string
   readonly contextWindowTokens: number
@@ -277,9 +282,9 @@ export const describeResidentModel = (
 const unique = (values: readonly string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))]
 
-export const describeLocalHardware = (
-  hardware: LocalInferenceHardware,
-): LocalHardwarePresentation => {
+const compactBytes = (bytes: number): string => formatBytes(bytes).replace(/\.0+(?= )/, "")
+
+const localHardwareTopology = (hardware: LocalInferenceHardware) => {
   const unified = hardware.memoryDomains.filter((domain) =>
     domain.kind === "UnifiedMemory" && domain.sharesSystemMemory)
   const discrete = hardware.memoryDomains.filter((domain) => domain.kind === "PhysicalDevice")
@@ -292,18 +297,65 @@ export const describeLocalHardware = (
   const unifiedBackends = unique(unified.flatMap((domain) => backendsFor(domain.memoryDomainId)))
   const unifiedAcceleratorNames = unique(unified.flatMap((domain) =>
     namesFor(domain.memoryDomainId)))
-  const isAppleSilicon =
-    hardware.platform === "MacOS" && hardware.architecture === "Arm64"
+  const isAppleSilicon = hardware.platform === "MacOS" && hardware.architecture === "Arm64"
   const processorName = Option.getOrElse(hardware.processor, () =>
     isAppleSilicon ? "Apple Silicon" : "CPU")
   const productName = Option.getOrElse(hardware.productName, () => "")
-  const acceleratorName = unifiedAcceleratorNames.join(" + ")
-  const name = isAppleSilicon
+  const systemName = isAppleSilicon
     ? processorName
-    : unique([productName, acceleratorName]).join(" · ") || processorName
+    : unique([productName, unifiedAcceleratorNames.join(" + ")]).join(" · ") || processorName
+  return { unified, discrete, backendsFor, namesFor, unifiedBackends, systemName }
+}
+
+export const describeLocalHardwareSummary = (
+  hardware: LocalInferenceHardware,
+): readonly LocalHardwareSummaryRow[] => {
+  const {
+    unified,
+    discrete,
+    backendsFor,
+    namesFor,
+    unifiedBackends,
+    systemName,
+  } = localHardwareTopology(hardware)
+  const platform = hardware.platform === "MacOS" ? "macOS" : hardware.platform
+  const architecture = hardware.architecture === "Arm64" ? "ARM64" : "x86-64"
+  const systemDetails = [
+    `${platform} ${architecture}`,
+    `${hardware.logicalCores} ${hardware.logicalCores === 1 ? "core" : "cores"}`,
+    unified.length > 0
+      ? `${compactBytes(hardware.totalSystemMemoryBytes)} unified`
+      : `${compactBytes(hardware.totalSystemMemoryBytes)} RAM`,
+    ...unifiedBackends,
+    ...(unified.length === 0 && discrete.length === 0 ? ["CPU inference"] : []),
+  ]
+  return [
+    { name: systemName, details: systemDetails },
+    ...discrete.map((domain): LocalHardwareSummaryRow => {
+      const names = namesFor(domain.memoryDomainId)
+      const backends = backendsFor(domain.memoryDomainId)
+      return {
+        name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
+        details: [`${compactBytes(domain.totalBytes)} VRAM`, ...backends],
+      }
+    }),
+  ]
+}
+
+export const describeLocalHardware = (
+  hardware: LocalInferenceHardware,
+): LocalHardwarePresentation => {
+  const {
+    unified,
+    discrete,
+    backendsFor,
+    namesFor,
+    unifiedBackends,
+    systemName,
+  } = localHardwareTopology(hardware)
   return {
     system: {
-      name,
+      name: systemName,
       details: [
         `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
         `${formatBytes(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,

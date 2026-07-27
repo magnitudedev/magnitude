@@ -106,6 +106,13 @@ const aggregateDownload = (
     : { _tag: "NotDownloaded", completedBytes, totalBytes }
 }
 
+export const preparationFromReconciliationFailure = (
+  providerModelIds: readonly ProviderModelId[],
+  failure: ModelFailure,
+): LocalModelPreparation => failure.retryable
+  ? { _tag: "Preparing" }
+  : { _tag: "Unavailable", providerModelIds, failure }
+
 const aggregatePreparation = (
   modelId: ModelOfferingTargetId,
   target: ModelOfferingTarget,
@@ -129,11 +136,7 @@ const aggregatePreparation = (
   const setup = autoSetup.get(modelId)
   if (setup) return setup._tag === "Preparing"
     ? setup
-    : {
-        _tag: "Unavailable",
-        providerModelIds: configuredProviderModelIds,
-        failure: setup.failure,
-      }
+    : preparationFromReconciliationFailure(configuredProviderModelIds, setup.failure)
   const availableProviderModelIds = configuredProviderModelIds.filter((providerModelId) =>
     providerEntries.get(providerModelId)?.availability._tag === "Available")
   if (availableProviderModelIds.length > 0) {
@@ -156,11 +159,10 @@ const aggregatePreparation = (
     }
   }
   if (configuredProviderModelIds.length > 0 && Option.isSome(providerProjectionFailure)) {
-    return {
-      _tag: "Unavailable",
-      providerModelIds: configuredProviderModelIds,
-      failure: providerProjectionFailure.value,
-    }
+    return preparationFromReconciliationFailure(
+      configuredProviderModelIds,
+      providerProjectionFailure.value,
+    )
   }
   return { _tag: "Preparing" }
 }

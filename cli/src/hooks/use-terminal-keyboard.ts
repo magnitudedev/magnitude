@@ -25,6 +25,7 @@ import type { ActionId } from '../types/ui-actions'
 
 export interface TerminalKeyboardParams {
   dispatchErrorAction: (actionId: ActionId) => void
+  recentChatsEnabled?: boolean
 }
 
 export function shouldExitOnCtrlC(input: {
@@ -36,7 +37,10 @@ export function shouldExitOnCtrlC(input: {
   return !input.composerHasContent && input.rootMode !== 'streaming'
 }
 
-export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardParams): void {
+export function useTerminalKeyboard({
+  dispatchErrorAction,
+  recentChatsEnabled = true,
+}: TerminalKeyboardParams): void {
   const composerHasContent = useAtomValue(composerHasContentAtom)
   const { expandedForkStack } = useDisplayViewController()
   const showRecentChats = useAtomValue(showRecentChatsOverlayAtom)
@@ -59,7 +63,10 @@ export function useTerminalKeyboard({ dispatchErrorAction }: TerminalKeyboardPar
   })
 
   const overlayActive = showRecentChats || modelMenu.open || usageOpen || expandedForkStack.length > 0
-  const canToggleRecentChats = !modelMenu.open && !usageOpen && expandedForkStack.length === 0
+  const canToggleRecentChats = recentChatsEnabled
+    && !modelMenu.open
+    && !usageOpen
+    && expandedForkStack.length === 0
 
   useKeyboard(
     useCallback((key: KeyEvent) => {

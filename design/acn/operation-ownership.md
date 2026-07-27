@@ -91,10 +91,12 @@ request, polling quickly while active and periodically while idle so missed requ
 cannot hide shared work.
 
 The onboarding model-selection mutation is outcome-total after download admission: it persists the
-selected offering and slot and completes onboarding even if the initiating transport disconnects.
-Its cancellation mutation waits for the matching attempts to become terminal before clearing the
-selection and reopening onboarding. Retrying either command converges from any observable partial
-result.
+selected offering and slot independently of the initiating transport. While the onboarding flow is
+open, an ACN-owned activation reconciler observes that durable selection. It waits for package and
+catalog availability, admits the ordinary slot-owned load, and completes onboarding only after the
+slot is ready. Its cancellation mutation waits for matching download attempts to become terminal
+before clearing the selection; clearing a loading or loaded selection uses the ordinary slot
+replacement lifecycle. Retrying either command converges from any observable partial result.
 
 ## Conformance
 

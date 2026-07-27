@@ -8,6 +8,7 @@ applies_to:
   - packages/acn/src/local-provider-**
   - packages/protocol/src/schemas/model-state.ts
   - cli/src/features/local-inference/**
+  - cli/src/features/model-setup/**
   - cli/src/features/model-menus/**
   - packages/storage/src/types/config.ts
   - inference/crates/icn-contracts/src/models.rs
@@ -238,11 +239,13 @@ failures, or blocked slot state. Model choices appear only after recommendations
 initial provider catalog has settled. A terminal discovery failure appears once in progress, while
 failures from a user-initiated download or selection remain immediate and attached to that action.
 
-Choosing a curated model is one onboarding-domain mutation: it persists the provider offering,
-admits or joins the package download, stores the primary slot selection, and completes onboarding.
-The coding surface may therefore open while the selected offering is still installing. Confirmed
-cancellation terminalizes every target-package attempt, clears that matching selection, and reopens
-model onboarding before returning the chooser. Neither transition is reconstructed from client
+Choosing an installed or curated model is one onboarding-domain mutation. It resolves or persists
+the provider offering, admits or joins any required package download, and stores the primary slot
+selection. While onboarding remains open, ACN advances an installed selected slot through the
+ordinary model-residency coordinator and completes onboarding only when that slot is ready. Package
+installation, preparation, model loading, and client reconnection therefore remain one convergent
+server-owned flow. Confirmed cancellation terminalizes every target-package attempt, clears that
+matching selection, and returns the chooser. Neither transition is reconstructed from client
 presentation state.
 
 The complete compatible recommendable-candidate projection is published beside the small labeled
@@ -266,6 +269,10 @@ projection is disabled until every required package is installed and its exact c
 The offering itself remains durable and unchanged as those observations change.
 Target capabilities are resolved from catalog or installed-package inspection evidence and are not
 duplicated in the durable offering record.
+
+Retryable failures while automatically configuring or assessing an installed offering remain a
+preparing state. They are not presented as model incompatibility. Only a terminal reconciliation
+failure or an authoritative assessment result may make the target unavailable to the user.
 
 ### Slot selection
 

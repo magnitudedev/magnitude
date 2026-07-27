@@ -62,6 +62,7 @@ export {
   ModelSlotsMirror,
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
+  OnboardingMirror,
   ModelOfferingTargetIdSchema,
   CatalogCandidateIdSchema,
   ModelServingConfigurationIdSchema,

@@ -172,15 +172,29 @@ and directory details when width permits, stacks at narrow widths, and scrolls a
 conversation history. It is not a chat message and is absent when the loaded window does not reach
 the beginning of the session.
 
-After first-run onboarding selects a local model whose packages are still installing, the startup
-identity remains above a bordered download card centered in the otherwise empty history area.
-Recent conversations are suppressed until installation and preparation finish. The card derives
-model identity, quantization, stage, byte progress, transfer rate, and remaining-time presentation
-from authoritative local-model mirrors; it is not a session event or activity rail. Its confirmation
-state is presentation-only, while confirmed cancellation is one server mutation that returns to the
-onboarding chooser. The composer remains visible but cannot submit while the selected model is not
-usable. Its model, reasoning-effort, and resident-memory footer controls also remain visible but
-have no hover or activation behavior until the download finishes.
+First-run local-model onboarding renders inside the ordinary coding shell. The startup identity
+remains first, while recent conversations are suppressed and the otherwise empty history region
+contains one centered setup surface. Discovery shows authoritative recommendation progress. Once
+hardware detection completes, its progress row resolves in place into persistent, compact machine
+metadata beneath the setup title: the system row identifies platform, architecture, CPU capacity,
+memory, and unified acceleration, while discrete accelerators receive their own rows. It has no
+section label, completion glyph, panel, or independent client state. The remaining setup progress
+is full-width and left-aligned with the title and hardware, then disappears when discovery settles;
+the hardware remains throughout choosing, downloading, preparation, and loading. Once ready, one
+master-detail chooser groups compact rows into models on the computer and models available to
+download; arrow keys move one selection across both groups, the right pane is informational until
+selection, and Enter or a row click performs the row's `Load` or `Download` action.
+
+After selection, the chooser remains mounted while its selected row stays highlighted and its
+other rows stop accepting keyboard, hover, or click input. The right pane advances through
+download, preparation, and loading without a screen transition, deriving model identity,
+quantization, byte progress, transfer rate, and remaining-time presentation from authoritative
+local-model mirrors. Detailed residency progress remains in the activity rail. Setup disappears
+only when the selected primary slot is ready. The composer remains visible but cannot submit
+throughout setup, and its model,
+reasoning-effort, and resident-memory footer controls have no hover or activation behavior. Cancel
+confirmation is presentation-only; confirmed cancellation is one server mutation that returns to
+the chooser. None of these surfaces are session events.
 
 The CLI composer keeps a one-line minimum editor inside a full-width input surface with one full
 row of visual padding above and below it. A solid mode border sits immediately outside the colored

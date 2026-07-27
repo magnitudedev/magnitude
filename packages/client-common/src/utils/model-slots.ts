@@ -13,13 +13,20 @@ import type { LocalInferenceView } from "../types/local-inference"
 
 export type SelectedLocalModelSetup = LocalModelCatalogCandidate
 
-export const deriveSelectedLocalModelSetup = (
+export const deriveSelectedLocalModelCandidate = (
   state: LocalInferenceView,
 ): SelectedLocalModelSetup | null => {
   const primary = state.slots.slots.primary
   if (primary._tag === "Unassigned" || state.models.recommendations._tag !== "Ready") return null
-  const candidate = state.models.recommendations.catalog.find(({ providerModelId }) =>
+  return state.models.recommendations.catalog.find(({ providerModelId }) =>
     providerModelId === primary.selection.providerModelId)
+    ?? null
+}
+
+export const deriveSelectedLocalModelSetup = (
+  state: LocalInferenceView,
+): SelectedLocalModelSetup | null => {
+  const candidate = deriveSelectedLocalModelCandidate(state)
   if (!candidate) return null
   if (candidate.download._tag === "Downloading" || candidate.download._tag === "Failed") {
     return candidate

@@ -51,7 +51,7 @@ import { LocalProviderOfferingsLive } from "./local-provider-offerings"
 import { LocalProviderOfferingProjectionLive } from "./local-provider-offering-projection"
 import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
-import { OnboardingLive } from "./onboarding"
+import { OnboardingLive, OnboardingModelActivationLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
@@ -249,9 +249,13 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
   const withCredentials = Layer.provideMerge(ProviderCredentialsLive, withCatalog)
   const withCloudUsage = Layer.provideMerge(MagnitudeCloudUsageLive, withCredentials)
   const withModelSlots = Layer.provideMerge(ModelSlotCoordinatorLive, withCloudUsage)
+  const withOnboardingModelActivation = Layer.provideMerge(
+    OnboardingModelActivationLive,
+    withModelSlots,
+  )
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
-    withModelSlots,
+    withOnboardingModelActivation,
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
