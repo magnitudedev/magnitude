@@ -338,6 +338,13 @@ function CliAppContent(props: CliAppProps & {
     }
   })()
   const modelSetupPlaceholder = onboardingModelSetupPlaceholder(setupView)
+  const activityRail = (
+    <ActivityRailContainer
+      modelLoadActivity={localModelLoadActivity}
+      width={chatColumnWidth}
+      agentActivityEnabled={!props.modelSetupActive}
+    />
+  )
 
   // Startup header content — rendered inside the timeline scrollback.
   const startupHeader = (
@@ -375,11 +382,11 @@ function CliAppContent(props: CliAppProps & {
                     <TaskListContainer />
                   </box>
                 )}
-                <ActivityRailContainer
-                  modelLoadActivity={localModelLoadActivity}
-                  width={chatColumnWidth}
-                  agentActivityEnabled={!props.modelSetupActive}
-                />
+                {props.modelSetupActive ? (
+                  <box style={{ height: 1, minHeight: 1, maxHeight: 1, flexShrink: 0 }}>
+                    {activityRail}
+                  </box>
+                ) : activityRail}
               </box>
               {menu.open && !props.modelSetupActive
                 ? <ModelMenusContainer downloadSummary={downloadSummary} />
