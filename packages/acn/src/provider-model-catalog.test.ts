@@ -96,7 +96,11 @@ describe("provider model catalog", () => {
             if (Option.isSome(signal)) yield* Deferred.succeed(signal.value, undefined)
             return []
           }),
-          state: Effect.succeed({ entries: [], failure: Option.none() }),
+          state: Effect.succeed({
+            packageEvidence: Option.none(),
+            entries: [],
+            failure: Option.none(),
+          }),
           changes: Stream.fromPubSub(localChanges),
         })),
         MirroredStateChangesLive,

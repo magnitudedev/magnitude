@@ -19,7 +19,11 @@ import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
-import { LocalProviderOfferingProjection } from "./local-provider-offering-projection"
+import {
+  LocalProviderOfferingProjection,
+  providerOfferingPackageEvidence,
+  sameProviderOfferingPackageEvidence,
+} from "./local-provider-offering-projection"
 import {
   LocalModelAutoSetup,
   type LocalModelAutoSetupStatus,
@@ -113,30 +117,15 @@ export const preparationFromReconciliationFailure = (
   ? { _tag: "Preparing" }
   : { _tag: "Unavailable", providerModelIds, failure }
 
-const aggregatePreparation = (
-  modelId: ModelOfferingTargetId,
-  target: ModelOfferingTarget,
-  entries: ReadonlyMap<string, ModelPackageEntry>,
+type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availability">
+
+export const preparationFromProviderProjection = (
   configuredProviderModelIds: readonly ProviderModelId[],
-  providerEntries: ReadonlyMap<ProviderModelId, ProviderModelCatalogEntry>,
+  providerEntries: ReadonlyMap<ProviderModelId, ProviderAvailabilityProjection>,
+  projectionCurrent: boolean,
   providerProjectionFailure: Option.Option<ModelFailure>,
-  autoSetup: ReadonlyMap<ModelOfferingTargetId, LocalModelAutoSetupStatus>,
 ): LocalModelPreparation => {
-  const targetEntries = modelOfferingTargetPackageIds(target).map((packageId) => entries.get(packageId))
-  if (!targetEntries.every((entry) => entry?.localState._tag === "Installed")) {
-    return { _tag: "NotDownloaded" }
-  }
-  const failure = targetEntries.flatMap((entry): readonly ModelFailure[] => {
-    if (entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible") {
-      return [entry.inspection.failure]
-    }
-    return []
-  })[0]
-  if (failure) return { _tag: "Unavailable", providerModelIds: configuredProviderModelIds, failure }
-  const setup = autoSetup.get(modelId)
-  if (setup) return setup._tag === "Preparing"
-    ? setup
-    : preparationFromReconciliationFailure(configuredProviderModelIds, setup.failure)
+  if (!projectionCurrent) return { _tag: "Preparing" }
   const availableProviderModelIds = configuredProviderModelIds.filter((providerModelId) =>
     providerEntries.get(providerModelId)?.availability._tag === "Available")
   if (availableProviderModelIds.length > 0) {
@@ -165,6 +154,42 @@ const aggregatePreparation = (
     )
   }
   return { _tag: "Preparing" }
+}
+
+const aggregatePreparation = (
+  modelId: ModelOfferingTargetId,
+  target: ModelOfferingTarget,
+  entries: ReadonlyMap<string, ModelPackageEntry>,
+  configuredProviderModelIds: readonly ProviderModelId[],
+  providerEntries: ReadonlyMap<ProviderModelId, ProviderModelCatalogEntry>,
+  providerProjectionCurrent: boolean,
+  providerProjectionFailure: Option.Option<ModelFailure>,
+  autoSetup: ReadonlyMap<ModelOfferingTargetId, LocalModelAutoSetupStatus>,
+): LocalModelPreparation => {
+  const targetEntries = modelOfferingTargetPackageIds(target).map((packageId) => entries.get(packageId))
+  if (!targetEntries.every((entry) => entry?.localState._tag === "Installed")) {
+    return { _tag: "NotDownloaded" }
+  }
+  const failure = targetEntries.flatMap((entry): readonly ModelFailure[] => {
+    if (entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible") {
+      return [entry.inspection.failure]
+    }
+    return []
+  })[0]
+  if (failure) return { _tag: "Unavailable", providerModelIds: configuredProviderModelIds, failure }
+  if (targetEntries.some((entry) => entry?.inspection._tag === "Pending")) {
+    return { _tag: "Preparing" }
+  }
+  const setup = autoSetup.get(modelId)
+  if (setup) return setup._tag === "Preparing"
+    ? setup
+    : preparationFromReconciliationFailure(configuredProviderModelIds, setup.failure)
+  return preparationFromProviderProjection(
+    configuredProviderModelIds,
+    providerEntries,
+    providerProjectionCurrent,
+    providerProjectionFailure,
+  )
 }
 
 export interface LocalModelsApi {
@@ -288,6 +313,17 @@ export const LocalModelsLive: Layer.Layer<
     const providerEntries = new Map(
       projectedOfferings.entries.map((entry) => [entry.providerModelId, entry]),
     )
+    const currentProviderPackageEvidence = providerOfferingPackageEvidence(
+      configured,
+      packageEntries,
+    )
+    const providerProjectionCurrent = Option.exists(
+      projectedOfferings.packageEvidence,
+      (evidence) => sameProviderOfferingPackageEvidence(
+        evidence,
+        currentProviderPackageEvidence,
+      ),
+    )
     const providerProjectionFailure = Option.map(projectedOfferings.failure, (error): ModelFailure => ({
       code: "local_offering_assessment_unavailable",
       message: error.message,
@@ -319,6 +355,7 @@ export const LocalModelsLive: Layer.Layer<
           packageEntries,
           providerIdsByTarget.get(projection.id) ?? [],
           providerEntries,
+          providerProjectionCurrent,
           providerProjectionFailure,
           setupStatuses,
         ),
