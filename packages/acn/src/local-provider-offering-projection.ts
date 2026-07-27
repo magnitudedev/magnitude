@@ -4,6 +4,8 @@ import {
   ProviderModelCatalogEntrySchema,
   SECONDARY_SLOT_ID,
   type LocalInferenceError,
+  type LocalProviderOffering,
+  type ModelPackageEntry,
   type ProviderModelCatalogEntry,
   modelOfferingTargetPackageIds,
 } from "@magnitudedev/protocol"
@@ -15,7 +17,54 @@ import { LocalProviderOfferings } from "./local-provider-offerings"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import { makeObservedState } from "./mirrored-state"
 
+export type ProviderOfferingPackageEvidence = readonly {
+  readonly providerModelId: LocalProviderOffering["providerModelId"]
+  readonly configurationId: LocalProviderOffering["configuration"]["id"]
+  readonly packages: readonly {
+    readonly packageId: ModelPackageEntry["package"]["id"]
+    readonly installed: boolean
+    readonly inspection: ModelPackageEntry["inspection"]["_tag"]
+  }[]
+}[]
+
+export const providerOfferingPackageEvidence = (
+  offerings: readonly LocalProviderOffering[],
+  entries: ReadonlyMap<ModelPackageEntry["package"]["id"], ModelPackageEntry>,
+): ProviderOfferingPackageEvidence => [...offerings]
+  .sort((left, right) => left.providerModelId.localeCompare(right.providerModelId))
+  .map((offering) => ({
+    providerModelId: offering.providerModelId,
+    configurationId: offering.configuration.id,
+    packages: modelOfferingTargetPackageIds(offering.configuration.target)
+      .map((packageId) => {
+        const entry = entries.get(packageId)
+        return {
+          packageId,
+          installed: entry?.localState._tag === "Installed",
+          inspection: entry?.inspection._tag ?? "Pending",
+        }
+      })
+      .sort((left, right) => left.packageId.localeCompare(right.packageId)),
+  }))
+
+export const sameProviderOfferingPackageEvidence = (
+  left: ProviderOfferingPackageEvidence,
+  right: ProviderOfferingPackageEvidence,
+): boolean => left.length === right.length && left.every((offering, offeringIndex) => {
+  const other = right[offeringIndex]
+  return offering.providerModelId === other?.providerModelId
+    && offering.configurationId === other.configurationId
+    && offering.packages.length === other.packages.length
+    && offering.packages.every((modelPackage, packageIndex) => {
+      const otherPackage = other.packages[packageIndex]
+      return modelPackage.packageId === otherPackage?.packageId
+        && modelPackage.installed === otherPackage.installed
+        && modelPackage.inspection === otherPackage.inspection
+    })
+})
+
 export interface LocalProviderOfferingProjectionState {
+  readonly packageEvidence: Option.Option<ProviderOfferingPackageEvidence>
   readonly entries: readonly ProviderModelCatalogEntry[]
   readonly failure: Option.Option<LocalInferenceError>
 }
@@ -43,6 +92,7 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
   const offerings = yield* LocalProviderOfferings
 
   const observed = yield* makeObservedState<LocalProviderOfferingProjectionState>({
+    packageEvidence: Option.none(),
     entries: [],
     failure: Option.none(),
   })
@@ -51,7 +101,14 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
     left: LocalProviderOfferingProjectionState,
     right: LocalProviderOfferingProjectionState,
   ): boolean =>
-    entriesEquivalent(left.entries, right.entries)
+    Option.match(left.packageEvidence, {
+      onNone: () => Option.isNone(right.packageEvidence),
+      onSome: (leftEvidence) => Option.exists(
+        right.packageEvidence,
+        (rightEvidence) => sameProviderOfferingPackageEvidence(leftEvidence, rightEvidence),
+      ),
+    })
+    && entriesEquivalent(left.entries, right.entries)
     && Option.getOrUndefined(left.failure)?.message === Option.getOrUndefined(right.failure)?.message
   const compute = Effect.gen(function* () {
     const recommendableModels = (yield* Effect.forEach(
@@ -59,11 +116,20 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
       (model) => recommendableModelFromIcn(model).pipe(Effect.option),
     )).flatMap(Option.toArray)
     const curatedNames = new Map(recommendableModels.map((model) => [model.targetId, model.displayName]))
-    const installedIds = yield* packages.installedPackageIds
+    const packageSnapshot = yield* packages.snapshot
+    const packageEntries = new Map(
+      packageSnapshot.state.entries.map((entry) => [entry.package.id, entry]),
+    )
     const configured = yield* offerings.list
-    const installed = configured.map((offering) =>
-      modelOfferingTargetPackageIds(offering.configuration.target).every((packageId) => installedIds.has(packageId)))
-    const assessmentRequests = configured.flatMap((offering, index) => installed[index]
+    const packageEvidence = providerOfferingPackageEvidence(configured, packageEntries)
+    const targetEntries = configured.map((offering) =>
+      modelOfferingTargetPackageIds(offering.configuration.target)
+        .map((packageId) => packageEntries.get(packageId)))
+    const installed = targetEntries.map((entries) =>
+      entries.every((entry) => entry?.localState._tag === "Installed"))
+    const inspectable = targetEntries.map((entries, index) => installed[index]
+      && entries.every((entry) => entry?.inspection._tag === "Inspected"))
+    const assessmentRequests = configured.flatMap((offering, index) => inspectable[index]
       ? [{
           target: offering.configuration.target,
           profiles: [offering.configuration.profile],
@@ -74,7 +140,8 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
     const entries = configured.map((offering, index) => {
       const { target, profile } = offering.configuration
       const isInstalled = installed[index] ?? false
-      const result = isInstalled ? assessed[assessmentIndex++] : undefined
+      const isInspectable = inspectable[index] ?? false
+      const result = isInspectable ? assessed[assessmentIndex++] : undefined
       const assessment = result?._tag === "Assessed"
         ? result.assessments[0]
         : undefined
@@ -110,15 +177,32 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
         pricing: Option.none(),
       }
     })
-    return entries
+    return { entries, packageEvidence }
   })
-  const project = compute.pipe(
-    Effect.flatMap((entries) => observed.setIfChanged({
-      entries,
-      failure: Option.none(),
-    }, equivalent)),
+  const publishCurrent: Effect.Effect<void, LocalInferenceError> = Effect.suspend(() => compute.pipe(
+    Effect.flatMap(({ entries, packageEvidence }) => Effect.all({
+      configured: offerings.list,
+      packages: packages.snapshot,
+    }).pipe(
+      Effect.flatMap(({ configured, packages: latest }) => {
+        const latestEntries = new Map(
+          latest.state.entries.map((entry) => [entry.package.id, entry]),
+        )
+        const latestEvidence = providerOfferingPackageEvidence(configured, latestEntries)
+        return sameProviderOfferingPackageEvidence(packageEvidence, latestEvidence)
+          ? observed.setIfChanged({
+            packageEvidence: Option.some(packageEvidence),
+            entries,
+            failure: Option.none(),
+          }, equivalent)
+          : publishCurrent
+      }),
+    )),
+  ))
+  const project = publishCurrent.pipe(
     Effect.catchAll((error) => observed.get.pipe(
       Effect.flatMap(({ state }) => observed.setIfChanged({
+        packageEvidence: state.packageEvidence,
         entries: state.entries,
         failure: Option.some(error),
       }, equivalent)),
