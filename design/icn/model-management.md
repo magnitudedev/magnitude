@@ -8,6 +8,7 @@ applies_to:
   - packages/icn/src/installed/**
   - packages/icn/src/downloads/**
   - packages/acn/src/local-model-packages.ts
+  - inference/catalog/**
 ---
 
 # ICN model management
@@ -59,14 +60,27 @@ part of catalog or configuration identity.
 Catalog membership means only that Magnitude may assess and recommend the target. It does not mean
 the target fits, is recommended, is installed, is offered, or is resident.
 
-Catalog resolution pins immutable Hugging Face commits and exact files. One invalid entry produces
-a catalog diagnostic without suppressing valid siblings.
+Catalog publication is an explicit release-development operation. It resolves the human source
+catalog through production ICN code, pins immutable Hugging Face commits and exact files, and emits
+a deterministic manifest with the exact byte ranges and content digests of the GGUF metadata
+needed for native planning. Generation fails if any source entry produces a diagnostic.
+Development and release builds materialize the deterministic compressed bundle in build output,
+retrieving and verifying those ranges from the pinned immutable revisions when a matching build
+artifact is absent, and embed it in the binary. The bundle is not committed to source control, and
+a build never embeds a partial catalog.
+Normal ICN startup validates the embedded artifacts against the source declarations, native
+template and planner identities, bundle digest, and exact catalog coverage. It performs no remote
+catalog refresh.
 
-Source-backed assessment and fitting keep any temporary sparse materialization alive for the entire
-request. Temporary paths are never returned as durable package locations or retained in assessment
-caches.
+At runtime, a release-catalog target is assessed from its embedded hardware-independent properties
+and planner inputs, combined with current machine topology and local calibration. ICN materializes
+the planner inputs as temporary sparse files off the asynchronous runtime and keeps them alive for
+the entire assessment. Temporary paths are never returned as durable package locations or retained
+in assessment caches. Installed targets use their authoritative local files. Arbitrary remote
+source targets outside the release catalog are not resolved or assessed by the product runtime.
+Consequently a complete setup makes no Hugging Face request and creates no remote-header cache.
 
-The catalog is ICN-owned. ACN owns assessment batching and recommendation policy.
+The catalog is ICN-owned. ACN owns runtime assessment batching and recommendation policy.
 
 ## Installed packages
 
@@ -168,9 +182,11 @@ acceleration, phase shape, and process-residency class; cross-model observations
 native environment are workload-scaled fallbacks. Failed or canceled loads never train this cache.
 Keys include immutable package identity and every behavior-changing runtime or hardware input.
 
-Malformed, missing, stale, or unreadable entries are misses at the smallest independent unit.
-Deleting the cache may repeat work but cannot remove installed models, change identity, or produce a
-permanent failed state.
+Malformed, missing, stale, or unreadable cache entries are misses at the smallest independent unit.
+Deleting the cache may repeat machine-specific inspection and assessment, but cannot remove
+installed models, reconstruct the release catalog, trigger model-header downloads, change identity,
+or produce a permanent failed state. The embedded release catalog and planner-input bundle are
+intentionally outside this cache contract.
 
 ## Acceptance criteria
 
@@ -181,5 +197,8 @@ permanent failed state.
 - Download failure belongs to one attempt and can be retried with a new attempt.
 - Package identity is independent of paths and mutable repository refs.
 - Catalog failure does not hide installed packages.
+- User setup never requires network access to reconstruct the curated release catalog.
+- A release catalog with unresolved entries or mismatched generation evidence fails release
+  validation and ICN readiness.
 - Cache corruption cannot make a valid package permanently unloadable.
 - ICN stores no durable product serving configuration or slot selection.

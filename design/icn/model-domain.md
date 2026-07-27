@@ -13,6 +13,7 @@ applies_to:
   - inference/crates/icn-contracts/src/models.rs
   - inference/crates/icn-models/**
   - inference/crates/icn-server/src/main.rs
+  - inference/catalog/**
 ---
 
 # Local model domain
@@ -189,15 +190,26 @@ is recommended, is installed, is offered, or is loaded.
 ICN exposes this catalog at `GET /v1/models/catalog`. It is distinct from ACN's provider model
 catalog, which contains configured provider offerings available for slot selection.
 
-Repository metadata used to resolve the curated catalog is a disposable snapshot. A fresh snapshot
-is reused without a network request. An expired snapshot remains sufficient to serve the last
-complete catalog immediately while ICN conditionally revalidates it in the background; a failed
-refresh never replaces the last complete result. A machine with no repository snapshot must fetch
-the metadata once before it can resolve exact immutable package files. The shared HTTP client is
-reused across repository operations. Curated package resolution consumes that one repository
-snapshot directly for every format, so preparing each quantization does not request the same
-repository metadata again. Missing immutable GGUF header ranges are acquired with bounded
-concurrency and remain keyed by published content identity.
+The catalog shipped to users is release-bound data, not a runtime cache. Human-reviewed source
+declarations name the curated checkpoints, formats, profiles, and recommendation evidence. An
+explicit developer generation command resolves those declarations through ICN's production
+Hugging Face resolver, GGUF parser, package builder, template assessor, and native planner. It pins
+immutable commits and exact files, synchronously revalidates mutable upstream refs, and writes a
+deterministic manifest containing the exact byte ranges and content digests of the GGUF metadata
+the planner needs. Development and release builds materialize the deterministic compressed bundle
+in build output, retrieving and verifying those ranges from the pinned immutable revisions when a
+matching build artifact is absent, and embed it in the binary. The bundle is not committed to
+source control.
+
+The ICN binary validates the canonical source digest, template-assessor and native-planner
+identities, exact catalog-to-planner coverage, bundle digest, unique model identities, and absence
+of generation diagnostics. Missing, stale, partial, or malformed embedded data is a release defect
+and prevents ICN readiness; it is never treated as a user cache miss. User setup performs no remote
+catalog reconstruction or model-header fetch. It combines the release inputs with current hardware
+topology and local calibration to calculate fit and speed. Installed targets continue to use their
+local files. A source-backed target outside the release catalog cannot be assessed by the product
+runtime. Adding a model, changing a format, or updating an upstream revision requires regenerating,
+reviewing, and shipping a new release.
 
 ### Recommendation
 
@@ -212,12 +224,12 @@ build, enabled backends, and recommendation-policy identity are unchanged. Missi
 unreadable, mismatched, or older-than-seven-days portfolio data is a cache miss. It never
 suppresses recomputation after one of those inputs changes.
 
-Recommendation calculation publishes an ordered, cumulative lifecycle for hardware, downloaded
-model discovery, catalog, metadata preparation, assessment, and selection. Each step is pending,
-running, completed, or failed; running and terminal states carry authoritative timing, and bounded
-collection work carries completed and total counts. Completed work remains visible while later work
-runs. Presentation may animate a running step from the published start time, but it must not invent
-server progress.
+Recommendation calculation publishes an ordered, cumulative four-stage lifecycle for hardware,
+downloaded-model discovery, model evaluation for the current machine, and recommendation
+preparation. Each step is pending, running, completed, or failed. Bounded evaluation carries
+authoritative completed and total counts plus an optional remaining-time estimate derived from
+measured work in the current run. Completed work remains visible while later work runs.
+Presentation may animate the running marker, but it must not invent progress, phases, or timing.
 
 Local-model onboarding presents that lifecycle as one coherent discovery flow. While the initial
 recommendation lifecycle or provider-model catalog is loading, onboarding shows authoritative

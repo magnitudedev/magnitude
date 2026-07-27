@@ -459,10 +459,8 @@ export type LocalModelRecommendation = typeof LocalModelRecommendationSchema.Typ
 export const LocalModelRecommendationProgressStepIdSchema = Schema.Literal(
   "hardware",
   "inventory",
-  "catalog",
-  "metadata",
-  "assessment",
-  "selection",
+  "analysis",
+  "recommendations",
 )
 export type LocalModelRecommendationProgressStepId =
   typeof LocalModelRecommendationProgressStepIdSchema.Type
@@ -491,6 +489,10 @@ export const LocalModelRecommendationProgressStepSchema = Schema.Struct({
   status: LocalModelRecommendationProgressStatusSchema,
   completedItems: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   totalItems: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+  estimatedRemainingMs: Schema.optionalWith(
+    NonNegativeSafeInteger,
+    { as: "Option", exact: true },
+  ),
 })
 export type LocalModelRecommendationProgressStep =
   typeof LocalModelRecommendationProgressStepSchema.Type

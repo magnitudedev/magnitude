@@ -1,221 +1,408 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, ModelFailure, ModelOfferingTarget, RecommendableModel,
-    RecommendableModelCatalog, RecommendableModelCatalogProvider, RecommendableModelId,
-    ServingProfile,
+    CatalogDiagnostic, ModelFailure, ModelOfferingTarget, ModelOfferingTargetId,
+    RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
+    RecommendableModelId, ResolvedModelTarget, ServingProfile,
 };
 use icn_contracts::{
-    HuggingFaceModelCatalog, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
-    InventoryError, ModelPreviewSource,
+    ContentId, HardwareAssessment, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
+    Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
+    ModelComponent, ModelId, ModelLocation, ModelPreviewSource, ModelSource, ResolvedComponent,
+    ResolvedModel,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::cache::ModelIndexKind;
+use crate::cache::ModelBlobKind;
 use crate::capabilities::model_capabilities;
 use crate::inventory::ModelManager;
 use crate::package_service::{offering_target_id, package_from_resolved};
+use crate::preview::ModelPreviewService;
 
-#[derive(Clone, Copy, Serialize)]
-struct CatalogModel {
-    id: &'static str,
-    display_name: &'static str,
-    description: &'static str,
-    repository: &'static str,
-    formats: &'static [&'static str],
-    contexts: &'static [u32],
-    license: &'static str,
-    quality_score: f64,
-    quality_score_provenance: &'static str,
-    quality_evidence: &'static [&'static str],
+#[path = "../../../catalog/planner_bundle.rs"]
+mod planner_bundle;
+use planner_bundle::PlannerBundle;
+
+const CATALOG_SOURCE: &str = include_str!("../../../catalog/models.json");
+const RELEASE_CATALOG: &str = include_str!("../../../catalog/generated/recommendable-models.json");
+const RELEASE_PLANNER_BUNDLE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/planner-headers.bin"));
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogSource {
+    models: Vec<CatalogModel>,
 }
 
-const QWEN_FORMATS: &[&str] = &["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"];
-const ONE_HUNDRED_K: &[u32] = &[100_000];
-const PRODUCT_CONTEXTS: &[u32] = &[100_000, 200_000];
-const QUANT_EVIDENCE: &[&str] = &[
-    "Quantization fidelity is curated independently from hardware fit.",
-    "https://arxiv.org/abs/2606.19558",
-];
-const LAGUNA_EVIDENCE: &[&str] = &[
-    "Publisher-measured Terminal-Bench v2.1 checkpoint result; not an exact GGUF quantization measurement.",
-    "https://huggingface.co/poolside/Laguna-S-2.1",
-    "https://arxiv.org/abs/2606.19558",
-];
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogModel {
+    id: String,
+    display_name: String,
+    description: String,
+    repository: String,
+    formats: Vec<String>,
+    contexts: Vec<u32>,
+    license: String,
+    quality_score: f64,
+    quality_score_provenance: String,
+    quality_evidence: Vec<String>,
+}
 
-const CATALOG_MODELS: &[CatalogModel] = &[
-    CatalogModel {
-        id: "qwen3.5-4b",
-        display_name: "Qwen3.5 4B",
-        description: "Compact dense model for machines where responsiveness and footprint matter most.",
-        repository: "unsloth/Qwen3.5-4B-GGUF",
-        formats: QWEN_FORMATS,
-        contexts: PRODUCT_CONTEXTS,
-        license: "apache-2.0",
-        quality_score: 25.8,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "qwen3.5-9b",
-        display_name: "Qwen3.5 9B",
-        description: "Small dense model with a substantial capability gain over the 4B tier.",
-        repository: "unsloth/Qwen3.5-9B-GGUF",
-        formats: QWEN_FORMATS,
-        contexts: PRODUCT_CONTEXTS,
-        license: "apache-2.0",
-        quality_score: 29.2,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "qwen3.6-27b",
-        display_name: "Qwen3.6 27B",
-        description: "Large dense coding model with strong agent and coding capability.",
-        repository: "unsloth/Qwen3.6-27B-GGUF",
-        formats: QWEN_FORMATS,
-        contexts: PRODUCT_CONTEXTS,
-        license: "apache-2.0",
-        quality_score: 60.7,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "qwen3.6-35b-a3b",
-        display_name: "Qwen3.6 35B-A3B",
-        description: "Efficient MoE coding model with a large knowledge footprint and low active compute.",
-        repository: "unsloth/Qwen3.6-35B-A3B-GGUF",
-        formats: QWEN_FORMATS,
-        contexts: PRODUCT_CONTEXTS,
-        license: "apache-2.0",
-        quality_score: 44.9,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "gemma-4-e2b-it-qat",
-        display_name: "Gemma 4 E2B",
-        description: "Very small dense model optimized for on-device use.",
-        repository: "unsloth/gemma-4-E2B-it-qat-GGUF",
-        formats: &["UD-Q4_K_XL"],
-        contexts: ONE_HUNDRED_K,
-        license: "gemma",
-        quality_score: 15.0,
-        quality_score_provenance: "estimated_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "gemma-4-12b-it-qat",
-        display_name: "Gemma 4 12B",
-        description: "Mid-size dense model with native tool use, reasoning, and multimodal capability.",
-        repository: "unsloth/gemma-4-12B-it-qat-GGUF",
-        formats: &["UD-Q4_K_XL"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "gemma",
-        quality_score: 21.0,
-        quality_score_provenance: "estimated_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "gemma-4-26b-a4b-it-qat",
-        display_name: "Gemma 4 26B-A4B",
-        description: "Mid-size MoE model balancing a substantial weight footprint with low active compute.",
-        repository: "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
-        formats: &["UD-Q4_K_XL"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "gemma",
-        quality_score: 39.0,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "gemma-4-31b-it-qat",
-        display_name: "Gemma 4 31B",
-        description: "Large dense Gemma model with the strongest measured coding score in its family.",
-        repository: "unsloth/gemma-4-31B-it-qat-GGUF",
-        formats: &["UD-Q4_K_XL"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "gemma",
-        quality_score: 43.4,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "laguna-s-2.1",
-        display_name: "Laguna S 2.1 118B-A8B",
-        description: "High-capability MoE model designed for agentic coding and long-horizon software work.",
-        repository: "poolside/Laguna-S-2.1-GGUF",
-        formats: &["Q4_K_M", "Q8_0"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "openmdw-1.1",
-        quality_score: 70.2,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: LAGUNA_EVIDENCE,
-    },
-    CatalogModel {
-        id: "qwen3.5-122b-a10b",
-        display_name: "Qwen3.5 122B-A10B",
-        description: "Workstation-class MoE model with a large knowledge footprint and moderate active compute.",
-        repository: "unsloth/Qwen3.5-122B-A10B-GGUF",
-        formats: &["Q4_K_M"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "apache-2.0",
-        quality_score: 47.6,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "nemotron-3-super-120b-a12b",
-        display_name: "NVIDIA Nemotron 3 Super 120B-A12B",
-        description: "Workstation-class hybrid MoE model designed for agentic workflows.",
-        repository: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
-        formats: &["UD-Q4_K_XL", "MXFP4_MOE"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "nvidia-nemotron-open-model-license",
-        quality_score: 38.6,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "deepseek-v4-flash",
-        display_name: "DeepSeek V4 Flash 284B-A13B",
-        description: "Frontier MoE model with a very large weight footprint and low active compute.",
-        repository: "unsloth/DeepSeek-V4-Flash-GGUF",
-        formats: &["UD-Q3_K_M"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "mit",
-        quality_score: 61.8,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "nemotron-3-ultra-550b-a55b",
-        display_name: "NVIDIA Nemotron 3 Ultra 550B-A55B",
-        description: "Frontier workstation/server MoE model for exceptionally high-memory systems.",
-        repository: "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
-        formats: &["MXFP4_MOE"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "openmdw-1.1",
-        quality_score: 53.9,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-    CatalogModel {
-        id: "glm-5.2",
-        display_name: "GLM 5.2 753B-A40B",
-        description: "Largest catalog tier, intended only for exceptionally high-memory systems.",
-        repository: "unsloth/GLM-5.2-GGUF",
-        formats: &["BF16"],
-        contexts: PRODUCT_CONTEXTS,
-        license: "mit",
-        quality_score: 77.9,
-        quality_score_provenance: "measured_terminal_bench_2.1",
-        quality_evidence: QUANT_EVIDENCE,
-    },
-];
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseCatalogManifest {
+    source_digest: String,
+    template_identity: String,
+    planner_identity: String,
+    planner_bundle_digest: String,
+    planner_artifacts: Vec<ReleasePlannerArtifact>,
+    catalog: RecommendableModelCatalog,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleasePlannerArtifact {
+    target_id: ModelOfferingTargetId,
+    model_id: ModelId,
+    content_id: ContentId,
+    name: String,
+    supported_parameters: Vec<String>,
+    properties: InventoryProperties,
+    source: ModelSource,
+    primary_gguf: PathBuf,
+    components: Vec<ReleasePlannerComponent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleasePlannerComponent {
+    component: ModelComponent,
+    header_digest: String,
+    header_size_bytes: u64,
+}
+
+pub struct GeneratedReleaseCatalog {
+    pub catalog: RecommendableModelCatalog,
+    planner_artifacts: Vec<ReleasePlannerArtifact>,
+    headers: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub struct EmbeddedReleaseCatalog {
+    catalog: RecommendableModelCatalog,
+    planner_artifacts: Arc<BTreeMap<ModelOfferingTargetId, ReleasePlannerArtifact>>,
+    planner_bundle: Arc<PlannerBundle<'static>>,
+}
+
+fn catalog_source() -> Result<CatalogSource, InventoryError> {
+    let source: CatalogSource = serde_json::from_str(CATALOG_SOURCE)
+        .map_err(|error| InventoryError::Integrity(format!("invalid catalog source: {error}")))?;
+    if source.models.is_empty() {
+        return Err(InventoryError::Integrity(
+            "catalog source must contain at least one model".to_owned(),
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for model in &source.models {
+        let formats = model.formats.iter().collect::<BTreeSet<_>>();
+        let contexts = model.contexts.iter().collect::<BTreeSet<_>>();
+        if model.id.is_empty()
+            || model.display_name.is_empty()
+            || model.description.is_empty()
+            || model.repository.is_empty()
+            || model.formats.is_empty()
+            || formats.len() != model.formats.len()
+            || model.contexts.is_empty()
+            || contexts.len() != model.contexts.len()
+            || model.contexts.contains(&0)
+            || model.license.is_empty()
+            || !model.quality_score.is_finite()
+            || model.quality_score < 0.0
+            || model.quality_score_provenance.is_empty()
+            || model.quality_evidence.is_empty()
+            || !ids.insert(model.id.as_str())
+        {
+            return Err(InventoryError::Integrity(format!(
+                "invalid or duplicate catalog declaration {}",
+                model.id
+            )));
+        }
+    }
+    Ok(source)
+}
+
+pub fn catalog_source_digest() -> Result<String, InventoryError> {
+    let canonical = serde_json::to_vec(&catalog_source()?)
+        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+pub fn release_catalog_manifest(
+    generated: &GeneratedReleaseCatalog,
+    template_identity: impl Into<String>,
+    planner_identity: impl Into<String>,
+    planner_bundle: &[u8],
+) -> Result<ReleaseCatalogManifest, InventoryError> {
+    let source = catalog_source()?;
+    validate_resolved_catalog(&generated.catalog, &source)?;
+    validate_planner_artifacts(&generated.catalog, &generated.planner_artifacts)?;
+    Ok(ReleaseCatalogManifest {
+        source_digest: catalog_source_digest()?,
+        template_identity: template_identity.into(),
+        planner_identity: planner_identity.into(),
+        planner_bundle_digest: format!("{:x}", Sha256::digest(planner_bundle)),
+        planner_artifacts: generated.planner_artifacts.clone(),
+        catalog: generated.catalog.clone(),
+    })
+}
+
+pub fn embedded_release_catalog(
+    template_identity: &str,
+    planner_identity: &str,
+) -> Result<EmbeddedReleaseCatalog, InventoryError> {
+    let source = catalog_source()?;
+    let manifest: ReleaseCatalogManifest =
+        serde_json::from_str(RELEASE_CATALOG).map_err(|error| {
+            InventoryError::Integrity(format!("invalid embedded release catalog: {error}"))
+        })?;
+    if manifest.source_digest != catalog_source_digest()? {
+        return Err(InventoryError::Integrity(
+            "embedded release catalog does not match its source declarations".to_owned(),
+        ));
+    }
+    if manifest.template_identity != template_identity {
+        return Err(InventoryError::Integrity(
+            "embedded release catalog was generated with a different template assessor".to_owned(),
+        ));
+    }
+    if manifest.planner_identity != planner_identity {
+        return Err(InventoryError::Integrity(
+            "embedded release catalog was generated for a different native planner".to_owned(),
+        ));
+    }
+    if manifest.planner_bundle_digest != planner_bundle::sha256(RELEASE_PLANNER_BUNDLE) {
+        return Err(InventoryError::Integrity(
+            "embedded planner bundle does not match the release catalog".to_owned(),
+        ));
+    }
+    validate_resolved_catalog(&manifest.catalog, &source)?;
+    validate_planner_artifacts(&manifest.catalog, &manifest.planner_artifacts)?;
+    let planner_bundle =
+        PlannerBundle::parse(RELEASE_PLANNER_BUNDLE).map_err(InventoryError::Integrity)?;
+    for artifact in &manifest.planner_artifacts {
+        for component in &artifact.components {
+            if !planner_bundle.contains(&component.header_digest) {
+                return Err(InventoryError::Integrity(format!(
+                    "embedded planner bundle is missing header {}",
+                    component.header_digest
+                )));
+            }
+        }
+    }
+    Ok(EmbeddedReleaseCatalog {
+        catalog: manifest.catalog,
+        planner_artifacts: Arc::new(
+            manifest
+                .planner_artifacts
+                .into_iter()
+                .map(|artifact| (artifact.target_id.clone(), artifact))
+                .collect(),
+        ),
+        planner_bundle: Arc::new(planner_bundle),
+    })
+}
+
+fn validate_planner_artifacts(
+    catalog: &RecommendableModelCatalog,
+    artifacts: &[ReleasePlannerArtifact],
+) -> Result<(), InventoryError> {
+    let catalog_targets = catalog
+        .models
+        .iter()
+        .map(|model| model.target_id.clone())
+        .collect::<BTreeSet<_>>();
+    let artifact_targets = artifacts
+        .iter()
+        .map(|artifact| artifact.target_id.clone())
+        .collect::<BTreeSet<_>>();
+    if artifact_targets.len() != artifacts.len() || artifact_targets != catalog_targets {
+        return Err(InventoryError::Integrity(
+            "release planner artifacts do not exactly cover the catalog targets".to_owned(),
+        ));
+    }
+    for artifact in artifacts {
+        if artifact.components.is_empty()
+            || !artifact
+                .components
+                .iter()
+                .any(|component| component.component.path == artifact.primary_gguf)
+            || artifact.components.iter().any(|component| {
+                component.header_digest.len() != 64
+                    || component.header_size_bytes == 0
+                    || !component
+                        .header_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(InventoryError::Integrity(format!(
+                "invalid release planner artifact {}",
+                artifact.target_id.0
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl GeneratedReleaseCatalog {
+    pub fn encode_planner_bundle(&self) -> Result<Vec<u8>, InventoryError> {
+        planner_bundle::encode(&self.headers).map_err(InventoryError::Integrity)
+    }
+}
+
+impl EmbeddedReleaseCatalog {
+    #[must_use]
+    pub fn catalog(&self) -> &RecommendableModelCatalog {
+        &self.catalog
+    }
+
+    pub fn resolve_target(
+        &self,
+        target_id: &ModelOfferingTargetId,
+    ) -> Result<Option<ResolvedModelTarget>, InventoryError> {
+        let Some(artifact) = self.planner_artifacts.get(target_id) else {
+            return Ok(None);
+        };
+        let target = self
+            .catalog
+            .models
+            .iter()
+            .find(|model| &model.target_id == target_id)
+            .map(|model| model.target.clone())
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "catalog target {} has no model declaration",
+                    target_id.0
+                ))
+            })?;
+        let workspace =
+            tempfile::tempdir().map_err(|error| InventoryError::Io(error.to_string()))?;
+        for component in &artifact.components {
+            let header = self
+                .planner_bundle
+                .header(&component.header_digest)
+                .map_err(InventoryError::Integrity)?;
+            let path = workspace.path().join(&component.component.path);
+            let parent = path.parent().ok_or_else(|| {
+                InventoryError::Integrity("planner component has no parent".to_owned())
+            })?;
+            fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| InventoryError::Io(error.to_string()))?;
+            file.write_all(&header)
+                .and_then(|()| file.set_len(component.component.size_bytes))
+                .map_err(|error| InventoryError::Io(error.to_string()))?;
+        }
+        let components = artifact
+            .components
+            .iter()
+            .map(|component| component.component.clone())
+            .collect::<Vec<_>>();
+        let location = ModelLocation::Directory {
+            source_id: "embedded_release_catalog".to_owned(),
+            root: workspace.path().to_path_buf(),
+            components: components.clone(),
+            total_bytes: components
+                .iter()
+                .map(|component| component.size_bytes)
+                .sum(),
+            integrity: Integrity::Verified {
+                method: "release_catalog_header_digest".to_owned(),
+            },
+        };
+        let model = InventoryModel {
+            id: artifact.model_id.clone(),
+            content_id: artifact.content_id.clone(),
+            created: 0,
+            name: artifact.name.clone(),
+            supported_parameters: artifact.supported_parameters.clone(),
+            serving_configuration: None,
+            availability: ModelAvailability::Available { ready_at: 0 },
+            source: artifact.source.clone(),
+            location,
+            properties: artifact.properties.clone(),
+            hardware: HardwareAssessment::NotAssessed {
+                reason: "release planner input".to_owned(),
+            },
+            operations: Vec::new(),
+            updated_at: 0,
+        };
+        let resolved = ResolvedModel {
+            model,
+            components: artifact
+                .components
+                .iter()
+                .map(|component| ResolvedComponent {
+                    path: workspace.path().join(&component.component.path),
+                    role: component.component.role.clone(),
+                    shard_index: component.component.shard_index,
+                    relationship: component.component.relationship.clone(),
+                })
+                .collect(),
+        };
+        Ok(Some(
+            ResolvedModelTarget::new(target_id.clone(), target, resolved, None)
+                .retain_resolution_guard(workspace),
+        ))
+    }
+}
+
+fn validate_resolved_catalog(
+    catalog: &RecommendableModelCatalog,
+    source: &CatalogSource,
+) -> Result<(), InventoryError> {
+    if !catalog.diagnostics.is_empty() {
+        return Err(InventoryError::Integrity(format!(
+            "release catalog contains {} unresolved entries",
+            catalog.diagnostics.len()
+        )));
+    }
+    let actual = catalog
+        .models
+        .iter()
+        .map(|model| model.id.0.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected = source
+        .models
+        .iter()
+        .flat_map(|model| {
+            model
+                .formats
+                .iter()
+                .map(|format| format!("{}:{format}", model.id))
+        })
+        .collect::<BTreeSet<_>>();
+    if actual.len() != catalog.models.len()
+        || actual.len() != expected.len()
+        || !expected.iter().all(|id| actual.contains(id.as_str()))
+    {
+        return Err(InventoryError::Integrity(
+            "release catalog does not exactly cover its source declarations".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
     if declaration_id.starts_with("gemma-4-") {
@@ -241,14 +428,14 @@ fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
     (rank, false)
 }
 
-pub struct NativeRecommendableCatalog {
+pub struct ResolvingRecommendableCatalog {
     models: Arc<ModelManager>,
-    hugging_face: Arc<dyn HuggingFaceModelCatalog>,
+    hugging_face: Arc<ModelPreviewService>,
 }
 
-impl NativeRecommendableCatalog {
+impl ResolvingRecommendableCatalog {
     #[must_use]
-    pub fn new(models: Arc<ModelManager>, hugging_face: Arc<dyn HuggingFaceModelCatalog>) -> Self {
+    pub fn new(models: Arc<ModelManager>, hugging_face: Arc<ModelPreviewService>) -> Self {
         Self {
             models,
             hugging_face,
@@ -257,23 +444,17 @@ impl NativeRecommendableCatalog {
 
     async fn resolve_model(
         &self,
-        declaration: CatalogModel,
+        declaration: &CatalogModel,
         format: &str,
         snapshot: &HuggingFaceRepositorySnapshot,
-    ) -> Result<RecommendableModel, InventoryError> {
-        let evidence = catalog_resolution_evidence(
-            declaration,
-            format,
-            snapshot,
-            self.models.template_assessment_cache_identity()?,
-        )?;
-        if let Some(model) = self
-            .models
-            .cache
-            .read_index(ModelIndexKind::RecommendableModelCatalog, &evidence)
-        {
-            return Ok(model);
-        }
+    ) -> Result<
+        (
+            RecommendableModel,
+            ReleasePlannerArtifact,
+            BTreeMap<String, Vec<u8>>,
+        ),
+        InventoryError,
+    > {
         let selector = format.to_ascii_lowercase();
         let mut matches = snapshot
             .gguf_files
@@ -309,11 +490,11 @@ impl NativeRecommendableCatalog {
             .await?;
         let package = package_from_resolved(&prepared.model)?;
         let capabilities = model_capabilities(&prepared.model.model.properties);
-        let (fidelity_rank, quantization_aware) = fidelity(declaration.id, format);
+        let (fidelity_rank, quantization_aware) = fidelity(&declaration.id, format);
         let target_id = offering_target_id(&[&package.id]);
         let model = RecommendableModel {
             id: RecommendableModelId(format!("{}:{format}", declaration.id)),
-            checkpoint_id: declaration.id.to_owned(),
+            checkpoint_id: declaration.id.clone(),
             target_id,
             target: ModelOfferingTarget::Package { package },
             eligible_serving_profiles: declaration
@@ -323,45 +504,82 @@ impl NativeRecommendableCatalog {
                     context_length: *context_length,
                 })
                 .collect(),
-            display_name: declaration.display_name.to_owned(),
-            description: declaration.description.to_owned(),
+            display_name: declaration.display_name.clone(),
+            description: declaration.description.clone(),
             license: snapshot
                 .license
                 .clone()
                 .filter(|license| license != "other")
-                .unwrap_or_else(|| declaration.license.to_owned()),
+                .unwrap_or_else(|| declaration.license.clone()),
             capabilities,
             quality_score: declaration.quality_score,
-            quality_score_provenance: declaration.quality_score_provenance.to_owned(),
+            quality_score_provenance: declaration.quality_score_provenance.clone(),
             fidelity_rank,
             quantization_aware,
-            quality_evidence: declaration
-                .quality_evidence
-                .iter()
-                .map(|evidence| (*evidence).to_owned())
-                .collect(),
+            quality_evidence: declaration.quality_evidence.clone(),
         };
-        self.models
-            .cache
-            .write_index(ModelIndexKind::RecommendableModelCatalog, &evidence, &model);
-        Ok(model)
+        let headers = prepared
+            .headers
+            .iter()
+            .map(|header| {
+                self.models
+                    .cache
+                    .read_blob(ModelBlobKind::GgufHeader, &header.digest)
+                    .map(|bytes| (header.digest.clone(), bytes))
+                    .ok_or_else(|| {
+                        InventoryError::Integrity(format!(
+                            "catalog generation lost planner header {}",
+                            header.digest
+                        ))
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let planner = ReleasePlannerArtifact {
+            target_id: model.target_id.clone(),
+            model_id: prepared.model.model.id.clone(),
+            content_id: prepared.model.model.content_id.clone(),
+            name: prepared.model.model.name.clone(),
+            supported_parameters: prepared.model.model.supported_parameters.clone(),
+            properties: prepared.model.model.properties.clone(),
+            source: prepared.model.model.source.clone(),
+            primary_gguf: primary.path.clone(),
+            components: prepared
+                .components
+                .iter()
+                .map(|component| {
+                    let header = prepared
+                        .headers
+                        .iter()
+                        .find(|header| header.path == component.path)
+                        .ok_or_else(|| {
+                            InventoryError::Integrity(format!(
+                                "catalog component {} has no planner header",
+                                component.path.display()
+                            ))
+                        })?;
+                    Ok(ReleasePlannerComponent {
+                        component: component.clone(),
+                        header_digest: header.digest.clone(),
+                        header_size_bytes: u64::try_from(
+                            headers
+                                .get(&header.digest)
+                                .ok_or_else(|| {
+                                    InventoryError::Integrity(format!(
+                                        "catalog generation lost planner header {}",
+                                        header.digest
+                                    ))
+                                })?
+                                .len(),
+                        )
+                        .map_err(|_| {
+                            InventoryError::Integrity("planner header is too large".to_owned())
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, InventoryError>>()?,
+        };
+        Ok((model, planner, headers))
     }
-}
-
-fn catalog_resolution_evidence(
-    declaration: CatalogModel,
-    format: &str,
-    snapshot: &HuggingFaceRepositorySnapshot,
-    template_assessment_identity: &str,
-) -> Result<String, InventoryError> {
-    serde_json::to_string(&(
-        template_assessment_identity,
-        declaration,
-        format,
-        snapshot.repository.as_str(),
-        snapshot.commit.as_str(),
-    ))
-    .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
 fn is_first_shard(name: &str) -> bool {
@@ -384,12 +602,16 @@ fn is_later_shard(name: &str) -> bool {
         })
 }
 
-impl RecommendableModelCatalogProvider for NativeRecommendableCatalog {
-    fn catalog(&self) -> BoxFuture<'_, Result<RecommendableModelCatalog, InventoryError>> {
+impl ResolvingRecommendableCatalog {
+    pub fn resolve_release_catalog(
+        &self,
+    ) -> BoxFuture<'_, Result<GeneratedReleaseCatalog, InventoryError>> {
         Box::pin(async move {
-            let repositories = CATALOG_MODELS
+            let source = catalog_source()?;
+            let repositories = source
+                .models
                 .iter()
-                .map(|declaration| declaration.repository.to_owned())
+                .map(|declaration| declaration.repository.clone())
                 .fold(Vec::new(), |mut unique, repository| {
                     if !unique.contains(&repository) {
                         unique.push(repository);
@@ -400,7 +622,7 @@ impl RecommendableModelCatalogProvider for NativeRecommendableCatalog {
                 .map(|repository| async move {
                     let result = self
                         .hugging_face
-                        .resolve(HuggingFaceRepositoryRequest {
+                        .refresh_repository(HuggingFaceRepositoryRequest {
                             repository: repository.clone(),
                             revision: "main".to_owned(),
                         })
@@ -424,17 +646,17 @@ impl RecommendableModelCatalogProvider for NativeRecommendableCatalog {
             }
             let resolved_snapshots = &resolved_snapshots;
             let snapshot_failures = &snapshot_failures;
-            let resolved = stream::iter(CATALOG_MODELS.iter().copied().enumerate())
+            let resolved = stream::iter(source.models.into_iter().enumerate())
                 .map(|(declaration_index, declaration)| async move {
                     let mut formats = Vec::with_capacity(declaration.formats.len());
                     for (format_index, format) in declaration.formats.iter().enumerate() {
-                        let result = match resolved_snapshots.get(declaration.repository) {
+                        let result = match resolved_snapshots.get(&declaration.repository) {
                             Some(snapshot) => {
-                                self.resolve_model(declaration, format, snapshot).await
+                                self.resolve_model(&declaration, format, snapshot).await
                             }
                             None => Err(InventoryError::Io(
                                 snapshot_failures
-                                    .get(declaration.repository)
+                                    .get(&declaration.repository)
                                     .cloned()
                                     .unwrap_or_else(|| {
                                         format!(
@@ -447,8 +669,8 @@ impl RecommendableModelCatalogProvider for NativeRecommendableCatalog {
                         formats.push((
                             declaration_index,
                             format_index,
-                            declaration,
-                            (*format).to_owned(),
+                            declaration.clone(),
+                            format.clone(),
                             result,
                         ));
                     }
@@ -463,10 +685,24 @@ impl RecommendableModelCatalogProvider for NativeRecommendableCatalog {
                 (*declaration_index, *format_index)
             });
             let mut models = Vec::new();
+            let mut planner_artifacts = Vec::new();
+            let mut headers = BTreeMap::new();
             let mut diagnostics = Vec::new();
             for (_, _, declaration, format, result) in resolved {
                 match result {
-                    Ok(model) => models.push(model),
+                    Ok((model, planner, model_headers)) => {
+                        models.push(model);
+                        planner_artifacts.push(planner);
+                        for (digest, header) in model_headers {
+                            if let Some(previous) = headers.insert(digest.clone(), header.clone())
+                                && previous != header
+                            {
+                                return Err(InventoryError::Integrity(format!(
+                                    "planner header digest collision {digest}"
+                                )));
+                            }
+                        }
+                    }
                     Err(error) => diagnostics.push(CatalogDiagnostic {
                         entry_id: Some(RecommendableModelId(format!(
                             "{}:{format}",
@@ -480,11 +716,38 @@ impl RecommendableModelCatalogProvider for NativeRecommendableCatalog {
                     }),
                 }
             }
-            Ok(RecommendableModelCatalog {
-                models,
-                diagnostics,
+            Ok(GeneratedReleaseCatalog {
+                catalog: RecommendableModelCatalog {
+                    models,
+                    diagnostics,
+                },
+                planner_artifacts,
+                headers,
             })
         })
+    }
+}
+
+impl RecommendableModelCatalogProvider for ResolvingRecommendableCatalog {
+    fn catalog(&self) -> BoxFuture<'_, Result<RecommendableModelCatalog, InventoryError>> {
+        Box::pin(async move { Ok(self.resolve_release_catalog().await?.catalog) })
+    }
+}
+
+pub struct ReleaseRecommendableCatalog {
+    catalog: RecommendableModelCatalog,
+}
+
+impl ReleaseRecommendableCatalog {
+    #[must_use]
+    pub fn new(catalog: RecommendableModelCatalog) -> Self {
+        Self { catalog }
+    }
+}
+
+impl RecommendableModelCatalogProvider for ReleaseRecommendableCatalog {
+    fn catalog(&self) -> BoxFuture<'_, Result<RecommendableModelCatalog, InventoryError>> {
+        Box::pin(async { Ok(self.catalog.clone()) })
     }
 }
 
@@ -503,49 +766,64 @@ mod tests {
     #[test]
     fn workstation_catalog_uses_published_gguf_format_names() {
         let formats = |id: &str| {
-            CATALOG_MODELS
+            catalog_source()
+                .expect("catalog source")
+                .models
                 .iter()
                 .find(|model| model.id == id)
                 .expect("catalog model")
                 .formats
+                .clone()
         };
-        assert_eq!(formats("laguna-s-2.1"), &["Q4_K_M", "Q8_0"]);
-        assert_eq!(formats("qwen3.5-122b-a10b"), &["Q4_K_M"]);
+        assert_eq!(formats("laguna-s-2.1"), ["Q4_K_M", "Q8_0"]);
+        assert_eq!(formats("qwen3.5-122b-a10b"), ["Q4_K_M"]);
         assert_eq!(
             formats("nemotron-3-super-120b-a12b"),
-            &["UD-Q4_K_XL", "MXFP4_MOE"]
+            ["UD-Q4_K_XL", "MXFP4_MOE"]
         );
-        assert_eq!(formats("deepseek-v4-flash"), &["UD-Q3_K_M"]);
-        assert_eq!(formats("glm-5.2"), &["BF16"]);
+        assert_eq!(formats("deepseek-v4-flash"), ["UD-Q3_K_M"]);
+        assert_eq!(formats("glm-5.2"), ["BF16"]);
     }
 
     #[test]
-    fn catalog_cache_evidence_tracks_native_template_identity() {
-        let declaration = CATALOG_MODELS
-            .iter()
-            .find(|model| model.id == "laguna-s-2.1")
-            .copied()
-            .expect("Laguna declaration");
-        let snapshot = HuggingFaceRepositorySnapshot {
-            repository: declaration.repository.to_owned(),
-            commit: "commit".to_owned(),
-            last_modified: None,
-            downloads: None,
-            likes: None,
-            gated: false,
-            private: false,
-            license: None,
-            license_url: None,
-            base_models: Vec::new(),
-            tags: Vec::new(),
-            gguf_files: Vec::new(),
-        };
+    fn source_digest_is_stable_and_nonempty() {
+        assert_eq!(catalog_source_digest().expect("source digest").len(), 64);
+        assert!(!catalog_source().expect("catalog source").models.is_empty());
+    }
 
-        assert_ne!(
-            catalog_resolution_evidence(declaration, "Q4_K_M", &snapshot, "native-a")
-                .expect("cache evidence"),
-            catalog_resolution_evidence(declaration, "Q4_K_M", &snapshot, "native-b")
-                .expect("cache evidence"),
+    #[test]
+    fn embedded_catalog_matches_source_and_template_evidence() {
+        let manifest: ReleaseCatalogManifest =
+            serde_json::from_str(RELEASE_CATALOG).expect("release catalog manifest");
+        let catalog =
+            embedded_release_catalog(&manifest.template_identity, &manifest.planner_identity)
+                .expect("valid embedded release catalog");
+        let expected = catalog_source()
+            .expect("catalog source")
+            .models
+            .iter()
+            .map(|model| model.formats.len())
+            .sum::<usize>();
+        assert_eq!(catalog.catalog().models.len(), expected);
+        assert!(
+            embedded_release_catalog("different-template", &manifest.planner_identity).is_err()
         );
+        assert!(
+            embedded_release_catalog(&manifest.template_identity, "different-planner").is_err()
+        );
+        let target_ids = catalog
+            .catalog()
+            .models
+            .iter()
+            .map(|model| model.target_id.clone())
+            .collect::<Vec<_>>();
+        for target_id in target_ids {
+            let resolved = catalog
+                .resolve_target(&target_id)
+                .expect("resolve embedded planner target")
+                .expect("catalog planner target");
+            assert_eq!(resolved.target_id, target_id);
+            assert!(!resolved.target_model.model.location.components().is_empty());
+        }
     }
 }

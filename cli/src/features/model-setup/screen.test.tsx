@@ -101,12 +101,14 @@ test("withholds provisional models and errors until curated setup is coherent", 
             },
             completedItems: Option.some(1),
             totalItems: Option.some(1),
+            estimatedRemainingMs: Option.none(),
           },
           {
             id: "inventory",
             status: { _tag: "Running", startedAtMs: 1_100 },
             completedItems: Option.none(),
             totalItems: Option.none(),
+            estimatedRemainingMs: Option.none(),
           },
         ],
       },
@@ -139,7 +141,7 @@ test("withholds provisional models and errors until curated setup is coherent", 
     await act(view.renderOnce)
     const partialFrame = view.captureCharFrame()
     expect(partialFrame).toContain("SETUP PROGRESS")
-    expect(partialFrame).toContain("Checking for downloaded models")
+    expect(partialFrame).toContain("Checking downloaded models")
     expect(partialFrame).not.toContain(provisionalName)
     expect(partialFrame).not.toContain(provisionalFailure)
     expect(partialFrame).not.toContain("Unable to use this model")
@@ -197,6 +199,7 @@ test("renders a terminal discovery failure exactly once and no partial model car
           },
           completedItems: Option.none(),
           totalItems: Option.none(),
+          estimatedRemainingMs: Option.none(),
         }],
       },
     },

@@ -15,7 +15,11 @@ mod service;
 mod validation;
 
 pub use cache::{ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind};
-pub use catalog::NativeRecommendableCatalog;
+pub use catalog::{
+    EmbeddedReleaseCatalog, GeneratedReleaseCatalog, ReleaseCatalogManifest,
+    ReleaseRecommendableCatalog, ResolvingRecommendableCatalog, catalog_source_digest,
+    embedded_release_catalog, release_catalog_manifest,
+};
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ModelManager};
 pub use package_service::{canonical_package_id, offering_target_id};

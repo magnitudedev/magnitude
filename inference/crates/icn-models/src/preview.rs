@@ -75,6 +75,37 @@ impl ModelPreviewService {
         }
     }
 
+    /// Resolve a repository synchronously against upstream, conditionally reusing cached bytes.
+    /// Release-catalog generation uses this path so an expired snapshot cannot be returned while
+    /// its refresh is abandoned with the short-lived generator process.
+    pub async fn refresh_repository(
+        &self,
+        request: HuggingFaceRepositoryRequest,
+    ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+        validate_repository_request(&request)?;
+        let cache_key = repository_cache_key(self.models.client.endpoint(), &request);
+        let cached = self
+            .models
+            .cache
+            .read_index::<CachedHuggingFaceRepositorySnapshot>(
+                ModelIndexKind::HuggingFaceRepositorySnapshot,
+                &cache_key,
+            );
+        let snapshot = refresh_hub_repository_snapshot(
+            &self.models,
+            &self.http,
+            self.models.client.endpoint(),
+            request,
+            cache_key.clone(),
+            cached,
+        )
+        .await?;
+        let mut memory_cache = self.hub_repository_snapshots.lock().await;
+        memory_cache.insert(cache_key, (Instant::now(), snapshot.clone()));
+        trim_discovery_cache(&mut memory_cache);
+        Ok(snapshot)
+    }
+
     async fn hardware_snapshot(&self) -> Result<icn_contracts::HardwareSnapshot, InventoryError> {
         let mut cached = self.hardware_snapshot.lock().await;
         if let Some((captured, snapshot)) = cached.as_ref()
@@ -298,6 +329,26 @@ impl ModelPreviewer for ModelPreviewService {
     }
 }
 
+fn validate_repository_request(
+    request: &HuggingFaceRepositoryRequest,
+) -> Result<(), InventoryError> {
+    if !valid_repository(&request.repository) {
+        return Err(InventoryError::InvalidRequest(
+            "Hugging Face repository must use owner/repository form".to_owned(),
+        ));
+    }
+    if !valid_hub_revision(&request.revision) {
+        return Err(InventoryError::InvalidRequest(
+            "Hugging Face revision contains unsupported characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn repository_cache_key(endpoint: &str, request: &HuggingFaceRepositoryRequest) -> String {
+    format!("{endpoint}:{}@{}", request.repository, request.revision)
+}
+
 impl HuggingFaceModelCatalog for ModelPreviewService {
     fn search(
         &self,
@@ -380,23 +431,8 @@ impl HuggingFaceModelCatalog for ModelPreviewService {
     ) -> futures_util::future::BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>>
     {
         Box::pin(async move {
-            if !valid_repository(&request.repository) {
-                return Err(InventoryError::InvalidRequest(
-                    "Hugging Face repository must use owner/repository form".to_owned(),
-                ));
-            }
-            let revision = request.revision.as_str();
-            if !valid_hub_revision(revision) {
-                return Err(InventoryError::InvalidRequest(
-                    "Hugging Face revision contains unsupported characters".to_owned(),
-                ));
-            }
-            let cache_key = format!(
-                "{}:{}@{}",
-                self.models.client.endpoint(),
-                request.repository,
-                revision
-            );
+            validate_repository_request(&request)?;
+            let cache_key = repository_cache_key(self.models.client.endpoint(), &request);
             {
                 let mut cache = self.hub_repository_snapshots.lock().await;
                 cache.retain(|_, (captured, _)| captured.elapsed() <= HUB_REPOSITORY_SNAPSHOT_TTL);
@@ -507,8 +543,15 @@ pub struct PreparedPreview {
     pub repository: String,
     pub commit: String,
     pub components: Vec<ModelComponent>,
+    pub headers: Vec<PreparedPreviewHeader>,
     pub artifact_fingerprint: String,
     _workspace: ModelCacheWorkspace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPreviewHeader {
+    pub path: PathBuf,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1115,6 +1158,14 @@ impl ModelManager {
             repository: artifact.repository,
             commit: artifact.commit,
             components,
+            headers: artifact
+                .components
+                .iter()
+                .map(|component| PreparedPreviewHeader {
+                    path: component.component.path.clone(),
+                    digest: component.header_digest.clone(),
+                })
+                .collect(),
             artifact_fingerprint: source_fingerprint,
             _workspace: workspace,
         })

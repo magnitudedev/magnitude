@@ -754,7 +754,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const detail = candidates.find(({ id }) => id === detailId) ?? null
   const progress = Option.match(snapshot, {
     onNone: () => [],
-    onSome: (state) => localInferenceProgressLines(state.models.recommendations.progress, Date.now()),
+    onSome: (state) => localInferenceProgressLines(state.models.recommendations.progress),
   })
   const runningProgress = progress.find((line) => line.state === "running")
   const detailActions = useMemo(() => {

@@ -63,6 +63,8 @@ export async function buildReleaseArtifacts(
   target: string,
   outDir = resolve(PROJECT_ROOT, "release")
 ): Promise<void> {
+  console.log("[release] Validating embedded local-model catalog");
+  await $`cargo run --manifest-path ${resolve(PROJECT_ROOT, "inference/Cargo.toml")} -p icn-server -- catalog check`;
   const info = getTargetInfo(target);
   await rm(outDir, { recursive: true, force: true });
   await mkdir(outDir, { recursive: true });

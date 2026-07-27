@@ -1,0 +1,215 @@
+{
+  "models": [
+    {
+      "id": "qwen3.5-4b",
+      "displayName": "Qwen3.5 4B",
+      "description": "Compact dense model for machines where responsiveness and footprint matter most.",
+      "repository": "unsloth/Qwen3.5-4B-GGUF",
+      "formats": ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
+      "contexts": [100000, 200000],
+      "license": "apache-2.0",
+      "qualityScore": 25.8,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "qwen3.5-9b",
+      "displayName": "Qwen3.5 9B",
+      "description": "Small dense model with a substantial capability gain over the 4B tier.",
+      "repository": "unsloth/Qwen3.5-9B-GGUF",
+      "formats": ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
+      "contexts": [100000, 200000],
+      "license": "apache-2.0",
+      "qualityScore": 29.2,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "qwen3.6-27b",
+      "displayName": "Qwen3.6 27B",
+      "description": "Large dense coding model with strong agent and coding capability.",
+      "repository": "unsloth/Qwen3.6-27B-GGUF",
+      "formats": ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
+      "contexts": [100000, 200000],
+      "license": "apache-2.0",
+      "qualityScore": 60.7,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "qwen3.6-35b-a3b",
+      "displayName": "Qwen3.6 35B-A3B",
+      "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
+      "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "formats": ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
+      "contexts": [100000, 200000],
+      "license": "apache-2.0",
+      "qualityScore": 44.9,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "gemma-4-e2b-it-qat",
+      "displayName": "Gemma 4 E2B",
+      "description": "Very small dense model optimized for on-device use.",
+      "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
+      "formats": ["UD-Q4_K_XL"],
+      "contexts": [100000],
+      "license": "gemma",
+      "qualityScore": 15.0,
+      "qualityScoreProvenance": "estimated_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "gemma-4-12b-it-qat",
+      "displayName": "Gemma 4 12B",
+      "description": "Mid-size dense model with native tool use, reasoning, and multimodal capability.",
+      "repository": "unsloth/gemma-4-12B-it-qat-GGUF",
+      "formats": ["UD-Q4_K_XL"],
+      "contexts": [100000, 200000],
+      "license": "gemma",
+      "qualityScore": 21.0,
+      "qualityScoreProvenance": "estimated_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "gemma-4-26b-a4b-it-qat",
+      "displayName": "Gemma 4 26B-A4B",
+      "description": "Mid-size MoE model balancing a substantial weight footprint with low active compute.",
+      "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+      "formats": ["UD-Q4_K_XL"],
+      "contexts": [100000, 200000],
+      "license": "gemma",
+      "qualityScore": 39.0,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "gemma-4-31b-it-qat",
+      "displayName": "Gemma 4 31B",
+      "description": "Large dense Gemma model with the strongest measured coding score in its family.",
+      "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
+      "formats": ["UD-Q4_K_XL"],
+      "contexts": [100000, 200000],
+      "license": "gemma",
+      "qualityScore": 43.4,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "laguna-s-2.1",
+      "displayName": "Laguna S 2.1 118B-A8B",
+      "description": "High-capability MoE model designed for agentic coding and long-horizon software work.",
+      "repository": "poolside/Laguna-S-2.1-GGUF",
+      "formats": ["Q4_K_M", "Q8_0"],
+      "contexts": [100000, 200000],
+      "license": "openmdw-1.1",
+      "qualityScore": 70.2,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Publisher-measured Terminal-Bench v2.1 checkpoint result; not an exact GGUF quantization measurement.",
+        "https://huggingface.co/poolside/Laguna-S-2.1",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "qwen3.5-122b-a10b",
+      "displayName": "Qwen3.5 122B-A10B",
+      "description": "Workstation-class MoE model with a large knowledge footprint and moderate active compute.",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "formats": ["Q4_K_M"],
+      "contexts": [100000, 200000],
+      "license": "apache-2.0",
+      "qualityScore": 47.6,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "nemotron-3-super-120b-a12b",
+      "displayName": "NVIDIA Nemotron 3 Super 120B-A12B",
+      "description": "Workstation-class hybrid MoE model designed for agentic workflows.",
+      "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+      "formats": ["UD-Q4_K_XL", "MXFP4_MOE"],
+      "contexts": [100000, 200000],
+      "license": "nvidia-nemotron-open-model-license",
+      "qualityScore": 38.6,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "displayName": "DeepSeek V4 Flash 284B-A13B",
+      "description": "Frontier MoE model with a very large weight footprint and low active compute.",
+      "repository": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "formats": ["UD-Q3_K_M"],
+      "contexts": [100000, 200000],
+      "license": "mit",
+      "qualityScore": 61.8,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "nemotron-3-ultra-550b-a55b",
+      "displayName": "NVIDIA Nemotron 3 Ultra 550B-A55B",
+      "description": "Frontier workstation/server MoE model for exceptionally high-memory systems.",
+      "repository": "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
+      "formats": ["MXFP4_MOE"],
+      "contexts": [100000, 200000],
+      "license": "openmdw-1.1",
+      "qualityScore": 53.9,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    },
+    {
+      "id": "glm-5.2",
+      "displayName": "GLM 5.2 753B-A40B",
+      "description": "Largest catalog tier, intended only for exceptionally high-memory systems.",
+      "repository": "unsloth/GLM-5.2-GGUF",
+      "formats": ["BF16"],
+      "contexts": [100000, 200000],
+      "license": "mit",
+      "qualityScore": 77.9,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://arxiv.org/abs/2606.19558"
+      ]
+    }
+  ]
+}
