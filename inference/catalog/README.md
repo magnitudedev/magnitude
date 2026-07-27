@@ -4,7 +4,7 @@
 generator resolves it through ICN's production repository resolver, GGUF parser, package builder,
 template assessor, and native planner. It emits one reviewed release manifest:
 
-- `generated/recommendable-models.json` contains the resolved catalog and hardware-independent
+- `generated/release-catalog.lock.json` contains the resolved catalog and hardware-independent
   model-planning metadata, including immutable Hugging Face revisions and the exact byte length and
   digest of every GGUF header required by the native planner.
 

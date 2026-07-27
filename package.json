@@ -68,7 +68,7 @@
     "icn:serve": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- serve",
     "icn:doctor": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- doctor",
     "icn:version": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- version --json",
-    "local-model-catalog:refresh": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- catalog generate --output inference/catalog/generated/recommendable-models.json --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
+    "local-model-catalog:refresh": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- catalog generate --output inference/catalog/generated/release-catalog.lock.json --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
     "local-model-catalog:check": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- catalog check"
   },
   "devDependencies": {
