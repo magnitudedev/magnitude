@@ -3,11 +3,31 @@ import {
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   type ModelSlot,
+  type LocalModelCatalogCandidate,
   type ModelSlotsState,
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
   type SlotId,
 } from "@magnitudedev/sdk"
+import type { LocalInferenceView } from "../types/local-inference"
+
+export type SelectedLocalModelSetup = LocalModelCatalogCandidate
+
+export const deriveSelectedLocalModelSetup = (
+  state: LocalInferenceView,
+): SelectedLocalModelSetup | null => {
+  const primary = state.slots.slots.primary
+  if (primary._tag === "Unassigned" || state.models.recommendations._tag !== "Ready") return null
+  const candidate = state.models.recommendations.catalog.find(({ providerModelId }) =>
+    providerModelId === primary.selection.providerModelId)
+  if (!candidate) return null
+  if (candidate.download._tag === "Downloading" || candidate.download._tag === "Failed") {
+    return candidate
+  }
+  return candidate.download._tag === "Downloaded" && candidate.preparation._tag === "Calibrating"
+    ? candidate
+    : null
+}
 
 type AssignedSlot = Exclude<ModelSlot, { readonly _tag: "Unassigned" }>
 

@@ -473,9 +473,14 @@ export const DownloadAttempt = S.Union(
   S.extend(
     S.Struct({
       _tag: S.Literal("Downloading"),
+      bytesPerSecond: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+        exact: true,
+        as: "Option",
+      }),
       completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
       packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
+      stage: S.suspend((): S.Schema<DownloadStage, DownloadStageEncoded> => DownloadStage),
       totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -514,6 +519,17 @@ export type DownloadAttemptEncoded = S.Schema.Encoded<typeof DownloadAttempt>
 export const DownloadAttemptId = S.String
 export type DownloadAttemptId = S.Schema.Type<typeof DownloadAttemptId>
 export type DownloadAttemptIdEncoded = S.Schema.Encoded<typeof DownloadAttemptId>
+
+export const DownloadStage = S.Union(
+  S.Literal("queued"),
+  S.Literal("resolving"),
+  S.Literal("checking_space"),
+  S.Literal("downloading"),
+  S.Literal("verifying"),
+  S.Literal("publishing"),
+)
+export type DownloadStage = S.Schema.Type<typeof DownloadStage>
+export type DownloadStageEncoded = S.Schema.Encoded<typeof DownloadStage>
 
 export const ErrorResponse = S.Struct({
   error: S.suspend((): S.Schema<ApiErrorBody, ApiErrorBodyEncoded> => ApiErrorBody),

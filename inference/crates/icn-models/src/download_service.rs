@@ -12,7 +12,7 @@ use icn_contracts::models::{
     StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{
-    ComponentRelationship, ComponentRole, DownloadComponent, DownloadModelRequest,
+    ComponentRelationship, ComponentRole, DownloadComponent, DownloadModelRequest, DownloadStage,
     HuggingFaceDownloadSource, InventoryError, ModelDownloadEvent, ModelInventory,
 };
 use serde::{Deserialize, Serialize};
@@ -98,16 +98,27 @@ impl ManagedModelDownloads {
                     completed_bytes,
                     total_bytes,
                     ..
-                }
-                | ModelDownloadEvent::Progress {
+                } => DownloadAttempt::Downloading {
+                    id: id.clone(),
+                    package_id: package.id.clone(),
+                    stage: DownloadStage::CheckingSpace,
                     completed_bytes,
                     total_bytes,
+                    bytes_per_second: None,
+                },
+                ModelDownloadEvent::Progress {
+                    completed_bytes,
+                    total_bytes,
+                    stage,
+                    bytes_per_second,
                     ..
                 } => DownloadAttempt::Downloading {
                     id: id.clone(),
                     package_id: package.id.clone(),
+                    stage,
                     completed_bytes,
                     total_bytes,
+                    bytes_per_second: bytes_per_second.map(|value| value.round() as u64),
                 },
                 ModelDownloadEvent::Ready { .. } => DownloadAttempt::Completed {
                     id: id.clone(),

@@ -68,6 +68,8 @@ const AcnDemandRpcs = RpcGroup.make(
   LocalInference.UnloadModel,
   Onboarding.GetOnboardingState,
   Onboarding.CompleteOnboardingFlow,
+  Onboarding.SelectOnboardingLocalModel,
+  Onboarding.CancelOnboardingLocalModelDownload,
   Files.ListFiles,
   Files.ReadFile,
   Files.CheckFileExists,

@@ -19,6 +19,7 @@ import {
   type RecommendableModel,
 } from "@magnitudedev/protocol"
 import { IcnCatalog, IcnHardware, IcnInstalledModels } from "@magnitudedev/icn"
+import { ProviderModelIdSchema } from "@magnitudedev/ai/provider/model"
 import {
   readStructuredFile,
   writeStructuredFileAtomic,
@@ -94,6 +95,7 @@ const catalogProjection = (
 ): CatalogEntry => ({
   candidate: {
     id: CatalogCandidateIdSchema.make(candidate.assessment.configurationId),
+    providerModelId: ProviderModelIdSchema.make(`local:${candidate.assessment.configurationId}`),
     displayName: candidate.model.displayName,
     description: candidate.model.description,
     license: candidate.model.license,

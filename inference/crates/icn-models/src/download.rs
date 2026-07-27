@@ -445,9 +445,13 @@ impl ModelManager {
         persist_operation_manifest(&self.config.root, &operation_manifest).await?;
 
         let started = Instant::now();
+        let mut resumed_by_component = Vec::with_capacity(remote.len());
+        for component in &remote {
+            resumed_by_component.push(component_partial_len(&repo_root, component).await);
+        }
         for (index, component) in remote.iter().enumerate() {
             operation.ensure_active()?;
-            let resumed_from = component_partial_len(&repo_root, component).await;
+            let resumed_from = resumed_by_component[index];
             let mut last_progress_emit = Instant::now()
                 .checked_sub(Duration::from_millis(100))
                 .unwrap_or_else(Instant::now);
@@ -465,9 +469,20 @@ impl ModelManager {
                     }
                     last_progress_emit = timestamp;
                     let previous_files = remote[..index].iter().map(|item| item.size).sum::<u64>();
-                    let completed = previous_files.saturating_add(file_completed);
+                    let future_resumed = resumed_by_component[index + 1..].iter().sum::<u64>();
+                    let completed = previous_files
+                        .saturating_add(file_completed)
+                        .saturating_add(future_resumed);
                     let elapsed = started.elapsed().as_secs_f64();
-                    let rate = (elapsed > 0.0).then(|| completed as f64 / elapsed);
+                    let previous_transferred = remote[..index]
+                        .iter()
+                        .zip(&resumed_by_component[..index])
+                        .map(|(item, resumed)| item.size.saturating_sub(*resumed))
+                        .sum::<u64>();
+                    let transferred = previous_transferred
+                        .saturating_add(file_completed.saturating_sub(resumed_from));
+                    let rate =
+                        (elapsed > 0.0 && transferred > 0).then(|| transferred as f64 / elapsed);
                     let stage = if file_completed == component.size {
                         DownloadStage::Verifying
                     } else {

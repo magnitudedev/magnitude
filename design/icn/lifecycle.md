@@ -162,7 +162,9 @@ Runtime code receives configuration explicitly and uses Effect platform services
 execution, filesystem/path work, HTTP, clock, randomness, logging, and scope. Core lifecycle code
 does not reach directly into Bun globals, Node port-probing APIs, environment variables, or the
 user's home directory. A Bun composition layer may translate process environment and packaged
-paths into the typed configuration.
+paths into the typed configuration. The managed child disables implicit Hugging Face credentials;
+native Hub access may use an explicitly supplied token but never a host login discovered from a
+global token file.
 
 ACN-owned ICN shutdown is bounded to one second: ICN receives `SIGTERM` and 500 milliseconds to
 exit, then receives `SIGKILL` and has another 500 milliseconds to be reaped. Model loading,

@@ -90,6 +90,12 @@ ICN owns accepted download attempts durably. ACN observes attempts independently
 request, polling quickly while active and periodically while idle so missed request-side wake-ups
 cannot hide shared work.
 
+The onboarding model-selection mutation is outcome-total after download admission: it persists the
+selected offering and slot and completes onboarding even if the initiating transport disconnects.
+Its cancellation mutation waits for the matching attempts to become terminal before clearing the
+selection and reopening onboarding. Retrying either command converges from any observable partial
+result.
+
 ## Conformance
 
 - Disconnecting the initiating client during load, unload, or refresh cannot strand nonterminal

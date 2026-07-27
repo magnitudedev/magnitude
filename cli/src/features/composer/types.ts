@@ -18,6 +18,8 @@ export type ComposerProps = {
   hasRunningForks: boolean
   bashMode: boolean
   modelsConfigured: boolean
+  modelSetupInProgress: boolean
+  modelSetupPlaceholder: string | null
   modelSummary: { role: string; model: string; thinkingLevel: string } | null
   localInferenceState: LocalInferenceView | null
   selectedProviderId: ProviderId | null

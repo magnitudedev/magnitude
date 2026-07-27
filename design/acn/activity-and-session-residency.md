@@ -172,6 +172,15 @@ and directory details when width permits, stacks at narrow widths, and scrolls a
 conversation history. It is not a chat message and is absent when the loaded window does not reach
 the beginning of the session.
 
+After first-run onboarding selects a local model whose packages are still installing, the startup
+identity remains above a bordered download card centered in the otherwise empty history area.
+Recent conversations are suppressed until installation and preparation finish. The card derives
+model identity, quantization, stage, byte progress, transfer rate, and remaining-time presentation
+from authoritative local-model mirrors; it is not a session event or activity rail. Its confirmation
+state is presentation-only, while confirmed cancellation is one server mutation that returns to the
+onboarding chooser. The composer remains visible but cannot submit while the selected model is not
+usable.
+
 The CLI composer keeps a one-line minimum editor inside a full-width input surface with one full
 row of visual padding above and below it. A solid mode border sits immediately outside the colored
 surface and spans its full height; additional visual input lines grow only from actual draft

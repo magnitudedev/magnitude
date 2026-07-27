@@ -45,12 +45,16 @@ export function ComposerContainer({
   widgetNavActive,
   handleWidgetKeyEvent,
   modelsConfigured,
+  modelSetupInProgress,
+  modelSetupPlaceholder,
 }: {
   chatColumnWidth: number
   clientWorkingDirectory: string
   widgetNavActive: boolean
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
   modelsConfigured: boolean
+  modelSetupInProgress: boolean
+  modelSetupPlaceholder: string | null
 }): ReactNode {
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
@@ -98,6 +102,7 @@ export function ComposerContainer({
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
+    if (modelSetupInProgress) return
     if (!allowProviderMessageSend(modelsConfigured, showErrorToast)) return
     composer.handleSend(text)
   }
@@ -137,7 +142,11 @@ export function ComposerContainer({
   const isCompacting = context?.isCompacting ?? false
   const attachmentsMaxWidth = Math.max(0, chatColumnWidth - 6)
 
-  const composerCanFocus = !showRecentChats && !menu.open && !usageOpen && expandedForkStack.length === 0
+  const composerCanFocus = !modelSetupInProgress
+    && !showRecentChats
+    && !menu.open
+    && !usageOpen
+    && expandedForkStack.length === 0
 
   const submitUserMessage = useCallback((payload: {
     message: string
@@ -161,6 +170,8 @@ export function ComposerContainer({
       hasRunningForks={(rootActor?.work.activeChildCount ?? 0) > 0}
       bashMode={composer.bashMode}
       modelsConfigured={modelsConfigured}
+      modelSetupInProgress={modelSetupInProgress}
+      modelSetupPlaceholder={modelSetupPlaceholder}
       modelSummary={{
         role: rootRoleLabel,
         model: composer.model || '-',

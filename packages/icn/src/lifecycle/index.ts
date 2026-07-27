@@ -847,7 +847,10 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
           Command.make(
             binary.path,
             ...renderIcnArguments(config, instanceId, config.parentPid)
-          ).pipe(Command.env({ MAGNITUDE_ICN_AUTH_TOKEN: authorization }))
+          ).pipe(Command.env({
+            MAGNITUDE_ICN_AUTH_TOKEN: authorization,
+            HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
+          }))
         ).pipe(
           Effect.mapError((cause) =>
             lifecycleError(

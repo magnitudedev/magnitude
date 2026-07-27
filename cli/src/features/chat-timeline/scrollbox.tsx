@@ -41,6 +41,9 @@ export function ChatScrollbox({
           backgroundColor: 'transparent',
         },
         contentOptions: {
+          flexGrow: 1,
+          minHeight: 0,
+          flexDirection: 'column',
           paddingLeft: 1,
           paddingRight: 1,
           paddingTop: 1,

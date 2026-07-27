@@ -220,6 +220,8 @@ function makeProps(): ComposerProps {
     hasRunningForks: false,
     bashMode: false,
     modelsConfigured: true,
+    modelSetupInProgress: false,
+    modelSetupPlaceholder: null,
     modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
     localInferenceState: null,
     selectedProviderId: null,

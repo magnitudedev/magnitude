@@ -24,6 +24,7 @@ import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ReasoningEffortSchema,
+  type CatalogCandidateId,
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -47,6 +48,9 @@ interface LocalInferenceScreenProps {
   readonly onExit: () => void
   readonly onSkip: () => void
   readonly onConfigured: () => void
+  readonly onSelectCatalogModel: (id: CatalogCandidateId) => void
+  readonly selectionPending: boolean
+  readonly selectionError: string | null
 }
 
 export const LOCAL_MODEL_SECTION_WIDTH = 72
@@ -263,6 +267,9 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
   onSkip,
   onConfigured,
   spinnerFrame,
+  onSelectCatalogModel,
+  selectionPending,
+  selectionError,
 }: LocalInferenceScreenProps & {
   readonly state: LocalInferenceView
   readonly local: LocalInferenceController
@@ -280,7 +287,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
     ? Option.some(primarySlot.selection)
     : Option.none<SlotSelection>()
   const mutationFailure = local.mutationFailure
-  const assigning = Result.isWaiting(local.slotAssignment)
+  const assigning = Result.isWaiting(local.slotAssignment) || selectionPending
 
   const selectionFor = useCallback((selection: LocalInferenceSelection): Option.Option<SlotSelection> =>
     Option.map(selection.providerModelId, (providerModelId) => ({
@@ -294,13 +301,13 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
 
   const confirmSelection = useCallback((selection: LocalInferenceSelection) => {
     if (assigning) return
+    if (Option.isSome(selection.recommendation)) {
+      onSelectCatalogModel(selection.recommendation.value.candidate.id)
+      return
+    }
     if (selection.model.download._tag === "Downloading") return
     if (selection.model.download._tag === "Failed") {
       local.retryModelDownload(selection.model.id)
-      return
-    }
-    if (Option.isSome(selection.recommendation)) {
-      local.downloadCatalogModel(selection.recommendation.value.candidate.id)
       return
     }
     if (selection.kind === "running") {
@@ -313,7 +320,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
         void local.assignSlot(PRIMARY_SLOT_ID, slotSelection).then(onConfigured, () => undefined)
       },
     })
-  }, [assigning, local, onConfigured, selectionFor])
+  }, [assigning, local, onConfigured, onSelectCatalogModel, selectionFor])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.ctrl && key.name === "c") return
@@ -393,7 +400,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
                   <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{sectionLabel}</text>
                   <text style={{ fg: theme.border }}>  {localModelSectionRule(sectionLabel)}</text>
                 </box>}
-                <Button id={`local-model-${index}`} onClick={() => confirmSelection(selection)} onMouseOver={() => setSelectedId(Option.some(selection.id))} cursor={model.download._tag === "Downloading" || assigning ? "default" : "pointer"} style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: index === selectedIndex ? theme.primary : theme.border, paddingLeft: 1, paddingRight: 1, marginBottom: 1, flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}>
+                <Button id={`local-model-${index}`} onClick={() => confirmSelection(selection)} onMouseOver={() => setSelectedId(Option.some(selection.id))} cursor={(model.download._tag === "Downloading" && Option.isNone(recommendation)) || assigning ? "default" : "pointer"} style={{ borderStyle: "single", customBorderChars: BOX_CHARS, borderColor: index === selectedIndex ? theme.primary : theme.border, paddingLeft: 1, paddingRight: 1, marginBottom: 1, flexDirection: "column", width: "100%", maxWidth: LOCAL_MODEL_SECTION_WIDTH }}>
                   <text style={{ fg: index === selectedIndex ? theme.primary : theme.foreground }} attributes={TextAttributes.BOLD}>
                     {index === selectedIndex ? "› " : "  "}{selectionTitle(selection)}
                     <span fg={theme.primary}>{selection.kind === "recommendation"
@@ -438,6 +445,7 @@ const ReadyLocalInferenceScreen = memo(function ReadyLocalInferenceScreen({
           })()}
         </box>
         {Option.isSome(mutationFailure) && <text style={{ fg: theme.error }}>{Cause.pretty(mutationFailure.value.cause)}</text>}
+        {selectionError && <text style={{ fg: theme.error }}>{selectionError}</text>}
         <text style={{ fg: theme.muted, marginTop: 1 }}>
           ↑/↓ choose · D details
           {selected?.model.download._tag === "Downloading"

@@ -1756,6 +1756,7 @@
             "required": [
               "id",
               "packageId",
+              "stage",
               "completedBytes",
               "totalBytes",
               "_tag"
@@ -1767,6 +1768,9 @@
               "packageId": {
                 "$ref": "#/components/schemas/ModelPackageId"
               },
+              "stage": {
+                "$ref": "#/components/schemas/DownloadStage"
+              },
               "completedBytes": {
                 "type": "integer",
                 "format": "int64",
@@ -1774,6 +1778,14 @@
               },
               "totalBytes": {
                 "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "bytesPerSecond": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
                 "format": "int64",
                 "minimum": 0
               },
@@ -1871,6 +1883,17 @@
       },
       "DownloadAttemptId": {
         "type": "string"
+      },
+      "DownloadStage": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "resolving",
+          "checking_space",
+          "downloading",
+          "verifying",
+          "publishing"
+        ]
       },
       "ErrorResponse": {
         "type": "object",

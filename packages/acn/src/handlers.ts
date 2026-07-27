@@ -4,6 +4,7 @@ import {
   PRIMARY_SLOT_ID,
   SessionOperationFailed,
   ModelSlotMutationRejected,
+  type CatalogCandidateId,
   type DisplayViewShape,
   type ModelOfferingTargetId,
   type SessionError,
@@ -181,6 +182,33 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         modelOfferingTargetPackageIds(offering.configuration.target)));
       yield* localModelPackages.removeTargetPackages(target, retainedPackageIds);
       return {};
+    });
+
+    const resolveCatalogEntry = (candidateId: CatalogCandidateId) =>
+      localModelRecommendations.getCatalog(candidateId).pipe(
+        Effect.flatMap((entry) => entry
+          ? Effect.succeed(entry)
+          : Effect.fail(new LocalModelMutationFailed({
+              code: "catalog_model_not_found",
+              message: "This catalog model is no longer available",
+              retryable: false,
+            }))),
+      );
+
+    const saveCatalogOffering = (candidateId: CatalogCandidateId) => Effect.gen(function* () {
+      const entry = yield* resolveCatalogEntry(candidateId);
+      const offering = yield* localProviderOfferings.save(
+        entry.modelId,
+        entry.configuration,
+        Option.match(entry.recommendation, {
+          onNone: () => ({ _tag: "UserConfigured" as const }),
+          onSome: ({ id: recommendationId }) => ({
+            _tag: "Recommendation" as const,
+            recommendationId,
+          }),
+        }),
+      );
+      return { entry, offering };
     });
 
     return {
@@ -378,26 +406,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         observeRpcDefects(
           "DownloadCatalogModel",
           Effect.gen(function* () {
-            const candidate = yield* localModelRecommendations.getCatalog(id);
-            if (!candidate) {
-              return yield* new LocalModelMutationFailed({
-                code: "catalog_model_not_found",
-                message: "This catalog model is no longer available",
-                retryable: false,
-              });
-            }
-            yield* localProviderOfferings.save(
-              candidate.modelId,
-              candidate.configuration,
-              Option.match(candidate.recommendation, {
-                onNone: () => ({ _tag: "UserConfigured" as const }),
-                onSome: ({ id: recommendationId }) => ({
-                  _tag: "Recommendation" as const,
-                  recommendationId,
-                }),
-              }),
-            );
-            yield* localModelPackages.downloadTarget(candidate.configuration.target);
+            const { entry } = yield* saveCatalogOffering(id);
+            yield* localModelPackages.downloadTarget(entry.configuration.target);
             return {};
           }),
         ),
@@ -406,15 +416,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         observeRpcDefects(
           "CancelCatalogModelDownload",
           Effect.gen(function* () {
-            const candidate = yield* localModelRecommendations.getCatalog(id);
-            if (!candidate) {
-              return yield* new LocalModelMutationFailed({
-                code: "catalog_model_not_found",
-                message: "This catalog model is no longer available",
-                retryable: false,
-              });
-            }
-            yield* localModelPackages.cancelTargetDownload(candidate.configuration.target);
+            const entry = yield* resolveCatalogEntry(id);
+            yield* localModelPackages.cancelTargetDownload(entry.configuration.target);
             return {};
           }),
         ),
@@ -423,15 +426,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         observeRpcDefects(
           "DeleteCatalogModel",
           Effect.gen(function* () {
-            const candidate = yield* localModelRecommendations.getCatalog(id);
-            if (!candidate) {
-              return yield* new LocalModelMutationFailed({
-                code: "catalog_model_not_found",
-                message: "This catalog model is no longer available",
-                retryable: false,
-              });
-            }
-            return yield* deleteLocalModel(candidate.modelId);
+            const entry = yield* resolveCatalogEntry(id);
+            return yield* deleteLocalModel(entry.modelId);
           }),
         ),
 
@@ -439,25 +435,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         observeRpcDefects(
           "SelectCatalogModel",
           Effect.gen(function* () {
-            const candidate = yield* localModelRecommendations.getCatalog(id);
-            if (!candidate) {
-              return yield* new LocalModelMutationFailed({
-                code: "catalog_model_not_found",
-                message: "This catalog model is no longer available",
-                retryable: false,
-              });
-            }
-            const offering = yield* localProviderOfferings.save(
-              candidate.modelId,
-              candidate.configuration,
-              Option.match(candidate.recommendation, {
-                onNone: () => ({ _tag: "UserConfigured" as const }),
-                onSome: ({ id: recommendationId }) => ({
-                  _tag: "Recommendation" as const,
-                  recommendationId,
-                }),
-              }),
-            );
+            const { offering } = yield* saveCatalogOffering(id);
             yield* modelSlots.updateModelSlot(PRIMARY_SLOT_ID, Option.some({
               providerId: LOCAL_PROVIDER_ID,
               providerModelId: offering.providerModelId,
@@ -468,6 +446,51 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
             }));
             return {};
           }),
+        ),
+
+      SelectOnboardingLocalModel: ({ candidateId }) =>
+        observeRpcDefects(
+          "SelectOnboardingLocalModel",
+          Effect.uninterruptible(Effect.gen(function* () {
+            const { entry, offering } = yield* saveCatalogOffering(candidateId);
+            yield* localModelPackages.downloadTarget(entry.configuration.target);
+            yield* localModels.refresh;
+            yield* modelSlots.updateModelSlot(PRIMARY_SLOT_ID, Option.some({
+              providerId: LOCAL_PROVIDER_ID,
+              providerModelId: offering.providerModelId,
+              reasoningEffort: Option.getOrElse(
+                offering.capabilities.reasoning.defaultEffort,
+                () => ReasoningEffortSchema.make("none"),
+              ),
+            }));
+            yield* onboarding.complete("model_setup");
+            return {};
+          })),
+        ),
+
+      CancelOnboardingLocalModelDownload: () =>
+        observeRpcDefects(
+          "CancelOnboardingLocalModelDownload",
+          Effect.uninterruptible(Effect.gen(function* () {
+            const primary = (yield* modelSlots.snapshot).state.slots.primary;
+            if (primary._tag === "Unassigned") {
+              yield* onboarding.reopen("model_setup");
+              return {};
+            }
+            if (primary.selection.providerId !== LOCAL_PROVIDER_ID) {
+              return yield* new LocalModelMutationFailed({
+                code: "onboarding_model_selection_changed",
+                message: "The onboarding model selection has changed",
+                retryable: false,
+              });
+            }
+            const offering = yield* localProviderOfferings.resolve(primary.selection.providerModelId);
+            yield* localModelPackages.cancelTargetDownload(offering.configuration.target);
+            yield* localModels.refresh;
+            yield* modelSlots.updateModelSlot(PRIMARY_SLOT_ID, Option.none());
+            yield* onboarding.reopen("model_setup");
+            return {};
+          })),
         ),
 
       RetryModelDownload: ({ modelId }) =>

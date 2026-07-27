@@ -8,7 +8,7 @@
  * boxes and the startup header slot.
  */
 import { useCallback, useSyncExternalStore, type ReactNode } from 'react'
-import { Option } from 'effect'
+import { Cause, Option } from 'effect'
 import { useAtomValue, useAtomSet, useAtomInitialValues, Result } from '@effect-atom/atom-react'
 import {
   useOnboardingState,
@@ -27,6 +27,7 @@ import {
   useLocalInferenceQuery,
   isModelSlotConfigured,
   deriveLocalModelLoadActivity,
+  deriveSelectedLocalModelSetup,
 } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, type SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, modelMenuStateAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
@@ -54,6 +55,7 @@ import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/ses
 import {
   ModelSetupScreen,
   PreparingModelSetupScreen,
+  OnboardingModelDownloadCard,
 } from './features/model-setup'
 import { registerCliCommands } from './commands/register'
 
@@ -152,12 +154,20 @@ function OnboardingGate(
   }
 
   const onboardingRequired = onboarding.state.value.flows.model_setup.required
-  const forcedSetupComplete = props.forceSetup && Result.isSuccess(onboarding.completeResult)
+  const forcedSetupComplete = props.forceSetup
+    && (Result.isSuccess(onboarding.completeResult)
+      || Result.isSuccess(onboarding.selectLocalModelResult))
   if (onboardingRequired || (props.forceSetup && !forcedSetupComplete)) {
+    const selectionError = Result.isFailure(onboarding.selectLocalModelResult)
+      ? Cause.pretty(onboarding.selectLocalModelResult.cause)
+      : null
     return (
       <ModelSetupScreen
         onExit={props.onExitApp}
         onComplete={() => onboarding.complete("model_setup")}
+        onSelectCatalogModel={onboarding.selectLocalModel}
+        selectionPending={Result.isWaiting(onboarding.selectLocalModelResult)}
+        selectionError={selectionError}
       />
     )
   }
@@ -179,23 +189,35 @@ function OnboardingGate(
   const primary = slotsSnapshot.value.state.slots.primary
   const modelsConfigured = primary.slotId === PRIMARY_SLOT_ID
     && isModelSlotConfigured(primary)
+  const modelsReadyForInitialWork = modelsConfigured
+    && !(primary._tag === 'Blocked' && primary.reason._tag === 'ModelUnavailable')
 
   return (
     <CliAppContent
       {...props}
       modelsConfigured={modelsConfigured}
+      modelsReadyForInitialWork={modelsReadyForInitialWork}
+      cancelOnboardingModelDownload={onboarding.cancelLocalModelDownload}
+      cancelOnboardingModelResult={onboarding.cancelLocalModelResult}
+      retryOnboardingModelDownload={onboarding.selectLocalModel}
     />
   )
 }
 
-function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean }): ReactNode {
+function CliAppContent(props: CliAppProps & {
+  readonly modelsConfigured: boolean
+  readonly modelsReadyForInitialWork: boolean
+  readonly cancelOnboardingModelDownload: ReturnType<typeof useOnboardingState>["cancelLocalModelDownload"]
+  readonly cancelOnboardingModelResult: ReturnType<typeof useOnboardingState>["cancelLocalModelResult"]
+  readonly retryOnboardingModelDownload: ReturnType<typeof useOnboardingState>["selectLocalModel"]
+}): ReactNode {
   useSessionPreload()
   useFileWatchBridge()
   useSessionStartup({
     sessionStart: props.sessionStart,
     initialPrompt: props.initialPrompt,
     goal: props.goal,
-    modelsConfigured: props.modelsConfigured,
+    modelsConfigured: props.modelsReadyForInitialWork,
   })
 
   const theme = useTheme()
@@ -216,6 +238,10 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
   const ephemeralMessage = useSyncExternalStore(subscribeEphemeralMessage, getEphemeralMessageSnapshot)
   const localInference = useLocalInferenceQuery()
   const localInferenceSnapshot = Result.value(localInference)
+  const selectedLocalModelSetup = Option.match(localInferenceSnapshot, {
+    onNone: () => null,
+    onSome: deriveSelectedLocalModelSetup,
+  })
   const downloadingModelCount = Option.match(localInferenceSnapshot, {
     onNone: () => 0,
     onSome: ({ models }) => models.models.filter((model) => model.download._tag === 'Downloading').length,
@@ -228,6 +254,10 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
     onNone: () => null,
     onSome: (state) => deriveLocalModelLoadActivity(state.slots, rootSlotId),
   })
+  const cancelOnboardingModelPending = Result.isWaiting(props.cancelOnboardingModelResult)
+  const cancelOnboardingModelError = Result.isFailure(props.cancelOnboardingModelResult)
+    ? Cause.pretty(props.cancelOnboardingModelResult.cause)
+    : null
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
   const clientWorkingDirectory = process.cwd()
@@ -249,7 +279,7 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
     <StartupHeader
       width={chatColumnWidth}
       workingDirectory={clientWorkingDirectory.replace(process.env.HOME || '', '~')}
-      recentChats={!widget.hasActivity && !(menu.open && sessionId === null)
+      recentChats={!selectedLocalModelSetup && !widget.hasActivity && !(menu.open && sessionId === null)
         ? <RecentChatsWidgetView state={widget} />
         : null}
     />
@@ -272,6 +302,16 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                   chatColumnWidth={chatColumnWidth}
                   dispatchErrorAction={dispatchErrorAction}
                   isOverlayActive={isOverlayActive}
+                  emptyState={selectedLocalModelSetup ? (
+                    <OnboardingModelDownloadCard
+                      candidate={selectedLocalModelSetup}
+                      width={chatColumnWidth}
+                      cancelling={cancelOnboardingModelPending}
+                      cancelError={cancelOnboardingModelError}
+                      onCancel={props.cancelOnboardingModelDownload}
+                      onRetry={() => props.retryOnboardingModelDownload(selectedLocalModelSetup.id)}
+                    />
+                  ) : undefined}
                 />
                 <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
                   <TaskListContainer />
@@ -290,6 +330,10 @@ function CliAppContent(props: CliAppProps & { readonly modelsConfigured: boolean
                     widgetNavActive={widget.widgetNavActive}
                     handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
                     modelsConfigured={props.modelsConfigured}
+                    modelSetupInProgress={selectedLocalModelSetup !== null}
+                    modelSetupPlaceholder={selectedLocalModelSetup
+                      ? `Downloading ${selectedLocalModelSetup.displayName}…`
+                      : null}
                   />
                 )}
             </box>

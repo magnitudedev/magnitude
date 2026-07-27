@@ -286,6 +286,23 @@ export function makeConfigStorage(): Effect.Effect<
             });
           })
         ),
+
+      reopenOnboardingFlow: (flowId) =>
+        io.withPathLock(
+          g.configFile,
+          Effect.gen(function* () {
+            const current = yield* readConfigUnlocked();
+            const completions = { ...current.onboarding?.completions };
+            delete completions[flowId];
+            yield* writeConfigUnlocked({
+              ...current,
+              onboarding: {
+                ...current.onboarding,
+                completions,
+              },
+            });
+          }),
+        ),
     };
   });
 }

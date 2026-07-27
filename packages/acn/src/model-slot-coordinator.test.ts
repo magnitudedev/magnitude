@@ -45,6 +45,7 @@ const selection: SlotSelection = {
   reasoningEffort: effort,
 }
 const packageId = ModelPackageIdSchema.make("test-package")
+const fallbackProviderModelId = ProviderModelIdSchema.make("local:fallback")
 
 const catalogModel: ProviderModelCatalogEntry = {
   providerId: LOCAL_PROVIDER_ID,
@@ -83,13 +84,33 @@ const offering = {
   capabilities: catalogModel.capabilities,
 } as LocalProviderOffering
 
-const makeHarness = Effect.gen(function* () {
+const fallbackCatalogModel: ProviderModelCatalogEntry = {
+  ...catalogModel,
+  providerModelId: fallbackProviderModelId,
+  displayName: "Previously installed local model",
+}
+
+const unavailableCatalogModel: ProviderModelCatalogEntry = {
+  ...catalogModel,
+  availability: { _tag: "Disabled", reason: "model_unavailable" },
+}
+
+const makeHarnessWith = (options: {
+  readonly downloadPending?: boolean
+  readonly availableFallback?: boolean
+  readonly unassigned?: boolean
+} = {}) => Effect.gen(function* () {
   const configured = yield* SubscriptionRef.make({
     slots: {
-      primary: Option.some(selection),
+      primary: options.unassigned ? Option.none<SlotSelection>() : Option.some(selection),
       secondary: Option.none<SlotSelection>(),
     },
-    localModelRecency: { primary: [providerModelId], secondary: [] },
+    localModelRecency: {
+      primary: options.availableFallback
+        ? [fallbackProviderModelId, providerModelId]
+        : [providerModelId],
+      secondary: [],
+    },
     favoriteModels: [],
     localProviderOfferings: [],
     dismissedDownloadFailures: [],
@@ -150,7 +171,7 @@ const makeHarness = Effect.gen(function* () {
     Layer.succeed(LocalModelPackages, LocalModelPackages.of({
       snapshot: Effect.succeed({ revision: 0, state: { entries: [] } }),
       changes: Stream.empty,
-      installedPackageIds: Effect.succeed(new Set([packageId])),
+      installedPackageIds: Effect.succeed(options.downloadPending ? new Set() : new Set([packageId])),
       downloadTarget: () => Effect.void,
       cancelTargetDownload: () => Effect.void,
       dismissTargetFailure: () => Effect.void,
@@ -174,7 +195,11 @@ const makeHarness = Effect.gen(function* () {
             authentication: "NotRequired",
             availability: { _tag: "Available" },
           }],
-          models: [catalogModel],
+          models: options.downloadPending
+            ? options.availableFallback
+              ? [unavailableCatalogModel, fallbackCatalogModel]
+              : []
+            : [catalogModel],
         }),
       }),
       changes: Stream.empty,
@@ -200,7 +225,43 @@ const makeHarness = Effect.gen(function* () {
   }
 })
 
+const makeHarness = makeHarnessWith()
+
 describe("ModelSlotCoordinator owned transitions", () => {
+  it("accepts a saved local offering while its packages are still downloading", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarnessWith({ downloadPending: true, unassigned: true })
+      yield* Effect.gen(function* () {
+        const coordinator = yield* ModelSlotCoordinator
+        yield* coordinator.updateModelSlot(PRIMARY_SLOT_ID, Option.some(selection))
+        const slot = (yield* coordinator.snapshot).state.slots.primary
+        expect(slot._tag).toBe("Blocked")
+        if (slot._tag === "Blocked") {
+          expect(slot.reason._tag).toBe("ModelUnavailable")
+          expect(slot.selection).toEqual(selection)
+        }
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("does not recover an unavailable offered selection to an older installed model", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarnessWith({
+        downloadPending: true,
+        availableFallback: true,
+      })
+      yield* Effect.gen(function* () {
+        const coordinator = yield* ModelSlotCoordinator
+        const slot = (yield* coordinator.snapshot).state.slots.primary
+        expect(slot._tag).toBe("Blocked")
+        if (slot._tag === "Blocked") {
+          expect(slot.selection.providerModelId).toBe(providerModelId)
+          expect(slot.reason._tag).toBe("ModelUnavailable")
+        }
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
   it("keeps one load owner when an equivalent waiter is interrupted", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness

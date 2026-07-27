@@ -169,6 +169,8 @@ export function Composer(props: ComposerProps) {
     hasRunningForks,
     bashMode,
     modelsConfigured,
+    modelSetupInProgress,
+    modelSetupPlaceholder,
     modelSummary,
     localInferenceState,
     selectedProviderId,
@@ -596,6 +598,7 @@ export function Composer(props: ComposerProps) {
   }, [setComposerText, setComposerAttachments, setComposerHasContent, setComposerHistoryIndex])
 
   const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionInputs: RawMentionOccurrence[] = []) => {
+    if (modelSetupInProgress) return
     if (bashMode) {
       const trimmed = message.trim()
       if (!trimmed) return
@@ -629,7 +632,7 @@ export function Composer(props: ComposerProps) {
     setComposerHistoryIndex(-1)
     setSavedDraft('')
     clearComposer()
-  }, [bashMode, modelsConfigured, submitUserMessage, executeBash, clearSystemBanners, showToast, attachments, clearComposer])
+  }, [bashMode, modelSetupInProgress, modelsConfigured, submitUserMessage, executeBash, clearSystemBanners, showToast, attachments, clearComposer])
 
   const handleInputSubmit = useCallback(async () => {
     setComposerHistoryIndex(-1)
@@ -837,6 +840,8 @@ export function Composer(props: ComposerProps) {
                   highlightColor={bashMode ? orange[400] : undefined}
                   placeholder={thinkingOpen
                     ? 'Select reasoning level...'
+                    : modelSetupInProgress
+                      ? modelSetupPlaceholder ?? 'Downloading model…'
                     : bashMode
                       ? 'Enter a command...'
                       : status === 'streaming'

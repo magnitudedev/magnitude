@@ -139,7 +139,7 @@ const sameAgentConfiguration = (left: ConfigState, right: ConfigState): boolean 
 
 const normalizeSelectionReasoning = (
   selection: SlotSelection,
-  model: ProviderModelCatalogEntry,
+  model: Pick<ProviderModelCatalogEntry, "capabilities">,
 ): SlotSelection => ({
   ...selection,
   reasoningEffort: model.capabilities.reasoning.efforts.includes(selection.reasoningEffort)
@@ -442,17 +442,38 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     catalogState: ProviderModelCatalogState,
   ): Effect.Effect<ModelConfigurationState> => Effect.gen(function* () {
     const models = catalogContents(catalogState).models
-    const primary = recoverRecentLocalSelection(
+    const recoverSlot = (
+      slotId: SlotId,
+      selection: Option.Option<SlotSelection>,
+      recency: readonly ProviderModelId[],
+    ) => Effect.gen(function* () {
+      const selected = Option.getOrNull(selection)
+      if (selected === null || selected.providerId !== LOCAL_PROVIDER_ID) return selection
+      const current = models.find((model) => model.providerModelId === selected.providerModelId)
+      const durableOffering = yield* Effect.option(localOfferings.resolve(selected.providerModelId))
+      // A durable offering is authoritative user intent even before its packages exist locally.
+      // Catalog availability must not replace an active download or its surfaced failure with an
+      // older installed model.
+      if (Option.isSome(durableOffering)) {
+        if (current && !current.supportedSlots.includes(slotId)) {
+          return recoverRecentLocalSelection(slotId, selection, recency, models)
+        }
+        return Option.some(normalizeSelectionReasoning(
+          selected,
+          current ?? durableOffering.value,
+        ))
+      }
+      return recoverRecentLocalSelection(slotId, selection, recency, models)
+    })
+    const primary = yield* recoverSlot(
       PRIMARY_SLOT_ID,
       configured.slots.primary,
       configured.localModelRecency.primary,
-      models,
     )
-    const secondary = recoverRecentLocalSelection(
+    const secondary = yield* recoverSlot(
       SECONDARY_SLOT_ID,
       configured.slots.secondary,
       configured.localModelRecency.secondary,
-      models,
     )
     if (!sameOptionalSelection(primary, configured.slots.primary)) {
       yield* configuration.updateSlot(PRIMARY_SLOT_ID, primary)
@@ -638,13 +659,26 @@ export const ModelSlotCoordinatorLive: Layer.Layer<
     slotId: SlotId,
     selection: SlotSelection,
   ): Effect.Effect<SlotSelection, ModelSlotMutationRejected> => Effect.gen(function* () {
+    if (selection.providerId === LOCAL_PROVIDER_ID) {
+      const offering = yield* Effect.option(localOfferings.resolve(selection.providerModelId))
+      if (Option.isSome(offering)) {
+        const installed = yield* localPackages.installedPackageIds
+        const awaitingInstallation = modelOfferingTargetPackageIds(offering.value.configuration.target)
+          .some((packageId) => !installed.has(packageId))
+        if (awaitingInstallation) {
+          return normalizeSelectionReasoning(selection, offering.value)
+        }
+      }
+    }
     const state = (yield* catalog.snapshot).state
     const model = catalogContents(state).models.find((candidate) =>
       candidate.providerId === selection.providerId
       && candidate.providerModelId === selection.providerModelId)
     const normalized = model ? normalizeSelectionReasoning(selection, model) : selection
     const issue = selectedModelIssue(state, slotId, normalized)
-    if (Option.isSome(issue)) return yield* reject(slotId, issue.value.message)
+    if (Option.isSome(issue)) {
+      return yield* reject(slotId, issue.value.message)
+    }
     return normalized
   })
 
