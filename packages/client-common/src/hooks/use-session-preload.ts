@@ -9,7 +9,7 @@ import { useAgentClient } from "../state/agent-client-context"
 import { getDraftSessionOwnerId } from "./draft-session-owner"
 import { useSelectedSessionId } from "../display-view-controller/hooks"
 
-export function useSessionPreload(): void {
+export function useSessionPreload(enabled = true): void {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const selectedCwd = useAtomValue(selectedCwdAtom)
@@ -25,7 +25,7 @@ export function useSessionPreload(): void {
     () =>
       Atom.make(
         Effect.gen(function* () {
-          if (selectedSessionId || !selectedCwd || !runtimeReady) return
+          if (!enabled || selectedSessionId || !selectedCwd || !runtimeReady) return
           const payload = {
             cwd: selectedCwd,
             options: sessionCreateOptions,
@@ -45,7 +45,7 @@ export function useSessionPreload(): void {
           )
         }),
       ),
-    [selectedSessionId, selectedCwd, sessionCreateOptions, runtimeReady, preloadSession, releaseSessionPreload],
+    [enabled, selectedSessionId, selectedCwd, sessionCreateOptions, runtimeReady, preloadSession, releaseSessionPreload],
   )
   useAtomMount(preloadAtom)
 }

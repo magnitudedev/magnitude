@@ -45,12 +45,14 @@ export function ChatTimelineContainer({
   dispatchErrorAction,
   isOverlayActive,
   emptyState,
+  exclusiveEmptyState = false,
 }: {
   header: ReactNode
   chatColumnWidth: number
   dispatchErrorAction: (actionId: ActionId) => void
   isOverlayActive: boolean
   emptyState?: ReactNode
+  exclusiveEmptyState?: boolean
 }): ReactNode {
   const theme = useTheme()
   const { pushFork } = useDisplayViewController()
@@ -149,7 +151,7 @@ export function ChatTimelineContainer({
 
   return (
     <ChatScrollbox scrollRef={attachScrollbox}>
-      {hasMoreBefore ? (
+      {hasMoreBefore && !exclusiveEmptyState ? (
         // Fixed-height slot: one centered loading line + one blank row below.
         // Constant height whether or not a load is in flight, so the text
         // toggling never shifts the content.
@@ -163,16 +165,18 @@ export function ChatTimelineContainer({
       ) : (
         header
       )}
-      {timelineIsEmpty && emptyState}
-      <ChatTimeline
-        timeline={rootTimeline}
-        chatColumnWidth={chatColumnWidth}
-        themeErrorColor={theme.error}
-        systemMessages={systemMessages}
-        onFileClick={openFile}
-        onForkExpand={pushFork}
-        onErrorAction={dispatchErrorAction}
-      />
+      {(timelineIsEmpty || exclusiveEmptyState) && emptyState}
+      {!exclusiveEmptyState && (
+        <ChatTimeline
+          timeline={rootTimeline}
+          chatColumnWidth={chatColumnWidth}
+          themeErrorColor={theme.error}
+          systemMessages={systemMessages}
+          onFileClick={openFile}
+          onForkExpand={pushFork}
+          onErrorAction={dispatchErrorAction}
+        />
+      )}
     </ChatScrollbox>
   )
 }

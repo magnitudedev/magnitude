@@ -286,7 +286,7 @@ export function Composer(props: ComposerProps) {
   const footerPrimaryWidth = bashMode
     ? 'Bash Mode'.length
     : !modelsConfigured
-      ? 'No provider configured'.length
+      ? 'No model configured'.length
       : (modelFooter.residency === null ? 0 : 2)
         + stringWidth(modelNameLabel)
         + 2
@@ -651,7 +651,7 @@ export function Composer(props: ComposerProps) {
         <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
       ) : !modelsConfigured ? (
         <Button onClick={openSettings}>
-          <text style={{ fg: theme.foreground }}>No provider configured</text>
+          <text style={{ fg: theme.foreground }}>No model configured</text>
         </Button>
       ) : (
         <>

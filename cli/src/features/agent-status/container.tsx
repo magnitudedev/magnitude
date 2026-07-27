@@ -25,9 +25,11 @@ import { useTheme } from '../../hooks/use-theme'
 export function ActivityRailContainer({
   modelLoadActivity,
   width,
+  agentActivityEnabled = true,
 }: {
   readonly modelLoadActivity: LocalModelLoadActivity | null
   readonly width: number
+  readonly agentActivityEnabled?: boolean
 }): ReactNode {
   const theme = useTheme()
   const timeline = useDisplayState((state) => getFork(state, null) ?? null)
@@ -58,20 +60,22 @@ export function ActivityRailContainer({
   const slotWidth = Math.max(0, width - 3)
   const activityWidth = Math.max(0, slotWidth - 3)
 
-  const hasWork = rootActor !== null
+  const hasWork = agentActivityEnabled && rootActor !== null
     && (isDisplayActorWorkActive(rootActor.work) || rootActor.work.activity !== null)
-  if (!hasWork && modelLoadActivity === null && modelRequestActivity === null && interrupted === null) {
+  const visibleModelRequestActivity = agentActivityEnabled ? modelRequestActivity : null
+  const visibleInterrupted = agentActivityEnabled ? interrupted : null
+  if (!hasWork && modelLoadActivity === null && visibleModelRequestActivity === null && visibleInterrupted === null) {
     return null
   }
 
   return (
     <ActivityRailSlot width={slotWidth} color={theme.modeDefault}>
       <ActivityRail
-        work={rootActor?.work ?? null}
+        work={agentActivityEnabled ? rootActor?.work ?? null : null}
         width={activityWidth}
         modelLoadActivity={modelLoadActivity}
-        modelRequestActivity={modelRequestActivity}
-        interruptedMessage={interrupted}
+        modelRequestActivity={visibleModelRequestActivity}
+        interruptedMessage={visibleInterrupted}
         advisorModelName={advisorProfile?.modelDisplayName ?? null}
       />
     </ActivityRailSlot>

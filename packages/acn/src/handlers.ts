@@ -448,12 +448,17 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           }),
         ),
 
-      SelectOnboardingLocalModel: ({ candidateId }) =>
+      SelectOnboardingLocalModel: ({ selection }) =>
         observeRpcDefects(
           "SelectOnboardingLocalModel",
           Effect.uninterruptible(Effect.gen(function* () {
-            const { entry, offering } = yield* saveCatalogOffering(candidateId);
-            yield* localModelPackages.downloadTarget(entry.configuration.target);
+            const offering = selection._tag === "CatalogCandidate"
+              ? yield* Effect.gen(function* () {
+                  const saved = yield* saveCatalogOffering(selection.candidateId);
+                  yield* localModelPackages.downloadTarget(saved.entry.configuration.target);
+                  return saved.offering;
+                })
+              : yield* localProviderOfferings.resolve(selection.providerModelId);
             yield* localModels.refresh;
             yield* modelSlots.updateModelSlot(PRIMARY_SLOT_ID, Option.some({
               providerId: LOCAL_PROVIDER_ID,
@@ -463,14 +468,14 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
                 () => ReasoningEffortSchema.make("none"),
               ),
             }));
-            yield* onboarding.complete("model_setup");
+            yield* onboarding.reopen("model_setup");
             return {};
           })),
         ),
 
-      CancelOnboardingLocalModelDownload: () =>
+      ClearOnboardingLocalModelSelection: () =>
         observeRpcDefects(
-          "CancelOnboardingLocalModelDownload",
+          "ClearOnboardingLocalModelSelection",
           Effect.uninterruptible(Effect.gen(function* () {
             const primary = (yield* modelSlots.snapshot).state.slots.primary;
             if (primary._tag === "Unassigned") {
@@ -566,7 +571,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       GetOnboardingState: () =>
         observeRpcDefects(
           "GetOnboardingState",
-          onboarding.state,
+          onboarding.snapshot,
         ),
 
       CompleteOnboardingFlow: ({ flowId }) =>

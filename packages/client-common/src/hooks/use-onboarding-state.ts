@@ -1,16 +1,18 @@
 import { useCallback, useMemo } from "react"
-import { useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
   LocalModelsMirror,
   ModelSlotsMirror,
+  OnboardingMirror,
   ProviderModelCatalogMirror,
-  type CatalogCandidateId,
+  type OnboardingLocalModelSelection,
   type OnboardingFlowId,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
+import { useMirroredState } from "./use-mirrored-state"
 
 const ONBOARDING_LOCAL_MODEL_KEYS = [
-  "onboarding",
+  OnboardingMirror.id,
   LocalModelsMirror.id,
   ModelSlotsMirror.id,
   ProviderModelCatalogMirror.id,
@@ -18,55 +20,51 @@ const ONBOARDING_LOCAL_MODEL_KEYS = [
 
 export function useOnboardingState() {
   const client = useAgentClient()
-  const stateAtom = useMemo(
-    () => client.query("GetOnboardingState", {}, { reactivityKeys: ["onboarding"] }),
-    [client],
-  )
   const completeAtom = useMemo(() => client.mutation("CompleteOnboardingFlow"), [client])
   const selectLocalModelAtom = useMemo(
     () => client.mutation("SelectOnboardingLocalModel"),
     [client],
   )
-  const cancelLocalModelAtom = useMemo(
-    () => client.mutation("CancelOnboardingLocalModelDownload"),
+  const clearLocalModelAtom = useMemo(
+    () => client.mutation("ClearOnboardingLocalModelSelection"),
     [client],
   )
-  const state = useAtomValue(stateAtom)
+  const state = Result.map(useMirroredState(OnboardingMirror), ({ state }) => state)
   const completeResult = useAtomValue(completeAtom)
   const selectLocalModelResult = useAtomValue(selectLocalModelAtom)
-  const cancelLocalModelResult = useAtomValue(cancelLocalModelAtom)
+  const clearLocalModelResult = useAtomValue(clearLocalModelAtom)
   const completeMutation = useAtomSet(completeAtom)
   const selectLocalModelMutation = useAtomSet(selectLocalModelAtom)
-  const cancelLocalModelMutation = useAtomSet(cancelLocalModelAtom)
+  const clearLocalModelMutation = useAtomSet(clearLocalModelAtom)
 
   const complete = useCallback((flowId: OnboardingFlowId): void => {
     completeMutation({
       payload: { flowId },
-      reactivityKeys: ["onboarding"],
+      reactivityKeys: [OnboardingMirror.id],
     })
   }, [completeMutation])
 
-  const selectLocalModel = useCallback((candidateId: CatalogCandidateId): void => {
+  const selectLocalModel = useCallback((selection: OnboardingLocalModelSelection): void => {
     selectLocalModelMutation({
-      payload: { candidateId },
+      payload: { selection },
       reactivityKeys: ONBOARDING_LOCAL_MODEL_KEYS,
     })
   }, [selectLocalModelMutation])
 
-  const cancelLocalModelDownload = useCallback((): void => {
-    cancelLocalModelMutation({
+  const clearLocalModelSelection = useCallback((): void => {
+    clearLocalModelMutation({
       payload: {},
       reactivityKeys: ONBOARDING_LOCAL_MODEL_KEYS,
     })
-  }, [cancelLocalModelMutation])
+  }, [clearLocalModelMutation])
 
   return {
     state,
     completeResult,
     selectLocalModelResult,
-    cancelLocalModelResult,
+    clearLocalModelResult,
     complete,
     selectLocalModel,
-    cancelLocalModelDownload,
+    clearLocalModelSelection,
   }
 }

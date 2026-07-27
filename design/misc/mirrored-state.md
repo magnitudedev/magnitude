@@ -3,6 +3,7 @@ applies_to:
   - packages/protocol/src/schemas/mirrored-state.ts
   - packages/protocol/src/rpcs/config.ts
   - packages/protocol/src/rpcs/local-inference.ts
+  - packages/protocol/src/rpcs/onboarding.ts
   - packages/protocol/src/schemas/model-state.ts
   - packages/protocol/src/rpcs/group.ts
   - packages/acn/src/mirrored-state.ts
@@ -13,6 +14,7 @@ applies_to:
   - packages/acn/src/local-models.ts
   - packages/acn/src/model-slot-coordinator.ts
   - packages/acn/src/local-inference-hardware.ts
+  - packages/acn/src/onboarding/**
   - packages/acn/src/handlers.ts
   - packages/acn/src/server.ts
   - packages/client-common/src/hooks/use-mirrored-state.ts
@@ -43,8 +45,9 @@ currently consumed mirrors.
 
 ## Ownership
 
-ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModels`, `ModelSlots`, and
-`LocalInferenceHardware`. `LocalModels` is the stable target-level product projection; package,
+ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModels`, `ModelSlots`,
+`LocalInferenceHardware`, and `Onboarding`. `LocalModels` is the stable target-level product
+projection; package,
 download-attempt, and recommendation working state remain private ACN observations. Private ICN
 types and native field names do not cross the protocol boundary. A backend may bind directly only
 when it owns the exact public schema and versioned replay.

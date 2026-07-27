@@ -15,6 +15,7 @@ import {
 import {
   buildLocalInferenceSelections,
   describeLocalHardware,
+  describeLocalHardwareSummary,
   describeResidentModel,
   localInferenceSetupPhase,
   localInferenceProgressLines,
@@ -339,6 +340,66 @@ describe("local inference selection view model", () => {
         "128.0 GiB unified memory · CUDA GPU acceleration",
       ],
     })
+    expect(describeLocalHardwareSummary(hardware)).toEqual([{
+      name: "DGX Spark · NVIDIA GB10",
+      details: ["Linux ARM64", "20 cores", "128 GiB unified", "CUDA"],
+    }])
+  })
+
+  it("presents unified hardware as one compact physical-domain row", () => {
+    const memoryDomainId = LocalInferenceMemoryDomainIdSchema.make("unified")
+    expect(describeLocalHardwareSummary(makeHardware({
+      platform: "MacOS",
+      architecture: "Arm64",
+      processor: Option.some("Apple M4 Max"),
+      totalSystemMemoryBytes: 64 * GIB,
+      accelerators: [{
+        acceleratorId: LocalInferenceAcceleratorIdSchema.make("metal"),
+        name: "MTL0",
+        backend: "Metal",
+        memoryDomainId,
+      }],
+      memoryDomains: [{
+        memoryDomainId,
+        kind: "UnifiedMemory",
+        totalBytes: 64 * GIB,
+        stableCapacityBytes: 52 * GIB,
+        availableBytes: Option.none(),
+        sharesSystemMemory: true,
+      }],
+    }))).toEqual([{
+      name: "Apple M4 Max",
+      details: ["macOS ARM64", "16 cores", "64 GiB unified", "Metal"],
+    }])
+  })
+
+  it("separates system and discrete accelerator hardware", () => {
+    expect(describeLocalHardwareSummary(makeHardware({
+      platform: "Linux",
+      architecture: "X64",
+      productName: Option.none(),
+      processor: Option.some("AMD Ryzen 9"),
+      totalSystemMemoryBytes: 64 * GIB,
+    }))).toEqual([
+      {
+        name: "AMD Ryzen 9",
+        details: ["Linux x86-64", "16 cores", "64 GiB RAM"],
+      },
+      {
+        name: "Test GPU",
+        details: ["24 GiB VRAM", "CUDA"],
+      },
+    ])
+  })
+
+  it("identifies CPU-only inference without inventing an accelerator", () => {
+    expect(describeLocalHardwareSummary(makeHardware({
+      accelerators: [],
+      memoryDomains: [],
+    }))).toEqual([{
+      name: "Test CPU",
+      details: ["Linux x86-64", "16 cores", "64 GiB RAM", "CPU inference"],
+    }])
   })
 
   it("classifies the downloaded model selected by a ready slot as running", () => {
