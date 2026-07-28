@@ -690,16 +690,18 @@ function OnboardingModelLoadingDetails({
           </box>
         </>
       ) : (
-        <text>
-          <span fg={theme.primary}>{spinner} </span>
-          <span fg={theme.muted}>
+        <box style={{ width, flexDirection: "row" }}>
+          <text style={{ fg: theme.primary, width: 2, flexShrink: 0 }} wrapMode="none">
+            {spinner}
+          </text>
+          <text style={{ fg: theme.muted, width: Math.max(1, width - 2) }} wrapMode="none">
             {phase === "Loading"
               ? "Loading model weights…"
               : phase === "Ready"
                 ? "Finishing setup…"
                 : "Preparing the model for use…"}
-          </span>
-        </text>
+          </text>
+        </box>
       )}
     </box>
   )

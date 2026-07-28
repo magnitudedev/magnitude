@@ -378,6 +378,44 @@ test("keeps the chosen row highlighted and locks navigation while download detai
   }
 })
 
+test("keeps the animated activation spinner isolated from its status label", async () => {
+  vi.useFakeTimers()
+  const view = await testRender(
+    <OnboardingModelChooser
+      state={chooserView()}
+      width={100}
+      pending={false}
+      error={null}
+      operation={{
+        _tag: "Activating",
+        providerModelId: ProviderModelIdSchema.make("configuration_remote"),
+        displayName: "Remote Model",
+        phase: "Preparing",
+        failure: null,
+        onRetry: vi.fn(),
+        onChooseAnother: vi.fn(),
+      }}
+      onChoose={onChoose}
+      onContinue={onContinue}
+      onSkip={onSkip}
+    />,
+    { width: 100, height: 34 },
+  )
+  try {
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain("Preparing the model for use…")
+
+    await act(async () => {
+      vi.advanceTimersByTime(8_000)
+    })
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain("Preparing the model for use…")
+  } finally {
+    await act(async () => view.renderer.destroy())
+    vi.useRealTimers()
+  }
+})
+
 test("keeps four rows per section and scrolls only the installed-model window", async () => {
   const view = await testRender(
     <OnboardingModelChooser
