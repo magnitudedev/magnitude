@@ -32,19 +32,19 @@ describe('model request progress copy', () => {
       completedTokens: 9_400,
       totalTokens: 14_300,
     }))).toEqual({
-      primary: 'Loading conversation into the model · 9.4k / 14.3k tokens',
+      primary: 'Prefilling · 9.4k / 14.3k input tokens',
       secondary: null,
     })
   })
 
-  it('separates reused context from newly added messages', () => {
+  it('separates cached tokens from the input tokens being prefilled', () => {
     expect(modelRequestProgressCopy(prefill({
       completedTokens: 14_020,
       totalTokens: 14_300,
       cachedTokens: 13_200,
     }))).toEqual({
-      primary: 'Adding new messages to the model · 820 / 1.1k tokens',
-      secondary: 'Reusing 13.2k tokens from earlier messages',
+      primary: 'Prefilling · 820 / 1.1k input tokens',
+      secondary: 'Using 13.2k cached tokens',
     })
   })
 
@@ -54,9 +54,9 @@ describe('model request progress copy', () => {
       totalTokens: 14_300,
       cachedTokens: 13_200,
     }))).toEqual({
-      label: 'Adding new messages',
-      detail: '820 / 1.1k tokens',
-      trailing: 'Reusing 13.2k tokens',
+      label: 'Prefilling',
+      detail: '820 / 1.1k input tokens',
+      trailing: 'Using 13.2k cached tokens',
     })
   })
 })

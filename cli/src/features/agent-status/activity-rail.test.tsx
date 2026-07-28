@@ -70,7 +70,7 @@ describe('activity rail', () => {
         modelRequestActivity={request()}
       />,
     )
-    expect(htmlToText(html)).toBe('⠋ Loading model · 42%')
+    expect(htmlToText(html)).toBe('⠋ Loading model into memory · 42%')
     expect(html).not.toContain('padding-left')
     expect(html).not.toContain('padding-top')
   })
@@ -125,7 +125,7 @@ describe('activity rail', () => {
           cachedTokens: 13_200,
         })}
       />,
-    )).toBe('⠋ Adding new messages · 820 / 1.1k tokens · Reusing 13.2k tokens')
+    )).toBe('⠋ Prefilling · 820 / 1.1k input tokens · Using 13.2k cached tokens')
     vi.restoreAllMocks()
   })
 
@@ -142,7 +142,7 @@ describe('activity rail', () => {
           cachedTokens: 13_200,
         })}
       />,
-    )).toBe('⠋ Adding new messages · 820 / 1.1k tokens')
+    )).toBe('⠋ Prefilling · 820 / 1.1k input tokens')
     vi.restoreAllMocks()
   })
 

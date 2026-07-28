@@ -44,7 +44,7 @@ export interface SelectedSlotModel {
 }
 
 export const formatModelLoadProgress = (percentage: number): string =>
-  `Loading model · ${percentage}%`
+  `Loading model into memory · ${percentage}%`
 
 export function deriveLocalModelLoadActivity(
   slots: ModelSlotsState,
