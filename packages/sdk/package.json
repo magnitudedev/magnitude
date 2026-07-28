@@ -26,6 +26,7 @@
     "@magnitudedev/ai": "workspace:*",
     "@magnitudedev/providers": "workspace:*",
     "@magnitudedev/protocol": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
     "@magnitudedev/storage": "workspace:*",
 
     "@magnitudedev/roles": "workspace:*",

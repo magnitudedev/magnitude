@@ -14,6 +14,7 @@ import { FileSystem } from "@effect/platform/FileSystem";
 import * as CommandExecutor from "@effect/platform/CommandExecutor";
 import * as HttpClient from "@effect/platform/HttpClient";
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
+import * as Path from "@effect/platform/Path";
 import * as NodePath from "node:path";
 import { readStructuredFile } from "@magnitudedev/storage";
 import {
@@ -678,12 +679,16 @@ export const makeLocalDaemonSpawner = (
 ): Effect.Effect<
   DaemonSpawner,
   never,
-  FileSystem | HttpClient.HttpClient | CommandExecutor.CommandExecutor
+  | FileSystem
+  | HttpClient.HttpClient
+  | CommandExecutor.CommandExecutor
+  | Path.Path
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem;
     const client = yield* HttpClient.HttpClient;
     const cmd = yield* CommandExecutor.CommandExecutor;
+    const path = yield* Path.Path;
 
     const dataDir = options.dataDir ?? defaultDataDir();
     const targetVersion = options.version ?? SDK_VERSION;
@@ -749,6 +754,7 @@ export const makeLocalDaemonSpawner = (
                 Effect.provideService(FileSystem, fs),
                 Effect.provideService(HttpClient.HttpClient, client),
                 Effect.provideService(CommandExecutor.CommandExecutor, cmd),
+                Effect.provideService(Path.Path, path),
                 Effect.map((resolved) =>
                   debug ? [...resolved.command, "--debug"] : resolved.command
                 )

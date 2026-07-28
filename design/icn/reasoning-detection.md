@@ -242,7 +242,7 @@ Reasoning persistence is part of the artifact-inspection index in the
 the typed result and a stable semantic-policy identity included in the inspection evidence; it does
 not own a reasoning-specific cache or filesystem layout. Local inventory inspection and remote
 preview reuse the same index whenever the artifact, effective template, and policy evidence match.
-Release-catalog generation records the resulting capabilities in the embedded catalog and binds
+Release-catalog generation records the resulting capabilities in the release-bound catalog and binds
 that artifact to the native template-assessor identity. A changed inspector, semantic policy, or
 pinned native implementation therefore requires catalog regeneration before release validation
 can pass.

@@ -1,16 +1,24 @@
-import { Effect, Schedule } from "effect"
-import { FileSystem } from "@effect/platform/FileSystem"
 import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
+import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
-import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
-import { dirname, join } from "node:path"
+import * as Path from "@effect/platform/Path"
+import { Effect, Option } from "effect"
 import { homedir } from "node:os"
+import { join } from "node:path"
+import {
+  acquireRelease,
+  currentHost,
+  embeddedTrustedReleaseKeys,
+  installArtifact,
+  NodeArchiveExtractor,
+  selectArtifact,
+} from "@magnitudedev/release"
 import {
   BinaryNotFound,
   BinaryVersionMismatch,
+  DaemonSpawnFailed,
   DownloadFailed,
-  DaemonSpawnFailed
 } from "./errors"
 
 export interface ResolveBinaryOptions {
@@ -25,73 +33,42 @@ export interface ResolvedBinaryCommand {
 }
 
 export const defaultDataDir = (): string => join(homedir(), ".magnitude")
-
 export const defaultBinaryPath = (dataDir: string = defaultDataDir()): string =>
-  `${dataDir}/bin/magnitude-acn`
+  join(dataDir, "bin", "magnitude-acn")
 
-export const immutableBinaryPath = (dataDir: string, version: string): string =>
-  join(dataDir, "bin", "acn", encodeURIComponent(version), platformArchTriple(), acnExecutableName())
-
-export const cachedBinaryPath = (dataDir: string, version?: string): string =>
-  version === undefined ? defaultBinaryPath(dataDir) : immutableBinaryPath(dataDir, version)
-
-function isWindows(): boolean {
-  return process.platform === "win32"
-}
-
-function acnExecutableName(): string {
-  return isWindows() ? "magnitude-acn.exe" : "magnitude-acn"
-}
-
-function platformArchTriple(): string {
-  const platform = process.platform
-  const arch = process.arch
-
-  switch (platform) {
-    case "darwin":
-      if (arch === "arm64") return "darwin-arm64"
-      if (arch === "x64") return "darwin-x64"
-      break
-    case "linux":
-      if (arch === "x64") return "linux-x64"
-      if (arch === "arm64") return "linux-arm64"
-      break
-    case "win32":
-      if (arch === "x64") return "windows-x64"
-      break
-  }
-
-  throw new Error(`Unsupported platform/arch: ${platform} ${arch}`)
-}
-
-const RELEASE_REPO = "magnitudedev/magnitude"
+const releaseRoot = (dataDir: string) => join(dataDir, "releases")
+const acnRoot = (dataDir: string, version: string) =>
+  join(releaseRoot(dataDir), "acn", version, currentHost())
+const pointerPath = (dataDir: string, version: string) =>
+  join(acnRoot(dataDir, version), "current.txt")
+const executableName = () => process.platform === "win32"
+  ? "magnitude-acn.exe"
+  : "magnitude-acn"
 
 export function releaseTag(version: string): string {
   return `@magnitudedev/cli@${version}`
 }
 
 export function releaseBaseUrl(): string {
-  return (process.env.MAGNITUDE_RELEASE_BASE_URL ?? `https://github.com/${RELEASE_REPO}/releases/download`)
-    .replace(/\/+$/, "")
+  return (
+    process.env.MAGNITUDE_RELEASE_BASE_URL ??
+    "https://github.com/magnitudedev/magnitude/releases/download"
+  ).replace(/\/+$/, "")
 }
 
-export function acnAssetName(platformKey: string = platformArchTriple()): string {
-  return `magnitude-acn-${platformKey}.tar.gz`
-}
-
-export function acnDownloadUrl(version: string, platformKey: string = platformArchTriple()): string {
-  return `${releaseBaseUrl()}/${encodeURIComponent(releaseTag(version))}/${acnAssetName(platformKey)}`
-}
-
-function validateBinaryVersion(
+const validateBinaryVersion = (
   binaryPath: string,
-  expectedVersion: string
-): Effect.Effect<void, BinaryVersionMismatch | DaemonSpawnFailed, CommandExecutor.CommandExecutor> {
-  return Effect.gen(function* () {
+  expectedVersion: string,
+): Effect.Effect<
+  void,
+  BinaryVersionMismatch | DaemonSpawnFailed,
+  CommandExecutor.CommandExecutor
+> =>
+  Effect.gen(function* () {
     const actual = yield* Command.make(binaryPath, "version").pipe(
       Command.string,
       Effect.map((value) => value.trim()),
-      Effect.mapError((error) => new DaemonSpawnFailed({ reason: String(error) }))
+      Effect.mapError((cause) => new DaemonSpawnFailed({ reason: String(cause) })),
     )
     if (actual !== expectedVersion) {
       return yield* new BinaryVersionMismatch({
@@ -101,159 +78,185 @@ function validateBinaryVersion(
       })
     }
   })
-}
 
-const downloadBinary = (url: string): Effect.Effect<Uint8Array, DownloadFailed, HttpClient.HttpClient> =>
+const cachedAcn = (
+  dataDir: string,
+  version: string,
+): Effect.Effect<
+  Option.Option<string>,
+  never,
+  CommandExecutor.CommandExecutor | FileSystem.FileSystem | Path.Path
+> =>
   Effect.gen(function* () {
-    const client = yield* HttpClient.HttpClient
-    const request = HttpClientRequest.get(url)
-    const response = yield* Effect.retry({
-      schedule: Schedule.exponential("1 second").pipe(Schedule.intersect(Schedule.recurs(2)))
-    })(client.execute(request)).pipe(
-      Effect.timeout("30 seconds"),
-      Effect.mapError((error) => new DownloadFailed({ url, status: 0, reason: String(error) }))
+    const fs = yield* FileSystem.FileSystem
+    const path = yield* Path.Path
+    const digest = yield* fs.readFileString(pointerPath(dataDir, version)).pipe(
+      Effect.map((value) => value.trim()),
+      Effect.orElseSucceed(() => ""),
     )
-
-    if (response.status < 200 || response.status >= 300) {
-      return yield* new DownloadFailed({
-        url,
-        status: response.status,
-        reason: `HTTP ${response.status}`
-      })
+    if (!/^[a-f0-9]{64}$/.test(digest)) return Option.none()
+    const executable = path.join(acnRoot(dataDir, version), digest, "bin", executableName())
+    if (!(yield* fs.exists(executable).pipe(Effect.orElseSucceed(() => false)))) {
+      return Option.none()
     }
-
-    const buffer = yield* response.arrayBuffer.pipe(
-      Effect.mapError((error) => new DownloadFailed({ url, status: 0, reason: String(error) }))
+    const valid = yield* validateBinaryVersion(executable, version).pipe(
+      Effect.as(true),
+      Effect.catchAll(() => Effect.succeed(false)),
     )
-    return new Uint8Array(buffer)
+    return valid ? Option.some(executable) : Option.none()
+  })
+
+const publishPointer = (
+  dataDir: string,
+  version: string,
+  digest: string,
+): Effect.Effect<void, DownloadFailed, FileSystem.FileSystem | Path.Path> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const path = yield* Path.Path
+      const pointer = pointerPath(dataDir, version)
+      const parent = path.dirname(pointer)
+      yield* fs.makeDirectory(parent, { recursive: true, mode: 0o700 }).pipe(
+        Effect.mapError(acquisitionFailure(version)),
+      )
+      const temporary = yield* fs.makeTempFileScoped({
+        directory: parent,
+        prefix: ".current-",
+      }).pipe(Effect.mapError(acquisitionFailure(version)))
+      yield* fs.writeFileString(temporary, `${digest}\n`, { mode: 0o600 }).pipe(
+        Effect.mapError(acquisitionFailure(version)),
+      )
+      yield* fs.rename(temporary, pointer).pipe(
+        Effect.catchAll(() =>
+          fs.remove(pointer, { force: true }).pipe(
+            Effect.zipRight(fs.rename(temporary, pointer)),
+          )
+        ),
+        Effect.mapError(acquisitionFailure(version)),
+      )
+    }),
+  )
+
+const acquisitionFailure = (version: string) => (cause: unknown) =>
+  new DownloadFailed({
+    url: `${releaseBaseUrl()}/${encodeURIComponent(releaseTag(version))}`,
+    status: 0,
+    reason: cause instanceof Error ? cause.message : String(cause),
+  })
+
+const ensureAcn = (
+  version: string,
+  dataDir: string,
+): Effect.Effect<
+  { readonly path: string; readonly acquired: boolean },
+  DownloadFailed | BinaryVersionMismatch | DaemonSpawnFailed,
+  | CommandExecutor.CommandExecutor
+  | FileSystem.FileSystem
+  | Path.Path
+  | HttpClient.HttpClient
+> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const path = yield* Path.Path
+    const cached = yield* cachedAcn(dataDir, version)
+    if (Option.isSome(cached)) return { path: cached.value, acquired: false }
+
+    const authenticated = yield* acquireRelease(
+      releaseBaseUrl(),
+      version,
+      embeddedTrustedReleaseKeys(),
+      path.join(releaseRoot(dataDir), "manifests", version),
+    ).pipe(Effect.mapError(acquisitionFailure(version)))
+    const artifact = yield* selectArtifact(
+      authenticated.manifest,
+      "acn",
+      currentHost(),
+    ).pipe(Effect.mapError(acquisitionFailure(version)))
+    const destination = path.join(acnRoot(dataDir, version), artifact.sha256)
+    const executable = path.join(destination, "bin", executableName())
+
+    if (yield* fs.exists(destination).pipe(Effect.orElseSucceed(() => false))) {
+      const valid = yield* validateBinaryVersion(executable, version).pipe(
+        Effect.as(true),
+        Effect.catchAll(() => Effect.succeed(false)),
+      )
+      if (!valid) {
+        yield* fs.remove(destination, { recursive: true, force: true }).pipe(
+          Effect.mapError(acquisitionFailure(version)),
+        )
+      }
+    }
+    let acquired = false
+    if (!(yield* fs.exists(destination).pipe(Effect.orElseSucceed(() => false)))) {
+      yield* installArtifact(
+        releaseBaseUrl(),
+        version,
+        artifact,
+        destination,
+      ).pipe(
+        Effect.provide(NodeArchiveExtractor),
+        Effect.mapError(acquisitionFailure(version)),
+      )
+      acquired = true
+    }
+    yield* validateBinaryVersion(executable, version)
+    yield* publishPointer(dataDir, version, artifact.sha256)
+    return { path: executable, acquired }
   })
 
 export const downloadAcn = (
   version: string,
-  dataDir: string
-): Effect.Effect<string, DownloadFailed | BinaryNotFound | BinaryVersionMismatch | DaemonSpawnFailed, FileSystem | HttpClient.HttpClient | CommandExecutor.CommandExecutor> =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem
-    const url = acnDownloadUrl(version)
-    const binDir = join(dataDir, "bin")
-    const tmpDir = join(dataDir, "downloads")
-    const publicationId = yield* Effect.sync(() => crypto.randomUUID())
-    const tmpFile = join(tmpDir, `magnitude-acn-${publicationId}.tar.gz.tmp`)
-    const extractDir = join(binDir, `.tmp-${publicationId}`)
-    const finalPath = immutableBinaryPath(dataDir, version)
-
-    const existing = yield* fs.exists(finalPath).pipe(Effect.mapError(fsError(url)))
-    if (existing) {
-      yield* validateBinaryVersion(finalPath, version)
-      return finalPath
-    }
-
-    yield* fs.makeDirectory(tmpDir, { recursive: true }).pipe(Effect.mapError(fsError(url)))
-    yield* fs.makeDirectory(extractDir, { recursive: true }).pipe(Effect.mapError(fsError(url)))
-
-    try {
-      const bytes = yield* downloadBinary(url)
-      yield* fs.writeFile(tmpFile, bytes).pipe(Effect.mapError(fsError(url)))
-
-      const tarFlag = isWindows() ? "-xf" : "-xzf"
-      const tarExit = yield* Command.make("tar", tarFlag, tmpFile, "-C", extractDir).pipe(
-        Command.exitCode,
-        Effect.mapError((error) => new DaemonSpawnFailed({ reason: String(error) }))
-      )
-
-      if (tarExit !== 0) {
-        return yield* new DaemonSpawnFailed({ reason: `tar extraction failed (${tarExit})` })
-      }
-
-      const extractedPath = join(extractDir, acnExecutableName())
-      const extractedExists = yield* fs.exists(extractedPath).pipe(Effect.mapError(fsError(url)))
-      if (!extractedExists) {
-        return yield* new BinaryNotFound({ path: extractedPath })
-      }
-
-      if (!isWindows()) {
-        yield* fs.chmod(extractedPath, 0o755).pipe(
-          Effect.mapError((error) => new DaemonSpawnFailed({ reason: String(error) }))
-        )
-      }
-
-      yield* validateBinaryVersion(extractedPath, version)
-
-      yield* fs.makeDirectory(dirname(finalPath), { recursive: true }).pipe(
-        Effect.mapError(fsError(url)),
-      )
-      const publication = yield* fs
-        .link(extractedPath, finalPath)
-        .pipe(Effect.mapError(fsError(url)), Effect.either)
-      if (publication._tag === "Left") {
-        const published = yield* fs.exists(finalPath).pipe(Effect.mapError(fsError(url)))
-        if (!published) return yield* publication.left
-        yield* validateBinaryVersion(finalPath, version)
-      }
-      yield* fs.remove(extractDir, { recursive: true, force: true }).pipe(Effect.mapError(fsError(url)))
-
-      return finalPath
-    } finally {
-      yield* fs.remove(tmpFile, { force: true }).pipe(Effect.catchAll(() => Effect.void))
-      yield* fs.remove(extractDir, { recursive: true, force: true }).pipe(Effect.catchAll(() => Effect.void))
-    }
-  })
-
-const fsError = (url: string) => (error: { readonly message: string }): DownloadFailed =>
-  new DownloadFailed({ url, status: 0, reason: error.message })
+  dataDir: string,
+): Effect.Effect<
+  string,
+  DownloadFailed | BinaryVersionMismatch | DaemonSpawnFailed,
+  | CommandExecutor.CommandExecutor
+  | FileSystem.FileSystem
+  | Path.Path
+  | HttpClient.HttpClient
+> => ensureAcn(version, dataDir).pipe(Effect.map(({ path }) => path))
 
 export const resolveBinaryCommand = (
-  options?: ResolveBinaryOptions
-): Effect.Effect<ResolvedBinaryCommand, DownloadFailed | BinaryNotFound | BinaryVersionMismatch | DaemonSpawnFailed, FileSystem | HttpClient.HttpClient | CommandExecutor.CommandExecutor> =>
+  options?: ResolveBinaryOptions,
+): Effect.Effect<
+  ResolvedBinaryCommand,
+  DownloadFailed | BinaryNotFound | BinaryVersionMismatch | DaemonSpawnFailed,
+  | CommandExecutor.CommandExecutor
+  | FileSystem.FileSystem
+  | Path.Path
+  | HttpClient.HttpClient
+> =>
   Effect.gen(function* () {
-    const fs = yield* FileSystem
+    const fs = yield* FileSystem.FileSystem
     const dataDir = options?.dataDir ?? defaultDataDir()
     const expectedVersion = options?.version
 
     if (options?.binaryPath) {
-      const explicitExists = yield* fs.exists(options.binaryPath).pipe(Effect.catchAll(() => Effect.succeed(false)))
-      if (!explicitExists) {
+      if (!(yield* fs.exists(options.binaryPath).pipe(Effect.orElseSucceed(() => false)))) {
         return yield* new BinaryNotFound({ path: options.binaryPath })
       }
-      if (expectedVersion) {
-        yield* validateBinaryVersion(options.binaryPath, expectedVersion)
-      }
+      if (expectedVersion) yield* validateBinaryVersion(options.binaryPath, expectedVersion)
       return {
         command: [options.binaryPath, "serve", "--register", "--data-dir", dataDir],
-        needsDownload: false
-      }
-    }
-
-    const cachedPath = cachedBinaryPath(dataDir, expectedVersion)
-    const cachedExists = yield* fs.exists(cachedPath).pipe(Effect.catchAll(() => Effect.succeed(false)))
-
-    if (expectedVersion) {
-      if (cachedExists) {
-        const cacheValid = yield* validateBinaryVersion(cachedPath, expectedVersion).pipe(
-          Effect.as(true),
-          Effect.catchAll(() => Effect.succeed(false))
-        )
-        if (cacheValid) {
-          return {
-            command: [cachedPath, "serve", "--register", "--data-dir", dataDir],
-            needsDownload: false
-          }
-        }
-      }
-    } else if (cachedExists) {
-      return {
-        command: [cachedPath, "serve", "--register", "--data-dir", dataDir],
-        needsDownload: false
+        needsDownload: false,
       }
     }
 
     if (!expectedVersion) {
-      return yield* new BinaryNotFound({ path: cachedPath })
+      const path = defaultBinaryPath(dataDir)
+      if (!(yield* fs.exists(path).pipe(Effect.orElseSucceed(() => false)))) {
+        return yield* new BinaryNotFound({ path })
+      }
+      return {
+        command: [path, "serve", "--register", "--data-dir", dataDir],
+        needsDownload: false,
+      }
     }
 
-    const downloadedPath = yield* downloadAcn(expectedVersion, dataDir)
+    const resolved = yield* ensureAcn(expectedVersion, dataDir)
     return {
-      command: [downloadedPath, "serve", "--register", "--data-dir", dataDir],
-      needsDownload: true
+      command: [resolved.path, "serve", "--register", "--data-dir", dataDir],
+      needsDownload: resolved.acquired,
     }
   })

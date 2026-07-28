@@ -43,10 +43,10 @@ Every file-backed format must be classified before its persistence behavior is d
 
 Release artifacts are a separate class from files in a user data directory. The release-bound
 recommendable-model manifest is generated from reviewed source declarations and checked in. Its
-pinned native-planner inputs are retrieved and integrity-checked by development and release builds
-when the matching build output is absent, packed into build output, embedded in ICN, and validated
-as part of the binary. They are not user caches: corruption or evidence mismatch is a build/release
-defect, and deleting
+pinned native-planner inputs are retrieved and integrity-checked by an explicit hydration command,
+then the manifest and bundle are packaged as immutable ICN release sidecars. Local development
+constructs the same installation layout. They are not user caches: corruption or evidence mismatch
+is an installation defect, and deleting
 `.magnitude/cache` must never cause catalog metadata or model headers to be reconstructed from the
 network during setup.
 

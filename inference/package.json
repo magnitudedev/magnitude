@@ -3,8 +3,6 @@
   "private": true,
   "scripts": {
     "build": "bun run scripts/build-local.ts",
-    "build:binary": "bun run scripts/build-binary.ts",
-    "build:release": "cargo build --release -p icn-server",
     "build:reference": "bun run scripts/build-reference.ts",
     "build:candidate": "bun run scripts/build-candidate.ts",
     "benchmark": "cargo run -p benchmark-runner --",
@@ -23,7 +21,7 @@
     "parity:test:ts": "bunx --bun vitest run scripts/*.test.ts",
     "parity:typecheck": "bunx tsc -p tsconfig.json",
     "dev": "cargo run -p icn-server -- serve --fake",
-    "serve": "cargo run -p icn-server -- serve",
+    "serve": "bun run scripts/build-local.ts --serve",
     "doctor": "cargo run -p icn-server -- doctor",
     "version": "cargo run -p icn-server -- version --json",
     "verify:native-pin": "bun run scripts/verify-native-pin.ts",

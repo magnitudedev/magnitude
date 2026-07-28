@@ -138,8 +138,8 @@ Batch assessment captures one normalized hardware environment identity and reuse
 target and profile in that request. ICN derives the stable offering-target identity before preparing
 model inputs and checks whether every requested profile has valid cached evidence. Complete hits
 return without planner-input materialization or native planning. On a miss, an installed target is
-planned from its local files and a release-catalog target is planned from embedded, integrity-checked
-GGUF metadata. A non-catalog remote source target is not an assessable runtime input. Partial hits
+planned from its local files and a release-catalog target is planned from installed,
+integrity-checked GGUF metadata. A non-catalog remote source target is not an assessable runtime input. Partial hits
 prepare the target and compute only the missing profiles.
 
 ## Loading

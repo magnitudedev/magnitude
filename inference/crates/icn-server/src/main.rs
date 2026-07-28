@@ -34,16 +34,19 @@ use icn_contracts::{
 use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    EmbeddedReleaseCatalog, InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind,
+    InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind,
     ModelManager, ModelPreviewService, ReleaseRecommendableCatalog, ResolvingRecommendableCatalog,
-    canonical_package_id, embedded_release_catalog, offering_target_id, release_catalog_manifest,
+    ReleaseCatalog, canonical_package_id, load_release_catalog, offering_target_id,
+    release_catalog_manifest,
 };
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
+mod backend_eligibility;
 mod build_identity;
 mod inference_worker;
+mod installation;
 mod load_progress;
 mod memory_supervisor;
 mod telemetry;
@@ -96,6 +99,9 @@ enum Command {
         /// Additional read-only Hugging Face hub cache roots.
         #[arg(long = "hf-cache", visible_alias = "hf-cache-dir")]
         hf_caches: Vec<PathBuf>,
+        /// Verified release or prepared development installation.
+        #[arg(long)]
+        installation: Option<PathBuf>,
     },
     /// Maintains the release-bound curated model catalog.
     #[command(hide = true)]
@@ -104,6 +110,17 @@ enum Command {
         command: CatalogCommand,
     },
     Doctor,
+    /// Probe supported accelerator APIs without loading an accelerator module.
+    BackendEligibility {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate a complete prepared ICN installation.
+    #[command(hide = true)]
+    InstallationCheck {
+        #[arg(long)]
+        installation: PathBuf,
+    },
     Version {
         #[arg(long)]
         json: bool,
@@ -129,8 +146,11 @@ enum CatalogCommand {
         #[arg(long = "hf-cache")]
         hf_caches: Vec<PathBuf>,
     },
-    /// Validate the catalog embedded in this binary.
-    Check,
+    /// Validate prepared release catalog sidecars.
+    Check {
+        #[arg(long)]
+        installation: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -610,7 +630,7 @@ impl NativeHardwareAssessor {
 struct NativeModelEvaluator {
     models: Arc<ModelManager>,
     assessor: Arc<NativeHardwareAssessor>,
-    release_catalog: Arc<EmbeddedReleaseCatalog>,
+    release_catalog: Arc<ReleaseCatalog>,
 }
 
 #[derive(Clone)]
@@ -624,7 +644,7 @@ impl NativeModelEvaluator {
     fn new(
         models: Arc<ModelManager>,
         assessor: Arc<NativeHardwareAssessor>,
-        release_catalog: Arc<EmbeddedReleaseCatalog>,
+        release_catalog: Arc<ReleaseCatalog>,
     ) -> Self {
         Self {
             models,
@@ -2857,6 +2877,84 @@ async fn generate_release_catalog(
     Ok(())
 }
 
+fn open_installation_catalog(
+    installation: &installation::Installation,
+) -> anyhow::Result<ReleaseCatalog> {
+    if installation.native_build() != build_identity::native_build() {
+        anyhow::bail!("ICN installation native build does not match its executable");
+    }
+    if installation.backend_module_abi() != build_identity::backend_module_abi() {
+        anyhow::bail!("ICN installation backend module ABI does not match its executable");
+    }
+    load_release_catalog(
+        &installation.catalog_lock(),
+        &installation.planner_bundle(),
+        native_template_identity(),
+        &native_planner_identity(),
+    )
+    .context("failed to load release catalog sidecars")
+}
+
+fn load_installation_backends(
+    installation: &installation::Installation,
+) -> anyhow::Result<()> {
+    let declared = installation
+        .executable()
+        .canonicalize()
+        .context("failed to resolve the declared ICN executable")?;
+    let running = std::env::current_exe()?
+        .canonicalize()
+        .context("failed to resolve the running ICN executable")?;
+    if declared != running {
+        anyhow::bail!("running executable is not part of the declared ICN installation");
+    }
+    #[cfg(feature = "dynamic-backends")]
+    {
+        llama_cpp_2::llama_backend::load_backends_from_path(
+            &installation.backend_directory(),
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "dynamic-backends"))]
+    {
+        let _ = installation;
+        anyhow::bail!("ICN executable does not support dynamic backend modules")
+    }
+}
+
+fn validate_registered_backend(
+    installation: &installation::Installation,
+) -> anyhow::Result<()> {
+    use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
+
+    let devices = list_llama_ggml_backend_devices();
+    if !devices
+        .iter()
+        .any(|device| device.device_type == LlamaBackendDeviceType::Cpu)
+    {
+        anyhow::bail!("ICN installation did not register a CPU backend");
+    }
+    if installation.backend() == installation::Backend::Cpu {
+        if devices.iter().any(|device| {
+            device.device_type != LlamaBackendDeviceType::Cpu
+                && device.device_type != LlamaBackendDeviceType::Unknown
+        }) {
+            anyhow::bail!("CPU installation registered an accelerator backend");
+        }
+        return Ok(());
+    }
+    let required = installation.backend().name();
+    if !devices.iter().any(|device| {
+        (device.backend.eq_ignore_ascii_case(required)
+            || (required == "metal" && device.backend.eq_ignore_ascii_case("mtl")))
+            && device.device_type != LlamaBackendDeviceType::Cpu
+            && device.device_type != LlamaBackendDeviceType::Unknown
+    }) {
+        anyhow::bail!("ICN installation did not register a usable {required} device");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _telemetry = telemetry::init()?;
@@ -2874,7 +2972,21 @@ async fn main() -> anyhow::Result<()> {
             cache_root,
             model_sources,
             hf_caches,
+            installation,
         } => {
+            let installation = installation
+                .as_deref()
+                .map(installation::Installation::load)
+                .transpose()
+                .context("invalid ICN installation")?;
+            if installation.is_none() && !fake {
+                anyhow::bail!(
+                    "ICN installation is not prepared; run `bun icn:build` before development"
+                );
+            }
+            if let Some(installation) = &installation {
+                load_installation_backends(installation)?;
+            }
             let inventory_root = match model_store {
                 Some(root) => root,
                 None => InventoryConfig::default_root()
@@ -2892,6 +3004,9 @@ async fn main() -> anyhow::Result<()> {
             let plan_defaults = runtime_plan_defaults();
             let native_backend = NativeBackend::initialize()
                 .context("failed to initialize the process native backend")?;
+            if let Some(installation) = &installation {
+                validate_registered_backend(installation)?;
+            }
             let inventory = Arc::new(
                 ModelManager::open_with_template_assessor(
                     inventory_config,
@@ -2905,18 +3020,11 @@ async fn main() -> anyhow::Result<()> {
             inventory
                 .set_hardware_assessor(inventory_hardware_assessor.clone())
                 .context("failed to configure inventory hardware assessment")?;
-            let release_catalog = Arc::new(
-                embedded_release_catalog(native_template_identity(), &native_planner_identity())
-                    .context("failed to validate the embedded release catalog")?,
-            );
-            let recommendable_catalog = Arc::new(ReleaseRecommendableCatalog::new(
-                release_catalog.catalog().clone(),
-            ));
-            let model_evaluator = Arc::new(NativeModelEvaluator::new(
-                inventory.clone(),
-                inventory_hardware_assessor.clone(),
-                release_catalog,
-            ));
+            let release_catalog = installation
+                .as_ref()
+                .map(open_installation_catalog)
+                .transpose()?
+                .map(Arc::new);
             let model_downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()));
             let backends = BackendRegistry::empty();
             if fake {
@@ -2949,12 +3057,21 @@ async fn main() -> anyhow::Result<()> {
                 runtime
             });
             let mut state = AppState::model_free(backends)
-                .with_installed_packages(inventory)
-                .with_hardware(inventory_hardware_assessor)
-                .with_model_evaluator(model_evaluator)
+                .with_installed_packages(inventory.clone())
+                .with_hardware(inventory_hardware_assessor.clone())
                 .with_model_downloads(model_downloads)
-                .with_recommendable_catalog(recommendable_catalog)
                 .with_identity(identity);
+            if let Some(release_catalog) = release_catalog {
+                state = state
+                    .with_model_evaluator(Arc::new(NativeModelEvaluator::new(
+                        inventory,
+                        inventory_hardware_assessor,
+                        release_catalog.clone(),
+                    )))
+                    .with_recommendable_catalog(Arc::new(ReleaseRecommendableCatalog::new(
+                        release_catalog.catalog().clone(),
+                    )));
+            }
             if let Some(runtime) = runtime {
                 state = state.with_runtime(runtime);
             }
@@ -3003,12 +3120,10 @@ async fn main() -> anyhow::Result<()> {
                 cache_root,
                 hf_caches,
             } => generate_release_catalog(output, model_store, cache_root, hf_caches).await?,
-            CatalogCommand::Check => {
-                let catalog = embedded_release_catalog(
-                    native_template_identity(),
-                    &native_planner_identity(),
-                )
-                .context("embedded release catalog validation failed")?;
+            CatalogCommand::Check { installation } => {
+                let installation = installation::Installation::load(&installation)
+                    .context("invalid ICN installation")?;
+                let catalog = open_installation_catalog(&installation)?;
                 println!(
                     "validated {} release catalog models",
                     catalog.catalog().models.len()
@@ -3016,6 +3131,23 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Doctor => println!("ICN runtime and native backend loaded successfully"),
+        Command::BackendEligibility { json } => {
+            let report = backend_eligibility::probe();
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        }
+        Command::InstallationCheck { installation } => {
+            let installation = installation::Installation::load(&installation)
+                .context("invalid ICN installation")?;
+            load_installation_backends(&installation)?;
+            NativeBackend::initialize().context("failed to initialize native backend")?;
+            validate_registered_backend(&installation)?;
+            open_installation_catalog(&installation)?;
+            println!("ICN installation is loadable");
+        }
         Command::Version { json } => {
             if json {
                 println!("{}", build_identity::json());

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
 axum.workspace = true
 clap.workspace = true
 futures-util.workspace = true
@@ -21,6 +22,7 @@ icn-models.workspace = true
 icn-mtp.workspace = true
 icn-reasoning.workspace = true
 libc.workspace = true
+libloading = "0.8.9"
 llama-cpp-2.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
@@ -38,9 +40,10 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
-default = ["mtmd"]
+default = ["mtmd", "dynamic-backends"]
 cuda = ["icn-engine/cuda", "icn-hardware/cuda", "icn-mtp/cuda"]
 cuda-no-vmm = ["icn-engine/cuda-no-vmm", "icn-hardware/cuda-no-vmm", "icn-mtp/cuda-no-vmm"]
+dynamic-backends = ["llama-cpp-2/dynamic-backends"]
 metal = ["icn-engine/metal", "icn-hardware/metal", "icn-mtp/metal"]
 mtmd = ["icn-engine/mtmd", "icn-hardware/mtmd"]
 vulkan = ["icn-engine/vulkan", "icn-hardware/vulkan", "icn-mtp/vulkan"]

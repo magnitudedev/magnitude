@@ -25,6 +25,7 @@
     "@effect/platform": "^0.96.0",
     "@magnitudedev/ai": "workspace:*",
     "@magnitudedev/openapi-effect": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
     "@noble/hashes": "^2.2.0",
     "effect": "3.21.2"
   },

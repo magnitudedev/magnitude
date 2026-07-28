@@ -1,0 +1,28 @@
+{
+  "name": "@magnitudedev/release",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./targets": "./src/targets.ts",
+    "./contracts": "./src/contracts.ts",
+    "./acquisition": "./src/acquisition.ts",
+    "./launcher": "./src/launcher.ts",
+    "./trust": "./src/trust.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-node": "0.107.0",
+    "effect": "3.21.2",
+    "mdast-util-from-markdown": "^2.0.3",
+    "tar-stream": "3.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/tar-stream": "^3.1.4"
+  }
+}

@@ -1,0 +1,70 @@
+name: Direct publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact public GitHub release version to publish to npm
+        required: true
+        type: string
+
+concurrency:
+  group: magnitude-production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.3.14"
+  NPM_VERSION: "11.6.2"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "@magnitudedev/cli@${{ inputs.version }}"
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global "npm@${NPM_VERSION}"
+      - run: bun install --frozen-lockfile
+      - name: Verify released source
+        id: source
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          test "$(node -p "require('./packages/cli/package.json').version")" = "$RELEASE_VERSION"
+          test "$(git rev-parse "@magnitudedev/cli@${RELEASE_VERSION}^{commit}")" = "$(git rev-parse HEAD)"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - run: bun run packages/release/scripts/verify-public-release.ts
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+      - id: npm-candidate
+        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
+        env:
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+      - name: Verify public CLI acquisition
+        run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+      - name: Publish npm through Changesets
+        shell: bash
+        run: |
+          bun run publish -- --no-git-tag || true
+          bun run packages/release/scripts/verify-npm.ts
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+          MAGNITUDE_EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -32,12 +32,12 @@
     "magnitude": "bin/magnitude.js"
   },
   "files": [
-    "bin",
-    "lib"
+    "bin/magnitude.js",
+    "lib/download.js",
+    "lib/release-runtime.cjs"
   ],
   "scripts": {
-    "postinstall": "node lib/postinstall.js",
-    "prepack": "cp ../../README.md ./README.md"
+    "prepack": "cp ../../README.md ./README.md && bun run scripts/prepare-release-runtime.ts"
   },
   "publishConfig": {
     "access": "public"

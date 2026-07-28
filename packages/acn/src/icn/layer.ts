@@ -1,5 +1,4 @@
 import { homedir } from "node:os"
-import { existsSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { Duration, Effect, Layer, Option } from "effect"
 import {
@@ -17,44 +16,28 @@ import {
 import { ACN_VERSION } from "../version"
 import { AcnShutdown } from "../acn-shutdown"
 import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache"
-import { selectIcnReleasePlatformKey } from "./release-platform"
-
-const platformKey = (): string => {
-  const nvidiaSmi = process.platform === "linux" ? Bun.which("nvidia-smi") : null
-  const nvidiaDriverAvailable = existsSync("/dev/nvidiactl")
-    || (nvidiaSmi !== null
-      && Bun.spawnSync([nvidiaSmi, "-L"], {
-        stdout: "ignore",
-        stderr: "ignore",
-      }).success)
-  return selectIcnReleasePlatformKey({
-    platform: process.platform,
-    arch: process.arch,
-    requestedBackend: process.env.MAGNITUDE_ICN_BACKEND,
-    nvidiaDriverAvailable,
-  })
-}
-
 const defaultDataDir = () => join(homedir(), ".magnitude")
 
 const binarySource = (dataDir: string) => {
   const explicit = process.env.MAGNITUDE_ICN_PATH?.trim()
-  if (explicit) return { _tag: "Explicit" as const, path: explicit }
+  if (explicit) {
+    return {
+      _tag: "Installation" as const,
+      path: explicit,
+    }
+  }
   if (ACN_VERSION.includes("+dev.")) {
     return {
-      _tag: "DevelopmentSearch" as const,
-      candidates: [
-        resolve(import.meta.dir, "../../../../inference/target/debug/magnitude-icn"),
-        resolve(import.meta.dir, "../../../../inference/target/release/magnitude-icn"),
-        resolve(process.cwd(), "inference/target/debug/magnitude-icn"),
-        resolve(process.cwd(), "inference/target/release/magnitude-icn"),
-      ] as const,
+      _tag: "Installation" as const,
+      path: resolve(
+        import.meta.dir,
+        "../../../../inference/target/development/installation.json",
+      ),
     }
   }
   return {
     _tag: "Release" as const,
     version: ACN_VERSION,
-    platformKey: platformKey(),
     dataDir,
     releaseBaseUrl: (
       process.env.MAGNITUDE_RELEASE_BASE_URL ??
@@ -81,9 +64,7 @@ const makeProcess = (dataDir: string) =>
           "model_residency",
           "chat_streaming",
         ],
-        allowBuildMismatch: false,
         probeTimeout: Duration.seconds(10),
-        downloadTimeout: Duration.minutes(10),
       }),
       storage: new IcnStorageConfig({
         modelStore: Option.some(join(dataDir, "models")),

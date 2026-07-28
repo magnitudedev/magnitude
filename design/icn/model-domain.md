@@ -197,14 +197,14 @@ explicit developer generation command resolves those declarations through ICN's 
 Hugging Face resolver, GGUF parser, package builder, template assessor, and native planner. It pins
 immutable commits and exact files, synchronously revalidates mutable upstream refs, and writes a
 deterministic manifest containing the exact byte ranges and content digests of the GGUF metadata
-the planner needs. Development and release builds materialize the deterministic compressed bundle
-in build output, retrieving and verifying those ranges from the pinned immutable revisions when a
-matching build artifact is absent, and embed it in the binary. The bundle is not committed to
-source control.
+the planner needs. An explicit hydration command retrieves and verifies those ranges from the
+pinned immutable revisions and materializes the deterministic compressed bundle. Release builds
+package the lock file and bundle as ICN catalog sidecars, and local development constructs the same
+installation layout. The bundle is not committed to source control.
 
-The ICN binary validates the canonical source digest, template-assessor and native-planner
+ICN validates the installed catalog sidecars' canonical source digest, template-assessor and native-planner
 identities, exact catalog-to-planner coverage, bundle digest, unique model identities, and absence
-of generation diagnostics. Missing, stale, partial, or malformed embedded data is a release defect
+of generation diagnostics. Missing, stale, partial, or malformed release data is an installation defect
 and prevents ICN readiness; it is never treated as a user cache miss. User setup performs no remote
 catalog reconstruction or model-header fetch. It combines the release inputs with current hardware
 topology and local calibration to calculate fit and speed. Installed targets continue to use their

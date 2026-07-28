@@ -12,7 +12,6 @@
   ],
   "scripts": {
     "dev": "bun run ../packages/version/scripts/generate-version.ts --dev && bun run src/index.tsx",
-    "build:binary": "bun run scripts/build-binary.ts",
     "typecheck": "bun run ../packages/version/scripts/generate-version.ts && tsc --noEmit",
     "test": "bunx --bun vitest run src/persistence/json-chat-persistence.test.ts src/persistence/session-utils.test.ts",
     "test:all": "bunx --bun vitest run",

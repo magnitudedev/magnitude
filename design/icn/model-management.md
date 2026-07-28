@@ -68,15 +68,16 @@ Catalog publication is an explicit release-development operation. It resolves th
 catalog through production ICN code, pins immutable Hugging Face commits and exact files, and emits
 a deterministic manifest with the exact byte ranges and content digests of the GGUF metadata
 needed for native planning. Generation fails if any source entry produces a diagnostic.
-Development and release builds materialize the deterministic compressed bundle in build output,
-retrieving and verifying those ranges from the pinned immutable revisions when a matching build
-artifact is absent, and embed it in the binary. The bundle is not committed to source control, and
-a build never embeds a partial catalog.
-Normal ICN startup validates the embedded artifacts against the source declarations, native
+An explicit hydration command retrieves and verifies those ranges from the pinned immutable
+revisions and materializes the deterministic compressed bundle. Release builds package the lock
+file and bundle as ICN catalog sidecars; local development constructs the same installation
+layout. The bundle is not committed to source control, and release validation rejects a partial
+catalog.
+Normal ICN startup validates the installed sidecars against the source declarations, native
 template and planner identities, bundle digest, and exact catalog coverage. It performs no remote
 catalog refresh.
 
-At runtime, a release-catalog target is assessed from its embedded hardware-independent properties
+At runtime, a release-catalog target is assessed from its installed hardware-independent properties
 and planner inputs, combined with current machine topology and local calibration. ICN materializes
 the planner inputs as temporary sparse files off the asynchronous runtime and keeps them alive for
 the entire assessment. Temporary paths are never returned as durable package locations or retained
@@ -193,7 +194,7 @@ Keys include immutable package identity and every behavior-changing runtime or h
 Malformed, missing, stale, or unreadable cache entries are misses at the smallest independent unit.
 Deleting the cache may repeat machine-specific inspection and assessment, but cannot remove
 installed models, reconstruct the release catalog, trigger model-header downloads, change identity,
-or produce a permanent failed state. The embedded release catalog and planner-input bundle are
+or produce a permanent failed state. The installed release catalog and planner-input bundle are
 intentionally outside this cache contract.
 
 ## Acceptance criteria

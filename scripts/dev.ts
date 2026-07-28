@@ -1,5 +1,3 @@
-import { access } from "node:fs/promises"
-import { constants } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { buildLocalIcn } from "../inference/scripts/build-local"
@@ -38,22 +36,21 @@ const versionExit = await run([
 if (versionExit !== 0) process.exit(versionExit)
 
 const explicit = process.env.MAGNITUDE_ICN_PATH?.trim()
-let binaryPath: string
+let icnPath: string
 if (explicit) {
-  binaryPath = resolve(explicit)
-  await access(binaryPath, constants.X_OK)
-  console.log(`[dev] Using explicit ICN binary: ${binaryPath}`)
+  icnPath = resolve(explicit)
+  console.log(`[dev] Using ICN: ${icnPath}`)
 } else {
   const built = await buildLocalIcn()
-  binaryPath = built.binaryPath
-  console.log(`[dev] Using ${built.backend} ICN binary: ${binaryPath}`)
+  icnPath = built.installationPath
+  console.log(`[dev] Using ${built.backend} ICN: ${icnPath}`)
 }
 
 const clientExit = await run(
   ["bun", "run", "cli/src/index.tsx", "--debug", ...process.argv.slice(2)],
   {
     ...process.env,
-    MAGNITUDE_ICN_PATH: binaryPath,
+    MAGNITUDE_ICN_PATH: icnPath,
   },
 )
 process.exit(clientExit)

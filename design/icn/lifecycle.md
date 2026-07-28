@@ -15,12 +15,10 @@ applies_to:
   - packages/acn/src/local-model-evaluations.ts
   - packages/acn/src/local-inference-hardware.ts
   - packages/protocol/src/schemas/model-state.ts
-  - packages/acn/scripts/build-binary.ts
   - inference/scripts/**
   - inference/package.json
   - package.json
   - scripts/dev.ts
-  - scripts/build-release-artifacts.ts
   - inference/catalog/**
   - .github/workflows/release.yml
 ---
@@ -54,7 +52,7 @@ document defines ownership, process lifetime, transport, and the Bun-facing pack
 
 The ICN package owns:
 
-- locating a release-matched or explicitly configured `magnitude-icn` executable;
+- resolving a release-matched or explicitly configured ICN installation path;
 - verifying its build and API compatibility before making it available;
 - constructing the model-free server launch configuration;
 - spawning exactly one child in an Effect scope;
@@ -74,15 +72,14 @@ endpoint-specific transport error mapper.
 
 The native ICN process owns hardware discovery, model acquisition and inventory, artifact
 inspection, model fitting, the pinned inference runtime, active-model state, and inference request
-execution. The native binary is acquired by `@magnitudedev/icn` from the matching Magnitude release;
-it is not downloaded from a model repository and is not selected from a user-installed runtime.
-That binary also embeds the release-bound recommendable-model catalog and the hardware-independent
-GGUF metadata needed to plan every catalog target. It validates source, native-template and planner
-identities, bundle integrity, and exact catalog coverage before becoming ready. Ordinary startup
-and setup therefore do not depend on a remote catalog service, model-header fetch, or user cache;
-only machine-specific topology, calibration, fit, and speed remain runtime work. Development and
-release builds obtain the metadata from immutable catalog revisions, validate its committed
-digests, and embed it; the packed metadata is build output rather than a checked-in binary.
+execution. `@magnitudedev/icn` acquires a signed release base plus an optional concrete accelerator
+pack; ICN is not downloaded from a model repository or selected from a user-installed runtime.
+The installation carries the release-bound catalog lock and hardware-independent planner-input
+bundle as authenticated sidecars. Native startup validates their source, template, planner,
+integrity, and exact-coverage identities before becoming ready. Ordinary startup and setup
+therefore do not contact a catalog service, fetch model headers, or depend on a user cache.
+Development hydration and release CI obtain the sidecars explicitly from immutable catalog
+revisions; ordinary TypeScript and Cargo builds perform no catalog network access.
 
 ACN owns the parent scope and application policy. It supplies ICN's storage roots and supported
 binary identity and translates private ICN observations into product-owned inventory, hardware,
@@ -172,41 +169,34 @@ inference, and model-resource release do not extend this deadline.
 
 ## Binary resolution and compatibility
 
-Production releases publish ICN as its own target-specific artifact. The ICN package owns release
-URL construction, bounded download, staging, extraction, manifest and checksum validation, binary
-identity verification, and atomic cache publication. This mirrors SDK ownership of ACN acquisition
-without coupling the two archives. Resolution uses deterministic precedence:
+Production releases publish a CPU-capable ICN base per host and distinct accelerator packs. The ICN
+package shares signed-manifest authentication, bounded download, safe extraction, and
+digest-addressed artifact installation with CLI and SDK acquisition. It alone owns native
+eligibility probing, concrete backend resolution, base/pack composition, installation declaration,
+and native validation.
 
-1. an explicit path supplied for development or tests;
-2. a verified cached binary for the requested Magnitude version and platform;
-3. the matching `magnitude-icn-<platform>.tar.gz` release artifact; and
-4. a development-only PATH lookup when explicitly enabled.
+Production has no requested or cached `auto` policy. Apple arm64 requires Metal. Other hosts prefer
+compatible CUDA, then compatible Vulkan, and select CPU only after successful probes establish
+that no supported accelerator is usable. Probe or operational failure fails ACN startup rather than
+changing backend. Every supervised start probes again before deriving the concrete composition
+identity, so installing a driver can change the next composition without manual cache repair.
 
-The CLI, ACN, and ICN release archives are independent. The npm command remains `magnitude`, while
-the compiled CLI executable is named `magnitude-cli`. ACN does not embed ICN; at startup it supplies
-typed release coordinates to the ICN lifecycle, which verifies a cached binary or downloads and
-atomically publishes the matching release artifact before ACN readiness can succeed.
+An installation is immutable and identified by the authenticated manifest, base, optional pack,
+concrete backend, native build, and backend-module ABI. Its fixed layout contains executable,
+runtime, backend modules, catalog sidecars, and a minimal declaration. Native validation proves the
+running executable belongs to that installation, the selected backend directory contains only the
+declared accelerator family, required devices register, and catalog sidecars are complete.
 
-An unresolved, non-executable, or incompatible binary is an ACN startup failure. There is no silent
-fallback to a different native runtime. Resolution canonicalizes the path and verifies the binary's
-machine-readable identity under a bounded command timeout and output limit.
-
-Linux releases may publish separate CPU and CUDA ICN artifacts for one operating-system and
-architecture target. The Bun composition layer selects the CUDA flavor only when an NVIDIA driver
-is available, permits an explicit CPU or CUDA development override, and otherwise selects the
-generic CPU flavor. This is binary compatibility selection, not hardware topology discovery:
-ICN remains the sole authority for enumerating devices, memory domains, and runtime capabilities.
-The selected artifact's manifest records its compiled backend set, and verification requires that
-set to match the executable's machine-readable identity.
-
-Source development builds use backend-specific Cargo target directories. The selected executable
-is passed to lifecycle resolution explicitly, so a generic build cannot overwrite or replace a
-CUDA build during one development launch.
+`bun dev` prepares the same fixed layout at
+`inference/target/development/installation.json` before starting the client. `MAGNITUDE_ICN_PATH`
+may instead name another `installation.json`; no separate executable or runtime path exists.
+Development preparation may accept an explicit backend override, but that policy is not part of
+production release coordinates.
 
 Compatibility is established by a versioned ICN API protocol identity plus the release's expected
 native build identity. It is not inferred merely because `/health` returned 200, and it need not
-require unrelated package semvers to be textually equal. Development overrides may relax the
-release-build match explicitly, but never the supported API-major or required-capability checks.
+require unrelated package semvers to be textually equal. Development installations still enforce
+the supported API identity and required capabilities.
 
 ## Lifecycle state machine
 
