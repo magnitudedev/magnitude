@@ -27,13 +27,13 @@ export function modelRequestProgressCopy(
     const newCompleted = Math.max(0, completedTokens - cachedTokens)
     const newTotal = Math.max(0, totalTokens - cachedTokens)
     return {
-      primary: `Adding new messages to the model · ${formatTokenCount(newCompleted)} / ${formatTokenCount(newTotal)} tokens`,
-      secondary: `Reusing ${formatTokenCount(cachedTokens)} tokens from earlier messages`,
+      primary: `Prefilling · ${formatTokenCount(newCompleted)} / ${formatTokenCount(newTotal)} input tokens`,
+      secondary: `Using ${formatTokenCount(cachedTokens)} cached tokens`,
     }
   }
 
   return {
-    primary: `Loading conversation into the model · ${formatTokenCount(completedTokens)} / ${formatTokenCount(totalTokens)} tokens`,
+    primary: `Prefilling · ${formatTokenCount(completedTokens)} / ${formatTokenCount(totalTokens)} input tokens`,
     secondary: null,
   }
 }
@@ -61,14 +61,14 @@ export function modelRequestProgressSegments(
     const newCompleted = Math.max(0, completedTokens - cachedTokens)
     const newTotal = Math.max(0, totalTokens - cachedTokens)
     return {
-      label: 'Adding new messages',
-      detail: `${formatTokenCount(newCompleted)} / ${formatTokenCount(newTotal)} tokens`,
-      trailing: `Reusing ${formatTokenCount(cachedTokens)} tokens`,
+      label: 'Prefilling',
+      detail: `${formatTokenCount(newCompleted)} / ${formatTokenCount(newTotal)} input tokens`,
+      trailing: `Using ${formatTokenCount(cachedTokens)} cached tokens`,
     }
   }
   return {
-    label: 'Loading conversation into the model',
-    detail: `${formatTokenCount(completedTokens)} / ${formatTokenCount(totalTokens)} tokens`,
+    label: 'Prefilling',
+    detail: `${formatTokenCount(completedTokens)} / ${formatTokenCount(totalTokens)} input tokens`,
     trailing: null,
   }
 }

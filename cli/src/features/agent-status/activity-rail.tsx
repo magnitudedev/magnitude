@@ -95,7 +95,7 @@ export const ActivityRail = memo(function ActivityRail({
         <text>
           <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
           {' '}
-          <span style={{ fg: theme.foreground }}>Loading model</span>
+          <span style={{ fg: theme.foreground }}>Loading model into memory</span>
           <span style={{ fg: theme.muted }}>{` · ${modelLoadActivity.percentage}%`}</span>
         </text>
       </box>
