@@ -27,6 +27,27 @@ export type OnboardingModelSetupView =
       readonly failure: string | null
     }
 
+/** Keeps forced setup mounted until its exact server-resolved selection is authoritatively ready. */
+export const deriveModelSetupActive = ({
+  forceSetup,
+  onboardingRequired,
+  completionSucceeded,
+  selectedProviderModelId,
+  primary,
+}: {
+  readonly forceSetup: boolean
+  readonly onboardingRequired: boolean
+  readonly completionSucceeded: boolean
+  readonly selectedProviderModelId: ProviderModelId | null
+  readonly primary: LocalInferenceView["slots"]["slots"]["primary"] | null
+}): boolean => {
+  if (onboardingRequired) return true
+  if (!forceSetup || completionSucceeded) return false
+  return selectedProviderModelId === null
+    || primary?._tag !== "Ready"
+    || primary.selection.providerModelId !== selectedProviderModelId
+}
+
 const blockedReasonMessage = (
   reason: Extract<
     LocalInferenceView["slots"]["slots"]["primary"],

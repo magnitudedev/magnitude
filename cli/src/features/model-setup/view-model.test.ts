@@ -3,6 +3,7 @@ import { Option } from "effect"
 import {
   ModelSlotUnloadedLocalModel,
   PRIMARY_SLOT_ID,
+  ProviderModelIdSchema,
 } from "@magnitudedev/sdk"
 import {
   LOCAL_PROVIDER_ID,
@@ -13,6 +14,7 @@ import {
   makeView,
 } from "../local-inference/test-fixtures"
 import {
+  deriveModelSetupActive,
   deriveOnboardingModelSetupView,
   onboardingModelSetupPlaceholder,
 } from "./view-model"
@@ -22,6 +24,58 @@ const selection = {
   providerModelId: TEST_MODEL_ID,
   reasoningEffort: TEST_REASONING_EFFORT,
 }
+
+describe("deriveModelSetupActive", () => {
+  it("preserves ordinary server-required onboarding", () => {
+    expect(deriveModelSetupActive({
+      forceSetup: false,
+      onboardingRequired: true,
+      completionSucceeded: false,
+      selectedProviderModelId: null,
+      primary: null,
+    })).toBe(true)
+  })
+
+  it("stays inactive when onboarding is complete and setup was not forced", () => {
+    expect(deriveModelSetupActive({
+      forceSetup: false,
+      onboardingRequired: false,
+      completionSucceeded: false,
+      selectedProviderModelId: null,
+      primary: makeView().slots.slots.primary,
+    })).toBe(false)
+  })
+
+  it("keeps forced setup active while selection success is ahead of mirrored state", () => {
+    expect(deriveModelSetupActive({
+      forceSetup: true,
+      onboardingRequired: false,
+      completionSucceeded: false,
+      selectedProviderModelId: ProviderModelIdSchema.make("local:new-selection"),
+      primary: makeView().slots.slots.primary,
+    })).toBe(true)
+  })
+
+  it("completes forced setup only when the exact selected model is ready", () => {
+    expect(deriveModelSetupActive({
+      forceSetup: true,
+      onboardingRequired: false,
+      completionSucceeded: false,
+      selectedProviderModelId: TEST_MODEL_ID,
+      primary: makeView().slots.slots.primary,
+    })).toBe(false)
+  })
+
+  it("completes forced setup after an explicit skip", () => {
+    expect(deriveModelSetupActive({
+      forceSetup: true,
+      onboardingRequired: false,
+      completionSucceeded: true,
+      selectedProviderModelId: null,
+      primary: null,
+    })).toBe(false)
+  })
+})
 
 describe("deriveOnboardingModelSetupView", () => {
   it("shows the chooser inside setup once recommendations are ready", () => {

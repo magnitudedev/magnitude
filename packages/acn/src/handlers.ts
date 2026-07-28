@@ -469,7 +469,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
               ),
             }));
             yield* onboarding.reopen("model_setup");
-            return {};
+            return { providerModelId: offering.providerModelId };
           })),
         ),
 

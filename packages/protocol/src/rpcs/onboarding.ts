@@ -31,7 +31,7 @@ export const CompleteOnboardingFlow = Rpc.make("CompleteOnboardingFlow", {
 
 export const SelectOnboardingLocalModel = Rpc.make("SelectOnboardingLocalModel", {
   payload: Schema.Struct({ selection: OnboardingLocalModelSelection }),
-  success: Schema.Struct({}),
+  success: Schema.Struct({ providerModelId: ProviderModelIdSchema }),
   error: OnboardingLocalModelError,
 })
 
