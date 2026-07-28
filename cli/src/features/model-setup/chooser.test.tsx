@@ -5,6 +5,7 @@ import { Option } from "effect"
 import {
   CatalogCandidateIdSchema,
   ModelOfferingTargetIdSchema,
+  ProviderModelIdSchema,
   RecommendationIdSchema,
 } from "@magnitudedev/sdk"
 import { beforeEach, expect, test, vi } from "vitest"
@@ -64,8 +65,10 @@ beforeEach(() => {
 
 const chooserView = () => {
   const remoteCandidateId = CatalogCandidateIdSchema.make("candidate_remote")
+  const remoteTargetId = ModelOfferingTargetIdSchema.make("target_remote")
+  const remoteProviderModelId = ProviderModelIdSchema.make("configuration_remote")
   const remoteModel = makeModel({
-    id: ModelOfferingTargetIdSchema.make("target_remote"),
+    targetId: remoteTargetId,
     catalogCandidateIds: [remoteCandidateId],
     displayName: "Remote Model",
     download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * 1024 ** 3 },
@@ -77,6 +80,8 @@ const chooserView = () => {
     recommendations: [makeRecommendation({
       candidate: makeCatalogCandidate({
         id: remoteCandidateId,
+        targetId: remoteTargetId,
+        providerModelId: remoteProviderModelId,
         displayName: "Remote Model",
         profile: { contextLength: 200_000 },
         estimatedTokensPerSecond: Option.some(36.2),
@@ -87,15 +92,17 @@ const chooserView = () => {
 
 const chooserViewWithInventory = (installedCount: number, downloadCount: number) => {
   const installed = Array.from({ length: installedCount }, (_, index) => makeModel({
-    id: ModelOfferingTargetIdSchema.make(`target_installed_${index + 1}`),
+    targetId: ModelOfferingTargetIdSchema.make(`target_installed_${index + 1}`),
     displayName: `Installed ${index + 1}`,
   }))
   const downloads = Array.from({ length: downloadCount }, (_, index) => {
     const number = index + 1
     const intents = ["balanced", "best_quality", "fastest", "lightweight"] as const
     const candidateId = CatalogCandidateIdSchema.make(`candidate_remote_${number}`)
+    const targetId = ModelOfferingTargetIdSchema.make(`target_remote_${number}`)
+    const providerModelId = ProviderModelIdSchema.make(`configuration_remote_${number}`)
     const model = makeModel({
-      id: ModelOfferingTargetIdSchema.make(`target_remote_${number}`),
+      targetId,
       catalogCandidateIds: [candidateId],
       displayName: `Remote ${number}`,
       download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * 1024 ** 3 },
@@ -109,6 +116,8 @@ const chooserViewWithInventory = (installedCount: number, downloadCount: number)
         : "Balanced local inference.",
       candidate: makeCatalogCandidate({
         id: candidateId,
+        targetId,
+        providerModelId,
         displayName: `Remote ${number}`,
       }),
     })
@@ -247,6 +256,8 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
 test("transitions directly from selection to starting and authoritative download details", async () => {
   const candidate = makeCatalogCandidate({
     id: CatalogCandidateIdSchema.make("candidate_remote"),
+    targetId: ModelOfferingTargetIdSchema.make("target_remote"),
+    providerModelId: ProviderModelIdSchema.make("configuration_remote"),
     displayName: "Remote Model",
     download: {
       _tag: "Downloading",
@@ -289,8 +300,9 @@ test("transitions directly from selection to starting and authoritative download
     await act(async () => press("down"))
     await act(async () => press("enter"))
     expect(onChoose).toHaveBeenCalledWith({
-      _tag: "CatalogCandidate",
-      candidateId: CatalogCandidateIdSchema.make("candidate_remote"),
+      targetId: candidate.targetId,
+      providerModelId: candidate.providerModelId,
+      reasoningEffort: "none",
     })
     await act(view.renderOnce)
     const startingFrame = view.captureCharFrame()

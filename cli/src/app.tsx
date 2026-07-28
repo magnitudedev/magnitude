@@ -24,11 +24,11 @@ import {
   subscribeEphemeralMessage,
   getEphemeralMessageSnapshot,
   useFileWatchBridge,
-  useLocalInferenceState,
+  useOnboardingModelSetup,
   isModelSlotConfigured,
   deriveLocalModelLoadActivity,
 } from '@magnitudedev/client-common'
-import { PRIMARY_SLOT_ID, type SessionOptions } from '@magnitudedev/sdk'
+import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type SessionOptions } from '@magnitudedev/sdk'
 import { authSourceAtom, modelMenuStateAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
 import { useSessionStartup, type SessionStart } from './hooks/use-session-startup'
 import { useTerminalBgDetection } from './hooks/use-terminal-bg-detection'
@@ -164,21 +164,20 @@ function OnboardingGate(
   }
 
   const onboardingRequired = Result.isSuccess(onboarding.state)
-    ? onboarding.state.value.flows.model_setup.required
+    ? !onboarding.state.value.completed
     : true
   const primary = Option.map(slotsSnapshot, ({ state }) => state.slots.primary)
-  const selectedProviderModelId = Result.isSuccess(onboarding.selectLocalModelResult)
-    ? onboarding.selectLocalModelResult.value.providerModelId
-    : null
   const modelSetupActive = deriveModelSetupActive({
     forceSetup: props.forceSetup,
     onboardingRequired,
-    completionSucceeded: Result.isSuccess(onboarding.completeResult),
-    selectedProviderModelId,
-    primary: Option.getOrNull(primary),
+    completionSucceeded: Result.isSuccess(onboarding.updateResult),
   })
   const modelsConfigured = Option.exists(primary, isModelSlotConfigured)
-  const modelsReadyForInitialWork = Option.exists(primary, (slot) => slot._tag === 'Ready')
+  const modelsReadyForInitialWork = Option.exists(primary, (slot) => {
+    if (slot._tag === 'Unassigned' || slot.availability._tag !== 'Available') return false
+    if (slot._tag === 'ConfiguredRemote') return true
+    return Option.exists(slot.instance, (instance) => instance.lifecycle._tag === 'Ready')
+  })
 
   return (
     <CliAppContent
@@ -187,11 +186,8 @@ function OnboardingGate(
       modelsReadyForInitialWork={modelsReadyForInitialWork}
       modelSetupActive={modelSetupActive}
       onboardingRequired={onboardingRequired}
-      completeModelSetup={() => onboarding.complete('model_setup')}
-      selectOnboardingModel={onboarding.selectLocalModel}
-      selectOnboardingModelResult={onboarding.selectLocalModelResult}
-      clearOnboardingModelSelection={onboarding.clearLocalModelSelection}
-      clearOnboardingModelResult={onboarding.clearLocalModelResult}
+      updateOnboarding={onboarding.update}
+      updateOnboardingResult={onboarding.updateResult}
     />
   )
 }
@@ -201,11 +197,8 @@ function CliAppContent(props: CliAppProps & {
   readonly modelsReadyForInitialWork: boolean
   readonly modelSetupActive: boolean
   readonly onboardingRequired: boolean
-  readonly completeModelSetup: () => void
-  readonly selectOnboardingModel: ReturnType<typeof useOnboardingState>["selectLocalModel"]
-  readonly selectOnboardingModelResult: ReturnType<typeof useOnboardingState>["selectLocalModelResult"]
-  readonly clearOnboardingModelSelection: ReturnType<typeof useOnboardingState>["clearLocalModelSelection"]
-  readonly clearOnboardingModelResult: ReturnType<typeof useOnboardingState>["clearLocalModelResult"]
+  readonly updateOnboarding: ReturnType<typeof useOnboardingState>["update"]
+  readonly updateOnboardingResult: ReturnType<typeof useOnboardingState>["updateResult"]
 }): ReactNode {
   useSessionPreload(!props.modelSetupActive)
   useFileWatchBridge()
@@ -232,10 +225,11 @@ function CliAppContent(props: CliAppProps & {
   const widget = useRecentChatsWidgetState()
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy()
   const ephemeralMessage = useSyncExternalStore(subscribeEphemeralMessage, getEphemeralMessageSnapshot)
-  const local = useLocalInferenceState()
+  const onboardingSetup = useOnboardingModelSetup(props.updateOnboarding)
+  const local = onboardingSetup.local
   const localInference = local.state
   const localInferenceSnapshot = Result.value(localInference)
-  const localInferenceView = Option.getOrNull(localInferenceSnapshot)
+  const localInferenceView = onboardingSetup.view
   const downloadingModelCount = Option.match(localInferenceSnapshot, {
     onNone: () => 0,
     onSome: ({ models }) => models.models.filter((model) => model.download._tag === 'Downloading').length,
@@ -248,14 +242,22 @@ function CliAppContent(props: CliAppProps & {
     onNone: () => null,
     onSome: (state) => deriveLocalModelLoadActivity(state.slots, rootSlotId),
   })
-  const clearOnboardingModelPending = Result.isWaiting(props.clearOnboardingModelResult)
-  const clearOnboardingModelError = Result.isFailure(props.clearOnboardingModelResult)
-    ? Cause.pretty(props.clearOnboardingModelResult.cause)
+  const cancelDownloadError = Result.isFailure(local.cancelDownloadResult)
+    ? Cause.pretty(local.cancelDownloadResult.cause)
     : null
-  const selectOnboardingModelPending = Result.isWaiting(props.selectOnboardingModelResult)
-  const selectOnboardingModelError = Result.isFailure(props.selectOnboardingModelResult)
-    ? Cause.pretty(props.selectOnboardingModelResult.cause)
+  const activationMutationError = Result.isFailure(local.loadModelResult)
+    ? Cause.pretty(local.loadModelResult.cause)
+    : Result.isFailure(local.slotAssignment)
+      ? Cause.pretty(local.slotAssignment.cause)
+      : null
+  const completionMutationError = Result.isFailure(props.updateOnboardingResult)
+    ? Cause.pretty(props.updateOnboardingResult.cause)
     : null
+  const completeModelSetup = useCallback(() => {
+    void props.updateOnboarding(true)
+  }, [props.updateOnboarding])
+  const selectOnboardingModel = onboardingSetup.select
+  const cancelOnboardingModelSetup = onboardingSetup.cancel
   const chatColumn = useLocalWidth()
   const chatColumnWidth = chatColumn.width ?? 80
   const clientWorkingDirectory = process.cwd()
@@ -278,6 +280,7 @@ function CliAppContent(props: CliAppProps & {
   const setupView = deriveOnboardingModelSetupView({
     active: props.modelSetupActive,
     onboardingRequired: props.onboardingRequired,
+    submittedProviderModelId: onboardingSetup.submittedProviderModelId,
     state: localInferenceView,
   })
   const setupSurface = (() => {
@@ -287,7 +290,7 @@ function CliAppContent(props: CliAppProps & {
         <OnboardingModelPreparation
           state={setupView.state}
           width={chatColumnWidth}
-          onSkip={props.completeModelSetup}
+          onSkip={completeModelSetup}
         />
       )
       case 'Downloading': return (
@@ -299,48 +302,77 @@ function CliAppContent(props: CliAppProps & {
           operation={{
             _tag: 'Downloading',
             candidate: setupView.candidate,
-            cancelling: clearOnboardingModelPending,
-            cancelError: clearOnboardingModelError,
-            onCancel: props.clearOnboardingModelSelection,
-            onRetry: () => props.selectOnboardingModel({
-              _tag: 'CatalogCandidate',
-              candidateId: setupView.candidate.id,
+            cancelling: Result.isWaiting(local.cancelDownloadResult),
+            cancelError: cancelDownloadError,
+            onCancel: cancelOnboardingModelSetup,
+            onRetry: () => selectOnboardingModel({
+              targetId: setupView.candidate.targetId,
+              providerModelId: setupView.candidate.providerModelId,
+              reasoningEffort: Option.getOrElse(
+                setupView.candidate.capabilities.reasoning.defaultEffort,
+                () => ReasoningEffortSchema.make("none"),
+              ),
             }),
           }}
-          onChoose={props.selectOnboardingModel}
-          onContinue={props.completeModelSetup}
-          onSkip={props.completeModelSetup}
+          onChoose={selectOnboardingModel}
+          onContinue={completeModelSetup}
+          onSkip={completeModelSetup}
         />
       )
-      case 'Loading': return (
+      case 'Activating': return (
         <OnboardingModelChooser
           state={setupView.state}
           width={chatColumnWidth}
           pending={false}
           error={null}
           operation={{
-            _tag: 'Loading',
+            _tag: 'Activating',
             providerModelId: setupView.providerModelId,
             displayName: setupView.displayName,
-            failure: setupView.failure,
-            onRetry: () => local.loadModel(PRIMARY_SLOT_ID),
-            onChooseAnother: props.clearOnboardingModelSelection,
+            phase: setupView.phase === "Ready" && completionMutationError !== null
+              ? "Failed"
+              : setupView.phase === "Preparing" && activationMutationError !== null
+              ? "Failed"
+              : setupView.phase,
+            failure: setupView.failure
+              ?? (setupView.phase === "Ready"
+                ? completionMutationError
+                : activationMutationError),
+            onRetry: () => {
+              const candidate = setupView.state.models.recommendations._tag === "Ready"
+                ? setupView.state.models.recommendations.catalog.find(({ providerModelId }) =>
+                    providerModelId === setupView.providerModelId)
+                : undefined
+              if (candidate) {
+                void selectOnboardingModel({
+                  targetId: candidate.targetId,
+                  providerModelId: candidate.providerModelId,
+                  reasoningEffort: Option.getOrElse(
+                    candidate.capabilities.reasoning.defaultEffort,
+                    () => ReasoningEffortSchema.make("none"),
+                  ),
+                })
+              } else {
+                void local.loadModel(PRIMARY_SLOT_ID)
+              }
+            },
+            onChooseAnother: cancelOnboardingModelSetup,
           }}
-          onChoose={props.selectOnboardingModel}
-          onContinue={props.completeModelSetup}
-          onSkip={props.completeModelSetup}
+          onChoose={selectOnboardingModel}
+          onContinue={completeModelSetup}
+          onSkip={completeModelSetup}
         />
       )
       case 'Choosing': return (
         <OnboardingModelChooser
           state={setupView.state}
           width={chatColumnWidth}
-          pending={selectOnboardingModelPending}
-          error={selectOnboardingModelError}
+          pending={false}
+          error={null}
           operation={null}
-          onChoose={props.selectOnboardingModel}
-          onContinue={props.completeModelSetup}
-          onSkip={props.completeModelSetup}
+          onChoose={selectOnboardingModel}
+          onContinue={completeModelSetup}
+          onSkip={completeModelSetup}
         />
       )
     }
@@ -349,6 +381,7 @@ function CliAppContent(props: CliAppProps & {
   const activityRail = (
     <ActivityRailContainer
       modelLoadActivity={localModelLoadActivity}
+      onStopModel={local.stopModel}
       width={chatColumnWidth}
       agentActivityEnabled={!props.modelSetupActive}
     />

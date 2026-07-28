@@ -157,7 +157,7 @@ export const preparationFromProviderProjection = (
 }
 
 const aggregatePreparation = (
-  modelId: ModelOfferingTargetId,
+  targetId: ModelOfferingTargetId,
   target: ModelOfferingTarget,
   entries: ReadonlyMap<string, ModelPackageEntry>,
   configuredProviderModelIds: readonly ProviderModelId[],
@@ -180,7 +180,7 @@ const aggregatePreparation = (
   if (targetEntries.some((entry) => entry?.inspection._tag === "Pending")) {
     return { _tag: "Preparing" }
   }
-  const setup = autoSetup.get(modelId)
+  const setup = autoSetup.get(targetId)
   if (setup) return setup._tag === "Preparing"
     ? setup
     : preparationFromReconciliationFailure(configuredProviderModelIds, setup.failure)
@@ -195,9 +195,8 @@ const aggregatePreparation = (
 export interface LocalModelsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: LocalModelsState }>
-  readonly refresh: Effect.Effect<void>
   readonly target: (
-    modelId: ModelOfferingTargetId,
+    targetId: ModelOfferingTargetId,
   ) => Effect.Effect<ModelOfferingTarget | undefined, LocalInferenceError>
 }
 
@@ -288,17 +287,17 @@ export const LocalModelsLive: Layer.Layer<
       })
     }
     for (const recommendation of recommendationEntries) {
-      targets.set(recommendation.modelId, {
-        id: recommendation.modelId,
+      targets.set(recommendation.targetId, {
+        id: recommendation.targetId,
         target: recommendation.configuration.target,
         displayName: recommendation.displayName,
         description: recommendation.description,
       })
     }
     for (const offering of configured) {
-      const current = targets.get(offering.modelId)
-      targets.set(offering.modelId, {
-        id: offering.modelId,
+      const current = targets.get(offering.targetId)
+      targets.set(offering.targetId, {
+        id: offering.targetId,
         target: offering.configuration.target,
         displayName: current?.displayName ?? sourceName(offering.configuration.target),
         description: current?.description ?? "",
@@ -306,9 +305,9 @@ export const LocalModelsLive: Layer.Layer<
     }
     const providerIdsByTarget = new Map<ModelOfferingTargetId, ProviderModelId[]>()
     for (const offering of configured) {
-      const ids = providerIdsByTarget.get(offering.modelId) ?? []
+      const ids = providerIdsByTarget.get(offering.targetId) ?? []
       ids.push(offering.providerModelId)
-      providerIdsByTarget.set(offering.modelId, ids)
+      providerIdsByTarget.set(offering.targetId, ids)
     }
     const providerEntries = new Map(
       projectedOfferings.entries.map((entry) => [entry.providerModelId, entry]),
@@ -332,10 +331,10 @@ export const LocalModelsLive: Layer.Layer<
     const models: LocalModel[] = [...targets.values()].map((projection): LocalModel => {
       const modelPackages = targetPackages(projection.target)
       return {
-        id: projection.id,
+        targetId: projection.id,
         catalogCandidateIds: recommendationState._tag === "Ready"
           ? recommendationState.catalog
-              .filter(({ modelId }) => modelId === projection.id)
+              .filter(({ candidate }) => candidate.targetId === projection.id)
               .map(({ candidate }) => candidate.id)
           : [],
         providerModelIds: providerIdsByTarget.get(projection.id) ?? [],
@@ -363,7 +362,7 @@ export const LocalModelsLive: Layer.Layer<
     }).sort((left, right) => left.displayName.localeCompare(right.displayName))
     const catalogCandidates = recommendationState._tag === "Ready"
       ? recommendationState.catalog.map((entry) => {
-          const model = models.find(({ id }) => id === entry.modelId)
+          const model = models.find(({ targetId }) => targetId === entry.candidate.targetId)
           const preparation = !model || model.preparation._tag === "NotDownloaded"
             ? { _tag: "NotDownloaded" as const }
             : model.preparation._tag === "Preparing"
@@ -438,17 +437,16 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     snapshot: mirror.get,
     changes: mirror.changes,
-    refresh: project,
-    target: (modelId) => Effect.gen(function* () {
+    target: (targetId) => Effect.gen(function* () {
       const recommendationState = (yield* recommendations.snapshot).state
       const recommendation = recommendationState._tag === "Ready"
-        ? recommendationState.recommendations.find((candidate) => candidate.modelId === modelId)
+        ? recommendationState.recommendations.find((candidate) => candidate.targetId === targetId)
         : undefined
       if (recommendation) return recommendation.configuration.target
-      const offering = (yield* offerings.list).find((candidate) => candidate.modelId === modelId)
+      const offering = (yield* offerings.list).find((candidate) => candidate.targetId === targetId)
       if (offering) return offering.configuration.target
       const entry = (yield* packages.snapshot).state.entries.find((candidate) =>
-        Option.exists(candidate.targetId, (targetId) => targetId === modelId))
+        Option.exists(candidate.targetId, (candidateTargetId) => candidateTargetId === targetId))
       return entry ? { _tag: "Package" as const, package: entry.package } : undefined
     }),
   })

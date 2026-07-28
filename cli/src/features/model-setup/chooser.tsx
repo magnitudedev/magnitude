@@ -7,12 +7,13 @@ import {
   subscribeAnimationTick,
   truncateToDisplayWidth,
   type LocalInferenceView,
+  type OnboardingModelChoice,
 } from "@magnitudedev/client-common"
 import type {
   LocalModelCatalogCandidate,
-  OnboardingLocalModelSelection,
   ProviderModelId,
 } from "@magnitudedev/sdk"
+import { ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
@@ -57,25 +58,19 @@ const actionLabel = (selection: LocalInferenceSelection): string => {
 
 const onboardingSelection = (
   selection: LocalInferenceSelection,
-): OnboardingLocalModelSelection | null => {
+): ProviderModelId | null => {
   if (Option.isSome(selection.recommendation)) {
-    return {
-      _tag: "CatalogCandidate",
-      candidateId: selection.recommendation.value.candidate.id,
-    }
+    return selection.recommendation.value.candidate.providerModelId
   }
-  return Option.match(selection.providerModelId, {
-    onNone: () => null,
-    onSome: (providerModelId) => ({ _tag: "InstalledModel", providerModelId }),
-  })
+  return Option.getOrNull(selection.providerModelId)
 }
 
 const matchesOnboardingSelection = (
   selection: LocalInferenceSelection,
-  submitted: OnboardingLocalModelSelection,
-): boolean => submitted._tag === "CatalogCandidate"
-  ? selection.model.catalogCandidateIds.includes(submitted.candidateId)
-  : Option.contains(selection.providerModelId, submitted.providerModelId)
+  submitted: ProviderModelId,
+): boolean => Option.contains(selection.providerModelId, submitted)
+  || Option.exists(selection.recommendation, ({ candidate }) =>
+    candidate.providerModelId === submitted)
 
 const ModelRow = ({
   selection,
@@ -234,9 +229,10 @@ export type OnboardingModelChooserOperation =
       readonly onRetry: () => void
     }
   | {
-      readonly _tag: "Loading"
+      readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly displayName: string
+      readonly phase: "Preparing" | "Loading" | "Ready" | "Failed"
       readonly failure: string | null
       readonly onRetry: () => void
       readonly onChooseAnother: () => void
@@ -257,7 +253,7 @@ export function OnboardingModelChooser({
   readonly pending: boolean
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
-  readonly onChoose: (selection: OnboardingLocalModelSelection) => void
+  readonly onChoose: (choice: OnboardingModelChoice) => void
   readonly onContinue: () => void
   readonly onSkip: () => void
 }): ReactNode {
@@ -265,7 +261,7 @@ export function OnboardingModelChooser({
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const [submittedSelection, setSubmittedSelection] =
-    useState<OnboardingLocalModelSelection | null>(null)
+    useState<ProviderModelId | null>(null)
   const activeSelectionId = operation === null
     ? Option.fromNullable(submittedSelection === null
       ? undefined
@@ -310,7 +306,14 @@ export function OnboardingModelChooser({
     const value = onboardingSelection(selection)
     if (value) {
       setSubmittedSelection(value)
-      onChoose(value)
+      onChoose({
+        targetId: selection.model.targetId,
+        providerModelId: value,
+        reasoningEffort: Option.getOrElse(
+          selection.reasoningEffort,
+          () => ReasoningEffortSchema.make("none"),
+        ),
+      })
     }
   }, [onChoose, onContinue, pending])
 
@@ -461,10 +464,10 @@ export function OnboardingModelChooser({
     <text style={{ fg: theme.muted }}>No compatible models found.</text>
   )
   const startingDownloadCandidate = starting
-    && submittedSelection?._tag === "CatalogCandidate"
+    && submittedSelection !== null
     && state.models.recommendations._tag === "Ready"
-    ? state.models.recommendations.catalog.find(({ id }) =>
-        id === submittedSelection.candidateId)
+    ? state.models.recommendations.catalog.find(({ providerModelId }) =>
+        providerModelId === submittedSelection)
       ?? (selected && Option.isSome(selected.recommendation)
         ? selected.recommendation.value.candidate
         : undefined)
@@ -485,11 +488,12 @@ export function OnboardingModelChooser({
         onRetry: operation.onRetry,
       }}
     />
-  ) : operation?._tag === "Loading" ? (
+  ) : operation?._tag === "Activating" ? (
     <OnboardingModelLoadingDetails
       displayName={operation.displayName}
       width={detailWidth}
       height={detailContentHeight}
+      phase={operation.phase}
       failed={operation.failure}
       onRetry={operation.onRetry}
       onChooseAnother={() => {
@@ -504,11 +508,12 @@ export function OnboardingModelChooser({
       height={detailContentHeight}
       operation={{ _tag: "Starting" }}
     />
-  ) : starting && submittedSelection?._tag === "InstalledModel" && selected ? (
+  ) : starting && selected ? (
     <OnboardingModelLoadingDetails
       displayName={selected.model.displayName}
       width={detailWidth}
       height={detailContentHeight}
+      phase="Preparing"
       failed={null}
       onRetry={() => undefined}
       onChooseAnother={() => undefined}
@@ -534,17 +539,21 @@ export function OnboardingModelChooser({
     </box>
   )
   const interactionHint = pending
-    ? submittedSelection?._tag === "CatalogCandidate" ? "Starting download…" : "Preparing model…"
+    ? startingDownloadCandidate ? "Starting download…" : "Preparing model…"
     : operation?._tag === "Downloading"
       ? operation.candidate.download._tag === "Failed"
         ? "Download failed · Retry or choose another model"
         : "Download in progress · Esc cancel"
-      : operation?._tag === "Loading"
-        ? operation.failure
+      : operation?._tag === "Activating"
+        ? operation.phase === "Failed"
           ? "Model loading failed"
-          : "Loading model into memory…"
+          : operation.phase === "Loading"
+            ? "Loading model into memory…"
+            : operation.phase === "Ready"
+              ? "Finishing setup…"
+              : "Preparing model…"
         : starting
-          ? submittedSelection?._tag === "CatalogCandidate" ? "Starting download…" : "Preparing model…"
+          ? startingDownloadCandidate ? "Starting download…" : "Preparing model…"
           : "↑/↓ choose · Enter select · Esc skip for now"
 
   return (
@@ -620,6 +629,7 @@ function OnboardingModelLoadingDetails({
   displayName,
   width,
   height,
+  phase,
   failed,
   onRetry,
   onChooseAnother,
@@ -627,6 +637,7 @@ function OnboardingModelLoadingDetails({
   readonly displayName: string
   readonly width: number
   readonly height: number
+  readonly phase: "Preparing" | "Loading" | "Ready" | "Failed"
   readonly failed: string | null
   readonly onRetry: () => void
   readonly onChooseAnother: () => void
@@ -648,7 +659,13 @@ function OnboardingModelLoadingDetails({
       <DetailRow width={width}>
         <text style={{ fg: theme.foreground, width }} attributes={TextAttributes.BOLD} wrapMode="none">
           {truncateToDisplayWidth(
-            failed ? `Couldn’t load ${displayName}` : `Loading ${displayName} into memory`,
+            failed
+              ? `Couldn’t load ${displayName}`
+              : phase === "Loading"
+                ? `Loading ${displayName} into memory`
+                : phase === "Ready"
+                  ? `Finishing setup for ${displayName}`
+                  : `Preparing ${displayName}`,
             width,
           )}
         </text>
@@ -669,7 +686,16 @@ function OnboardingModelLoadingDetails({
           </box>
         </>
       ) : (
-        <text><span fg={theme.primary}>{spinner} </span><span fg={theme.muted}>Preparing the model for use…</span></text>
+        <text>
+          <span fg={theme.primary}>{spinner} </span>
+          <span fg={theme.muted}>
+            {phase === "Loading"
+              ? "Loading model weights…"
+              : phase === "Ready"
+                ? "Finishing setup…"
+                : "Preparing the model for use…"}
+          </span>
+        </text>
       )}
     </box>
   )

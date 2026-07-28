@@ -12,8 +12,11 @@ import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import {
   deriveHardwareMemoryView,
+  deriveCurrentLocalModel,
   modelMemoryStatusDetail,
   modelMemoryStatusLabel,
+  modelSlotInstanceId,
+  modelSlotResidentAllocation,
   requiredMemoryBytes,
   providerModelMemoryConditions,
   selectedSlotModel,
@@ -27,6 +30,7 @@ import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelCatalogLifecycle,
+  ReasoningEffortSchema,
   type LocalModel,
   type LocalModelCatalogCandidate,
   type LocalModelRecommendation,
@@ -42,7 +46,6 @@ import {
 } from "../../state/cli-atoms"
 import { SingleLineInput } from "../composer/single-line-input"
 import {
-  describeResidentModel,
   describeLocalHardware,
   formatBytes,
   localInferenceProgressLines,
@@ -158,7 +161,6 @@ export function ModelMenusContainer({
         maxHeight: "100%",
         minHeight: 0,
         width: "100%",
-        marginTop: 1,
         flexShrink: 0,
         flexDirection: "column",
         backgroundColor: "transparent",
@@ -417,6 +419,9 @@ const ModelsMenu = memo(function ModelsMenu({
     onNone: () => null,
     onSome: (snapshot) => snapshot.slots.slots.primary,
   })
+  const residentAllocation = primarySlot === null
+    ? Option.none()
+    : modelSlotResidentAllocation(primarySlot)
   const detailIsLocal = detail?.providerId === LOCAL_PROVIDER_ID
   const detailIsSelected = detail !== null && providerModelKey(detail) === selectedKey
   const detailLocalModel = detailIsLocal && detail
@@ -431,30 +436,35 @@ const ModelsMenu = memo(function ModelsMenu({
     ? localCatalogCandidates.find(({ id }) => detailLocalModel.catalogCandidateIds.includes(id))
     : undefined
   const detailActions = useMemo(() => {
-    if (!detail) return [] as readonly ("select" | "load" | "unload" | "catalog")[]
-    const actions: ("select" | "load" | "unload" | "catalog")[] = []
-    const memoryConditions = providerModelMemoryConditions(detail, hardware)
+    if (!detail) return [] as readonly ("select" | "load" | "stop" | "catalog")[]
+    const actions: ("select" | "load" | "stop" | "catalog")[] = []
+    const memoryConditions = providerModelMemoryConditions(detail, hardware, residentAllocation)
     if (!detailIsSelected
       && detail.availability._tag === "Available"
       && detail.supportedSlots.includes(PRIMARY_SLOT_ID)) actions.push("select")
     if (detailIsLocal
       && detailIsSelected
-      && primarySlot?._tag === "UnloadedLocalModel"
-      && !memoryConditions.evidenceUnavailable
-      && !memoryConditions.exceedsCapacity
-      && !memoryConditions.lacksCurrentHeadroom) actions.push("load")
-    if (detailIsLocal && detailIsSelected && primarySlot?._tag === "Ready") actions.push("unload")
+      && primarySlot?._tag === "ConfiguredLocal"
+      && primarySlot.actions.some((action) => action === "Load" || action === "RetryLoad")) {
+      actions.push("load")
+    }
+    if (detailIsLocal
+      && detailIsSelected
+      && primarySlot
+      && primarySlot._tag === "ConfiguredLocal"
+      && primarySlot.actions.includes("Stop")) actions.push("stop")
     if (detailCatalogCandidate) actions.push("catalog")
     return actions
-  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, hardware, primarySlot])
+  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, hardware, primarySlot, residentAllocation])
   const focusedDetailAction = detailActions[Math.min(detailActionIndex, Math.max(0, detailActions.length - 1))]
 
   const statusFor = useCallback((model: ProviderModelCatalogEntry): string => {
     const isSelected = providerModelKey(model) === selectedKey
     if (model.providerId === LOCAL_PROVIDER_ID) {
-      const memoryConditions = providerModelMemoryConditions(model, hardware)
+      const memoryConditions = providerModelMemoryConditions(model, hardware, residentAllocation)
       if (isSelected
-        && (primarySlot?._tag === "Ready" || primarySlot?._tag === "LoadingLocalModel")
+        && primarySlot?._tag === "ConfiguredLocal"
+        && Option.isSome(primarySlot.instance)
         && memoryConditions.lacksCurrentHeadroom) return "Selected"
       const memoryLabel = modelMemoryStatusLabel(memoryConditions)
       if (memoryLabel !== "") return memoryLabel
@@ -462,7 +472,7 @@ const ModelsMenu = memo(function ModelsMenu({
     }
     if (isSelected) return "Selected"
     return model.providerId === LOCAL_PROVIDER_ID ? "Installed" : "Available"
-  }, [hardware, primarySlot, selectedKey])
+  }, [hardware, primarySlot, residentAllocation, selectedKey])
 
   const choose = useCallback((model: ProviderModelCatalogEntry) => {
     if (!model.supportedSlots.includes(PRIMARY_SLOT_ID)) return
@@ -481,9 +491,14 @@ const ModelsMenu = memo(function ModelsMenu({
     if (!detail) return
     if (action === "select") choose(detail)
     else if (action === "load") local.loadModel(PRIMARY_SLOT_ID)
-    else if (action === "unload") local.unloadModel(PRIMARY_SLOT_ID)
+    else if (action === "stop" && primarySlot) {
+      Option.match(modelSlotInstanceId(primarySlot), {
+        onNone: () => {},
+        onSome: local.stopModel,
+      })
+    }
     else if (detailCatalogCandidate) openCatalogDetail(detailCatalogCandidate.id)
-  }, [choose, detail, detailCatalogCandidate, local, openCatalogDetail])
+  }, [choose, detail, detailCatalogCandidate, local, openCatalogDetail, primarySlot])
 
   bindMenuKeyHandler(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
@@ -553,7 +568,7 @@ const ModelsMenu = memo(function ModelsMenu({
     const detailActionLabel = {
       select: "Use this model",
       load: "Load model",
-      unload: "Unload model",
+      stop: "Stop model",
       catalog: "View in Catalog",
     } as const
     return (
@@ -574,9 +589,9 @@ const ModelsMenu = memo(function ModelsMenu({
           <text style={{ fg: theme.muted }}>
             {detailIsLocal ? "Local" : "Cloud"} · {formatContextWindow(detail.contextWindow)} context · {statusFor(detail)}
           </text>
-          {detailIsLocal && modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware)) !== "" && (
+          {detailIsLocal && modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware, residentAllocation)) !== "" && (
             <text style={{ fg: theme.warning }}>
-              {modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware))}
+              {modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware, residentAllocation))}
             </text>
           )}
           <text style={{ fg: theme.muted }}>
@@ -629,7 +644,7 @@ const ModelsMenu = memo(function ModelsMenu({
         </box>
         {calibrating.map((model, index) => (
           <box
-            key={`calibrating:${model.id}`}
+            key={`calibrating:${model.targetId}`}
             style={{
               flexDirection: "row",
               width: "100%",
@@ -772,12 +787,19 @@ const CatalogMenu = memo(function CatalogMenu({
   const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.download._tag === "Downloading"
       || candidate.download._tag === "Downloaded") return
-    local.downloadCatalogModel(candidate.id)
+    void local.downloadModel(candidate.targetId)
   }, [local])
 
   const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.preparation._tag !== "Installed") return
-    local.selectCatalogModel(candidate.id)
+    void local.assignSlot(PRIMARY_SLOT_ID, {
+      providerId: LOCAL_PROVIDER_ID,
+      providerModelId: candidate.providerModelId,
+      reasoningEffort: Option.getOrElse(
+        candidate.capabilities.reasoning.defaultEffort,
+        () => ReasoningEffortSchema.make("none"),
+      ),
+    })
   }, [local])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
@@ -787,7 +809,7 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "cancel") {
-      local.cancelCatalogModelDownload(detail.id)
+      local.cancelModelDownload(detail.targetId)
       return
     }
     if (action === "select") {
@@ -822,7 +844,7 @@ const CatalogMenu = memo(function CatalogMenu({
         && !key.option
       if (confirmsDelete) {
         const candidate = candidates.find(({ id }) => id === pendingDeleteId)
-        if (candidate?.download._tag === "Downloaded") local.deleteCatalogModel(candidate.id)
+        if (candidate?.download._tag === "Downloaded") local.deleteLocalModel(candidate.targetId)
         setPendingDeleteId(null)
         key.preventDefault()
         return
@@ -852,7 +874,7 @@ const CatalogMenu = memo(function CatalogMenu({
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
       if (cursor.download._tag === "Downloading") {
-        local.cancelCatalogModelDownload(cursor.id)
+        local.cancelModelDownload(cursor.targetId)
         key.preventDefault()
       } else if (cursor.download._tag === "Downloaded") {
         setPendingDeleteId(cursor.id)
@@ -1007,7 +1029,6 @@ const CatalogMenu = memo(function CatalogMenu({
             </Button>
           )
         })}
-        {Option.isSome(local.mutationFailure) && <text style={{ fg: theme.error }}>{Cause.pretty(local.mutationFailure.value.cause)}</text>}
       </scrollbox>
     </>
   )
@@ -1019,13 +1040,59 @@ const HardwareMenu = memo(function HardwareMenu({
   const theme = useTheme()
   const hardwareState = useLocalInferenceHardware()
   const config = useModelConfig()
-  const snapshot = Result.value(hardwareState)
+  const local = useLocalInferenceState()
+  const hardwareSnapshot = Result.value(hardwareState)
+  const slotsSnapshot = Result.value(config.slots)
+  const currentSlot = Option.flatMap(slotsSnapshot, ({ state }) => {
+    const slot = state.slots.primary
+    return slot._tag === "ConfiguredLocal"
+      ? Option.some(slot)
+      : Option.none()
+  })
+  const currentModel = deriveCurrentLocalModel(
+    Option.map(currentSlot, (slot) => slot),
+  )
+  const currentResidentAllocation = Option.flatMap(
+    currentSlot,
+    modelSlotResidentAllocation,
+  )
+  const action = Option.match(currentSlot, {
+    onNone: () => Option.none<"load" | "stop">(),
+    onSome: (slot) => slot.actions.includes("Stop")
+      ? Option.some("stop" as const)
+      : slot.actions.some((candidate) => candidate === "Load" || candidate === "RetryLoad")
+        ? Option.some("load" as const)
+        : Option.none(),
+  })
+  const runAction = useCallback(() => {
+    if (Option.isNone(action)) return
+    if (action.value === "load") {
+      local.loadModel(PRIMARY_SLOT_ID)
+      return
+    }
+    Option.flatMap(currentSlot, modelSlotInstanceId).pipe(
+      Option.match({
+        onNone: () => {},
+        onSome: local.stopModel,
+      }),
+    )
+  }, [action, currentSlot, local])
 
-  bindMenuKeyHandler(useCallback(() => {}, []))
+  bindMenuKeyHandler(useCallback((key: KeyEvent) => {
+    if (key.defaultPrevented) return
+    if (key.name === "up" || key.name === "down") {
+      key.preventDefault()
+      return
+    }
+    if ((key.name === "return" || key.name === "enter") && Option.isSome(action)) {
+      key.preventDefault()
+      runAction()
+    }
+  }, [action, runAction]))
 
   return (
     <>
-      <MenuHeader title="Hardware" subtitle="View detected hardware" />
+      <MenuHeader title="Hardware" hints="↑↓ navigate · Enter choose · Esc close" />
       <scrollbox
         scrollX={false}
         style={{
@@ -1037,7 +1104,7 @@ const HardwareMenu = memo(function HardwareMenu({
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}
       >
-        {Option.match(snapshot, {
+        {Option.match(hardwareSnapshot, {
           onNone: () => (
             <text style={{ fg: Result.isFailure(hardwareState) ? theme.error : theme.muted }}>
               {Result.isFailure(hardwareState) ? "Hardware detection is unavailable." : "Detecting local-inference hardware…"}
@@ -1045,11 +1112,6 @@ const HardwareMenu = memo(function HardwareMenu({
           ),
           onSome: ({ state: detectedHardware }) => {
             const hardware = describeLocalHardware(detectedHardware)
-            const memory = deriveHardwareMemoryView(detectedHardware)
-            const resident = describeResidentModel(
-              detectedHardware,
-              Option.map(Result.value(config.catalog), ({ state }) => state),
-            )
             return (
               <>
                 <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
@@ -1060,49 +1122,103 @@ const HardwareMenu = memo(function HardwareMenu({
                 {hardware.accelerators.length === 0 && !detectedHardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory") && (
                   <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
                 )}
-                {Option.match(resident, {
-                  onNone: () => (
-                    <box style={{
-                      borderStyle: "single",
-                      borderColor: theme.muted,
-                      flexDirection: "column",
-                      paddingLeft: 1,
-                      paddingRight: 1,
-                      marginTop: 1,
-                    }}>
-                      <text style={{ fg: theme.muted }}>No local model is running</text>
-                    </box>
-                  ),
-                  onSome: (model) => (
-                    <box style={{
-                      borderStyle: "single",
-                      borderColor: theme.primary,
-                      flexDirection: "column",
-                      paddingLeft: 1,
-                      paddingRight: 1,
-                      marginTop: 1,
-                    }}>
-                      <box style={{ flexDirection: "row" }}>
-                        <text style={{ fg: theme.muted, flexGrow: 1 }} attributes={TextAttributes.BOLD}>RUNNING MODEL</text>
-                        <text style={{ fg: theme.primary }}>● ACTIVE</text>
-                      </box>
-                      <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{model.displayName}</text>
-                      <box style={{ flexDirection: "row", paddingTop: 1 }}>
-                        <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
-                        <text style={{ fg: theme.foreground, width: 16 }}>{formatContextWindow(model.contextWindowTokens)} tokens</text>
-                        <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
-                        <text style={{ fg: theme.foreground }}>{model.parallelSequences}</text>
-                      </box>
-                    </box>
-                  ),
-                })}
-                <box style={{ flexDirection: "column", paddingTop: 1 }}>
-                  {memory.domains.map((domain) => <HardwareMemoryDomain key={domain.id} domain={domain} />)}
-                </box>
               </>
             )
           },
         })}
+        <box style={{ flexDirection: "column", marginTop: 1 }}>
+          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>CURRENT MODEL</text>
+          {currentModel._tag === "NoSelection"
+            ? <text style={{ fg: theme.muted }}>No local model selected</text>
+            : (() => {
+              const actualAllocation =
+                currentModel._tag === "Running"
+                  ? Option.some(currentModel.allocation)
+                  : currentModel._tag === "Loading"
+                  || currentModel._tag === "Stopping"
+                  ? currentModel.allocation
+                  : Option.flatMap(currentModel.preview, (currentPreview) =>
+                    currentPreview._tag === "Available"
+                      ? Option.some(currentPreview.allocation)
+                      : Option.none())
+              const parallelismLabel = Option.match(actualAllocation, {
+                onNone: () =>
+                  (currentModel._tag === "NotLoaded" || currentModel._tag === "Failed")
+                    && Option.exists(
+                      currentModel.preview,
+                      (currentPreview) => currentPreview._tag === "Unavailable",
+                    )
+                    ? "Unable to load now"
+                    : "—",
+                onSome: (allocation) =>
+                  currentModel._tag === "NotLoaded" || currentModel._tag === "Failed"
+                    ? `${allocation.parallelSequences} if loaded now`
+                    : String(allocation.parallelSequences),
+              })
+              const status = currentModel._tag === "NotLoaded"
+                ? "NOT LOADED"
+                : currentModel._tag === "Loading"
+                  ? `LOADING · ${currentModel.percentage}%`
+                  : currentModel._tag === "Running"
+                    ? "RUNNING"
+                    : currentModel._tag === "Stopping"
+                      ? "STOPPING"
+                      : "FAILED"
+              return (
+                <>
+                  <box style={{ flexDirection: "row" }}>
+                    <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD}>{currentModel.displayName}</text>
+                    <text style={{ fg: currentModel._tag === "Running" ? theme.primary : theme.muted }}>{status}</text>
+                  </box>
+                  <box style={{ flexDirection: "row" }}>
+                    <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
+                    <text style={{ fg: theme.foreground, width: 16 }}>
+                      {Option.match(currentModel.contextWindow, {
+                        onNone: () => "—",
+                        onSome: (tokens) => `${formatContextWindow(tokens)} tokens`,
+                      })}
+                    </text>
+                    <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
+                    <text style={{ fg: theme.foreground }}>
+                      {parallelismLabel}
+                    </text>
+                  </box>
+                </>
+              )
+            })()}
+        </box>
+        {Option.match(hardwareSnapshot, {
+          onNone: () => null,
+          onSome: ({ state }) => (
+            <box style={{ flexDirection: "column", marginTop: 1 }}>
+              {deriveHardwareMemoryView(state, currentResidentAllocation).domains.map((domain) =>
+                <HardwareMemoryDomain key={domain.id} domain={domain} />)}
+            </box>
+          ),
+        })}
+        {Option.isSome(currentSlot) && (
+          <box style={{ flexDirection: "column", marginTop: 1 }}>
+            <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>ACTIONS</text>
+            {Option.match(action, {
+              onNone: () =>
+                Option.exists(currentSlot.value.instance, (instance) =>
+                  instance.lifecycle._tag === "Stopping")
+                  ? <text style={{ fg: theme.muted }}>Stopping model…</text>
+                  : currentSlot.value.readiness._tag === "Unavailable"
+                    ? <text style={{ fg: theme.muted }}>Unable to load model with current resources</text>
+                    : <text style={{ fg: theme.muted }}>{"  "}Load model</text>,
+              onSome: (currentAction) => (
+                <MenuAction
+                  label={currentAction === "load" ? "Load model" : "Stop model"}
+                  focused
+                  tone={currentAction === "load" ? "primary" : "normal"}
+                  onClick={runAction}
+                  onMouseOver={() => {}}
+                />
+              ),
+            })}
+          </box>
+        )}
       </scrollbox>
     </>
   )

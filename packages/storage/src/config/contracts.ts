@@ -8,7 +8,6 @@ import type {
   MagnitudeConfig,
   ModelPackageId,
   OnboardingConfig,
-  OnboardingFlowId,
   PersistedLocalProviderOffering,
   SlotId,
   SlotModelConfig,
@@ -41,14 +40,9 @@ export interface ConfigStorageShape {
     packageId: ModelPackageId,
   ) => Effect.Effect<void, PlatformError | JsonError>
 
-  readonly getOnboardingConfig: () => Effect.Effect<OnboardingConfig | null, PlatformError | JsonError>
-  readonly completeOnboardingFlow: (
-    flowId: OnboardingFlowId,
-    version: number,
-    completedAt: string,
-  ) => Effect.Effect<void, PlatformError | JsonError>
-  readonly reopenOnboardingFlow: (
-    flowId: OnboardingFlowId,
+  readonly getOnboardingConfig: () => Effect.Effect<Option.Option<OnboardingConfig>, PlatformError | JsonError>
+  readonly updateOnboardingState: (
+    completed: boolean,
   ) => Effect.Effect<void, PlatformError | JsonError>
 }
 

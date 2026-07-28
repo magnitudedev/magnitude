@@ -14,7 +14,7 @@ import {
   isDisplayActorWorkActive,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
-import { PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID } from '@magnitudedev/sdk'
+import { PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID, type ModelInstanceId } from '@magnitudedev/sdk'
 import { Option } from 'effect'
 import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
 import { ActivityRail } from './activity-rail'
@@ -24,10 +24,12 @@ import { useTheme } from '../../hooks/use-theme'
 
 export function ActivityRailContainer({
   modelLoadActivity,
+  onStopModel,
   width,
   agentActivityEnabled = true,
 }: {
   readonly modelLoadActivity: LocalModelLoadActivity | null
+  readonly onStopModel: (instanceId: ModelInstanceId) => void
   readonly width: number
   readonly agentActivityEnabled?: boolean
 }): ReactNode {
@@ -74,6 +76,7 @@ export function ActivityRailContainer({
         work={agentActivityEnabled ? rootActor?.work ?? null : null}
         width={activityWidth}
         modelLoadActivity={modelLoadActivity}
+        onStopModel={onStopModel}
         modelRequestActivity={visibleModelRequestActivity}
         interruptedMessage={visibleInterrupted}
         advisorModelName={advisorProfile?.modelDisplayName ?? null}

@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import type { LocalInferenceView } from "@magnitudedev/client-common"
+import { modelSlotResidentAllocation, type LocalInferenceView } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
 import type { ProviderId, SlotId } from "@magnitudedev/sdk"
 
@@ -13,11 +13,13 @@ export interface LocalInferenceFooterView {
 const compactGiB = (bytes: number): string =>
   (bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, "")
 
-const residentMemoryLabel = (state: LocalInferenceView): string | null =>
-  Option.match(state.hardware.residentMemory, {
+const residentMemoryLabel = (
+  slot: LocalInferenceView["slots"]["slots"]["primary"],
+): string | null =>
+  Option.match(modelSlotResidentAllocation(slot), {
     onNone: () => null,
-    onSome: ({ domains }) => {
-      const bytes = domains.reduce(
+    onSome: ({ memoryDomains }) => {
+      const bytes = memoryDomains.reduce(
         (total, domain) => total
           + domain.modelBytes
           + domain.contextBytes
@@ -59,14 +61,17 @@ export const deriveLocalInferenceFooterView = (
   const downloadModel = state.models.models.find((model) =>
     model.download._tag === "Downloading" || model.download._tag === "Failed")
   const model = activeModel ?? downloadModel
-  const residency = slot?._tag === "Ready"
+  const lifecycle = slot?._tag === "ConfiguredLocal"
+    ? Option.getOrNull(slot.instance)?.lifecycle
+    : undefined
+  const residency = lifecycle?._tag === "Ready"
     ? "loaded" as const
-    : slot?._tag === "LoadingLocalModel" || slot?._tag === "UnloadingLocalModel"
+    : lifecycle?._tag === "Loading" || lifecycle?._tag === "Stopping"
       ? "loading" as const
       : "not_loaded" as const
   return {
     modelName: selectedModelName ?? model?.displayName ?? null,
     residency,
-    memoryLabel: residency === "loaded" ? residentMemoryLabel(state) : null,
+    memoryLabel: residency === "loaded" && slot ? residentMemoryLabel(slot) : null,
   }
 }

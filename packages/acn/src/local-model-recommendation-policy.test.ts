@@ -133,7 +133,7 @@ const candidate = (input: {
         },
     fidelityRank: fidelity,
     quantizationAware: false,
-    estimatedRuntimeBytes: runtimeBytes,
+    estimatedLoadedBytes: runtimeBytes,
     stableCapacityBudgetBytes: capacityBytes,
     totalDownloadBytes: downloadBytes,
   }

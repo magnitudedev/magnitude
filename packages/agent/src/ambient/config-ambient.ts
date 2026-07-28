@@ -1,9 +1,13 @@
 import { Ambient } from '@magnitudedev/event-core'
-import { Effect } from 'effect'
+import { Effect, Schema } from 'effect'
 
 import type { ModelSlotsState, ProviderModelCatalogEntry } from '@magnitudedev/sdk'
 import { type SlotId } from '@magnitudedev/roles'
-import { type ReasoningEffort } from '@magnitudedev/ai'
+import {
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+} from '@magnitudedev/ai'
 import {
   computeContextLimits,
   DEFAULT_CONTEXT_LIMIT_POLICY,
@@ -13,38 +17,51 @@ import { ROLE_TO_SLOT, type RoleId } from '@magnitudedev/roles'
 
 import { OUTPUT_TOKEN_RESERVE } from '../constants'
 
-export interface SlotConfig {
-  readonly slotId: SlotId
-  readonly providerId: string
-  readonly providerModelId: string
-  readonly modelDisplayName: string
-  readonly profile: { readonly contextWindow: number; readonly maxOutputTokens: number }
-  readonly vision: boolean | undefined
-  readonly hardCap: number
-  readonly softCap: number
-  readonly reasoningEffort: ReasoningEffort
-  readonly isUserOverride: boolean
-  readonly isFallback: boolean
-}
+export const SlotConfigSchema = Schema.Struct({
+  slotId: Schema.Literal('primary', 'secondary'),
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
+  modelDisplayName: Schema.String,
+  profile: Schema.Struct({
+    contextWindow: Schema.Number,
+    maxOutputTokens: Schema.Number,
+  }),
+  vision: Schema.Boolean,
+  hardCap: Schema.Number,
+  softCap: Schema.Number,
+  reasoningEffort: ReasoningEffortSchema,
+  isUserOverride: Schema.Boolean,
+  isFallback: Schema.Boolean,
+})
+export type SlotConfig = typeof SlotConfigSchema.Type
 
-export interface ReadyAgentSlot {
-  readonly _tag: 'Ready'
-  readonly config: SlotConfig
-}
+export const AgentSlotStateSchema = Schema.Union(
+  Schema.TaggedStruct('Ready', {
+    config: SlotConfigSchema,
+  }),
+  Schema.TaggedStruct('Unavailable', {
+    slotId: Schema.Literal('primary', 'secondary'),
+    reason: Schema.String,
+  }),
+)
+export type AgentSlotState = typeof AgentSlotStateSchema.Type
+export type ReadyAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Ready' }>
+export type UnavailableAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unavailable' }>
 
-export interface UnavailableAgentSlot {
-  readonly _tag: 'Unavailable'
-  readonly slotId: SlotId
-  readonly reason: string
-}
+export const ConfigStateSchema = Schema.Struct({
+  revision: Schema.Number,
+  bySlot: Schema.Struct({
+    primary: AgentSlotStateSchema,
+    secondary: AgentSlotStateSchema,
+  }),
+  catalogLoaded: Schema.Boolean,
+})
+export type ConfigState = typeof ConfigStateSchema.Type
 
-export type AgentSlotState = ReadyAgentSlot | UnavailableAgentSlot
+const configStateEquivalent = Schema.equivalence(ConfigStateSchema)
 
-export interface ConfigState {
-  readonly revision: number
-  readonly bySlot: Readonly<Record<SlotId, AgentSlotState>>
-  readonly catalogLoaded: boolean
-}
+export const sameConfigStateValue = (left: ConfigState, right: ConfigState): boolean =>
+  configStateEquivalent(left, { ...right, revision: left.revision })
 
 export function getSlotConfig(state: ConfigState, slotId: SlotId): SlotConfig {
   const slot = state.bySlot[slotId]

@@ -6,12 +6,10 @@ import {
   CatalogCandidateIdSchema,
   LocalModelCatalogCandidateSchema,
   ModelFailureSchema,
-  ModelOfferingTargetIdSchema,
   ModelServingConfigurationSchema,
   LocalModelRecommendationProgressStepSchema,
   RecommendationSchema,
   RecommendableModelIdSchema,
-  type CatalogCandidateId,
   type LocalModelRecommendationProgressStep,
   type LocalModelRecommendationProgressStepId,
   type ModelFailure,
@@ -19,7 +17,10 @@ import {
   type RecommendableModel,
 } from "@magnitudedev/protocol"
 import { IcnCatalog, IcnHardware, IcnInstalledModels } from "@magnitudedev/icn"
-import { ProviderModelIdSchema } from "@magnitudedev/ai/provider/model"
+import {
+  ProviderModelIdSchema,
+  type ProviderModelId,
+} from "@magnitudedev/ai/provider/model"
 import {
   readStructuredFile,
   writeStructuredFileAtomic,
@@ -56,8 +57,8 @@ export interface LocalModelRecommendationsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: RecommendationState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: RecommendationState }>
   readonly refresh: Effect.Effect<void>
-  readonly getCatalog: (
-    id: CatalogCandidateId,
+  readonly getCatalogByProviderModelId: (
+    providerModelId: ProviderModelId,
   ) => Effect.Effect<CatalogEntry | undefined>
 }
 
@@ -82,7 +83,6 @@ const targetPackages = (model: RecommendableModel) =>
 
 const CatalogEntrySchema = Schema.Struct({
   candidate: LocalModelCatalogCandidateSchema,
-  modelId: ModelOfferingTargetIdSchema,
   recommendableModelId: RecommendableModelIdSchema,
   configuration: ModelServingConfigurationSchema,
   recommendation: Schema.optionalWith(RecommendationSchema, { as: "Option", exact: true }),
@@ -95,7 +95,8 @@ const catalogProjection = (
 ): CatalogEntry => ({
   candidate: {
     id: CatalogCandidateIdSchema.make(candidate.assessment.configurationId),
-    providerModelId: ProviderModelIdSchema.make(`local:${candidate.assessment.configurationId}`),
+    targetId: candidate.model.targetId,
+    providerModelId: ProviderModelIdSchema.make(candidate.assessment.configurationId),
     displayName: candidate.model.displayName,
     description: candidate.model.description,
     license: candidate.model.license,
@@ -128,7 +129,6 @@ const catalogProjection = (
       files: modelPackage.files.map(({ path, sha256 }) => ({ path, sha256 })),
     })),
   },
-  modelId: candidate.model.targetId,
   recommendableModelId: candidate.model.id,
   configuration: {
     id: candidate.assessment.configurationId,
@@ -494,7 +494,7 @@ export const makeLocalModelRecommendationsLive = (
           },
           fidelityRank: model.fidelityRank,
           quantizationAware: model.quantizationAware,
-          estimatedRuntimeBytes: assessment.assessment.memory
+          estimatedLoadedBytes: assessment.assessment.memory
             .reduce((total, domain) => total + domain.requiredBytes, 0),
           stableCapacityBudgetBytes: assessment.assessment.memory
             .reduce(
@@ -599,7 +599,7 @@ export const makeLocalModelRecommendationsLive = (
 
   yield* refresh.pipe(Effect.forkScoped)
   yield* Stream.merge(
-    Stream.merge(catalog.changes, hardware.changes),
+    Stream.merge(catalog.changes, hardware.fittingChanges),
     installed.changes,
   ).pipe(Stream.runForEach(() => refresh), Effect.forkScoped)
 
@@ -607,8 +607,9 @@ export const makeLocalModelRecommendationsLive = (
     snapshot: mirror.get,
     changes: mirror.changes,
     refresh,
-    getCatalog: (id) => mirror.get.pipe(Effect.map(({ state }) => state._tag === "Ready"
-      ? state.catalog.find((entry) => entry.candidate.id === id)
-      : undefined)),
+    getCatalogByProviderModelId: (providerModelId) =>
+      mirror.get.pipe(Effect.map(({ state }) => state._tag === "Ready"
+        ? state.catalog.find((entry) => entry.candidate.providerModelId === providerModelId)
+        : undefined)),
   })
 }))

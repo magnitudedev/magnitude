@@ -5,7 +5,8 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
   ModelServingConfigurationIdSchema,
-  ModelSlotReady,
+  ModelInstanceIdSchema,
+  ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
@@ -15,6 +16,7 @@ import {
   RecommendationIdSchema,
   SECONDARY_SLOT_ID,
   type LocalInferenceHardware,
+  type ModelInstanceAllocation,
   type LocalModel,
   type LocalModelCatalogCandidate,
   type LocalModelRecommendation,
@@ -23,7 +25,7 @@ import type { LocalInferenceView } from "@magnitudedev/client-common"
 
 export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
-export const TEST_MODEL_ID = ProviderModelIdSchema.make("local:configuration_test")
+export const TEST_MODEL_ID = ProviderModelIdSchema.make("configuration_test")
 export const TEST_TARGET_ID = ModelOfferingTargetIdSchema.make("target_test")
 export const TEST_CONFIGURATION_ID = ModelServingConfigurationIdSchema.make("configuration_test")
 export const TEST_CANDIDATE_ID = CatalogCandidateIdSchema.make("candidate_test")
@@ -57,14 +59,11 @@ export const makeHardware = (
     availableBytes: Option.some(6 * GIB),
     sharesSystemMemory: false,
   }],
-  residentMemory: Option.none(),
-  residentRuntime: Option.none(),
-  runtimeFailure: Option.none(),
   ...overrides,
 })
 
 export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
-  id: TEST_TARGET_ID,
+  targetId: TEST_TARGET_ID,
   catalogCandidateIds: [TEST_CANDIDATE_ID],
   providerModelIds: [TEST_MODEL_ID],
   displayName: "Qwen Test",
@@ -82,6 +81,7 @@ export const makeCatalogCandidate = (
   overrides: Partial<LocalModelCatalogCandidate> = {},
 ): LocalModelCatalogCandidate => ({
   id: TEST_CANDIDATE_ID,
+  targetId: TEST_TARGET_ID,
   providerModelId: TEST_MODEL_ID,
   displayName: "Qwen Test",
   description: "Test model",
@@ -133,6 +133,7 @@ export const makeView = (options: {
   readonly hardware?: LocalInferenceHardware
   readonly models?: readonly LocalModel[]
   readonly recommendations?: readonly LocalModelRecommendation[]
+  readonly allocation?: ModelInstanceAllocation
   readonly ready?: boolean
 } = {}): LocalInferenceView => {
   const models = options.models ?? [makeModel()]
@@ -182,7 +183,39 @@ export const makeView = (options: {
       slots: {
         primary: options.ready === false
           ? new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID })
-          : new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection }),
+          : new ModelSlotConfiguredLocal({
+              slotId: PRIMARY_SLOT_ID,
+              selection,
+              descriptor: {
+                providerId: LOCAL_PROVIDER_ID,
+                providerModelId: TEST_MODEL_ID,
+                displayName: "Qwen Test",
+              },
+              availability: { _tag: "Available" },
+              readiness: {
+                _tag: "Loadable",
+                allocation: {
+                  contextWindowTokens: 32_768,
+                  parallelSequences: 1,
+                  physicalContextTokens: 32_768,
+                  requiredSystemMemoryBytes: 0,
+                },
+              },
+              instance: Option.some({
+                id: ModelInstanceIdSchema.make("test-instance"),
+                configurationId: TEST_CONFIGURATION_ID,
+                lifecycle: {
+                  _tag: "Ready",
+                  allocation: options.allocation ?? {
+                    contextWindowTokens: 32_768,
+                    parallelSequences: 1,
+                    physicalContextTokens: 32_768,
+                    memoryDomains: [],
+                  },
+                },
+              }),
+              actions: ["Stop"],
+            }),
         secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
       },
       recentModelIds: { primary: [TEST_MODEL_ID], secondary: [] },

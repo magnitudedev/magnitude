@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Match, Option, Ref, Schema, Stream } from "effect"
+import { Cause, Context, Effect, FiberRef, Layer, Match, Option, Ref, Schema, Stream } from "effect"
 import {
   ModelCatalogError,
   ModelDiscoveryOperationIdSchema,
@@ -37,6 +37,7 @@ import {
   type GeneratedClientError,
 } from "@magnitudedev/openapi-effect/client-runtime"
 import type { LocalProviderSource } from "./provider.js"
+import { CurrentModelInstance } from "./contract.js"
 
 const catalogError = <Cause>(
   message: string,
@@ -180,20 +181,37 @@ const bindIcnModel = (
     const maxTokens = Option.fromNullable(requestOptions?.maxTokens ?? defaults?.maxTokens)
     const toolChoice = Option.fromNullable(requestOptions?.toolChoice ?? defaults?.toolChoice)
     const reasoningEffort = Option.fromNullable(requestOptions?.reasoningEffort ?? defaults?.reasoningEffort)
-    const wire = {
-      stream: true as const,
-      stream_options: { include_usage: true },
-      ...nativeChatCompletionsCodec.encodePrompt(providerModelId, prompt, tools),
-      ...Option.match(maxTokens, { onNone: () => ({}), onSome: (max_tokens) => ({ max_tokens }) }),
-      ...Option.match(toolChoice, { onNone: () => ({}), onSome: (tool_choice) => ({ tool_choice }) }),
-      ...Option.match(reasoningEffort, { onNone: () => ({}), onSome: (reasoning_effort) => ({ reasoning_effort }) }),
-    }
-    return Schema.decodeUnknown(Generated.ChatCompletionRequest)(wire).pipe(
-      Effect.mapError((cause) => new StreamStartClientCorrectnessViolation({
-        call,
-        component: "request_builder",
-        message: "Unable to encode the ICN chat request",
-        evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
+    return FiberRef.get(CurrentModelInstance).pipe(
+      Effect.flatMap((binding) => Option.match(binding, {
+        onNone: () => Effect.fail(new StreamStartClientCorrectnessViolation({
+          call,
+          component: "request_builder",
+          message: "No exact model instance was bound to the local request",
+          evidence: {
+            _tag: "UnexpectedDefectCaught",
+            cause: {
+              _tag: "ErrorCause",
+              name: "MissingModelInstanceBinding",
+              message: "ModelSlotController must bind a Ready instance before provider start",
+            },
+          },
+        })),
+        onSome: (target) => Schema.decodeUnknown(Generated.ChatCompletionRequest)({
+          stream: true as const,
+          stream_options: { include_usage: true },
+          model_instance_id: target.instanceId,
+          ...nativeChatCompletionsCodec.encodePrompt(providerModelId, prompt, tools),
+          ...Option.match(maxTokens, { onNone: () => ({}), onSome: (max_tokens) => ({ max_tokens }) }),
+          ...Option.match(toolChoice, { onNone: () => ({}), onSome: (tool_choice) => ({ tool_choice }) }),
+          ...Option.match(reasoningEffort, { onNone: () => ({}), onSome: (reasoning_effort) => ({ reasoning_effort }) }),
+        }).pipe(
+          Effect.mapError((cause) => new StreamStartClientCorrectnessViolation({
+            call,
+            component: "request_builder",
+            message: "Unable to encode the ICN chat request",
+            evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
+          })),
+        ),
       })),
       Effect.tap(() => bindOptions?.requestAttribution?.requestStarted ?? Effect.void),
       Effect.flatMap((payload) =>

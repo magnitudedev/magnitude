@@ -125,7 +125,23 @@ const emitSchemaExpression = (
         ]
       ),
     Object: ({ properties, propertyNames, additionalProperties }) => {
+      const tag = properties
+        .map((property) => {
+          if (property.name !== "_tag" || !property.required) return undefined
+          if (property.schema._tag === "Literal"
+            && typeof property.schema.value === "string") {
+            return { property, value: property.schema.value }
+          }
+          if (property.schema._tag === "Enum"
+            && property.schema.values.length === 1
+            && typeof property.schema.values[0] === "string") {
+            return { property, value: property.schema.values[0] }
+          }
+          return undefined
+        })
+        .find((candidate) => candidate !== undefined)
       const fields = properties
+        .filter((property) => property !== tag?.property)
         .map(
           (property) =>
             `${quote(property.name)}: ${
@@ -139,7 +155,11 @@ const emitSchemaExpression = (
             }`
         )
         .join(",\n");
-      const struct = `S.Struct({${
+      const struct = tag
+        ? `S.TaggedStruct(${quote(tag.value)}, {${
+            fields.length === 0 ? "" : `\n${fields}\n`
+          }})`
+        : `S.Struct({${
         fields.length === 0 ? "" : `\n${fields}\n`
       }})`;
       const key = Option.match(propertyNames, {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { DownloadAttempt as NativeDownloadAttemptSchema } from "@magnitudedev/icn"
 import { downloadAttemptFromIcn } from "./local-model-icn-adapter"
 
@@ -24,11 +24,11 @@ describe("local model ICN adapter", () => {
       stage: "downloading",
       completedBytes: 4_000,
       totalBytes: 10_000,
-      bytesPerSecond: 2_000,
+      bytesPerSecond: Option.some(2_000),
     })
   })
 
-  it("projects a missing native download rate as null", async () => {
+  it("projects a missing native download rate as None", async () => {
     const attempt = Schema.decodeUnknownSync(NativeDownloadAttemptSchema)({
       _tag: "Downloading",
       id: "download_test",
@@ -42,7 +42,7 @@ describe("local model ICN adapter", () => {
 
     expect(projected._tag).toBe("Downloading")
     if (projected._tag === "Downloading") {
-      expect(projected.bytesPerSecond).toBeNull()
+      expect(projected.bytesPerSecond).toEqual(Option.none())
     }
   })
 })

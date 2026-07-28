@@ -2,9 +2,9 @@ import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
 import {
-  CatalogCandidateIdSchema,
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
+  ModelInstanceIdSchema,
   ModelOfferingTargetIdSchema,
   SlotIdSchema,
 } from "../schemas/model-state"
@@ -20,50 +20,26 @@ export const LocalModelsMirror = defineMirroredState("GetLocalModels", {
   errorSchema: Schema.Never,
 })
 
-export const DownloadCatalogModel = Rpc.make("DownloadCatalogModel", {
-  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
-  success: Schema.Struct({}),
-  error: LocalInferenceError,
-})
-
-export const CancelCatalogModelDownload = Rpc.make("CancelCatalogModelDownload", {
-  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
-  success: Schema.Struct({}),
-  error: LocalInferenceError,
-})
-
-export const DeleteCatalogModel = Rpc.make("DeleteCatalogModel", {
-  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
-  success: Schema.Struct({}),
-  error: LocalInferenceError,
-})
-
-export const SelectCatalogModel = Rpc.make("SelectCatalogModel", {
-  payload: Schema.Struct({ id: CatalogCandidateIdSchema }),
-  success: Schema.Struct({}),
-  error: LocalInferenceError,
-})
-
-export const RetryModelDownload = Rpc.make("RetryModelDownload", {
-  payload: Schema.Struct({ modelId: ModelOfferingTargetIdSchema }),
+export const DownloadModel = Rpc.make("DownloadModel", {
+  payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const CancelModelDownload = Rpc.make("CancelModelDownload", {
-  payload: Schema.Struct({ modelId: ModelOfferingTargetIdSchema }),
+  payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const DismissModelDownloadFailure = Rpc.make("DismissModelDownloadFailure", {
-  payload: Schema.Struct({ modelId: ModelOfferingTargetIdSchema }),
+  payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const DeleteLocalModel = Rpc.make("DeleteLocalModel", {
-  payload: Schema.Struct({ modelId: ModelOfferingTargetIdSchema }),
+  payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
@@ -74,8 +50,8 @@ export const LoadModel = Rpc.make("LoadModel", {
   error: LocalInferenceError,
 })
 
-export const UnloadModel = Rpc.make("UnloadModel", {
-  payload: Schema.Struct({ slotId: SlotIdSchema }),
+export const StopModel = Rpc.make("StopModel", {
+  payload: Schema.Struct({ instanceId: ModelInstanceIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })

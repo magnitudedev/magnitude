@@ -76,7 +76,7 @@ export const downloadAttemptFromIcn = (
   Schema.validate(DownloadAttemptSchema)(attempt._tag === "Downloading"
     ? {
         ...attempt,
-        bytesPerSecond: Option.getOrNull(attempt.bytesPerSecond),
+        bytesPerSecond: Option.flatMap(attempt.bytesPerSecond, Option.fromNullable),
       }
     : attempt)
 

@@ -6,7 +6,7 @@ import {
   type LocalInferenceHardware as LocalInferenceHardwareState,
   type MirroredSnapshot,
 } from "@magnitudedev/protocol"
-import { IcnHardware, type Generated } from "@magnitudedev/icn"
+import { IcnHardware, IcnInstances, type Generated } from "@magnitudedev/icn"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 
 export class LocalInferenceHardwareProjectionFailure extends Data.TaggedError("LocalInferenceHardwareProjectionFailure")<{
@@ -75,31 +75,6 @@ export const projectLocalInferenceHardware = (
     abortReserveBytes: hardware.system_memory.abort_reserve_bytes,
     accelerators,
     memoryDomains,
-    residentMemory: Option.flatMap(hardware.resident_memory, Option.fromNullable).pipe(
-      Option.map((resident) => ({ domains: resident.domains.map((domain) => ({
-        memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(domain.memory_domain_id),
-        modelBytes: domain.model_bytes,
-        contextBytes: domain.context_bytes,
-        computeBytes: domain.compute_bytes,
-        auxiliaryBytes: domain.auxiliary_bytes,
-      })) })),
-    ),
-    residentRuntime: Option.flatMap(hardware.resident_execution, Option.fromNullable).pipe(
-      Option.map((resident) => ({
-        configurationId: resident.model_id,
-        contextWindowTokens: resident.context_window_tokens,
-        parallelSequences: resident.parallel_sequences,
-        physicalContextTokens: resident.physical_context_tokens,
-      })),
-    ),
-    runtimeFailure: Option.flatMap(hardware.runtime_failure, Option.fromNullable).pipe(
-      Option.map((failure) => ({
-        modelId: failure.model_id,
-        code: failure.code,
-        message: failure.message,
-        retryable: failure.retryable,
-      })),
-    ),
   }
 })
 
@@ -117,9 +92,10 @@ export class LocalInferenceHardware extends Context.Tag("LocalInferenceHardware"
 export const LocalInferenceHardwareLive: Layer.Layer<
   LocalInferenceHardware,
   LocalInferenceHardwareProjectionFailure,
-  IcnHardware | MirroredStateChanges
+  IcnHardware | IcnInstances | MirroredStateChanges
 > = Layer.scoped(LocalInferenceHardware, Effect.gen(function* () {
   const hardware = yield* IcnHardware
+  const instances = yield* IcnInstances
   const scope = yield* Scope.Scope
   const mirror = yield* makeMirroredState(
     LocalInferenceHardwareMirror,
@@ -143,6 +119,13 @@ export const LocalInferenceHardwareLive: Layer.Layer<
       )),
       Effect.asVoid,
     )),
+  ), scope)
+  // Instance changes can immediately alter available memory. The hardware
+  // projection owns invalidating and rebuilding its availability snapshot;
+  // model-instance lifecycle consumers do not need to coordinate that concern.
+  yield* Effect.forkIn(instances.changes.pipe(
+    Stream.drop(1),
+    Stream.runForEach(() => hardware.refresh.pipe(Effect.ignore)),
   ), scope)
   return LocalInferenceHardware.of({
     snapshot: mirror.get,

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use icn_contracts::models::{ModelInstanceAllocation, ModelInstanceMemoryDomain};
 use icn_contracts::output::{StopBuffer, Utf8Buffer};
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatRequest, ChatTemplateRequest,
@@ -18,8 +19,8 @@ use icn_contracts::{
     FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
     HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceEvent,
     InferenceProgress, InferenceStreamEvent, ModelModalities, ModelProperties, PreparedChatInfo,
-    ProjectorConfig, ReasoningControl, ResidentExecution, ResidentMemory, ResidentMemoryDomain,
-    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
+    ProjectorConfig, ReasoningControl, ResponseFormat, SplitMode, TemplateCapabilities, ToolCall,
+    ToolChoice,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -147,22 +148,20 @@ const IDLE_ADMISSION_COALESCE_INTERVAL: Duration = Duration::from_millis(1);
 
 type ExclusiveNativeTask = Box<dyn FnOnce(&LlamaBackend) + Send + 'static>;
 
-struct HardwareObservationRequest {
-    model_id: String,
-    runtime_generation: u64,
+struct ModelInstanceObservationRequest {
     policy: icn_hardware::CapacityPolicy,
     native_build: String,
     enabled_backends: Vec<String>,
-    response: SyncSender<Result<HardwareSnapshot, HardwareObservationError>>,
+    response: SyncSender<Result<ModelInstanceObservation, ModelInstanceObservationError>>,
 }
 
 #[derive(Debug)]
-pub enum HardwareObservationError {
+pub enum ModelInstanceObservationError {
     ExecutorStopped,
     MemoryDomainUnresolved { location: String },
 }
 
-impl std::fmt::Display for HardwareObservationError {
+impl std::fmt::Display for ModelInstanceObservationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExecutorStopped => formatter.write_str("inference executor stopped"),
@@ -174,7 +173,13 @@ impl std::fmt::Display for HardwareObservationError {
     }
 }
 
-impl std::error::Error for HardwareObservationError {}
+impl std::error::Error for ModelInstanceObservationError {}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelInstanceObservation {
+    pub hardware: HardwareSnapshot,
+    pub allocation: ModelInstanceAllocation,
+}
 
 #[derive(Clone)]
 struct ResidentAllocation {
@@ -213,7 +218,7 @@ enum ExecutorCommand {
     RunExclusiveNative {
         task: ExclusiveNativeTask,
     },
-    ObserveHardware(HardwareObservationRequest),
+    ObserveModelInstance(ModelInstanceObservationRequest),
     Shutdown,
 }
 
@@ -545,31 +550,28 @@ impl LlamaCompletionBackend {
         receiver.recv().map_err(|_| InferenceError::ExecutorStopped)
     }
 
-    /// Capture current hardware state between scheduler batches without waiting for inference to
-    /// become idle.
-    pub fn observe_hardware(
+    /// Capture the resident model instance and current hardware topology between scheduler batches
+    /// without waiting for inference to become idle.
+    pub fn observe_model_instance(
         &self,
-        runtime_generation: u64,
         policy: icn_hardware::CapacityPolicy,
         native_build: String,
         enabled_backends: Vec<String>,
-    ) -> Result<HardwareSnapshot, HardwareObservationError> {
+    ) -> Result<ModelInstanceObservation, ModelInstanceObservationError> {
         let (response, receiver) = sync_channel(1);
         self.commands
-            .send(ExecutorCommand::ObserveHardware(
-                HardwareObservationRequest {
-                    model_id: self.model_id.clone(),
-                    runtime_generation,
+            .send(ExecutorCommand::ObserveModelInstance(
+                ModelInstanceObservationRequest {
                     policy,
                     native_build,
                     enabled_backends,
                     response,
                 },
             ))
-            .map_err(|_| HardwareObservationError::ExecutorStopped)?;
+            .map_err(|_| ModelInstanceObservationError::ExecutorStopped)?;
         receiver
             .recv()
-            .map_err(|_| HardwareObservationError::ExecutorStopped)?
+            .map_err(|_| ModelInstanceObservationError::ExecutorStopped)?
     }
 }
 
@@ -1204,13 +1206,12 @@ fn capture_resident_allocations(
     Ok(allocations)
 }
 
-fn resident_memory_state(
+fn model_instance_allocation(
     snapshot: &HardwareSnapshot,
     allocations: &[ResidentAllocation],
-    model_id: String,
-    runtime_generation: u64,
-) -> Result<ResidentMemory, HardwareObservationError> {
-    let mut domains = BTreeMap::<icn_contracts::MemoryDomainId, ResidentMemoryDomain>::new();
+    config: &ExecutionIntent,
+) -> Result<ModelInstanceAllocation, ModelInstanceObservationError> {
+    let mut domains = BTreeMap::<icn_contracts::MemoryDomainId, ModelInstanceMemoryDomain>::new();
     for allocation in allocations {
         let location = match &allocation.location {
             LlamaMemoryLocation::Host => icn_hardware::NativeMemoryLocation::Host,
@@ -1227,19 +1228,20 @@ fn resident_memory_state(
         };
         let domain_id =
             icn_hardware::resolve_memory_domain(snapshot, &location).ok_or_else(|| {
-                HardwareObservationError::MemoryDomainUnresolved {
+                ModelInstanceObservationError::MemoryDomainUnresolved {
                     location: format!("{location:?}"),
                 }
             })?;
-        let domain = domains
-            .entry(domain_id.clone())
-            .or_insert_with(|| ResidentMemoryDomain {
-                memory_domain_id: domain_id.clone(),
-                model_bytes: 0,
-                context_bytes: 0,
-                compute_bytes: 0,
-                auxiliary_bytes: 0,
-            });
+        let domain =
+            domains
+                .entry(domain_id.clone())
+                .or_insert_with(|| ModelInstanceMemoryDomain {
+                    memory_domain_id: domain_id.clone(),
+                    model_bytes: 0,
+                    context_bytes: 0,
+                    compute_bytes: 0,
+                    auxiliary_bytes: 0,
+                });
         domain.model_bytes = domain.model_bytes.saturating_add(allocation.model_bytes);
         domain.context_bytes = domain
             .context_bytes
@@ -1251,20 +1253,12 @@ fn resident_memory_state(
             .auxiliary_bytes
             .saturating_add(allocation.auxiliary_bytes);
     }
-    Ok(ResidentMemory {
-        model_id,
-        runtime_generation,
-        domains: domains.into_values().collect(),
-    })
-}
-
-fn resident_execution_state(config: &ExecutionIntent, model_id: String) -> ResidentExecution {
-    ResidentExecution {
-        model_id,
+    Ok(ModelInstanceAllocation {
         context_window_tokens: config.context_size,
         parallel_sequences: config.max_sequences,
         physical_context_tokens: config.physical_context_size,
-    }
+        memory_domains: domains.into_values().collect(),
+    })
 }
 
 // The scheduler composition root receives each owned runtime subsystem explicitly. Keeping these
@@ -1287,7 +1281,7 @@ fn run_scheduler<'model>(
     let mut decode_buffer = LlamaBatch::new(context.n_batch() as usize, 1);
     let mut queued = VecDeque::<QueuedCompletion>::new();
     let mut exclusive_native = VecDeque::<ExclusiveNativeTask>::new();
-    let mut hardware_observations = VecDeque::<HardwareObservationRequest>::new();
+    let mut model_instance_observations = VecDeque::<ModelInstanceObservationRequest>::new();
     let mut active = Vec::<ActiveRequest<'_>>::new();
     let mut shutting_down = false;
     let max_tracked = COMMAND_QUEUE_CAPACITY + config.max_sequences as usize;
@@ -1299,33 +1293,25 @@ fn run_scheduler<'model>(
             multimodal.as_ref().map(multimodal_marker),
             &mut queued,
             &mut exclusive_native,
-            &mut hardware_observations,
+            &mut model_instance_observations,
             &active,
             max_tracked,
             &mut shutting_down,
         );
 
-        if let Some(observation) = hardware_observations.pop_front() {
-            let mut snapshot = icn_hardware::discover_hardware(
+        if let Some(observation) = model_instance_observations.pop_front() {
+            let hardware = icn_hardware::discover_hardware(
                 backend,
                 observation.policy,
                 observation.native_build,
                 observation.enabled_backends,
             );
-            let observed = resident_memory_state(
-                &snapshot,
-                &resident_allocations,
-                observation.model_id.clone(),
-                observation.runtime_generation,
-            )
-            .map(|resident_memory| {
-                snapshot.resident_memory = Some(resident_memory);
-                snapshot.resident_execution = Some(resident_execution_state(
-                    config,
-                    observation.model_id.clone(),
-                ));
-                snapshot
-            });
+            let observed = model_instance_allocation(&hardware, &resident_allocations, config).map(
+                |allocation| ModelInstanceObservation {
+                    hardware,
+                    allocation,
+                },
+            );
             let _ = observation.response.try_send(observed);
         }
 
@@ -1352,7 +1338,7 @@ fn run_scheduler<'model>(
                         multimodal.as_ref().map(multimodal_marker),
                         &mut queued,
                         &mut exclusive_native,
-                        &mut hardware_observations,
+                        &mut model_instance_observations,
                         0,
                         max_tracked,
                         &mut shutting_down,
@@ -1456,7 +1442,7 @@ fn run_scheduler<'model>(
                     multimodal.as_ref().map(multimodal_marker),
                     &mut queued,
                     &mut exclusive_native,
-                    &mut hardware_observations,
+                    &mut model_instance_observations,
                     active.len(),
                     max_tracked,
                     &mut shutting_down,
@@ -1477,7 +1463,7 @@ fn drain_commands(
     media_marker: Option<&str>,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
-    hardware_observations: &mut VecDeque<HardwareObservationRequest>,
+    model_instance_observations: &mut VecDeque<ModelInstanceObservationRequest>,
     active: &[ActiveRequest<'_>],
     max_tracked: usize,
     shutting_down: &mut bool,
@@ -1490,7 +1476,7 @@ fn drain_commands(
                 media_marker,
                 queued,
                 exclusive_native,
-                hardware_observations,
+                model_instance_observations,
                 active.len(),
                 max_tracked,
                 shutting_down,
@@ -1511,7 +1497,7 @@ fn handle_command(
     media_marker: Option<&str>,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
-    hardware_observations: &mut VecDeque<HardwareObservationRequest>,
+    model_instance_observations: &mut VecDeque<ModelInstanceObservationRequest>,
     active_count: usize,
     max_tracked: usize,
     shutting_down: &mut bool,
@@ -1563,11 +1549,11 @@ fn handle_command(
                 exclusive_native.push_back(task);
             }
         }
-        ExecutorCommand::ObserveHardware(observation) => {
+        ExecutorCommand::ObserveModelInstance(observation) => {
             if *shutting_down {
                 drop(observation.response);
             } else {
-                hardware_observations.push_back(observation);
+                model_instance_observations.push_back(observation);
             }
         }
         ExecutorCommand::Shutdown => *shutting_down = true,
@@ -3854,21 +3840,6 @@ mod tests {
     }
 
     #[test]
-    fn resident_execution_reports_the_exact_runtime_allocation() {
-        let config = model_config_with_projector(4);
-
-        assert_eq!(
-            resident_execution_state(&config, "configuration_test".to_owned()),
-            ResidentExecution {
-                model_id: "configuration_test".to_owned(),
-                context_window_tokens: 128,
-                parallel_sequences: 4,
-                physical_context_tokens: 512,
-            }
-        );
-    }
-
-    #[test]
     fn execution_validation_rejects_ambiguous_or_native_invalid_combinations() {
         let mut config = model_config();
         config.execution.gpu_layers = GpuLayers::All;
@@ -4340,9 +4311,6 @@ mod tests {
                     memory_limit: None,
                 }],
             }],
-            resident_memory: None,
-            resident_execution: None,
-            runtime_failure: None,
         };
         let evidence = vec![
             ResidentAllocation {
@@ -4365,16 +4333,20 @@ mod tests {
             },
         ];
 
-        let resident = resident_memory_state(&snapshot, &evidence, "model".to_owned(), 7)
+        let config = model_config_with_projector(4);
+        let resident = model_instance_allocation(&snapshot, &evidence, &config)
             .expect("exact device identities resolve");
-        assert_eq!(resident.domains.len(), 1);
+        assert_eq!(resident.context_window_tokens, 128);
+        assert_eq!(resident.parallel_sequences, 4);
+        assert_eq!(resident.physical_context_tokens, 512);
+        assert_eq!(resident.memory_domains.len(), 1);
         assert_eq!(
-            resident.domains[0].memory_domain_id,
+            resident.memory_domains[0].memory_domain_id,
             icn_contracts::MemoryDomainId::system()
         );
-        assert_eq!(resident.domains[0].model_bytes, 8);
-        assert_eq!(resident.domains[0].context_bytes, 6);
-        assert_eq!(resident.domains[0].compute_bytes, 4);
-        assert_eq!(resident.domains[0].auxiliary_bytes, 2);
+        assert_eq!(resident.memory_domains[0].model_bytes, 8);
+        assert_eq!(resident.memory_domains[0].context_bytes, 6);
+        assert_eq!(resident.memory_domains[0].compute_bytes, 4);
+        assert_eq!(resident.memory_domains[0].auxiliary_bytes, 2);
     }
 }

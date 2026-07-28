@@ -69,7 +69,7 @@ export interface LocalProviderOfferingsApi {
     providerModelId: ProviderModelId,
   ) => Effect.Effect<LocalProviderOffering, LocalInferenceError>
   readonly save: (
-    modelId: ModelOfferingTargetId,
+    targetId: ModelOfferingTargetId,
     configuration: ModelServingConfiguration,
     origin: LocalProviderOfferingOrigin,
   ) => Effect.Effect<LocalProviderOffering, LocalInferenceError>
@@ -140,11 +140,11 @@ export const LocalProviderOfferingsLive: Layer.Layer<
             retryable: false,
           }))
     })),
-    save: (modelId, configuration, origin) => Effect.gen(function* () {
-      const providerModelId = ProviderModelIdSchema.make(`local:${configuration.id}`)
+    save: (targetId, configuration, origin) => Effect.gen(function* () {
+      const providerModelId = ProviderModelIdSchema.make(configuration.id)
       const persisted: PersistedLocalProviderOffering = {
         providerModelId,
-        modelId,
+        targetId,
         configuration,
         origin,
       }

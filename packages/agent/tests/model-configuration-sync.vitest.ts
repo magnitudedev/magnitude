@@ -1,5 +1,9 @@
 import type { AmbientService } from '@magnitudedev/event-core'
-import { ReasoningEffortSchema } from '@magnitudedev/ai'
+import {
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+} from '@magnitudedev/ai'
 import { Effect, Ref } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { ConfigAmbient, type ConfigState } from '../src/ambient/config-ambient'
@@ -13,8 +17,8 @@ const config = (revision: number, providerModelId: string): ConfigState => ({
       _tag: 'Ready',
       config: {
         slotId: 'primary',
-        providerId: 'local',
-        providerModelId,
+        providerId: ProviderIdSchema.make('local'),
+        providerModelId: ProviderModelIdSchema.make(providerModelId),
         modelDisplayName: providerModelId,
         profile: { contextWindow: 100_000, maxOutputTokens: 4_000 },
         vision: false,

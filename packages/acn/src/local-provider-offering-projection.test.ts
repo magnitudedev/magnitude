@@ -13,7 +13,7 @@ const evidence = (
   installed: boolean,
   inspection: ProviderOfferingPackageEvidence[number]["packages"][number]["inspection"],
 ): ProviderOfferingPackageEvidence => [{
-  providerModelId: ProviderModelIdSchema.make("local:test"),
+  providerModelId: ProviderModelIdSchema.make("test-configuration"),
   configurationId: ModelServingConfigurationIdSchema.make("configuration-test"),
   packages: [{
     packageId: ModelPackageIdSchema.make("package-test"),

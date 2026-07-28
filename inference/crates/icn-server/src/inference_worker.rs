@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use icn_contracts::{
-    ChatRequest, ChatTemplateRequest, CompletionBackend, Generation, HardwareSnapshot,
-    InferenceError, InferenceStreamEvent, ModelProperties, PreparedChatInfo,
+    ChatRequest, ChatTemplateRequest, CompletionBackend, Generation, InferenceError,
+    InferenceStreamEvent, ModelProperties, PreparedChatInfo,
 };
 use icn_engine::{ModelLoadObserver, ModelLoadPhase, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
@@ -50,9 +50,8 @@ enum HostMessage {
         request: ChatTemplateRequest,
         trace: crate::telemetry::TraceCarrier,
     },
-    ObserveHardware {
+    ObserveModelInstance {
         request_id: u64,
-        runtime_generation: u64,
         policy: CapacityPolicy,
         native_build: String,
         enabled_backends: Vec<String>,
@@ -100,9 +99,9 @@ enum WorkerMessage {
         request_id: u64,
         result: Result<PreparedChatInfo, WireInferenceError>,
     },
-    HardwareObserved {
+    ModelInstanceObserved {
         request_id: u64,
-        result: Result<HardwareSnapshot, String>,
+        result: Result<icn_engine::ModelInstanceObservation, String>,
     },
 }
 
@@ -207,7 +206,7 @@ enum RequestReply {
     Completed(Generation),
     Failed(WireInferenceError),
     Template(Result<PreparedChatInfo, WireInferenceError>),
-    Hardware(Result<HardwareSnapshot, String>),
+    ModelInstance(Result<icn_engine::ModelInstanceObservation, String>),
 }
 
 struct ClientInner {
@@ -306,18 +305,16 @@ pub(crate) struct RemoteBackend {
 }
 
 impl RemoteBackend {
-    pub(crate) fn observe_hardware(
+    pub(crate) fn observe_model_instance(
         &self,
-        runtime_generation: u64,
         policy: CapacityPolicy,
         native_build: String,
         enabled_backends: Vec<String>,
-    ) -> Result<HardwareSnapshot, String> {
+    ) -> Result<icn_engine::ModelInstanceObservation, String> {
         let waiter = self
             .client
-            .request(|request_id| HostMessage::ObserveHardware {
+            .request(|request_id| HostMessage::ObserveModelInstance {
                 request_id,
-                runtime_generation,
                 policy,
                 native_build,
                 enabled_backends,
@@ -325,9 +322,9 @@ impl RemoteBackend {
             })
             .map_err(|error| error.to_string())?;
         match waiter.receiver.recv() {
-            Ok(RequestReply::Hardware(result)) => result,
+            Ok(RequestReply::ModelInstance(result)) => result,
             Ok(RequestReply::Failed(error)) => Err(InferenceError::from(error).to_string()),
-            Ok(_) => Err("worker returned the wrong hardware response".to_owned()),
+            Ok(_) => Err("worker returned the wrong model instance response".to_owned()),
             Err(_) => Err("inference worker stopped".to_owned()),
         }
     }
@@ -767,8 +764,8 @@ fn dispatch_worker_message(inner: &Arc<ClientInner>, message: WorkerMessage) {
         WorkerMessage::TemplateCompleted { request_id, result } => {
             send_request_reply(inner, request_id, RequestReply::Template(result), true);
         }
-        WorkerMessage::HardwareObserved { request_id, result } => {
-            send_request_reply(inner, request_id, RequestReply::Hardware(result), true);
+        WorkerMessage::ModelInstanceObserved { request_id, result } => {
+            send_request_reply(inner, request_id, RequestReply::ModelInstance(result), true);
         }
         WorkerMessage::Hello { .. } => {
             inner.fail_all(
@@ -996,9 +993,8 @@ pub(crate) fn run_worker(build: String) -> anyhow::Result<()> {
                     let _ = responses.send(WorkerMessage::TemplateCompleted { request_id, result });
                 });
             }
-            HostMessage::ObserveHardware {
+            HostMessage::ObserveModelInstance {
                 request_id,
-                runtime_generation,
                 policy,
                 native_build,
                 enabled_backends,
@@ -1008,20 +1004,16 @@ pub(crate) fn run_worker(build: String) -> anyhow::Result<()> {
                 let responses = responses.clone();
                 thread::spawn(move || {
                     let span = tracing::info_span!(
-                        "icn.worker.hardware_observation",
+                        "icn.worker.model_instance_observation",
                         worker.request.id = request_id
                     );
                     crate::telemetry::set_parent_from_carrier(&span, &trace);
                     let _entered = span.enter();
                     let result = backend
-                        .observe_hardware(
-                            runtime_generation,
-                            policy,
-                            native_build,
-                            enabled_backends,
-                        )
+                        .observe_model_instance(policy, native_build, enabled_backends)
                         .map_err(|error| error.to_string());
-                    let _ = responses.send(WorkerMessage::HardwareObserved { request_id, result });
+                    let _ =
+                        responses.send(WorkerMessage::ModelInstanceObserved { request_id, result });
                 });
             }
             HostMessage::Cancel { request_id } => {

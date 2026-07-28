@@ -8,6 +8,7 @@ export * from "./catalog/index.js";
 export * from "./installed/index.js";
 export * from "./downloads/index.js";
 export * from "./provider/index.js";
+export * from "./instances/index.js";
 export {
   GeneratedClientIncompleteStreamError,
   GeneratedClientInputError,

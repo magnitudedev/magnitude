@@ -192,12 +192,20 @@ quantization, byte progress, transfer rate, and remaining-time presentation from
 local-model mirrors. The initiating Enter or click event may bridge server acknowledgement with a
 presentation-only starting state for that exact selection; it reports no inferred progress and
 cannot regress to the informational chooser before authoritative download or loading state arrives.
-Detailed residency progress remains in the activity rail. Setup disappears
-only when the selected primary slot is ready. The composer remains visible but cannot submit
-throughout setup, and its model,
+The presentation says Loading only while the selected slot projects an exact ICN instance in its
+Loading lifecycle; assignment, package preparation, or readiness assessment alone never implies
+loading. Detailed residency progress remains in the activity rail. The explicit selection action
+composes the ordinary target download, primary-slot assignment, and slot load commands; the client
+marks onboarding complete only after the exact selected instance is Ready. Cancel uses the ordinary
+download-cancel or slot-clear command. ACN has no onboarding-specific model operation and startup
+never infers one from persisted state. Setup disappears only after completion. The composer remains
+visible but cannot submit throughout setup, and its model,
 reasoning-effort, and resident-memory footer controls have no hover or activation behavior. Cancel
-confirmation is presentation-only; confirmed cancellation is one server mutation that returns to
-the chooser. None of these surfaces are session events.
+confirmation is presentation-only. None of these surfaces are session events.
+
+Cancellation presentation is keyed to the exact cancel mutation for the selected target. Download,
+assignment, load, completion, or any unrelated pending mutation can never produce a “Cancelling”
+state.
 
 The CLI composer keeps a one-line minimum editor inside a full-width input surface with one full
 row of visual padding above and below it. A solid mode border sits immediately outside the colored
@@ -219,7 +227,7 @@ Enter or a clicked choice
 commits through the existing model-configuration mutation, and Escape closes without changing the
 saved effort. It has no timeout and never renders inside the colored composer surface.
 
-When the selected local-model slot is ready and its server-published resident allocation is
+When the selected local-model slot is ready and its correlated model-instance allocation is
 available, the composer footer shows one compact memory value exactly three spaces after context,
 for example `24 GB mem`. The value sums model, context, compute, and auxiliary allocations across
 participating memory domains. It uses the same muted presentation as context and is plain,
@@ -230,9 +238,14 @@ There is no separate local-inference badge or client-owned transition state.
 While the root slot is loading, the rail may present its authoritative percentage as well as
 persistent model chrome. Both presentations derive from the one mirrored slot lifecycle state;
 readiness hands the rail from model loading to request prefill without a client-owned loading state
-or timer. A typed low-memory load failure or resident-runtime loss uses that same slot state to
+or timer. A typed low-memory load failure or residency loss uses that same slot state to
 replace progress with the durable low-memory stopped message until the user retries or changes the
 selection.
+
+Loading also presents a dim Stop control immediately adjacent to its progress. The action carries
+only the exact model-instance identity from the slot. Any source of stopping—Hardware, the rail,
+replacement, or model policy—transitions the exact bound native instance to `Stopping`, so the
+rail renders one muted stopping state without retaining the initiating action.
 
 Local request preparation publishes preparing activity before acquiring the selected model. Its
 request identifier remains absent until ICN accepts the native request, and that handoff preserves

@@ -16,7 +16,18 @@ const textPosition = (frame: string, needle: string) => {
 const memoryDomainId = LocalInferenceMemoryDomainIdSchema.make("system")
 const localInferenceState = makeView({
   models: [],
-  ready: false,
+  allocation: {
+    contextWindowTokens: 32_768,
+    parallelSequences: 1,
+    physicalContextTokens: 32_768,
+    memoryDomains: [{
+      memoryDomainId,
+      modelBytes: 27 * GIB,
+      contextBytes: 6 * GIB,
+      computeBytes: 1.5 * GIB,
+      auxiliaryBytes: 0.5 * GIB,
+    }],
+  },
   hardware: makeHardware({
     platform: "MacOS",
     architecture: "Arm64",
@@ -38,15 +49,6 @@ const localInferenceState = makeView({
       availableBytes: Option.some(12 * GIB),
       sharesSystemMemory: true,
     }],
-    residentMemory: Option.some({
-      domains: [{
-        memoryDomainId,
-        modelBytes: 27 * GIB,
-        contextBytes: 6 * GIB,
-        computeBytes: 1.5 * GIB,
-        auxiliaryBytes: 0.5 * GIB,
-      }],
-    }),
   }),
 })
 

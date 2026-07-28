@@ -1,9 +1,12 @@
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { ReactNode } from 'react'
+import type { ComponentProps, ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
+import { Option } from 'effect'
+import { TextAttributes } from '@opentui/core'
 import {
-  ModelSlotBlocked,
-  ModelSlotLoadingLocalModel,
+  ModelSlotConfiguredLocal,
+  ModelInstanceIdSchema,
+  ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -11,8 +14,6 @@ import {
   type DisplayActorWork,
   type DisplayModelRequestActivity,
 } from '@magnitudedev/sdk'
-import { ActivityRail } from './activity-rail'
-
 vi.mock('../../hooks/use-theme', () => ({
   useTheme: () => ({
     primary: 'cyan',
@@ -20,6 +21,21 @@ vi.mock('../../hooks/use-theme', () => ({
     muted: 'gray',
   }),
 }))
+vi.mock('@opentui/react', async () => {
+  const actual = await vi.importActual<typeof import('@opentui/react')>('@opentui/react')
+  return {
+    ...actual,
+    useRenderer: () => ({ setMousePointer: () => {} }),
+  }
+})
+vi.mock('../../components/button', () => ({
+  Button: ({ children }: { children: ReactNode }) => <>{children}</>,
+}))
+
+const { ActivityRail: ActivityRailView } = await import('./activity-rail')
+const ActivityRail = (
+  props: Omit<ComponentProps<typeof ActivityRailView>, "onStopModel">,
+) => <ActivityRailView {...props} onStopModel={() => {}} />
 
 const htmlToText = (html: string): string =>
   html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
@@ -27,9 +43,36 @@ const htmlToText = (html: string): string =>
 const text = (node: ReactNode): string => htmlToText(renderToStaticMarkup(<>{node}</>))
 const selection = {
   providerId: ProviderIdSchema.make("local"),
-  providerModelId: ProviderModelIdSchema.make("local:test"),
+  providerModelId: ProviderModelIdSchema.make("test-configuration"),
   reasoningEffort: ReasoningEffortSchema.make("none"),
 }
+const instanceId = ModelInstanceIdSchema.make("test-instance")
+const configurationId = ModelServingConfigurationIdSchema.make("test-configuration")
+const localActivity = (
+  lifecycle:
+    | {
+        readonly _tag: "Loading"
+        readonly stage: "loading"
+        readonly progress: Option.Option<number>
+        readonly plannedAllocation: Option.Option<never>
+      }
+    | {
+        readonly _tag: "Failed"
+        readonly failure: { readonly code: string; readonly message: string; readonly retryable: boolean }
+      },
+) => new ModelSlotConfiguredLocal({
+  slotId: PRIMARY_SLOT_ID,
+  selection,
+  descriptor: {
+    providerId: selection.providerId,
+    providerModelId: selection.providerModelId,
+    displayName: "Local test",
+  },
+  availability: { _tag: "Available" },
+  readiness: { _tag: "Assessing" },
+  instance: Option.some({ id: instanceId, configurationId, lifecycle }),
+  actions: lifecycle._tag === "Loading" ? ["Stop"] : [],
+})
 
 const work = (overrides: Partial<DisplayActorWork> = {}): DisplayActorWork => ({
   phase: 'working',
@@ -62,15 +105,18 @@ describe('activity rail', () => {
       <ActivityRail
         work={work()}
         width={100}
-        modelLoadActivity={new ModelSlotLoadingLocalModel({
-          slotId: PRIMARY_SLOT_ID,
-          selection,
-          percentage: 42,
+        modelLoadActivity={localActivity({
+          _tag: "Loading",
+          stage: "loading",
+          progress: Option.some(0.42),
+          plannedAllocation: Option.none(),
         })}
         modelRequestActivity={request()}
       />,
     )
-    expect(htmlToText(html)).toBe('⠋ Loading model into memory · 42%')
+    expect(htmlToText(html)).toBe('⠋ Loading model into memory · 42% Stop')
+    expect(html).toContain('  Stop')
+    expect(html).toContain(`attributes="${TextAttributes.DIM}"`)
     expect(html).not.toContain('padding-left')
     expect(html).not.toContain('padding-top')
   })
@@ -80,16 +126,12 @@ describe('activity rail', () => {
       <ActivityRail
         work={work()}
         width={100}
-        modelLoadActivity={new ModelSlotBlocked({
-          slotId: PRIMARY_SLOT_ID,
-          selection,
-          reason: {
-            _tag: "LocalModelStoppedLowMemory",
-            error: {
-              code: "low_memory",
-              message: "internal detail",
-              retryable: true,
-            },
+        modelLoadActivity={localActivity({
+          _tag: "Failed",
+          failure: {
+            code: "low_memory",
+            message: "internal detail",
+            retryable: true,
           },
         })}
         modelRequestActivity={request()}

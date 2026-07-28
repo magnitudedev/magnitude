@@ -58,6 +58,7 @@ export const ApplyTemplateRequest = S.Struct({
   ),
   messages: S.Array(S.suspend((): S.Schema<ChatMessageRequest, ChatMessageRequestEncoded> => ChatMessageRequest)),
   model: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  model_instance_id: S.String,
   parallel_tool_calls: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   response_format: S.optionalWith(
     S.suspend((): S.Schema<ResponseFormatRequest, ResponseFormatRequestEncoded> => ResponseFormatRequest),
@@ -109,8 +110,7 @@ export type AssessModelRequestEncoded = S.Schema.Encoded<typeof AssessModelReque
 
 export const AssessModelResult = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Assessed"),
+    S.TaggedStruct("Assessed", {
       profiles: S.Array(S.suspend((): S.Schema<OfferingAssessment, OfferingAssessmentEncoded> => OfferingAssessment)),
       requestId: S.suspend(
         (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
@@ -120,8 +120,7 @@ export const AssessModelResult = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("InvalidTarget"),
+    S.TaggedStruct("InvalidTarget", {
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
       requestId: S.suspend(
         (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
@@ -210,33 +209,17 @@ export type ChatCompletionChunk = S.Schema.Type<typeof ChatCompletionChunk>
 export type ChatCompletionChunkEncoded = S.Schema.Encoded<typeof ChatCompletionChunk>
 
 export const ChatCompletionProgress = S.Union(
+  S.extend(S.TaggedStruct("Queued", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Preparing", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Queued"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("Preparing"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("Prefill"),
+    S.TaggedStruct("Prefill", {
       cachedTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       completedTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       totalTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("Generating"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
+  S.extend(S.TaggedStruct("Generating", {}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type ChatCompletionProgress = S.Schema.Type<typeof ChatCompletionProgress>
 export type ChatCompletionProgressEncoded = S.Schema.Encoded<typeof ChatCompletionProgress>
@@ -255,6 +238,7 @@ export const ChatCompletionRequest = S.Struct({
   max_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   messages: S.Array(S.suspend((): S.Schema<ChatMessageRequest, ChatMessageRequestEncoded> => ChatMessageRequest)),
   model: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  model_instance_id: S.String,
   parallel_tool_calls: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   reasoning_effort: S.optionalWith(
     S.suspend((): S.Schema<ReasoningEffortRequest, ReasoningEffortRequestEncoded> => ReasoningEffortRequest),
@@ -463,16 +447,14 @@ export type DefaultGenerationSettingsEncoded = S.Schema.Encoded<typeof DefaultGe
 
 export const DownloadAttempt = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Pending"),
+    S.TaggedStruct("Pending", {
       id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
       packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Downloading"),
+    S.TaggedStruct("Downloading", {
       bytesPerSecond: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
         exact: true,
         as: "Option",
@@ -486,16 +468,14 @@ export const DownloadAttempt = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Completed"),
+    S.TaggedStruct("Completed", {
       id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
       packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Failed"),
+    S.TaggedStruct("Failed", {
       completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
       id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
@@ -505,8 +485,7 @@ export const DownloadAttempt = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Cancelled"),
+    S.TaggedStruct("Cancelled", {
       id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
       packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
     }),
@@ -577,8 +556,7 @@ export type ExecutionSettingsResponseEncoded = S.Schema.Encoded<typeof Execution
 
 export const FitModelResult = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Fitted"),
+    S.TaggedStruct("Fitted", {
       assessment: S.suspend((): S.Schema<OfferingAssessment, OfferingAssessmentEncoded> => OfferingAssessment),
       configuration: S.suspend(
         (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
@@ -591,8 +569,7 @@ export const FitModelResult = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("DoesNotFit"),
+    S.TaggedStruct("DoesNotFit", {
       deficitBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       limitingResource: S.String,
       requestId: S.suspend(
@@ -603,8 +580,7 @@ export const FitModelResult = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("InvalidTarget"),
+    S.TaggedStruct("InvalidTarget", {
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
       requestId: S.suspend(
         (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
@@ -815,27 +791,6 @@ export const HardwareSnapshot = S.Struct({
   ),
   native_build: S.String,
   platform: S.String,
-  resident_execution: S.optionalWith(
-    S.Union(
-      S.Null,
-      S.suspend((): S.Schema<ResidentExecution, ResidentExecutionEncoded> => ResidentExecution),
-    ),
-    { exact: true, as: "Option" },
-  ),
-  resident_memory: S.optionalWith(
-    S.Union(
-      S.Null,
-      S.suspend((): S.Schema<ResidentMemory, ResidentMemoryEncoded> => ResidentMemory),
-    ),
-    { exact: true, as: "Option" },
-  ),
-  runtime_failure: S.optionalWith(
-    S.Union(
-      S.Null,
-      S.suspend((): S.Schema<RuntimeFailureObservation, RuntimeFailureObservationEncoded> => RuntimeFailureObservation),
-    ),
-    { exact: true, as: "Option" },
-  ),
   system_memory: S.suspend((): S.Schema<HardwareSystemMemory, HardwareSystemMemoryEncoded> => HardwareSystemMemory),
   system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   topology_fingerprint: S.String,
@@ -975,13 +930,13 @@ export type JsonSchemaRequest = S.Schema.Type<typeof JsonSchemaRequest>
 export type JsonSchemaRequestEncoded = S.Schema.Encoded<typeof JsonSchemaRequest>
 
 export const LoadModelReady = S.Struct({
+  allocation: S.suspend(
+    (): S.Schema<ModelInstanceAllocation, ModelInstanceAllocationEncoded> => ModelInstanceAllocation,
+  ),
   configurationId: S.suspend(
     (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
   ),
-  executionEvidenceId: S.String,
-  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  residencyId: S.suspend((): S.Schema<RuntimeResidencyId, RuntimeResidencyIdEncoded> => RuntimeResidencyId),
+  instanceId: S.suspend((): S.Schema<ModelInstanceId, ModelInstanceIdEncoded> => ModelInstanceId),
 })
 export type LoadModelReady = S.Schema.Type<typeof LoadModelReady>
 export type LoadModelReadyEncoded = S.Schema.Encoded<typeof LoadModelReady>
@@ -990,6 +945,7 @@ export const LoadModelRequest = S.Struct({
   configuration: S.suspend(
     (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
   ),
+  instanceId: S.suspend((): S.Schema<ModelInstanceId, ModelInstanceIdEncoded> => ModelInstanceId),
 })
 export type LoadModelRequest = S.Schema.Type<typeof LoadModelRequest>
 export type LoadModelRequestEncoded = S.Schema.Encoded<typeof LoadModelRequest>
@@ -1065,8 +1021,7 @@ export type ModelFileIdEncoded = S.Schema.Encoded<typeof ModelFileId>
 
 export const ModelFileRelationship = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Shard"),
+    S.TaggedStruct("Shard", {
       count: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       fileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
       index: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1074,24 +1029,21 @@ export const ModelFileRelationship = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("ProjectorFor"),
+    S.TaggedStruct("ProjectorFor", {
       projectorFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
       weightsFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("MtpFor"),
+    S.TaggedStruct("MtpFor", {
       mtpFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
       weightsFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("DraftFor"),
+    S.TaggedStruct("DraftFor", {
       draftFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
       method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
       weightsFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
@@ -1112,25 +1064,137 @@ export const ModelFileRole = S.Union(
 export type ModelFileRole = S.Schema.Type<typeof ModelFileRole>
 export type ModelFileRoleEncoded = S.Schema.Encoded<typeof ModelFileRole>
 
+export const ModelInstance = S.Struct({
+  configurationId: S.suspend(
+    (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
+  ),
+  id: S.suspend((): S.Schema<ModelInstanceId, ModelInstanceIdEncoded> => ModelInstanceId),
+  lifecycle: S.suspend((): S.Schema<ModelInstanceLifecycle, ModelInstanceLifecycleEncoded> => ModelInstanceLifecycle),
+})
+export type ModelInstance = S.Schema.Type<typeof ModelInstance>
+export type ModelInstanceEncoded = S.Schema.Encoded<typeof ModelInstance>
+
+export const ModelInstanceAllocation = S.Struct({
+  contextWindowTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  memoryDomains: S.Array(
+    S.suspend((): S.Schema<ModelInstanceMemoryDomain, ModelInstanceMemoryDomainEncoded> => ModelInstanceMemoryDomain),
+  ),
+  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelInstanceAllocation = S.Schema.Type<typeof ModelInstanceAllocation>
+export type ModelInstanceAllocationEncoded = S.Schema.Encoded<typeof ModelInstanceAllocation>
+
+export const ModelInstanceId = S.String
+export type ModelInstanceId = S.Schema.Type<typeof ModelInstanceId>
+export type ModelInstanceIdEncoded = S.Schema.Encoded<typeof ModelInstanceId>
+
+export const ModelInstanceLifecycle = S.Union(
+  S.extend(
+    S.TaggedStruct("Loading", {
+      plannedAllocation: S.optionalWith(
+        S.suspend((): S.Schema<ModelLoadAllocation, ModelLoadAllocationEncoded> => ModelLoadAllocation),
+        { exact: true, as: "Option" },
+      ),
+      progress: S.optionalWith(S.Number, { exact: true, as: "Option" }),
+      stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Ready", {
+      allocation: S.suspend(
+        (): S.Schema<ModelInstanceAllocation, ModelInstanceAllocationEncoded> => ModelInstanceAllocation,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Stopping", {
+      allocation: S.suspend(
+        (): S.Schema<ModelStoppingAllocation, ModelStoppingAllocationEncoded> => ModelStoppingAllocation,
+      ),
+      reason: S.suspend((): S.Schema<ModelReleaseReason, ModelReleaseReasonEncoded> => ModelReleaseReason),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Stopped", {
+      reason: S.suspend((): S.Schema<ModelReleaseReason, ModelReleaseReasonEncoded> => ModelReleaseReason),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelInstanceLifecycle = S.Schema.Type<typeof ModelInstanceLifecycle>
+export type ModelInstanceLifecycleEncoded = S.Schema.Encoded<typeof ModelInstanceLifecycle>
+
+export const ModelInstanceMemoryDomain = S.Struct({
+  auxiliaryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  computeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  contextBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+  modelBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelInstanceMemoryDomain = S.Schema.Type<typeof ModelInstanceMemoryDomain>
+export type ModelInstanceMemoryDomainEncoded = S.Schema.Encoded<typeof ModelInstanceMemoryDomain>
+
+export const ModelInstancesInvalidation = S.Struct({
+  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelInstancesInvalidation = S.Schema.Type<typeof ModelInstancesInvalidation>
+export type ModelInstancesInvalidationEncoded = S.Schema.Encoded<typeof ModelInstancesInvalidation>
+
+export const ModelInstancesSnapshot = S.Struct({
+  instances: S.Array(S.suspend((): S.Schema<ModelInstance, ModelInstanceEncoded> => ModelInstance)),
+  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelInstancesSnapshot = S.Schema.Type<typeof ModelInstancesSnapshot>
+export type ModelInstancesSnapshotEncoded = S.Schema.Encoded<typeof ModelInstancesSnapshot>
+
+export const ModelLoadAllocation = S.Struct({
+  contextWindowTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  requiredSystemMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelLoadAllocation = S.Schema.Type<typeof ModelLoadAllocation>
+export type ModelLoadAllocationEncoded = S.Schema.Encoded<typeof ModelLoadAllocation>
+
 export const ModelLoadEvent = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Progress"),
+    S.TaggedStruct("Progress", {
+      allocation: S.optionalWith(
+        S.Union(
+          S.Null,
+          S.suspend((): S.Schema<ModelLoadAllocation, ModelLoadAllocationEncoded> => ModelLoadAllocation),
+        ),
+        { exact: true, as: "Option" },
+      ),
       fraction: S.optionalWith(S.Union(S.Number, S.Null), { exact: true, as: "Option" }),
       stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Ready"),
+    S.TaggedStruct("Ready", {
       ready: S.suspend((): S.Schema<LoadModelReady, LoadModelReadyEncoded> => LoadModelReady),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Failed"),
+    S.TaggedStruct("Stopped", {
+      instance_id: S.suspend((): S.Schema<ModelInstanceId, ModelInstanceIdEncoded> => ModelInstanceId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Failed", {
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1151,15 +1215,13 @@ export type ModelLoadStageEncoded = S.Schema.Encoded<typeof ModelLoadStage>
 
 export const ModelOfferingTarget = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Package"),
+    S.TaggedStruct("Package", {
       package: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("SpeculativeDecodingPair"),
+    S.TaggedStruct("SpeculativeDecodingPair", {
       draft: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
       id: S.suspend(
         (): S.Schema<SpeculativeDecodingPairId, SpeculativeDecodingPairIdEncoded> => SpeculativeDecodingPairId,
@@ -1193,29 +1255,21 @@ export type ModelPackageId = S.Schema.Type<typeof ModelPackageId>
 export type ModelPackageIdEncoded = S.Schema.Encoded<typeof ModelPackageId>
 
 export const ModelPackageInspection = S.Union(
+  S.extend(S.TaggedStruct("Pending", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Pending"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("Inspected"),
+    S.TaggedStruct("Inspected", {
       capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Invalid"),
+    S.TaggedStruct("Invalid", {
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Incompatible"),
+    S.TaggedStruct("Incompatible", {
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1226,15 +1280,13 @@ export type ModelPackageInspectionEncoded = S.Schema.Encoded<typeof ModelPackage
 
 export const ModelPackageOperand = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Installed"),
+    S.TaggedStruct("Installed", {
       packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("SourceBacked"),
+    S.TaggedStruct("SourceBacked", {
       package: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1255,16 +1307,14 @@ export type ModelPackagePropertiesEncoded = S.Schema.Encoded<typeof ModelPackage
 
 export const ModelPackageSource = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("HuggingFace"),
+    S.TaggedStruct("HuggingFace", {
       repository: S.String,
       revision: S.String,
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Local"),
+    S.TaggedStruct("Local", {
       path: S.String,
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1281,6 +1331,14 @@ export const ModelReasoningCapabilities = S.Struct({
 export type ModelReasoningCapabilities = S.Schema.Type<typeof ModelReasoningCapabilities>
 export type ModelReasoningCapabilitiesEncoded = S.Schema.Encoded<typeof ModelReasoningCapabilities>
 
+export const ModelReleaseReason = S.Union(
+  S.Literal("explicit_stop"),
+  S.Literal("replacement"),
+  S.Literal("idle_timeout"),
+)
+export type ModelReleaseReason = S.Schema.Type<typeof ModelReleaseReason>
+export type ModelReleaseReasonEncoded = S.Schema.Encoded<typeof ModelReleaseReason>
+
 export const ModelServingConfiguration = S.Struct({
   id: S.suspend(
     (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
@@ -1295,17 +1353,37 @@ export const ModelServingConfigurationId = S.String
 export type ModelServingConfigurationId = S.Schema.Type<typeof ModelServingConfigurationId>
 export type ModelServingConfigurationIdEncoded = S.Schema.Encoded<typeof ModelServingConfigurationId>
 
+export const ModelStoppingAllocation = S.Union(
+  S.extend(
+    S.TaggedStruct("Planned", {
+      allocation: S.optionalWith(
+        S.suspend((): S.Schema<ModelLoadAllocation, ModelLoadAllocationEncoded> => ModelLoadAllocation),
+        { exact: true, as: "Option" },
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Resident", {
+      allocation: S.suspend(
+        (): S.Schema<ModelInstanceAllocation, ModelInstanceAllocationEncoded> => ModelInstanceAllocation,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelStoppingAllocation = S.Schema.Type<typeof ModelStoppingAllocation>
+export type ModelStoppingAllocationEncoded = S.Schema.Encoded<typeof ModelStoppingAllocation>
+
 export const ModelTargetInput = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Package"),
+    S.TaggedStruct("Package", {
       package: S.suspend((): S.Schema<ModelPackageOperand, ModelPackageOperandEncoded> => ModelPackageOperand),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("SpeculativeDecodingPair"),
+    S.TaggedStruct("SpeculativeDecodingPair", {
       draft: S.suspend((): S.Schema<ModelPackageOperand, ModelPackageOperandEncoded> => ModelPackageOperand),
       target: S.suspend((): S.Schema<ModelPackageOperand, ModelPackageOperandEncoded> => ModelPackageOperand),
     }),
@@ -1324,8 +1402,7 @@ export type NamedFunctionCallRequestEncoded = S.Schema.Encoded<typeof NamedFunct
 
 export const OfferingAssessment = S.Union(
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Fits"),
+    S.TaggedStruct("Fits", {
       assessmentId: S.suspend((): S.Schema<OfferingAssessmentId, OfferingAssessmentIdEncoded> => OfferingAssessmentId),
       configurationId: S.suspend(
         (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
@@ -1350,8 +1427,7 @@ export const OfferingAssessment = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("DoesNotFit"),
+    S.TaggedStruct("DoesNotFit", {
       assessmentId: S.suspend((): S.Schema<OfferingAssessmentId, OfferingAssessmentIdEncoded> => OfferingAssessmentId),
       configurationId: S.suspend(
         (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
@@ -1364,8 +1440,7 @@ export const OfferingAssessment = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Incompatible"),
+    S.TaggedStruct("Incompatible", {
       configurationId: S.suspend(
         (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
       ),
@@ -1404,6 +1479,14 @@ export const PerformanceUnavailable = S.Struct({
 })
 export type PerformanceUnavailable = S.Schema.Type<typeof PerformanceUnavailable>
 export type PerformanceUnavailableEncoded = S.Schema.Encoded<typeof PerformanceUnavailable>
+
+export const PreviewModelLoadRequest = S.Struct({
+  configuration: S.suspend(
+    (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
+  ),
+})
+export type PreviewModelLoadRequest = S.Schema.Type<typeof PreviewModelLoadRequest>
+export type PreviewModelLoadRequestEncoded = S.Schema.Encoded<typeof PreviewModelLoadRequest>
 
 export const PropsResponse = S.Struct({
   build_info: S.String,
@@ -1486,33 +1569,6 @@ export const RemoveInstalledModelPackageResponse = S.extend(
 export type RemoveInstalledModelPackageResponse = S.Schema.Type<typeof RemoveInstalledModelPackageResponse>
 export type RemoveInstalledModelPackageResponseEncoded = S.Schema.Encoded<typeof RemoveInstalledModelPackageResponse>
 
-export const ResidentExecution = S.Struct({
-  context_window_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  model_id: S.String,
-  parallel_sequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physical_context_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type ResidentExecution = S.Schema.Type<typeof ResidentExecution>
-export type ResidentExecutionEncoded = S.Schema.Encoded<typeof ResidentExecution>
-
-export const ResidentMemory = S.Struct({
-  domains: S.Array(S.suspend((): S.Schema<ResidentMemoryDomain, ResidentMemoryDomainEncoded> => ResidentMemoryDomain)),
-  model_id: S.String,
-  runtime_generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type ResidentMemory = S.Schema.Type<typeof ResidentMemory>
-export type ResidentMemoryEncoded = S.Schema.Encoded<typeof ResidentMemory>
-
-export const ResidentMemoryDomain = S.Struct({
-  auxiliary_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  compute_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  context_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  memory_domain_id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
-  model_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type ResidentMemoryDomain = S.Schema.Type<typeof ResidentMemoryDomain>
-export type ResidentMemoryDomainEncoded = S.Schema.Encoded<typeof ResidentMemoryDomain>
-
 export const ResponseFormatRequest = S.Union(
   S.extend(
     S.Struct({
@@ -1544,19 +1600,6 @@ export const ResponseFormatRequest = S.Union(
 export type ResponseFormatRequest = S.Schema.Type<typeof ResponseFormatRequest>
 export type ResponseFormatRequestEncoded = S.Schema.Encoded<typeof ResponseFormatRequest>
 
-export const RuntimeFailureObservation = S.Struct({
-  code: S.String,
-  message: S.String,
-  model_id: S.String,
-  retryable: S.Boolean,
-})
-export type RuntimeFailureObservation = S.Schema.Type<typeof RuntimeFailureObservation>
-export type RuntimeFailureObservationEncoded = S.Schema.Encoded<typeof RuntimeFailureObservation>
-
-export const RuntimeResidencyId = S.String
-export type RuntimeResidencyId = S.Schema.Type<typeof RuntimeResidencyId>
-export type RuntimeResidencyIdEncoded = S.Schema.Encoded<typeof RuntimeResidencyId>
-
 export const ServingProfile = S.Struct({
   contextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
@@ -1568,40 +1611,18 @@ export type SpeculativeDecodingPairId = S.Schema.Type<typeof SpeculativeDecoding
 export type SpeculativeDecodingPairIdEncoded = S.Schema.Encoded<typeof SpeculativeDecodingPairId>
 
 export const SpeculativeMethod = S.Union(
+  S.extend(S.TaggedStruct("Mtp", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("DraftSimple", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("DraftEagle3", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("DraftDFlash", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("Mtp"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("DraftSimple"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("DraftEagle3"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("DraftDFlash"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      _tag: S.Literal("Ngram"),
+    S.TaggedStruct("Ngram", {
       method: S.String,
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.Struct({
-      _tag: S.Literal("UnknownNative"),
+    S.TaggedStruct("UnknownNative", {
       evidence: S.String,
       method: S.String,
     }),

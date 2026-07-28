@@ -11,7 +11,6 @@ import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type TaskDisplayRow } from '@ma
 import {
   GIB,
   LOCAL_PROVIDER_ID,
-  makeHardware,
   makeView,
   TEST_MEMORY_DOMAIN_ID,
 } from '../local-inference/test-fixtures'
@@ -295,17 +294,18 @@ test('shows a single no-provider label instead of model and reasoning effort', (
 test('shows resident memory three spaces after context and links it to hardware', () => {
   const openHardware = vi.fn()
   const localInferenceState = makeView({
-    hardware: makeHardware({
-      residentMemory: Option.some({
-        domains: [{
-          memoryDomainId: TEST_MEMORY_DOMAIN_ID,
-          modelBytes: 13 * GIB,
-          contextBytes: 2 * GIB,
-          computeBytes: GIB,
-          auxiliaryBytes: 0,
-        }],
-      }),
-    }),
+    allocation: {
+      contextWindowTokens: 32_768,
+      parallelSequences: 1,
+      physicalContextTokens: 32_768,
+      memoryDomains: [{
+        memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+        modelBytes: 13 * GIB,
+        contextBytes: 2 * GIB,
+        computeBytes: GIB,
+        auxiliaryBytes: 0,
+      }],
+    },
   })
   const html = render(
     <Composer
@@ -355,17 +355,18 @@ test('shows resident memory three spaces after context and links it to hardware'
 test('clicking effort opens the footer selector and clicking an option commits it', () => {
   const applied: string[] = []
   const localInferenceState = makeView({
-    hardware: makeHardware({
-      residentMemory: Option.some({
-        domains: [{
-          memoryDomainId: TEST_MEMORY_DOMAIN_ID,
-          modelBytes: 16 * GIB,
-          contextBytes: 0,
-          computeBytes: 0,
-          auxiliaryBytes: 0,
-        }],
-      }),
-    }),
+    allocation: {
+      contextWindowTokens: 32_768,
+      parallelSequences: 1,
+      physicalContextTokens: 32_768,
+      memoryDomains: [{
+        memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+        modelBytes: 16 * GIB,
+        contextBytes: 0,
+        computeBytes: 0,
+        auxiliaryBytes: 0,
+      }],
+    },
   })
   const thinkingOptions = ['none', 'low', 'medium', 'high'].map((value) => ({
     value: ReasoningEffortSchema.make(value),
@@ -422,17 +423,18 @@ test('disables footer settings controls while onboarding downloads a model', () 
   const openHardware = vi.fn()
   const applyThinking = vi.fn()
   const localInferenceState = makeView({
-    hardware: makeHardware({
-      residentMemory: Option.some({
-        domains: [{
-          memoryDomainId: TEST_MEMORY_DOMAIN_ID,
-          modelBytes: 16 * GIB,
-          contextBytes: 0,
-          computeBytes: 0,
-          auxiliaryBytes: 0,
-        }],
-      }),
-    }),
+    allocation: {
+      contextWindowTokens: 32_768,
+      parallelSequences: 1,
+      physicalContextTokens: 32_768,
+      memoryDomains: [{
+        memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+        modelBytes: 16 * GIB,
+        contextBytes: 0,
+        computeBytes: 0,
+        auxiliaryBytes: 0,
+      }],
+    },
   })
   const thinkingOptions = ['none', 'low', 'medium', 'high'].map((value) => ({
     value: ReasoningEffortSchema.make(value),

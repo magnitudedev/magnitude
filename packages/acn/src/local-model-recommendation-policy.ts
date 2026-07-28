@@ -29,7 +29,7 @@ export interface RecommendationCandidate {
     | undefined
   readonly fidelityRank: number
   readonly quantizationAware: boolean
-  readonly estimatedRuntimeBytes: number
+  readonly estimatedLoadedBytes: number
   readonly stableCapacityBudgetBytes: number
   readonly totalDownloadBytes: number
 }
@@ -147,7 +147,7 @@ export const balancedUtility = (candidate: RecommendationCandidate): number => {
   const generation = generationFor(candidate)
   if (!generation) return Number.NEGATIVE_INFINITY
   const capability = (capabilityScore(candidate) ?? 50) / 100
-  const memory = clamp(1 - candidate.estimatedRuntimeBytes
+  const memory = clamp(1 - candidate.estimatedLoadedBytes
     / Math.max(1, candidate.stableCapacityBudgetBytes))
   const download = DOWNLOAD_UTILITY_BYTES
     / (DOWNLOAD_UTILITY_BYTES + candidate.totalDownloadBytes)
@@ -213,7 +213,7 @@ const materiallyLighterThan = (
   candidate: RecommendationCandidate,
   reference: RecommendationCandidate,
   ratio: number,
-): boolean => candidate.estimatedRuntimeBytes <= reference.estimatedRuntimeBytes * ratio
+): boolean => candidate.estimatedLoadedBytes <= reference.estimatedLoadedBytes * ratio
   || candidate.totalDownloadBytes <= reference.totalDownloadBytes * ratio
 
 const percentDifference = (value: number, reference: number): number => Math.round(
@@ -258,8 +258,8 @@ const describeBestQuality = (
     ? "Offers stronger performance on difficult coding tasks. "
     : ""
   const memoryChange = percentDifference(
-    candidate.estimatedRuntimeBytes,
-    balanced.estimatedRuntimeBytes,
+    candidate.estimatedLoadedBytes,
+    balanced.estimatedLoadedBytes,
   )
   const memoryTradeoff = memoryChange >= 5
     ? ` It uses about ${memoryChange}% more memory than Balanced.`
@@ -293,14 +293,14 @@ const describeLightweight = (
   balanced: RecommendationCandidate,
 ): string => {
   const generation = generationFor(candidate)!
-  const runtimeReduction = Math.max(0, Math.round(
-    (1 - candidate.estimatedRuntimeBytes / balanced.estimatedRuntimeBytes) * 100,
+  const loadedMemoryReduction = Math.max(0, Math.round(
+    (1 - candidate.estimatedLoadedBytes / balanced.estimatedLoadedBytes) * 100,
   ))
   const downloadReduction = Math.max(0, Math.round(
     (1 - candidate.totalDownloadBytes / balanced.totalDownloadBytes) * 100,
   ))
-  const reduction = runtimeReduction >= downloadReduction
-    ? `${runtimeReduction}% less runtime memory`
+  const reduction = loadedMemoryReduction >= downloadReduction
+    ? `${loadedMemoryReduction}% less memory while loaded`
     : `${downloadReduction}% less disk space`
   const balancedSpeed = generationFor(balanced)!.estimatedTokensPerSecond
   const speedTradeoff = generation.estimatedTokensPerSecond < balancedSpeed * 0.95
@@ -321,7 +321,7 @@ const toRecommendation = (
   balanced: RecommendationCandidate,
 ): Recommendation => ({
   id: RecommendationIdSchema.make(`${candidate.assessment.configurationId}:${intent}`),
-  modelId: candidate.model.targetId,
+  targetId: candidate.model.targetId,
   recommendableModelId: candidate.model.id,
   displayName: candidate.model.displayName,
   description: candidate.model.description,
@@ -413,14 +413,14 @@ export const selectRecommendationPortfolio = (
   const lightweightCapable = lightweightCapabilityGuard(largestContexts)
     .filter((candidate) =>
       !selectedConfigurations.has(candidate.assessment.configurationId))
-    .sort((left, right) => left.estimatedRuntimeBytes - right.estimatedRuntimeBytes
+    .sort((left, right) => left.estimatedLoadedBytes - right.estimatedLoadedBytes
       || left.totalDownloadBytes - right.totalDownloadBytes
       || (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
       || right.fidelityRank - left.fidelityRank
       || stableCompare(left, right))
-  const lightestRuntime = lightweightCapable.at(0)?.estimatedRuntimeBytes ?? 0
+  const lightestLoaded = lightweightCapable.at(0)?.estimatedLoadedBytes ?? 0
   const nearLightest = lightweightCapable.filter((candidate) =>
-    candidate.estimatedRuntimeBytes <= lightestRuntime * 1.15)
+    candidate.estimatedLoadedBytes <= lightestLoaded * 1.15)
   const lightweight = preferNewCheckpointWithin(nearLightest, usedCheckpointIds)
   if (lightweight && materiallyLighterThan(lightweight, balanced, 0.8)) {
     selected.push({ candidate: lightweight, intent: "lightweight" })

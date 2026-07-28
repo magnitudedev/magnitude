@@ -29,9 +29,6 @@ const hardware: LocalInferenceHardware = {
     availableBytes: Option.some(8),
     sharesSystemMemory: true,
   }],
-  residentMemory: Option.none(),
-  residentRuntime: Option.none(),
-  runtimeFailure: Option.none(),
 }
 
 const model = {
@@ -48,11 +45,11 @@ const model = {
 
 describe("model memory presentation", () => {
   it("uses the same strict boundary as load admission", () => {
-    expect(providerModelMemoryConditions(model, hardware).lacksCurrentHeadroom).toBe(true)
+    expect(providerModelMemoryConditions(model, hardware, Option.none()).lacksCurrentHeadroom).toBe(true)
     expect(providerModelMemoryConditions(model, {
       ...hardware,
       availableSystemMemoryBytes: 9,
-    }).lacksCurrentHeadroom).toBe(false)
+    }, Option.none()).lacksCurrentHeadroom).toBe(false)
   })
 
   it("keeps stable incompatibility distinct from temporary headroom", () => {
@@ -66,7 +63,7 @@ describe("model memory presentation", () => {
         warningReserveBytes: 4,
         remainingBytes: -1,
       }]),
-    }, hardware).exceedsCapacity).toBe(true)
+    }, hardware, Option.none()).exceedsCapacity).toBe(true)
   })
 
   it("derives the warning state from assessment quantities", () => {
@@ -80,16 +77,16 @@ describe("model memory presentation", () => {
         warningReserveBytes: 4,
         remainingBytes: 1,
       }]),
-    }, undefined).belowWarningReserve).toBe(true)
+    }, undefined, Option.none()).belowWarningReserve).toBe(true)
   })
 
   it("marks current headroom evidence unavailable until hardware is known", () => {
-    expect(providerModelMemoryConditions(model, undefined).evidenceUnavailable).toBe(true)
-    expect(providerModelMemoryConditions(model, hardware).evidenceUnavailable).toBe(false)
+    expect(providerModelMemoryConditions(model, undefined, Option.none()).evidenceUnavailable).toBe(true)
+    expect(providerModelMemoryConditions(model, hardware, Option.none()).evidenceUnavailable).toBe(false)
     expect(providerModelMemoryConditions({
       ...model,
       memory: Option.none(),
-    }, hardware).evidenceUnavailable).toBe(true)
+    }, hardware, Option.none()).evidenceUnavailable).toBe(true)
   })
 
   it("counts the current singleton residency as reclaimable before replacement", () => {
@@ -103,15 +100,17 @@ describe("model memory presentation", () => {
         availableBytes: Option.some(8),
         sharesSystemMemory: true,
       }],
-      residentMemory: Option.some({
-        domains: [{
-          memoryDomainId: systemMemoryDomainId,
-          modelBytes: 1,
-          contextBytes: 0,
-          computeBytes: 0,
-          auxiliaryBytes: 0,
-        }],
-      }),
-    }).lacksCurrentHeadroom).toBe(false)
+    }, Option.some({
+      contextWindowTokens: 1,
+      parallelSequences: 1,
+      physicalContextTokens: 1,
+      memoryDomains: [{
+        memoryDomainId: systemMemoryDomainId,
+        modelBytes: 1,
+        contextBytes: 0,
+        computeBytes: 0,
+        auxiliaryBytes: 0,
+      }],
+    })).lacksCurrentHeadroom).toBe(false)
   })
 })

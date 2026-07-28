@@ -7,7 +7,7 @@ import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
-import { deriveHardwareMemoryView, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
+import { deriveHardwareMemoryView, modelSlotResidentAllocation, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, ProviderModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
@@ -90,8 +90,15 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const localInferenceState = useLocalInferenceQuery()
   const localInferenceSnapshot = Result.value(localInferenceState)
   const hardwareState = Option.map(localInferenceSnapshot, (state) => state.hardware)
+  const residentAllocation = Option.flatMap(
+    localInferenceSnapshot,
+    (state) => modelSlotResidentAllocation(state.slots.slots.primary),
+  )
   const hardware = Option.map(hardwareState, describeLocalHardware)
-  const hardwareMemory = Option.map(hardwareState, deriveHardwareMemoryView)
+  const hardwareMemory = Option.map(
+    hardwareState,
+    (hardware) => deriveHardwareMemoryView(hardware, residentAllocation),
+  )
   const [mode, setMode] = useState<Mode>('view')
   const [inputValue, setInputValue] = useState('')
   const [error, setError] = useState<string | null>(null)

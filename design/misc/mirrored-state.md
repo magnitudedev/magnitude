@@ -12,7 +12,7 @@ applies_to:
   - packages/acn/src/local-model-packages.ts
   - packages/acn/src/local-model-recommendations.ts
   - packages/acn/src/local-models.ts
-  - packages/acn/src/model-slot-coordinator.ts
+  - packages/acn/src/model-slot-controller.ts
   - packages/acn/src/local-inference-hardware.ts
   - packages/acn/src/onboarding/**
   - packages/acn/src/handlers.ts

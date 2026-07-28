@@ -3,17 +3,8 @@ import { Schema } from "effect"
 import { OnboardingState } from "./onboarding"
 
 describe("onboarding protocol schema", () => {
-  test("contains only generic versioned flow completion", () => {
-    const state = {
-      flows: {
-        model_setup: {
-          currentVersion: 1,
-          completedVersion: null,
-          completedAt: null,
-          required: true,
-        },
-      },
-    }
+  test("contains only durable completion", () => {
+    const state = { completed: false }
     expect(Schema.decodeUnknownSync(OnboardingState)(state)).toEqual(state)
   })
 })

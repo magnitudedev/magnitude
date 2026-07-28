@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Request, State};
@@ -17,9 +17,12 @@ use futures_util::{future::BoxFuture, stream::BoxStream};
 use icn_contracts::models::{
     AssessModelsRequest, AssessModelsResponse, DownloadAttempt, DownloadAttemptId,
     FitModelsRequest, FitModelsResponse, InstalledModelPackages, InstalledModelPackagesResponse,
-    LoadModelRequest, ModelDownloads, ModelDownloadsResponse, ModelEvaluator, ModelLoadEvent,
-    ModelPackageId, RecommendableModelCatalog, RecommendableModelCatalogProvider,
-    RemoveInstalledModelPackageResponse, StartModelDownloadRequest, StartModelDownloadResponse,
+    LoadModelRequest, ModelDownloads, ModelDownloadsResponse, ModelEvaluator, ModelInstance,
+    ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
+    ModelInstancesSnapshot, ModelLoadAllocation, ModelLoadEvent, ModelPackageId,
+    ModelServingConfigurationId, PreviewModelLoadRequest, RecommendableModelCatalog,
+    RecommendableModelCatalogProvider, RemoveInstalledModelPackageResponse,
+    StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
@@ -33,7 +36,7 @@ use icn_contracts::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use utoipa::openapi::extensions::Extensions;
 use utoipa::openapi::path::Operation;
@@ -63,14 +66,13 @@ const fn default_true() -> bool {
 
 #[derive(Clone)]
 pub struct AppState {
-    backends: BackendRegistry,
     installed_packages: Option<Arc<dyn InstalledModelPackages>>,
     recommendable_catalog: Option<Arc<dyn RecommendableModelCatalogProvider>>,
     model_evaluator: Option<Arc<dyn ModelEvaluator>>,
     model_downloads: Option<Arc<dyn ModelDownloads>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
     hugging_face_catalog: Option<Arc<dyn HuggingFaceModelCatalog>>,
-    runtime: Option<Arc<dyn RuntimeController>>,
+    model_controller: Option<Arc<dyn ModelInstanceController>>,
     identity: ServerIdentity,
     authorization: Option<Arc<str>>,
     next_id: Arc<AtomicU64>,
@@ -93,60 +95,45 @@ impl Default for ServerIdentity {
     }
 }
 
-#[derive(Clone)]
-pub struct BackendRegistry {
-    inner: Arc<RwLock<BackendRegistryState>>,
-    active_leases: Arc<AtomicU64>,
-    mutating: Arc<AtomicBool>,
-    mutation_available: Arc<Notify>,
-    lease_released: Arc<Notify>,
-}
-
-struct BackendRegistryState {
-    backend: Option<Arc<dyn CompletionBackend>>,
-    model_id: Option<String>,
-    properties: Option<Result<ModelProperties, String>>,
-    model_aliases: Arc<BTreeSet<String>>,
-    generation: u64,
-}
-
-pub struct BackendLease {
+pub struct ModelInstanceLease {
     backend: Arc<dyn CompletionBackend>,
+    instance_id: ModelInstanceId,
+    configuration_id: ModelServingConfigurationId,
     model_aliases: Arc<BTreeSet<String>>,
-    generation: u64,
-    active_leases: Arc<AtomicU64>,
-    lease_released: Arc<Notify>,
+    release: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-pub struct BackendMutationGuard {
-    mutating: Arc<AtomicBool>,
-    mutation_available: Arc<Notify>,
-}
-
-#[derive(Clone)]
-pub struct BackendObservation {
-    pub model_id: String,
-    pub properties: Result<ModelProperties, String>,
-}
-
-impl Drop for BackendMutationGuard {
-    fn drop(&mut self) {
-        self.mutating.store(false, Ordering::Release);
-        self.mutation_available.notify_one();
+impl ModelInstanceLease {
+    pub fn new(
+        backend: Arc<dyn CompletionBackend>,
+        instance_id: ModelInstanceId,
+        configuration_id: ModelServingConfigurationId,
+        model_aliases: Arc<BTreeSet<String>>,
+        release: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            backend,
+            instance_id,
+            configuration_id,
+            model_aliases,
+            release: Some(Arc::new(release)),
+        }
     }
-}
 
-impl BackendLease {
     pub fn backend(&self) -> &Arc<dyn CompletionBackend> {
         &self.backend
     }
 
-    pub fn model_id(&self) -> &str {
-        self.backend.model_id()
+    pub fn instance_id(&self) -> &ModelInstanceId {
+        &self.instance_id
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation
+    pub fn configuration_id(&self) -> &ModelServingConfigurationId {
+        &self.configuration_id
+    }
+
+    pub fn model_id(&self) -> &str {
+        self.backend.model_id()
     }
 
     fn accepts_model(&self, requested: &str) -> bool {
@@ -154,146 +141,11 @@ impl BackendLease {
     }
 }
 
-impl Drop for BackendLease {
+impl Drop for ModelInstanceLease {
     fn drop(&mut self) {
-        self.active_leases.fetch_sub(1, Ordering::AcqRel);
-        self.lease_released.notify_waiters();
-    }
-}
-
-impl BackendRegistry {
-    pub fn empty() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(BackendRegistryState {
-                backend: None,
-                model_id: None,
-                properties: None,
-                model_aliases: Arc::new(BTreeSet::new()),
-                generation: 0,
-            })),
-            active_leases: Arc::new(AtomicU64::new(0)),
-            mutating: Arc::new(AtomicBool::new(false)),
-            mutation_available: Arc::new(Notify::new()),
-            lease_released: Arc::new(Notify::new()),
+        if let Some(release) = self.release.take() {
+            release();
         }
-    }
-
-    pub fn with_backend(backend: Arc<dyn CompletionBackend>) -> Self {
-        let registry = Self::empty();
-        registry.replace(backend, BTreeSet::new());
-        registry
-    }
-
-    pub fn lease(&self) -> Option<BackendLease> {
-        if self.mutating.load(Ordering::Acquire) {
-            return None;
-        }
-        let state = self.inner.read().ok()?;
-        let backend = state.backend.clone()?;
-        self.active_leases.fetch_add(1, Ordering::AcqRel);
-        if self.mutating.load(Ordering::Acquire) {
-            self.active_leases.fetch_sub(1, Ordering::AcqRel);
-            self.lease_released.notify_waiters();
-            return None;
-        }
-        Some(BackendLease {
-            backend,
-            model_aliases: Arc::clone(&state.model_aliases),
-            generation: state.generation,
-            active_leases: Arc::clone(&self.active_leases),
-            lease_released: Arc::clone(&self.lease_released),
-        })
-    }
-
-    pub fn active_leases(&self) -> u64 {
-        self.active_leases.load(Ordering::Acquire)
-    }
-
-    /// Immutable metadata copied when the backend generation is published.
-    /// Observation never borrows the executable backend or changes idleness.
-    pub fn observe(&self) -> Option<BackendObservation> {
-        let state = self.inner.read().ok()?;
-        Some(BackendObservation {
-            model_id: state.model_id.clone()?,
-            properties: state.properties.clone()?,
-        })
-    }
-
-    pub fn add_alias(&self, alias: String) {
-        let mut state = self.inner.write().expect("backend registry lock poisoned");
-        let mut aliases = (*state.model_aliases).clone();
-        aliases.insert(alias);
-        state.model_aliases = Arc::new(aliases);
-    }
-
-    pub fn try_begin_mutation(&self) -> Option<BackendMutationGuard> {
-        self.mutating
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        if self.active_leases() > 0 {
-            self.mutating.store(false, Ordering::Release);
-            self.mutation_available.notify_one();
-            return None;
-        }
-        Some(BackendMutationGuard {
-            mutating: Arc::clone(&self.mutating),
-            mutation_available: Arc::clone(&self.mutation_available),
-        })
-    }
-
-    pub async fn begin_mutation(&self) -> BackendMutationGuard {
-        loop {
-            let available = self.mutation_available.notified();
-            if self
-                .mutating
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // Closing mutation admission first prevents an unbounded sequence of new
-                // inference leases from starving a queued replacement or unload.
-                while self.active_leases() > 0 {
-                    let released = self.lease_released.notified();
-                    if self.active_leases() > 0 {
-                        released.await;
-                    }
-                }
-                return BackendMutationGuard {
-                    mutating: Arc::clone(&self.mutating),
-                    mutation_available: Arc::clone(&self.mutation_available),
-                };
-            }
-            available.await;
-        }
-    }
-
-    pub fn replace(&self, backend: Arc<dyn CompletionBackend>, aliases: BTreeSet<String>) -> u64 {
-        let model_id = backend.model_id().to_owned();
-        let properties = backend.properties().map_err(|error| error.to_string());
-        let mut state = self.inner.write().expect("backend registry lock poisoned");
-        state.generation = state.generation.saturating_add(1);
-        state.backend = Some(backend);
-        state.model_id = Some(model_id);
-        state.properties = Some(properties);
-        state.model_aliases = Arc::new(aliases);
-        let generation = state.generation;
-        drop(state);
-        generation
-    }
-
-    pub fn clear(&self) -> u64 {
-        let mut state = self.inner.write().expect("backend registry lock poisoned");
-        state.generation = state.generation.saturating_add(1);
-        state.backend = None;
-        state.model_id = None;
-        state.properties = None;
-        state.model_aliases = Arc::new(BTreeSet::new());
-        let generation = state.generation;
-        drop(state);
-        generation
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.inner.read().map(|state| state.generation).unwrap_or(0)
     }
 }
 
@@ -305,30 +157,28 @@ impl AppState {
     /// Construct API state from a backend shared with another server-owned service.
     pub fn from_shared_backend(backend: Arc<dyn CompletionBackend>) -> Self {
         Self {
-            backends: BackendRegistry::with_backend(backend),
             installed_packages: None,
             recommendable_catalog: None,
             model_evaluator: None,
             model_downloads: None,
             hardware: None,
             hugging_face_catalog: None,
-            runtime: None,
+            model_controller: Some(Arc::new(StaticModelInstanceController::new(backend))),
             identity: ServerIdentity::default(),
             authorization: None,
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    pub fn model_free(backends: BackendRegistry) -> Self {
+    pub fn model_free() -> Self {
         Self {
-            backends,
             installed_packages: None,
             recommendable_catalog: None,
             model_evaluator: None,
             model_downloads: None,
             hardware: None,
             hugging_face_catalog: None,
-            runtime: None,
+            model_controller: None,
             identity: ServerIdentity::default(),
             authorization: None,
             next_id: Arc::new(AtomicU64::new(1)),
@@ -339,7 +189,9 @@ impl AppState {
     ///
     /// The backend's stable model ID remains authoritative; aliases are routing names only.
     pub fn with_model_alias(self, alias: impl Into<String>) -> Self {
-        self.backends.add_alias(alias.into());
+        if let Some(controller) = &self.model_controller {
+            controller.add_alias(alias.into());
+        }
         self
     }
 
@@ -379,8 +231,8 @@ impl AppState {
         self
     }
 
-    pub fn with_runtime(mut self, runtime: Arc<dyn RuntimeController>) -> Self {
-        self.runtime = Some(runtime);
+    pub fn with_model_controller(mut self, controller: Arc<dyn ModelInstanceController>) -> Self {
+        self.model_controller = Some(controller);
         self
     }
 
@@ -410,10 +262,15 @@ pub fn app(state: AppState) -> Router {
             "/v1/models/downloads",
             get(model_downloads).post(start_model_download),
         )
-        .route("/v1/models/load", post(load_model_configuration))
+        .route("/v1/models/load/preview", post(preview_model_load))
         .route(
-            "/v1/models/residencies/{residency_id}",
-            axum::routing::delete(unload_model_residency),
+            "/v1/models/instances",
+            get(model_instances).post(load_model_instance),
+        )
+        .route("/v1/models/instances/watch", get(watch_model_instances))
+        .route(
+            "/v1/models/instances/{instance_id}/stop",
+            post(stop_model_instance),
         )
         .route(
             "/v1/models/downloads/{attempt_id}",
@@ -479,17 +336,147 @@ pub struct HealthResponse {
     native_build: String,
 }
 
-pub trait RuntimeController: Send + Sync + 'static {
-    fn load_configuration(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent>;
-    fn unload_residency(&self, residency_id: String) -> BoxFuture<'_, Result<(), InventoryError>>;
+pub trait ModelInstanceController: Send + Sync + 'static {
+    fn preview_load(
+        &self,
+        request: PreviewModelLoadRequest,
+    ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>>;
+    fn load_instance(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent>;
+    fn stop_instance(
+        &self,
+        instance_id: ModelInstanceId,
+    ) -> BoxFuture<'_, Result<(), InventoryError>>;
+    fn instances(&self) -> BoxFuture<'_, ModelInstancesSnapshot>;
+    fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation>;
     fn remove_installed(
         &self,
         package_id: ModelPackageId,
     ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>>;
     fn lease(
         &self,
-        configuration_id: String,
-    ) -> BoxFuture<'_, Result<BackendLease, InventoryError>>;
+        instance_id: ModelInstanceId,
+        configuration_id: ModelServingConfigurationId,
+    ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>>;
+    fn add_alias(&self, _alias: String) {}
+}
+
+struct StaticModelInstanceController {
+    backend: Arc<dyn CompletionBackend>,
+    aliases: Arc<RwLock<BTreeSet<String>>>,
+}
+
+impl StaticModelInstanceController {
+    const INSTANCE_ID: &'static str = "static-instance";
+
+    fn new(backend: Arc<dyn CompletionBackend>) -> Self {
+        Self {
+            backend,
+            aliases: Arc::new(RwLock::new(BTreeSet::new())),
+        }
+    }
+
+    fn configuration_id(&self) -> ModelServingConfigurationId {
+        ModelServingConfigurationId(self.backend.model_id().to_owned())
+    }
+}
+
+impl ModelInstanceController for StaticModelInstanceController {
+    fn preview_load(
+        &self,
+        _request: PreviewModelLoadRequest,
+    ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>> {
+        Box::pin(async {
+            Err(InventoryError::Unsupported(
+                "static test model cannot preview loading".to_owned(),
+            ))
+        })
+    }
+
+    fn load_instance(&self, _request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent> {
+        Box::pin(futures_util::stream::empty())
+    }
+
+    fn stop_instance(
+        &self,
+        _instance_id: ModelInstanceId,
+    ) -> BoxFuture<'_, Result<(), InventoryError>> {
+        Box::pin(async {
+            Err(InventoryError::Unsupported(
+                "static test model cannot be stopped".to_owned(),
+            ))
+        })
+    }
+
+    fn instances(&self) -> BoxFuture<'_, ModelInstancesSnapshot> {
+        let configuration_id = self.configuration_id();
+        Box::pin(async move {
+            ModelInstancesSnapshot {
+                revision: 0,
+                instances: vec![ModelInstance {
+                    id: ModelInstanceId(Self::INSTANCE_ID.to_owned()),
+                    configuration_id,
+                    lifecycle: ModelInstanceLifecycle::Ready {
+                        allocation: ModelInstanceAllocation {
+                            context_window_tokens: 1,
+                            parallel_sequences: 1,
+                            physical_context_tokens: 1,
+                            memory_domains: Vec::new(),
+                        },
+                    },
+                }],
+            }
+        })
+    }
+
+    fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation> {
+        Box::pin(futures_util::stream::empty())
+    }
+
+    fn remove_installed(
+        &self,
+        package_id: ModelPackageId,
+    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
+        Box::pin(async move {
+            Err(InventoryError::Unsupported(format!(
+                "cannot remove package {} from a static model controller",
+                package_id.0
+            )))
+        })
+    }
+
+    fn lease(
+        &self,
+        instance_id: ModelInstanceId,
+        configuration_id: ModelServingConfigurationId,
+    ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
+        let expected_configuration = self.configuration_id();
+        let backend = Arc::clone(&self.backend);
+        let aliases = self
+            .aliases
+            .read()
+            .map(|aliases| Arc::new(aliases.clone()))
+            .unwrap_or_else(|_| Arc::new(BTreeSet::new()));
+        Box::pin(async move {
+            if instance_id.0 != Self::INSTANCE_ID || configuration_id != expected_configuration {
+                return Err(InventoryError::NotReady(
+                    "the requested model instance is not ready".to_owned(),
+                ));
+            }
+            Ok(ModelInstanceLease::new(
+                backend,
+                instance_id,
+                configuration_id,
+                aliases,
+                || {},
+            ))
+        })
+    }
+
+    fn add_alias(&self, alias: String) {
+        if let Ok(mut aliases) = self.aliases.write() {
+            aliases.insert(alias);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -620,6 +607,7 @@ pub struct TemplateCapabilitiesResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyTemplateRequest {
+    pub model_instance_id: String,
     #[schema(nullable = false)]
     pub model: Option<String>,
     pub messages: Vec<ChatMessageRequest>,
@@ -667,6 +655,7 @@ pub enum GrammarTriggerResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
+    pub model_instance_id: String,
     #[schema(nullable = false)]
     pub model: Option<String>,
     pub messages: Vec<ChatMessageRequest>,
@@ -1140,11 +1129,11 @@ impl ApiError {
                 "integrity_failed",
                 false,
             ),
-            InventoryError::Runtime {
+            InventoryError::ModelOperation {
                 code, retryable, ..
             } => (
                 StatusCode::CONFLICT,
-                "runtime_error",
+                "model_error",
                 code.as_str(),
                 *retryable,
             ),
@@ -1192,23 +1181,23 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-#[utoipa::path(post, path = "/v1/models/load", operation_id = "loadModelConfiguration", tag = "models",
+#[utoipa::path(post, path = "/v1/models/instances", operation_id = "loadModelInstance", tag = "models",
     request_body(content = LoadModelRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Exact model configuration load progress", body = String, content_type = "text/event-stream"),
         (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.model_configuration.load", skip_all, err(Debug))]
-async fn load_model_configuration(
+#[tracing::instrument(name = "icn.model_instance.load", skip_all, err(Debug))]
+async fn load_model_instance(
     State(state): State<AppState>,
     Json(request): Json<LoadModelRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let runtime = state
-        .runtime
+    let controller = state
+        .model_controller
         .as_ref()
-        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
-    let events = runtime.load_configuration(request);
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let events = controller.load_instance(request);
     let framed = tokio_stream::StreamExt::map(events, |event| {
         let data = serde_json::to_string(&event).unwrap_or_else(|error| {
             serde_json::json!({
@@ -1226,32 +1215,94 @@ async fn load_model_configuration(
     Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
 }
 
-#[utoipa::path(delete, path = "/v1/models/residencies/{residency_id}", operation_id = "unloadModelResidency", tag = "models",
-    params(("residency_id" = String, Path, description = "Runtime residency ID")),
+#[utoipa::path(post, path = "/v1/models/load/preview", operation_id = "previewModelLoad", tag = "models",
+    request_body(content = PreviewModelLoadRequest, content_type = "application/json"),
     responses(
-        (status = 204, description = "Residency is no longer loaded"),
-        (status = 404, description = "Residency not found", body = ErrorResponse),
-        (status = 500, description = "Runtime unload failed", body = ErrorResponse)
+        (status = 200, description = "Allocation ICN would select from current admission evidence", body = ModelLoadAllocation),
+        (status = 400, description = "Configuration cannot be resolved", body = ErrorResponse),
+        (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
+        (status = 500, description = "Load preview failed", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.model_residency.unload", skip_all, err(Debug))]
-async fn unload_model_residency(
+#[tracing::instrument(name = "icn.model_load.preview", skip_all, err(Debug))]
+async fn preview_model_load(
     State(state): State<AppState>,
-    Path(residency_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let runtime = state
-        .runtime
+    Json(request): Json<PreviewModelLoadRequest>,
+) -> Result<Json<ModelLoadAllocation>, ApiError> {
+    let controller = state
+        .model_controller
         .as_ref()
-        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
-    runtime
-        .unload_residency(residency_id)
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    controller
+        .preview_load(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/models/instances/{instance_id}/stop", operation_id = "stopModelInstance", tag = "models",
+    params(("instance_id" = String, Path, description = "Model instance ID")),
+    responses(
+        (status = 204, description = "The exact model instance is stopped"),
+        (status = 500, description = "Model instance stop failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.model_instance.stop", skip_all, err(Debug))]
+async fn stop_model_instance(
+    State(state): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    controller
+        .stop_instance(ModelInstanceId(instance_id))
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(ApiError::from_inventory)
 }
 
+#[utoipa::path(get, path = "/v1/models/instances", operation_id = "getModelInstances", tag = "models",
+    responses(
+        (status = 200, description = "Authoritative native model instances", body = ModelInstancesSnapshot),
+        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
+    )
+)]
+async fn model_instances(
+    State(state): State<AppState>,
+) -> Result<Json<ModelInstancesSnapshot>, ApiError> {
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    Ok(Json(controller.instances().await))
+}
+
+#[utoipa::path(get, path = "/v1/models/instances/watch", operation_id = "watchModelInstances", tag = "models",
+    responses(
+        (status = 200, description = "Coalescing native model-instance invalidations", body = String, content_type = "text/event-stream"),
+        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
+    )
+)]
+async fn watch_model_instances(
+    State(state): State<AppState>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let events = controller.watch_instances();
+    let framed = tokio_stream::StreamExt::map(events, |event| {
+        Ok(Event::default()
+            .id(event.revision.to_string())
+            .data(serde_json::to_string(&event).expect("instance invalidation is serializable")))
+    });
+    Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
+}
+
 #[utoipa::path(get, path = "/v1/hardware", operation_id = "getHardware", tag = "system", responses(
-    (status = 200, description = "Hardware visible to the pinned ICN runtime", body = HardwareSnapshot),
+    (status = 200, description = "Hardware visible to the pinned ICN process", body = HardwareSnapshot),
     (status = 500, description = "Hardware discovery failed", body = ErrorResponse)
 ))]
 #[tracing::instrument(name = "icn.hardware.snapshot", skip_all, err(Debug))]
@@ -1349,11 +1400,11 @@ async fn remove_installed_model(
     State(state): State<AppState>,
     Path(package_id): Path<String>,
 ) -> Result<Json<RemoveInstalledModelPackageResponse>, ApiError> {
-    let runtime = state
-        .runtime
+    let controller = state
+        .model_controller
         .as_ref()
-        .ok_or_else(|| ApiError::server("runtime control is not configured"))?;
-    runtime
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    controller
         .remove_installed(ModelPackageId(package_id))
         .await
         .map(Json)
@@ -1528,14 +1579,12 @@ async fn cancel_model_download(
     err(Debug)
 )]
 async fn props(State(state): State<AppState>) -> Result<Json<PropsResponse>, ApiError> {
-    let backend = state.backends.observe().ok_or_else(|| {
-        ApiError::conflict(
-            "model_not_loaded",
-            "no model is loaded by this inference node",
-        )
-    })?;
-    tracing::Span::current().record("model.id", backend.model_id.as_str());
-    let properties = backend.properties.map_err(ApiError::server)?;
+    let lease = lease_ready_instance(&state).await?;
+    tracing::Span::current().record("model.id", lease.model_id());
+    let properties = lease
+        .backend()
+        .properties()
+        .map_err(ApiError::from_inference)?;
     Ok(Json(props_response(properties)))
 }
 
@@ -1557,7 +1606,23 @@ async fn apply_template(
     State(state): State<AppState>,
     Json(request): Json<ApplyTemplateRequest>,
 ) -> Result<Json<ApplyTemplateResponse>, ApiError> {
-    let lease = require_backend(&state)?;
+    let configuration_id = request
+        .model
+        .as_ref()
+        .filter(|model| !model.is_empty())
+        .cloned()
+        .ok_or_else(|| ApiError::invalid("model is required"))?;
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let lease = controller
+        .lease(
+            ModelInstanceId(request.model_instance_id.clone()),
+            ModelServingConfigurationId(configuration_id),
+        )
+        .await
+        .map_err(ApiError::from_inventory)?;
     tracing::Span::current().record("model.id", lease.model_id());
     validate_model_selection(request.model.as_deref(), &lease)?;
     let properties = lease
@@ -1602,21 +1667,24 @@ async fn chat_completions(
         .clone()
         .filter(|model| !model.is_empty())
         .ok_or_else(|| ApiError::invalid("model is required"))?;
-    let lease = if let Some(runtime) = state.runtime.as_ref() {
-        runtime
-            .lease(model_id)
-            .await
-            .map_err(ApiError::from_inventory)?
-    } else {
-        require_backend(&state)?
-    };
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let lease = controller
+        .lease(
+            request.model_instance_id.clone(),
+            ModelServingConfigurationId(model_id),
+        )
+        .await
+        .map_err(ApiError::from_inventory)?;
     chat_completion_with_lease(state, request, lease).await
 }
 
 async fn chat_completion_with_lease(
     state: AppState,
     request: ValidatedChatRequest,
-    lease: BackendLease,
+    lease: ModelInstanceLease,
 ) -> Result<Response, ApiError> {
     validate_model_selection(request.model.as_deref(), &lease)?;
     let properties = lease
@@ -1951,16 +2019,28 @@ fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
     }
 }
 
-fn require_backend(state: &AppState) -> Result<BackendLease, ApiError> {
-    state.backends.lease().ok_or_else(|| {
-        ApiError::conflict(
-            "model_not_loaded",
-            "no model is loaded by this inference node",
-        )
-    })
+async fn lease_ready_instance(state: &AppState) -> Result<ModelInstanceLease, ApiError> {
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let instance = controller
+        .instances()
+        .await
+        .instances
+        .into_iter()
+        .find(|instance| matches!(instance.lifecycle, ModelInstanceLifecycle::Ready { .. }))
+        .ok_or_else(|| ApiError::conflict("model_not_loaded", "no model instance is ready"))?;
+    controller
+        .lease(instance.id, instance.configuration_id)
+        .await
+        .map_err(ApiError::from_inventory)
 }
 
-fn validate_model_selection(requested: Option<&str>, lease: &BackendLease) -> Result<(), ApiError> {
+fn validate_model_selection(
+    requested: Option<&str>,
+    lease: &ModelInstanceLease,
+) -> Result<(), ApiError> {
     match requested {
         Some("") => Err(ApiError::invalid("model must not be empty")),
         Some(requested) if !lease.accepts_model(requested) => Err(ApiError::invalid(format!(
@@ -1975,6 +2055,7 @@ fn validate_apply_template_request(
     reasoning_profile: &icn_contracts::ReasoningProfile,
 ) -> Result<ChatTemplateRequest, ApiError> {
     let validated = validate_request(ChatCompletionRequest {
+        model_instance_id: request.model_instance_id,
         model: request.model,
         messages: request.messages,
         max_tokens: None,
@@ -2125,6 +2206,7 @@ fn apply_template_response(prepared: PreparedChatInfo) -> ApplyTemplateResponse 
 }
 
 struct ValidatedChatRequest {
+    model_instance_id: ModelInstanceId,
     model: Option<String>,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
@@ -2156,6 +2238,9 @@ fn validate_request(request: ChatCompletionRequest) -> Result<ValidatedChatReque
     }
     if request.model.as_deref().is_some_and(str::is_empty) {
         return Err(ApiError::invalid("model must not be empty"));
+    }
+    if request.model_instance_id.is_empty() {
+        return Err(ApiError::invalid("model_instance_id must not be empty"));
     }
     if request.max_tokens.is_some() && request.max_completion_tokens.is_some() {
         return Err(ApiError::invalid(
@@ -2197,6 +2282,7 @@ fn validate_request(request: ChatCompletionRequest) -> Result<ValidatedChatReque
     let response_format = response_format(request.response_format)?;
     let stop = stops(request.stop)?;
     Ok(ValidatedChatRequest {
+        model_instance_id: ModelInstanceId(request.model_instance_id),
         model: request.model,
         messages,
         tools,
@@ -2615,8 +2701,11 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         model_downloads,
         model_download_attempt,
         cancel_model_download,
-        load_model_configuration,
-        unload_model_residency,
+        preview_model_load,
+        load_model_instance,
+        model_instances,
+        watch_model_instances,
+        stop_model_instance,
         props,
         apply_template,
         chat_completions
@@ -2640,7 +2729,11 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         ModelDownloadsResponse,
         DownloadAttempt,
         LoadModelRequest,
+        PreviewModelLoadRequest,
+        ModelLoadAllocation,
         ModelLoadEvent,
+        ModelInstancesSnapshot,
+        ModelInstancesInvalidation,
         PropsResponse,
         ExecutionConfigResponse,
         ExecutionSettingsResponse,
@@ -2791,6 +2884,29 @@ impl StreamContract for ModelLoadStream {
     }
 }
 
+struct ModelInstancesWatchStream;
+
+impl StreamContract for ModelInstancesWatchStream {
+    type Event = ModelInstancesInvalidation;
+    const RESPONSE_STATUS: u16 = 200;
+
+    fn metadata() -> StreamMetadata {
+        StreamMetadata {
+            version: 1,
+            response_status: Self::RESPONSE_STATUS,
+            framing: StreamFraming::Sse,
+            data: StreamData {
+                encoding: "json",
+                schema: StreamSchemaRef {
+                    reference: format!("#/components/schemas/{}", Self::Event::name()),
+                },
+            },
+            termination: StreamTermination::LongLived,
+            reconnect: StreamReconnect::LastEventId,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenApiExportError {
     #[error("OpenAPI operation {0} was not generated")]
@@ -2819,7 +2935,12 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     )?;
     attach_stream_contract::<ModelLoadStream>(
         &mut document,
-        "loadModelConfiguration",
+        "loadModelInstance",
+        "text/event-stream",
+    )?;
+    attach_stream_contract::<ModelInstancesWatchStream>(
+        &mut document,
+        "watchModelInstances",
         "text/event-stream",
     )?;
     Ok(document)
@@ -3118,12 +3239,14 @@ mod tests {
                     "logical_cores": 8,
                     "system_memory": {
                         "total_bytes": 1024,
-                        "current_available_bytes": 512
+                        "current_available_bytes": 512,
+                        "warning_reserve_bytes": 256,
+                        "assess_reserve_bytes": 128,
+                        "abort_reserve_bytes": 64
                     },
                     "native_build": "test-build",
                     "enabled_backends": ["cpu"],
                     "topology_fingerprint": "topology",
-                    "resident_memory": null,
                     "memory_domains": [{
                         "id": "system",
                         "kind": "system",
@@ -3210,6 +3333,7 @@ mod tests {
 
     fn minimal_request() -> Value {
         json!({
+            "model_instance_id": StaticModelInstanceController::INSTANCE_ID,
             "model": "test-model",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
@@ -3234,7 +3358,15 @@ mod tests {
             .collect()
     }
 
-    async fn post_chat(backend: impl CompletionBackend, request: Value) -> (StatusCode, String) {
+    async fn post_chat(
+        backend: impl CompletionBackend,
+        mut request: Value,
+    ) -> (StatusCode, String) {
+        if let Some(request) = request.as_object_mut() {
+            request.entry("model_instance_id").or_insert_with(|| {
+                Value::String(StaticModelInstanceController::INSTANCE_ID.to_owned())
+            });
+        }
         let response = app(AppState::new(backend))
             .oneshot(
                 Request::post("/v1/chat/completions")
@@ -3249,21 +3381,29 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
-    struct StubRuntime {
-        backends: BackendRegistry,
+    struct StubModelInstanceController {
+        backend: Arc<dyn CompletionBackend>,
         leases: Arc<AtomicU64>,
     }
 
-    impl RuntimeController for StubRuntime {
-        fn load_configuration(
+    impl ModelInstanceController for StubModelInstanceController {
+        fn preview_load(
             &self,
-            _request: LoadModelRequest,
-        ) -> BoxStream<'static, ModelLoadEvent> {
+            _request: PreviewModelLoadRequest,
+        ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>> {
+            Box::pin(async {
+                Err(InventoryError::Unsupported(
+                    "model load preview is unavailable in the stub model controller".to_owned(),
+                ))
+            })
+        }
+
+        fn load_instance(&self, _request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent> {
             Box::pin(futures_util::stream::once(async {
                 ModelLoadEvent::Failed {
                     failure: icn_contracts::models::ModelFailure {
                         code: "unsupported".to_owned(),
-                        message: "exact configuration loading is unavailable in the stub runtime"
+                        message: "exact configuration loading is unavailable in the stub model controller"
                             .to_owned(),
                         retryable: false,
                     },
@@ -3271,11 +3411,35 @@ mod tests {
             }))
         }
 
-        fn unload_residency(
+        fn stop_instance(
             &self,
-            _residency_id: String,
+            _instance_id: ModelInstanceId,
         ) -> BoxFuture<'_, Result<(), InventoryError>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn instances(&self) -> BoxFuture<'_, ModelInstancesSnapshot> {
+            Box::pin(async {
+                ModelInstancesSnapshot {
+                    revision: 0,
+                    instances: vec![ModelInstance {
+                        id: ModelInstanceId("test-instance".to_owned()),
+                        configuration_id: ModelServingConfigurationId("test-model".to_owned()),
+                        lifecycle: ModelInstanceLifecycle::Ready {
+                            allocation: ModelInstanceAllocation {
+                                context_window_tokens: 1,
+                                parallel_sequences: 1,
+                                physical_context_tokens: 1,
+                                memory_domains: Vec::new(),
+                            },
+                        },
+                    }],
+                }
+            })
+        }
+
+        fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation> {
+            Box::pin(futures_util::stream::empty())
         }
 
         fn remove_installed(
@@ -3284,37 +3448,74 @@ mod tests {
         ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
             Box::pin(async move {
                 Err(InventoryError::Unsupported(format!(
-                    "cannot remove package {} in the stub runtime",
+                    "cannot remove package {} in the stub model controller",
                     package_id.0
                 )))
             })
         }
 
-        fn lease(&self, _model_id: String) -> BoxFuture<'_, Result<BackendLease, InventoryError>> {
-            Box::pin(async {
+        fn lease(
+            &self,
+            instance_id: ModelInstanceId,
+            configuration_id: ModelServingConfigurationId,
+        ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
+            let backend = Arc::clone(&self.backend);
+            Box::pin(async move {
+                if instance_id.0 != "test-instance" || configuration_id.0 != "test-model" {
+                    return Err(InventoryError::NotReady(
+                        "test model instance unavailable".to_owned(),
+                    ));
+                }
                 self.leases.fetch_add(1, Ordering::Relaxed);
-                self.backends
-                    .lease()
-                    .ok_or_else(|| InventoryError::Internal("test backend unavailable".into()))
+                Ok(ModelInstanceLease::new(
+                    backend,
+                    instance_id,
+                    configuration_id,
+                    Arc::new(BTreeSet::new()),
+                    || {},
+                ))
             })
         }
     }
 
     #[tokio::test]
+    async fn exposes_the_authoritative_model_instances_snapshot() {
+        let controller = Arc::new(StubModelInstanceController {
+            backend: Arc::new(FakeBackend::new("test-model", "ready")),
+            leases: Arc::new(AtomicU64::new(0)),
+        });
+        let response = app(AppState::model_free().with_model_controller(controller))
+            .oneshot(
+                Request::get("/v1/models/instances")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["revision"], 0);
+        assert_eq!(body["instances"][0]["id"], "test-instance");
+        assert_eq!(body["instances"][0]["lifecycle"]["_tag"], "Ready");
+    }
+
+    #[tokio::test]
     async fn ordinary_chat_leases_the_requested_resident_model_before_streaming() {
-        let backends =
-            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
         let leases = Arc::new(AtomicU64::new(0));
-        let runtime = Arc::new(StubRuntime {
-            backends: backends.clone(),
+        let controller = Arc::new(StubModelInstanceController {
+            backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
         });
-        let response = app(AppState::model_free(backends).with_runtime(runtime))
+        let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
+                            "model_instance_id": "test-instance",
                             "model": "test-model",
                             "messages": [{"role": "user", "content": "hi"}],
                             "stream": true
@@ -3334,19 +3535,18 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_chat_is_rejected_before_model_lease() {
-        let backends =
-            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ready")));
         let leases = Arc::new(AtomicU64::new(0));
-        let runtime = Arc::new(StubRuntime {
-            backends: backends.clone(),
+        let controller = Arc::new(StubModelInstanceController {
+            backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
         });
-        let response = app(AppState::model_free(backends).with_runtime(runtime))
+        let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
+                            "model_instance_id": "test-instance",
                             "model": "test-model",
                             "messages": [{"role": "assistant", "content": null}],
                             "stream": true
@@ -3575,6 +3775,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
+                            "model_instance_id": StaticModelInstanceController::INSTANCE_ID,
                             "model": "test-model",
                             "messages": [
                                 {"role": "system", "content": "system"},
@@ -3597,7 +3798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_a_model_not_loaded_by_the_node() {
+    async fn rejects_a_model_that_does_not_match_the_exact_instance_configuration() {
         let (status, body) = post_chat(
             FakeBackend::new("test-model", "ok"),
             json!({
@@ -3607,63 +3808,25 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("not loaded"));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("requested model instance is not ready"));
     }
 
-    #[test]
-    fn accepts_the_loaded_model_id_and_configured_aliases() {
+    #[tokio::test]
+    async fn accepts_the_loaded_model_id_and_configured_aliases() {
         let state =
             AppState::new(FakeBackend::new("test-model", "ok")).with_model_alias("friendly-name");
-        let lease = state.backends.lease().expect("backend lease");
+        let lease = lease_ready_instance(&state).await.expect("instance lease");
 
         assert!(validate_model_selection(Some("test-model"), &lease).is_ok());
         assert!(validate_model_selection(Some("friendly-name"), &lease).is_ok());
         assert!(validate_model_selection(None, &lease).is_ok());
         assert!(validate_model_selection(Some("different-model"), &lease).is_err());
     }
-
-    #[test]
-    fn backend_mutations_exclude_inference_leases_in_both_directions() {
-        let registry =
-            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ok")));
-        let lease = registry.lease().expect("initial lease");
-        assert!(registry.try_begin_mutation().is_none());
-        drop(lease);
-
-        let mutation = registry.try_begin_mutation().expect("mutation guard");
-        assert!(registry.lease().is_none());
-        drop(mutation);
-        assert!(registry.lease().is_some());
-    }
-
-    #[tokio::test]
-    async fn coordinated_mutation_waits_for_the_response_lease() {
-        let registry =
-            BackendRegistry::with_backend(Arc::new(FakeBackend::new("test-model", "ok")));
-        let lease = registry.lease().expect("initial lease");
-        let waiting = registry.clone();
-        let mutation = tokio::spawn(async move { waiting.begin_mutation().await });
-        tokio::task::yield_now().await;
-        assert!(!mutation.is_finished());
-        assert!(
-            registry.lease().is_none(),
-            "queued mutation must close new lease admission"
-        );
-
-        drop(lease);
-        let guard = tokio::time::timeout(std::time::Duration::from_secs(1), mutation)
-            .await
-            .expect("mutation should wake after lease release")
-            .expect("mutation task should complete");
-        assert!(registry.lease().is_none());
-        drop(guard);
-        assert!(registry.lease().is_some());
-    }
-
     #[test]
     fn maps_the_complete_chat_request_contract() {
         let request = request_from_json(json!({
+            "model_instance_id": StaticModelInstanceController::INSTANCE_ID,
             "model": "test-model",
             "messages": [
                 {"role": "system", "content": "system"},
@@ -3966,7 +4129,7 @@ mod tests {
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                        r#"{"model_instance_id":"static-instance","model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
                     ))
                     .unwrap(),
             )

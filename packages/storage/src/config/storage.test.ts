@@ -33,7 +33,7 @@ describe("config storage onboarding state", () => {
     await rm(root, { recursive: true, force: true })
   })
 
-  test("persists a versioned completion atomically without replacing other domains", async () => {
+  test("persists completion atomically without replacing other domains", async () => {
     const base = makeBase()
     const result = await Effect.runPromise(Effect.gen(function* () {
       const config = yield* makeConfigStorage()
@@ -51,7 +51,7 @@ describe("config storage onboarding state", () => {
         },
         futureDomain: { enabled: true },
       }))
-      yield* config.completeOnboardingFlow("model_setup", 2, "2026-07-14T22:00:00.000Z")
+      yield* config.updateOnboardingState(true)
       return yield* config.load()
     }).pipe(Effect.provide(base)))
 
@@ -59,30 +59,28 @@ describe("config storage onboarding state", () => {
       models.slots.primary))).toEqual(selection("local", "model"))
     const persisted = await Bun.file(makeGlobalStoragePaths(root).configFile).json()
     expect(persisted.futureDomain).toEqual({ enabled: true })
-    expect(result.onboarding?.completions?.model_setup).toEqual({
-      version: 2,
-      completedAt: "2026-07-14T22:00:00.000Z",
-    })
+    expect(result.onboarding).toEqual(Option.some({ completed: true }))
+    expect(persisted.onboarding).toEqual({ completed: true })
   })
 
-  test("reopens one onboarding flow without replacing other configuration", async () => {
+  test("persists incomplete without replacing other configuration", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const config = yield* makeConfigStorage()
       yield* config.update((current) => ({
         ...current,
         futureDomain: { enabled: true },
       }))
-      yield* config.completeOnboardingFlow("model_setup", 1, "2026-07-26T00:00:00.000Z")
-      yield* config.reopenOnboardingFlow("model_setup")
+      yield* config.updateOnboardingState(true)
+      yield* config.updateOnboardingState(false)
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(result.onboarding?.completions?.model_setup).toBeUndefined()
+    expect(result.onboarding).toEqual(Option.some({ completed: false }))
     const persisted = await Bun.file(makeGlobalStoragePaths(root).configFile).json()
     expect(persisted.futureDomain).toEqual({ enabled: true })
   })
 
-  test("recovers stale onboarding and discards incomplete canonical selections", async () => {
+  test("discards invalid onboarding state and incomplete canonical selections", async () => {
     const paths = makeGlobalStoragePaths(root)
     await Bun.write(paths.configFile, JSON.stringify({
       models: {
@@ -91,9 +89,7 @@ describe("config storage onboarding state", () => {
         },
       },
       onboarding: {
-        completions: {
-          model_setup: { completedAt: "2026-07-14T22:00:00.000Z" },
-        },
+        unexpected: true,
       },
       futureDomain: { enabled: true },
     }))
@@ -105,11 +101,11 @@ describe("config storage onboarding state", () => {
       return { onboarding, loaded }
     }).pipe(Effect.provide(makeBase())))
 
-    expect(result.onboarding?.completions?.model_setup).toBeUndefined()
+    expect(result.onboarding).toEqual(Option.none())
     expect(Option.flatMap(Option.fromNullable(result.loaded.models), (models) =>
       models.slots.primary)).toEqual(Option.none())
     const persisted = await Bun.file(paths.configFile).json()
-    expect(persisted.onboarding?.completions?.model_setup).toBeUndefined()
+    expect(persisted.onboarding).toBeUndefined()
     expect(persisted.futureDomain).toEqual({ enabled: true })
   })
 
@@ -138,10 +134,10 @@ describe("config storage onboarding state", () => {
     })
   })
 
-  test("can complete onboarding after recovering stale state", async () => {
+  test("can update onboarding after discarding invalid state", async () => {
     const paths = makeGlobalStoragePaths(root)
     await Bun.write(paths.configFile, JSON.stringify({
-      onboarding: { completions: { model_setup: { completedAt: "old" } } },
+      onboarding: { unexpected: true },
       models: { slots: { primary: {
         providerId: "local",
         providerModelId: "local:model",
@@ -151,14 +147,11 @@ describe("config storage onboarding state", () => {
 
     const loaded = await Effect.runPromise(Effect.gen(function* () {
       const config = yield* makeConfigStorage()
-      yield* config.completeOnboardingFlow("model_setup", 3, "2026-07-15T23:00:00.000Z")
+      yield* config.updateOnboardingState(true)
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(loaded.onboarding?.completions?.model_setup).toEqual({
-      version: 3,
-      completedAt: "2026-07-15T23:00:00.000Z",
-    })
+    expect(loaded.onboarding).toEqual(Option.some({ completed: true }))
     expect(Option.getOrThrow(Option.flatMap(Option.fromNullable(loaded.models), (models) =>
       models.slots.primary)).providerModelId).toBe("local:model")
   })
@@ -173,7 +166,7 @@ describe("config storage onboarding state", () => {
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(loaded).toEqual({})
+    expect(loaded).toEqual({ onboarding: Option.none() })
     expect(await Bun.file(paths.configFile).json()).toEqual({})
     const backup = (await readdir(root)).find((name) => name.startsWith("config.json.corrupt-"))
     expect(backup).toBeDefined()
@@ -190,7 +183,7 @@ describe("config storage onboarding state", () => {
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(loaded).toEqual({})
+    expect(loaded).toEqual({ onboarding: Option.none() })
     const backup = (await readdir(root)).find((name) => name.startsWith("config.json.corrupt-"))
     expect(backup).toBeDefined()
     expect(await readFile(join(root, backup!), "utf8")).toBe(original)
@@ -243,7 +236,10 @@ describe("config storage onboarding state", () => {
   test("serializes concurrent recovery-capable config updates", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const config = yield* makeConfigStorage()
-      yield* config.save({ contextLimits: { softCapRatio: 0, softCapMaxTokens: null } })
+      yield* config.save({
+        contextLimits: { softCapRatio: 0, softCapMaxTokens: null },
+        onboarding: Option.none(),
+      })
       yield* Effect.all(
         Array.from({ length: 20 }, () => config.update((current) => ({
           ...current,

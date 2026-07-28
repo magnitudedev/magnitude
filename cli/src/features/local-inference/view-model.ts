@@ -2,13 +2,11 @@ import { Option } from "effect"
 import {
   ProviderModelCatalogLifecycle,
   ProviderIdSchema,
-  ProviderModelIdSchema,
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
   type LocalModelRecommendation,
   type LocalModelRecommendationProgressStep,
-  type ProviderModelCatalogState,
   type ProviderModelId,
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
@@ -69,7 +67,8 @@ export const buildLocalInferenceSelections = (
   view: LocalInferenceView,
 ): readonly LocalInferenceSelection[] => {
   const running = new Set([view.slots.slots.primary, view.slots.slots.secondary].flatMap((slot) =>
-    slot._tag === "Ready" && slot.selection.providerId === LOCAL_PROVIDER_ID
+    slot._tag === "ConfiguredLocal"
+      && Option.exists(slot.instance, (instance) => instance.lifecycle._tag === "Ready")
       ? [slot.selection.providerModelId]
       : []))
   const catalogModels = ProviderModelCatalogLifecycle.match(view.catalog, {
@@ -92,7 +91,7 @@ export const buildLocalInferenceSelections = (
       const providerModel = Option.flatMap(providerModelId, (id) =>
         Option.fromNullable(catalogModels.find(({ providerModelId }) => providerModelId === id)))
       return {
-        id: `model:${model.id}`,
+        id: `model:${model.targetId}`,
         kind: Option.exists(providerModelId, (id) => running.has(id)) ? "running" : "stored",
         model,
         recommendation: Option.none(),
@@ -113,22 +112,22 @@ export const buildLocalInferenceSelections = (
           kind: "recommendation",
           model,
           recommendation: Option.some(recommendation),
-          providerModelId: Option.none(),
-          reasoningEffort: Option.none(),
+          providerModelId: Option.some(recommendation.candidate.providerModelId),
+          reasoningEffort: recommendation.candidate.capabilities.reasoning.defaultEffort,
         }]
       })
     : []
-  const representedModelIds = new Set(recommendations.map(({ model }) => model.id))
+  const representedModelIds = new Set(recommendations.map(({ model }) => model.targetId))
   const transientDownloads = view.models.models
     .filter((model) =>
       (model.download._tag === "Downloading" || model.download._tag === "Failed")
-      && !representedModelIds.has(model.id))
+      && !representedModelIds.has(model.targetId))
     .map((model): LocalInferenceSelection => ({
-      id: `download:${model.id}`,
+      id: `download:${model.targetId}`,
       kind: "recommendation",
       model,
       recommendation: Option.none(),
-      providerModelId: Option.none(),
+      providerModelId: Option.fromNullable(model.providerModelIds[0]),
       reasoningEffort: Option.none(),
     }))
   return [...stored, ...recommendations, ...transientDownloads].sort(compareSelections)
@@ -251,40 +250,6 @@ export interface LocalHardwareSummaryRow {
   readonly name: string
   readonly details: readonly string[]
 }
-
-export interface ResidentModelPresentation {
-  readonly displayName: string
-  readonly contextWindowTokens: number
-  readonly parallelSequences: number
-}
-
-export const describeResidentModel = (
-  hardware: LocalInferenceHardware,
-  catalog: Option.Option<ProviderModelCatalogState>,
-): Option.Option<ResidentModelPresentation> => Option.map(
-  hardware.residentRuntime,
-  (runtime) => {
-    const residentProviderModelId = ProviderModelIdSchema.make(`local:${runtime.configurationId}`)
-    const models = Option.match(catalog, {
-      onNone: () => [] as const,
-      onSome: (state) => ProviderModelCatalogLifecycle.match(state, {
-        Loading: () => [] as const,
-        Ready: ({ models }) => models,
-        Refreshing: ({ models }) => models,
-        Degraded: ({ models }) => models,
-        Unavailable: () => [] as const,
-      }),
-    })
-    const model = models.find((candidate) =>
-      candidate.providerId === LOCAL_PROVIDER_ID
-      && candidate.providerModelId === residentProviderModelId)
-    return {
-      displayName: model?.displayName ?? residentProviderModelId,
-      contextWindowTokens: runtime.contextWindowTokens,
-      parallelSequences: runtime.parallelSequences,
-    }
-  },
-)
 
 const unique = (values: readonly string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))]

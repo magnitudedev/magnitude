@@ -7,7 +7,7 @@ import {
 } from "./local-models"
 
 describe("local model preparation", () => {
-  const providerModelIds = [ProviderModelIdSchema.make("local:test")]
+  const providerModelIds = [ProviderModelIdSchema.make("test-configuration")]
 
   it("keeps retryable automatic reconciliation failures in preparation", () => {
     expect(preparationFromReconciliationFailure(providerModelIds, {

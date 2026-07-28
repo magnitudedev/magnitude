@@ -3,25 +3,26 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
+use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use icn_api::{
-    AppState, BackendMutationGuard, BackendRegistry, FakeBackend, RuntimeController,
-    ServerIdentity, app,
+    AppState, FakeBackend, ModelInstanceController, ModelInstanceLease, ServerIdentity, app,
 };
 use icn_contracts::models::{
     AssessModelResult, AssessModelsRequest, AssessModelsResponse, AssessmentEnvironmentId,
     FitModelResult, FitModelsRequest, FitModelsResponse, InstalledModelPackages as _,
     LoadModelReady, LoadModelRequest, MemoryAssessment, ModelEvaluator,
-    ModelFailure as DomainModelFailure, ModelLoadEvent, ModelLoadStage,
-    ModelOfferingTarget as DomainModelOfferingTarget, ModelPackageId, ModelPackageOperand,
-    ModelServingConfiguration, ModelServingConfigurationId, ModelTargetInput, OfferingAssessment,
+    ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceId, ModelInstanceLifecycle,
+    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadAllocation, ModelLoadEvent,
+    ModelLoadStage, ModelOfferingTarget as DomainModelOfferingTarget, ModelPackageId,
+    ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
+    ModelServingConfigurationId, ModelStoppingAllocation, ModelTargetInput, OfferingAssessment,
     OfferingAssessmentId, PerformanceConfidence, PerformanceEvidence, PerformanceUnavailable,
-    RemoveInstalledModelPackageResponse, RuntimeResidencyId,
+    PreviewModelLoadRequest, RemoveInstalledModelPackageResponse,
     ServingProfile as DomainServingProfile,
 };
 use icn_contracts::{
@@ -154,7 +155,7 @@ enum CatalogCommand {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct RuntimePlanDefaults {
+struct ModelPlanDefaults {
     context_size: u32,
     physical_context_size: u32,
     batch_size: u32,
@@ -169,33 +170,508 @@ struct RuntimePlanDefaults {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeExecutionProfile {
+struct ModelExecutionProfile {
     context_length: u32,
 }
 
-#[derive(Debug, Clone)]
-struct ResidentTarget {
-    model_id: String,
-    residency_id: String,
-    profile: RuntimeExecutionProfile,
+#[derive(Clone)]
+struct InstanceRuntime {
+    inner: Arc<RwLock<InstanceRuntimeState>>,
+    active_leases: Arc<AtomicU64>,
+    mutating: Arc<AtomicBool>,
+    mutation_available: Arc<tokio::sync::Notify>,
+    lease_released: Arc<tokio::sync::Notify>,
+    activity: Arc<Mutex<InstanceActivity>>,
+    activity_changed: Arc<tokio::sync::Notify>,
+}
+
+struct InstanceRuntimeState {
+    backend: Option<Arc<dyn CompletionBackend>>,
+    instance_id: Option<ModelInstanceId>,
+    configuration_id: Option<ModelServingConfigurationId>,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InstanceActivity {
+    generation: u64,
+    active_leases: u64,
+    idle_since: Option<std::time::Instant>,
+}
+
+struct InstanceMutationGuard {
+    mutating: Arc<AtomicBool>,
+    mutation_available: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for InstanceMutationGuard {
+    fn drop(&mut self) {
+        self.mutating.store(false, Ordering::Release);
+        self.mutation_available.notify_one();
+    }
+}
+
+impl InstanceRuntime {
+    fn empty() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InstanceRuntimeState {
+                backend: None,
+                instance_id: None,
+                configuration_id: None,
+                generation: 0,
+            })),
+            active_leases: Arc::new(AtomicU64::new(0)),
+            mutating: Arc::new(AtomicBool::new(false)),
+            mutation_available: Arc::new(tokio::sync::Notify::new()),
+            lease_released: Arc::new(tokio::sync::Notify::new()),
+            activity: Arc::new(Mutex::new(InstanceActivity {
+                generation: 0,
+                active_leases: 0,
+                idle_since: None,
+            })),
+            activity_changed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn acquire(
+        &self,
+        instance_id: &ModelInstanceId,
+        configuration_id: &ModelServingConfigurationId,
+    ) -> Option<ModelInstanceLease> {
+        if self.mutating.load(Ordering::Acquire) {
+            return None;
+        }
+        let state = self.inner.read().ok()?;
+        if state.instance_id.as_ref() != Some(instance_id)
+            || state.configuration_id.as_ref() != Some(configuration_id)
+        {
+            return None;
+        }
+        let backend = state.backend.clone()?;
+        self.active_leases.fetch_add(1, Ordering::AcqRel);
+        if self.mutating.load(Ordering::Acquire) {
+            self.active_leases.fetch_sub(1, Ordering::AcqRel);
+            self.lease_released.notify_waiters();
+            return None;
+        }
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.active_leases = activity.active_leases.saturating_add(1);
+            activity.idle_since = None;
+        }
+        self.activity_changed.notify_waiters();
+        let active_leases = Arc::clone(&self.active_leases);
+        let lease_released = Arc::clone(&self.lease_released);
+        let activity = Arc::clone(&self.activity);
+        let activity_changed = Arc::clone(&self.activity_changed);
+        Some(ModelInstanceLease::new(
+            backend,
+            instance_id.clone(),
+            configuration_id.clone(),
+            Arc::new(std::collections::BTreeSet::new()),
+            move || {
+                active_leases.fetch_sub(1, Ordering::AcqRel);
+                if let Ok(mut activity) = activity.lock() {
+                    activity.active_leases = activity.active_leases.saturating_sub(1);
+                    if activity.active_leases == 0 {
+                        activity.idle_since = Some(std::time::Instant::now());
+                    }
+                }
+                activity_changed.notify_waiters();
+                lease_released.notify_waiters();
+            },
+        ))
+    }
+
+    fn try_begin_mutation(&self) -> Option<InstanceMutationGuard> {
+        self.mutating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        if self.active_leases.load(Ordering::Acquire) > 0 {
+            self.mutating.store(false, Ordering::Release);
+            self.mutation_available.notify_one();
+            return None;
+        }
+        Some(InstanceMutationGuard {
+            mutating: Arc::clone(&self.mutating),
+            mutation_available: Arc::clone(&self.mutation_available),
+        })
+    }
+
+    async fn begin_mutation(&self) -> InstanceMutationGuard {
+        loop {
+            let available = self.mutation_available.notified();
+            if self
+                .mutating
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                while self.active_leases.load(Ordering::Acquire) > 0 {
+                    let released = self.lease_released.notified();
+                    if self.active_leases.load(Ordering::Acquire) > 0 {
+                        released.await;
+                    }
+                }
+                return InstanceMutationGuard {
+                    mutating: Arc::clone(&self.mutating),
+                    mutation_available: Arc::clone(&self.mutation_available),
+                };
+            }
+            available.await;
+        }
+    }
+
+    fn install(
+        &self,
+        instance_id: ModelInstanceId,
+        configuration_id: ModelServingConfigurationId,
+        backend: Arc<dyn CompletionBackend>,
+    ) -> u64 {
+        let mut state = self.inner.write().expect("instance runtime lock poisoned");
+        state.generation = state.generation.saturating_add(1);
+        state.backend = Some(backend);
+        state.instance_id = Some(instance_id);
+        state.configuration_id = Some(configuration_id);
+        let generation = state.generation;
+        drop(state);
+        if let Ok(mut activity) = self.activity.lock() {
+            *activity = InstanceActivity {
+                generation,
+                active_leases: 0,
+                idle_since: Some(std::time::Instant::now()),
+            };
+        }
+        self.activity_changed.notify_waiters();
+        generation
+    }
+
+    fn clear(&self) {
+        let mut state = self.inner.write().expect("instance runtime lock poisoned");
+        state.generation = state.generation.saturating_add(1);
+        state.backend = None;
+        state.instance_id = None;
+        state.configuration_id = None;
+        let generation = state.generation;
+        drop(state);
+        if let Ok(mut activity) = self.activity.lock() {
+            *activity = InstanceActivity {
+                generation,
+                active_leases: 0,
+                idle_since: None,
+            };
+        }
+        self.activity_changed.notify_waiters();
+    }
+
+    fn activity(&self) -> InstanceActivity {
+        self.activity
+            .lock()
+            .map(|activity| *activity)
+            .unwrap_or(InstanceActivity {
+                generation: 0,
+                active_leases: 0,
+                idle_since: None,
+            })
+    }
+
+    fn activity_changed(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.activity_changed.notified()
+    }
+}
+
+#[derive(Clone)]
+struct ReadyInstanceRecord {
+    configuration_id: ModelServingConfigurationId,
+    instance_id: ModelInstanceId,
+    generation: u64,
     package_ids: Vec<ModelPackageId>,
-    parallel_sequences: u32,
-    physical_context_tokens: u32,
+    allocation: icn_contracts::models::ModelInstanceAllocation,
+    runtime: InstanceRuntime,
 }
 
-#[derive(Debug, Clone)]
-struct RuntimeState {
-    resident: Option<ResidentTarget>,
+#[derive(Clone)]
+struct ModelInstanceEntry {
+    instance: ModelInstance,
+    stop_requested: Arc<AtomicBool>,
+    worker: Option<OwnedInferenceWorker>,
+    ready: Option<ReadyInstanceRecord>,
 }
 
-#[derive(Debug, Clone)]
-struct RuntimeAllocation {
-    residency_id: RuntimeResidencyId,
-    parallel_sequences: u32,
-    physical_context_tokens: u32,
+#[derive(Clone)]
+struct ModelInstanceRegistry {
+    revision: u64,
+    entries: std::collections::BTreeMap<ModelInstanceId, ModelInstanceEntry>,
+    resident_instance_id: Option<ModelInstanceId>,
 }
 
-fn select_runtime_allocation(
+impl ModelInstanceRegistry {
+    fn admit(
+        &mut self,
+        instance_id: ModelInstanceId,
+        configuration_id: ModelServingConfigurationId,
+    ) -> Result<(Arc<AtomicBool>, bool, u64), DomainModelFailure> {
+        if let Some(existing) = self.entries.get(&instance_id) {
+            return if existing.instance.configuration_id == configuration_id {
+                Ok((Arc::clone(&existing.stop_requested), false, self.revision))
+            } else {
+                Err(DomainModelFailure {
+                    code: "model_instance_identity_conflict".to_owned(),
+                    message: "model instance ID was already admitted for another configuration"
+                        .to_owned(),
+                    retryable: false,
+                })
+            };
+        }
+        self.revision = self.revision.saturating_add(1);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        self.entries.insert(
+            instance_id.clone(),
+            ModelInstanceEntry {
+                instance: ModelInstance {
+                    id: instance_id,
+                    configuration_id,
+                    lifecycle: ModelInstanceLifecycle::Loading {
+                        stage: ModelLoadStage::Queued,
+                        progress: None,
+                        planned_allocation: None,
+                    },
+                },
+                stop_requested: Arc::clone(&stop_requested),
+                worker: None,
+                ready: None,
+            },
+        );
+        Ok((stop_requested, true, self.revision))
+    }
+
+    fn publish(&mut self, instance: ModelInstance) -> Option<u64> {
+        let current = self
+            .entries
+            .get(&instance.id)
+            .expect("model instance must be admitted before publication");
+        assert_eq!(
+            current.instance.configuration_id, instance.configuration_id,
+            "an admitted model instance cannot change configuration"
+        );
+        if current.instance == instance {
+            return None;
+        }
+        let transition_allowed = matches!(
+            (&current.instance.lifecycle, &instance.lifecycle),
+            (
+                ModelInstanceLifecycle::Loading { .. },
+                ModelInstanceLifecycle::Loading { .. }
+            ) | (
+                ModelInstanceLifecycle::Loading { .. },
+                ModelInstanceLifecycle::Stopping { .. }
+            ) | (
+                ModelInstanceLifecycle::Loading { .. },
+                ModelInstanceLifecycle::Stopped { .. }
+            ) | (
+                ModelInstanceLifecycle::Loading { .. },
+                ModelInstanceLifecycle::Failed { .. }
+            ) | (
+                ModelInstanceLifecycle::Ready { .. },
+                ModelInstanceLifecycle::Stopping { .. }
+            ) | (
+                ModelInstanceLifecycle::Ready { .. },
+                ModelInstanceLifecycle::Failed { .. }
+            ) | (
+                ModelInstanceLifecycle::Stopping { .. },
+                ModelInstanceLifecycle::Stopped { .. }
+            ) | (
+                ModelInstanceLifecycle::Stopping { .. },
+                ModelInstanceLifecycle::Failed { .. }
+            )
+        );
+        let loading_after_stop =
+            matches!(&instance.lifecycle, ModelInstanceLifecycle::Loading { .. })
+                && current.stop_requested.load(Ordering::Acquire);
+        if !transition_allowed || loading_after_stop {
+            return None;
+        }
+        self.revision = self.revision.saturating_add(1);
+        let current = self
+            .entries
+            .get_mut(&instance.id)
+            .expect("model instance entry remains present while borrowed");
+        current.instance = instance;
+        Some(self.revision)
+    }
+
+    fn snapshot(&self) -> ModelInstancesSnapshot {
+        ModelInstancesSnapshot {
+            revision: self.revision,
+            instances: self
+                .entries
+                .values()
+                .map(|entry| entry.instance.clone())
+                .collect(),
+        }
+    }
+
+    fn ready_instance(&self) -> Option<ReadyInstanceRecord> {
+        let instance_id = self.resident_instance_id.as_ref()?;
+        self.entries.get(instance_id)?.ready.clone()
+    }
+
+    fn publish_ready(&mut self, ready: ReadyInstanceRecord) -> Option<u64> {
+        let entry = self
+            .entries
+            .get_mut(&ready.instance_id)
+            .expect("ready resources belong to an admitted model instance");
+        assert_eq!(
+            entry.instance.configuration_id, ready.configuration_id,
+            "ready resources must match the admitted configuration"
+        );
+        assert!(
+            entry.worker.is_some(),
+            "an instance cannot become ready without its entry-owned worker"
+        );
+        if !matches!(
+            entry.instance.lifecycle,
+            ModelInstanceLifecycle::Loading { .. }
+        ) || entry.stop_requested.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        self.revision = self.revision.saturating_add(1);
+        entry.instance.lifecycle = ModelInstanceLifecycle::Ready {
+            allocation: ready.allocation.clone(),
+        };
+        entry.ready = Some(ready.clone());
+        self.resident_instance_id = Some(ready.instance_id);
+        Some(self.revision)
+    }
+
+    fn clear_ready(&mut self, instance_id: &ModelInstanceId) {
+        if let Some(entry) = self.entries.get_mut(instance_id) {
+            entry.ready = None;
+        }
+        if self.resident_instance_id.as_ref() == Some(instance_id) {
+            self.resident_instance_id = None;
+        }
+    }
+
+    fn install_worker(&mut self, instance_id: &ModelInstanceId, worker: InferenceWorker) {
+        let entry = self
+            .entries
+            .get_mut(instance_id)
+            .expect("worker belongs to an admitted model instance");
+        entry.worker = Some(OwnedInferenceWorker { worker });
+    }
+
+    fn owns_worker(&self, instance_id: &ModelInstanceId, pid: Option<u32>) -> bool {
+        self.entries
+            .get(instance_id)
+            .and_then(|entry| entry.worker.as_ref())
+            .is_some_and(|owned| owned.worker.pid() == pid)
+    }
+
+    fn take_worker(&mut self, instance_id: &ModelInstanceId) -> Option<OwnedInferenceWorker> {
+        self.entries.get_mut(instance_id)?.worker.take()
+    }
+}
+
+#[derive(Clone)]
+struct InstanceEntries {
+    state: Arc<tokio::sync::RwLock<ModelInstanceRegistry>>,
+    changes: tokio::sync::broadcast::Sender<ModelInstancesInvalidation>,
+}
+
+impl InstanceEntries {
+    fn new() -> Self {
+        let (changes, _) = tokio::sync::broadcast::channel(16);
+        Self {
+            state: Arc::new(tokio::sync::RwLock::new(ModelInstanceRegistry {
+                revision: 0,
+                entries: std::collections::BTreeMap::new(),
+                resident_instance_id: None,
+            })),
+            changes,
+        }
+    }
+
+    async fn admit(
+        &self,
+        instance_id: ModelInstanceId,
+        configuration_id: ModelServingConfigurationId,
+    ) -> Result<(Arc<AtomicBool>, bool), DomainModelFailure> {
+        let (stop_requested, is_new, revision) = self
+            .state
+            .write()
+            .await
+            .admit(instance_id, configuration_id)?;
+        if is_new {
+            let _ = self.changes.send(ModelInstancesInvalidation { revision });
+        }
+        Ok((stop_requested, is_new))
+    }
+
+    async fn publish(&self, instance: ModelInstance) -> u64 {
+        let mut state = self.state.write().await;
+        let Some(revision) = state.publish(instance) else {
+            return state.revision;
+        };
+        drop(state);
+        let _ = self.changes.send(ModelInstancesInvalidation { revision });
+        revision
+    }
+
+    async fn instance(&self, instance_id: &ModelInstanceId) -> Option<ModelInstance> {
+        self.state
+            .read()
+            .await
+            .entries
+            .get(instance_id)
+            .map(|entry| entry.instance.clone())
+    }
+
+    async fn entry(&self, instance_id: &ModelInstanceId) -> Option<ModelInstanceEntry> {
+        self.state.read().await.entries.get(instance_id).cloned()
+    }
+
+    async fn snapshot(&self) -> ModelInstancesSnapshot {
+        self.state.read().await.snapshot()
+    }
+
+    async fn revision(&self) -> u64 {
+        self.state.read().await.revision
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ModelInstancesInvalidation> {
+        self.changes.subscribe()
+    }
+
+    async fn ready_instance(&self) -> Option<ReadyInstanceRecord> {
+        self.state.read().await.ready_instance()
+    }
+
+    async fn publish_ready(&self, ready: ReadyInstanceRecord) -> bool {
+        let Some(revision) = self.state.write().await.publish_ready(ready) else {
+            return false;
+        };
+        let _ = self.changes.send(ModelInstancesInvalidation { revision });
+        true
+    }
+
+    async fn clear_ready(&self, instance_id: &ModelInstanceId) {
+        self.state.write().await.clear_ready(instance_id);
+    }
+
+    async fn install_worker(&self, instance_id: &ModelInstanceId, worker: InferenceWorker) {
+        self.state.write().await.install_worker(instance_id, worker);
+    }
+
+    async fn owns_worker(&self, instance_id: &ModelInstanceId, pid: Option<u32>) -> bool {
+        self.state.read().await.owns_worker(instance_id, pid)
+    }
+
+    async fn take_worker(&self, instance_id: &ModelInstanceId) -> Option<OwnedInferenceWorker> {
+        self.state.write().await.take_worker(instance_id)
+    }
+}
+
+fn select_model_allocation(
     candidates: &[(u32, u64)],
     sample: memory_supervisor::MemorySample,
 ) -> Option<(u32, u64)> {
@@ -206,8 +682,24 @@ fn select_runtime_allocation(
         .find(|(_, required)| sample.permits_load(*required))
 }
 
-fn runtime_plan_defaults() -> RuntimePlanDefaults {
-    RuntimePlanDefaults {
+fn credit_replaced_instance_memory(
+    mut sample: memory_supervisor::MemorySample,
+    releasable_system_memory_bytes: u64,
+) -> memory_supervisor::MemorySample {
+    sample.available_bytes = sample
+        .available_bytes
+        .saturating_add(releasable_system_memory_bytes)
+        .min(sample.total_bytes);
+    sample.available_commit_bytes = sample.available_commit_bytes.map(|available| {
+        available
+            .saturating_add(releasable_system_memory_bytes)
+            .min(sample.commit_limit_bytes.unwrap_or(u64::MAX))
+    });
+    sample
+}
+
+fn model_plan_defaults() -> ModelPlanDefaults {
+    ModelPlanDefaults {
         // Managed product models always overwrite context from their persisted serving
         // configuration. This conservative value is only the discovery/migration fallback for
         // unmanaged local artifacts that predate serving configurations.
@@ -243,7 +735,7 @@ fn runtime_plan_defaults() -> RuntimePlanDefaults {
 fn execution_intent(
     model_path: PathBuf,
     projector_path: Option<PathBuf>,
-    defaults: &RuntimePlanDefaults,
+    defaults: &ModelPlanDefaults,
 ) -> anyhow::Result<ExecutionIntent> {
     Ok(ExecutionIntent {
         model_path,
@@ -267,21 +759,16 @@ fn execution_intent(
 }
 
 #[derive(Clone)]
-struct ResidentNativeExecutor {
-    generation: u64,
-    model_id: String,
-    backend: Arc<RemoteBackend>,
-}
-
 struct NativeHardwareAssessor {
-    defaults: RuntimePlanDefaults,
+    defaults: ModelPlanDefaults,
     cache: Option<ModelCache>,
     native_backend: NativeBackend,
-    native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
-    runtime_failure: Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
-    gate: tokio::sync::Mutex<()>,
+    native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    assessment_work_gates:
+        Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     planning_slots: Arc<tokio::sync::Semaphore>,
-    calibration: tokio::sync::Mutex<CalibrationCache>,
+    calibration: Arc<tokio::sync::Mutex<CalibrationCache>>,
 }
 
 #[derive(Default)]
@@ -293,28 +780,26 @@ struct CalibrationCache {
 
 type NativeAssessorServices = (
     Arc<NativeHardwareAssessor>,
-    Arc<RwLock<Option<ResidentNativeExecutor>>>,
-    Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
+    Arc<RwLock<Option<Weak<RemoteBackend>>>>,
 );
 
 fn native_assessor_services(
     inventory: &Arc<ModelManager>,
     native_backend: NativeBackend,
-    defaults: RuntimePlanDefaults,
+    defaults: ModelPlanDefaults,
 ) -> NativeAssessorServices {
     let native_executor = Arc::new(RwLock::new(None));
-    let runtime_failure = Arc::new(RwLock::new(None));
     let assessor = Arc::new(NativeHardwareAssessor {
         defaults,
         cache: Some(inventory.derived_cache().clone()),
         native_backend,
         native_executor: Arc::clone(&native_executor),
-        runtime_failure: Arc::clone(&runtime_failure),
-        gate: tokio::sync::Mutex::new(()),
+        gate: Arc::new(tokio::sync::Mutex::new(())),
+        assessment_work_gates: Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
         planning_slots: Arc::new(tokio::sync::Semaphore::new(planner_concurrency())),
-        calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
+        calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
     });
-    (assessor, native_executor, runtime_failure)
+    (assessor, native_executor)
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -352,7 +837,7 @@ struct PlanningWorkerRequest {
     primary: PathBuf,
     projector: Option<PathBuf>,
     mtp: Vec<PathBuf>,
-    defaults: Vec<RuntimePlanDefaults>,
+    defaults: Vec<ModelPlanDefaults>,
     estimate_performance: bool,
     capacity_policy: CapacityPolicy,
     calibration: Option<llama_cpp_2::model::params::fit::FitCalibration>,
@@ -418,7 +903,18 @@ const LOW_MEMORY_FAILURE_CODE: &str = "low_memory";
 const TEMPLATE_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl NativeHardwareAssessor {
-    fn effective_defaults(&self, profile: Option<&ModelPreviewProfile>) -> RuntimePlanDefaults {
+    async fn assessment_work_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.assessment_work_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(key.to_owned(), Arc::downgrade(&gate));
+        gate
+    }
+
+    fn effective_defaults(&self, profile: Option<&ModelPreviewProfile>) -> ModelPlanDefaults {
         let mut defaults = self.defaults.clone();
         if let Some(profile) = profile {
             defaults.context_size = profile.context_length;
@@ -478,6 +974,130 @@ impl NativeHardwareAssessor {
             CapacityPolicy::default(),
         )
         .await
+    }
+
+    async fn assess_resolved_plans_cached_with_policy(
+        &self,
+        resolved: ResolvedModel,
+        profiles: Vec<ModelPreviewProfile>,
+        snapshot: &HardwareSnapshot,
+        capacity_policy: CapacityPolicy,
+        configuration_id: &ModelServingConfigurationId,
+    ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
+        let Some(cache) = self.cache.clone() else {
+            return self
+                .assess_resolved_plans_with_policy(resolved, profiles, false, capacity_policy)
+                .await;
+        };
+        let topology = icn_contracts::MemoryTopology::from_snapshot(snapshot).ok_or_else(|| {
+            InventoryError::Internal("hardware snapshot has an invalid memory topology".to_owned())
+        })?;
+        let content_id = resolved.model.content_id.clone();
+        let mut entries = profiles
+            .into_iter()
+            .map(|profile| {
+                let planner_evidence = self.assessment_cache_key_with_policy(
+                    Some(&profile),
+                    snapshot,
+                    capacity_policy,
+                )?;
+                let evidence = serde_json::to_string(&(&configuration_id.0, planner_evidence))
+                    .map_err(|error| InventoryError::Internal(error.to_string()))?;
+                let assessment = cache.read_execution_assessment(&content_id, &evidence, &topology);
+                Ok((profile, evidence, assessment))
+            })
+            .collect::<Result<Vec<_>, InventoryError>>()?;
+        if entries
+            .iter()
+            .any(|(_, _, assessment)| assessment.is_none())
+        {
+            let gate_key = serde_json::to_string(&(
+                &content_id.0,
+                &configuration_id.0,
+                entries
+                    .iter()
+                    .map(|(_, evidence, _)| evidence)
+                    .collect::<Vec<_>>(),
+            ))
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            let cache_guard = self
+                .assessment_work_gate(&gate_key)
+                .await
+                .lock_owned()
+                .await;
+            for (_, evidence, assessment) in &mut entries {
+                if assessment.is_none() {
+                    *assessment = cache.read_execution_assessment(&content_id, evidence, &topology);
+                }
+            }
+            let missing = entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (profile, _, assessment))| {
+                    assessment.is_none().then_some((
+                        index,
+                        profile.clone(),
+                        entries[index].1.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                let assessor = self.clone();
+                let task_cache = cache.clone();
+                let task_content_id = content_id.clone();
+                let planned = tokio::spawn(async move {
+                    let _cache_guard = cache_guard;
+                    let measured = assessor
+                        .assess_resolved_plans_with_policy(
+                            resolved,
+                            missing
+                                .iter()
+                                .map(|(_, profile, _)| profile.clone())
+                                .collect(),
+                            false,
+                            capacity_policy,
+                        )
+                        .await?;
+                    if measured.len() != missing.len() {
+                        return Err(InventoryError::Internal(
+                            "native planner returned the wrong number of cached assessments"
+                                .to_owned(),
+                        ));
+                    }
+                    Ok::<_, InventoryError>(
+                        missing
+                            .into_iter()
+                            .zip(measured)
+                            .map(|((index, _, evidence), assessment)| {
+                                task_cache.write_execution_assessment(
+                                    &task_content_id,
+                                    &evidence,
+                                    &assessment,
+                                );
+                                (index, assessment)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    InventoryError::Internal(format!("cached native planning task failed: {error}"))
+                })??;
+                for (index, assessment) in planned {
+                    entries[index].2 = Some(assessment);
+                }
+            }
+        }
+        entries
+            .into_iter()
+            .map(|(_, _, assessment)| {
+                assessment.ok_or_else(|| {
+                    InventoryError::Internal(
+                        "assessment was neither cached nor measured".to_owned(),
+                    )
+                })
+            })
+            .collect()
     }
 
     async fn assess_resolved_plans_with_policy(
@@ -613,8 +1233,17 @@ impl NativeHardwareAssessor {
         profile: Option<&ModelPreviewProfile>,
         snapshot: &HardwareSnapshot,
     ) -> Result<String, InventoryError> {
+        self.assessment_cache_key_with_policy(profile, snapshot, CapacityPolicy::default())
+    }
+
+    fn assessment_cache_key_with_policy(
+        &self,
+        profile: Option<&ModelPreviewProfile>,
+        snapshot: &HardwareSnapshot,
+        capacity_policy: CapacityPolicy,
+    ) -> Result<String, InventoryError> {
         serde_json::to_string(&(
-            CapacityPolicy::default(),
+            capacity_policy,
             icn_hardware::GENERATION_PERFORMANCE_METHOD,
             llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
             llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
@@ -1753,28 +2382,24 @@ impl HardwareProvider for NativeHardwareAssessor {
                 .native_executor
                 .read()
                 .map_err(|_| InventoryError::Internal("native executor lock poisoned".to_owned()))?
-                .clone();
-            let native_build = build_identity::native_build();
-            let observed_runtime = native_executor
                 .as_ref()
-                .map(|resident| (resident.generation, resident.model_id.clone()));
+                .and_then(Weak::upgrade);
+            let native_build = build_identity::native_build();
             let enabled_backends = build_identity::enabled_backends()
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
             let native_backend = self.native_backend.clone();
-            let mut snapshot = spawn_blocking_traced(move || match native_executor {
+            let snapshot = spawn_blocking_traced(move || match native_executor {
                 Some(resident) => {
-                    let snapshot = resident
-                        .backend
-                        .observe_hardware(
-                            resident.generation,
+                    let observation = resident
+                        .observe_model_instance(
                             CapacityPolicy::default(),
                             native_build,
                             enabled_backends,
                         )
                         .map_err(|error| InventoryError::Internal(error.to_string()))?;
-                    Ok(snapshot)
+                    Ok(observation.hardware)
                 }
                 None => Ok(native_backend.discover_hardware(
                     CapacityPolicy::default(),
@@ -1784,27 +2409,6 @@ impl HardwareProvider for NativeHardwareAssessor {
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
-            if let Some((generation, model_id)) = observed_runtime {
-                let unchanged = self
-                    .native_executor
-                    .read()
-                    .map_err(|_| {
-                        InventoryError::Internal("native executor lock poisoned".to_owned())
-                    })?
-                    .as_ref()
-                    .is_some_and(|current| {
-                        current.generation == generation && current.model_id == model_id
-                    });
-                if !unchanged {
-                    snapshot.resident_memory = None;
-                    snapshot.resident_execution = None;
-                }
-            }
-            snapshot.runtime_failure = self
-                .runtime_failure
-                .read()
-                .map_err(|_| InventoryError::Internal("runtime failure lock poisoned".to_owned()))?
-                .clone();
             let mut calibration = self.calibration.lock().await;
             let evidence = calibration_evidence(&snapshot)?;
             if calibration.evidence.as_deref() != Some(evidence.as_str()) {
@@ -1831,31 +2435,34 @@ impl HardwareProvider for NativeHardwareAssessor {
 }
 
 #[derive(Clone)]
-struct NativeRuntimeController {
-    backends: BackendRegistry,
+struct NativeModelInstanceController {
     inventory: Arc<ModelManager>,
     assessor: Arc<NativeHardwareAssessor>,
-    native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
-    runtime_failure: Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
-    worker: Arc<tokio::sync::RwLock<Option<InferenceWorker>>>,
+    native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
     memory_observer: Arc<SystemMemoryObserver>,
     next_worker_generation: Arc<AtomicU64>,
     admission_blocked_until: Arc<Mutex<Option<std::time::Instant>>>,
-    defaults: RuntimePlanDefaults,
+    defaults: ModelPlanDefaults,
     load_progress: Arc<LoadProgressEstimator>,
     loaded_configurations: Arc<Mutex<std::collections::BTreeSet<String>>>,
-    state: Arc<tokio::sync::RwLock<RuntimeState>>,
+    instances: InstanceEntries,
     mutation: Arc<tokio::sync::Mutex<()>>,
+    idle_timeout: std::time::Duration,
 }
 
 #[derive(Clone)]
-struct RuntimeFailure {
+struct OwnedInferenceWorker {
+    worker: InferenceWorker,
+}
+
+#[derive(Clone)]
+struct ModelOperationFailure {
     code: String,
     message: String,
     retryable: bool,
 }
 
-impl RuntimeFailure {
+impl ModelOperationFailure {
     fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
         Self {
             code: code.into(),
@@ -1865,28 +2472,57 @@ impl RuntimeFailure {
     }
 }
 
-struct RuntimeTransitionFailure {
-    event: RuntimeFailure,
+struct ModelTransitionFailure {
+    event: ModelOperationFailure,
 }
 
-impl RuntimeTransitionFailure {
-    fn new(event: RuntimeFailure) -> Self {
+fn idle_release_elapsed(
+    expected: &ReadyInstanceRecord,
+    current: Option<&ReadyInstanceRecord>,
+    activity: InstanceActivity,
+    timeout: std::time::Duration,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let current = current?;
+    if current.generation != expected.generation
+        || current.instance_id != expected.instance_id
+        || activity.generation != expected.generation
+        || activity.active_leases != 0
+    {
+        return None;
+    }
+    let elapsed = now.checked_duration_since(activity.idle_since?)?;
+    (elapsed >= timeout).then_some(elapsed)
+}
+
+impl ModelTransitionFailure {
+    fn new(event: ModelOperationFailure) -> Self {
         Self { event }
+    }
+
+    fn stopped() -> Self {
+        Self::new(ModelOperationFailure::new(
+            "model_instance_stopped",
+            "model instance was stopped",
+            false,
+        ))
     }
 }
 
-impl From<InventoryError> for RuntimeTransitionFailure {
+impl From<InventoryError> for ModelTransitionFailure {
     fn from(error: InventoryError) -> Self {
         let message = error.to_string();
-        Self::new(RuntimeFailure::new(
-            "runtime_transition_failed",
+        Self::new(ModelOperationFailure::new(
+            "model_transition_failed",
             message,
             true,
         ))
     }
 }
 
-impl NativeRuntimeController {
+impl NativeModelInstanceController {
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
     fn load_failure(error: InventoryError) -> DomainModelFailure {
         let (code, retryable) = match &error {
             InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
@@ -1901,7 +2537,7 @@ impl NativeRuntimeController {
             InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
             InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
             InventoryError::ConcurrentMutation(_) => ("concurrent_mutation".to_owned(), true),
-            InventoryError::Runtime {
+            InventoryError::ModelOperation {
                 code, retryable, ..
             } => (code.clone(), *retryable),
             InventoryError::Internal(_) => ("internal".to_owned(), true),
@@ -1914,37 +2550,192 @@ impl NativeRuntimeController {
     }
 
     fn new(
-        backends: BackendRegistry,
         inventory: Arc<ModelManager>,
         assessor: Arc<NativeHardwareAssessor>,
-        native_executor: Arc<RwLock<Option<ResidentNativeExecutor>>>,
-        runtime_failure: Arc<RwLock<Option<icn_contracts::RuntimeFailureObservation>>>,
-        defaults: RuntimePlanDefaults,
+        native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
+        defaults: ModelPlanDefaults,
         cache: ModelCache,
         native_build: String,
     ) -> Self {
         Self {
-            backends,
             inventory,
             assessor,
             native_executor,
-            runtime_failure,
-            worker: Arc::new(tokio::sync::RwLock::new(None)),
             memory_observer: Arc::new(SystemMemoryObserver::new()),
             next_worker_generation: Arc::new(AtomicU64::new(1)),
             admission_blocked_until: Arc::new(Mutex::new(None)),
             defaults,
             load_progress: Arc::new(LoadProgressEstimator::new(cache, native_build)),
             loaded_configurations: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            state: Arc::new(tokio::sync::RwLock::new(RuntimeState { resident: None })),
+            instances: InstanceEntries::new(),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
+            idle_timeout: Self::IDLE_TIMEOUT,
         }
+    }
+
+    async fn publish_loading(
+        &self,
+        instance_id: &ModelInstanceId,
+        configuration_id: &ModelServingConfigurationId,
+        stage: ModelLoadStage,
+        progress: Option<f32>,
+        planned_allocation: Option<ModelLoadAllocation>,
+    ) {
+        self.instances
+            .publish(ModelInstance {
+                id: instance_id.clone(),
+                configuration_id: configuration_id.clone(),
+                lifecycle: ModelInstanceLifecycle::Loading {
+                    stage,
+                    progress,
+                    planned_allocation,
+                },
+            })
+            .await;
+    }
+
+    async fn publish_failed(
+        &self,
+        instance_id: &ModelInstanceId,
+        configuration_id: &ModelServingConfigurationId,
+        failure: DomainModelFailure,
+    ) {
+        self.instances
+            .publish(ModelInstance {
+                id: instance_id.clone(),
+                configuration_id: configuration_id.clone(),
+                lifecycle: ModelInstanceLifecycle::Failed { failure },
+            })
+            .await;
+    }
+
+    async fn publish_stopped_loading(
+        &self,
+        instance_id: &ModelInstanceId,
+        configuration_id: &ModelServingConfigurationId,
+    ) {
+        self.instances
+            .publish(ModelInstance {
+                id: instance_id.clone(),
+                configuration_id: configuration_id.clone(),
+                lifecycle: ModelInstanceLifecycle::Stopped {
+                    reason: ModelReleaseReason::ExplicitStop,
+                },
+            })
+            .await;
+    }
+
+    async fn replay_load_events(
+        &self,
+        instance_id: &ModelInstanceId,
+        events: &tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
+    ) {
+        let mut changes = self.instances.subscribe();
+        loop {
+            let Some(instance) = self.instances.instance(instance_id).await else {
+                return;
+            };
+            match instance.lifecycle {
+                ModelInstanceLifecycle::Loading {
+                    stage,
+                    progress,
+                    planned_allocation,
+                } => {
+                    let _ = events.send(ModelLoadEvent::Progress {
+                        stage,
+                        fraction: progress,
+                        allocation: planned_allocation,
+                    });
+                }
+                ModelInstanceLifecycle::Ready { allocation } => {
+                    let _ = events.send(ModelLoadEvent::Ready {
+                        ready: LoadModelReady {
+                            instance_id: instance.id,
+                            configuration_id: instance.configuration_id,
+                            allocation,
+                        },
+                    });
+                    return;
+                }
+                ModelInstanceLifecycle::Stopping { .. } => {}
+                ModelInstanceLifecycle::Stopped { .. } => {
+                    let _ = events.send(ModelLoadEvent::Stopped {
+                        instance_id: instance.id,
+                    });
+                    return;
+                }
+                ModelInstanceLifecycle::Failed { failure } => {
+                    let _ = events.send(ModelLoadEvent::Failed { failure });
+                    return;
+                }
+            }
+            match changes.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+
+    fn start_idle_supervisor(&self, ready_instance: ReadyInstanceRecord) {
+        let controller = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let activity_changed = ready_instance.runtime.activity_changed();
+                tokio::pin!(activity_changed);
+                let activity = ready_instance.runtime.activity();
+                if activity.generation != ready_instance.generation {
+                    return;
+                }
+                let Some(idle_since) = activity.idle_since.filter(|_| activity.active_leases == 0)
+                else {
+                    activity_changed.await;
+                    continue;
+                };
+                let deadline = tokio::time::Instant::from_std(idle_since + controller.idle_timeout);
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {}
+                    _ = &mut activity_changed => continue,
+                }
+
+                let _operation = controller.mutation.lock().await;
+                let Some(backend_mutation) = ready_instance.runtime.try_begin_mutation() else {
+                    continue;
+                };
+                let current = controller.instances.ready_instance().await;
+                let activity = ready_instance.runtime.activity();
+                let Some(elapsed) = idle_release_elapsed(
+                    &ready_instance,
+                    current.as_ref(),
+                    activity,
+                    controller.idle_timeout,
+                    std::time::Instant::now(),
+                ) else {
+                    drop(backend_mutation);
+                    continue;
+                };
+                tracing::info!(
+                    model.configuration.id = %ready_instance.configuration_id.0,
+                    model.instance.id = %ready_instance.instance_id.0,
+                    generation = ready_instance.generation,
+                    idle_seconds = elapsed.as_secs_f64(),
+                    "model idle deadline won admission race"
+                );
+                let _ = controller
+                    .stop_ready_instance_under_mutation(
+                        &ready_instance,
+                        ModelReleaseReason::IdleTimeout,
+                        backend_mutation,
+                    )
+                    .await;
+                return;
+            }
+        });
     }
 
     fn profile_defaults(
         &self,
-        profile: &RuntimeExecutionProfile,
-    ) -> Result<RuntimePlanDefaults, InventoryError> {
+        profile: &ModelExecutionProfile,
+    ) -> Result<ModelPlanDefaults, InventoryError> {
         let mut defaults = self.defaults.clone();
         defaults.context_size = profile.context_length;
         defaults.physical_context_size = profile.context_length;
@@ -2019,11 +2810,13 @@ impl NativeRuntimeController {
             .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
             .map(|component| component.path.clone())
             .collect();
-        let defaults = self.profile_defaults(&RuntimeExecutionProfile {
+        let defaults = self.profile_defaults(&ModelExecutionProfile {
             context_length: configuration.profile.context_length,
         })?;
         let plan = execution_intent(primary, projector, &defaults).map_err(|error| {
-            InventoryError::Internal(format!("failed to resolve runtime intent: {error:#}"))
+            InventoryError::Internal(format!(
+                "failed to resolve model execution intent: {error:#}"
+            ))
         })?;
         Ok((
             model,
@@ -2036,15 +2829,35 @@ impl NativeRuntimeController {
     async fn assess_load_candidates(
         &self,
         resolved: ResolvedModel,
-        profile: &RuntimeExecutionProfile,
-    ) -> Result<Vec<(u32, u64)>, RuntimeTransitionFailure> {
+        profile: &ModelExecutionProfile,
+        configuration_id: &ModelServingConfigurationId,
+    ) -> Result<(Vec<(u32, u64)>, u64), ModelTransitionFailure> {
         const MAX_DYNAMIC_PARALLEL_SEQUENCES: u32 = 4;
         let hardware = HardwareProvider::snapshot(self.assessor.as_ref())
             .await
-            .map_err(RuntimeTransitionFailure::from)?;
+            .map_err(ModelTransitionFailure::from)?;
         let assess_reserve =
             icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes)
                 .assess_reserve_bytes;
+        let resident = self.instances.ready_instance().await;
+        let releasable_system_memory_bytes = resident
+            .as_ref()
+            .map(|resident| {
+                resident
+                    .allocation
+                    .memory_domains
+                    .iter()
+                    .filter(|domain| domain.memory_domain_id.is_system())
+                    .map(|domain| {
+                        domain
+                            .model_bytes
+                            .saturating_add(domain.context_bytes)
+                            .saturating_add(domain.compute_bytes)
+                            .saturating_add(domain.auxiliary_bytes)
+                    })
+                    .fold(0_u64, u64::saturating_add)
+            })
+            .unwrap_or_default();
         let maximum = if resolved
             .components
             .iter()
@@ -2061,19 +2874,21 @@ impl NativeRuntimeController {
                 parallel_sequences,
             })
             .collect::<Vec<_>>();
+        let capacity_policy = CapacityPolicy {
+            reserve_bytes_per_domain: CapacityPolicy::default().reserve_bytes_per_domain,
+            system_reserve_bytes: Some(assess_reserve),
+        };
         let assessments = self
             .assessor
-            .assess_resolved_plans_with_policy(
+            .assess_resolved_plans_cached_with_policy(
                 resolved,
                 profiles,
-                false,
-                CapacityPolicy {
-                    reserve_bytes_per_domain: CapacityPolicy::default().reserve_bytes_per_domain,
-                    system_reserve_bytes: Some(assess_reserve),
-                },
+                &hardware,
+                capacity_policy,
+                configuration_id,
             )
             .await
-            .map_err(RuntimeTransitionFailure::from)?;
+            .map_err(ModelTransitionFailure::from)?;
         let mut candidates = Vec::new();
         for (index, assessment) in assessments.into_iter().enumerate() {
             let parallel_sequences = u32::try_from(index + 1).expect("four candidates fit u32");
@@ -2085,7 +2900,7 @@ impl NativeRuntimeController {
                         .find(|domain| domain.memory_domain.is_system())
                         .map(|domain| domain.required_bytes)
                         .ok_or_else(|| {
-                            RuntimeTransitionFailure::new(RuntimeFailure::new(
+                            ModelTransitionFailure::new(ModelOperationFailure::new(
                                 "memory_assessment_incomplete",
                                 "native planner omitted the system-memory domain",
                                 false,
@@ -2099,7 +2914,7 @@ impl NativeRuntimeController {
                     memory,
                     ..
                 } => {
-                    return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                         "insufficient_resources",
                         format!(
                             "native baseline does not fit {limiting_resource}: {} byte deficit",
@@ -2110,12 +2925,12 @@ impl NativeRuntimeController {
                 }
                 HardwareAssessment::InvalidArtifact { code, message }
                 | HardwareAssessment::IncompatibleArtifact { code, message } => {
-                    return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                         code, message, false,
                     )));
                 }
                 HardwareAssessment::NotAssessed { reason } if parallel_sequences == 1 => {
-                    return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                    return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                         "memory_estimate_failed",
                         reason,
                         true,
@@ -2124,47 +2939,71 @@ impl NativeRuntimeController {
                 HardwareAssessment::NotAssessed { .. } => break,
             }
         }
-        Ok(candidates)
+        Ok((candidates, releasable_system_memory_bytes))
     }
 
-    async fn discard_worker(&self, worker: &InferenceWorker, code: &str, reason: &str) {
+    async fn cleanup_owned_worker_under_mutation(
+        &self,
+        _model_mutation: &tokio::sync::MutexGuard<'_, ()>,
+        instance_id: &ModelInstanceId,
+        worker: &InferenceWorker,
+        code: &str,
+        reason: &str,
+    ) {
         let pid = worker.pid();
-        let is_current = self
-            .worker
-            .read()
+        let is_current = self.instances.owns_worker(instance_id, pid).await;
+        let resident = self
+            .instances
+            .ready_instance()
             .await
-            .as_ref()
-            .is_some_and(|current| current.pid() == pid);
+            .filter(|resident| resident.instance_id == *instance_id);
         if !is_current {
             return;
         }
-        let resident_model_id = self
-            .state
-            .read()
-            .await
-            .resident
-            .as_ref()
-            .map(|resident| resident.model_id.clone());
-        if let Some(model_id) = resident_model_id
-            && let Ok(mut failure) = self.runtime_failure.write()
-        {
-            *failure = Some(icn_contracts::RuntimeFailureObservation {
-                model_id,
-                code: code.to_owned(),
-                message: reason.to_owned(),
-                retryable: true,
-            });
-        }
         worker.terminate(code, reason);
-        self.backends.clear();
+        if let Some(resident) = resident.as_ref() {
+            resident.runtime.clear();
+        }
         if let Ok(mut slot) = self.native_executor.write() {
             *slot = None;
         }
-        *self.state.write().await = RuntimeState { resident: None };
-        let mut slot = self.worker.write().await;
-        if slot.as_ref().is_some_and(|current| current.pid() == pid) {
-            *slot = None;
+        {
+            self.instances.clear_ready(instance_id).await;
+            self.instances.take_worker(instance_id).await;
         }
+        if let Some(resident) = resident {
+            self.instances
+                .publish(ModelInstance {
+                    id: resident.instance_id,
+                    configuration_id: resident.configuration_id,
+                    lifecycle: ModelInstanceLifecycle::Failed {
+                        failure: DomainModelFailure {
+                            code: code.to_owned(),
+                            message: reason.to_owned(),
+                            retryable: true,
+                        },
+                    },
+                })
+                .await;
+        }
+    }
+
+    async fn cleanup_owned_worker(
+        &self,
+        instance_id: &ModelInstanceId,
+        worker: &InferenceWorker,
+        code: &str,
+        reason: &str,
+    ) {
+        let model_mutation = self.mutation.lock().await;
+        self.cleanup_owned_worker_under_mutation(
+            &model_mutation,
+            instance_id,
+            worker,
+            code,
+            reason,
+        )
+        .await;
     }
 
     fn block_memory_admission(&self) {
@@ -2204,7 +3043,7 @@ impl NativeRuntimeController {
         });
     }
 
-    fn supervise_worker(&self, worker: InferenceWorker) {
+    fn supervise_worker(&self, instance_id: ModelInstanceId, worker: InferenceWorker) {
         let controller = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(POLL_INTERVAL);
@@ -2215,7 +3054,8 @@ impl NativeRuntimeController {
                 match worker.try_wait() {
                     Ok(Some(status)) => {
                         controller
-                            .discard_worker(
+                            .cleanup_owned_worker(
+                                &instance_id,
                                 &worker,
                                 "worker_exited",
                                 &format!("inference worker exited unexpectedly: {status}"),
@@ -2225,7 +3065,8 @@ impl NativeRuntimeController {
                     }
                     Err(error) => {
                         controller
-                            .discard_worker(
+                            .cleanup_owned_worker(
+                                &instance_id,
                                 &worker,
                                 "worker_monitor_failed",
                                 &format!("failed to observe inference worker: {error}"),
@@ -2254,7 +3095,8 @@ impl NativeRuntimeController {
                                 "evicting inference worker under system memory pressure"
                             );
                             controller
-                                .discard_worker(
+                                .cleanup_owned_worker(
+                                    &instance_id,
                                     &worker,
                                     LOW_MEMORY_FAILURE_CODE,
                                     "inference worker evicted under system memory pressure",
@@ -2269,7 +3111,8 @@ impl NativeRuntimeController {
                         if failed_at.elapsed() >= MONITOR_LOSS_DEADLINE {
                             controller.block_memory_admission();
                             controller
-                                .discard_worker(
+                                .cleanup_owned_worker(
+                                    &instance_id,
                                     &worker,
                                     "memory_monitor_unavailable",
                                     &format!("system memory supervision unavailable: {error}"),
@@ -2283,60 +3126,12 @@ impl NativeRuntimeController {
         });
     }
 
-    #[tracing::instrument(
-        name = "icn.runtime.load.operation",
-        skip_all,
-        fields(model.configuration.id = %configuration.id.0)
-    )]
-    async fn perform_prepared_transition(
-        self,
-        configuration: ModelServingConfiguration,
+    async fn select_load_allocation(
+        &self,
         resolved: ResolvedModel,
-        mut plan: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
-        package_ids: Vec<ModelPackageId>,
-        events: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
-    ) -> Result<RuntimeAllocation, RuntimeTransitionFailure> {
-        let model_id = configuration.id.0.clone();
-        let profile = RuntimeExecutionProfile {
-            context_length: configuration.profile.context_length,
-        };
-        let existing = self.state.read().await.clone();
-
-        if existing
-            .resident
-            .as_ref()
-            .is_some_and(|resident| resident.model_id == model_id && resident.profile == profile)
-            && let Some(lease) = self.backends.lease()
-        {
-            drop(lease);
-            let resident = existing.resident.expect("matching resident was checked");
-            return Ok(RuntimeAllocation {
-                residency_id: RuntimeResidencyId(resident.residency_id),
-                parallel_sequences: resident.parallel_sequences,
-                physical_context_tokens: resident.physical_context_tokens,
-            });
-        };
-        let _backend_mutation = self.backends.begin_mutation().await;
-
-        if existing.resident.is_some() {
-            let _ = events.send(ModelLoadEvent::Progress {
-                stage: ModelLoadStage::Unloading,
-                fraction: None,
-            });
-        }
-        if existing.resident.is_some() || self.worker.read().await.is_some() {
-            self.stop_worker_gracefully().await;
-        }
-        *self.state.write().await = RuntimeState { resident: None };
-        if let Ok(mut slot) = self.native_executor.write() {
-            *slot = None;
-        }
-        self.backends.clear();
-        if let Ok(mut failure) = self.runtime_failure.write() {
-            *failure = None;
-        }
-
+        profile: &ModelExecutionProfile,
+        configuration_id: &ModelServingConfigurationId,
+    ) -> Result<(u32, u64), ModelTransitionFailure> {
         let recovery_blocked = self
             .admission_blocked_until
             .lock()
@@ -2344,19 +3139,25 @@ impl NativeRuntimeController {
             .and_then(|blocked_until| *blocked_until)
             .is_some_and(|blocked_until| blocked_until > std::time::Instant::now());
         if recovery_blocked {
-            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+            return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                 LOW_MEMORY_FAILURE_CODE,
                 "system memory is still in the post-eviction recovery period",
                 true,
             )));
         }
+        let (candidates, releasable_system_memory_bytes) = self
+            .assess_load_candidates(resolved, profile, configuration_id)
+            .await?;
+        // Selection uses a fresh observation immediately after planning. Both preview and load
+        // call this exact function; neither reconstructs parallelism from persisted assessments.
         let sample = self.memory_observer.sample().map_err(|error| {
-            RuntimeTransitionFailure::new(RuntimeFailure::new(
+            ModelTransitionFailure::new(ModelOperationFailure::new(
                 "memory_monitor_unavailable",
                 error,
                 true,
             ))
         })?;
+        let sample = credit_replaced_instance_memory(sample, releasable_system_memory_bytes);
         if self
             .admission_blocked_until
             .lock()
@@ -2365,7 +3166,7 @@ impl NativeRuntimeController {
             .is_some()
             && !sample.recovered()
         {
-            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+            return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                 LOW_MEMORY_FAILURE_CODE,
                 format!(
                     "system memory has not recovered above the {} byte reserve and hysteresis margin",
@@ -2377,41 +3178,113 @@ impl NativeRuntimeController {
         if let Ok(mut blocked_until) = self.admission_blocked_until.lock() {
             *blocked_until = None;
         }
-        let candidates = self
-            .assess_load_candidates(resolved.clone(), &profile)
-            .await?;
-        // Planning is isolated and can take time. Admission must use a fresh observation taken
-        // immediately before worker creation rather than the sample that selected the policy.
-        let admission_sample = self.memory_observer.sample().map_err(|error| {
-            RuntimeTransitionFailure::new(RuntimeFailure::new(
-                "memory_monitor_unavailable",
-                error,
-                true,
-            ))
-        })?;
-        let Some((parallel_sequences, required_system_memory_bytes)) =
-            select_runtime_allocation(&candidates, admission_sample)
-        else {
+        let Some(selected) = select_model_allocation(&candidates, sample) else {
             let minimum_required = candidates
                 .first()
                 .map(|(_, required)| *required)
                 .unwrap_or_default();
-            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+            return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                 LOW_MEMORY_FAILURE_CODE,
                 format!(
                     "model requires at least {minimum_required} bytes of system memory at parallelism 1, but only {} bytes are available with a {} byte system reserve",
-                    admission_sample.available_bytes,
-                    admission_sample.abort_reserve_bytes()
+                    sample.available_bytes,
+                    sample.abort_reserve_bytes()
                 ),
                 true,
             )));
         };
+        Ok(selected)
+    }
+
+    #[tracing::instrument(
+        name = "icn.model.load.operation",
+        skip_all,
+        fields(model.configuration.id = %configuration.id.0)
+    )]
+    async fn perform_prepared_transition(
+        self,
+        configuration: ModelServingConfiguration,
+        resolved: ResolvedModel,
+        mut plan: ExecutionIntent,
+        mtp_selection: MtpCandidateSelection,
+        package_ids: Vec<ModelPackageId>,
+        events: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
+        instance_id: ModelInstanceId,
+        stop_requested: Arc<AtomicBool>,
+        model_mutation: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<icn_contracts::models::ModelInstanceAllocation, ModelTransitionFailure> {
+        if stop_requested.load(Ordering::Acquire) {
+            return Err(ModelTransitionFailure::stopped());
+        }
+        let configuration_id = configuration.id.clone();
+        let model_id = configuration_id.0.clone();
+        let profile = ModelExecutionProfile {
+            context_length: configuration.profile.context_length,
+        };
+        let existing = self.instances.ready_instance().await;
+        let _backend_mutation = match existing.as_ref() {
+            Some(resident) => Some(resident.runtime.begin_mutation().await),
+            None => None,
+        };
+        if stop_requested.load(Ordering::Acquire) {
+            return Err(ModelTransitionFailure::stopped());
+        }
+
+        if existing.is_some() {
+            let _ = events.send(ModelLoadEvent::Progress {
+                stage: ModelLoadStage::Unloading,
+                fraction: None,
+                allocation: None,
+            });
+        }
+        if let Some(resident) = existing.as_ref() {
+            self.instances
+                .publish(ModelInstance {
+                    id: resident.instance_id.clone(),
+                    configuration_id: resident.configuration_id.clone(),
+                    lifecycle: ModelInstanceLifecycle::Stopping {
+                        reason: ModelReleaseReason::Replacement,
+                        allocation: ModelStoppingAllocation::Resident {
+                            allocation: resident.allocation.clone(),
+                        },
+                    },
+                })
+                .await;
+        }
+        if let Some(resident) = existing.as_ref() {
+            self.stop_worker_gracefully(&resident.instance_id).await;
+        }
+        if let Some(resident) = existing.as_ref() {
+            self.instances.clear_ready(&resident.instance_id).await;
+            resident.runtime.clear();
+        }
+        if let Ok(mut slot) = self.native_executor.write() {
+            *slot = None;
+        }
+        if let Some(resident) = existing {
+            self.instances
+                .publish(ModelInstance {
+                    id: resident.instance_id,
+                    configuration_id: resident.configuration_id,
+                    lifecycle: ModelInstanceLifecycle::Stopped {
+                        reason: ModelReleaseReason::Replacement,
+                    },
+                })
+                .await;
+        }
+
+        let (parallel_sequences, required_system_memory_bytes) = self
+            .select_load_allocation(resolved.clone(), &profile, &configuration_id)
+            .await?;
+        if stop_requested.load(Ordering::Acquire) {
+            return Err(ModelTransitionFailure::stopped());
+        }
         let physical_context_tokens = plan
             .context_size
             .checked_mul(parallel_sequences)
             .ok_or_else(|| {
-                RuntimeTransitionFailure::new(RuntimeFailure::new(
-                    "invalid_runtime_allocation",
+                ModelTransitionFailure::new(ModelOperationFailure::new(
+                    "invalid_model_allocation",
                     "context length multiplied by selected parallelism exceeds u32",
                     false,
                 ))
@@ -2423,7 +3296,7 @@ impl NativeRuntimeController {
             parallel_sequences,
             physical_context_tokens,
             required_system_memory_bytes,
-            "selected runtime allocation"
+            "selected model allocation"
         );
 
         let worker_generation = self.next_worker_generation.fetch_add(1, Ordering::Relaxed);
@@ -2433,29 +3306,37 @@ impl NativeRuntimeController {
         })
         .await
         .map_err(|error| {
-            RuntimeTransitionFailure::new(RuntimeFailure::new(
+            ModelTransitionFailure::new(ModelOperationFailure::new(
                 "worker_spawn_failed",
                 error.to_string(),
                 true,
             ))
         })?
         .map_err(|error| {
-            RuntimeTransitionFailure::new(RuntimeFailure::new(
+            ModelTransitionFailure::new(ModelOperationFailure::new(
                 "worker_spawn_failed",
                 error.to_string(),
                 true,
             ))
         })?;
-        *self.worker.write().await = Some(worker.clone());
-        self.supervise_worker(worker.clone());
+        if stop_requested.load(Ordering::Acquire) {
+            worker.shutdown();
+            return Err(ModelTransitionFailure::stopped());
+        }
+        self.instances
+            .install_worker(&instance_id, worker.clone())
+            .await;
+        self.supervise_worker(instance_id.clone(), worker.clone());
         if let Err(error) = worker.start_load(model_id.clone(), plan, mtp_selection) {
-            self.discard_worker(
+            self.cleanup_owned_worker_under_mutation(
+                model_mutation,
+                &instance_id,
                 &worker,
                 "worker_protocol_error",
                 "failed to send worker load command",
             )
             .await;
-            return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+            return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                 "worker_protocol_error",
                 error.to_string(),
                 true,
@@ -2466,7 +3347,24 @@ impl NativeRuntimeController {
             .loaded_configurations
             .lock()
             .is_ok_and(|loaded| loaded.contains(&model_id));
-        let (acceleration, signature, tracker) = match load_events.recv().await {
+        let prepared = loop {
+            tokio::select! {
+                event = load_events.recv() => break event,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if stop_requested.load(Ordering::Acquire) {
+                        self.cleanup_owned_worker_under_mutation(
+                            model_mutation,
+                            &instance_id,
+                            &worker,
+                            "model_instance_stopped",
+                            "model instance was stopped",
+                        ).await;
+                        return Err(ModelTransitionFailure::stopped());
+                    }
+                }
+            }
+        };
+        let (acceleration, signature, tracker) = match prepared {
             Some(LoadEvent::Prepared {
                 acceleration,
                 timing_plan_identity,
@@ -2485,37 +3383,58 @@ impl NativeRuntimeController {
                 (acceleration, signature, LoadProgressTracker::new(estimates))
             }
             Some(LoadEvent::Failed(message)) => {
-                self.discard_worker(&worker, "backend_load_failed", &message)
-                    .await;
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                self.cleanup_owned_worker_under_mutation(
+                    model_mutation,
+                    &instance_id,
+                    &worker,
+                    "backend_load_failed",
+                    &message,
+                )
+                .await;
+                return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                     "backend_load_failed",
                     message,
                     true,
                 )));
             }
             Some(LoadEvent::Lost { code, message }) => {
-                self.discard_worker(&worker, &code, &message).await;
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                self.cleanup_owned_worker_under_mutation(
+                    model_mutation,
+                    &instance_id,
+                    &worker,
+                    &code,
+                    &message,
+                )
+                .await;
+                return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                     code, message, true,
                 )));
             }
             Some(LoadEvent::Phase { .. }) | Some(LoadEvent::Loaded(_)) => {
-                self.discard_worker(
+                self.cleanup_owned_worker_under_mutation(
+                    model_mutation,
+                    &instance_id,
                     &worker,
                     "worker_protocol_error",
                     "worker load protocol order violation",
                 )
                 .await;
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                     "worker_protocol_error",
                     "worker sent load activity before its prepared plan",
                     false,
                 )));
             }
             None => {
-                self.discard_worker(&worker, "worker_exited", "worker load channel closed")
-                    .await;
-                return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                self.cleanup_owned_worker_under_mutation(
+                    model_mutation,
+                    &instance_id,
+                    &worker,
+                    "worker_exited",
+                    "worker load channel closed",
+                )
+                .await;
+                return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                     "worker_exited",
                     "inference worker stopped during load",
                     true,
@@ -2525,7 +3444,26 @@ impl NativeRuntimeController {
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Loading,
             fraction: Some(0.0),
+            allocation: Some(ModelLoadAllocation {
+                context_window_tokens: profile.context_length,
+                parallel_sequences,
+                physical_context_tokens,
+                required_system_memory_bytes,
+            }),
         });
+        self.publish_loading(
+            &instance_id,
+            &configuration_id,
+            ModelLoadStage::Loading,
+            Some(0.0),
+            Some(ModelLoadAllocation {
+                context_window_tokens: profile.context_length,
+                parallel_sequences,
+                physical_context_tokens,
+                required_system_memory_bytes,
+            }),
+        )
+        .await;
         let mut progress_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let properties = loop {
@@ -2540,40 +3478,56 @@ impl NativeRuntimeController {
                     }
                     Some(LoadEvent::Loaded(properties)) => break *properties,
                     Some(LoadEvent::Failed(message)) => {
-                        self.discard_worker(&worker, "backend_load_failed", &message).await;
-                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        self.cleanup_owned_worker_under_mutation(
+                            model_mutation,
+                            &instance_id,
+                            &worker,
+                            "backend_load_failed",
+                            &message,
+                        ).await;
+                        return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                             "backend_load_failed",
                             message,
                             true,
                         )));
                     }
                     Some(LoadEvent::Lost { code, message }) => {
-                        self.discard_worker(&worker, &code, &message).await;
-                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        self.cleanup_owned_worker_under_mutation(
+                            model_mutation,
+                            &instance_id,
+                            &worker,
+                            &code,
+                            &message,
+                        ).await;
+                        return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                             code,
                             message,
                             true,
                         )));
                     }
                     Some(LoadEvent::Prepared { .. }) => {
-                        self.discard_worker(
+                        self.cleanup_owned_worker_under_mutation(
+                            model_mutation,
+                            &instance_id,
                             &worker,
                             "worker_protocol_error",
                             "worker sent duplicate prepared event",
                         ).await;
-                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                             "worker_protocol_error",
                             "worker sent duplicate prepared event",
                             false,
                         )));
                     }
                     None => {
-                        self.discard_worker(
+                        self.cleanup_owned_worker_under_mutation(
+                            model_mutation,
+                            &instance_id,
                             &worker,
                             "worker_exited",
                             "worker load channel closed",
                         ).await;
-                        return Err(RuntimeTransitionFailure::new(RuntimeFailure::new(
+                        return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                             "worker_exited",
                             "inference worker stopped during load",
                             true,
@@ -2581,63 +3535,162 @@ impl NativeRuntimeController {
                     }
                 },
                 _ = progress_tick.tick() => {
+                    if stop_requested.load(Ordering::Acquire) {
+                        self.cleanup_owned_worker_under_mutation(
+                            model_mutation,
+                            &instance_id,
+                            &worker,
+                            "model_instance_stopped",
+                            "model instance was stopped",
+                        ).await;
+                        return Err(ModelTransitionFailure::stopped());
+                    }
+                    let fraction = tracker.fraction();
                     let _ = events.send(ModelLoadEvent::Progress {
                         stage: ModelLoadStage::Loading,
-                        fraction: Some(tracker.fraction()),
+                        fraction: Some(fraction),
+                        allocation: None,
                     });
+                    self.publish_loading(
+                        &instance_id,
+                        &configuration_id,
+                        ModelLoadStage::Loading,
+                        Some(fraction),
+                        Some(ModelLoadAllocation {
+                            context_window_tokens: profile.context_length,
+                            parallel_sequences,
+                            physical_context_tokens,
+                            required_system_memory_bytes,
+                        }),
+                    )
+                    .await;
                 }
             }
         };
         let backend = Arc::new(worker.backend(model_id.clone(), properties));
+        if stop_requested.load(Ordering::Acquire) {
+            self.cleanup_owned_worker_under_mutation(
+                model_mutation,
+                &instance_id,
+                &worker,
+                "model_instance_stopped",
+                "model instance was stopped",
+            )
+            .await;
+            return Err(ModelTransitionFailure::stopped());
+        }
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Verifying,
             fraction: Some(tracker.fraction()),
+            allocation: None,
         });
-        let mut aliases = std::collections::BTreeSet::new();
-        aliases.insert(resolved.model.name.clone());
-        let generation = self
-            .backends
-            .replace(Arc::clone(&backend) as Arc<dyn CompletionBackend>, aliases);
-        if let Ok(mut slot) = self.native_executor.write() {
-            *slot = Some(ResidentNativeExecutor {
-                generation,
-                model_id: model_id.clone(),
-                backend: Arc::clone(&backend),
-            });
-        }
-        let residency_id = format!("residency-{model_id}-{generation}");
-        let state = RuntimeState {
-            resident: Some(ResidentTarget {
-                model_id: model_id.clone(),
-                residency_id: residency_id.clone(),
-                profile,
-                package_ids,
+        self.publish_loading(
+            &instance_id,
+            &configuration_id,
+            ModelLoadStage::Verifying,
+            Some(tracker.fraction()),
+            Some(ModelLoadAllocation {
+                context_window_tokens: profile.context_length,
                 parallel_sequences,
                 physical_context_tokens,
+                required_system_memory_bytes,
             }),
+        )
+        .await;
+        let observation_backend = Arc::clone(&backend);
+        let observation_result = spawn_blocking_traced(move || {
+            observation_backend.observe_model_instance(
+                CapacityPolicy::default(),
+                build_identity::native_build(),
+                build_identity::enabled_backends()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+        })
+        .await;
+        let observation = match observation_result {
+            Ok(Ok(observation)) => observation,
+            Ok(Err(error)) => {
+                self.cleanup_owned_worker_under_mutation(
+                    model_mutation,
+                    &instance_id,
+                    &worker,
+                    "model_instance_observation_failed",
+                    &error,
+                )
+                .await;
+                return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
+                    "model_instance_observation_failed",
+                    error,
+                    true,
+                )));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.cleanup_owned_worker_under_mutation(
+                    model_mutation,
+                    &instance_id,
+                    &worker,
+                    "model_instance_observation_failed",
+                    &message,
+                )
+                .await;
+                return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
+                    "model_instance_observation_failed",
+                    message,
+                    true,
+                )));
+            }
         };
-        *self.state.write().await = state.clone();
+        let allocation = observation.allocation;
+        let runtime = InstanceRuntime::empty();
+        let generation = runtime.install(
+            instance_id.clone(),
+            configuration_id.clone(),
+            Arc::clone(&backend) as Arc<dyn CompletionBackend>,
+        );
+        if let Ok(mut slot) = self.native_executor.write() {
+            *slot = Some(Arc::downgrade(&backend));
+        }
+        let resident = ReadyInstanceRecord {
+            configuration_id: configuration_id.clone(),
+            instance_id: instance_id.clone(),
+            generation,
+            package_ids,
+            allocation: allocation.clone(),
+            runtime,
+        };
+        if !self.instances.publish_ready(resident.clone()).await {
+            self.cleanup_owned_worker_under_mutation(
+                model_mutation,
+                &instance_id,
+                &worker,
+                "model_instance_stopped",
+                "model instance was stopped",
+            )
+            .await;
+            return Err(ModelTransitionFailure::stopped());
+        }
+        self.start_idle_supervisor(resident);
         tracker.phase_completed(icn_engine::ModelLoadPhase::Finalize);
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Verifying,
             fraction: Some(tracker.fraction()),
+            allocation: None,
         });
         if let Ok(mut loaded) = self.loaded_configurations.lock() {
             loaded.insert(model_id.clone());
         }
         self.load_progress
             .record_success(&signature, &acceleration, &tracker);
-        tracing::info!("runtime model ready");
-        Ok(RuntimeAllocation {
-            residency_id: RuntimeResidencyId(residency_id),
-            parallel_sequences,
-            physical_context_tokens,
-        })
+        tracing::info!("model ready");
+        Ok(allocation)
     }
 
-    async fn stop_worker_gracefully(&self) {
-        let worker = self.worker.write().await.take();
-        let Some(worker) = worker else {
+    async fn stop_worker_gracefully(&self, instance_id: &ModelInstanceId) {
+        let owned = self.instances.take_worker(instance_id).await;
+        let Some(OwnedInferenceWorker { worker, .. }) = owned else {
             return;
         };
         worker.shutdown();
@@ -2659,121 +3712,351 @@ impl NativeRuntimeController {
         }
     }
 
-    async fn unload_resident_with_admission_closed(
+    async fn stop_ready_instance_under_mutation(
         &self,
-        model_id: &str,
-        _backend_mutation: BackendMutationGuard,
+        expected: &ReadyInstanceRecord,
+        reason: ModelReleaseReason,
+        _runtime_mutation: InstanceMutationGuard,
     ) -> Result<bool, InventoryError> {
-        let previous = self.state.read().await.clone();
-        if previous
-            .resident
-            .as_ref()
-            .is_none_or(|resident| resident.model_id != model_id)
-        {
+        let current = self.instances.ready_instance().await;
+        let Some(resident) = current.filter(|resident| {
+            resident.generation == expected.generation
+                && resident.instance_id == expected.instance_id
+        }) else {
             return Ok(false);
-        }
+        };
 
-        self.backends.clear();
+        self.instances
+            .publish(ModelInstance {
+                id: resident.instance_id.clone(),
+                configuration_id: resident.configuration_id.clone(),
+                lifecycle: ModelInstanceLifecycle::Stopping {
+                    reason,
+                    allocation: ModelStoppingAllocation::Resident {
+                        allocation: resident.allocation.clone(),
+                    },
+                },
+            })
+            .await;
+        resident.runtime.clear();
         if let Ok(mut slot) = self.native_executor.write() {
             *slot = None;
         }
-        *self.state.write().await = RuntimeState { resident: None };
-        self.stop_worker_gracefully().await;
+        self.instances.clear_ready(&resident.instance_id).await;
+        self.stop_worker_gracefully(&resident.instance_id).await;
+        self.instances
+            .publish(ModelInstance {
+                id: resident.instance_id,
+                configuration_id: resident.configuration_id,
+                lifecycle: ModelInstanceLifecycle::Stopped { reason },
+            })
+            .await;
         Ok(true)
     }
 
-    async fn unload_resident_locked(&self, model_id: &str) -> Result<bool, InventoryError> {
-        let backend_mutation = self.backends.begin_mutation().await;
-        self.unload_resident_with_admission_closed(model_id, backend_mutation)
+    async fn stop_ready_instance(
+        &self,
+        ready_instance: &ReadyInstanceRecord,
+        reason: ModelReleaseReason,
+    ) -> Result<bool, InventoryError> {
+        let backend_mutation = ready_instance.runtime.begin_mutation().await;
+        self.stop_ready_instance_under_mutation(ready_instance, reason, backend_mutation)
             .await
     }
 }
 
-impl RuntimeController for NativeRuntimeController {
-    fn load_configuration(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent> {
+impl ModelInstanceController for NativeModelInstanceController {
+    fn preview_load(
+        &self,
+        request: PreviewModelLoadRequest,
+    ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>> {
+        Box::pin(async move {
+            let profile = ModelExecutionProfile {
+                context_length: request.configuration.profile.context_length,
+            };
+            let (resolved, plan, _, _) = self
+                .resolved_configuration_load(&request.configuration)
+                .await?;
+            let (parallel_sequences, required_system_memory_bytes) = self
+                .select_load_allocation(resolved, &profile, &request.configuration.id)
+                .await
+                .map_err(|failure| InventoryError::ModelOperation {
+                    code: failure.event.code,
+                    message: failure.event.message,
+                    retryable: failure.event.retryable,
+                })?;
+            let physical_context_tokens = plan
+                .context_size
+                .checked_mul(parallel_sequences)
+                .ok_or_else(|| {
+                    InventoryError::InvalidRequest(
+                        "context length multiplied by selected parallelism exceeds u32".to_owned(),
+                    )
+                })?;
+            Ok(ModelLoadAllocation {
+                context_window_tokens: plan.context_size,
+                parallel_sequences,
+                physical_context_tokens,
+                required_system_memory_bytes,
+            })
+        })
+    }
+
+    fn load_instance(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent> {
         let controller = self.clone();
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let instance_id = request.instance_id.clone();
+        let configuration_id = request.configuration.id.clone();
         tokio::spawn(async move {
-            let _ = events.send(ModelLoadEvent::Progress {
-                stage: ModelLoadStage::Queued,
-                fraction: None,
-            });
-            let _guard = controller.mutation.lock().await;
-            let configuration = request.configuration;
-            let configuration_id = configuration.id.clone();
-            let _ = events.send(ModelLoadEvent::Progress {
-                stage: ModelLoadStage::Resolving,
-                fraction: None,
-            });
-            let (resolved, plan, mtp_selection, package_ids) =
-                match controller.resolved_configuration_load(&configuration).await {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        let _ = events.send(ModelLoadEvent::Failed {
-                            failure: Self::load_failure(error),
-                        });
-                        return;
-                    }
-                };
-            let allocation = match controller
-                .clone()
-                .perform_prepared_transition(
-                    configuration,
-                    resolved,
-                    plan,
-                    mtp_selection,
-                    package_ids,
-                    events.clone(),
-                )
+            let (stop_requested, is_new) = match controller
+                .instances
+                .admit(instance_id.clone(), configuration_id.clone())
                 .await
             {
-                Ok(allocation) => allocation,
+                Ok(admission) => admission,
                 Err(failure) => {
-                    let _ = events.send(ModelLoadEvent::Failed {
-                        failure: DomainModelFailure {
-                            code: failure.event.code.to_owned(),
-                            message: failure.event.message,
-                            retryable: failure.event.retryable,
-                        },
-                    });
+                    let _ = events.send(ModelLoadEvent::Failed { failure });
                     return;
                 }
             };
-            let mut digest = Sha256::new();
-            digest.update(b"magnitude-runtime-execution-evidence-v1\0");
-            digest.update(configuration_id.0.as_bytes());
-            digest.update(b"\0");
-            digest.update(allocation.residency_id.0.as_bytes());
-            digest.update(b"\0");
-            digest.update(allocation.parallel_sequences.to_le_bytes());
-            digest.update(allocation.physical_context_tokens.to_le_bytes());
-            let _ = events.send(ModelLoadEvent::Ready {
-                ready: LoadModelReady {
-                    residency_id: allocation.residency_id,
-                    configuration_id,
-                    execution_evidence_id: format!("execution_{:x}", digest.finalize()),
-                    parallel_sequences: allocation.parallel_sequences,
-                    physical_context_tokens: allocation.physical_context_tokens,
-                },
-            });
+            if !is_new {
+                controller.replay_load_events(&instance_id, &events).await;
+                return;
+            }
+            let run = async {
+                let send_stopped = || {
+                    let _ = events.send(ModelLoadEvent::Stopped {
+                        instance_id: instance_id.clone(),
+                    });
+                };
+                let _ = events.send(ModelLoadEvent::Progress {
+                    stage: ModelLoadStage::Queued,
+                    fraction: None,
+                    allocation: None,
+                });
+                let model_mutation = controller.mutation.lock().await;
+                if stop_requested.load(Ordering::Acquire) {
+                    controller
+                        .publish_stopped_loading(&instance_id, &configuration_id)
+                        .await;
+                    send_stopped();
+                    return;
+                }
+                let configuration = request.configuration;
+                let _ = events.send(ModelLoadEvent::Progress {
+                    stage: ModelLoadStage::Resolving,
+                    fraction: None,
+                    allocation: None,
+                });
+                controller
+                    .publish_loading(
+                        &instance_id,
+                        &configuration_id,
+                        ModelLoadStage::Resolving,
+                        None,
+                        None,
+                    )
+                    .await;
+                let (resolved, plan, mtp_selection, package_ids) = match controller
+                    .resolved_configuration_load(&configuration)
+                    .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        if stop_requested.load(Ordering::Acquire) {
+                            controller
+                                .publish_stopped_loading(&instance_id, &configuration_id)
+                                .await;
+                            send_stopped();
+                        } else {
+                            let failure = Self::load_failure(error);
+                            controller
+                                .publish_failed(&instance_id, &configuration_id, failure.clone())
+                                .await;
+                            let _ = events.send(ModelLoadEvent::Failed { failure });
+                        }
+                        return;
+                    }
+                };
+                if stop_requested.load(Ordering::Acquire) {
+                    controller
+                        .publish_stopped_loading(&instance_id, &configuration_id)
+                        .await;
+                    send_stopped();
+                    return;
+                }
+                let allocation = match controller
+                    .clone()
+                    .perform_prepared_transition(
+                        configuration,
+                        resolved,
+                        plan,
+                        mtp_selection,
+                        package_ids,
+                        events.clone(),
+                        instance_id.clone(),
+                        Arc::clone(&stop_requested),
+                        &model_mutation,
+                    )
+                    .await
+                {
+                    Ok(allocation) => allocation,
+                    Err(failure) if failure.event.code == "model_instance_stopped" => {
+                        controller
+                            .publish_stopped_loading(&instance_id, &configuration_id)
+                            .await;
+                        send_stopped();
+                        return;
+                    }
+                    Err(failure) => {
+                        let failure = DomainModelFailure {
+                            code: failure.event.code.to_owned(),
+                            message: failure.event.message,
+                            retryable: failure.event.retryable,
+                        };
+                        controller
+                            .publish_failed(&instance_id, &configuration_id, failure.clone())
+                            .await;
+                        let _ = events.send(ModelLoadEvent::Failed { failure });
+                        return;
+                    }
+                };
+                if stop_requested.load(Ordering::Acquire) {
+                    if let Some(resident) = controller
+                        .instances
+                        .ready_instance()
+                        .await
+                        .filter(|resident| resident.instance_id == instance_id)
+                    {
+                        let _ = controller
+                            .stop_ready_instance(&resident, ModelReleaseReason::ExplicitStop)
+                            .await;
+                    }
+                    send_stopped();
+                    return;
+                }
+                let _ = events.send(ModelLoadEvent::Ready {
+                    ready: LoadModelReady {
+                        instance_id: instance_id.clone(),
+                        configuration_id: configuration_id.clone(),
+                        allocation,
+                    },
+                });
+            };
+            if std::panic::AssertUnwindSafe(run)
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                if let Some(worker) = controller
+                    .instances
+                    .entry(&instance_id)
+                    .await
+                    .and_then(|entry| entry.worker)
+                {
+                    controller
+                        .cleanup_owned_worker(
+                            &instance_id,
+                            &worker.worker,
+                            "model_instance_operation_panicked",
+                            "model instance operation panicked",
+                        )
+                        .await;
+                }
+                if !matches!(
+                    controller.instances.instance(&instance_id).await,
+                    Some(ModelInstance {
+                        lifecycle: ModelInstanceLifecycle::Failed { .. },
+                        ..
+                    })
+                ) {
+                    controller
+                        .publish_failed(
+                            &instance_id,
+                            &configuration_id,
+                            DomainModelFailure {
+                                code: "model_instance_operation_panicked".to_owned(),
+                                message: "model instance operation panicked".to_owned(),
+                                retryable: true,
+                            },
+                        )
+                        .await;
+                }
+            }
         });
         UnboundedReceiverStream::new(receiver).boxed()
     }
 
-    fn unload_residency(&self, residency_id: String) -> BoxFuture<'_, Result<(), InventoryError>> {
+    fn stop_instance(
+        &self,
+        instance_id: ModelInstanceId,
+    ) -> BoxFuture<'_, Result<(), InventoryError>> {
         Box::pin(async move {
+            let entry = self.instances.entry(&instance_id).await;
+            if let Some(entry) = entry {
+                entry.stop_requested.store(true, Ordering::Release);
+                let loading = Some(entry.instance);
+                if let Some(ModelInstance {
+                    configuration_id,
+                    lifecycle:
+                        ModelInstanceLifecycle::Loading {
+                            planned_allocation, ..
+                        },
+                    ..
+                }) = loading
+                {
+                    self.instances
+                        .publish(ModelInstance {
+                            id: instance_id.clone(),
+                            configuration_id,
+                            lifecycle: ModelInstanceLifecycle::Stopping {
+                                reason: ModelReleaseReason::ExplicitStop,
+                                allocation: ModelStoppingAllocation::Planned {
+                                    allocation: planned_allocation,
+                                },
+                            },
+                        })
+                        .await;
+                }
+            }
             let _guard = self.mutation.lock().await;
             let resident = self
-                .state
-                .read()
+                .instances
+                .ready_instance()
                 .await
-                .resident
-                .clone()
-                .filter(|resident| resident.residency_id == residency_id)
-                .ok_or_else(|| InventoryError::NotFound(residency_id.clone()))?;
-            self.unload_resident_locked(&resident.model_id).await?;
+                .filter(|resident| resident.instance_id == instance_id);
+            if let Some(resident) = resident {
+                self.stop_ready_instance(&resident, ModelReleaseReason::ExplicitStop)
+                    .await?;
+            }
             Ok(())
         })
+    }
+
+    fn instances(&self) -> BoxFuture<'_, ModelInstancesSnapshot> {
+        Box::pin(async move { self.instances.snapshot().await })
+    }
+
+    fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation> {
+        let receiver = self.instances.subscribe();
+        let instances = self.instances.clone();
+        let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => return Some((event, receiver)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Box::pin(
+            futures_util::stream::once(async move {
+                ModelInstancesInvalidation {
+                    revision: instances.revision().await,
+                }
+            })
+            .chain(changes),
+        )
     }
 
     fn remove_installed(
@@ -2783,11 +4066,9 @@ impl RuntimeController for NativeRuntimeController {
         Box::pin(async move {
             let _guard = self.mutation.lock().await;
             if self
-                .state
-                .read()
+                .instances
+                .ready_instance()
                 .await
-                .resident
-                .as_ref()
                 .is_some_and(|resident| resident.package_ids.contains(&package_id))
             {
                 return Err(InventoryError::Loaded(package_id.0));
@@ -2798,25 +4079,29 @@ impl RuntimeController for NativeRuntimeController {
 
     fn lease(
         &self,
-        configuration_id: String,
-    ) -> BoxFuture<'_, Result<icn_api::BackendLease, InventoryError>> {
+        instance_id: ModelInstanceId,
+        configuration_id: ModelServingConfigurationId,
+    ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
         Box::pin(async move {
             let _guard = self.mutation.lock().await;
-            let resident = self.state.read().await.clone();
-            if resident
-                .resident
-                .as_ref()
-                .is_none_or(|resident| resident.model_id != configuration_id)
-            {
+            let resident = self.instances.ready_instance().await;
+            let Some(resident) = resident.filter(|resident| {
+                resident.instance_id == instance_id && resident.configuration_id == configuration_id
+            }) else {
                 return Err(InventoryError::NotReady(format!(
-                    "configuration {configuration_id} is not loaded"
+                    "configuration {} is not loaded",
+                    configuration_id.0
                 )));
-            }
-            self.backends.lease().ok_or_else(|| {
-                InventoryError::NotReady(format!(
-                    "configuration {configuration_id} is not available for inference"
-                ))
-            })
+            };
+            resident
+                .runtime
+                .acquire(&instance_id, &configuration_id)
+                .ok_or_else(|| {
+                    InventoryError::NotReady(format!(
+                        "configuration {} is not available for inference",
+                        configuration_id.0
+                    ))
+                })
         })
     }
 }
@@ -2837,8 +4122,7 @@ async fn generate_release_catalog(
             .await
             .context("failed to initialize catalog generation inventory")?,
     );
-    let (assessor, _, _) =
-        native_assessor_services(&inventory, native_backend, runtime_plan_defaults());
+    let (assessor, _) = native_assessor_services(&inventory, native_backend, model_plan_defaults());
     inventory
         .set_hardware_assessor(assessor.clone())
         .context("failed to configure catalog generation hardware assessment")?;
@@ -3002,7 +4286,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("invalid model inventory configuration")?;
             inventory_config.model_sources.extend(model_sources);
             inventory_config.hf_cache_dirs.extend(hf_caches);
-            let plan_defaults = runtime_plan_defaults();
+            let plan_defaults = model_plan_defaults();
             let native_backend = NativeBackend::initialize()
                 .context("failed to initialize the process native backend")?;
             if let Some(installation) = &installation {
@@ -3016,7 +4300,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("failed to initialize model inventory")?,
             );
-            let (inventory_hardware_assessor, native_executor_slot, runtime_failure) =
+            let (inventory_hardware_assessor, native_executor_slot) =
                 native_assessor_services(&inventory, native_backend.clone(), plan_defaults.clone());
             inventory
                 .set_hardware_assessor(inventory_hardware_assessor.clone())
@@ -3027,37 +4311,29 @@ async fn main() -> anyhow::Result<()> {
                 .transpose()?
                 .map(Arc::new);
             let model_downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()));
-            let backends = BackendRegistry::empty();
-            if fake {
-                let model_id = "icn-fake".to_owned();
-                let mut aliases = std::collections::BTreeSet::new();
-                aliases.insert(model_id.clone());
-                backends.replace(
-                    Arc::new(FakeBackend::new(model_id.clone(), "Hello from ICN.")),
-                    aliases,
-                );
-            }
             let native_build = build_identity::native_build();
             let identity = ServerIdentity {
                 instance_id: instance_id.clone(),
                 api_version: 1,
                 native_build: native_build.clone(),
             };
-            let runtime = (!fake).then(|| {
-                let runtime = Arc::new(NativeRuntimeController::new(
-                    backends.clone(),
+            let model_controller = (!fake).then(|| {
+                let controller = Arc::new(NativeModelInstanceController::new(
                     inventory.clone(),
                     inventory_hardware_assessor.clone(),
                     native_executor_slot,
-                    runtime_failure,
                     plan_defaults,
                     inventory.derived_cache().clone(),
                     native_build.clone(),
                 ));
-                runtime.start_idle_memory_observer();
-                runtime
+                controller.start_idle_memory_observer();
+                controller
             });
-            let mut state = AppState::model_free(backends)
+            let mut state = if fake {
+                AppState::new(FakeBackend::new("icn-fake", "Hello from ICN."))
+            } else {
+                AppState::model_free()
+            }
                 .with_installed_packages(inventory.clone())
                 .with_hardware(inventory_hardware_assessor.clone())
                 .with_model_downloads(model_downloads)
@@ -3073,8 +4349,8 @@ async fn main() -> anyhow::Result<()> {
                         release_catalog.catalog().clone(),
                     )));
             }
-            if let Some(runtime) = runtime {
-                state = state.with_runtime(runtime);
+            if let Some(model_controller) = model_controller {
+                state = state.with_model_controller(model_controller);
             }
             if let Some(auth_token) = auth_token {
                 state = state.with_authorization(auth_token);
@@ -3131,7 +4407,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         },
-        Command::Doctor => println!("ICN runtime and native backend loaded successfully"),
+        Command::Doctor => println!("ICN inference engine and native backend loaded successfully"),
         Command::BackendEligibility { json } => {
             let report = backend_eligibility::probe();
             if json {
@@ -3250,6 +4526,127 @@ mod tests {
     use super::*;
     use icn_contracts::ModelInventory as _;
 
+    fn test_model_instance_allocation() -> icn_contracts::models::ModelInstanceAllocation {
+        icn_contracts::models::ModelInstanceAllocation {
+            context_window_tokens: 1,
+            parallel_sequences: 1,
+            physical_context_tokens: 1,
+            memory_domains: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_model_instance_admission_is_single_and_identity_preserving() {
+        let instances = InstanceEntries::new();
+        let mut changes = instances.subscribe();
+        let instance_id = ModelInstanceId("instance".to_owned());
+        let configuration_id = ModelServingConfigurationId("configuration".to_owned());
+
+        let (first, second) = tokio::join!(
+            instances.admit(instance_id.clone(), configuration_id.clone()),
+            instances.admit(instance_id.clone(), configuration_id.clone()),
+        );
+        let (first_stop, first_is_new) = first.expect("first admission should succeed");
+        let (second_stop, second_is_new) = second.expect("second admission should succeed");
+        assert_ne!(first_is_new, second_is_new);
+        assert!(Arc::ptr_eq(&first_stop, &second_stop));
+        assert_eq!(
+            changes
+                .recv()
+                .await
+                .expect("one admission invalidation")
+                .revision,
+            1
+        );
+        assert!(changes.try_recv().is_err());
+
+        first_stop.store(true, Ordering::Release);
+        let late_loading = ModelInstance {
+            id: instance_id.clone(),
+            configuration_id: configuration_id.clone(),
+            lifecycle: ModelInstanceLifecycle::Loading {
+                stage: ModelLoadStage::Loading,
+                progress: Some(0.5),
+                planned_allocation: None,
+            },
+        };
+        instances.publish(late_loading.clone()).await;
+        assert_ne!(
+            instances.instance(&instance_id).await,
+            Some(late_loading.clone()),
+            "Loading cannot advance after Stop has been requested",
+        );
+        instances
+            .publish(ModelInstance {
+                id: instance_id.clone(),
+                configuration_id: configuration_id.clone(),
+                lifecycle: ModelInstanceLifecycle::Stopping {
+                    reason: ModelReleaseReason::ExplicitStop,
+                    allocation: ModelStoppingAllocation::Planned { allocation: None },
+                },
+            })
+            .await;
+        instances.publish(late_loading).await;
+        assert!(matches!(
+            instances
+                .instance(&instance_id)
+                .await
+                .expect("instance remains observable")
+                .lifecycle,
+            ModelInstanceLifecycle::Stopping { .. }
+        ));
+
+        let terminal = ModelInstance {
+            id: instance_id.clone(),
+            configuration_id: configuration_id.clone(),
+            lifecycle: ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::ExplicitStop,
+            },
+        };
+        instances.publish(terminal.clone()).await;
+        let (repeated_stop, repeated_is_new) = instances
+            .admit(instance_id.clone(), configuration_id)
+            .await
+            .expect("equivalent admission should resolve to the existing instance");
+
+        assert!(!repeated_is_new);
+        assert!(Arc::ptr_eq(&first_stop, &repeated_stop));
+
+        let second_id = ModelInstanceId("second-instance".to_owned());
+        let second_configuration = ModelServingConfigurationId("second-configuration".to_owned());
+        instances
+            .admit(second_id.clone(), second_configuration.clone())
+            .await
+            .expect("second identity should be admitted");
+        let second_terminal = ModelInstance {
+            id: second_id,
+            configuration_id: second_configuration,
+            lifecycle: ModelInstanceLifecycle::Failed {
+                failure: DomainModelFailure {
+                    code: "test_failure".to_owned(),
+                    message: "test failure".to_owned(),
+                    retryable: false,
+                },
+            },
+        };
+        instances.publish(second_terminal.clone()).await;
+        assert_eq!(
+            instances.snapshot().await.instances,
+            vec![terminal, second_terminal],
+            "terminal identity history must remain exactly observable",
+        );
+
+        let conflict = instances
+            .admit(
+                instance_id,
+                ModelServingConfigurationId("different-configuration".to_owned()),
+            )
+            .await
+            .expect_err("an instance ID cannot be rebound");
+        assert_eq!(conflict.code, "model_instance_identity_conflict");
+        assert!(!conflict.retryable);
+    }
+
     #[test]
     fn performance_evidence_preserves_the_exact_requested_context_and_bounds() {
         let (evidence, unavailable) = performance_result(
@@ -3322,8 +4719,8 @@ mod tests {
         assert!(identity.contains(build_identity::NATIVE_BACKEND_REVISION));
     }
 
-    fn parity_test_defaults() -> RuntimePlanDefaults {
-        RuntimePlanDefaults {
+    fn parity_test_defaults() -> ModelPlanDefaults {
+        ModelPlanDefaults {
             context_size: 128,
             physical_context_size: 128,
             batch_size: 128,
@@ -3348,10 +4745,12 @@ mod tests {
             cache: None,
             native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
-            runtime_failure: Arc::new(RwLock::new(None)),
-            gate: tokio::sync::Mutex::new(()),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
             planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-            calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
+            calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
         };
 
         let defaults = assessor.effective_defaults(Some(&ModelPreviewProfile {
@@ -3378,8 +4777,124 @@ mod tests {
         };
 
         assert_eq!(
-            select_runtime_allocation(&[(1, gib), (2, 4 * gib), (3, 6 * gib)], sample),
+            select_model_allocation(&[(1, gib), (2, 4 * gib), (3, 6 * gib)], sample),
             Some((2, 4 * gib))
+        );
+    }
+
+    #[test]
+    fn replacement_preview_credits_only_memory_the_current_residency_will_release() {
+        let gib = 1024 * 1024 * 1024;
+        let sample = memory_supervisor::MemorySample {
+            captured_at: std::time::Instant::now(),
+            total_bytes: 16 * gib,
+            available_bytes: 3 * gib,
+            commit_limit_bytes: Some(20 * gib),
+            available_commit_bytes: Some(4 * gib),
+        };
+
+        assert_eq!(select_model_allocation(&[(1, 4 * gib)], sample), None);
+        let credited = credit_replaced_instance_memory(sample, 3 * gib);
+        assert_eq!(credited.available_bytes, 6 * gib);
+        assert_eq!(credited.available_commit_bytes, Some(7 * gib));
+        assert_eq!(
+            select_model_allocation(&[(1, 4 * gib)], credited),
+            Some((1, 4 * gib))
+        );
+    }
+
+    #[test]
+    fn idle_release_requires_the_exact_residency_and_a_full_idle_interval() {
+        let timeout = std::time::Duration::from_secs(600);
+        let now = std::time::Instant::now();
+        let resident = ReadyInstanceRecord {
+            configuration_id: ModelServingConfigurationId("model-a".to_owned()),
+            instance_id: ModelInstanceId("instance-a".to_owned()),
+            generation: 7,
+            package_ids: Vec::new(),
+            allocation: test_model_instance_allocation(),
+            runtime: InstanceRuntime::empty(),
+        };
+        let activity = InstanceActivity {
+            generation: 7,
+            active_leases: 0,
+            idle_since: Some(now - timeout),
+        };
+
+        assert_eq!(
+            idle_release_elapsed(&resident, Some(&resident), activity, timeout, now),
+            Some(timeout)
+        );
+        assert_eq!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                InstanceActivity {
+                    idle_since: Some(now - timeout + std::time::Duration::from_nanos(1)),
+                    ..activity
+                },
+                timeout,
+                now,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_release_rejects_active_or_stale_observations() {
+        let timeout = std::time::Duration::from_secs(600);
+        let now = std::time::Instant::now();
+        let resident = ReadyInstanceRecord {
+            configuration_id: ModelServingConfigurationId("model-a".to_owned()),
+            instance_id: ModelInstanceId("instance-a".to_owned()),
+            generation: 7,
+            package_ids: Vec::new(),
+            allocation: test_model_instance_allocation(),
+            runtime: InstanceRuntime::empty(),
+        };
+        let stale = ReadyInstanceRecord {
+            configuration_id: ModelServingConfigurationId("model-b".to_owned()),
+            instance_id: ModelInstanceId("instance-b".to_owned()),
+            generation: 8,
+            package_ids: Vec::new(),
+            allocation: test_model_instance_allocation(),
+            runtime: InstanceRuntime::empty(),
+        };
+        let idle = InstanceActivity {
+            generation: 7,
+            active_leases: 0,
+            idle_since: Some(now - timeout),
+        };
+
+        assert_eq!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                InstanceActivity {
+                    active_leases: 1,
+                    ..idle
+                },
+                timeout,
+                now,
+            ),
+            None
+        );
+        assert_eq!(
+            idle_release_elapsed(&resident, Some(&stale), idle, timeout, now),
+            None
+        );
+        assert_eq!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                InstanceActivity {
+                    generation: 8,
+                    ..idle
+                },
+                timeout,
+                now,
+            ),
+            None
         );
     }
 
@@ -3390,10 +4905,12 @@ mod tests {
             cache: None,
             native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
-            runtime_failure: Arc::new(RwLock::new(None)),
-            gate: tokio::sync::Mutex::new(()),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
             planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-            calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
+            calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
         };
         let snapshot = HardwareSnapshot {
             captured_at: 1,
@@ -3413,9 +4930,6 @@ mod tests {
             enabled_backends: vec!["cpu".to_owned()],
             topology_fingerprint: "topology".to_owned(),
             memory_domains: Vec::new(),
-            resident_memory: None,
-            resident_execution: None,
-            runtime_failure: None,
         };
         let equivalent_preview = ModelPreviewProfile {
             id: "caller-correlation-does-not-affect-fit".to_owned(),
@@ -3437,6 +4951,38 @@ mod tests {
                         ..equivalent_preview.clone()
                     }),
                     &snapshot,
+                )
+                .unwrap()
+        );
+        let mut availability_only_change = snapshot.clone();
+        availability_only_change.captured_at = 2;
+        availability_only_change
+            .system_memory
+            .current_available_bytes = 0;
+        assert_eq!(
+            assessor
+                .assessment_cache_key(Some(&equivalent_preview), &snapshot)
+                .unwrap(),
+            assessor
+                .assessment_cache_key(Some(&equivalent_preview), &availability_only_change)
+                .unwrap()
+        );
+        assert_ne!(
+            assessor
+                .assessment_cache_key_with_policy(
+                    Some(&equivalent_preview),
+                    &snapshot,
+                    CapacityPolicy::default(),
+                )
+                .unwrap(),
+            assessor
+                .assessment_cache_key_with_policy(
+                    Some(&equivalent_preview),
+                    &snapshot,
+                    CapacityPolicy {
+                        reserve_bytes_per_domain: 1,
+                        system_reserve_bytes: Some(2),
+                    },
                 )
                 .unwrap()
         );
@@ -3481,10 +5027,12 @@ mod tests {
             cache: None,
             native_backend: test_native_backend(),
             native_executor: Arc::new(RwLock::new(None)),
-            runtime_failure: Arc::new(RwLock::new(None)),
-            gate: tokio::sync::Mutex::new(()),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
             planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-            calibration: tokio::sync::Mutex::new(CalibrationCache::default()),
+            calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
         });
         let profile = ModelPreviewProfile {
             id: "parity".to_owned(),

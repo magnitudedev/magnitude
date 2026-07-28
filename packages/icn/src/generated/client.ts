@@ -29,6 +29,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         cancelModelDownload: makeHttpOperation(http, options, Operations.cancelModelDownloadOperation),
         fitModels: makeHttpOperation(http, options, Operations.fitModelsOperation),
         getModelDownload: makeHttpOperation(http, options, Operations.getModelDownloadOperation),
+        getModelInstances: makeHttpOperation(http, options, Operations.getModelInstancesOperation),
         getModelProperties: makeHttpOperation(http, options, Operations.getModelPropertiesOperation),
         getRecommendableModelCatalog: makeHttpOperation(
           http,
@@ -37,10 +38,12 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         ),
         listInstalledModels: makeHttpOperation(http, options, Operations.listInstalledModelsOperation),
         listModelDownloads: makeHttpOperation(http, options, Operations.listModelDownloadsOperation),
+        previewModelLoad: makeHttpOperation(http, options, Operations.previewModelLoadOperation),
         removeInstalledModel: makeHttpOperation(http, options, Operations.removeInstalledModelOperation),
         startModelDownload: makeHttpOperation(http, options, Operations.startModelDownloadOperation),
-        unloadModelResidency: makeHttpOperation(http, options, Operations.unloadModelResidencyOperation),
-        loadModelConfiguration: makeStreamOperation(http, options, Operations.loadModelConfigurationOperation),
+        stopModelInstance: makeHttpOperation(http, options, Operations.stopModelInstanceOperation),
+        loadModelInstance: makeStreamOperation(http, options, Operations.loadModelInstanceOperation),
+        watchModelInstances: makeStreamOperation(http, options, Operations.watchModelInstancesOperation),
       },
       system: {
         getHardware: makeHttpOperation(http, options, Operations.getHardwareOperation),

@@ -6,7 +6,7 @@ import { describe, it, expect } from 'vitest'
 import { Effect, Layer, Option } from 'effect'
 import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/ai'
 import {
-  ModelSlotReady,
+  ModelSlotConfiguredRemote,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
   type ModelSlotsState,
@@ -66,8 +66,28 @@ const mockModels = [
 ] as const satisfies readonly ProviderModelCatalogEntry[]
 
 const mockSlots: ModelSlotsState['slots'] = {
-  primary: new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection: { providerId, providerModelId: mockModels[0].providerModelId, reasoningEffort } }),
-  secondary: new ModelSlotReady({ slotId: SECONDARY_SLOT_ID, selection: { providerId, providerModelId: mockModels[1].providerModelId, reasoningEffort } }),
+  primary: new ModelSlotConfiguredRemote({
+    slotId: PRIMARY_SLOT_ID,
+    selection: { providerId, providerModelId: mockModels[0].providerModelId, reasoningEffort },
+    descriptor: {
+      providerId,
+      providerModelId: mockModels[0].providerModelId,
+      displayName: mockModels[0].displayName,
+    },
+    availability: { _tag: 'Available' },
+    actions: [],
+  }),
+  secondary: new ModelSlotConfiguredRemote({
+    slotId: SECONDARY_SLOT_ID,
+    selection: { providerId, providerModelId: mockModels[1].providerModelId, reasoningEffort },
+    descriptor: {
+      providerId,
+      providerModelId: mockModels[1].providerModelId,
+      displayName: mockModels[1].displayName,
+    },
+    availability: { _tag: 'Available' },
+    actions: [],
+  }),
 }
 const mockConfigState = buildConfigStateFromSlots(mockModels, mockSlots, {
   softCapRatio: 0.9,

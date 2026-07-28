@@ -175,6 +175,33 @@ describe("compileOpenApi", () => {
     }
   });
 
+  it("emits required string _tag discriminants as Effect tagged structs", async () => {
+    const result = await compile({
+      openapi: "3.1.0",
+      info: { title: "Tagged schema", version: "1" },
+      components: {
+        schemas: {
+          Ready: {
+            type: "object",
+            required: ["_tag", "value"],
+            properties: {
+              _tag: { const: "Ready" },
+              value: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      },
+      paths: {},
+    });
+    const schemas = HashMap.get(result.files, "schemas.ts");
+    expect(schemas._tag).toBe("Some");
+    if (schemas._tag === "Some") {
+      expect(schemas.value).toContain('S.TaggedStruct("Ready", {');
+      expect(schemas.value).not.toContain('"_tag":');
+    }
+  });
+
   it("applies propertyNames to declared properties when additional properties are forbidden", async () => {
     const result = await compile({
       openapi: "3.1.0",

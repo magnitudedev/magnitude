@@ -266,42 +266,19 @@ export function makeConfigStorage(): Effect.Effect<
         ),
 
       getOnboardingConfig: () =>
-        readConfig().pipe(Effect.map((config) => config.onboarding ?? null)),
+        readConfig().pipe(Effect.map((config) => config.onboarding)),
 
 
-      completeOnboardingFlow: (flowId, version, completedAt) =>
+      updateOnboardingState: (completed) =>
         io.withPathLock(
           g.configFile,
           Effect.gen(function* () {
             const current = yield* readConfigUnlocked();
             yield* writeConfigUnlocked({
               ...current,
-              onboarding: {
-                ...current.onboarding,
-                completions: {
-                  ...current.onboarding?.completions,
-                  [flowId]: { version, completedAt },
-                },
-              },
+              onboarding: Option.some({ completed }),
             });
           })
-        ),
-
-      reopenOnboardingFlow: (flowId) =>
-        io.withPathLock(
-          g.configFile,
-          Effect.gen(function* () {
-            const current = yield* readConfigUnlocked();
-            const completions = { ...current.onboarding?.completions };
-            delete completions[flowId];
-            yield* writeConfigUnlocked({
-              ...current,
-              onboarding: {
-                ...current.onboarding,
-                completions,
-              },
-            });
-          }),
         ),
     };
   });
