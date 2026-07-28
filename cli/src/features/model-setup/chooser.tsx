@@ -19,6 +19,7 @@ import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   buildLocalInferenceSelections,
   describeLocalHardwareSummary,
+  formatContext,
   localInferenceProgressLines,
   selectedInferenceIndex,
   selectionCapacityWarning,
@@ -32,6 +33,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const SECTION_VIEWPORT_ROWS = 4
 const DESCRIPTION_ROWS = 5
 const DETAIL_FIXED_ROWS = 10
+const WIDE_LIST_WIDTH = 42
 
 const setupCardWidth = (width: number): number => Math.max(1, Math.min(96, width - 2))
 
@@ -292,7 +294,7 @@ export function OnboardingModelChooser({
   )
   const cardWidth = setupCardWidth(width)
   const wide = cardWidth >= 82
-  const leftWidth = wide ? 37 : Math.max(1, cardWidth - 6)
+  const leftWidth = wide ? WIDE_LIST_WIDTH : Math.max(1, cardWidth - 6)
   const detailWidth = wide ? Math.max(1, cardWidth - leftWidth - 9) : leftWidth
   const localRows = local.length > 0 ? SECTION_VIEWPORT_ROWS + 1 : 0
   const downloadRows = downloads.length > 0 ? SECTION_VIEWPORT_ROWS + 1 : 0
@@ -425,7 +427,7 @@ export function OnboardingModelChooser({
       <DetailRow width={detailWidth}>
         {Option.isSome(selected.recommendation) && Option.isSome(selected.recommendation.value.candidate.estimatedTokensPerSecond) && (
           <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
-            About {Math.round(selected.recommendation.value.candidate.estimatedTokensPerSecond.value)} tokens/sec
+            {`~${Math.round(selected.recommendation.value.candidate.estimatedTokensPerSecond.value)} tok/s at ${formatContext(selected.recommendation.value.candidate.profile.contextLength)} ctx`}
           </text>
         )}
       </DetailRow>

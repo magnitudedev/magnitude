@@ -387,7 +387,7 @@ export const selectionMetadata = ({ model, recommendation }: LocalInferenceSelec
       onNone: () => model.maximumContextLength,
       onSome: ({ candidate }) => candidate.profile.contextLength,
     }),
-  )} context`
+  )} ctx`
 
 export const selectionCapacityWarning = ({ model }: LocalInferenceSelection): string | null =>
   model.preparation._tag === "Unavailable" ? model.preparation.failure.message : null
