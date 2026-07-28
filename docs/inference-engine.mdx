@@ -1,0 +1,40 @@
+---
+title: Inference Engine
+description: "How Magnitude configures and manages local inference"
+icon: cpu
+---
+
+Magnitude runs local models on an inference engine built in Rust on top of llama.cpp. You do not need to start a model server or configure llama.cpp yourself.
+
+## Managed automatically
+
+When you select a local model, Magnitude controls its complete runtime lifecycle. It starts the inference process, loads the model into memory, keeps it available while it is being used, and stops it when necessary.
+
+Downloading and loading are different:
+
+- **Downloaded** means the model files are stored on disk.
+- **Loading** means Magnitude is placing the model and its runtime data into memory.
+- **Running** means the model is ready to respond.
+- **Unloaded** means it is still selected and downloaded, but no longer using inference memory.
+
+Magnitude loads the selected model when needed. Open `/settings → Hardware` to check its status and memory use or to load and stop it manually. Inactive models are eventually unloaded without deleting their files.
+
+## Configured for your hardware
+
+Magnitude configures hardware acceleration, model placement, context, memory, and runtime settings for the current machine. It repeats the final memory check when a model loads so a configuration that normally fits is not started when other applications are using too much memory.
+
+## Context and concurrency
+
+Magnitude preserves the configured context for every request, then uses additional memory for parallel agent work when the machine can support it. A machine with less available capacity runs fewer requests at once rather than silently reducing their context.
+
+During long conversations, Magnitude can reuse matching context already processed by the running model and process only the new input. This avoids repeating work the model has already done.
+
+## Memory protection
+
+Magnitude monitors memory continuously while a local model is loading or running. If available memory becomes dangerously low, it stops the model before inference destabilizes the computer.
+
+The model remains selected after a low-memory stop. Close memory-intensive applications, then load it again from `/settings`.
+
+## Consistent behavior across models
+
+Local models use different reasoning formats, tool-call formats, chat templates, and conversation-history conventions. Magnitude normalizes those differences into one interface for the coding agent, so switching models does not require reconfiguring the rest of the system.
