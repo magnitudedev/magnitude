@@ -189,7 +189,10 @@ After selection, the chooser remains mounted while its selected row stays highli
 other rows stop accepting keyboard, hover, or click input. The right pane advances through
 download, preparation, and loading without a screen transition, deriving model identity,
 quantization, byte progress, transfer rate, and remaining-time presentation from authoritative
-local-model mirrors. Detailed residency progress remains in the activity rail. Setup disappears
+local-model mirrors. The initiating Enter or click event may bridge server acknowledgement with a
+presentation-only starting state for that exact selection; it reports no inferred progress and
+cannot regress to the informational chooser before authoritative download or loading state arrives.
+Detailed residency progress remains in the activity rail. Setup disappears
 only when the selected primary slot is ready. The composer remains visible but cannot submit
 throughout setup, and its model,
 reasoning-effort, and resident-memory footer controls have no hover or activation behavior. Cancel

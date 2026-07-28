@@ -65,10 +65,13 @@ test("shows compact download details with progress, rate, and ETA", async () => 
       candidate={candidate}
       width={56}
       height={11}
-      cancelling={false}
-      cancelError={null}
-      onCancel={onCancel}
-      onRetry={onRetry}
+      operation={{
+        _tag: "Active",
+        cancelling: false,
+        cancelError: null,
+        onCancel,
+        onRetry,
+      }}
     />,
     { width: 100, height: 24 },
   )
@@ -91,10 +94,13 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
       candidate={candidate}
       width={56}
       height={11}
-      cancelling={false}
-      cancelError={null}
-      onCancel={onCancel}
-      onRetry={onRetry}
+      operation={{
+        _tag: "Active",
+        cancelling: false,
+        cancelError: null,
+        onCancel,
+        onRetry,
+      }}
     />,
     { width: 100, height: 24 },
   )
@@ -140,10 +146,13 @@ test("shows failed-download actions in the details pane", async () => {
       candidate={failedCandidate}
       width={56}
       height={11}
-      cancelling={false}
-      cancelError={null}
-      onCancel={onCancel}
-      onRetry={onRetry}
+      operation={{
+        _tag: "Active",
+        cancelling: false,
+        cancelError: null,
+        onCancel,
+        onRetry,
+      }}
     />,
     { width: 100, height: 24 },
   )
