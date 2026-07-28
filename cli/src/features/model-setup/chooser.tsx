@@ -258,7 +258,11 @@ export function OnboardingModelChooser({
   readonly onSkip: () => void
 }): ReactNode {
   const theme = useTheme()
-  const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
+  const selections = useMemo(() =>
+    buildLocalInferenceSelections(state).filter((selection) =>
+      selection.kind === "recommendation"
+        ? Option.isSome(selection.recommendation)
+        : Option.isSome(selection.providerModelId)), [state])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const [submittedSelection, setSubmittedSelection] =
     useState<ProviderModelId | null>(null)
