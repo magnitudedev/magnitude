@@ -6,29 +6,31 @@ import {
   type ModelInstanceId,
   type ModelSlot,
   type LocalModelCatalogCandidate,
+  type LocalModelsState,
   type ModelSlotsState,
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
   type SlotId,
 } from "@magnitudedev/sdk"
-import type { LocalInferenceView } from "../types/local-inference"
 
 export type SelectedLocalModelSetup = LocalModelCatalogCandidate
 
 export const deriveSelectedLocalModelCandidate = (
-  state: LocalInferenceView,
+  models: LocalModelsState,
+  slots: ModelSlotsState,
 ): SelectedLocalModelSetup | null => {
-  const primary = state.slots.slots.primary
-  if (primary._tag === "Unassigned" || state.models.recommendations._tag !== "Ready") return null
-  return state.models.recommendations.catalog.find(({ providerModelId }) =>
+  const primary = slots.slots.primary
+  if (primary._tag === "Unassigned" || models.recommendations._tag !== "Ready") return null
+  return models.recommendations.catalog.find(({ providerModelId }) =>
     providerModelId === primary.selection.providerModelId)
     ?? null
 }
 
 export const deriveSelectedLocalModelSetup = (
-  state: LocalInferenceView,
+  models: LocalModelsState,
+  slots: ModelSlotsState,
 ): SelectedLocalModelSetup | null => {
-  const candidate = deriveSelectedLocalModelCandidate(state)
+  const candidate = deriveSelectedLocalModelCandidate(models, slots)
   if (!candidate) return null
   if (candidate.download._tag === "Downloading" || candidate.download._tag === "Failed") {
     return candidate

@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import {
+  ModelRequestPreparationCancelled,
   ModelRequestPreparationFailed,
   type PrepareModelRequest,
 } from "@magnitudedev/agent"
@@ -17,5 +18,8 @@ export const makeModelRequestPreparation = (
       message: cause.message,
       retryable: "retryable" in cause ? cause.retryable : false,
     })),
+    Effect.flatMap((result) => result._tag === "Ready"
+      ? Effect.void
+      : new ModelRequestPreparationCancelled({ reason: result.reason })),
   )
 }

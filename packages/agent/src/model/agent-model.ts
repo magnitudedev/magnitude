@@ -21,7 +21,7 @@ import type { RoleId } from '../agents/role-validation'
 import { createId } from '../util/id'
 import type {
   AgentModelStartFailure,
-  ModelRequestPreparationFailed,
+  ModelRequestPreparationError,
 } from './model-request-preparation'
 
 const { ForkContext } = Fork
@@ -77,7 +77,7 @@ export interface AgentBoundModel {
 
 export interface AgentBoundModelConfig {
   readonly rawModel: BoundModel<BaseCallOptions>
-  readonly prepareRequest?: Effect.Effect<void, ModelRequestPreparationFailed, Scope.Scope>
+  readonly prepareRequest?: Effect.Effect<void, ModelRequestPreparationError, Scope.Scope>
   readonly clearRequestProgress?: Effect.Effect<void>
   readonly modelId: string
   readonly modelDisplayName: string

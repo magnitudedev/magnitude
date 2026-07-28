@@ -5,8 +5,6 @@ import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
-  ProviderModelCatalogLoading,
-  ProviderModelCatalogRefreshing,
   RecommendationIdSchema,
 } from "@magnitudedev/sdk"
 import {
@@ -14,69 +12,18 @@ import {
   describeLocalHardware,
   describeLocalHardwareSummary,
   formatDownloadBytes,
-  localInferenceSetupPhase,
   localInferenceProgressLines,
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
 import { GIB, makeCatalogCandidate, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
 
-describe("local inference onboarding presentation", () => {
-  const loadingRecommendations = {
-    _tag: "Loading" as const,
-    progress: [],
-  }
+const selectionsFor = (view: ReturnType<typeof makeView>) =>
+  buildLocalInferenceSelections(view.models, view.catalog, view.slots)
 
+describe("local inference onboarding presentation", () => {
   it("formats model artifacts in decimal gigabytes", () => {
     expect(formatDownloadBytes(73_395_172_000)).toBe("73.4 GB")
-  })
-
-  it("keeps onboarding in discovery while recommendations are loading", () => {
-    const view = makeView()
-    expect(localInferenceSetupPhase({
-      ...view,
-      models: { ...view.models, recommendations: loadingRecommendations },
-    })).toBe("discovering")
-  })
-
-  it("keeps onboarding in discovery until the initial provider catalog settles", () => {
-    const view = makeView()
-    expect(localInferenceSetupPhase({
-      ...view,
-      catalog: new ProviderModelCatalogLoading(),
-    })).toBe("discovering")
-  })
-
-  it("uses retained catalog data during a refresh", () => {
-    const view = makeView()
-    if (view.catalog._tag !== "Ready") throw new Error("expected ready catalog fixture")
-    expect(localInferenceSetupPhase({
-      ...view,
-      catalog: new ProviderModelCatalogRefreshing({
-        providers: view.catalog.providers,
-        models: view.catalog.models,
-        failures: [],
-      }),
-    })).toBe("ready")
-  })
-
-  it("classifies a terminal recommendation failure separately from discovery", () => {
-    const view = makeView()
-    expect(localInferenceSetupPhase({
-      ...view,
-      models: {
-        ...view.models,
-        recommendations: {
-          _tag: "Failed",
-          failure: {
-            code: "recommendations_unavailable",
-            message: "Recommendation setup failed",
-            retryable: true,
-          },
-          progress: [],
-        },
-      },
-    })).toBe("failed")
   })
 })
 
@@ -327,7 +274,7 @@ describe("local inference selection view model", () => {
   })
 
   it("classifies the downloaded model selected by a ready slot as running", () => {
-    expect(buildLocalInferenceSelections(makeView())[0]?.kind).toBe("running")
+    expect(selectionsFor(makeView())[0]?.kind).toBe("running")
   })
 
   it("keeps recommendations actionable without duplicating target state", () => {
@@ -335,7 +282,7 @@ describe("local inference selection view model", () => {
       download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
       preparation: { _tag: "NotDownloaded" },
     })
-    const selections = buildLocalInferenceSelections(makeView({
+    const selections = selectionsFor(makeView({
       models: [model],
       recommendations: [makeRecommendation()],
       ready: false,
@@ -366,7 +313,7 @@ describe("local inference selection view model", () => {
       download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
       preparation: { _tag: "NotDownloaded" },
     }))
-    const selections = buildLocalInferenceSelections(makeView({
+    const selections = selectionsFor(makeView({
       ready: false,
       models,
       recommendations: intents.map(recommendation),
@@ -390,7 +337,7 @@ describe("local inference selection view model", () => {
         failure: { code: "does_not_fit", message: "Requires more memory", retryable: false },
       },
     })
-    const selection = buildLocalInferenceSelections(makeView({
+    const selection = selectionsFor(makeView({
       models: [model],
       ready: false,
     }))[0]!

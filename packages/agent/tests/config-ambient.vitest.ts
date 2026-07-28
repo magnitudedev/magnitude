@@ -36,7 +36,7 @@ describe('agent model configuration boundary', () => {
       configurationId,
       lifecycle: {
         _tag: 'Stopping' as const,
-        reason: 'explicit_stop' as const,
+        reason: 'user_stop' as const,
         allocation: { _tag: 'Planned' as const, allocation: Option.none() },
       },
     })],

@@ -172,7 +172,8 @@ export function Composer(props: ComposerProps) {
     modelSetupInProgress,
     modelSetupPlaceholder,
     modelSummary,
-    localInferenceState,
+    localModels,
+    modelSlots,
     selectedProviderId,
     selectedSlotId,
     tokenUsage,
@@ -264,12 +265,13 @@ export function Composer(props: ComposerProps) {
   const [thinkingIndex, setThinkingIndex] = useState(currentThinkingIndex)
   const modelFooter = useMemo(
     () => deriveLocalInferenceFooterView(
-      localInferenceState,
+      localModels,
+      modelSlots,
       modelSummary?.model ?? null,
       selectedProviderId,
       selectedSlotId,
     ),
-    [localInferenceState, modelSummary?.model, selectedProviderId, selectedSlotId],
+    [localModels, modelSlots, modelSummary?.model, selectedProviderId, selectedSlotId],
   )
   const workingDirectoryLabel = displayWorkingDirectory(clientWorkingDirectory)
   const modelNameLabel = modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'

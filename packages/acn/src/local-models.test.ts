@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest"
-import { Option } from "effect"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { Either, Option } from "effect"
 import {
+  ModelOfferingTargetIdSchema,
+  ProviderModelIdSchema,
+  type LocalModelsState,
+} from "@magnitudedev/sdk"
+import {
+  localModelTargetPreparationOutcome,
   preparationFromProviderProjection,
   preparationFromReconciliationFailure,
 } from "./local-models"
@@ -58,5 +63,62 @@ describe("local model preparation", () => {
         retryable: true,
       },
     })
+  })
+})
+
+describe("local model target preparation outcome", () => {
+  const targetId = ModelOfferingTargetIdSchema.make("target")
+  const state = (preparation: LocalModelsState["models"][number]["preparation"]): LocalModelsState => ({
+    models: [{
+      targetId,
+      catalogCandidateIds: [],
+      providerModelIds: [],
+      displayName: "Test",
+      description: "",
+      kind: "Standalone",
+      quantization: "Q4",
+      maximumContextLength: 1,
+      downloadBytes: 1,
+      download: { _tag: "Downloaded", installedBytes: 1 },
+      preparation,
+    }],
+    recommendations: { _tag: "Ready", entries: [], catalog: [], progress: [] },
+  })
+
+  it("waits while the installed target is still preparing", () => {
+    expect(Option.isNone(localModelTargetPreparationOutcome(
+      state({ _tag: "Preparing" }),
+      targetId,
+    ))).toBe(true)
+  })
+
+  it("completes only when the target is available to load", () => {
+    const outcome = localModelTargetPreparationOutcome(
+      state({ _tag: "Available", providerModelIds: [] }),
+      targetId,
+    )
+    expect(Option.isSome(outcome) && Either.isRight(outcome.value)).toBe(true)
+  })
+
+  it("preserves terminal preparation failure", () => {
+    const outcome = localModelTargetPreparationOutcome(
+      state({
+        _tag: "Unavailable",
+        providerModelIds: [],
+        failure: {
+          code: "invalid_target",
+          message: "The downloaded model is invalid",
+          retryable: false,
+        },
+      }),
+      targetId,
+    )
+    expect(Option.isSome(outcome) && Either.isLeft(outcome.value)
+      ? outcome.value.left
+      : null).toMatchObject({
+        code: "invalid_target",
+        message: "The downloaded model is invalid",
+        retryable: false,
+      })
   })
 })

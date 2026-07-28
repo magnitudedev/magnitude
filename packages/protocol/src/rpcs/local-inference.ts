@@ -5,6 +5,7 @@ import {
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
   ModelInstanceIdSchema,
+  ModelLoadResultSchema,
   ModelLoadPlanSchema,
   ModelOfferingTargetIdSchema,
   SlotIdSchema,
@@ -47,7 +48,7 @@ export const DeleteLocalModel = Rpc.make("DeleteLocalModel", {
 
 export const LoadModel = Rpc.make("LoadModel", {
   payload: Schema.Struct({ slotId: SlotIdSchema }),
-  success: Schema.Struct({}),
+  success: ModelLoadResultSchema,
   error: LocalInferenceError,
 })
 

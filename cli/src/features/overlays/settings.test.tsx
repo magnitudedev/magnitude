@@ -54,7 +54,8 @@ const localInferenceState = makeView({
 
 vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   ...await importOriginal<typeof import("@magnitudedev/client-common")>(),
-  useLocalInferenceQuery: () => Result.success(localInferenceState),
+  useLocalInferenceHardware: () => Result.success(localInferenceState.hardware),
+  useModelSlots: () => Result.success(localInferenceState.slots),
 }))
 
 vi.mock("../../hooks/use-theme", () => ({

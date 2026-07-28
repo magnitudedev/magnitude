@@ -5,6 +5,7 @@ import type {
   SlotId,
 } from '@magnitudedev/sdk'
 import type { ModelRequestProgress, StreamStartFailure } from '@magnitudedev/ai'
+import { ModelReleaseReasonSchema } from '@magnitudedev/protocol'
 
 export class ModelRequestPreparationFailed extends Schema.TaggedError<ModelRequestPreparationFailed>()(
   'ModelRequestPreparationFailed',
@@ -15,8 +16,19 @@ export class ModelRequestPreparationFailed extends Schema.TaggedError<ModelReque
   },
 ) {}
 
-export type AgentModelStartFailure =
+export class ModelRequestPreparationCancelled extends Schema.TaggedError<ModelRequestPreparationCancelled>()(
+  'ModelRequestPreparationCancelled',
+  {
+    reason: ModelReleaseReasonSchema,
+  },
+) {}
+
+export type ModelRequestPreparationError =
   | ModelRequestPreparationFailed
+  | ModelRequestPreparationCancelled
+
+export type AgentModelStartFailure =
+  | ModelRequestPreparationError
   | StreamStartFailure
 
 export interface ModelRequestPreparationInput {
@@ -30,4 +42,8 @@ export interface ModelRequestPreparationInput {
 
 export type PrepareModelRequest = (
   input: ModelRequestPreparationInput,
-) => Effect.Effect<void, ModelRequestPreparationFailed, Scope.Scope>
+) => Effect.Effect<
+  void,
+  ModelRequestPreparationError,
+  Scope.Scope
+>

@@ -88,8 +88,9 @@ an instance is represented with `Option`, never `undefined`.
 
 Stop enters the exact instance's native transition. Unknown and terminal IDs are idempotent.
 Loading transitions through Stopping, cancels its owned operation, reaps its owned worker, and
-becomes Stopped. Ready closes exact lease admission, drains accepted leases, reaps its worker, and
-becomes Stopped.
+becomes Stopped. A waiter receives this as a typed cancellation with the native release reason,
+not as a load failure. Ready closes exact lease admission, drains accepted leases, reaps its
+worker, and becomes Stopped.
 
 Slot reconciliation cannot author physical lifecycle. It retains durable selection and directly
 projects the exact bound native instance. Catalog and provider changes affect availability; they

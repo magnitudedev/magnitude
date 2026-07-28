@@ -1,7 +1,7 @@
 import { Option } from "effect"
-import { modelSlotResidentAllocation, type LocalInferenceView } from "@magnitudedev/client-common"
+import { modelSlotResidentAllocation } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
-import type { ProviderId, SlotId } from "@magnitudedev/sdk"
+import type { LocalModelsState, ModelSlot, ModelSlotsState, ProviderId, SlotId } from "@magnitudedev/sdk"
 
 const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 export interface LocalInferenceFooterView {
@@ -14,7 +14,7 @@ const compactGiB = (bytes: number): string =>
   (bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, "")
 
 const residentMemoryLabel = (
-  slot: LocalInferenceView["slots"]["slots"]["primary"],
+  slot: ModelSlot,
 ): string | null =>
   Option.match(modelSlotResidentAllocation(slot), {
     onNone: () => null,
@@ -32,7 +32,8 @@ const residentMemoryLabel = (
   })
 
 export const deriveLocalInferenceFooterView = (
-  state: LocalInferenceView | null,
+  models: LocalModelsState | null,
+  slots: ModelSlotsState | null,
   selectedModelName: string | null,
   selectedProviderId: ProviderId | null,
   selectedSlotId: SlotId,
@@ -40,25 +41,25 @@ export const deriveLocalInferenceFooterView = (
   if (selectedProviderId !== null && selectedProviderId !== LOCAL_PROVIDER_ID) {
     return { modelName: selectedModelName ?? "Cloud model", residency: null, memoryLabel: null }
   }
-  if (state === null) {
+  if (slots === null) {
     return {
       modelName: selectedModelName,
       residency: selectedProviderId === LOCAL_PROVIDER_ID ? "not_loaded" : null,
       memoryLabel: null,
     }
   }
-  const selectedSlot = state.slots.slots[
+  const selectedSlot = slots.slots[
     selectedSlotId === PRIMARY_SLOT_ID ? "primary" : "secondary"
   ]
   const slot = selectedSlot._tag !== "Unassigned"
     && selectedSlot.selection.providerId === LOCAL_PROVIDER_ID
     ? selectedSlot
     : undefined
-  const activeModel = slot
-    ? state.models.models.find((model) => model.preparation._tag === "Available"
+  const activeModel = slot && models !== null
+    ? models.models.find((model) => model.preparation._tag === "Available"
       && model.preparation.providerModelIds.includes(slot.selection.providerModelId))
     : undefined
-  const downloadModel = state.models.models.find((model) =>
+  const downloadModel = models?.models.find((model) =>
     model.download._tag === "Downloading" || model.download._tag === "Failed")
   const model = activeModel ?? downloadModel
   const lifecycle = slot?._tag === "ConfiguredLocal"

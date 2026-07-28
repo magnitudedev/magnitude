@@ -22,7 +22,9 @@ import {
   selectedSlotModel,
   usePlatform,
   useLocalInferenceHardware,
-  useLocalInferenceState,
+  useLocalModelActions,
+  useLocalModels,
+  useModelSlotActions,
   usePreviewModelLoad,
   useModelConfig,
   useSettingsState,
@@ -335,11 +337,9 @@ const ModelsMenu = memo(function ModelsMenu({
 }: MenuRootProps) {
   const theme = useTheme()
   const config = useModelConfig()
-  const local = useLocalInferenceState()
-  const hardware = Option.map(
-    Result.value(useLocalInferenceHardware()),
-    ({ state }) => state,
-  ).pipe(Option.getOrUndefined)
+  const localModels = useLocalModels()
+  const slotActions = useModelSlotActions()
+  const hardware = Option.getOrUndefined(Result.value(useLocalInferenceHardware()))
   const models = catalogModels(config)
   const catalogSnapshot = Result.value(config.catalog)
   const slotsSnapshot = Result.value(config.slots)
@@ -393,11 +393,11 @@ const ModelsMenu = memo(function ModelsMenu({
   const cursorIndex = Math.max(0, eligible.findIndex((model) => providerModelKey(model) === cursorId))
   const cursor = eligible[cursorIndex]
   const detail = eligible.find((model) => providerModelKey(model) === detailId) ?? null
-  const localSnapshot = Result.value(local.state)
+  const localSnapshot = Result.value(localModels)
   const localCatalogCandidates = Option.match(localSnapshot, {
     onNone: () => [] as readonly LocalModelCatalogCandidate[],
-    onSome: ({ models: localModels }) =>
-      localModels.recommendations._tag === "Ready" ? localModels.recommendations.catalog : [],
+    onSome: (models) =>
+      models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
   })
   const requirementFor = (model: ProviderModelCatalogEntry): string => {
     if (model.providerId !== LOCAL_PROVIDER_ID) return "Cloud"
@@ -413,12 +413,12 @@ const ModelsMenu = memo(function ModelsMenu({
   }
   const calibrating = Option.match(localSnapshot, {
     onNone: () => [] as readonly LocalModel[],
-    onSome: ({ models: localModels }) => localModels.models.filter((model) =>
+    onSome: (models) => models.models.filter((model) =>
       model.download._tag === "Downloaded" && model.preparation._tag === "Preparing"),
   })
-  const primarySlot = Option.match(localSnapshot, {
+  const primarySlot = Option.match(slotsSnapshot, {
     onNone: () => null,
-    onSome: (snapshot) => snapshot.slots.slots.primary,
+    onSome: ({ state }) => state.slots.primary,
   })
   const residentAllocation = primarySlot === null
     ? Option.none()
@@ -428,7 +428,7 @@ const ModelsMenu = memo(function ModelsMenu({
   const detailLocalModel = detailIsLocal && detail
     ? Option.match(localSnapshot, {
         onNone: () => undefined,
-        onSome: ({ models: localModels }) => localModels.models.find(({ preparation }) =>
+        onSome: (models) => models.models.find(({ preparation }) =>
           (preparation._tag === "Available" || preparation._tag === "Unavailable")
           && preparation.providerModelIds.includes(detail.providerModelId)),
       })
@@ -491,15 +491,15 @@ const ModelsMenu = memo(function ModelsMenu({
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
     if (action === "select") choose(detail)
-    else if (action === "load") local.loadModel(PRIMARY_SLOT_ID)
+    else if (action === "load") void slotActions.load(PRIMARY_SLOT_ID)
     else if (action === "stop" && primarySlot) {
       Option.match(modelSlotInstanceId(primarySlot), {
         onNone: () => {},
-        onSome: local.stopModel,
+        onSome: slotActions.stop,
       })
     }
     else if (detailCatalogCandidate) openCatalogDetail(detailCatalogCandidate.id)
-  }, [choose, detail, detailCatalogCandidate, local, openCatalogDetail, primarySlot])
+  }, [choose, detail, detailCatalogCandidate, openCatalogDetail, primarySlot, slotActions])
 
   bindMenuKeyHandler(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
@@ -741,16 +741,18 @@ const CatalogMenu = memo(function CatalogMenu({
   bindMenuKeyHandler,
 }: MenuRootProps) {
   const theme = useTheme()
-  const local = useLocalInferenceState()
-  const snapshot = Result.value(local.state)
+  const localModels = useLocalModels()
+  const modelActions = useLocalModelActions()
+  const slotActions = useModelSlotActions()
+  const snapshot = Result.value(localModels)
   const catalogCandidates = Option.match(snapshot, {
     onNone: () => [] as readonly LocalModelCatalogCandidate[],
-    onSome: ({ models }) =>
+    onSome: (models) =>
       models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
   })
   const recommendations = Option.match(snapshot, {
     onNone: () => [] as readonly LocalModelRecommendation[],
-    onSome: ({ models }) =>
+    onSome: (models) =>
       models.recommendations._tag === "Ready" ? models.recommendations.entries : [],
   })
   const recommendationFor = useCallback((candidate: LocalModelCatalogCandidate) =>
@@ -770,7 +772,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const detail = candidates.find(({ id }) => id === detailId) ?? null
   const progress = Option.match(snapshot, {
     onNone: () => [],
-    onSome: (state) => localInferenceProgressLines(state.models.recommendations.progress),
+    onSome: (models) => localInferenceProgressLines(models.recommendations.progress),
   })
   const runningProgress = progress.find((line) => line.state === "running")
   const detailActions = useMemo(() => {
@@ -788,12 +790,12 @@ const CatalogMenu = memo(function CatalogMenu({
   const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.download._tag === "Downloading"
       || candidate.download._tag === "Downloaded") return
-    void local.downloadModel(candidate.targetId)
-  }, [local])
+    void modelActions.download(candidate.targetId)
+  }, [modelActions])
 
   const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.preparation._tag !== "Installed") return
-    void local.assignSlot(PRIMARY_SLOT_ID, {
+    void slotActions.assign(PRIMARY_SLOT_ID, {
       providerId: LOCAL_PROVIDER_ID,
       providerModelId: candidate.providerModelId,
       reasoningEffort: Option.getOrElse(
@@ -801,7 +803,7 @@ const CatalogMenu = memo(function CatalogMenu({
         () => ReasoningEffortSchema.make("none"),
       ),
     })
-  }, [local])
+  }, [slotActions])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
@@ -810,14 +812,14 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "cancel") {
-      local.cancelModelDownload(detail.targetId)
+      modelActions.cancel(detail.targetId)
       return
     }
     if (action === "select") {
       selectCandidate(detail)
       return
     }
-  }, [detail, local, primaryAction, selectCandidate])
+  }, [detail, modelActions, primaryAction, selectCandidate])
 
   bindMenuKeyHandler(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
@@ -845,7 +847,7 @@ const CatalogMenu = memo(function CatalogMenu({
         && !key.option
       if (confirmsDelete) {
         const candidate = candidates.find(({ id }) => id === pendingDeleteId)
-        if (candidate?.download._tag === "Downloaded") local.deleteLocalModel(candidate.targetId)
+        if (candidate?.download._tag === "Downloaded") modelActions.delete(candidate.targetId)
         setPendingDeleteId(null)
         key.preventDefault()
         return
@@ -875,14 +877,14 @@ const CatalogMenu = memo(function CatalogMenu({
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
       if (cursor.download._tag === "Downloading") {
-        local.cancelModelDownload(cursor.targetId)
+        modelActions.cancel(cursor.targetId)
         key.preventDefault()
       } else if (cursor.download._tag === "Downloaded") {
         setPendingDeleteId(cursor.id)
         key.preventDefault()
       }
     }
-  }, [candidates, cursor, cursorIndex, detail, detailActions.length, focusedDetailAction, local, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
+  }, [candidates, cursor, cursorIndex, detail, detailActions.length, focusedDetailAction, modelActions, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
 
   if (detail) {
     const recommendation = recommendationFor(detail)
@@ -1041,7 +1043,7 @@ const HardwareMenu = memo(function HardwareMenu({
   const theme = useTheme()
   const hardwareState = useLocalInferenceHardware()
   const config = useModelConfig()
-  const local = useLocalInferenceState()
+  const slotActions = useModelSlotActions()
   const hardwareSnapshot = Result.value(hardwareState)
   const slotsSnapshot = Result.value(config.slots)
   const currentSlot = Option.flatMap(slotsSnapshot, ({ state }) => {
@@ -1068,16 +1070,16 @@ const HardwareMenu = memo(function HardwareMenu({
   const runAction = useCallback(() => {
     if (Option.isNone(action)) return
     if (action.value === "load") {
-      local.loadModel(PRIMARY_SLOT_ID)
+      void slotActions.load(PRIMARY_SLOT_ID)
       return
     }
     Option.flatMap(currentSlot, modelSlotInstanceId).pipe(
       Option.match({
         onNone: () => {},
-        onSome: local.stopModel,
+        onSome: slotActions.stop,
       }),
     )
-  }, [action, currentSlot, local])
+  }, [action, currentSlot, slotActions])
 
   bindMenuKeyHandler(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
@@ -1111,7 +1113,7 @@ const HardwareMenu = memo(function HardwareMenu({
               {Result.isFailure(hardwareState) ? "Hardware detection is unavailable." : "Detecting local-inference hardware…"}
             </text>
           ),
-          onSome: ({ state: detectedHardware }) => {
+          onSome: (detectedHardware) => {
             const hardware = describeLocalHardware(detectedHardware)
             return (
               <>
@@ -1178,7 +1180,7 @@ const HardwareMenu = memo(function HardwareMenu({
         </box>
         {Option.match(hardwareSnapshot, {
           onNone: () => null,
-          onSome: ({ state }) => (
+          onSome: (state) => (
             <box style={{ flexDirection: "column", marginTop: 1 }}>
               {deriveHardwareMemoryView(state, currentResidentAllocation).domains.map((domain) =>
                 <HardwareMemoryDomain key={domain.id} domain={domain} />)}

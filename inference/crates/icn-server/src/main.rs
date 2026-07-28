@@ -2619,7 +2619,7 @@ impl NativeModelInstanceController {
                 id: instance_id.clone(),
                 configuration_id: configuration_id.clone(),
                 lifecycle: ModelInstanceLifecycle::Stopped {
-                    reason: ModelReleaseReason::ExplicitStop,
+                    reason: ModelReleaseReason::UserStop,
                 },
             })
             .await;
@@ -3006,6 +3006,29 @@ impl NativeModelInstanceController {
         .await;
     }
 
+    async fn release_owned_ready_instance(
+        &self,
+        instance_id: &ModelInstanceId,
+        worker: &InferenceWorker,
+        reason: ModelReleaseReason,
+    ) -> Result<bool, InventoryError> {
+        let _model_mutation = self.mutation.lock().await;
+        if !self.instances.owns_worker(instance_id, worker.pid()).await {
+            return Ok(false);
+        }
+        let Some(resident) = self
+            .instances
+            .ready_instance()
+            .await
+            .filter(|resident| resident.instance_id == *instance_id)
+        else {
+            return Ok(false);
+        };
+        let backend_mutation = resident.runtime.begin_mutation().await;
+        self.stop_ready_instance_under_mutation(&resident, reason, backend_mutation)
+            .await
+    }
+
     fn block_memory_admission(&self) {
         if let Ok(mut blocked_until) = self.admission_blocked_until.lock() {
             *blocked_until = Some(std::time::Instant::now() + RECOVERY_STABLE_TIME);
@@ -3094,14 +3117,41 @@ impl NativeModelInstanceController {
                                 worker.pid = worker.pid(),
                                 "evicting inference worker under system memory pressure"
                             );
-                            controller
-                                .cleanup_owned_worker(
+                            match controller
+                                .release_owned_ready_instance(
                                     &instance_id,
                                     &worker,
-                                    LOW_MEMORY_FAILURE_CODE,
-                                    "inference worker evicted under system memory pressure",
+                                    ModelReleaseReason::MemoryPressure,
                                 )
-                                .await;
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    controller
+                                        .cleanup_owned_worker(
+                                            &instance_id,
+                                            &worker,
+                                            LOW_MEMORY_FAILURE_CODE,
+                                            "inference worker evicted under system memory pressure",
+                                        )
+                                        .await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        model.instance.id = %instance_id.0,
+                                        error = %error,
+                                        "memory-pressure model release failed"
+                                    );
+                                    controller
+                                        .cleanup_owned_worker(
+                                            &instance_id,
+                                            &worker,
+                                            LOW_MEMORY_FAILURE_CODE,
+                                            "inference worker evicted under system memory pressure",
+                                        )
+                                        .await;
+                                }
+                            }
                             break;
                         }
                     }
@@ -3929,7 +3979,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         .filter(|resident| resident.instance_id == instance_id)
                     {
                         let _ = controller
-                            .stop_ready_instance(&resident, ModelReleaseReason::ExplicitStop)
+                            .stop_ready_instance(&resident, ModelReleaseReason::UserStop)
                             .await;
                     }
                     send_stopped();
@@ -4010,7 +4060,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                             id: instance_id.clone(),
                             configuration_id,
                             lifecycle: ModelInstanceLifecycle::Stopping {
-                                reason: ModelReleaseReason::ExplicitStop,
+                                reason: ModelReleaseReason::UserStop,
                                 allocation: ModelStoppingAllocation::Planned {
                                     allocation: planned_allocation,
                                 },
@@ -4026,7 +4076,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                 .await
                 .filter(|resident| resident.instance_id == instance_id);
             if let Some(resident) = resident {
-                self.stop_ready_instance(&resident, ModelReleaseReason::ExplicitStop)
+                self.stop_ready_instance(&resident, ModelReleaseReason::UserStop)
                     .await?;
             }
             Ok(())
@@ -4304,7 +4354,11 @@ async fn main() -> anyhow::Result<()> {
                 .map(open_installation_catalog)
                 .transpose()?
                 .map(Arc::new);
-            let model_downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()));
+            let model_downloads = Arc::new(
+                ManagedModelDownloads::open(inventory.clone())
+                    .await
+                    .context("failed to initialize model downloads")?,
+            );
             let native_build = build_identity::native_build();
             let identity = ServerIdentity {
                 instance_id: instance_id.clone(),
@@ -4575,7 +4629,7 @@ mod tests {
                 id: instance_id.clone(),
                 configuration_id: configuration_id.clone(),
                 lifecycle: ModelInstanceLifecycle::Stopping {
-                    reason: ModelReleaseReason::ExplicitStop,
+                    reason: ModelReleaseReason::UserStop,
                     allocation: ModelStoppingAllocation::Planned { allocation: None },
                 },
             })
@@ -4594,7 +4648,7 @@ mod tests {
             id: instance_id.clone(),
             configuration_id: configuration_id.clone(),
             lifecycle: ModelInstanceLifecycle::Stopped {
-                reason: ModelReleaseReason::ExplicitStop,
+                reason: ModelReleaseReason::UserStop,
             },
         };
         instances.publish(terminal.clone()).await;

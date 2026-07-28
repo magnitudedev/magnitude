@@ -1,5 +1,4 @@
-import type { LocalInferenceView } from '@magnitudedev/client-common'
-import type { DisplayMessage, DisplayTimeline, ProviderId, RawImageAttachment, RawMentionOccurrence, ReasoningEffort, SlotId } from '@magnitudedev/sdk'
+import type { DisplayMessage, DisplayTimeline, LocalModelsState, ModelSlotsState, ProviderId, RawImageAttachment, RawMentionOccurrence, ReasoningEffort, SlotId } from '@magnitudedev/sdk'
 import type { KeyEvent } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
 
@@ -21,7 +20,8 @@ export type ComposerProps = {
   modelSetupInProgress: boolean
   modelSetupPlaceholder: string | null
   modelSummary: { role: string; model: string; thinkingLevel: string } | null
-  localInferenceState: LocalInferenceView | null
+  localModels: LocalModelsState | null
+  modelSlots: ModelSlotsState | null
   selectedProviderId: ProviderId | null
   selectedSlotId: SlotId
   tokenUsage: number | null

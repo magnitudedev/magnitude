@@ -21,6 +21,7 @@ import type { ToolKeyErased } from './tools/types'
 
 import type { Skill } from '@magnitudedev/skills'
 import type { RoleId } from '@magnitudedev/roles'
+import type { ModelReleaseReason } from '@magnitudedev/protocol'
 import type { TaskAssignee } from './tasks/types'
 import type { ErrorPresentation } from './errors/present'
 import type { CompletedTurn } from './window/types'
@@ -259,6 +260,10 @@ export type CancelledReason =
   | { readonly _tag: 'UserInterrupt' }
   | { readonly _tag: 'WorkerKilled' }
   | { readonly _tag: 'TurnSuperseded' }
+  | {
+      readonly _tag: 'ModelStopped'
+      readonly reason: ModelReleaseReason
+    }
 
 export type SafetyStopReason =
   | { readonly _tag: 'IdenticalResponseCircuitBreaker'; readonly threshold: number }

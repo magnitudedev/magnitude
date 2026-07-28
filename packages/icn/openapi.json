@@ -4026,9 +4026,10 @@
       "ModelReleaseReason": {
         "type": "string",
         "enum": [
-          "explicit_stop",
+          "user_stop",
+          "idle_timeout",
           "replacement",
-          "idle_timeout"
+          "memory_pressure"
         ]
       },
       "ModelServingConfiguration": {

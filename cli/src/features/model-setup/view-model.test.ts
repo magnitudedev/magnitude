@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
+  onboardingModelDownloadRequired,
+} from "@magnitudedev/client-common"
+import {
   ModelInstanceIdSchema,
   ModelSlotConfiguredLocal,
   PRIMARY_SLOT_ID,
@@ -9,6 +12,7 @@ import {
   LOCAL_PROVIDER_ID,
   TEST_CONFIGURATION_ID,
   TEST_MODEL_ID,
+  TEST_TARGET_ID,
   TEST_REASONING_EFFORT,
   makeCatalogCandidate,
   makeModel,
@@ -16,15 +20,55 @@ import {
 } from "../local-inference/test-fixtures"
 import {
   deriveModelSetupActive,
-  deriveOnboardingModelSetupView,
+  deriveOnboardingModelSetupView as deriveOnboardingModelSetupViewFromDomains,
   onboardingModelSetupPlaceholder,
 } from "./view-model"
+
+describe("onboardingModelDownloadRequired", () => {
+  it("skips the download command for an installed target", () => {
+    expect(onboardingModelDownloadRequired(
+      makeView().models,
+      TEST_TARGET_ID,
+    )).toEqual(Option.some(false))
+  })
+
+  it("requires the download command for a target that is not downloaded", () => {
+    const state = makeView({
+      models: [makeModel({
+        download: {
+          _tag: "NotDownloaded",
+          completedBytes: 0,
+          totalBytes: 16,
+        },
+        preparation: { _tag: "NotDownloaded" },
+      })],
+    })
+    expect(onboardingModelDownloadRequired(
+      state.models,
+      TEST_TARGET_ID,
+    )).toEqual(Option.some(true))
+  })
+})
 
 const selection = {
   providerId: LOCAL_PROVIDER_ID,
   providerModelId: TEST_MODEL_ID,
   reasoningEffort: TEST_REASONING_EFFORT,
 }
+
+const deriveOnboardingModelSetupView = ({
+  state,
+  ...input
+}: {
+  readonly active: boolean
+  readonly submittedProviderModelId: typeof TEST_MODEL_ID | null
+  readonly state: ReturnType<typeof makeView>
+}) => deriveOnboardingModelSetupViewFromDomains({
+  ...input,
+  models: state.models,
+  catalog: state.catalog,
+  slots: state.slots,
+})
 
 describe("deriveModelSetupActive", () => {
   it("preserves ordinary server-required onboarding", () => {
@@ -69,7 +113,7 @@ describe("deriveOnboardingModelSetupView", () => {
     })._tag).toBe("Choosing")
   })
 
-  it("keeps an installed selection in setup until its exact instance is ready", () => {
+  it("keeps the chooser unchanged until an exact instance exists", () => {
     const base = makeView({ ready: false })
     const state = {
       ...base,
@@ -103,11 +147,9 @@ describe("deriveOnboardingModelSetupView", () => {
       state,
     })
     expect(view).toMatchObject({
-      _tag: "Activating",
-      phase: "Preparing",
-      displayName: "Qwen Test",
+      _tag: "Choosing",
     })
-    expect(onboardingModelSetupPlaceholder(view)).toBe("Preparing Qwen Test…")
+    expect(onboardingModelSetupPlaceholder(view)).toBe("Select a model to start coding…")
   })
 
   it("shows Loading only when the selected exact instance is Loading", () => {
@@ -183,5 +225,43 @@ describe("deriveOnboardingModelSetupView", () => {
       state,
     })
     expect(view).toMatchObject({ _tag: "Downloading", candidate: { displayName: "Qwen Test" } })
+  })
+
+  it("projects an authoritative download failure as failed", () => {
+    const candidate = makeCatalogCandidate({
+      download: {
+        _tag: "Failed",
+        completedBytes: 16,
+        totalBytes: 16,
+        failure: {
+          code: "interrupted",
+          message: "Download was interrupted",
+          retryable: true,
+        },
+      },
+      preparation: { _tag: "NotDownloaded" },
+    })
+    const base = makeView({ models: [makeModel({
+      download: candidate.download,
+      preparation: { _tag: "NotDownloaded" },
+    })] })
+    const view = deriveOnboardingModelSetupView({
+      active: true,
+      submittedProviderModelId: TEST_MODEL_ID,
+      state: {
+        ...base,
+        models: {
+          ...base.models,
+          recommendations: {
+            _tag: "Ready",
+            entries: [],
+            catalog: [candidate],
+            progress: [],
+          },
+        },
+      },
+    })
+    expect(view).toMatchObject({ _tag: "DownloadFailed" })
+    expect(onboardingModelSetupPlaceholder(view)).toBe("Couldn’t download Qwen Test")
   })
 })

@@ -388,6 +388,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
             }
             yield* localModelPackages.downloadTarget(target)
             yield* localModelPackages.awaitTargetInstalled(target)
+            yield* localModels.awaitTargetPrepared(targetId)
             return {}
           }),
         ),
@@ -435,7 +436,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       LoadModel: ({ slotId }) =>
         observeRpcDefects(
           "LoadModel",
-          modelSlots.loadModel(slotId).pipe(Effect.as({})),
+          modelSlots.loadModel(slotId),
         ),
 
       PreviewModelLoad: ({ slotId }) =>

@@ -1332,9 +1332,10 @@ export type ModelReasoningCapabilities = S.Schema.Type<typeof ModelReasoningCapa
 export type ModelReasoningCapabilitiesEncoded = S.Schema.Encoded<typeof ModelReasoningCapabilities>
 
 export const ModelReleaseReason = S.Union(
-  S.Literal("explicit_stop"),
-  S.Literal("replacement"),
+  S.Literal("user_stop"),
   S.Literal("idle_timeout"),
+  S.Literal("replacement"),
+  S.Literal("memory_pressure"),
 )
 export type ModelReleaseReason = S.Schema.Type<typeof ModelReleaseReason>
 export type ModelReleaseReasonEncoded = S.Schema.Encoded<typeof ModelReleaseReason>

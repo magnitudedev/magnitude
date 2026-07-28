@@ -261,6 +261,12 @@ export const ModelPackageLocalStateSchema = Schema.Union(
     totalBytes: NonNegativeSafeInteger,
     bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   }),
+  Schema.TaggedStruct("DownloadFailed", {
+    attemptId: DownloadAttemptIdSchema,
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+    failure: ModelFailureSchema,
+  }),
   Schema.TaggedStruct("Installed", { path: NonEmptyString }),
 )
 export type ModelPackageLocalState = typeof ModelPackageLocalStateSchema.Type
@@ -270,11 +276,6 @@ export const ModelPackageEntrySchema = Schema.Struct({
   targetId: Schema.optionalWith(ModelOfferingTargetIdSchema, { as: "Option", exact: true }),
   localState: ModelPackageLocalStateSchema,
   inspection: ModelPackageInspectionSchema,
-  lastDownloadFailure: Schema.optionalWith(Schema.Struct({
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-    failure: ModelFailureSchema,
-  }), { as: "Option", exact: true }),
 })
 export type ModelPackageEntry = typeof ModelPackageEntrySchema.Type
 
@@ -760,6 +761,14 @@ export const ModelSlotAvailabilitySchema = Schema.Union(
 )
 export type ModelSlotAvailability = typeof ModelSlotAvailabilitySchema.Type
 
+export const ModelReleaseReasonSchema = Schema.Literal(
+  "user_stop",
+  "idle_timeout",
+  "replacement",
+  "memory_pressure",
+)
+export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
+
 export const ModelSlotInstanceLifecycleSchema = Schema.Union(
   Schema.TaggedStruct("Loading", {
     stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
@@ -771,11 +780,11 @@ export const ModelSlotInstanceLifecycleSchema = Schema.Union(
   }),
   Schema.TaggedStruct("Ready", { allocation: ModelInstanceAllocationSchema }),
   Schema.TaggedStruct("Stopping", {
-    reason: Schema.Literal("explicit_stop", "replacement", "idle_timeout", "memory_pressure", "shutdown"),
+    reason: ModelReleaseReasonSchema,
     allocation: ModelStoppingAllocationSchema,
   }),
   Schema.TaggedStruct("Stopped", {
-    reason: Schema.Literal("explicit_stop", "replacement", "idle_timeout", "memory_pressure", "shutdown"),
+    reason: ModelReleaseReasonSchema,
   }),
   Schema.TaggedStruct("Failed", { failure: ModelFailureSchema }),
 )
@@ -787,6 +796,18 @@ export const ModelSlotInstanceSchema = Schema.Struct({
   lifecycle: ModelSlotInstanceLifecycleSchema,
 })
 export type ModelSlotInstance = typeof ModelSlotInstanceSchema.Type
+
+export const ModelLoadResultSchema = Schema.Union(
+  Schema.TaggedStruct("Ready", {
+    instanceId: ModelInstanceIdSchema,
+    configurationId: ModelServingConfigurationIdSchema,
+  }),
+  Schema.TaggedStruct("Cancelled", {
+    instanceId: ModelInstanceIdSchema,
+    reason: ModelReleaseReasonSchema,
+  }),
+)
+export type ModelLoadResult = typeof ModelLoadResultSchema.Type
 
 export const ModelSlotActionSchema = Schema.Literal("Load", "Stop", "RetryLoad")
 export type ModelSlotAction = typeof ModelSlotActionSchema.Type
