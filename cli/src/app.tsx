@@ -54,6 +54,7 @@ import { useRecentChatsWidgetState, RecentChatsWidgetView } from './features/ses
 import {
   OnboardingModelChooser,
   OnboardingModelPreparation,
+  deriveModelSetupActive,
   deriveOnboardingModelSetupView,
   onboardingModelSetupPlaceholder,
 } from './features/model-setup'
@@ -165,10 +166,17 @@ function OnboardingGate(
   const onboardingRequired = Result.isSuccess(onboarding.state)
     ? onboarding.state.value.flows.model_setup.required
     : true
-  const forcedSetupComplete = Result.isSuccess(onboarding.completeResult)
-    || (Result.isSuccess(onboarding.selectLocalModelResult) && !onboardingRequired)
-  const modelSetupActive = onboardingRequired || (props.forceSetup && !forcedSetupComplete)
   const primary = Option.map(slotsSnapshot, ({ state }) => state.slots.primary)
+  const selectedProviderModelId = Result.isSuccess(onboarding.selectLocalModelResult)
+    ? onboarding.selectLocalModelResult.value.providerModelId
+    : null
+  const modelSetupActive = deriveModelSetupActive({
+    forceSetup: props.forceSetup,
+    onboardingRequired,
+    completionSucceeded: Result.isSuccess(onboarding.completeResult),
+    selectedProviderModelId,
+    primary: Option.getOrNull(primary),
+  })
   const modelsConfigured = Option.exists(primary, isModelSlotConfigured)
   const modelsReadyForInitialWork = Option.exists(primary, (slot) => slot._tag === 'Ready')
 
