@@ -81,6 +81,7 @@ const terminalCapabilities: TerminalCapabilities = {
 
 export interface TerminalPlatformOptions {
   readonly spawnCommand?: string[]
+  readonly spawnTimeoutMs?: number
   readonly debug?: boolean
   readonly effectLoggingLayer?: Layer.Layer<never, never, never>
 }
@@ -98,6 +99,7 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions = 
 
   const spawner = await Effect.runPromise(
     makeLocalDaemonSpawner(bunSpawn, {
+      ...(options.spawnTimeoutMs === undefined ? {} : { spawnTimeoutMs: options.spawnTimeoutMs }),
       ...(options.debug ? { debug: true } : {}),
     }).pipe(
       Effect.map(withSpawnCommand),

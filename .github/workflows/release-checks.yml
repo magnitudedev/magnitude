@@ -1,0 +1,54 @@
+name: Release checks
+
+on:
+  pull_request:
+    paths:
+      - ".changeset/**"
+      - ".github/workflows/**"
+      - "cli/**"
+      - "inference/**"
+      - "packages/**"
+      - "patches/**"
+      - "scripts/release-target.ts"
+      - "bun.lock"
+      - "package.json"
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.3.14"
+  RUST_VERSION: "1.91.1"
+  NPM_VERSION: "11.6.2"
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+      - run: npm install --global "npm@${NPM_VERSION}"
+      - run: bun install --frozen-lockfile
+      - name: Create an ephemeral test trust ring
+        shell: bash
+        run: |
+          node -e 'const {appendFileSync}=require("fs"); const {generateKeyPairSync}=require("crypto"); const {publicKey}=generateKeyPairSync("ed25519"); const ring=JSON.stringify([{keyId:"ci",publicKeySpki:publicKey.export({format:"der",type:"spki"}).toString("base64")}]); appendFileSync(process.env.GITHUB_ENV, `MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON=${ring}\n`)'
+      - run: bun run --cwd packages/release typecheck
+      - run: bun run --cwd cli typecheck
+      - run: bun run --cwd packages/sdk typecheck
+      - run: bun run --cwd packages/icn typecheck
+      - run: bun run --cwd packages/ripgrep prepare
+      - run: bun run --cwd packages/acn typecheck
+      - run: bun run packages/release/scripts/matrix.ts
+      - run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
+      - run: bun run icn:catalog:hydrate
+      - run: bun run packages/release/scripts/build/host.ts linux-x64-gnu inference/target/catalog-inputs release/linux-x64-gnu

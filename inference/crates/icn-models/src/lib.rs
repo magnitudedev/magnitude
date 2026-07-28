@@ -16,9 +16,10 @@ mod validation;
 
 pub use cache::{ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind};
 pub use catalog::{
-    EmbeddedReleaseCatalog, GeneratedReleaseCatalog, ReleaseCatalogManifest,
+    GeneratedReleaseCatalog, ReleaseCatalog, ReleaseCatalogManifest,
     ReleaseRecommendableCatalog, ResolvingRecommendableCatalog, catalog_source_digest,
-    embedded_release_catalog, release_catalog_manifest,
+    catalog_source_digest_from, encode_release_planner_bundle,
+    encode_release_planner_bundle_with_progress, load_release_catalog, release_catalog_manifest,
 };
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ModelManager};

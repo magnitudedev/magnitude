@@ -2,132 +2,263 @@ name: Release
 
 on:
   pull_request:
-  push:
-    branches: [main, release/alpha, release/beta]
+    branches: [main]
+    types: [closed]
+
+concurrency:
+  group: magnitude-production-release
+  cancel-in-progress: false
 
 permissions:
   contents: write
-  pull-requests: write
-  issues: write
+
+env:
+  BUN_VERSION: "1.3.14"
+  RUST_VERSION: "1.91.1"
+  NPM_VERSION: "11.6.2"
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: bun-darwin-arm64
-            os: macos-latest
-            artifact: release-darwin-arm64
-            rust_target: aarch64-apple-darwin
-          - target: bun-darwin-x64
-            os: macos-15-intel
-            artifact: release-darwin-x64
-            rust_target: x86_64-apple-darwin
-          - target: bun-linux-x64-baseline
-            os: ubuntu-latest
-            artifact: release-linux-x64
-            rust_target: x86_64-unknown-linux-gnu
-          - target: bun-linux-arm64
-            os: ubuntu-24.04-arm
-            artifact: release-linux-arm64
-            rust_target: aarch64-unknown-linux-gnu
-          - target: bun-windows-x64
-            os: windows-latest
-            artifact: release-windows-x64
-            rust_target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
+  preflight:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'changeset-release/main' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.preflight.outputs.version }}
+      source_commit: ${{ steps.preflight.outputs.source_commit }}
+      hosts: ${{ steps.matrix.outputs.hosts }}
+      backends: ${{ steps.matrix.outputs.backends }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Require the exact commit on main
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          test "${{ github.ref }}" = "refs/heads/main"
+          [[ "$RELEASE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          test "$RELEASE_COMMIT" = "$(git rev-parse HEAD)"
+          git fetch origin main
+          git merge-base --is-ancestor "$RELEASE_COMMIT" origin/main
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14"
-      - uses: dtolnay/rust-toolchain@1.91.1
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
         with:
-          targets: ${{ matrix.rust_target }}
-      - name: Install Linux native build toolchain
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake wget
+          node-version: 24
+          registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
-      - run: bun run scripts/build-release-artifacts.ts ${{ matrix.target }} release
+      - id: preflight
+        run: bun run packages/release/scripts/preflight.ts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install CUDA build toolkit
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          case "$(uname -m)" in
-            x86_64) CUDA_REPOSITORY_ARCH=x86_64 ;;
-            aarch64) CUDA_REPOSITORY_ARCH=sbsa ;;
-            *) echo "Unsupported CUDA build architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${CUDA_REPOSITORY_ARCH}/cuda-keyring_1.1-1_all.deb"
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          sudo apt-get install -y cuda-toolkit-13-0
-          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
-      - name: Build CUDA ICN release
-        if: runner.os == 'Linux'
-        run: bun run inference/scripts/build-binary.ts ${{ matrix.target }} release cuda
-        env:
-          CUDA_PATH: /usr/local/cuda-13.0
-      - name: Verify release artifact count
-        shell: bash
-        run: |
-          EXPECTED=3
-          if [ "${{ runner.os }}" = "Linux" ]; then EXPECTED=4; fi
-          test "$(find release -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = "$EXPECTED"
-          find release -maxdepth 1 -name '*.tar.gz' -print0 | xargs -0 -n1 tar -tzf
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: release/*.tar.gz
+          MAGNITUDE_SOURCE_COMMIT: ${{ github.sha }}
+          MAGNITUDE_RELEASE_SIGNING_KEY_ID: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_ID }}
+          MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8 }}
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - id: matrix
+        run: bun run packages/release/scripts/matrix.ts
 
-  release:
-    needs: build
-    if: github.event_name == 'push'
+  catalog:
+    needs: preflight
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14"
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - run: bun install --frozen-lockfile
+      - run: bun run icn:catalog:hydrate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catalog-inputs
+          path: inference/target/catalog-inputs/
+          if-no-files-found: error
 
+  host:
+    needs: [preflight, catalog]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.hosts) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.rustTarget }}
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+      - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
-          path: release-artifacts/
-
-      - name: Verify downloaded release assets
-        shell: bash
-        run: |
-          CLI_COUNT=$(find release-artifacts -name 'magnitude-*.tar.gz' ! -name 'magnitude-acn-*.tar.gz' ! -name 'magnitude-icn-*.tar.gz' | wc -l | tr -d ' ')
-          ACN_COUNT=$(find release-artifacts -name 'magnitude-acn-*.tar.gz' | wc -l | tr -d ' ')
-          ICN_COUNT=$(find release-artifacts -name 'magnitude-icn-*.tar.gz' | wc -l | tr -d ' ')
-          test "$CLI_COUNT" = "5"
-          test "$ACN_COUNT" = "5"
-          test "$ICN_COUNT" = "7"
-          find release-artifacts -name '*.tar.gz' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-
-      - name: Changesets
-        id: changesets
-        uses: changesets/action@v1
+          name: catalog-inputs
+          path: catalog-inputs
+      - run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
+        env:
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+      - uses: actions/upload-artifact@v4
         with:
-          publish: bun run publish
-          createGithubReleases: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          name: host-${{ matrix.id }}
+          path: release/${{ matrix.id }}/
+          if-no-files-found: error
 
-      - name: Attach binaries to GitHub Release
-        if: steps.changesets.outputs.published == 'true'
+  backend:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.backends) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+      - name: Install Linux Vulkan tools
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        run: sudo apt-get install -y libvulkan-dev glslc
+      - name: Install Windows Vulkan SDK
+        if: runner.os == 'Windows' && matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --no-progress -y
+          $sdk = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').VULKAN_SDK
+          if (-not $sdk) { throw "Vulkan SDK installation did not publish VULKAN_SDK" }
+          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          "$sdk\Bin" >> $env:GITHUB_PATH
+      - name: Install Linux CUDA toolkit
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
         shell: bash
         run: |
-          VERSION=$(node -e "console.log(require('./packages/cli/package.json').version)")
-          TAG="@magnitudedev/cli@${VERSION}"
-          for f in release-artifacts/**/*.tar.gz; do
-            gh release upload "$TAG" "$f" --clobber
-          done
-          gh release upload "$TAG" SHA256SUMS --clobber
+          case "$(uname -m)" in
+            x86_64) repository_arch=x86_64 ;;
+            aarch64) repository_arch=sbsa ;;
+            *) exit 1 ;;
+          esac
+          toolkit="${{ matrix.toolkit }}"
+          package_version="${toolkit/./-}"
+          curl --fail --location --silent --show-error \
+            --output cuda-keyring.deb \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${repository_arch}/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring.deb
+          sudo apt-get update
+          sudo apt-get install -y "cuda-toolkit-${package_version}"
+          echo "CUDA_PATH=/usr/local/cuda-${toolkit}" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-${toolkit}/bin" >> "$GITHUB_PATH"
+      - uses: Jimver/cuda-toolkit@v0.2.28
+        if: runner.os == 'Windows' && matrix.backend == 'cuda'
+        with:
+          cuda: ${{ matrix.toolkit }}
+          method: network
+      - run: bun install --frozen-lockfile
+      - run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ matrix.id }}
+          path: release/${{ matrix.id }}/
+          if-no-files-found: error
+
+  publish:
+    needs: [preflight, host, backend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: host-*
+          path: release-artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: backend-*
+          path: release-artifacts
+      - run: npm install --global "npm@${NPM_VERSION}"
+      - id: npm-candidate
+        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
+        env:
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+      - run: bun run packages/release/scripts/assemble.ts release-artifacts release-candidate
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          MAGNITUDE_RELEASE_SIGNING_KEY_ID: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_ID }}
+          MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8 }}
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+      - run: bun run packages/release/scripts/accept-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
+      - name: Commit-point recheck
+        run: bun run packages/release/scripts/preflight.ts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          MAGNITUDE_RELEASE_SIGNING_KEY_ID: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_ID }}
+          MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8 }}
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: bun run packages/release/scripts/publish.ts release-candidate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+      - name: Verify public CLI acquisition
+        run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+      - name: Publish npm through Changesets
+        shell: bash
+        run: |
+          bun run publish -- --no-git-tag || true
+          bun run packages/release/scripts/verify-npm.ts
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          MAGNITUDE_EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
+          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  public-smoke:
+    needs: [preflight, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - shell: bash
+        run: |
+          npm install --global "@magnitudedev/cli@${{ needs.preflight.outputs.version }}"
+          magnitude --version

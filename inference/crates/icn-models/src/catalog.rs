@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
@@ -31,9 +31,8 @@ mod planner_bundle;
 use planner_bundle::PlannerBundle;
 
 const CATALOG_SOURCE: &str = include_str!("../../../catalog/models.json");
-const RELEASE_CATALOG: &str = include_str!("../../../catalog/generated/release-catalog.lock.json");
-const RELEASE_PLANNER_BUNDLE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/planner-headers.bin"));
+const MAX_RELEASE_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -96,7 +95,7 @@ pub struct GeneratedReleaseCatalog {
 }
 
 #[derive(Clone)]
-pub struct EmbeddedReleaseCatalog {
+pub struct ReleaseCatalog {
     catalog: RecommendableModelCatalog,
     planner_artifacts: Arc<BTreeMap<ModelOfferingTargetId, ReleasePlannerArtifact>>,
     planner_bundle: Arc<PlannerBundle<'static>>,
@@ -140,9 +139,28 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
 }
 
 pub fn catalog_source_digest() -> Result<String, InventoryError> {
-    let canonical = serde_json::to_vec(&catalog_source()?)
+    catalog_source_digest_from(CATALOG_SOURCE.as_bytes())
+}
+
+pub fn catalog_source_digest_from(bytes: &[u8]) -> Result<String, InventoryError> {
+    let source: CatalogSource = serde_json::from_slice(bytes)
+        .map_err(|error| InventoryError::Integrity(format!("invalid catalog source: {error}")))?;
+    let canonical = serde_json::to_vec(&source)
         .map_err(|error| InventoryError::Internal(error.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+pub fn encode_release_planner_bundle(
+    headers: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>, InventoryError> {
+    encode_release_planner_bundle_with_progress(headers, |_, _| {})
+}
+
+pub fn encode_release_planner_bundle_with_progress(
+    headers: &BTreeMap<String, Vec<u8>>,
+    progress: impl FnMut(usize, usize),
+) -> Result<Vec<u8>, InventoryError> {
+    planner_bundle::encode(headers, progress).map_err(InventoryError::Integrity)
 }
 
 pub fn release_catalog_manifest(
@@ -164,50 +182,53 @@ pub fn release_catalog_manifest(
     })
 }
 
-pub fn embedded_release_catalog(
+pub fn load_release_catalog(
+    catalog_path: &Path,
+    planner_bundle_path: &Path,
     template_identity: &str,
     planner_identity: &str,
-) -> Result<EmbeddedReleaseCatalog, InventoryError> {
-    let source = catalog_source()?;
+) -> Result<ReleaseCatalog, InventoryError> {
+    let catalog_bytes = read_bounded_regular_file(catalog_path, MAX_RELEASE_CATALOG_BYTES)?;
     let manifest: ReleaseCatalogManifest =
-        serde_json::from_str(RELEASE_CATALOG).map_err(|error| {
-            InventoryError::Integrity(format!("invalid embedded release catalog: {error}"))
+        serde_json::from_slice(&catalog_bytes).map_err(|error| {
+            InventoryError::Integrity(format!("invalid release catalog: {error}"))
         })?;
-    if manifest.source_digest != catalog_source_digest()? {
-        return Err(InventoryError::Integrity(
-            "embedded release catalog does not match its source declarations".to_owned(),
-        ));
-    }
     if manifest.template_identity != template_identity {
         return Err(InventoryError::Integrity(
-            "embedded release catalog was generated with a different template assessor".to_owned(),
+            "release catalog was generated with a different template assessor".to_owned(),
         ));
     }
     if manifest.planner_identity != planner_identity {
         return Err(InventoryError::Integrity(
-            "embedded release catalog was generated for a different native planner".to_owned(),
+            "release catalog was generated for a different native planner".to_owned(),
         ));
     }
-    if manifest.planner_bundle_digest != planner_bundle::sha256(RELEASE_PLANNER_BUNDLE) {
+    let planner_bundle_bytes =
+        read_bounded_regular_file(planner_bundle_path, MAX_PLANNER_BUNDLE_BYTES)?;
+    if manifest.planner_bundle_digest != planner_bundle::sha256(&planner_bundle_bytes) {
         return Err(InventoryError::Integrity(
-            "embedded planner bundle does not match the release catalog".to_owned(),
+            "model planner input bundle does not match the release catalog".to_owned(),
         ));
     }
-    validate_resolved_catalog(&manifest.catalog, &source)?;
+    validate_runtime_catalog(&manifest.catalog)?;
     validate_planner_artifacts(&manifest.catalog, &manifest.planner_artifacts)?;
+    // The catalog is loaded once for the process lifetime. Retaining its immutable bytes lets the
+    // indexed bundle lazily decompress individual headers without copying the complete bundle.
+    let planner_bundle_bytes: &'static [u8] =
+        Box::leak(planner_bundle_bytes.into_boxed_slice());
     let planner_bundle =
-        PlannerBundle::parse(RELEASE_PLANNER_BUNDLE).map_err(InventoryError::Integrity)?;
+        PlannerBundle::parse(planner_bundle_bytes).map_err(InventoryError::Integrity)?;
     for artifact in &manifest.planner_artifacts {
         for component in &artifact.components {
             if !planner_bundle.contains(&component.header_digest) {
                 return Err(InventoryError::Integrity(format!(
-                    "embedded planner bundle is missing header {}",
+                    "model planner input bundle is missing header {}",
                     component.header_digest
                 )));
             }
         }
     }
-    Ok(EmbeddedReleaseCatalog {
+    Ok(ReleaseCatalog {
         catalog: manifest.catalog,
         planner_artifacts: Arc::new(
             manifest
@@ -218,6 +239,46 @@ pub fn embedded_release_catalog(
         ),
         planner_bundle: Arc::new(planner_bundle),
     })
+}
+
+fn read_bounded_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>, InventoryError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| InventoryError::Io(error.to_string()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > maximum {
+        return Err(InventoryError::Integrity(format!(
+            "{} is not a bounded regular release file",
+            path.display()
+        )));
+    }
+    fs::read(path).map_err(|error| InventoryError::Io(error.to_string()))
+}
+
+fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), InventoryError> {
+    if !catalog.diagnostics.is_empty() {
+        return Err(InventoryError::Integrity(format!(
+            "release catalog contains {} unresolved entries",
+            catalog.diagnostics.len()
+        )));
+    }
+    let model_ids = catalog
+        .models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<BTreeSet<_>>();
+    let target_ids = catalog
+        .models
+        .iter()
+        .map(|model| model.target_id.clone())
+        .collect::<BTreeSet<_>>();
+    if catalog.models.is_empty()
+        || model_ids.len() != catalog.models.len()
+        || target_ids.len() != catalog.models.len()
+    {
+        return Err(InventoryError::Integrity(
+            "release catalog has missing or duplicate model identities".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_planner_artifacts(
@@ -264,11 +325,11 @@ fn validate_planner_artifacts(
 
 impl GeneratedReleaseCatalog {
     pub fn encode_planner_bundle(&self) -> Result<Vec<u8>, InventoryError> {
-        planner_bundle::encode(&self.headers).map_err(InventoryError::Integrity)
+        encode_release_planner_bundle(&self.headers)
     }
 }
 
-impl EmbeddedReleaseCatalog {
+impl ReleaseCatalog {
     #[must_use]
     pub fn catalog(&self) -> &RecommendableModelCatalog {
         &self.catalog
@@ -320,7 +381,7 @@ impl EmbeddedReleaseCatalog {
             .map(|component| component.component.clone())
             .collect::<Vec<_>>();
         let location = ModelLocation::Directory {
-            source_id: "embedded_release_catalog".to_owned(),
+            source_id: "release_catalog".to_owned(),
             root: workspace.path().to_path_buf(),
             components: components.clone(),
             total_bytes: components
@@ -794,39 +855,4 @@ mod tests {
         assert!(!catalog_source().expect("catalog source").models.is_empty());
     }
 
-    #[test]
-    fn embedded_catalog_matches_source_and_template_evidence() {
-        let manifest: ReleaseCatalogManifest =
-            serde_json::from_str(RELEASE_CATALOG).expect("release catalog manifest");
-        let catalog =
-            embedded_release_catalog(&manifest.template_identity, &manifest.planner_identity)
-                .expect("valid embedded release catalog");
-        let expected = catalog_source()
-            .expect("catalog source")
-            .models
-            .iter()
-            .map(|model| model.formats.len())
-            .sum::<usize>();
-        assert_eq!(catalog.catalog().models.len(), expected);
-        assert!(
-            embedded_release_catalog("different-template", &manifest.planner_identity).is_err()
-        );
-        assert!(
-            embedded_release_catalog(&manifest.template_identity, "different-planner").is_err()
-        );
-        let target_ids = catalog
-            .catalog()
-            .models
-            .iter()
-            .map(|model| model.target_id.clone())
-            .collect::<Vec<_>>();
-        for target_id in target_ids {
-            let resolved = catalog
-                .resolve_target(&target_id)
-                .expect("resolve embedded planner target")
-                .expect("catalog planner target");
-            assert_eq!(resolved.target_id, target_id);
-            assert!(!resolved.target_model.model.location.components().is_empty());
-        }
-    }
 }

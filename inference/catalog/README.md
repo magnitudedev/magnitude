@@ -12,22 +12,22 @@ After editing the source or when intentionally updating pinned upstream revision
 repository root:
 
 ```sh
-bun run local-model-catalog:refresh
-bun run local-model-catalog:check
+bun run icn:catalog:update
+bun run icn:catalog:hydrate
+bun run icn:catalog:check
 ```
 
-Refresh synchronously conditionally revalidates every upstream repository, fails rather than
+Update synchronously conditionally revalidates every upstream repository, fails rather than
 publishing a partial catalog, and writes the manifest atomically. Review the source and generated
 diffs together. Stable upstream and source inputs produce byte-identical output.
 
-Development and release Cargo builds materialize the planner bundle in Cargo's build-output
-directory. When a matching bundle is not already present there, the build downloads only the
-pinned header byte ranges directly from Hugging Face, verifies each digest, deterministically packs
-them, and verifies the aggregate digest from the manifest. The resulting bundle is embedded in the
-ICN binary. `HF_TOKEN` is used when present. The bundle is not committed to the repository.
+Hydrate downloads only the pinned header byte ranges from Hugging Face, verifies each digest,
+deterministically packs them, and verifies the aggregate digest from the lock file. `check` repeats
+that validation offline. The bundle is not committed to the repository.
 
 Normal product startup never runs this workflow and never reconstructs this catalog from the
-network. Setup combines the already embedded planning inputs with current hardware topology and
-local calibration; it does not fetch model metadata. Installed models are inspected from their
-local files. Adding or changing a curated model requires regenerating the manifest and shipping a
-new release.
+network. Release builds package the lock file and planner bundle beside ICN under `catalog/`; local
+development prepares the same installation layout before starting ACN. ICN validates both files at
+startup, then combines those release inputs with current hardware topology and local calibration.
+Installed models are inspected from their local files. Adding or changing a curated model requires
+regenerating the lock file and shipping a new release.

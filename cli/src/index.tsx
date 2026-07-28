@@ -68,7 +68,12 @@ async function main() {
 
       const effectLoggingLayer = makeCliEffectLoggingLayer({ debug: opts.debug === true })
       Atom.runtime.addGlobalLayer(effectLoggingLayer)
-      const platform = await createTerminalPlatform({ spawnCommand, debug: opts.debug, effectLoggingLayer })
+      const platform = await createTerminalPlatform({
+        spawnCommand,
+        ...(isDev ? { spawnTimeoutMs: 30_000 } : {}),
+        debug: opts.debug,
+        effectLoggingLayer,
+      })
       const agentClientTag = createAgentClient(platform.protocolLayer)
       const renderer = await createCliRenderer({
         exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit

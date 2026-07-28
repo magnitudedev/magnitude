@@ -9,22 +9,26 @@ use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 8] = b"MAGPLAN1";
 
-pub fn encode(headers: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
+pub fn encode(
+    headers: &BTreeMap<String, Vec<u8>>,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<Vec<u8>, String> {
     let mut encoded = Vec::new();
+    let total = headers.len();
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(
         &u32::try_from(headers.len())
             .map_err(|_| "too many planner headers".to_owned())?
             .to_le_bytes(),
     );
-    for (digest, header) in headers {
+    for (index, (digest, header)) in headers.iter().enumerate() {
         validate_digest(digest)?;
         if sha256(header) != *digest {
             return Err(format!(
                 "planner header {digest} failed integrity validation"
             ));
         }
-        let mut compressor = GzEncoder::new(Vec::new(), Compression::best());
+        let mut compressor = GzEncoder::new(Vec::new(), Compression::fast());
         compressor
             .write_all(header)
             .map_err(|error| error.to_string())?;
@@ -41,6 +45,7 @@ pub fn encode(headers: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
                 .to_le_bytes(),
         );
         encoded.extend_from_slice(&compressed);
+        progress(index + 1, total);
     }
     Ok(encoded)
 }

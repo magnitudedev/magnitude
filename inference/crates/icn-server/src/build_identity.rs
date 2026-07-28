@@ -29,6 +29,7 @@ pub(crate) fn json() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "api_version": 1,
         "native_build": native_build,
+        "backend_module_abi": backend_module_abi(),
         "capabilities": [
             "hardware",
             "model_catalog",
@@ -52,6 +53,10 @@ pub(crate) fn native_build() -> String {
     digest.update([0]);
     digest.update(NATIVE_BACKEND_REVISION.as_bytes());
     format!("native_{:x}", digest.finalize())
+}
+
+pub(crate) fn backend_module_abi() -> String {
+    format!("llama-backend-{BINDINGS_REVISION}")
 }
 
 #[cfg(test)]

@@ -6,9 +6,8 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "dev": "bun run ../version/scripts/generate-version.ts --dev && bun run src/binary.ts serve --register --debug",
+    "dev": "bun run --cwd ../.. icn:build && bun run ../version/scripts/generate-version.ts --dev && bun run src/binary.ts serve --register --debug",
     "dev:run": "bun run src/binary.ts serve --register --debug",
-    "build:binary": "bun run scripts/build-binary.ts",
     "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit"
   },
   "dependencies": {

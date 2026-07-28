@@ -1,8 +1,8 @@
 {
   "sourceDigest": "b8e07c973209ab6edd44feff4d0f6b8337acc82f1483436bd3100d0a0d60b005",
-  "templateIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
-  "plannerIdentity": "icn-native-model-template:0.1.0:dddce4949bbbe9e1e08cf363cedaa0d7153e72dc:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v2",
-  "plannerBundleDigest": "3412c6cd0bacc31fbef95feedf735aa80dcdf2526163b507120053ca5b67dcff",
+  "templateIdentity": "icn-native-model-template:0.1.0:41a9afdac7f4a722fc536199e529c1e6f20f3dd6:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
+  "plannerIdentity": "icn-native-model-template:0.1.0:41a9afdac7f4a722fc536199e529c1e6f20f3dd6:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v2",
+  "plannerBundleDigest": "336af9d9240d5d87102264ec34fffa372f19b70a07c83b6ad72d3c67550d87e1",
   "plannerArtifacts": [
     {
       "targetId": "target_7e29bbf4930748686de85c45afadbddfaeae7266cc1c4894a7d67fed7bcd1079",
