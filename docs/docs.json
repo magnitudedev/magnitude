@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "name": "Magnitude",
     "theme": "linden",
-    "description": "The best coding agent for open models",
+    "description": "Everything you need to code with local models",
     "logo": {
         "light": "/wordmark-black.svg",
         "dark": "/wordmark-white.svg"
@@ -40,7 +40,7 @@
         "primary": {
             "type": "button",
             "label": "Get started",
-            "href": "https://app.magnitude.dev"
+            "href": "/get-started"
         }
     },
     "navigation": {
@@ -66,9 +66,11 @@
         "pages": [
             "why-magnitude",
             "get-started",
-            "benchmark",
-            "pricing",
-            "reference"
+            "models",
+            "inference-engine",
+            "magnitude-cloud",
+            "reference",
+            "troubleshooting"
         ]
     },
     "styling": {

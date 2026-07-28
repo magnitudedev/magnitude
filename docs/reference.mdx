@@ -1,6 +1,6 @@
 ---
 title: Reference
-description: "Commands, shortcuts, configuration, and file layout"
+description: "Commands, shortcuts, input, sessions, and local files"
 icon: book-open
 ---
 
@@ -10,103 +10,90 @@ icon: book-open
 |---|---|---|
 | `/new` | | Start a new conversation |
 | `/resume` | | Open recent conversations |
-| `/exit` | `/quit`, `/q` | Exit Magnitude |
+| `/models` | | Choose a ready model |
+| `/catalog` | | Find and download local models |
+| `/hardware` | | Inspect local inference hardware |
+| `/cloud` | | Manage the Magnitude Cloud connection |
+| `/settings` | `/s` | Open model settings |
+| `/usage` | `/limits` | View Cloud usage and reset times |
 | `/bash` | | Enter bash mode |
-| `/init` | | Generate AGENTS.md for your project |
-| `/settings` | `/s` | Open settings |
-| `/usage` | `/limits` | View cloud subscription, limits, and recent usage |
+| `/init` | | Generate `AGENTS.md` for the project |
+| `/transcript` | | Toggle transcript display mode |
+| `/exit` | `/quit`, `/q` | Exit Magnitude |
 
-Type `/` to see all available commands with autocomplete.
+Type `/` to see available commands with autocomplete. Installed skills may add their own commands to the same menu.
 
 ## Keyboard shortcuts
 
-| Shortcut | Context | Action |
-|---|---|---|
-| `Enter` | Chat input | Send message |
-| `Shift+Enter` | Chat input | New line |
-| `Ctrl+C` | Streaming | Interrupt |
-| `Ctrl+C` | Idle (2x) | Exit |
-| `Esc` | Running agents | Interrupt agents (2x to kill all) |
-| `Ctrl+R` | Any | Toggle recent conversations |
+| Shortcut | Action |
+|---|---|
+| `Enter` | Send a message or confirm a selection |
+| `Shift+Enter` | Add a new line |
+| `Ctrl+T` | Open the reasoning-level selector; press again to move through its options |
+| `Ctrl+R` | Open or close recent conversations |
+| `Esc` | Close the active menu or interrupt active agent work |
+| `Ctrl+C` | Clear composer text, or exit while idle with an empty composer |
 
-### Multiline input
+When the reasoning selector is open, use the arrow keys or `J`/`K` to move, `Enter` to apply the selection, and `Esc` to close it without applying the pending change.
+
+Menus use the arrow keys to move, `Enter` to choose, and `Esc` to close. The models settings menu also uses `Tab` and `Shift+Tab` to move between models, catalog, hardware, and cloud.
+
+### Input editing
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+A` | Jump to start of line |
-| `Ctrl+E` | Jump to end of line |
-| `Ctrl+U` | Delete everything before cursor on current line |
-| `Ctrl+K` | Delete everything after cursor on current line |
-| `Ctrl+W` | Delete the word before cursor |
-| `Ctrl+D` | Delete the word after cursor |
-| `Ctrl+Y` | Paste back the last deleted text |
+| `Ctrl+A` | Move to the start of the current line |
+| `Ctrl+E` | Move to the end of the current line |
+| `Ctrl+U` | Delete before the cursor on the current line |
+| `Ctrl+K` | Delete after the cursor on the current line |
+| `Ctrl+W` | Delete the word before the cursor |
+| `Ctrl+D` | Delete the word after the cursor |
+| `Ctrl+Y` | Restore the last deleted text |
 
-## File mentions
+## Files and input
 
-Type `@` in the input to mention files or directories. A picker appears with project file autocomplete. Mentioned files are included as context for the agent.
+Type `@` in the composer to mention a file or directory. Mentioned files are included as context for the agent.
 
-You can also paste or drag images into the input. Large text pastes (over 1000 characters) are automatically collapsed into paste segments.
+You can paste or drag images into the composer. Large text pastes are collapsed into paste segments instead of filling the input.
 
-## Workspace
-
-Each session runs inside a workspace, referenced as `$M`. The workspace is per-session and ephemeral. Agents use it for scratch work, plans, and shared context between workers.
-
-Assistant messages can include clickable file links:
-
-- Project files: `[app](cli/src/app.tsx)`
-- Workspace files: `[plan]($M/plan.md)`
-- Heading links: `[Approach]($M/plan.md#Approach)`
+Enter bash mode with `/bash` or start a message with `!` to run a shell command directly.
 
 ## Sessions
 
-Magnitude saves every conversation automatically. Resume in three ways:
+Magnitude saves conversations automatically. Use `/resume` or `Ctrl+R` to open recent conversations, or start a new one with `/new`.
 
-- `magnitude --resume` resumes the most recent session immediately
-- `/resume` opens a picker of recent conversations
-- `Ctrl+R` opens the same recent conversations overlay
+When a conversation becomes too long for its model context, Magnitude compacts older work into a summary and continues the session.
 
-When a conversation gets long, Magnitude compacts context automatically using LLM-driven summarization. The session continues without interruption. Each agent compacts its context independently.
+## Project instructions
 
-### Session inspection
+Run `/init` to generate an `AGENTS.md` file for the current project. Use it to describe repository conventions, architecture, test commands, and anything agents should do or avoid.
 
-Inspect past sessions from the command line:
+Edit `AGENTS.md` like any other project file. Magnitude reads applicable instructions when working in the repository.
 
-```bash
-bun session list                                    # list recent sessions
-bun session events <id>                             # list events for a session
-bun session search <keyword> --last 5               # search across recent sessions
-```
+## Environment variables
 
-## AGENTS.md
+| Variable | Purpose |
+|---|---|
+| `MAGNITUDE_API_KEY` | Connect Magnitude Cloud without saving the key in settings |
+| `HF_HUB_CACHE` | Set the Hugging Face Hub cache directory |
+| `HUGGINGFACE_HUB_CACHE` | Legacy Hugging Face Hub cache override |
+| `HF_HOME` | Set the Hugging Face data directory; Magnitude checks its `hub` directory |
+| `XDG_CACHE_HOME` | Set the base cache directory; Magnitude checks `huggingface/hub` within it |
 
-Run `/init` to generate an `AGENTS.md` file in your project. This is project context the agents read when working in your repo: conventions, architecture notes, what to do and what to avoid.
+Magnitude checks those Hugging Face cache settings in the order shown. If none is set, it checks `~/.cache/huggingface/hub`.
 
-Edit `AGENTS.md` like any other file. The agents will pick up your changes on the next session.
+## Files and directories
 
-## API key
-
-Run `/settings` (or `/s`) to update your API key. You can also set it as an environment variable:
-
-```sh
-export MAGNITUDE_API_KEY=...
-```
-
-## Bash mode
-
-Run shell commands directly without leaving Magnitude. Enter bash mode with `/bash` or by starting your input with `!`.
-
-## The .magnitude directory
-
-Magnitude creates `~/.magnitude/` automatically to store local state.
+Magnitude creates `~/.magnitude` automatically.
 
 | Path | Purpose |
 |---|---|
-| `auth.json` | Stored credentials (file permissions `600`) |
-| `config.json` | Preferences and global settings |
-| `sessions/` | Conversation history |
-| `logs/` | CLI and event logs |
-| `traces/` | Debug trace data when tracing is enabled |
+| `~/.magnitude/models/` | Magnitude-managed local models |
+| `~/.magnitude/cache/` | Disposable model metadata, profiling results, and other caches |
+| `~/.magnitude/sessions/` | Conversation history |
+| `~/.magnitude/logs/` | Application logs |
+| `~/.magnitude/traces/` | Local trace data when tracing is enabled |
+| `~/.magnitude/config.json` | User settings and model selections |
+| `~/.magnitude/auth.json` | Stored credentials |
 
-Delete `auth.json` to clear saved credentials and re-authenticate.
-
-You can also drop a `.magnitude/` directory inside your project for project-scoped state.
+Deleting `~/.magnitude/cache` may cause hardware profiling and model evaluation to run again, but it does not delete downloaded models. Models managed by Magnitude are stored separately under `~/.magnitude/models`.

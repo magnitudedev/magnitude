@@ -1,62 +1,57 @@
 ---
 title: Get Started
-description: "Install and start coding with Magnitude"
+description: "Install Magnitude and start coding with a local model"
 icon: rocket
 ---
 
 ## Install
 
-<Steps>
-  <Step title="Install the CLI">
-    <Tabs>
-      <Tab title="npm">
-        ```sh
-        npm i -g @magnitudedev/cli
-        ```
-      </Tab>
-      <Tab title="bun">
-        ```sh
-        bun add -g @magnitudedev/cli
-        ```
-      </Tab>
-      <Tab title="pnpm">
-        ```sh
-        pnpm add -g @magnitudedev/cli
-        ```
-      </Tab>
-      <Tab title="yarn">
-        ```sh
-        yarn global add @magnitudedev/cli
-        ```
-      </Tab>
-    </Tabs>
-  </Step>
-  <Step title="Run it">
-    From any project directory:
-
+<Tabs>
+  <Tab title="npm">
     ```sh
-    magnitude
+    npm install -g @magnitudedev/cli
     ```
+  </Tab>
+  <Tab title="bun">
+    ```sh
+    bun add -g @magnitudedev/cli
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```sh
+    pnpm add -g @magnitudedev/cli
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```sh
+    yarn global add @magnitudedev/cli
+    ```
+  </Tab>
+</Tabs>
 
-    Follow the local model setup. A cloud API key is optional.
-  </Step>
-  <Step title="Add cloud models (optional)">
-    Subscribe to Magnitude Pro at [app.magnitude.dev](https://app.magnitude.dev), copy your API key, and add it during setup or from settings. Pro is \$10 for the first month, then \$20/month.
-  </Step>
-</Steps>
+## Run Magnitude
 
-Need Magnitude hosted in your own VPC or data center? See [Pricing](/pricing) or [talk to us](https://calendly.com/tom-magnitude/30min).
+From your project directory:
+
+```sh
+cd your-project
+magnitude
+```
+
+On first launch, Magnitude detects and profiles your hardware, recommends local models for your machine, and asks you to choose one. Magnitude then downloads, prepares, and loads the model automatically. [Learn about model recommendations →](/models)
+
+Magnitude Cloud is optional. You can connect it at any time from `/settings` if you want access to hosted models and web search.
 
 ## Windows
 
-Magnitude requires WSL on Windows. We don't currently support native Windows.
+Magnitude requires WSL on Windows. Native Windows is not currently supported.
 
 ```powershell
 wsl --install
 ```
 
-Restart, then run `wsl` and follow the install steps above.
+Restart your computer, open WSL, and follow the installation steps above.
 
 ## Terminal
 
-Magnitude renders best in a modern terminal emulator like [Ghostty](https://ghostty.org) or [Kitty](https://sw.kovidgoyal.net/kitty/). The default macOS Terminal.app has limited color support and may look off.
+Magnitude renders best in a modern terminal emulator such as [Ghostty](https://ghostty.org) or [Kitty](https://sw.kovidgoyal.net/kitty/). The default macOS Terminal has limited color support and may look different.

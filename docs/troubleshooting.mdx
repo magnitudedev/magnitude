@@ -1,0 +1,57 @@
+---
+title: Troubleshooting
+description: "Resolve common local model and Magnitude Cloud problems"
+icon: wrench
+---
+
+## The model catalog is unavailable
+
+The catalog is installed with Magnitude rather than rebuilt from the internet during setup. Restart Magnitude once. If the message remains, update or reinstall the CLI so its bundled inference files and model catalog are restored together.
+
+Deleting `~/.magnitude/cache` does not restore a missing catalog.
+
+## A model download failed
+
+Magnitude automatically retries temporary network and server failures. If those retries are exhausted, the download view shows the failure and a **Retry** action. Retrying can continue a resumable partial download instead of starting from zero.
+
+Check the displayed error first. Authentication errors, insufficient disk space, and files that fail verification require correcting the reported cause before retrying. You can also cancel the download and choose another model.
+
+## An existing Hugging Face model is not shown
+
+Magnitude checks one standard Hugging Face Hub cache location. Open [Reference](/reference#environment-variables) and confirm which cache path applies to your environment.
+
+The model must be a compatible GGUF package. Incomplete, invalid, and incompatible packages are not available to load. After downloading a model with external Hugging Face tools, restart Magnitude to force a fresh inventory check.
+
+Magnitude treats files in the Hugging Face cache as externally managed and will not delete them.
+
+## A model is too large
+
+**Too large** means the model configuration cannot fit this system while preserving the memory Magnitude reserves for the operating system and other applications. Choose a smaller model, a lighter quantization, or a configuration with less context from the catalog.
+
+## There is not enough free memory
+
+**Not enough memory available** means the model normally fits the system, but other applications are currently using too much memory. Close memory-intensive applications and try loading the model again.
+
+This differs from **Too large**, which does not change when other applications close.
+
+## The model stopped because of low memory
+
+Magnitude monitors available memory while local inference runs. If memory becomes dangerously low, it stops the model and asks you to close memory-intensive apps before trying again.
+
+The model remains selected and downloaded. Close memory-intensive applications, then open `/settings → Hardware` and load it again.
+
+## A downloaded model is not using memory
+
+A model can be downloaded and selected without being loaded. This is normal after it has been stopped or remained inactive for an extended period.
+
+Open `/settings → Hardware` to check its state and choose **Load model**. Loading places the model and its context into memory; it does not download the files again.
+
+## Cloud models are not available
+
+Magnitude Cloud requires an active subscription and a valid API key. Open `/settings → Cloud` to add or update the key. Visit the [Magnitude Cloud console](https://app.magnitude.dev) to confirm the subscription and create an API key.
+
+If a rolling usage limit has been reached, open `/usage` or `/limits` to see when it resets.
+
+## Get help
+
+If the problem remains, include the Magnitude version, operating system, the exact error message, and relevant output from `~/.magnitude/logs` when opening a [GitHub issue](https://github.com/magnitudedev/magnitude/issues). Do not include API keys, private code, or other credentials.
