@@ -297,10 +297,9 @@ cannot be assigned. Existing assignments may later become unavailable when their
 degrade, but assignment never creates a blocked slot.
 
 A successful slot-assignment mutation means ACN has validated the exact installed configuration,
-obtained current load readiness, durably stored the normalized selection, and atomically published
-the `ModelSlots` mirror and agent model configuration. An immediately following slot-load command
-is therefore admissible unless authoritative conditions changed after assignment. A rejected
-assignment leaves the slot unchanged.
+durably stored the normalized selection, and atomically published the `ModelSlots` mirror and agent
+model configuration. An immediately following slot-load command is therefore admissible unless
+authoritative conditions changed after assignment. A rejected assignment leaves the slot unchanged.
 
 ### Model favorites
 

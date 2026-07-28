@@ -42,6 +42,19 @@ export const useLocalInferenceHardware = () => useMirroredState(LocalInferenceHa
 export const useLocalModels = () => useMirroredState(LocalModelsMirror)
 export const useModelSlots = () => useMirroredState(ModelSlotsMirror)
 
+export function usePreviewModelLoad(slotId: SlotId) {
+  const client = useAgentClient()
+  const preview = useMemo(
+    () => client.query(
+      "PreviewModelLoad",
+      { slotId },
+      { reactivityKeys: [LocalInferenceHardwareMirror.id, ModelSlotsMirror.id] },
+    ),
+    [client, slotId],
+  )
+  return useAtomValue(preview)
+}
+
 export function useLocalInferenceQuery() {
   const hardware = useMirroredStateAtom(LocalInferenceHardwareMirror)
   const models = useMirroredStateAtom(LocalModelsMirror)

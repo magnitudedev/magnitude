@@ -94,10 +94,8 @@ export const deriveOnboardingModelSetupView = ({
       providerModelId === primary.selection.providerModelId))
   const lifecycle = Option.map(primary.instance, ({ lifecycle }) => lifecycle)
   const failure = Option.match(lifecycle, {
-    onNone: () => primary.readiness._tag === "Unavailable"
-      ? primary.readiness.failure.message
-      : primary.availability._tag === "Unavailable"
-        && primary.availability.failure.code !== "local_model_not_installed"
+    onNone: () => primary.availability._tag === "Unavailable"
+      && primary.availability.failure.code !== "local_model_not_installed"
         ? primary.availability.failure.message
         : null,
     onSome: (instanceLifecycle) => instanceLifecycle._tag === "Failed"

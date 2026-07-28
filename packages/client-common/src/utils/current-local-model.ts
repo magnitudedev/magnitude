@@ -1,14 +1,9 @@
 import { Option } from "effect"
 import {
   type ModelFailure,
-  type ModelLoadPreview,
   type ModelSlot,
   type ModelSlotConfiguredLocal,
 } from "@magnitudedev/sdk"
-
-export type CurrentModelPreview =
-  | { readonly _tag: "Available"; readonly allocation: ModelLoadPreview }
-  | { readonly _tag: "Unavailable" }
 
 export interface CurrentModelAllocation {
   readonly parallelSequences: number
@@ -25,7 +20,6 @@ export type CurrentLocalModel =
   | { readonly _tag: "NoSelection" }
   | (CurrentModelDetails & {
       readonly _tag: "NotLoaded"
-      readonly preview: Option.Option<CurrentModelPreview>
     })
   | (CurrentModelDetails & {
       readonly _tag: "Loading"
@@ -42,7 +36,6 @@ export type CurrentLocalModel =
     })
   | (CurrentModelDetails & {
       readonly _tag: "Failed"
-      readonly preview: Option.Option<CurrentModelPreview>
       readonly reason: ModelFailure
     })
 
@@ -63,9 +56,7 @@ export const deriveCurrentLocalModel = (
       slot,
       displayName: slot.descriptor.displayName,
       contextWindow: Option.match(slot.instance, {
-        onNone: () => slot.readiness._tag === "Loadable"
-          ? Option.some(slot.readiness.allocation.contextWindowTokens)
-          : Option.none(),
+        onNone: Option.none,
         onSome: (instance) => {
           switch (instance.lifecycle._tag) {
             case "Ready":
@@ -84,23 +75,14 @@ export const deriveCurrentLocalModel = (
               )
             case "Stopped":
             case "Failed":
-              return slot.readiness._tag === "Loadable"
-                ? Option.some(slot.readiness.allocation.contextWindowTokens)
-                : Option.none()
+              return Option.none()
           }
         },
       }),
     }
-    const preview = slot.readiness._tag === "Assessing"
-      ? Option.none<CurrentModelPreview>()
-      : Option.some<CurrentModelPreview>(
-          slot.readiness._tag === "Loadable"
-            ? { _tag: "Available", allocation: slot.readiness.allocation }
-            : { _tag: "Unavailable" },
-        )
     if (Option.isNone(slot.instance)
       || slot.instance.value.lifecycle._tag === "Stopped") {
-      return { _tag: "NotLoaded", ...details, preview }
+      return { _tag: "NotLoaded", ...details }
     }
     switch (slot.instance.value.lifecycle._tag) {
       case "Loading":
@@ -130,7 +112,6 @@ export const deriveCurrentLocalModel = (
         return {
           _tag: "Failed",
           ...details,
-          preview,
           reason: slot.instance.value.lifecycle.failure,
         }
     }

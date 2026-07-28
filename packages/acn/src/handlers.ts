@@ -438,6 +438,12 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           modelSlots.loadModel(slotId).pipe(Effect.as({})),
         ),
 
+      PreviewModelLoad: ({ slotId }) =>
+        observeRpcDefects(
+          "PreviewModelLoad",
+          modelSlots.previewModelLoad(slotId),
+        ),
+
       StopModel: ({ instanceId }) =>
         observeRpcDefects(
           "StopModel",

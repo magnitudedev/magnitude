@@ -21,15 +21,6 @@ const descriptor = {
   providerModelId: selection.providerModelId,
   displayName: "Canonical local model",
 }
-const readiness = {
-  _tag: "Loadable" as const,
-  allocation: {
-    contextWindowTokens: 200_000,
-    parallelSequences: 4,
-    physicalContextTokens: 800_000,
-    requiredSystemMemoryBytes: 60_000_000_000,
-  },
-}
 const allocation = {
   contextWindowTokens: 200_000,
   parallelSequences: 3,
@@ -38,13 +29,12 @@ const allocation = {
 }
 
 describe("current local model derivation", () => {
-  it("derives selection, readiness, and display identity from the slot alone", () => {
+  it("derives unloaded identity without fabricating allocation evidence", () => {
     const current = deriveCurrentLocalModel(Option.some(new ModelSlotConfiguredLocal({
       slotId: PRIMARY_SLOT_ID,
       selection,
       descriptor,
       availability: { _tag: "Available" },
-      readiness,
       instance: Option.none(),
       actions: ["Load"],
     })))
@@ -52,10 +42,7 @@ describe("current local model derivation", () => {
     expect(current).toMatchObject({
       _tag: "NotLoaded",
       displayName: "Canonical local model",
-      preview: {
-        _tag: "Some",
-        value: { _tag: "Available", allocation: { parallelSequences: 4 } },
-      },
+      contextWindow: { _tag: "None" },
     })
   })
 
@@ -65,7 +52,6 @@ describe("current local model derivation", () => {
       selection,
       descriptor,
       availability: { _tag: "Available" },
-      readiness,
       instance: Option.some({
         id: ModelInstanceIdSchema.make("instance"),
         configurationId: ModelServingConfigurationIdSchema.make("configuration"),

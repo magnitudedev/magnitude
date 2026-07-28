@@ -60,6 +60,7 @@ const AcnDemandRpcs = RpcGroup.make(
   LocalInference.CancelModelDownload,
   LocalInference.DismissModelDownloadFailure,
   LocalInference.DeleteLocalModel,
+  LocalInference.PreviewModelLoad,
   LocalInference.LoadModel,
   LocalInference.StopModel,
   Onboarding.OnboardingMirror.getRpc,

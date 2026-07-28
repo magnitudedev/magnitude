@@ -16,7 +16,7 @@ const remoteProviderId = ProviderIdSchema.make("magnitude")
 const modelId = ProviderModelIdSchema.make("model")
 
 describe("model request preparation", () => {
-  it("reports local preparation before acquiring the model", async () => {
+  it("acquires the local model without fabricating request progress", async () => {
     const order: string[] = []
     const progress: ModelRequestProgress[] = []
     const prepare = makeModelRequestPreparation({
@@ -40,8 +40,8 @@ describe("model request preparation", () => {
       }),
     })))
 
-    expect(order).toEqual(["preparing", "acquire", "release"])
-    expect(progress).toEqual([{ phase: "preparing", requestId: null }])
+    expect(order).toEqual(["acquire", "release"])
+    expect(progress).toEqual([])
   })
 
   it("does not prepare remote provider requests", async () => {

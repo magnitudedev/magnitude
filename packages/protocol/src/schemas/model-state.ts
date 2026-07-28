@@ -88,13 +88,13 @@ export const ModelServingConfigurationIdSchema =
   NonEmptyString.pipe(Schema.brand("ModelServingConfigurationId"))
 export type ModelServingConfigurationId = typeof ModelServingConfigurationIdSchema.Type
 
-export const ModelLoadPreviewSchema = Schema.Struct({
+export const ModelLoadPlanSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
   parallelSequences: PositiveSafeInteger,
   physicalContextTokens: PositiveSafeInteger,
   requiredSystemMemoryBytes: NonNegativeSafeInteger,
 })
-export type ModelLoadPreview = typeof ModelLoadPreviewSchema.Type
+export type ModelLoadPlan = typeof ModelLoadPlanSchema.Type
 
 export const ModelInstanceAllocationSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
@@ -112,7 +112,7 @@ export type ModelInstanceAllocation = typeof ModelInstanceAllocationSchema.Type
 
 export const ModelStoppingAllocationSchema = Schema.Union(
   Schema.TaggedStruct("Planned", {
-    allocation: Schema.optionalWith(ModelLoadPreviewSchema, { as: "Option", exact: true }),
+    allocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Resident", {
     allocation: ModelInstanceAllocationSchema,
@@ -760,13 +760,6 @@ export const ModelSlotAvailabilitySchema = Schema.Union(
 )
 export type ModelSlotAvailability = typeof ModelSlotAvailabilitySchema.Type
 
-export const ModelLoadReadinessSchema = Schema.Union(
-  Schema.TaggedStruct("Assessing", {}),
-  Schema.TaggedStruct("Loadable", { allocation: ModelLoadPreviewSchema }),
-  Schema.TaggedStruct("Unavailable", { failure: ModelFailureSchema }),
-)
-export type ModelLoadReadiness = typeof ModelLoadReadinessSchema.Type
-
 export const ModelSlotInstanceLifecycleSchema = Schema.Union(
   Schema.TaggedStruct("Loading", {
     stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
@@ -774,7 +767,7 @@ export const ModelSlotInstanceLifecycleSchema = Schema.Union(
       as: "Option",
       exact: true,
     }),
-    plannedAllocation: Schema.optionalWith(ModelLoadPreviewSchema, { as: "Option", exact: true }),
+    plannedAllocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Ready", { allocation: ModelInstanceAllocationSchema }),
   Schema.TaggedStruct("Stopping", {
@@ -811,7 +804,6 @@ export class ModelSlotConfiguredLocal extends Schema.TaggedClass<ModelSlotConfig
   selection: SlotSelectionSchema,
   descriptor: ModelSlotDescriptorSchema,
   availability: ModelSlotAvailabilitySchema,
-  readiness: ModelLoadReadinessSchema,
   instance: Schema.optionalWith(ModelSlotInstanceSchema, { as: "Option", exact: true }),
   actions: Schema.Array(ModelSlotActionSchema),
 }) {}
@@ -843,20 +835,18 @@ export const ModelSlotSchema = Schema.Union(
   if (slot.selection.providerId !== "local") return false
   const expectedActions: readonly ModelSlotAction[] = slot.availability._tag === "Available"
     ? Option.match(slot.instance, {
-        onNone: () => slot.readiness._tag === "Loadable" ? ["Load"] : [],
+        onNone: () => ["Load"],
         onSome: (instance) => {
           switch (instance.lifecycle._tag) {
             case "Loading":
             case "Ready":
               return ["Stop"]
             case "Failed":
-              return instance.lifecycle.failure.retryable && slot.readiness._tag === "Loadable"
-                ? ["RetryLoad"]
-                : []
+              return instance.lifecycle.failure.retryable ? ["RetryLoad"] : []
             case "Stopping":
               return []
             case "Stopped":
-              return slot.readiness._tag === "Loadable" ? ["Load"] : []
+              return ["Load"]
           }
         },
       })

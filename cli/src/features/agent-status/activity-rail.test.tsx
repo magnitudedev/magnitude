@@ -69,7 +69,6 @@ const localActivity = (
     displayName: "Local test",
   },
   availability: { _tag: "Available" },
-  readiness: { _tag: "Assessing" },
   instance: Option.some({ id: instanceId, configurationId, lifecycle }),
   actions: lifecycle._tag === "Loading" ? ["Stop"] : [],
 })

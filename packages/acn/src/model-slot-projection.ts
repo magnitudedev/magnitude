@@ -3,11 +3,10 @@ import {
   ModelInstanceIdSchema,
   ModelServingConfigurationIdSchema,
   type ModelInstanceAllocation,
-  type ModelLoadPreview,
+  type ModelLoadPlan,
   type ModelCapabilities,
   type ModelSlotAction,
   type ModelSlotAvailability,
-  type ModelSlotConfiguredLocal,
   type ModelSlotInstance,
   type ProviderModelCatalogEntry,
   type SlotId,
@@ -29,13 +28,13 @@ export const projectModelInstanceAllocation = (
   })),
 })
 
-export const projectModelLoadPreview = (
-  allocation: Generated.ModelLoadAllocation,
-): ModelLoadPreview => ({
-  contextWindowTokens: allocation.contextWindowTokens,
-  parallelSequences: allocation.parallelSequences,
-  physicalContextTokens: allocation.physicalContextTokens,
-  requiredSystemMemoryBytes: allocation.requiredSystemMemoryBytes,
+export const projectModelLoadPlan = (
+  plan: Generated.ModelLoadPlan,
+): ModelLoadPlan => ({
+  contextWindowTokens: plan.contextWindowTokens,
+  parallelSequences: plan.parallelSequences,
+  physicalContextTokens: plan.physicalContextTokens,
+  requiredSystemMemoryBytes: plan.requiredSystemMemoryBytes,
 })
 
 export const projectModelInstance = (
@@ -52,7 +51,7 @@ export const projectModelInstance = (
           progress: Option.flatMap(instance.lifecycle.progress, Option.fromNullable),
           plannedAllocation: Option.map(
             instance.lifecycle.plannedAllocation,
-            projectModelLoadPreview,
+            projectModelLoadPlan,
           ),
         }
       case "Ready":
@@ -75,7 +74,7 @@ export const projectModelInstance = (
                 _tag: "Planned" as const,
                 allocation: Option.map(
                   instance.lifecycle.allocation.allocation,
-                  projectModelLoadPreview,
+                  projectModelLoadPlan,
                 ),
               },
         }
@@ -89,12 +88,11 @@ export const projectModelInstance = (
 
 export const modelSlotActions = (
   availability: ModelSlotAvailability,
-  readiness: ModelSlotConfiguredLocal["readiness"],
   instance: Option.Option<ModelSlotInstance>,
 ): readonly ModelSlotAction[] => {
   if (availability._tag !== "Available") return []
   return Option.match(instance, {
-    onNone: () => readiness._tag === "Loadable" ? ["Load"] : [],
+    onNone: () => ["Load"],
     onSome: (current) => {
       switch (current.lifecycle._tag) {
         case "Loading":
@@ -103,9 +101,9 @@ export const modelSlotActions = (
         case "Stopping":
           return []
         case "Stopped":
-          return readiness._tag === "Loadable" ? ["Load"] : []
+          return ["Load"]
         case "Failed":
-          return current.lifecycle.failure.retryable && readiness._tag === "Loadable"
+          return current.lifecycle.failure.retryable
             ? ["RetryLoad"]
             : []
       }

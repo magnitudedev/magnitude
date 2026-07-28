@@ -36,7 +36,6 @@ const localSlot = (
     displayName: "Qwen Test",
   },
   availability: { _tag: "Available" },
-  readiness: { _tag: "Assessing" },
   instance,
   actions: Option.isSome(instance) && instance.value.lifecycle._tag === "Loading"
     ? ["Stop"]

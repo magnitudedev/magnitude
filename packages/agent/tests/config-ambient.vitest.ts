@@ -80,7 +80,6 @@ describe('agent model configuration boundary', () => {
         selection: { providerId, providerModelId, reasoningEffort },
         descriptor: { providerId, providerModelId, displayName: 'Local model' },
         availability: { _tag: 'Available' },
-        readiness: { _tag: 'Assessing' },
         instance,
         actions: [],
       }),

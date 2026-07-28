@@ -21,16 +21,6 @@ import {
 } from "./model-slot-projection"
 import type { Generated } from "@magnitudedev/icn"
 
-const loadable = {
-  _tag: "Loadable" as const,
-  allocation: {
-    contextWindowTokens: 4096,
-    parallelSequences: 1,
-    physicalContextTokens: 4096,
-    requiredSystemMemoryBytes: 1024,
-  },
-}
-
 describe("model slot projection", () => {
   it("preserves exact instance and configuration identity from ICN", () => {
     const instance = {
@@ -56,8 +46,8 @@ describe("model slot projection", () => {
 
   it("derives every physical action from canonical instance lifecycle", () => {
     const available = { _tag: "Available" as const }
-    expect(modelSlotActions(available, loadable, Option.none())).toEqual(["Load"])
-    expect(modelSlotActions(available, loadable, Option.some({
+    expect(modelSlotActions(available, Option.none())).toEqual(["Load"])
+    expect(modelSlotActions(available, Option.some({
       id: ModelInstanceIdSchema.make("instance"),
       configurationId: ModelServingConfigurationIdSchema.make("configuration"),
       lifecycle: {
@@ -67,7 +57,7 @@ describe("model slot projection", () => {
         plannedAllocation: Option.none(),
       },
     }))).toEqual(["Stop"])
-    expect(modelSlotActions(available, loadable, Option.some({
+    expect(modelSlotActions(available, Option.some({
       id: ModelInstanceIdSchema.make("instance"),
       configurationId: ModelServingConfigurationIdSchema.make("configuration"),
       lifecycle: {
@@ -78,7 +68,7 @@ describe("model slot projection", () => {
     expect(modelSlotActions({
       _tag: "Unavailable",
       failure: { code: "offline", message: "offline", retryable: true },
-    }, loadable, Option.none())).toEqual([])
+    }, Option.none())).toEqual([])
   })
 
   it("keeps a durable local offering selected while its packages download", () => {

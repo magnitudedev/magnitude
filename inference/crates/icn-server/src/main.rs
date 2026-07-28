@@ -17,7 +17,7 @@ use icn_contracts::models::{
     FitModelResult, FitModelsRequest, FitModelsResponse, InstalledModelPackages as _,
     LoadModelReady, LoadModelRequest, MemoryAssessment, ModelEvaluator,
     ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceId, ModelInstanceLifecycle,
-    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadAllocation, ModelLoadEvent,
+    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan,
     ModelLoadStage, ModelOfferingTarget as DomainModelOfferingTarget, ModelPackageId,
     ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
     ModelServingConfigurationId, ModelStoppingAllocation, ModelTargetInput, OfferingAssessment,
@@ -35,9 +35,9 @@ use icn_contracts::{
 use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind,
-    ModelManager, ModelPreviewService, ReleaseRecommendableCatalog, ResolvingRecommendableCatalog,
-    ReleaseCatalog, canonical_package_id, load_release_catalog, offering_target_id,
+    InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
+    ModelPreviewService, ReleaseCatalog, ReleaseRecommendableCatalog,
+    ResolvingRecommendableCatalog, canonical_package_id, load_release_catalog, offering_target_id,
     release_catalog_manifest,
 };
 use sha2::{Digest, Sha256};
@@ -2579,7 +2579,7 @@ impl NativeModelInstanceController {
         configuration_id: &ModelServingConfigurationId,
         stage: ModelLoadStage,
         progress: Option<f32>,
-        planned_allocation: Option<ModelLoadAllocation>,
+        planned_allocation: Option<ModelLoadPlan>,
     ) {
         self.instances
             .publish(ModelInstance {
@@ -2644,7 +2644,7 @@ impl NativeModelInstanceController {
                     let _ = events.send(ModelLoadEvent::Progress {
                         stage,
                         fraction: progress,
-                        allocation: planned_allocation,
+                        plan: planned_allocation,
                     });
                 }
                 ModelInstanceLifecycle::Ready { allocation } => {
@@ -3234,7 +3234,7 @@ impl NativeModelInstanceController {
             let _ = events.send(ModelLoadEvent::Progress {
                 stage: ModelLoadStage::Unloading,
                 fraction: None,
-                allocation: None,
+                plan: None,
             });
         }
         if let Some(resident) = existing.as_ref() {
@@ -3444,7 +3444,7 @@ impl NativeModelInstanceController {
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Loading,
             fraction: Some(0.0),
-            allocation: Some(ModelLoadAllocation {
+            plan: Some(ModelLoadPlan {
                 context_window_tokens: profile.context_length,
                 parallel_sequences,
                 physical_context_tokens,
@@ -3456,7 +3456,7 @@ impl NativeModelInstanceController {
             &configuration_id,
             ModelLoadStage::Loading,
             Some(0.0),
-            Some(ModelLoadAllocation {
+            Some(ModelLoadPlan {
                 context_window_tokens: profile.context_length,
                 parallel_sequences,
                 physical_context_tokens,
@@ -3549,14 +3549,14 @@ impl NativeModelInstanceController {
                     let _ = events.send(ModelLoadEvent::Progress {
                         stage: ModelLoadStage::Loading,
                         fraction: Some(fraction),
-                        allocation: None,
+                        plan: None,
                     });
                     self.publish_loading(
                         &instance_id,
                         &configuration_id,
                         ModelLoadStage::Loading,
                         Some(fraction),
-                        Some(ModelLoadAllocation {
+                        Some(ModelLoadPlan {
                             context_window_tokens: profile.context_length,
                             parallel_sequences,
                             physical_context_tokens,
@@ -3582,14 +3582,14 @@ impl NativeModelInstanceController {
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Verifying,
             fraction: Some(tracker.fraction()),
-            allocation: None,
+            plan: None,
         });
         self.publish_loading(
             &instance_id,
             &configuration_id,
             ModelLoadStage::Verifying,
             Some(tracker.fraction()),
-            Some(ModelLoadAllocation {
+            Some(ModelLoadPlan {
                 context_window_tokens: profile.context_length,
                 parallel_sequences,
                 physical_context_tokens,
@@ -3677,7 +3677,7 @@ impl NativeModelInstanceController {
         let _ = events.send(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Verifying,
             fraction: Some(tracker.fraction()),
-            allocation: None,
+            plan: None,
         });
         if let Ok(mut loaded) = self.loaded_configurations.lock() {
             loaded.insert(model_id.clone());
@@ -3769,7 +3769,7 @@ impl ModelInstanceController for NativeModelInstanceController {
     fn preview_load(
         &self,
         request: PreviewModelLoadRequest,
-    ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>> {
+    ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>> {
         Box::pin(async move {
             let profile = ModelExecutionProfile {
                 context_length: request.configuration.profile.context_length,
@@ -3793,7 +3793,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         "context length multiplied by selected parallelism exceeds u32".to_owned(),
                     )
                 })?;
-            Ok(ModelLoadAllocation {
+            Ok(ModelLoadPlan {
                 context_window_tokens: plan.context_size,
                 parallel_sequences,
                 physical_context_tokens,
@@ -3832,7 +3832,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                 let _ = events.send(ModelLoadEvent::Progress {
                     stage: ModelLoadStage::Queued,
                     fraction: None,
-                    allocation: None,
+                    plan: None,
                 });
                 let model_mutation = controller.mutation.lock().await;
                 if stop_requested.load(Ordering::Acquire) {
@@ -3846,7 +3846,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                 let _ = events.send(ModelLoadEvent::Progress {
                     stage: ModelLoadStage::Resolving,
                     fraction: None,
-                    allocation: None,
+                    plan: None,
                 });
                 controller
                     .publish_loading(
@@ -4179,9 +4179,7 @@ fn open_installation_catalog(
     .context("failed to load release catalog sidecars")
 }
 
-fn load_installation_backends(
-    installation: &installation::Installation,
-) -> anyhow::Result<()> {
+fn load_installation_backends(installation: &installation::Installation) -> anyhow::Result<()> {
     let declared = installation
         .executable()
         .canonicalize()
@@ -4194,9 +4192,7 @@ fn load_installation_backends(
     }
     #[cfg(feature = "dynamic-backends")]
     {
-        llama_cpp_2::llama_backend::load_backends_from_path(
-            &installation.backend_directory(),
-        );
+        llama_cpp_2::llama_backend::load_backends_from_path(&installation.backend_directory());
         Ok(())
     }
     #[cfg(not(feature = "dynamic-backends"))]
@@ -4206,9 +4202,7 @@ fn load_installation_backends(
     }
 }
 
-fn validate_registered_backend(
-    installation: &installation::Installation,
-) -> anyhow::Result<()> {
+fn validate_registered_backend(installation: &installation::Installation) -> anyhow::Result<()> {
     use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
 
     let devices = list_llama_ggml_backend_devices();
@@ -4334,10 +4328,10 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 AppState::model_free()
             }
-                .with_installed_packages(inventory.clone())
-                .with_hardware(inventory_hardware_assessor.clone())
-                .with_model_downloads(model_downloads)
-                .with_identity(identity);
+            .with_installed_packages(inventory.clone())
+            .with_hardware(inventory_hardware_assessor.clone())
+            .with_model_downloads(model_downloads)
+            .with_identity(identity);
             if let Some(release_catalog) = release_catalog {
                 state = state
                     .with_model_evaluator(Arc::new(NativeModelEvaluator::new(
