@@ -185,7 +185,6 @@ function OnboardingGate(
       modelsConfigured={modelsConfigured}
       modelsReadyForInitialWork={modelsReadyForInitialWork}
       modelSetupActive={modelSetupActive}
-      onboardingRequired={onboardingRequired}
       updateOnboarding={onboarding.update}
       updateOnboardingResult={onboarding.updateResult}
     />
@@ -196,7 +195,6 @@ function CliAppContent(props: CliAppProps & {
   readonly modelsConfigured: boolean
   readonly modelsReadyForInitialWork: boolean
   readonly modelSetupActive: boolean
-  readonly onboardingRequired: boolean
   readonly updateOnboarding: ReturnType<typeof useOnboardingState>["update"]
   readonly updateOnboardingResult: ReturnType<typeof useOnboardingState>["updateResult"]
 }): ReactNode {
@@ -279,7 +277,6 @@ function CliAppContent(props: CliAppProps & {
 
   const setupView = deriveOnboardingModelSetupView({
     active: props.modelSetupActive,
-    onboardingRequired: props.onboardingRequired,
     submittedProviderModelId: onboardingSetup.submittedProviderModelId,
     state: localInferenceView,
   })
