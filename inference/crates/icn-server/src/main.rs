@@ -2957,11 +2957,12 @@ fn validate_registered_backend(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _telemetry = telemetry::init()?;
+    let cli = Cli::parse();
+    let _telemetry = telemetry::init(matches!(&cli.command, Command::Serve { .. }))?;
     // Native planner diagnostics are extremely verbose and can dominate metadata-only fitting.
     // ICN emits bounded, structured operation telemetry at the service boundary instead.
     icn_engine::disable_native_diagnostics();
-    match Cli::parse().command {
+    match cli.command {
         Command::Serve {
             bind,
             instance_id,

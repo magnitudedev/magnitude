@@ -71,10 +71,10 @@ struct OtlpEndpoints {
     logs: String,
 }
 
-pub fn init() -> anyhow::Result<TelemetryGuard> {
+pub fn init(export: bool) -> anyhow::Result<TelemetryGuard> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let Some(endpoints) = otlp_endpoints() else {
+    let Some(endpoints) = export.then(otlp_endpoints).flatten() else {
         tracing_subscriber::registry()
             .with(stderr_layer())
             .try_init()
