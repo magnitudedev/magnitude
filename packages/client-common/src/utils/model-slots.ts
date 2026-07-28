@@ -13,31 +13,15 @@ import {
   type SlotId,
 } from "@magnitudedev/sdk"
 
-export type SelectedLocalModelSetup = LocalModelCatalogCandidate
-
 export const deriveSelectedLocalModelCandidate = (
   models: LocalModelsState,
   slots: ModelSlotsState,
-): SelectedLocalModelSetup | null => {
+): LocalModelCatalogCandidate | null => {
   const primary = slots.slots.primary
   if (primary._tag === "Unassigned" || models.recommendations._tag !== "Ready") return null
   return models.recommendations.catalog.find(({ providerModelId }) =>
     providerModelId === primary.selection.providerModelId)
     ?? null
-}
-
-export const deriveSelectedLocalModelSetup = (
-  models: LocalModelsState,
-  slots: ModelSlotsState,
-): SelectedLocalModelSetup | null => {
-  const candidate = deriveSelectedLocalModelCandidate(models, slots)
-  if (!candidate) return null
-  if (candidate.download._tag === "Downloading" || candidate.download._tag === "Failed") {
-    return candidate
-  }
-  return candidate.download._tag === "Downloaded" && candidate.preparation._tag === "Calibrating"
-    ? candidate
-    : null
 }
 
 type AssignedSlot = Exclude<ModelSlot, { readonly _tag: "Unassigned" }>

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto"
 import * as NodePath from "node:path"
 import {
   CatalogCandidateIdSchema,
-  LocalModelCatalogCandidateSchema,
+  LocalModelCatalogCandidateMetadataSchema,
   ModelFailureSchema,
   ModelServingConfigurationSchema,
   LocalModelRecommendationProgressStepSchema,
@@ -82,7 +82,7 @@ const targetPackages = (model: RecommendableModel) =>
     : [model.target.target, model.target.draft]
 
 const CatalogEntrySchema = Schema.Struct({
-  candidate: LocalModelCatalogCandidateSchema,
+  candidate: LocalModelCatalogCandidateMetadataSchema,
   recommendableModelId: RecommendableModelIdSchema,
   configuration: ModelServingConfigurationSchema,
   recommendation: Schema.optionalWith(RecommendationSchema, { as: "Option", exact: true }),
@@ -102,12 +102,6 @@ const catalogProjection = (
     license: candidate.model.license,
     profile: candidate.profile,
     downloadBytes: candidate.totalDownloadBytes,
-    download: {
-      _tag: "NotDownloaded",
-      completedBytes: 0,
-      totalBytes: candidate.totalDownloadBytes,
-    },
-    preparation: { _tag: "NotDownloaded" },
     quantization: targetPackages(candidate.model)
       .map(({ properties }) => properties.quantization)
       .join(" + "),

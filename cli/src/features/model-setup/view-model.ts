@@ -68,9 +68,7 @@ export const deriveOnboardingModelSetupView = ({
   if (submittedCandidate?.download._tag === "Failed") {
     return { _tag: "DownloadFailed", candidate: submittedCandidate }
   }
-  if (submittedCandidate?.download._tag === "Downloading"
-    || submittedCandidate?.download._tag === "Downloaded"
-      && submittedCandidate.preparation._tag === "Calibrating") {
+  if (submittedCandidate?.download._tag === "Downloading") {
     return { _tag: "Downloading", candidate: submittedCandidate }
   }
 
@@ -78,7 +76,15 @@ export const deriveOnboardingModelSetupView = ({
   if (submittedProviderModelId === null
     || primary._tag !== "ConfiguredLocal"
     || primary.selection.providerModelId !== submittedProviderModelId) {
-    return { _tag: "Choosing" }
+    return submittedCandidate === null
+      ? { _tag: "Choosing" }
+      : {
+          _tag: "Activating",
+          providerModelId: submittedCandidate.providerModelId,
+          displayName: submittedCandidate.displayName,
+          phase: "Loading",
+          failure: null,
+        }
   }
   const candidate = deriveSelectedLocalModelCandidate(models, slots)
   const selection = buildLocalInferenceSelections(models, catalog, slots).find((item) =>

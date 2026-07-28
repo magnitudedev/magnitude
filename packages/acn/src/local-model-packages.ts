@@ -41,7 +41,7 @@ import {
   recommendableModelFromIcn,
 } from "./local-model-icn-adapter"
 
-const mutationFailure = (operation: string, error: unknown) =>
+const mutationFailure = <Failure>(operation: string, error: Failure) =>
   new LocalModelMutationFailed({
     code: operation,
     message: error instanceof Error ? error.message : String(error),
@@ -84,14 +84,96 @@ const latestAttempt = (
   return Option.none()
 }
 
+type TargetInstallationOutcome =
+  | { readonly _tag: "Installed" }
+  | { readonly _tag: "Failed"; readonly failure: LocalModelMutationFailed }
+
+type PackageAcquisition =
+  | { readonly _tag: "NotInstalled" }
+  | { readonly _tag: "Downloading"; readonly attempt: Extract<DownloadAttempt, {
+      readonly _tag: "Pending" | "Downloading"
+    }> }
+  | { readonly _tag: "Failed"; readonly attemptId: DownloadAttemptId; readonly completedBytes: number
+      readonly totalBytes: number; readonly failure: LocalModelMutationFailed }
+  | { readonly _tag: "Cancelled" }
+  | { readonly _tag: "Installed"; readonly path: string }
+
+const packageAcquisition = (
+  modelPackage: ModelPackage,
+  installedPackages: ReadonlyMap<ModelPackageId, string>,
+  attempts: readonly DownloadAttempt[],
+): PackageAcquisition => {
+  const installedPath = installedPackages.get(modelPackage.id)
+  if (installedPath !== undefined) return { _tag: "Installed", path: installedPath }
+  const current = latestAttempt(attempts, modelPackage.id)
+  if (Option.isNone(current)) return { _tag: "NotInstalled" }
+  const attempt = current.value
+  if (attempt._tag === "Pending" || attempt._tag === "Downloading") {
+    return { _tag: "Downloading", attempt }
+  }
+  if (attempt._tag === "Cancelled") return { _tag: "Cancelled" }
+  if (attempt._tag === "Failed") {
+    return {
+      _tag: "Failed",
+      attemptId: attempt.id,
+      completedBytes: attempt.completedBytes,
+      totalBytes: attempt.totalBytes,
+      failure: new LocalModelMutationFailed(attempt.failure),
+    }
+  }
+  return { _tag: "NotInstalled" }
+}
+
+export const targetInstallationOutcome = (
+  target: ModelOfferingTarget,
+  installedPackages: ReadonlyMap<ModelPackageId, string>,
+  attempts: readonly DownloadAttempt[],
+): Option.Option<TargetInstallationOutcome> => {
+  const packages = target._tag === "Package"
+    ? [target.package]
+    : [target.target, target.draft]
+  const acquisitions = packages.map((modelPackage) =>
+    packageAcquisition(modelPackage, installedPackages, attempts))
+  if (acquisitions.every(({ _tag }) => _tag === "Installed")) {
+    return Option.some({ _tag: "Installed" })
+  }
+  for (const acquisition of acquisitions) {
+    if (acquisition._tag === "Installed") continue
+    if (acquisition._tag === "NotInstalled") {
+      return Option.some({
+        _tag: "Failed",
+        failure: new LocalModelMutationFailed({
+          code: "local_model_download_not_active",
+          message: "The selected local model download is no longer active",
+          retryable: true,
+        }),
+      })
+    }
+    if (acquisition._tag === "Failed") {
+      return Option.some({
+        _tag: "Failed",
+        failure: acquisition.failure,
+      })
+    }
+    if (acquisition._tag === "Cancelled") {
+      return Option.some({
+        _tag: "Failed",
+        failure: new LocalModelMutationFailed({
+          code: "local_model_download_cancelled",
+          message: "The selected local model download was cancelled",
+          retryable: true,
+        }),
+      })
+    }
+  }
+  return Option.none()
+}
+
 export interface LocalModelPackagesApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
-  readonly downloadTarget: (
-    target: ModelOfferingTarget,
-  ) => Effect.Effect<void, LocalInferenceError>
-  readonly awaitTargetInstalled: (
+  readonly acquireTarget: (
     target: ModelOfferingTarget,
   ) => Effect.Effect<void, LocalInferenceError>
   readonly cancelTargetDownload: (
@@ -170,41 +252,53 @@ export const LocalModelPackagesLive: Layer.Layer<
       targetIds.set(item.package.id, item.targetId)
     }
     const installedById = new Map(installedModels.map((item) => [item.package.id, item]))
+    const installedPaths = new Map(installedModels.map((item) => [item.package.id, item.path]))
 
     const entries: ModelPackageEntry[] = [...allPackages.values()]
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((modelPackage) => {
         const installedEntry = installedById.get(modelPackage.id)
-        const latest = latestAttempt(attempts, modelPackage.id)
-        const localState: ModelPackageEntry["localState"] = installedEntry
-          ? { _tag: "Installed", path: installedEntry.path }
-          : Option.match(latest, {
-              onNone: () => ({ _tag: "NotInstalled" as const }),
-              onSome: (attempt): ModelPackageEntry["localState"] => {
-                if (attempt._tag === "Pending" || attempt._tag === "Downloading") {
-                  return {
-                    _tag: "Downloading",
-                    attemptId: attempt.id,
-                    stage: attempt._tag === "Downloading" ? attempt.stage : "queued",
-                    completedBytes: attempt._tag === "Downloading" ? attempt.completedBytes : 0,
-                    totalBytes: attempt._tag === "Downloading" ? attempt.totalBytes : 0,
-                    bytesPerSecond: attempt._tag === "Downloading"
-                      ? attempt.bytesPerSecond
-                      : Option.none(),
-                  }
-                }
-                if (attempt._tag === "Failed" && !dismissed.has(modelPackage.id)) {
-                  return {
+        const acquisition = packageAcquisition(
+          modelPackage,
+          installedPaths,
+          attempts,
+        )
+        const localState: ModelPackageEntry["localState"] = (() => {
+          switch (acquisition._tag) {
+            case "Installed":
+              return { _tag: "Installed", path: acquisition.path }
+            case "Downloading": {
+              const { attempt } = acquisition
+              return {
+                _tag: "Downloading",
+                attemptId: attempt.id,
+                stage: attempt._tag === "Downloading" ? attempt.stage : "queued",
+                completedBytes: attempt._tag === "Downloading" ? attempt.completedBytes : 0,
+                totalBytes: attempt._tag === "Downloading" ? attempt.totalBytes : 0,
+                bytesPerSecond: attempt._tag === "Downloading"
+                  ? attempt.bytesPerSecond
+                  : Option.none(),
+              }
+            }
+            case "Failed":
+              return dismissed.has(modelPackage.id)
+                ? { _tag: "NotInstalled" }
+                : {
                     _tag: "DownloadFailed",
-                    attemptId: attempt.id,
-                    completedBytes: attempt.completedBytes,
-                    totalBytes: attempt.totalBytes,
-                    failure: attempt.failure,
+                    attemptId: acquisition.attemptId,
+                    completedBytes: acquisition.completedBytes,
+                    totalBytes: acquisition.totalBytes,
+                    failure: {
+                      code: acquisition.failure.code,
+                      message: acquisition.failure.message,
+                      retryable: acquisition.failure.retryable,
+                    },
                   }
-                }
-                return { _tag: "NotInstalled" }
-              },
-            })
+            case "Cancelled":
+            case "NotInstalled":
+              return { _tag: "NotInstalled" }
+          }
+        })()
         return {
           package: modelPackage,
           targetId: Option.fromNullable(targetIds.get(modelPackage.id)),
@@ -245,83 +339,59 @@ export const LocalModelPackagesLive: Layer.Layer<
   const targetPackages = (target: ModelOfferingTarget) =>
     target._tag === "Package" ? [target.package] : [target.target, target.draft]
 
-  type TargetInstallationOutcome =
-    | { readonly _tag: "Installed" }
-    | { readonly _tag: "Failed"; readonly failure: LocalModelMutationFailed }
-
-  const targetInstallationOutcome = (
+  const resolveTargetInstallation = (
     target: ModelOfferingTarget,
-    state: ModelPackagesState,
-  ): Option.Option<TargetInstallationOutcome> => {
-    const packageIds = new Set(modelOfferingTargetPackageIds(target))
-    const entries = state.entries.filter(({ package: modelPackage }) =>
-      packageIds.has(modelPackage.id))
-    if (entries.length !== packageIds.size) {
-      return Option.some({
-        _tag: "Failed",
-        failure: mutationFailure(
-          "local_model_target_unavailable",
-          "The selected local model target is unavailable",
-        ),
-      })
-    }
-    if (entries.every(({ localState }) => localState._tag === "Installed")) {
-      return Option.some({ _tag: "Installed" })
-    }
-    const failed = entries.find(({ localState }) =>
-      localState._tag === "DownloadFailed")
-    if (failed?.localState._tag === "DownloadFailed") {
-      return Option.some({
-        _tag: "Failed",
-        failure: new LocalModelMutationFailed({
-          code: failed.localState.failure.code,
-          message: failed.localState.failure.message,
-          retryable: failed.localState.failure.retryable,
-        }),
-      })
-    }
-    if (entries.some(({ localState }) => localState._tag === "Downloading")) {
-      return Option.none()
-    }
-    return Option.some({
-      _tag: "Failed",
-      failure: new LocalModelMutationFailed({
-        code: "local_model_download_not_active",
-        message: "The selected local model download is no longer active",
-        retryable: true,
-      }),
-    })
-  }
+  ): Effect.Effect<Option.Option<TargetInstallationOutcome>, LocalInferenceError> =>
+    Effect.gen(function* () {
+      const attempts = yield* Effect.forEach(
+        (yield* downloads.get).state.attempts,
+        downloadAttemptFromIcn,
+      ).pipe(
+        Effect.mapError((error) =>
+          mutationFailure("decode_model_download_attempt_failed", error)),
+      )
+      if (modelOfferingTargetPackageIds(target).some((packageId) =>
+        Option.exists(latestAttempt(attempts, packageId), (attempt) =>
+          attempt._tag === "Completed"))) {
+        yield* installed.refresh
+      }
+      const installedPackages = new Map(
+        (yield* installed.get).state.packages.map(({ package: modelPackage, path }) => [
+          ModelPackageIdSchema.make(modelPackage.id),
+          path,
+        ]),
+      )
+      return targetInstallationOutcome(target, installedPackages, attempts)
+    }).pipe(
+      Effect.mapError((error) => mutationFailure(
+        "resolve_model_target_installation_failed",
+        error,
+      )),
+    )
 
   const awaitTargetInstalled = (
     target: ModelOfferingTarget,
   ): Effect.Effect<void, LocalInferenceError> => Effect.gen(function* () {
-    yield* downloads.refresh.pipe(
-      Effect.mapError((error) => mutationFailure("refresh_model_downloads_failed", error)),
-    )
-    yield* installed.refresh.pipe(
-      Effect.mapError((error) => mutationFailure("refresh_installed_models_failed", error)),
-    )
-    yield* project
-    const current = yield* mirror.get
-    const immediate = targetInstallationOutcome(target, current.state)
+    const immediate = yield* resolveTargetInstallation(target)
     const outcome = Option.isSome(immediate)
       ? immediate.value
-      : yield* mirror.changes.pipe(
-          Stream.tap(() => installed.refresh.pipe(
-            Effect.tap(() => project),
-            Effect.catchAll((error) =>
-              Effect.logWarning("Unable to refresh installed models after download completion").pipe(
-                Effect.annotateLogs({ error: String(error) }),
-              )),
-          )),
-          Stream.filterMap(({ state: changed }) => targetInstallationOutcome(target, changed)),
+      : yield* Stream.merge(
+          downloads.changes.pipe(Stream.map(() => undefined)),
+          installed.changes.pipe(Stream.map(() => undefined)),
+        ).pipe(
+          Stream.mapEffect(() => resolveTargetInstallation(target)),
+          Stream.filterMap((observed) => observed),
           Stream.runHead,
           Effect.flatMap(Option.match({
-            onNone: () => Effect.die("Local model package observation ended"),
+            onNone: () => new LocalModelMutationFailed({
+              code: "local_model_observation_ended",
+              message: "Local model package observation ended",
+              retryable: true,
+            }),
             onSome: Effect.succeed,
           })),
         )
+    yield* project
     if (outcome._tag === "Failed") return yield* outcome.failure
   })
 
@@ -330,18 +400,15 @@ export const LocalModelPackagesLive: Layer.Layer<
     changes: mirror.changes,
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
-    downloadTarget: (target) => Effect.gen(function* () {
-      const entries = (yield* mirror.get).state.entries
-      yield* Effect.forEach(targetPackages(target), (modelPackage) => {
-        const entry = entries.find((candidate) => candidate.package.id === modelPackage.id)
-        return entry?.localState._tag === "Installed"
-          || entry?.localState._tag === "Downloading"
-          ? Effect.void
-          : startDownload(modelPackage).pipe(Effect.asVoid)
-      }, { concurrency: "unbounded", discard: true })
+    acquireTarget: (target) => Effect.gen(function* () {
+      yield* Effect.forEach(
+        targetPackages(target),
+        (modelPackage) => startDownload(modelPackage).pipe(Effect.asVoid),
+        { concurrency: "unbounded", discard: true },
+      )
       yield* project
+      yield* awaitTargetInstalled(target)
     }),
-    awaitTargetInstalled,
     cancelTargetDownload: (target) => Effect.gen(function* () {
       const entries = (yield* mirror.get).state.entries
       const attempts = targetPackages(target).flatMap((modelPackage) => {

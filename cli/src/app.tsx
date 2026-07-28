@@ -71,16 +71,6 @@ registerCliCommands()
 
 export type { SessionStart }
 
-const mutationFailureMessage = <A, E extends { readonly message: string }>(
-  result: Result.Result<A, E>,
-  fallback: string,
-): string | null => Result.matchWithError(result, {
-  onInitial: () => null,
-  onError: (failure) => failure.message,
-  onDefect: () => fallback,
-  onSuccess: () => null,
-})
-
 export interface CliAppProps {
   sessionStart: SessionStart
   initialPrompt: string | undefined
@@ -256,12 +246,8 @@ function CliAppContent(props: CliAppProps & {
     onFailure: () => null,
     onSuccess: ({ value }) => deriveLocalModelLoadActivity(value, rootSlotId),
   })
-  const cancelDownloadError = mutationFailureMessage(
-    onboardingSetup.cancelDownloadResult,
-    "Could not cancel the model download.",
-  )
   const workflowError = (
-    command: "download" | "assign" | "load" | "complete",
+    command: "download" | "assign" | "load" | "complete" | "cancel" | "clear",
   ): string | null => Result.matchWithError(onboardingSetup.workflowResult, {
     onInitial: () => null,
     onError: (failure) =>
@@ -275,6 +261,7 @@ function CliAppContent(props: CliAppProps & {
   const loadMutationError = workflowError("load")
   const assignmentMutationError = workflowError("assign")
   const completionMutationError = workflowError("complete")
+  const cancelDownloadError = workflowError("cancel") ?? workflowError("clear")
   const completeModelSetup = useCallback(() => {
     void props.updateOnboarding(true)
   }, [props.updateOnboarding])
@@ -361,7 +348,7 @@ function CliAppContent(props: CliAppProps & {
             operation={{
               _tag: 'Downloading',
               candidate: setupView.candidate,
-              cancelling: Result.isWaiting(onboardingSetup.cancelDownloadResult),
+              cancelling: onboardingSetup.cancelling,
               cancelError: cancelDownloadError,
               onCancel: cancelOnboardingModelSetup,
               onRetry: () => selectOnboardingModel({

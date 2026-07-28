@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest"
 import { Effect, Fiber, Option, Ref, Schema, Stream } from "effect"
 import { defineMirroredState } from "@magnitudedev/protocol"
 import { makeIcnObservedState } from "@magnitudedev/icn"
-import { bindMirroredState, MirroredStateChanges, MirroredStateChangesLive, makeMirroredState } from "./mirrored-state"
+import {
+  bindMirroredState,
+  makeMirroredState,
+  makeObservedState,
+  MirroredStateChanges,
+  MirroredStateChangesLive,
+} from "./mirrored-state"
 
 const CountMirror = defineMirroredState("GetTestCount", {
   stateSchema: Schema.Struct({ count: Schema.Number }),
@@ -74,6 +80,26 @@ describe("mirrored state", () => {
 
     expect(result.snapshot).toEqual({ revision: 0, state: { count: 0 } })
     expect(Option.isNone(result.published)).toBe(true)
+  })
+
+  it("does not emit an observed-state change when the state is equivalent", async () => {
+    const snapshots = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const observed = yield* makeObservedState({ count: 0 })
+      const events = yield* observed.changes.pipe(
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.fork,
+      )
+      yield* Effect.yieldNow()
+      yield* observed.setIfChanged({ count: 0 }, (left, right) => left.count === right.count)
+      yield* observed.setIfChanged({ count: 1 }, (left, right) => left.count === right.count)
+      return Array.from(yield* Fiber.join(events))
+    })))
+
+    expect(snapshots).toEqual([
+      { revision: 0, state: { count: 0 } },
+      { revision: 1, state: { count: 1 } },
+    ])
   })
 
   it("binds an authoritative source without copying or re-versioning it", async () => {

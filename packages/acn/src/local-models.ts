@@ -1,6 +1,5 @@
-import { Context, Effect, Either, Layer, Option, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
-  LocalModelMutationFailed,
   LocalModelsMirror,
   type LocalModel,
   type LocalInferenceError,
@@ -74,8 +73,10 @@ const aggregateDownload = (
   )
   if (downloading.length > 0) {
     const stages = downloading.map(({ stage }) => stage)
-    const stage = stages.every((value) => value === "verifying" || value === "publishing")
-      ? "verifying" as const
+    const stage = stages.every((value) => value === stages[0])
+      ? stages[0] ?? "queued"
+      : stages.every((value) => value === "verifying" || value === "publishing")
+        ? "verifying" as const
       : stages.some((value) => value === "downloading")
         ? "downloading" as const
         : stages[0] ?? "queued"
@@ -189,32 +190,12 @@ const aggregatePreparation = (
 export interface LocalModelsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: LocalModelsState }>
-  readonly awaitTargetPrepared: (
-    targetId: ModelOfferingTargetId,
-  ) => Effect.Effect<void, LocalModelMutationFailed>
   readonly target: (
     targetId: ModelOfferingTargetId,
   ) => Effect.Effect<ModelOfferingTarget | undefined, LocalInferenceError>
 }
 
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
-
-export const localModelTargetPreparationOutcome = (
-  state: LocalModelsState,
-  targetId: ModelOfferingTargetId,
-): Option.Option<Either.Either<void, LocalModelMutationFailed>> => {
-  const model = state.models.find((candidate) => candidate.targetId === targetId)
-  if (!model || model.preparation._tag === "NotDownloaded"
-    || model.preparation._tag === "Preparing") {
-    return Option.none()
-  }
-  if (model.preparation._tag === "Unavailable") {
-    return Option.some(Either.left(new LocalModelMutationFailed(
-      model.preparation.failure,
-    )))
-  }
-  return Option.some(Either.right(undefined))
-}
 
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
@@ -375,20 +356,15 @@ export const LocalModelsLive: Layer.Layer<
       }
     }).sort((left, right) => left.displayName.localeCompare(right.displayName))
     const catalogCandidates = recommendationState._tag === "Ready"
-      ? recommendationState.catalog.map((entry) => {
-          const model = models.find(({ targetId }) => targetId === entry.candidate.targetId)
-          const preparation = !model || model.preparation._tag === "NotDownloaded"
-            ? { _tag: "NotDownloaded" as const }
-            : model.preparation._tag === "Preparing"
-              ? { _tag: "Calibrating" as const }
-              : model.preparation._tag === "Available"
-                ? { _tag: "Installed" as const }
-                : { _tag: "Unavailable" as const, failure: model.preparation.failure }
-          return {
-            ...entry.candidate,
-            download: model?.download ?? entry.candidate.download,
-            preparation,
-          }
+      ? recommendationState.catalog.flatMap(({ candidate }) => {
+          const model = models.find(({ targetId }) => targetId === candidate.targetId)
+          return model === undefined
+            ? []
+            : [{
+                ...candidate,
+                download: model.download,
+                preparation: model.preparation,
+              }]
         })
       : []
     const catalogCandidatesById = new Map(
@@ -451,28 +427,6 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     snapshot: mirror.get,
     changes: mirror.changes,
-    awaitTargetPrepared: (targetId) => Effect.gen(function* () {
-      const current = localModelTargetPreparationOutcome(
-        (yield* mirror.get).state,
-        targetId,
-      )
-      const outcome = Option.isSome(current)
-        ? current.value
-        : yield* mirror.changes.pipe(
-            Stream.filterMap(({ state }) =>
-              localModelTargetPreparationOutcome(state, targetId)),
-            Stream.runHead,
-            Effect.flatMap(Option.match({
-              onNone: () => new LocalModelMutationFailed({
-                code: "local_model_observation_ended",
-                message: "Local model preparation observation ended",
-                retryable: true,
-              }),
-              onSome: Effect.succeed,
-            })),
-          )
-      if (Either.isLeft(outcome)) return yield* outcome.left
-    }),
     target: (targetId) => Effect.gen(function* () {
       const recommendationState = (yield* recommendations.snapshot).state
       const recommendation = recommendationState._tag === "Ready"

@@ -128,7 +128,7 @@ const recommendationEntry = {
     profile: offering.configuration.profile,
     downloadBytes: 1,
     download: { _tag: "Downloaded" as const, installedBytes: 1 },
-    preparation: { _tag: "Installed" as const },
+    preparation: { _tag: "Available" as const, providerModelIds: [providerModelId] },
     quantization: "Q4",
     quantizationName: "4-bit",
     memory: [],
@@ -254,8 +254,7 @@ const makeHarness = (options: {
       installedPackageIds: Effect.succeed(
         new Set(options.installed === false ? [] : [packageId]),
       ),
-      downloadTarget: () => Effect.void,
-      awaitTargetInstalled: () => Effect.void,
+      acquireTarget: () => Effect.void,
       cancelTargetDownload: () => Effect.void,
       dismissTargetFailure: () => Effect.void,
       removeTargetPackages: () => Effect.void,

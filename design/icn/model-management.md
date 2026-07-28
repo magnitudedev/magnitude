@@ -8,6 +8,10 @@ applies_to:
   - packages/icn/src/installed/**
   - packages/icn/src/downloads/**
   - packages/acn/src/local-model-packages.ts
+  - packages/acn/src/local-model-recommendations.ts
+  - packages/acn/src/local-models.ts
+  - packages/client-common/src/hooks/use-onboarding-model-setup.ts
+  - packages/protocol/src/schemas/model-state.ts
   - inference/catalog/**
 ---
 
@@ -147,9 +151,12 @@ Successful publication is atomic: incomplete staging is never reported as instal
 the complete package before publication. Interrupted attempts recover as terminal failures or are
 cleaned without leaving a false installed record.
 
-`Completed` is authoritative success for the attempt. While installed-package observation catches
-up, ACN retains a nonterminal target-acquisition projection and refreshes inventory; it never
-reclassifies this convergence interval as an inactive-download failure.
+`Completed` records that the attempt successfully published its exact package. Installed inventory,
+not attempt history, owns whether the package is currently present; a user may remove a package
+after a successful attempt. When ACN observes `Completed`, it refreshes its installed observer
+before deriving the target outcome. If the package is absent, package presentation is
+`NotInstalled`, never 100% active progress or a fabricated failed attempt. A currently waiting
+target-acquisition operation fails because its required installation did not materialize.
 
 ICN owns an accepted attempt independently of the HTTP caller. ACN's download observer periodically
 refreshes even when its last snapshot is idle, then uses the faster active interval until every
@@ -166,9 +173,23 @@ ACN builds `ModelPackageEntry` values by joining:
 - current download attempts.
 
 This join changes only product presentation. The immutable `ModelPackage` value is reused unchanged.
-An entry's local state is `NotInstalled`, `Downloading`, or `Installed`; its last surfaced download
-failure and retained progress are separate. The target-level product projection aggregates progress
-and concurrent transfer rates across every package required by that target.
+One package-acquisition derivation joins installed inventory with the latest relevant attempt and
+produces `NotInstalled`, `Downloading`, `DownloadFailed`, or `Installed`. Both package presentation
+and target acquisition consume that derivation; no waiter independently interprets attempts.
+The target-level product projection aggregates progress and concurrent transfer rates across every
+package required by that target.
+
+Catalog assessment stores only candidate metadata. The final ACN `LocalModels` projection attaches
+the already-derived target download and preparation values to client-ready catalog candidates.
+There are no placeholder candidate lifecycles and no fallback source of target state.
+
+`DownloadModel` is one idempotent target-acquisition operation: it admits missing package attempts
+and waits for their authoritative terminal outcome. Clients do not precompute whether a download is
+required. Observed inventory and attempt snapshots never gate admission; ACN sends the command
+directly to ICN, whose package operation is idempotent. Reconciliation therefore cannot delay the
+start of a download. A frontend flow that composes download, slot assignment, loading, completion, and
+cancellation represents the command and its lifecycle as one composite Effect Atom; React does not
+coordinate those mutation results or copy mirror state.
 
 Installed packages appear even when catalog resolution or assessment is unavailable. Catalog-only
 packages appear as not installed. Download progress does not require inventory-wide reconciliation.
@@ -208,6 +229,12 @@ intentionally outside this cache contract.
 - Installed listing performs no hardware assessment and isolates artifact inspection failures.
 - Draft and MTP execution companions are never listed as standalone installed models.
 - Download failure belongs to one attempt and can be retried with a new attempt.
+- A completed attempt records successful historical publication; installed inventory owns current
+  presence.
+- `Completed` with an absent package projects as `NotInstalled`, never active progress or a failed
+  historical attempt.
+- Target acquisition has one ACN operation and one package-outcome derivation.
+- Composite client workflows are atom-owned and render authoritative mirror state.
 - Package identity is independent of paths and mutable repository refs.
 - Catalog failure does not hide installed packages.
 - User setup never requires network access to reconstruct the curated release catalog.
