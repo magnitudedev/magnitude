@@ -1,21 +1,15 @@
 import { useTheme } from '../hooks/use-theme'
 
-/** Compact Magnitude mark at its exact 22×11 terminal-cell geometry. */
-export const COMPACT_MAGNITUDE_LOGO_WIDTH = 22
-export const COMPACT_MAGNITUDE_LOGO_HEIGHT = 11
+/** Compact Magnitude mark at its exact 9×5 terminal-cell geometry. */
+export const COMPACT_MAGNITUDE_LOGO_WIDTH = 9
+export const COMPACT_MAGNITUDE_LOGO_HEIGHT = 5
 
 export const COMPACT_MAGNITUDE_LOGO_LINES = [
-  '▗▆▆▇██████████████▇▆▆▖',
-  '██▔      ▔▀▀▔      ▔██',
-  '█▌   ▅▅▅▅▖    ▅▅▅▅▖ ▐█',
-  '█▌ ▁▄▟██▀   ▁▄▟██▀  ▐█',
-  '█▌ ▀▘ ▀     ▀▘ ▀    ▐█',
-  '█▌                  ▐█',
-  '█▌      ▀▇▆▆▇▀      ▐█',
-  '██▁                ▁██',
-  '▝▜████████▇▇████████▛▘',
-  '        ▕████▏',
-  '       ▆██████▆',
+  '┏━━━━━━━┓',
+  '┃ ↗   ↗ ┃',
+  '┃   ◡   ┃',
+  '┗━━━┳━━━┛',
+  '   ━┻━',
 ] as const
 
 export function CompactMagnitudeLogo() {
