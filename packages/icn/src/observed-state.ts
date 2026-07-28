@@ -29,16 +29,15 @@ export const makeIcnObservedState = <A, E>(
 
     const refresh = refreshLock.withPermits(1)(Effect.gen(function* () {
       const nextState = yield* read
-      yield* SubscriptionRef.modify(current, (previous) =>
-        previous.initialized && equivalent(previous.snapshot.state, nextState)
-          ? [undefined, previous]
-          : [undefined, {
-              initialized: true,
-              snapshot: {
-                revision: previous.snapshot.revision + 1,
-                state: nextState,
-              },
-            }])
+      const previous = yield* SubscriptionRef.get(current)
+      if (previous.initialized && equivalent(previous.snapshot.state, nextState)) return
+      yield* SubscriptionRef.set(current, {
+        initialized: true,
+        snapshot: {
+          revision: previous.snapshot.revision + 1,
+          state: nextState,
+        },
+      })
     }))
 
     return {

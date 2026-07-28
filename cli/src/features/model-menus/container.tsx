@@ -729,7 +729,7 @@ const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
     return `Downloading ${Math.round(candidate.download.completedBytes / Math.max(1, candidate.download.totalBytes) * 100)}%`
   }
   if (candidate.download._tag === "Failed") return "Download failed"
-  if (candidate.preparation._tag === "Calibrating") return "Calibrating"
+  if (candidate.preparation._tag === "Preparing") return "Calibrating"
   if (candidate.preparation._tag === "Unavailable") return "Unavailable"
   return "Installed"
 }
@@ -780,7 +780,7 @@ const CatalogMenu = memo(function CatalogMenu({
     const actions: ("primary" | "cancel" | "select")[] = []
     if (detail.download._tag === "Downloading") actions.push("cancel")
     else if (detail.download._tag === "Downloaded") {
-      if (detail.preparation._tag === "Installed") actions.push("select")
+      if (detail.preparation._tag === "Available") actions.push("select")
     }
     else actions.push("primary")
     return actions
@@ -794,7 +794,7 @@ const CatalogMenu = memo(function CatalogMenu({
   }, [modelActions])
 
   const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
-    if (candidate.preparation._tag !== "Installed") return
+    if (candidate.preparation._tag !== "Available") return
     void slotActions.assign(PRIMARY_SLOT_ID, {
       providerId: LOCAL_PROVIDER_ID,
       providerModelId: candidate.providerModelId,
@@ -872,7 +872,7 @@ const CatalogMenu = memo(function CatalogMenu({
     } else if (key.name === "d" && cursor) {
       key.preventDefault()
       primaryAction(cursor)
-    } else if (key.name === "s" && cursor && cursor.preparation._tag === "Installed") {
+    } else if (key.name === "s" && cursor && cursor.preparation._tag === "Available") {
       key.preventDefault()
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {

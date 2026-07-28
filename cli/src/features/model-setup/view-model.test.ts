@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
-  onboardingModelDownloadRequired,
-} from "@magnitudedev/client-common"
-import {
   ModelInstanceIdSchema,
   ModelSlotConfiguredLocal,
   PRIMARY_SLOT_ID,
@@ -23,32 +20,6 @@ import {
   deriveOnboardingModelSetupView as deriveOnboardingModelSetupViewFromDomains,
   onboardingModelSetupPlaceholder,
 } from "./view-model"
-
-describe("onboardingModelDownloadRequired", () => {
-  it("skips the download command for an installed target", () => {
-    expect(onboardingModelDownloadRequired(
-      makeView().models,
-      TEST_TARGET_ID,
-    )).toEqual(Option.some(false))
-  })
-
-  it("requires the download command for a target that is not downloaded", () => {
-    const state = makeView({
-      models: [makeModel({
-        download: {
-          _tag: "NotDownloaded",
-          completedBytes: 0,
-          totalBytes: 16,
-        },
-        preparation: { _tag: "NotDownloaded" },
-      })],
-    })
-    expect(onboardingModelDownloadRequired(
-      state.models,
-      TEST_TARGET_ID,
-    )).toEqual(Option.some(true))
-  })
-})
 
 const selection = {
   providerId: LOCAL_PROVIDER_ID,

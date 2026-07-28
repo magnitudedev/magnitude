@@ -460,17 +460,7 @@ export const LocalModelSchema = Schema.Struct({
 })
 export type LocalModel = typeof LocalModelSchema.Type
 
-export const LocalModelCatalogPreparationSchema = Schema.Union(
-  Schema.TaggedStruct("NotDownloaded", {}),
-  Schema.TaggedStruct("Calibrating", {}),
-  Schema.TaggedStruct("Installed", {}),
-  Schema.TaggedStruct("Unavailable", {
-    failure: ModelFailureSchema,
-  }),
-)
-export type LocalModelCatalogPreparation = typeof LocalModelCatalogPreparationSchema.Type
-
-export const LocalModelCatalogCandidateSchema = Schema.Struct({
+export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct({
   id: CatalogCandidateIdSchema,
   targetId: ModelOfferingTargetIdSchema,
   providerModelId: ProviderModelIdSchema,
@@ -479,8 +469,6 @@ export const LocalModelCatalogCandidateSchema = Schema.Struct({
   license: NonEmptyString,
   profile: ServingProfileSchema,
   downloadBytes: NonNegativeSafeInteger,
-  download: LocalModelDownloadSchema,
-  preparation: LocalModelCatalogPreparationSchema,
   quantization: NonEmptyString,
   quantizationName: NonEmptyString,
   memory: Schema.Array(MemoryAssessmentSchema),
@@ -500,6 +488,14 @@ export const LocalModelCatalogCandidateSchema = Schema.Struct({
       sha256: Sha256Digest,
     })),
   })),
+})
+export type LocalModelCatalogCandidateMetadata =
+  typeof LocalModelCatalogCandidateMetadataSchema.Type
+
+export const LocalModelCatalogCandidateSchema = Schema.Struct({
+  ...LocalModelCatalogCandidateMetadataSchema.fields,
+  download: LocalModelDownloadSchema,
+  preparation: LocalModelPreparationSchema,
 })
 export type LocalModelCatalogCandidate = typeof LocalModelCatalogCandidateSchema.Type
 

@@ -386,9 +386,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
                 retryable: false,
               })
             }
-            yield* localModelPackages.downloadTarget(target)
-            yield* localModelPackages.awaitTargetInstalled(target)
-            yield* localModels.awaitTargetPrepared(targetId)
+            yield* localModelPackages.acquireTarget(target)
             return {}
           }),
         ),

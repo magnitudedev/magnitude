@@ -61,22 +61,18 @@ export function OnboardingModelDownloadDetails({
   const download = candidate.download
   const downloading = download._tag === "Downloading"
   const failed = download._tag === "Failed"
-  const preparing = download._tag === "Downloaded" && candidate.preparation._tag === "Calibrating"
-  const cancelable = downloading || preparing
+  const cancelable = downloading
   const fraction = downloading
     ? download.completedBytes / Math.max(1, download.totalBytes)
-    : preparing ? 1 : 0
+    : 0
   const percentage = Math.round(Math.max(0, Math.min(1, fraction)) * 100)
   const percentageLabel = `${percentage}%`
   const barWidth = Math.max(8, contentWidth - percentageLabel.length - 2)
   const heading = failed
     ? `Couldn’t download ${candidate.displayName} · ${candidate.quantization}`
-    : preparing
-    ? `Preparing ${candidate.displayName} · ${candidate.quantization}`
     : `Downloading ${candidate.displayName} · ${candidate.quantization}`
   const rate = downloading ? Option.getOrNull(download.bytesPerSecond) : null
   const detail = useMemo(() => {
-    if (preparing) return "Preparing this model for your machine…"
     if (failed) return download.failure.message
     if (!downloading) return null
     if (download.stage === "verifying" || download.stage === "publishing") {
@@ -84,7 +80,7 @@ export function OnboardingModelDownloadDetails({
     }
     if (rate === null || rate <= 0) return "Estimating time remaining…"
     return `${formatRate(rate)} · ${formatEta(download.totalBytes - download.completedBytes, rate)}`
-  }, [download, downloading, failed, preparing, rate])
+  }, [download, downloading, failed, rate])
 
   const declineCancellation = useCallback(() => {
     setConfirming(false)

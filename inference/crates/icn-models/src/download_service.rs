@@ -7,9 +7,8 @@ use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use getrandom::fill;
 use icn_contracts::models::{
-    DownloadAttempt, DownloadAttemptId, InstalledModelPackages, ModelDownloads,
-    ModelDownloadsResponse, ModelFailure, ModelFileRelationship, ModelFileRole, ModelPackage,
-    ModelPackageSource,
+    DownloadAttempt, DownloadAttemptId, ModelDownloads, ModelDownloadsResponse, ModelFailure,
+    ModelFileRelationship, ModelFileRole, ModelPackage, ModelPackageSource,
     StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{
@@ -40,48 +39,22 @@ impl ManagedModelDownloads {
     pub async fn open(manager: Arc<ModelManager>) -> Result<Self, InventoryError> {
         let path = manager.config.root.join("download-attempts.json");
         let mut records = load_records(&path);
-        let installed = manager
-            .list_installed()
-            .await?
-            .packages
-            .into_iter()
-            .map(|entry| entry.package.id)
-            .collect::<std::collections::BTreeSet<_>>();
         for record in records.values_mut() {
             let interrupted = matches!(
                 record.attempt,
                 DownloadAttempt::Pending { .. } | DownloadAttempt::Downloading { .. }
             );
-            let completed_without_package = matches!(
-                record.attempt,
-                DownloadAttempt::Completed { .. }
-            ) && !installed.contains(&record.package.id);
-            if interrupted || completed_without_package {
+            if interrupted {
                 let (id, package_id) = attempt_identity(&record.attempt);
-                let (completed_bytes, total_bytes) = if completed_without_package {
-                    let total = record.package.files.iter().map(|file| file.size_bytes).sum();
-                    (total, total)
-                } else {
-                    attempt_progress(&record.attempt)
-                };
+                let (completed_bytes, total_bytes) = attempt_progress(&record.attempt);
                 record.attempt = DownloadAttempt::Failed {
                     id,
                     package_id,
                     completed_bytes,
                     total_bytes,
                     failure: ModelFailure {
-                        code: if completed_without_package {
-                            "completed_package_missing"
-                        } else {
-                            "interrupted"
-                        }
-                        .to_owned(),
-                        message: if completed_without_package {
-                            "download completed but the package is not installed"
-                        } else {
-                            "download was interrupted when ICN stopped"
-                        }
-                        .to_owned(),
+                        code: "interrupted".to_owned(),
+                        message: "download was interrupted when ICN stopped".to_owned(),
                         retryable: true,
                     },
                 };

@@ -121,12 +121,14 @@ export const makeObservedState = <State>(initial: State): Effect.Effect<Observed
     return {
       get: SubscriptionRef.get(state),
       changes: state.changes,
-      setIfChanged: (nextState, equivalent) => lock.withPermits(1)(
-        SubscriptionRef.modify(state, (current) =>
-          equivalent(current.state, nextState)
-            ? [undefined, current]
-            : [undefined, { revision: current.revision + 1, state: nextState }]),
-      ),
+      setIfChanged: (nextState, equivalent) => lock.withPermits(1)(Effect.gen(function* () {
+        const current = yield* SubscriptionRef.get(state)
+        if (equivalent(current.state, nextState)) return
+        yield* SubscriptionRef.set(state, {
+          revision: current.revision + 1,
+          state: nextState,
+        })
+      })),
     }
   })
 
