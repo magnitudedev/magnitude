@@ -17,11 +17,13 @@ describe('startup header', () => {
   it('preserves the complete compact mark at its verified cell geometry', () => {
     expect(COMPACT_MAGNITUDE_LOGO_LINES).toHaveLength(COMPACT_MAGNITUDE_LOGO_HEIGHT)
     expect(Math.max(...COMPACT_MAGNITUDE_LOGO_LINES.map((line) => stringWidth(line)))).toBe(COMPACT_MAGNITUDE_LOGO_WIDTH)
-    expect(COMPACT_MAGNITUDE_LOGO_LINES[0]).toBe('▗▆▆▇██████████████▇▆▆▖')
-    expect(COMPACT_MAGNITUDE_LOGO_LINES[2]).toBe('█▌   ▅▅▅▅▖    ▅▅▅▅▖ ▐█')
-    expect(COMPACT_MAGNITUDE_LOGO_LINES[3]).toBe('█▌ ▁▄▟██▀   ▁▄▟██▀  ▐█')
-    expect(COMPACT_MAGNITUDE_LOGO_LINES[4]).toBe('█▌ ▀▘ ▀     ▀▘ ▀    ▐█')
-    expect(COMPACT_MAGNITUDE_LOGO_LINES.at(-1)).toBe('       ▆██████▆')
+    expect(COMPACT_MAGNITUDE_LOGO_LINES).toEqual([
+      '┏━━━━━━━┓',
+      '┃ ↗   ↗ ┃',
+      '┃   ◡   ┃',
+      '┗━━━┳━━━┛',
+      '   ━┻━',
+    ])
   })
 
   it('uses two columns at standard terminal widths', async () => {
@@ -33,11 +35,11 @@ describe('startup header', () => {
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
       const lines = frame.split('\n')
-      expect(lines[0]?.indexOf('Magnitude')).toBe(25)
+      expect(lines[0]?.indexOf('Magnitude')).toBe(12)
       expect(frame).toContain('Current directory: ~/magnitude')
       const recentRow = lines.findIndex((line) => line.includes('Recent'))
-      expect(recentRow).toBe(12)
-      expect(lines[11]?.trim()).toBe('')
+      expect(recentRow).toBe(6)
+      expect(lines[5]?.trim()).toBe('')
     } finally {
       await act(async () => view.renderer.destroy())
     }
@@ -51,8 +53,8 @@ describe('startup header', () => {
     try {
       await act(view.renderOnce)
       const lines = view.captureCharFrame().split('\n')
-      expect(lines.findIndex((line) => line.includes('Magnitude'))).toBe(12)
-      expect(lines[12]?.indexOf('Magnitude')).toBe(1)
+      expect(lines.findIndex((line) => line.includes('Magnitude'))).toBe(6)
+      expect(lines[6]?.indexOf('Magnitude')).toBe(1)
     } finally {
       await act(async () => view.renderer.destroy())
     }
