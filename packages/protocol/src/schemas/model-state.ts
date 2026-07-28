@@ -73,6 +73,9 @@ export const ModelDownloadStageSchema = Schema.Literal(
 )
 export type ModelDownloadStage = typeof ModelDownloadStageSchema.Type
 
+export const ModelInstanceIdSchema = NonEmptyString.pipe(Schema.brand("ModelInstanceId"))
+export type ModelInstanceId = typeof ModelInstanceIdSchema.Type
+
 export const SpeculativeDecodingPairIdSchema =
   NonEmptyString.pipe(Schema.brand("SpeculativeDecodingPairId"))
 export type SpeculativeDecodingPairId = typeof SpeculativeDecodingPairIdSchema.Type
@@ -84,6 +87,38 @@ export type ModelOfferingTargetId = typeof ModelOfferingTargetIdSchema.Type
 export const ModelServingConfigurationIdSchema =
   NonEmptyString.pipe(Schema.brand("ModelServingConfigurationId"))
 export type ModelServingConfigurationId = typeof ModelServingConfigurationIdSchema.Type
+
+export const ModelLoadPreviewSchema = Schema.Struct({
+  contextWindowTokens: PositiveSafeInteger,
+  parallelSequences: PositiveSafeInteger,
+  physicalContextTokens: PositiveSafeInteger,
+  requiredSystemMemoryBytes: NonNegativeSafeInteger,
+})
+export type ModelLoadPreview = typeof ModelLoadPreviewSchema.Type
+
+export const ModelInstanceAllocationSchema = Schema.Struct({
+  contextWindowTokens: PositiveSafeInteger,
+  parallelSequences: PositiveSafeInteger,
+  physicalContextTokens: PositiveSafeInteger,
+  memoryDomains: Schema.Array(Schema.Struct({
+    memoryDomainId: LocalInferenceMemoryDomainIdSchema,
+    modelBytes: NonNegativeSafeInteger,
+    contextBytes: NonNegativeSafeInteger,
+    computeBytes: NonNegativeSafeInteger,
+    auxiliaryBytes: NonNegativeSafeInteger,
+  })),
+})
+export type ModelInstanceAllocation = typeof ModelInstanceAllocationSchema.Type
+
+export const ModelStoppingAllocationSchema = Schema.Union(
+  Schema.TaggedStruct("Planned", {
+    allocation: Schema.optionalWith(ModelLoadPreviewSchema, { as: "Option", exact: true }),
+  }),
+  Schema.TaggedStruct("Resident", {
+    allocation: ModelInstanceAllocationSchema,
+  }),
+)
+export type ModelStoppingAllocation = typeof ModelStoppingAllocationSchema.Type
 
 export const RecommendableModelIdSchema =
   NonEmptyString.pipe(Schema.brand("RecommendableModelId"))
@@ -254,7 +289,7 @@ export const DownloadAttemptSchema = Schema.Union(
     stage: ModelDownloadStageSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
-    bytesPerSecond: Schema.NullOr(NonNegativeSafeInteger),
+    bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Completed", {
     id: DownloadAttemptIdSchema,
@@ -363,7 +398,7 @@ export type FitsOfferingAssessment = typeof FitsOfferingAssessmentSchema.Type
 
 export const RecommendationSchema = Schema.Struct({
   id: RecommendationIdSchema,
-  modelId: ModelOfferingTargetIdSchema,
+  targetId: ModelOfferingTargetIdSchema,
   recommendableModelId: RecommendableModelIdSchema,
   displayName: NonEmptyString,
   description: Schema.String,
@@ -410,7 +445,7 @@ export const LocalModelPreparationSchema = Schema.Union(
 export type LocalModelPreparation = typeof LocalModelPreparationSchema.Type
 
 export const LocalModelSchema = Schema.Struct({
-  id: ModelOfferingTargetIdSchema,
+  targetId: ModelOfferingTargetIdSchema,
   catalogCandidateIds: Schema.Array(CatalogCandidateIdSchema),
   providerModelIds: Schema.Array(ProviderModelIdSchema),
   displayName: NonEmptyString,
@@ -436,6 +471,7 @@ export type LocalModelCatalogPreparation = typeof LocalModelCatalogPreparationSc
 
 export const LocalModelCatalogCandidateSchema = Schema.Struct({
   id: CatalogCandidateIdSchema,
+  targetId: ModelOfferingTargetIdSchema,
   providerModelId: ProviderModelIdSchema,
   displayName: NonEmptyString,
   description: Schema.String,
@@ -563,7 +599,7 @@ export type LocalProviderOfferingOrigin = typeof LocalProviderOfferingOriginSche
 
 export const LocalProviderOfferingSchema = Schema.Struct({
   providerModelId: ProviderModelIdSchema,
-  modelId: ModelOfferingTargetIdSchema,
+  targetId: ModelOfferingTargetIdSchema,
   configuration: ModelServingConfigurationSchema,
   origin: LocalProviderOfferingOriginSchema,
   capabilities: ModelCapabilitiesSchema,
@@ -707,73 +743,127 @@ export const SlotSelectionSchema = Schema.Struct({
 })
 export type SlotSelection = typeof SlotSelectionSchema.Type
 
-export const ModelSlotBlockedReasonSchema = Schema.Union(
-  Schema.TaggedStruct("ProviderUnavailable", { message: Schema.String }),
-  Schema.TaggedStruct("ModelUnavailable", { message: Schema.String }),
-  Schema.TaggedStruct("InvalidConfiguration", { message: Schema.String }),
-  Schema.TaggedStruct("LocalModelLoadFailed", { error: ModelFailureSchema }),
-  Schema.TaggedStruct("LocalModelRuntimeLost", { error: ModelFailureSchema }),
-  Schema.TaggedStruct("LocalModelStoppedLowMemory", { error: ModelFailureSchema }),
-)
-export type ModelSlotBlockedReason = typeof ModelSlotBlockedReasonSchema.Type
-
 export class ModelSlotUnassigned extends Schema.TaggedClass<ModelSlotUnassigned>()("Unassigned", {
   slotId: SlotIdSchema,
 }) {}
-export class ModelSlotUnloadedLocalModel extends Schema.TaggedClass<ModelSlotUnloadedLocalModel>()("UnloadedLocalModel", {
+
+export const ModelSlotDescriptorSchema = Schema.Struct({
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
+  displayName: NonEmptyString,
+})
+export type ModelSlotDescriptor = typeof ModelSlotDescriptorSchema.Type
+
+export const ModelSlotAvailabilitySchema = Schema.Union(
+  Schema.TaggedStruct("Available", {}),
+  Schema.TaggedStruct("Unavailable", { failure: ModelFailureSchema }),
+)
+export type ModelSlotAvailability = typeof ModelSlotAvailabilitySchema.Type
+
+export const ModelLoadReadinessSchema = Schema.Union(
+  Schema.TaggedStruct("Assessing", {}),
+  Schema.TaggedStruct("Loadable", { allocation: ModelLoadPreviewSchema }),
+  Schema.TaggedStruct("Unavailable", { failure: ModelFailureSchema }),
+)
+export type ModelLoadReadiness = typeof ModelLoadReadinessSchema.Type
+
+export const ModelSlotInstanceLifecycleSchema = Schema.Union(
+  Schema.TaggedStruct("Loading", {
+    stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
+    progress: Schema.optionalWith(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)), {
+      as: "Option",
+      exact: true,
+    }),
+    plannedAllocation: Schema.optionalWith(ModelLoadPreviewSchema, { as: "Option", exact: true }),
+  }),
+  Schema.TaggedStruct("Ready", { allocation: ModelInstanceAllocationSchema }),
+  Schema.TaggedStruct("Stopping", {
+    reason: Schema.Literal("explicit_stop", "replacement", "idle_timeout", "memory_pressure", "shutdown"),
+    allocation: ModelStoppingAllocationSchema,
+  }),
+  Schema.TaggedStruct("Stopped", {
+    reason: Schema.Literal("explicit_stop", "replacement", "idle_timeout", "memory_pressure", "shutdown"),
+  }),
+  Schema.TaggedStruct("Failed", { failure: ModelFailureSchema }),
+)
+export type ModelSlotInstanceLifecycle = typeof ModelSlotInstanceLifecycleSchema.Type
+
+export const ModelSlotInstanceSchema = Schema.Struct({
+  id: ModelInstanceIdSchema,
+  configurationId: ModelServingConfigurationIdSchema,
+  lifecycle: ModelSlotInstanceLifecycleSchema,
+})
+export type ModelSlotInstance = typeof ModelSlotInstanceSchema.Type
+
+export const ModelSlotActionSchema = Schema.Literal("Load", "Stop", "RetryLoad")
+export type ModelSlotAction = typeof ModelSlotActionSchema.Type
+
+export class ModelSlotConfiguredRemote extends Schema.TaggedClass<ModelSlotConfiguredRemote>()("ConfiguredRemote", {
   slotId: SlotIdSchema,
   selection: SlotSelectionSchema,
+  descriptor: ModelSlotDescriptorSchema,
+  availability: ModelSlotAvailabilitySchema,
+  actions: Schema.Array(ModelSlotActionSchema),
 }) {}
-export class ModelSlotLoadingLocalModel extends Schema.TaggedClass<ModelSlotLoadingLocalModel>()("LoadingLocalModel", {
+
+export class ModelSlotConfiguredLocal extends Schema.TaggedClass<ModelSlotConfiguredLocal>()("ConfiguredLocal", {
   slotId: SlotIdSchema,
   selection: SlotSelectionSchema,
-  percentage: PercentageSchema,
-}) {}
-export class ModelSlotReady extends Schema.TaggedClass<ModelSlotReady>()("Ready", {
-  slotId: SlotIdSchema,
-  selection: SlotSelectionSchema,
-}) {}
-export class ModelSlotUnloadingLocalModel extends Schema.TaggedClass<ModelSlotUnloadingLocalModel>()("UnloadingLocalModel", {
-  slotId: SlotIdSchema,
-  selection: SlotSelectionSchema,
-}) {}
-export class ModelSlotBlocked extends Schema.TaggedClass<ModelSlotBlocked>()("Blocked", {
-  slotId: SlotIdSchema,
-  selection: SlotSelectionSchema,
-  reason: ModelSlotBlockedReasonSchema,
+  descriptor: ModelSlotDescriptorSchema,
+  availability: ModelSlotAvailabilitySchema,
+  readiness: ModelLoadReadinessSchema,
+  instance: Schema.optionalWith(ModelSlotInstanceSchema, { as: "Option", exact: true }),
+  actions: Schema.Array(ModelSlotActionSchema),
 }) {}
 
 export const ModelSlotLifecycle = defineFSM(
   {
     Unassigned: ModelSlotUnassigned,
-    UnloadedLocalModel: ModelSlotUnloadedLocalModel,
-    LoadingLocalModel: ModelSlotLoadingLocalModel,
-    Ready: ModelSlotReady,
-    UnloadingLocalModel: ModelSlotUnloadingLocalModel,
-    Blocked: ModelSlotBlocked,
+    ConfiguredRemote: ModelSlotConfiguredRemote,
+    ConfiguredLocal: ModelSlotConfiguredLocal,
   },
   {
-    Unassigned: ["UnloadedLocalModel", "LoadingLocalModel", "Ready", "UnloadingLocalModel", "Blocked"],
-    UnloadedLocalModel: ["Unassigned", "LoadingLocalModel", "Ready", "Blocked"],
-    LoadingLocalModel: ["Unassigned", "Ready", "UnloadedLocalModel", "UnloadingLocalModel", "Blocked"],
-    Ready: ["Unassigned", "UnloadingLocalModel", "UnloadedLocalModel", "Blocked"],
-    UnloadingLocalModel: ["Unassigned", "UnloadedLocalModel", "LoadingLocalModel", "Ready", "Blocked"],
-    Blocked: ["Unassigned", "UnloadedLocalModel", "LoadingLocalModel", "Ready"],
+    Unassigned: ["ConfiguredRemote", "ConfiguredLocal"],
+    ConfiguredRemote: ["Unassigned", "ConfiguredLocal"],
+    ConfiguredLocal: ["Unassigned", "ConfiguredRemote"],
   } as const,
 )
 
 export const ModelSlotSchema = Schema.Union(
   ModelSlotUnassigned,
-  ModelSlotUnloadedLocalModel,
-  ModelSlotLoadingLocalModel,
-  ModelSlotReady,
-  ModelSlotUnloadingLocalModel,
-  ModelSlotBlocked,
-).pipe(Schema.filter((slot) => slot._tag === "Unassigned"
-  || slot._tag === "Ready"
-  || slot._tag === "Blocked"
-  || slot.selection.providerId === "local",
-{ message: () => "local-model slot states require the local provider" }))
+  ModelSlotConfiguredRemote,
+  ModelSlotConfiguredLocal,
+).pipe(Schema.filter((slot) => {
+  if (slot._tag === "Unassigned") return true
+  if (slot.selection.providerId !== slot.descriptor.providerId
+    || slot.selection.providerModelId !== slot.descriptor.providerModelId) return false
+  if (slot._tag === "ConfiguredRemote") {
+    return slot.selection.providerId !== "local" && slot.actions.length === 0
+  }
+  if (slot.selection.providerId !== "local") return false
+  const expectedActions: readonly ModelSlotAction[] = slot.availability._tag === "Available"
+    ? Option.match(slot.instance, {
+        onNone: () => slot.readiness._tag === "Loadable" ? ["Load"] : [],
+        onSome: (instance) => {
+          switch (instance.lifecycle._tag) {
+            case "Loading":
+            case "Ready":
+              return ["Stop"]
+            case "Failed":
+              return instance.lifecycle.failure.retryable && slot.readiness._tag === "Loadable"
+                ? ["RetryLoad"]
+                : []
+            case "Stopping":
+              return []
+            case "Stopped":
+              return slot.readiness._tag === "Loadable" ? ["Load"] : []
+          }
+        },
+      })
+    : []
+  return expectedActions.length === slot.actions.length
+    && expectedActions.every((action, index) => action === slot.actions[index])
+}, { message: () => "slot identity, provider kind, and actions must agree with canonical slot state" }))
 export type ModelSlot = typeof ModelSlotSchema.Type
 
 export const ModelSlotsStateSchema = Schema.Struct({
@@ -791,13 +881,21 @@ export const ModelSlotsStateSchema = Schema.Struct({
     && state.slots.secondary.slotId === SECONDARY_SLOT_ID,
   { message: () => "each model slot state must carry its containing slot identity" }),
   Schema.filter((state) => {
-    const activeLocalModels = [state.slots.primary, state.slots.secondary].flatMap((slot) =>
-      (slot._tag === "LoadingLocalModel" || slot._tag === "Ready" || slot._tag === "UnloadingLocalModel")
-        && slot.selection.providerId === "local"
-        ? [slot.selection.providerModelId]
-        : [])
-    return new Set(activeLocalModels).size <= 1
-  }, { message: () => "at most one distinct local model may be active" }),
+    const local = [state.slots.primary, state.slots.secondary].filter(
+      (slot): slot is ModelSlotConfiguredLocal => slot._tag === "ConfiguredLocal",
+    )
+    const instanceIdsByConfiguration = new Map<string, Set<ModelInstanceId>>()
+    for (const slot of local) {
+      if (Option.isNone(slot.instance)) continue
+      const instance = slot.instance.value
+      const ids = instanceIdsByConfiguration.get(instance.configurationId) ?? new Set<ModelInstanceId>()
+      ids.add(instance.id)
+      instanceIdsByConfiguration.set(instance.configurationId, ids)
+    }
+    return [...instanceIdsByConfiguration.values()].every((ids) => ids.size === 1)
+  }, {
+    message: () => "matching local slots must share one canonical model instance",
+  }),
 )
 export type ModelSlotsState = typeof ModelSlotsStateSchema.Type
 
@@ -828,27 +926,6 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   abortReserveBytes: NonNegativeSafeInteger,
   accelerators: Schema.Array(LocalInferenceAcceleratorSchema),
   memoryDomains: Schema.Array(LocalInferenceMemoryDomainSchema),
-  residentMemory: Schema.optionalWith(Schema.Struct({
-    domains: Schema.Array(Schema.Struct({
-      memoryDomainId: LocalInferenceMemoryDomainIdSchema,
-      modelBytes: NonNegativeSafeInteger,
-      contextBytes: NonNegativeSafeInteger,
-      computeBytes: NonNegativeSafeInteger,
-      auxiliaryBytes: NonNegativeSafeInteger,
-    })),
-  }), { as: "Option", exact: true }),
-  residentRuntime: Schema.optionalWith(Schema.Struct({
-    configurationId: NonEmptyString,
-    contextWindowTokens: PositiveSafeInteger,
-    parallelSequences: PositiveSafeInteger,
-    physicalContextTokens: PositiveSafeInteger,
-  }), { as: "Option", exact: true }),
-  runtimeFailure: Schema.optionalWith(Schema.Struct({
-    modelId: NonEmptyString,
-    code: NonEmptyString,
-    message: NonEmptyString,
-    retryable: Schema.Boolean,
-  }), { as: "Option", exact: true }),
 }).pipe(Schema.filter((hardware) => {
   const memoryDomainIds = hardware.memoryDomains.map(({ memoryDomainId }) => memoryDomainId)
   const acceleratorIds = hardware.accelerators.map(({ acceleratorId }) => acceleratorId)
@@ -856,10 +933,5 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   return domains.size === memoryDomainIds.length
     && new Set(acceleratorIds).size === acceleratorIds.length
     && hardware.accelerators.every(({ memoryDomainId }) => domains.has(memoryDomainId))
-    && Option.match(hardware.residentMemory, {
-      onNone: () => true,
-      onSome: ({ domains: residentDomains }) =>
-        residentDomains.every(({ memoryDomainId }) => domains.has(memoryDomainId)),
-    })
 }, { message: () => "hardware identities must be unique and accelerator memory-domain references must resolve" }))
 export type LocalInferenceHardware = typeof LocalInferenceHardwareSchema.Type

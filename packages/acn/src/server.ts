@@ -20,7 +20,7 @@ import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
 import { ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderCredentialsLive } from "./provider-credentials"
-import { ModelSlotCoordinatorLive } from "./model-slot-coordinator"
+import { ModelSlotControllerLive } from "./model-slot-controller"
 import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
 import { ProviderClientRegistryLive, SharedProviderClientLive } from "./shared-client"
 import { ActiveSessionStatusesLive } from "./active-session-statuses"
@@ -46,12 +46,11 @@ import { LocalModelEvaluationsLive } from "./local-model-evaluations"
 import { LocalModelPackagesLive } from "./local-model-packages"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
-import { LocalModelRuntimeLive } from "./local-model-runtime"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
 import { LocalProviderOfferingProjectionLive } from "./local-provider-offering-projection"
 import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
-import { OnboardingLive, OnboardingModelActivationLive } from "./onboarding"
+import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
@@ -248,14 +247,10 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
   const withCatalog = Layer.provideMerge(ProviderModelCatalogLive, withSharedClient)
   const withCredentials = Layer.provideMerge(ProviderCredentialsLive, withCatalog)
   const withCloudUsage = Layer.provideMerge(MagnitudeCloudUsageLive, withCredentials)
-  const withModelSlots = Layer.provideMerge(ModelSlotCoordinatorLive, withCloudUsage)
-  const withOnboardingModelActivation = Layer.provideMerge(
-    OnboardingModelActivationLive,
-    withModelSlots,
-  )
+  const withModelSlots = Layer.provideMerge(ModelSlotControllerLive, withCloudUsage)
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
-    withOnboardingModelActivation,
+    withModelSlots,
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
@@ -280,8 +275,7 @@ const addLocalInferenceServices = <A, E, R>(
     makeLocalModelRecommendationsLive(dataDir),
     withOfferingProjection,
   )
-  const withRuntime = Layer.provideMerge(LocalModelRuntimeLive, withRecommendations)
-  const withAutoSetup = Layer.provideMerge(LocalModelAutoSetupLive, withRuntime)
+  const withAutoSetup = Layer.provideMerge(LocalModelAutoSetupLive, withRecommendations)
   const withLocalModels = Layer.provideMerge(LocalModelsLive, withAutoSetup)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)
   const withResolver = Layer.provideMerge(LocalProviderResolverLive, withOnboarding)

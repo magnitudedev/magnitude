@@ -11,6 +11,7 @@ import {
   makeIcnProcess,
   makeIcnHardware,
   makeIcnInstalledModels,
+  IcnInstancesLive,
   IcnStorageConfig,
 } from "@magnitudedev/icn"
 import { ACN_VERSION } from "../version"
@@ -107,6 +108,7 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const withHardware = Layer.provideMerge(makeIcnHardware(), withClient)
   const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware)
   const withInstalled = Layer.provideMerge(makeIcnInstalledModels(), withCatalog)
-  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withInstalled)
+  const withInstances = Layer.provideMerge(IcnInstancesLive, withInstalled)
+  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withInstances)
   return withDownloads.pipe(Layer.orDie)
 }

@@ -46,7 +46,7 @@ export interface LocalModelAssessmentRequest {
 export type LocalModelAssessmentResult =
   | {
       readonly _tag: "Assessed"
-      readonly modelId: ModelOfferingTargetId
+      readonly targetId: ModelOfferingTargetId
       readonly assessments: readonly LocalModelAssessment[]
     }
   | { readonly _tag: "InvalidTarget"; readonly message: string }
@@ -116,13 +116,13 @@ export interface LocalModelEvaluationsApi {
     target: ModelOfferingTarget,
     profiles: readonly ServingProfile[],
   ) => Effect.Effect<{
-    readonly modelId: ModelOfferingTargetId
+    readonly targetId: ModelOfferingTargetId
     readonly assessments: readonly LocalModelAssessment[]
   }, LocalInferenceError>
   readonly fit: (
     target: ModelOfferingTarget,
   ) => Effect.Effect<{
-    readonly modelId: ModelOfferingTargetId
+    readonly targetId: ModelOfferingTargetId
     readonly configuration: ModelServingConfiguration
     readonly assessment: FitsOfferingAssessment
   }, LocalInferenceError>
@@ -190,7 +190,7 @@ export const LocalModelEvaluationsLive: Layer.Layer<
         }
         results.push({
           _tag: "Assessed",
-          modelId: ModelOfferingTargetIdSchema.make(String(result.targetId)),
+          targetId: ModelOfferingTargetIdSchema.make(String(result.targetId)),
           assessments: yield* Effect.all(result.profiles.map(assessmentFromIcn)),
         })
       }
@@ -250,7 +250,7 @@ export const LocalModelEvaluationsLive: Layer.Layer<
         profile: yield* servingProfileFromIcn(result.configuration.profile),
       })
       return {
-        modelId: ModelOfferingTargetIdSchema.make(String(result.targetId)),
+        targetId: ModelOfferingTargetIdSchema.make(String(result.targetId)),
         configuration,
         assessment: yield* fitAssessment(result.assessment),
       }

@@ -1,9 +1,11 @@
 import { memo, useSyncExternalStore } from 'react'
 import { Option } from 'effect'
+import { TextAttributes } from '@opentui/core'
 import type {
   DisplayActorWork,
   DisplayModelRequestActivity,
   InterruptedMessage,
+  ModelInstanceId,
 } from '@magnitudedev/sdk'
 import { useTheme } from '../../hooks/use-theme'
 import {
@@ -16,6 +18,7 @@ import {
 } from '@magnitudedev/client-common'
 import { red } from '../../utils/theme'
 import { modelRequestProgressSegments } from '../chat-timeline/model-request-progress'
+import { Button } from '../../components/button'
 
 const WORKING_PULSE_COLORS = [
   slate[100], slate[200], slate[300], slate[400], slate[500],
@@ -41,6 +44,7 @@ interface ActivityRailProps {
   work: DisplayActorWork | null
   width: number
   modelLoadActivity: LocalModelLoadActivity | null
+  onStopModel: (instanceId: ModelInstanceId) => void
   modelRequestActivity: DisplayModelRequestActivity | null
   interruptedMessage?: InterruptedMessage | null
   advisorModelName?: string | null
@@ -60,6 +64,7 @@ export const ActivityRail = memo(function ActivityRail({
   work,
   width,
   modelLoadActivity,
+  onStopModel,
   modelRequestActivity,
   interruptedMessage,
   advisorModelName,
@@ -83,21 +88,40 @@ export const ActivityRail = memo(function ActivityRail({
   const loadingBrailleIndex = tick % BRAILLE_FRAMES.length
 
   if (modelLoadActivity !== null) {
-    if (modelLoadActivity._tag === "Blocked") {
+    const instance = Option.getOrThrow(modelLoadActivity.instance)
+    if (instance.lifecycle._tag === "Failed") {
       return (
         <box style={{ height: 1, flexShrink: 0 }}>
           <text style={{ fg: theme.warning }}>{LOW_MEMORY_MODEL_STOPPED_MESSAGE}</text>
         </box>
       )
     }
+    if (instance.lifecycle._tag === "Stopping") {
+      return (
+        <box style={{ height: 1, flexShrink: 0 }}>
+          <text>
+            <span style={{ fg: theme.muted }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
+            {' '}
+            <span style={{ fg: theme.muted }}>Stopping model…</span>
+          </text>
+        </box>
+      )
+    }
     return (
-      <box style={{ height: 1, flexShrink: 0 }}>
+      <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
         <text>
           <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
           {' '}
           <span style={{ fg: theme.foreground }}>Loading model into memory</span>
-          <span style={{ fg: theme.muted }}>{` · ${modelLoadActivity.percentage}%`}</span>
+          <span style={{ fg: theme.muted }}>{` · ${Math.round(
+            Option.getOrElse(instance.lifecycle._tag === "Loading"
+              ? instance.lifecycle.progress
+              : Option.none(), () => 0) * 100,
+          )}%`}</span>
         </text>
+        <Button onClick={() => onStopModel(instance.id)}>
+          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{'  Stop'}</text>
+        </Button>
       </box>
     )
   }

@@ -1,5 +1,9 @@
 import { Option } from "effect"
-import type { LocalInferenceHardware, LocalInferenceMemoryDomainId } from "@magnitudedev/sdk"
+import type {
+  LocalInferenceHardware,
+  LocalInferenceMemoryDomainId,
+  ModelInstanceAllocation,
+} from "@magnitudedev/sdk"
 
 export type HardwareMemoryBreakdownStatus =
   | "complete"
@@ -19,7 +23,7 @@ export interface HardwareMemoryDomainView {
   readonly freeBytes: number | null
   readonly status: HardwareMemoryBreakdownStatus
   readonly notice: string | null
-  readonly participatesInRuntime: boolean
+  readonly participatesInModelServing: boolean
 }
 
 export interface HardwareMemoryView {
@@ -50,17 +54,19 @@ export interface HardwareMemoryViewOptions {
 
 export const deriveHardwareMemoryView = (
   hardware: LocalInferenceHardware,
+  modelAllocation: Option.Option<ModelInstanceAllocation>,
   options: HardwareMemoryViewOptions = {},
 ): HardwareMemoryView => {
-  const allocations = new Map(Option.match(hardware.residentMemory, {
+  const allocations = new Map(Option.match(modelAllocation, {
     onNone: () => [],
-    onSome: ({ domains }) => domains.map((domain) => [domain.memoryDomainId, domain] as const),
+    onSome: ({ memoryDomains }) =>
+      memoryDomains.map((domain) => [domain.memoryDomainId, domain] as const),
   }))
-  const explicitFallbackIds = Option.isSome(hardware.residentMemory)
+  const explicitFallbackIds = Option.isSome(modelAllocation)
     ? []
     : options.participatingDomainIds ?? []
   const acceleratorDomainIds = hardware.accelerators.map(({ memoryDomainId }) => memoryDomainId)
-  const fallbackRuntimeDomainIds = new Set(explicitFallbackIds.length > 0
+  const fallbackModelServingDomainIds = new Set(explicitFallbackIds.length > 0
     ? explicitFallbackIds
     : options.fallbackToAccelerators === false
       ? []
@@ -71,7 +77,7 @@ export const deriveHardwareMemoryView = (
   const domains = hardware.memoryDomains.map((domain): HardwareMemoryDomainView => {
     if (domain.kind === "PhysicalDevice") physicalOrdinal += 1
     const allocation = Option.fromNullable(allocations.get(domain.memoryDomainId))
-    const participatesInRuntime = fallbackRuntimeDomainIds.has(domain.memoryDomainId)
+    const participatesInModelServing = fallbackModelServingDomainIds.has(domain.memoryDomainId)
       || Option.exists(allocation, (resident) =>
         resident.modelBytes + resident.contextBytes + resident.computeBytes + resident.auxiliaryBytes > 0)
     const freeBytes = Option.getOrNull(Option.map(domain.availableBytes, (available) =>
@@ -90,7 +96,7 @@ export const deriveHardwareMemoryView = (
       label: domainLabel(hardware, domain, physicalOrdinal),
       kind: domain.kind,
       totalBytes: domain.totalBytes,
-      participatesInRuntime,
+      participatesInModelServing,
     }
     if (freeBytes === null || usedBytes === null) return {
       ...base,
@@ -128,7 +134,9 @@ export const deriveHardwareMemoryView = (
       notice: null,
     }
   })
-  const participating = domains.filter((domain) => domain.participatesInRuntime && domain.usedBytes !== null)
+  const participating = domains.filter(
+    (domain) => domain.participatesInModelServing && domain.usedBytes !== null,
+  )
   return {
     domains,
     compact: participating.length === 0 ? null : {

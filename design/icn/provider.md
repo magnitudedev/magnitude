@@ -33,8 +33,8 @@ ACN owns durable local provider offerings. Each offering contains:
 Capabilities are not persisted on the offering. ACN resolves them from the recommendable catalog
 or the installed package inspection, which are the authoritative evidence for the target.
 
-The local provider model ID deterministically namespaces the configuration identity. ACN never
-hashes package or profile data to create another configuration identity.
+Within the separate `local` provider namespace, the provider model ID is exactly the serving
+configuration ID. ACN never prefixes or hashes package or profile data to create another identity.
 
 An offering exists independently of current installation, fit, slot selection, or residency.
 ACN's local-offering projection combines the durable offering with installed-package and assessment
@@ -65,37 +65,39 @@ configuration ID. Provider binding is cheap and has no runtime side effect.
 Existing recency-based slot substitution remains product behavior. It operates on stable provider
 model IDs and does not create, refit, or rewrite offerings.
 
-## Explicit residency
+## Explicit instances
 
-ICN owns one native runtime coordinator and at most one resident configuration.
+ICN owns one `ModelInstanceController` and currently permits at most one Ready local instance.
 
-ACN's slot coordinator is the product lifecycle authority. A manual load and local request
-preparation use the same service-owned slot transition:
+ACN's `ModelSlotController` is the product intent authority. A manual load and local request
+preparation use the same canonical slot and instance observation:
 
 1. resolve the selected offering;
 2. require all target packages to be installed;
-3. submit the offering's exact configuration to ICN load;
-4. wait for terminal readiness; and
-5. admit chat only against that resident configuration.
+3. create a fresh `ModelInstanceId` and submit the exact configuration to ICN;
+4. bind the slot after native admission and observe that exact instance to Ready; and
+5. start chat with that exact instance ID and configuration.
 
 The submitted configuration fixes per-request context capacity. ICN independently resolves the
 resident parallel allocation and reports it as load execution evidence; ACN does not persist or
 select that allocation.
 
 Loading another configuration replaces the singleton residency through the same serialized
-transition. Unload addresses the returned residency identity and waits for active generation
-leases to drain.
+transition. ACN creates a branded model-instance identity before loading and ICN preserves it
+through loading and residency. One Stop operation addresses only that exact identity, whether it is
+still loading or already resident, and waits for partial cleanup or active generation leases to
+drain. A delayed Stop cannot affect a newer instance of the same configuration.
 
 ICN chat never loads, configures, or selects a model. A chat request for a configuration that is
 not resident fails without mutating runtime state.
 
 ## Concurrency and lifetime
 
-The ICN runtime coordinator is the sole native mutation and lease authority.
+The ICN `ModelInstanceController` is the sole native mutation and lease authority.
 
-- Load and unload mutations serialize.
-- Equivalent callers join one shared completion; caller interruption never cancels the mutation.
-- A loading or unloading slot always has a matching live coordinator owner.
+- Load, Stop, and replacement mutations serialize.
+- Equivalent instance admissions are idempotent; caller interruption never cancels admitted work.
+- A projected Loading or Stopping lifecycle always has a matching live ICN owner.
 - An identical load is idempotent after current state is rechecked.
 - Replacement closes new admission and waits for existing generation leases.
 - A completion holds one generation lease until its body completes, fails, or is canceled.
@@ -103,9 +105,8 @@ The ICN runtime coordinator is the sole native mutation and lease authority.
 - Unexpected resident-worker loss is observed with the configuration identity and becomes a typed
   blocked slot state; it is not inferred from generic provider unavailability.
 
-ACN serializes product slot transitions and rechecks the attributed slot after preparation is
-admitted. Preparation joins an in-progress load rather than treating it as ready. Progress is
-observation only; terminal operation results drive slot state.
+ACN rechecks the attributed slot and exact instance after preparation. Progress and terminal state
+come from `ModelInstancesSnapshot`; the load response stream is never the lifecycle authority.
 
 ## Prompt and request boundary
 
@@ -113,12 +114,10 @@ The ICN provider encodes prompts once with the shared native chat-completions co
 client validates the request before transport. ICN validates structural inputs before accepting a
 stream and validates tokenizer-dependent constraints under the resident lease.
 
-Local-model preparation is a scoped agent-request phase injected by ACN. It is outside the generic
-provider contract: preparation failure is a generic model-not-ready start result, never a fabricated
-provider response or provider rejection. After preparation succeeds, the ordinary provider request
-begins. ACN retains preparation admission until ICN accepts the request and owns its generation
-lease, then releases it. Provider start and response-stream failures keep their existing provider
-semantics and metadata.
+Local-model preparation is a scoped agent-request phase injected by ACN. It resolves and observes
+the exact Ready instance, then installs an Effect fiber-local instance binding for the provider
+request. The local provider refuses to encode a request without that binding. ICN atomically
+acquires the exact `ModelInstanceLease`; no ACN residency-admission bridge exists.
 
 Context admission uses the resident configuration's context length. Catalog metadata, compaction,
 load planning, and request admission must agree on that exact configuration.

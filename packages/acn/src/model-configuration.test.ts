@@ -34,6 +34,7 @@ describe("model configuration ownership", () => {
   it("updates one addressed slot without replacing its sibling", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const state = yield* Ref.make<MagnitudeConfig>({
+        onboarding: Option.none(),
         models: {
           slots: {
             primary: Option.some(selection("primary-old")),
@@ -58,6 +59,7 @@ describe("model configuration ownership", () => {
   it("records local model use as bounded per-slot recency", async () => {
     const state = await Effect.runPromise(Effect.gen(function* () {
       const stored = yield* Ref.make<MagnitudeConfig>({
+        onboarding: Option.none(),
         models: {
           slots: {
             primary: Option.some(localSelection("local-a")),
@@ -83,7 +85,7 @@ describe("model configuration ownership", () => {
 
   it("persists provider-qualified model favorites", async () => {
     const state = await Effect.runPromise(Effect.gen(function* () {
-      const stored = yield* Ref.make<MagnitudeConfig>({})
+      const stored = yield* Ref.make<MagnitudeConfig>({ onboarding: Option.none() })
       const configuration = yield* makeModelConfiguration(updateStorage(stored))
       yield* configuration.setFavorite(modelIdentity("local", "shared"), true)
       yield* configuration.setFavorite(modelIdentity("magnitude", "shared"), true)

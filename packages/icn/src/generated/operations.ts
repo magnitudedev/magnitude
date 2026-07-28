@@ -215,6 +215,31 @@ export const getModelDownloadOperation = {
   pathParameters: S.Struct({ attempt_id: S.String }),
 } as const
 
+export const getModelInstancesOperation = {
+  operationId: "getModelInstances",
+  transport: "http",
+  method: "GET",
+  path: "/v1/models/instances",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ModelInstancesSnapshot, Schemas.ModelInstancesSnapshotEncoded> =>
+          Schemas.ModelInstancesSnapshot,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
 export const getModelPropertiesOperation = {
   operationId: "getModelProperties",
   transport: "http",
@@ -328,11 +353,11 @@ export const listModelDownloadsOperation = {
   ],
 } as const
 
-export const loadModelConfigurationOperation = {
-  operationId: "loadModelConfiguration",
+export const loadModelInstanceOperation = {
+  operationId: "loadModelInstance",
   transport: "sse",
   method: "POST",
-  path: "/v1/models/load",
+  path: "/v1/models/instances",
   group: "models",
   mediaType: "text/event-stream",
   responseStatus: 200,
@@ -351,6 +376,46 @@ export const loadModelConfigurationOperation = {
       mediaType: "application/json",
     },
   ],
+} as const
+
+export const previewModelLoadOperation = {
+  operationId: "previewModelLoad",
+  transport: "http",
+  method: "POST",
+  path: "/v1/models/load/preview",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ModelLoadAllocation, Schemas.ModelLoadAllocationEncoded> => Schemas.ModelLoadAllocation,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.PreviewModelLoadRequest, Schemas.PreviewModelLoadRequestEncoded> =>
+      Schemas.PreviewModelLoadRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
 } as const
 
 export const removeInstalledModelOperation = {
@@ -487,24 +552,39 @@ export const startModelDownloadOperation = {
   payloadRequired: true,
 } as const
 
-export const unloadModelResidencyOperation = {
-  operationId: "unloadModelResidency",
+export const stopModelInstanceOperation = {
+  operationId: "stopModelInstance",
   transport: "http",
-  method: "DELETE",
-  path: "/v1/models/residencies/{residency_id}",
+  method: "POST",
+  path: "/v1/models/instances/{instance_id}/stop",
   group: "models",
   successes: [{ status: 204, schema: S.Void }],
   errors: [
-    {
-      status: 404,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
     {
       status: 500,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",
     },
   ],
-  pathParameters: S.Struct({ residency_id: S.String }),
+  pathParameters: S.Struct({ instance_id: S.String }),
+} as const
+
+export const watchModelInstancesOperation = {
+  operationId: "watchModelInstances",
+  transport: "sse",
+  method: "GET",
+  path: "/v1/models/instances/watch",
+  group: "models",
+  mediaType: "text/event-stream",
+  responseStatus: 200,
+  eventSchema: Schemas.ModelInstancesInvalidation,
+  termination: { type: "long-lived" },
+  reconnect: { type: "last-event-id" },
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
 } as const

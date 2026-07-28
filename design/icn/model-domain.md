@@ -239,14 +239,15 @@ failures, or blocked slot state. Model choices appear only after recommendations
 initial provider catalog has settled. A terminal discovery failure appears once in progress, while
 failures from a user-initiated download or selection remain immediate and attached to that action.
 
-Choosing an installed or curated model is one onboarding-domain mutation. It resolves or persists
-the provider offering, admits or joins any required package download, and stores the primary slot
-selection. While onboarding remains open, ACN advances an installed selected slot through the
-ordinary model-residency coordinator and completes onboarding only when that slot is ready. Package
-installation, preparation, model loading, and client reconnection therefore remain one convergent
-server-owned flow. Confirmed cancellation terminalizes every target-package attempt, clears that
-matching selection, and returns the chooser. Neither transition is reconstructed from client
-presentation state.
+Choosing an installed or curated model starts one client-owned sequence of ordinary domain
+mutations. The target-level download command admits or joins required package work and returns only
+after authoritative installation. Generic slot assignment retains the selected serving
+configuration and stores the primary selection. Generic slot load returns only after the exact
+selected instance is Ready; the client then marks onboarding complete. The submitted choice is the
+only onboarding-specific transient state and exists only in the client that received the explicit
+action. ACN has no onboarding model command, activation service, or startup reconciler. Confirmed
+cancellation uses the ordinary target-download cancellation or slot-clear mutation. Interruption or
+restart never reconstructs command intent from onboarding, download, slot, or instance snapshots.
 
 The complete compatible recommendable-candidate projection is published beside the small labeled
 portfolio. Labeled portfolio members retain their intent and order. Remaining compatible
@@ -291,16 +292,15 @@ runtime identity.
 ACN normalizes its reasoning effort against the referenced provider model at the slot boundary,
 using the model default whenever the requested or stored value is unsupported.
 
-A valid local offering may be selected while its exact packages are absent or downloading. The slot
-then remains authoritatively blocked as unavailable until package and catalog reconciliation make
-the offering usable. This expected installation state does not make an incompatible, unsupported,
-or otherwise invalid selection acceptable.
+A local offering whose exact packages are absent, downloading, incompatible, or not load-admissible
+cannot be assigned. Existing assignments may later become unavailable when their dependencies
+degrade, but assignment never creates a blocked slot.
 
-A successful slot-assignment mutation means ACN has durably stored the normalized selection,
-reconciled the authoritative `ModelSlots` mirror, and published the corresponding agent model
-configuration. Clients may advance onboarding or another configuration flow only after the
-containing server mutation succeeds. Invoking a client mutation is not success, and a failed
-mutation leaves the initiating flow open.
+A successful slot-assignment mutation means ACN has validated the exact installed configuration,
+obtained current load readiness, durably stored the normalized selection, and atomically published
+the `ModelSlots` mirror and agent model configuration. An immediately following slot-load command
+is therefore admissible unless authoritative conditions changed after assignment. A rejected
+assignment leaves the slot unchanged.
 
 ### Model favorites
 

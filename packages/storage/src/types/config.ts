@@ -37,7 +37,7 @@ export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
 
 export const PersistedLocalProviderOfferingSchema = Schema.Struct({
   providerModelId: ProviderModelIdSchema,
-  modelId: ModelOfferingTargetIdSchema,
+  targetId: ModelOfferingTargetIdSchema,
   configuration: ModelServingConfigurationSchema,
   origin: LocalProviderOfferingOriginSchema,
 })
@@ -70,26 +70,15 @@ export const ModelConfigSchema = Schema.Struct({
 })
 export type ModelConfig = Schema.Schema.Type<typeof ModelConfigSchema>
 
-export const OnboardingFlowIdSchema = Schema.Literal('model_setup')
-export type OnboardingFlowId = Schema.Schema.Type<typeof OnboardingFlowIdSchema>
-
-export const OnboardingCompletionSchema = Schema.Struct({
-  version: Schema.Number.pipe(Schema.int(), Schema.positive()),
-  completedAt: Schema.String,
-})
-export type OnboardingCompletion = Schema.Schema.Type<typeof OnboardingCompletionSchema>
-
 export const OnboardingConfigSchema = Schema.Struct({
-  completions: Schema.optional(
-    Schema.partial(Schema.Record({ key: OnboardingFlowIdSchema, value: OnboardingCompletionSchema })),
-  ),
+  completed: Schema.Boolean,
 })
 export type OnboardingConfig = Schema.Schema.Type<typeof OnboardingConfigSchema>
 
 export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   models: Schema.optional(ModelConfigSchema),
-  onboarding: Schema.optional(OnboardingConfigSchema),
+  onboarding: Schema.optionalWith(OnboardingConfigSchema, { as: 'Option', exact: true }),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

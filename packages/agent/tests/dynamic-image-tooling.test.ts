@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest'
 import type { ConfigState, SlotConfig } from '../src/ambient/config-ambient'
 import { ConfigAmbient } from '../src/ambient/config-ambient'
 import { materializeAgentToolkit, selectAgentToolKeys, toolUniverseToolkit } from '../src/tools/toolkits'
-import { ReasoningEffortSchema } from '@magnitudedev/ai'
+import {
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+} from '@magnitudedev/ai'
 import { AmbientServiceTag, EventEngine } from '@magnitudedev/event-core'
 import { Effect } from 'effect'
 import type { AppEvent } from '../src/events'
@@ -17,16 +21,19 @@ const ToolkitProjectionAgent = EventEngine.make<AppEvent>()({
   workers: [],
 })
 
-function slot(slotId: 'primary' | 'secondary', vision: boolean | undefined): SlotConfig {
+function slot(slotId: 'primary' | 'secondary', vision: boolean): SlotConfig {
   return {
-    slotId, providerId: 'test', providerModelId: slotId, modelDisplayName: slotId,
+    slotId,
+    providerId: ProviderIdSchema.make('test'),
+    providerModelId: ProviderModelIdSchema.make(slotId),
+    modelDisplayName: slotId,
     profile: { contextWindow: 100_000, maxOutputTokens: 4_000 },
     vision, hardCap: 96_000, softCap: 80_000, reasoningEffort: ReasoningEffortSchema.make('medium'),
     isUserOverride: false, isFallback: false,
   }
 }
 
-function config(primary: boolean | undefined, secondary: boolean | undefined): ConfigState {
+function config(primary: boolean, secondary: boolean): ConfigState {
   return {
     revision: 1,
     catalogLoaded: true,
@@ -53,7 +60,6 @@ describe('dynamic image tooling', () => {
 
   it('exposes no image tool when neither capability is available', () => {
     expect(imageTools(config(false, false))).toEqual([])
-    expect(imageTools(config(undefined, undefined))).toEqual([])
   })
 
   it('treats an unavailable opposite slot as non-vision', () => {

@@ -691,46 +691,6 @@ pub struct HardwareMemoryDomain {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ResidentMemoryDomain {
-    pub memory_domain_id: MemoryDomainId,
-    pub model_bytes: u64,
-    pub context_bytes: u64,
-    pub compute_bytes: u64,
-    pub auxiliary_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResidentMemory {
-    pub model_id: String,
-    pub runtime_generation: u64,
-    pub domains: Vec<ResidentMemoryDomain>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResidentExecution {
-    pub model_id: String,
-    pub context_window_tokens: u32,
-    pub parallel_sequences: u32,
-    pub physical_context_tokens: u32,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeFailureObservation {
-    pub model_id: String,
-    pub code: String,
-    pub message: String,
-    pub retryable: bool,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HardwareSnapshot {
     pub captured_at: u64,
     pub platform: String,
@@ -744,9 +704,6 @@ pub struct HardwareSnapshot {
     pub enabled_backends: Vec<String>,
     pub topology_fingerprint: String,
     pub memory_domains: Vec<HardwareMemoryDomain>,
-    pub resident_memory: Option<ResidentMemory>,
-    pub resident_execution: Option<ResidentExecution>,
-    pub runtime_failure: Option<RuntimeFailureObservation>,
 }
 
 /// Canonical physical memory pools used to interpret persisted assessments.
@@ -1359,7 +1316,7 @@ pub enum InventoryError {
     #[error("model artifacts changed during inspection: {0}")]
     ConcurrentMutation(String),
     #[error("{message}")]
-    Runtime {
+    ModelOperation {
         code: String,
         message: String,
         retryable: bool,

@@ -4,6 +4,7 @@ import * as HttpClient from '@effect/platform/HttpClient'
 import {
   PromptBuilder,
   StreamStartOperationalFailure,
+  StreamStartProviderRejection,
   type BaseCallOptions,
   type BoundModel,
   type ModelStreamResult,
@@ -168,5 +169,55 @@ describe('agent model request preparation', () => {
     }))
 
     expect(order).toEqual(['released', 'cleared'])
+  })
+
+  it('re-prepares exactly once when local admission races an idle unload', async () => {
+    let preparations = 0
+    let starts = 0
+    const notReady = new StreamStartProviderRejection({
+      call: {
+        provider: 'local',
+        model: 'model',
+        method: 'POST',
+        url: 'icn://chat/model',
+      },
+      response: {
+        status: 409,
+        headers: [],
+        body: JSON.stringify({
+          error: {
+            type: 'invalid_request_error',
+            code: 'model_not_ready',
+            message: 'model is releasing',
+          },
+        }),
+        requestId: null,
+        retryAfterMs: null,
+      },
+      rejection: {
+        _tag: 'ModelUnavailable',
+        message: 'model is releasing',
+      },
+    })
+    const rawModel: BoundModel<BaseCallOptions> = {
+      stream: () => Effect.suspend(() => {
+        starts += 1
+        return starts === 1 ? Effect.fail(notReady) : Effect.succeed(result)
+      }),
+    }
+    const model = makeAgentBoundModel({
+      ...config,
+      rawModel,
+      prepareRequest: Effect.sync(() => {
+        preparations += 1
+      }),
+    })
+
+    await Effect.runPromise(model.model.stream(prompt, []).pipe(
+      Effect.provideService(HttpClient.HttpClient, {} as HttpClient.HttpClient),
+    ))
+
+    expect(preparations).toBe(2)
+    expect(starts).toBe(2)
   })
 })

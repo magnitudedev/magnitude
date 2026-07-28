@@ -25,29 +25,30 @@ limits. Fit uses stable capacity rather than volatile free memory.
 The byte vocabulary is explicit: `total_capacity_bytes` is physical capacity,
 `usable_capacity_bytes` is the stable fitting capacity after policy reserves, and
 `current_available_bytes`/`current_free_bytes` are live observations used only for admission and
-runtime supervision. Cached fitting assessments never use a live observation as capacity evidence.
+serving-time supervision. Cached fitting assessments never use a live observation as capacity evidence.
 
 Unified-memory machines expose one physical memory domain. CPU and accelerator allocations are
 charged to that domain once. Device-specific working-set limits remain additional constraints; they
 are not reported as independent physical capacity.
 
 Physical-domain identity is canonical across discovery, native fitting, persisted assessment,
-runtime residency, and clients. The system domain has one reserved identity. Dedicated-domain
+model-instance allocation, and clients. The system domain has one reserved identity. Dedicated-domain
 identity is derived from exact physical-device evidence and backend-scoped native identity when no
 physical identity exists. Device names are presentation only and never domain identity.
 Device-specific working-set constraints use a separate canonical native-device identity derived
 from normalized backend, physical identity when available, and native ordinal.
 
-Hardware presentation keeps system-product identity, accelerator chip identity, runtime backend,
+Hardware presentation keeps system-product identity, accelerator chip identity, native backend,
 and native device ordinal distinct. Product identity comes from operating-system firmware data;
-chip identity comes from the native backend's device description. Generic runtime ordinals such as
+chip identity comes from the native backend's device description. Generic backend ordinals such as
 `CUDA0` and `MTL0` are never interpreted as a particular product or chip.
 
-While a model is resident, the live hardware snapshot also reports the resident execution
-allocation: configuration identity, per-request context window, selected parallel sequences, and
-total physical context tokens. This is observed runtime evidence, not a serving-profile input.
-Clients may combine it with the authoritative model-slot catalog to present the resident model
-name, but must not reconstruct the allocation from catalog metadata.
+Hardware observation contains topology, capacity, device limits, and current availability only.
+Model identity, model-instance lifecycle and failure, context allocation, parallelism, and
+resident-model memory belong to the correlated model-instance residency observation defined by
+[local model instance lifecycle](./model-instance-lifecycle.md). Allocation uses canonical
+hardware memory-domain identity so presentation can join it to capacity without moving ownership
+into the hardware API.
 
 Failure to enumerate or normalize hardware fails the operation. It is never converted into an
 empty topology or “no accelerator” result.
@@ -70,7 +71,7 @@ Each profile produces one complete result:
   performance evidence;
 - `DoesNotFit`, with the same configuration identity, limiting resource, deficit, and accounting;
   or
-- `Incompatible`, with a specific artifact or runtime diagnostic.
+- `Incompatible`, with a specific artifact or native-engine diagnostic.
 
 Invalid or incomplete targets are per-target results. Operational failures fail the request.
 Assessment never installs, configures, offers, selects, or loads a model.
@@ -122,7 +123,7 @@ every behavior-changing input:
 - immutable package and target identity;
 - serving profile;
 - reserve and performance policy;
-- runtime, planner, capacity, projector, and speculative-selection fingerprints;
+- native-engine, planner, capacity, projector, and speculative-selection fingerprints;
 - native build and backend; and
 - normalized hardware topology.
 
@@ -133,6 +134,11 @@ invalidates only that assessment entry. Domain availability must equal the topol
 capacity, and each device constraint must identify one current device and exactly match its stable
 limit. Cache failure never becomes a model-fit result. ACN may retain product projections, but it
 does not persist or recreate ICN assessment evidence.
+
+ICN publishes separate observation streams for all hardware changes and for changes to stable
+fitting evidence. Live availability and capture-time changes do not trigger catalog fitting,
+automatic setup, or offering reprojection. Those consumers react only to fitting-evidence changes;
+admission and hardware presentation continue to consume the full live observation.
 
 Batch assessment captures one normalized hardware environment identity and reuses it for every
 target and profile in that request. ICN derives the stable offering-target identity before preparing
@@ -145,10 +151,10 @@ prepare the target and compute only the missing profiles.
 ## Loading
 
 Loading accepts one exact `ModelServingConfiguration`. ICN resolves and reassesses that
-configuration under current runtime and hardware state before allocating, then applies the fresh
+configuration under current native-engine and hardware state before allocating, then applies the fresh
 availability rule in [system memory management](../inference/system-memory-management.md). A
 cached assessment is advisory and cannot authorize a different target, profile, reserve policy,
-runtime, or topology.
+native-engine build, or topology.
 
 After the exact one-sequence baseline fits, loading evaluates native sequence capacities from one
 through four. Candidate `P` provisions physical context `configured context × P`, preserves the
@@ -156,9 +162,21 @@ baseline target, acceleration, and per-sequence model context, and is selected o
 native allocation fits stable capacity and fresh admission. Selected sequence capacity is resolved
 execution evidence, not serving configuration identity.
 
+The exact candidate assessments use the shared disposable model-derived cache keyed by model
+content, execution profile, capacity policy, native planner/build, backend, and normalized
+topology. Preview and load share that evidence. A cache miss performs one batched native planning
+pass for the missing candidates; each preview and load still takes a fresh availability sample and
+selects the currently admissible candidate.
+
+Once a candidate cache miss enters native planning, the assessor owns that work through cache
+publication. Cancellation of an HTTP requester detaches that waiter but does not abandon the
+planner subprocess or discard its reusable result. Concurrent misses join through the same cache
+coordination boundary when their exact evidence matches; unrelated misses remain concurrent within
+the bounded native planner pool.
+
 Successful load evidence identifies the same configuration that was requested. ACN passes the
 ICN-issued configuration identity unchanged through recommendation, offering, provider resolution,
-slot admission, and runtime load.
+slot admission, and model load.
 
 ## Product behavior
 

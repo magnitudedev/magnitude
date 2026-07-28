@@ -1945,9 +1945,6 @@ mod tests {
                         shares_system_memory: true,
                         devices: Vec::new(),
                     }],
-                    resident_memory: None,
-                    resident_execution: None,
-                    runtime_failure: None,
                 })
             })
         }

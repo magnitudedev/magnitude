@@ -6,7 +6,8 @@ applies_to:
   - inference/crates/icn-server/src/memory_supervisor.rs
   - packages/acn/src/local-inference-hardware.ts
   - packages/acn/src/local-model-*.ts
-  - packages/acn/src/model-slot-coordinator.ts
+  - packages/acn/src/model-slot-controller.ts
+  - packages/acn/src/model-slot-projection.ts
   - packages/acn/src/model-request-preparation.ts
   - packages/agent/src/errors/model-start.ts
   - packages/protocol/src/schemas/model-state.ts
@@ -22,7 +23,7 @@ applies_to:
 
 # System memory management
 
-ICN uses one memory-safety policy for model fitting, load admission, and runtime eviction. Fitting
+ICN uses one memory-safety policy for model fitting, load admission, and serving-time eviction. Fitting
 decides what a machine can normally serve, admission decides whether it is safe to load now, and
 eviction protects the machine when conditions change. These decisions must use the same physical
 memory domains and peak-memory evidence.
@@ -96,6 +97,17 @@ Monitor loss for one second also terminates the worker. After a pressure termina
 stays closed until availability exceeds `B + 512 MiB` for five seconds. There is no automatic
 reload.
 
+Separately, a resident generation is released normally after ten continuous minutes with no
+accepted inference lease. The monotonic interval begins when the generation becomes ready without
+a lease or when its final lease ends. Metadata and observation do not count as activity.
+
+Inference admission and idle release share the backend mutation boundary. A request that acquires
+a lease first runs to completion and starts a fresh full interval after the final lease. Idle
+release that closes admission first rechecks the exact generation, zero active leases, and the
+complete elapsed interval before publishing `IdleTimeout` releasing state and gracefully reaping
+the worker. A stale deadline cannot affect a replacement generation, and idle release does not
+enter pressure recovery.
+
 ## Memory domains
 
 A physical allocation is charged once. Unified CPU/GPU allocations use the system reserve.
@@ -109,7 +121,7 @@ post-unload availability.
 
 ICN owns and publishes the thresholds. ACN and clients consume the values rather than reconstructing
 the formulas. A resident worker failure is published with its configuration identity and becomes a
-typed slot runtime-loss state.
+typed slot residency-loss state.
 
 An assigned model remains configured while it is loading, unloaded, or blocked. Loadability is
 separate, transient state; a failed load must not erase the selection or make the client report that
@@ -129,12 +141,33 @@ low-memory rejection during load or termination during serving appears in the ac
 
 `Model stopped · Low memory - close memory-intensive apps and try again`
 
-While the selected local model is ready, the composer footer shows its resident runtime allocation
+While the selected local model is ready, the composer footer shows its correlated model-instance allocation
 after context: the sum of the server-published model, context, compute, and auxiliary allocations
 across participating memory domains. It is compactly labeled, for example `24 GB mem`; it is not
 whole-system used memory and has no capacity denominator. Memory disappears outside ready
 residency and has no placeholder or transitional state. The Hardware menu owns whole-system,
 application, free-memory, and per-allocation detail.
+
+The Hardware menu places a flat `CURRENT MODEL` section below hardware identity and above memory.
+It always shows the selected local model, including while unloaded, and derives loading, running,
+stopping, unloaded, and failed state from `ModelSlots`. Running and resident stopping use
+allocation evidence carried by the same model-instance slot state, while aborting a pre-residency
+load retains the tagged planned-allocation form. The hardware mirror supplies only
+topology, capacity, and live availability. While unloaded, an authoritative ICN preview runs the
+same exact configuration planner,
+one-through-four candidate assessment, and fresh admission policy as a real load, and displays the
+parallelism it would select now. Clients never estimate this value. Load remains unavailable while
+preview evidence is pending or failed.
+
+Frozen-topology candidate assessments are cached as disposable derived evidence and shared by
+preview and load. Live hardware polling therefore reruns only the fresh admission selection when
+stable fitting evidence is unchanged. Catalog fitting and recommendation work does not rerun for
+availability-only hardware changes.
+
+The menu's state-appropriate Actions load or Stop the selected model without destructive
+confirmation. Stop carries only the exact model-instance identity. The activity rail exposes the
+same Stop while loading; both actions converge through the single slot lifecycle and operation
+owner.
 
 While current hardware or system-domain evidence is unavailable, clients do not infer either
 compatibility or available headroom and present memory status as unavailable. Model selection

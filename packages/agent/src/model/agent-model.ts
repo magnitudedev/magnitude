@@ -167,6 +167,19 @@ function defaultOperationKind(callType: AgentCallType): AgentModelOperationKind 
   }
 }
 
+const isPreStreamModelNotReady = (failure: AgentModelStartFailure): boolean => {
+  if (failure._tag !== "StreamStartProviderRejection"
+    || failure.response.status !== 409) return false
+  try {
+    const body = JSON.parse(failure.response.body) as {
+      readonly error?: { readonly code?: unknown }
+    }
+    return body.error?.code === "model_not_ready"
+  } catch {
+    return false
+  }
+}
+
 function deriveActor(input: {
   readonly config: Pick<AgentBoundModelConfig, 'agentId' | 'roleId'>
   readonly turnForkId: string | null | undefined
@@ -229,10 +242,13 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
           onSome: (gc) => ({ ...callOptions, toolChoice: gc }),
           onNone: () => callOptions,
         })
-        const streamEffect = Effect.scoped(
+        const start = () => Effect.scoped(
           (config.prepareRequest ?? Effect.void).pipe(
             Effect.zipRight(config.rawModel.stream(prompt, tools, effectiveOptions)),
           ),
+        )
+        const streamEffect = start().pipe(
+          Effect.catchIf(isPreStreamModelNotReady, () => start()),
         )
         const clearFailedStart = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
           effect.pipe(

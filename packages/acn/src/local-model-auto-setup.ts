@@ -72,13 +72,13 @@ export const LocalModelAutoSetupLive: Layer.Layer<
     for (const candidate of candidates) {
       const attemptKey = `${topology}:${candidate.package.id}`
       if (candidate.targetId._tag === "None") continue
-      const modelId = candidate.targetId.value
+      const targetId = candidate.targetId.value
       yield* Ref.update(statuses, (current) =>
-        new Map(current).set(modelId, { _tag: "Preparing" }))
+        new Map(current).set(targetId, { _tag: "Preparing" }))
       yield* PubSub.publish(changes, undefined)
       const result = yield* evaluations.fit({ _tag: "Package", package: candidate.package }).pipe(
-        Effect.flatMap(({ modelId, configuration }) =>
-          offerings.save(modelId, configuration, { _tag: "Automatic" })),
+        Effect.flatMap(({ targetId: fittedTargetId, configuration }) =>
+          offerings.save(fittedTargetId, configuration, { _tag: "Automatic" })),
         Effect.tapError((error) => Effect.logWarning("Unable to auto-fit installed model package").pipe(
           Effect.annotateLogs({ packageId: candidate.package.id, cause: error.message }),
         )),
@@ -91,9 +91,9 @@ export const LocalModelAutoSetupLive: Layer.Layer<
       yield* Ref.update(statuses, (current) => {
         const next = new Map(current)
         if (result._tag === "Right") {
-          next.delete(modelId)
+          next.delete(targetId)
         } else {
-          next.set(modelId, {
+          next.set(targetId, {
             _tag: "Unavailable",
             failure: {
               code: "code" in result.left ? result.left.code : result.left._tag,
@@ -113,7 +113,7 @@ export const LocalModelAutoSetupLive: Layer.Layer<
 
   yield* reconcile
   yield* Stream.merge(
-    Stream.merge(packages.changes, hardware.changes),
+    Stream.merge(packages.changes, hardware.fittingChanges),
     catalog.changes,
   ).pipe(
     Stream.runForEach(() => reconcile),

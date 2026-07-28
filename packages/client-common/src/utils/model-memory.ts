@@ -3,6 +3,7 @@ import type {
   LocalInferenceHardware,
   LocalModelCatalogCandidate,
   MemoryAssessment,
+  ModelInstanceAllocation,
   ProviderModelCatalogEntry,
 } from "@magnitudedev/sdk"
 
@@ -16,11 +17,12 @@ export interface ModelMemoryConditions {
 const lacksCurrentHeadroom = (
   requiredBytes: number,
   hardware: LocalInferenceHardware,
+  residentAllocation: Option.Option<ModelInstanceAllocation>,
   systemDomains: ReadonlySet<MemoryAssessment["memoryDomainId"]>,
 ): boolean => {
-  const reclaimableBytes = Option.match(hardware.residentMemory, {
+  const reclaimableBytes = Option.match(residentAllocation, {
     onNone: () => 0,
-    onSome: ({ domains }) => domains
+    onSome: ({ memoryDomains }) => memoryDomains
       .filter(({ memoryDomainId }) => systemDomains.has(memoryDomainId))
       .reduce(
         (total, domain) => total
@@ -72,6 +74,7 @@ const exceedsCompatibleCapacity = (
 const assessedMemoryConditions = (
   memory: readonly MemoryAssessment[],
   hardware: LocalInferenceHardware | undefined,
+  residentAllocation: Option.Option<ModelInstanceAllocation>,
 ): ModelMemoryConditions => {
   const systemDomains = new Set(hardware?.memoryDomains
     .filter(({ sharesSystemMemory }) => sharesSystemMemory)
@@ -82,7 +85,7 @@ const assessedMemoryConditions = (
     belowWarningReserve: !isWithinWarningReserve(memory),
     lacksCurrentHeadroom: hardware !== undefined
       && systemRequiredBytes !== undefined
-      && lacksCurrentHeadroom(systemRequiredBytes, hardware, systemDomains),
+      && lacksCurrentHeadroom(systemRequiredBytes, hardware, residentAllocation, systemDomains),
     evidenceUnavailable: hardware === undefined || systemRequiredBytes === undefined,
   }
 }
@@ -90,6 +93,7 @@ const assessedMemoryConditions = (
 export const providerModelMemoryConditions = (
   model: ProviderModelCatalogEntry,
   hardware: LocalInferenceHardware | undefined,
+  residentAllocation: Option.Option<ModelInstanceAllocation>,
 ): ModelMemoryConditions => {
   return Option.match(model.memory, {
     onNone: () => ({
@@ -98,14 +102,15 @@ export const providerModelMemoryConditions = (
       lacksCurrentHeadroom: false,
       evidenceUnavailable: true,
     }),
-    onSome: (memory) => assessedMemoryConditions(memory, hardware),
+    onSome: (memory) => assessedMemoryConditions(memory, hardware, residentAllocation),
   })
 }
 
 export const catalogCandidateMemoryConditions = (
   candidate: LocalModelCatalogCandidate,
   hardware: LocalInferenceHardware | undefined,
-): ModelMemoryConditions => assessedMemoryConditions(candidate.memory, hardware)
+  residentAllocation: Option.Option<ModelInstanceAllocation>,
+): ModelMemoryConditions => assessedMemoryConditions(candidate.memory, hardware, residentAllocation)
 
 export const modelMemoryStatusLabel = ({
   exceedsCapacity,

@@ -1,25 +1,19 @@
-import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   OnboardingError,
   OnboardingMirror,
   type MirroredSnapshot,
-  type OnboardingFlowId,
   type OnboardingState,
 } from "@magnitudedev/protocol"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import type { ConfigStorageShape } from "@magnitudedev/storage"
 import { makeMirroredState, MirroredStateChanges } from "../mirrored-state"
 
-const FLOW_VERSIONS = {
-  model_setup: 1,
-} as const satisfies Record<OnboardingFlowId, number>
-
 export interface OnboardingApi {
   readonly state: Effect.Effect<OnboardingState, OnboardingError>
   readonly snapshot: Effect.Effect<MirroredSnapshot<OnboardingState>>
   readonly changes: Stream.Stream<MirroredSnapshot<OnboardingState>>
-  readonly complete: (flowId: OnboardingFlowId) => Effect.Effect<void, OnboardingError>
-  readonly reopen: (flowId: OnboardingFlowId) => Effect.Effect<void, OnboardingError>
+  readonly update: (completed: boolean) => Effect.Effect<void, OnboardingError>
 }
 
 export class Onboarding extends Context.Tag("Onboarding")<Onboarding, OnboardingApi>() {}
@@ -32,41 +26,26 @@ const onboardingError = (operation: string, cause: unknown): OnboardingError =>
 
 type OnboardingStorage = Pick<
   ConfigStorageShape,
-  "getOnboardingConfig" | "completeOnboardingFlow" | "reopenOnboardingFlow"
+  "getOnboardingConfig" | "updateOnboardingState"
 >
 
 type OnboardingPersistenceApi = Omit<OnboardingApi, "snapshot" | "changes">
 
 export const makeOnboarding = (storage: OnboardingStorage): OnboardingPersistenceApi => {
   const state = storage.getOnboardingConfig().pipe(
-    Effect.map((config): OnboardingState => {
-      const completion = config?.completions?.model_setup ?? null
-      const currentVersion = FLOW_VERSIONS.model_setup
-      return {
-        flows: {
-          model_setup: {
-            currentVersion,
-            completedVersion: completion?.version ?? null,
-            completedAt: completion?.completedAt ?? null,
-            required: (completion?.version ?? 0) < currentVersion,
-          },
-        },
-      }
-    }),
+    Effect.map((config): OnboardingState => ({
+      completed: Option.match(config, {
+        onNone: () => false,
+        onSome: (value) => value.completed,
+      }),
+    })),
     Effect.mapError((cause) => onboardingError("read onboarding state", cause)),
   )
 
   return {
     state,
-    complete: (flowId) => storage.completeOnboardingFlow(
-      flowId,
-      FLOW_VERSIONS[flowId],
-      new Date().toISOString(),
-    ).pipe(
-      Effect.mapError((cause) => onboardingError("complete onboarding flow", cause)),
-    ),
-    reopen: (flowId) => storage.reopenOnboardingFlow(flowId).pipe(
-      Effect.mapError((cause) => onboardingError("reopen onboarding flow", cause)),
+    update: (completed) => storage.updateOnboardingState(completed).pipe(
+      Effect.mapError((cause) => onboardingError("update onboarding state", cause)),
     ),
   }
 }
@@ -93,8 +72,7 @@ export const OnboardingLive: Layer.Layer<
       state: mirror.get.pipe(Effect.map(({ state }) => state)),
       snapshot: mirror.get,
       changes: mirror.changes,
-      complete: (flowId) => persisted.complete(flowId).pipe(Effect.zipRight(refresh)),
-      reopen: (flowId) => persisted.reopen(flowId).pipe(Effect.zipRight(refresh)),
+      update: (completed) => persisted.update(completed).pipe(Effect.zipRight(refresh)),
     })
   }),
 )

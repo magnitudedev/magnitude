@@ -13,7 +13,8 @@
     "./catalog": "./src/catalog/index.ts",
     "./installed": "./src/installed/index.ts",
     "./downloads": "./src/downloads/index.ts",
-    "./provider": "./src/provider/index.ts"
+    "./provider": "./src/provider/index.ts",
+    "./instances": "./src/instances/index.ts"
   },
   "scripts": {
     "generate": "bun run scripts/generate.ts",

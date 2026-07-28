@@ -1,11 +1,10 @@
 import { Option } from 'effect'
 import { describe, expect, it } from 'vitest'
 import {
-  ModelSlotBlocked,
-  ModelSlotLoadingLocalModel,
+  ModelInstanceIdSchema,
+  ModelServingConfigurationIdSchema,
+  ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
-  ModelSlotUnloadedLocalModel,
-  ModelSlotUnloadingLocalModel,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -18,16 +17,38 @@ import {
 import { buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 
 describe('agent model configuration boundary', () => {
+  const instanceId = ModelInstanceIdSchema.make("test-instance")
+  const configurationId = ModelServingConfigurationIdSchema.make("configuration")
   it.each([
-    ['unloaded', (selection: SlotSelection) => new ModelSlotUnloadedLocalModel({ slotId: PRIMARY_SLOT_ID, selection })],
-    ['loading', (selection: SlotSelection) => new ModelSlotLoadingLocalModel({ slotId: PRIMARY_SLOT_ID, selection, percentage: 42 })],
-    ['unloading', (selection: SlotSelection) => new ModelSlotUnloadingLocalModel({ slotId: PRIMARY_SLOT_ID, selection })],
-    ['blocked', (selection: SlotSelection) => new ModelSlotBlocked({
-      slotId: PRIMARY_SLOT_ID,
-      selection,
-      reason: { _tag: 'LocalModelLoadFailed', error: { code: 'load_failed', message: 'failed', retryable: true } },
+    ['not loaded', Option.none()],
+    ['loading', Option.some({
+      id: instanceId,
+      configurationId,
+      lifecycle: {
+        _tag: 'Loading' as const,
+        stage: 'loading' as const,
+        progress: Option.some(0.42),
+        plannedAllocation: Option.none(),
+      },
     })],
-  ] as const)('keeps a selected %s local model callable through the provider boundary', (_state, makeSlot) => {
+    ['stopping', Option.some({
+      id: instanceId,
+      configurationId,
+      lifecycle: {
+        _tag: 'Stopping' as const,
+        reason: 'explicit_stop' as const,
+        allocation: { _tag: 'Planned' as const, allocation: Option.none() },
+      },
+    })],
+    ['failed', Option.some({
+      id: instanceId,
+      configurationId,
+      lifecycle: {
+        _tag: 'Failed' as const,
+        failure: { code: 'load_failed', message: 'failed', retryable: true },
+      },
+    })],
+  ] as const)('keeps a selected %s local model callable through the provider boundary', (_state, instance) => {
     const providerId = ProviderIdSchema.make('local')
     const providerModelId = ProviderModelIdSchema.make('local:model')
     const reasoningEffort = ReasoningEffortSchema.make('none')
@@ -54,7 +75,15 @@ describe('agent model configuration boundary', () => {
       pricing: Option.none(),
     }]
     const slots: ModelSlotsState['slots'] = {
-      primary: makeSlot({ providerId, providerModelId, reasoningEffort }),
+      primary: new ModelSlotConfiguredLocal({
+        slotId: PRIMARY_SLOT_ID,
+        selection: { providerId, providerModelId, reasoningEffort },
+        descriptor: { providerId, providerModelId, displayName: 'Local model' },
+        availability: { _tag: 'Available' },
+        readiness: { _tag: 'Assessing' },
+        instance,
+        actions: [],
+      }),
       secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
     }
 

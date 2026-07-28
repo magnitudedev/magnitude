@@ -509,9 +509,6 @@ fn hardware_snapshot_from_devices(
         enabled_backends: environment.enabled_backends,
         topology_fingerprint,
         memory_domains: domains,
-        resident_memory: None,
-        resident_execution: None,
-        runtime_failure: None,
     }
 }
 

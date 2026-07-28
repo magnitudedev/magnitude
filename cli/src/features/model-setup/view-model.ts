@@ -1,7 +1,6 @@
 import { Option } from "effect"
 import {
   deriveSelectedLocalModelCandidate,
-  deriveSelectedLocalModelSetup,
   type LocalInferenceView,
 } from "@magnitudedev/client-common"
 import type { LocalModelCatalogCandidate, ProviderModelId } from "@magnitudedev/sdk"
@@ -20,48 +19,36 @@ export type OnboardingModelSetupView =
       readonly candidate: LocalModelCatalogCandidate
     }
   | {
-      readonly _tag: "Loading"
+      readonly _tag: "Activating"
       readonly state: LocalInferenceView
       readonly providerModelId: ProviderModelId
       readonly displayName: string
+      readonly phase: "Preparing" | "Loading" | "Ready" | "Failed"
       readonly failure: string | null
     }
 
-/** Keeps forced setup mounted until its exact server-resolved selection is authoritatively ready. */
 export const deriveModelSetupActive = ({
   forceSetup,
   onboardingRequired,
   completionSucceeded,
-  selectedProviderModelId,
-  primary,
 }: {
   readonly forceSetup: boolean
   readonly onboardingRequired: boolean
   readonly completionSucceeded: boolean
-  readonly selectedProviderModelId: ProviderModelId | null
-  readonly primary: LocalInferenceView["slots"]["slots"]["primary"] | null
 }): boolean => {
   if (onboardingRequired) return true
-  if (!forceSetup || completionSucceeded) return false
-  return selectedProviderModelId === null
-    || primary?._tag !== "Ready"
-    || primary.selection.providerModelId !== selectedProviderModelId
+  return forceSetup && !completionSucceeded
 }
-
-const blockedReasonMessage = (
-  reason: Extract<
-    LocalInferenceView["slots"]["slots"]["primary"],
-    { readonly _tag: "Blocked" }
-  >["reason"],
-): string => "message" in reason ? reason.message : reason.error.message
 
 export const deriveOnboardingModelSetupView = ({
   active,
   onboardingRequired,
+  submittedProviderModelId,
   state,
 }: {
   readonly active: boolean
   readonly onboardingRequired: boolean
+  readonly submittedProviderModelId: ProviderModelId | null
   readonly state: LocalInferenceView | null
 }): OnboardingModelSetupView => {
   if (!active) return { _tag: "Inactive" }
@@ -70,25 +57,75 @@ export const deriveOnboardingModelSetupView = ({
   }
   if (!onboardingRequired) return { _tag: "Choosing", state }
 
-  const download = deriveSelectedLocalModelSetup(state)
+  const submittedCandidate = submittedProviderModelId === null
+    || state.models.recommendations._tag !== "Ready"
+    ? null
+    : state.models.recommendations.catalog.find(({ providerModelId }) =>
+        providerModelId === submittedProviderModelId) ?? null
+  const download = submittedCandidate
+    && (submittedCandidate.download._tag === "Downloading"
+      || submittedCandidate.download._tag === "Failed"
+      || submittedCandidate.download._tag === "Downloaded"
+        && submittedCandidate.preparation._tag === "Calibrating")
+    ? submittedCandidate
+    : null
   if (download) return { _tag: "Downloading", state, candidate: download }
 
   const primary = state.slots.slots.primary
-  if (primary._tag === "Unassigned" || primary._tag === "Ready") {
+  if (submittedProviderModelId === null
+    || primary._tag !== "ConfiguredLocal"
+    || primary.selection.providerModelId !== submittedProviderModelId) {
+    if (submittedProviderModelId !== null
+      && submittedCandidate?.download._tag === "Downloaded") {
+      return {
+        _tag: "Activating",
+        state,
+        providerModelId: submittedProviderModelId,
+        displayName: submittedCandidate.displayName,
+        phase: "Preparing",
+        failure: null,
+      }
+    }
     return { _tag: "Choosing", state }
   }
   const candidate = deriveSelectedLocalModelCandidate(state)
   const selection = buildLocalInferenceSelections(state).find((item) =>
     Option.exists(item.providerModelId, (providerModelId) =>
       providerModelId === primary.selection.providerModelId))
+  const lifecycle = Option.map(primary.instance, ({ lifecycle }) => lifecycle)
+  const failure = Option.match(lifecycle, {
+    onNone: () => primary.readiness._tag === "Unavailable"
+      ? primary.readiness.failure.message
+      : primary.availability._tag === "Unavailable"
+        && primary.availability.failure.code !== "local_model_not_installed"
+        ? primary.availability.failure.message
+        : null,
+    onSome: (instanceLifecycle) => instanceLifecycle._tag === "Failed"
+      ? instanceLifecycle.failure.message
+      : null,
+  })
+  const phase = Option.match(lifecycle, {
+    onNone: () => failure === null ? "Preparing" as const : "Failed" as const,
+    onSome: (instanceLifecycle) => {
+      switch (instanceLifecycle._tag) {
+        case "Loading": return "Loading" as const
+        case "Ready": return "Ready" as const
+        case "Failed": return "Failed" as const
+        case "Stopping":
+        case "Stopped":
+          return "Preparing" as const
+      }
+    },
+  })
   return {
-    _tag: "Loading",
+    _tag: "Activating",
     state,
     providerModelId: primary.selection.providerModelId,
-    displayName: candidate?.displayName ?? selection?.model.displayName ?? "local model",
-    failure: primary._tag === "Blocked" && primary.reason._tag !== "ModelUnavailable"
-      ? blockedReasonMessage(primary.reason)
-      : null,
+    displayName: candidate?.displayName
+      ?? selection?.model.displayName
+      ?? primary.descriptor.displayName,
+    phase,
+    failure,
   }
 }
 
@@ -98,6 +135,11 @@ export const onboardingModelSetupPlaceholder = (view: OnboardingModelSetupView):
     case "Preparing": return "Preparing local models…"
     case "Choosing": return "Select a model to start coding…"
     case "Downloading": return `Downloading ${view.candidate.displayName}…`
-    case "Loading": return `Loading ${view.displayName}…`
+    case "Activating":
+      return view.phase === "Loading"
+        ? `Loading ${view.displayName}…`
+        : view.phase === "Ready"
+          ? `Finishing setup for ${view.displayName}…`
+          : `Preparing ${view.displayName}…`
   }
 }

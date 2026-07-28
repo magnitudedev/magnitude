@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
-  ModelSlotUnloadedLocalModel,
+  ModelInstanceIdSchema,
+  ModelSlotConfiguredLocal,
   PRIMARY_SLOT_ID,
-  ProviderModelIdSchema,
 } from "@magnitudedev/sdk"
 import {
   LOCAL_PROVIDER_ID,
+  TEST_CONFIGURATION_ID,
   TEST_MODEL_ID,
   TEST_REASONING_EFFORT,
   makeCatalogCandidate,
@@ -31,8 +32,6 @@ describe("deriveModelSetupActive", () => {
       forceSetup: false,
       onboardingRequired: true,
       completionSucceeded: false,
-      selectedProviderModelId: null,
-      primary: null,
     })).toBe(true)
   })
 
@@ -41,29 +40,15 @@ describe("deriveModelSetupActive", () => {
       forceSetup: false,
       onboardingRequired: false,
       completionSucceeded: false,
-      selectedProviderModelId: null,
-      primary: makeView().slots.slots.primary,
     })).toBe(false)
   })
 
-  it("keeps forced setup active while selection success is ahead of mirrored state", () => {
+  it("keeps forced setup active until the completed update succeeds", () => {
     expect(deriveModelSetupActive({
       forceSetup: true,
       onboardingRequired: false,
       completionSucceeded: false,
-      selectedProviderModelId: ProviderModelIdSchema.make("local:new-selection"),
-      primary: makeView().slots.slots.primary,
     })).toBe(true)
-  })
-
-  it("completes forced setup only when the exact selected model is ready", () => {
-    expect(deriveModelSetupActive({
-      forceSetup: true,
-      onboardingRequired: false,
-      completionSucceeded: false,
-      selectedProviderModelId: TEST_MODEL_ID,
-      primary: makeView().slots.slots.primary,
-    })).toBe(false)
   })
 
   it("completes forced setup after an explicit skip", () => {
@@ -71,8 +56,6 @@ describe("deriveModelSetupActive", () => {
       forceSetup: true,
       onboardingRequired: false,
       completionSucceeded: true,
-      selectedProviderModelId: null,
-      primary: null,
     })).toBe(false)
   })
 })
@@ -82,11 +65,12 @@ describe("deriveOnboardingModelSetupView", () => {
     expect(deriveOnboardingModelSetupView({
       active: true,
       onboardingRequired: true,
+      submittedProviderModelId: null,
       state: makeView({ ready: false }),
     })._tag).toBe("Choosing")
   })
 
-  it("keeps an installed selection in setup until residency is ready", () => {
+  it("keeps an installed selection in setup until its exact instance is ready", () => {
     const base = makeView({ ready: false })
     const state = {
       ...base,
@@ -94,16 +78,87 @@ describe("deriveOnboardingModelSetupView", () => {
         ...base.slots,
         slots: {
           ...base.slots.slots,
-          primary: new ModelSlotUnloadedLocalModel({ slotId: PRIMARY_SLOT_ID, selection }),
+          primary: new ModelSlotConfiguredLocal({
+            slotId: PRIMARY_SLOT_ID,
+            selection,
+            descriptor: {
+              providerId: LOCAL_PROVIDER_ID,
+              providerModelId: TEST_MODEL_ID,
+              displayName: "Qwen Test",
+            },
+            availability: { _tag: "Available" },
+            readiness: {
+              _tag: "Loadable",
+              allocation: {
+                contextWindowTokens: 32_768,
+                parallelSequences: 1,
+                physicalContextTokens: 32_768,
+                requiredSystemMemoryBytes: 0,
+              },
+            },
+            instance: Option.none(),
+            actions: ["Load"],
+          }),
         },
       },
     }
+    expect(deriveOnboardingModelSetupView({
+      active: true,
+      onboardingRequired: true,
+      submittedProviderModelId: null,
+      state,
+    })._tag).toBe("Choosing")
     const view = deriveOnboardingModelSetupView({
       active: true,
       onboardingRequired: true,
+      submittedProviderModelId: TEST_MODEL_ID,
       state,
     })
-    expect(view).toMatchObject({ _tag: "Loading", displayName: "Qwen Test" })
+    expect(view).toMatchObject({
+      _tag: "Activating",
+      phase: "Preparing",
+      displayName: "Qwen Test",
+    })
+    expect(onboardingModelSetupPlaceholder(view)).toBe("Preparing Qwen Test…")
+  })
+
+  it("shows Loading only when the selected exact instance is Loading", () => {
+    const base = makeView({ ready: false })
+    const primary = new ModelSlotConfiguredLocal({
+      slotId: PRIMARY_SLOT_ID,
+      selection,
+      descriptor: {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: TEST_MODEL_ID,
+        displayName: "Qwen Test",
+      },
+      availability: { _tag: "Available" },
+      readiness: { _tag: "Assessing" },
+      instance: Option.some({
+        id: ModelInstanceIdSchema.make("loading-instance"),
+        configurationId: TEST_CONFIGURATION_ID,
+        lifecycle: {
+          _tag: "Loading",
+          stage: "loading",
+          progress: Option.some(0.25),
+          plannedAllocation: Option.none(),
+        },
+      }),
+      actions: ["Stop"],
+    })
+    const view = deriveOnboardingModelSetupView({
+      active: true,
+      onboardingRequired: true,
+      submittedProviderModelId: TEST_MODEL_ID,
+      state: {
+        ...base,
+        slots: {
+          ...base.slots,
+          slots: { ...base.slots.slots, primary },
+        },
+      },
+    })
+    expect(view).toMatchObject({ _tag: "Activating", phase: "Loading" })
     expect(onboardingModelSetupPlaceholder(view)).toBe("Loading Qwen Test…")
   })
 
@@ -135,6 +190,7 @@ describe("deriveOnboardingModelSetupView", () => {
     const view = deriveOnboardingModelSetupView({
       active: true,
       onboardingRequired: true,
+      submittedProviderModelId: TEST_MODEL_ID,
       state,
     })
     expect(view).toMatchObject({ _tag: "Downloading", candidate: { displayName: "Qwen Test" } })

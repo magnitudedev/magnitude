@@ -51,11 +51,8 @@ Owned fibers are children of the responsible service scope. Unscoped daemon fibe
 ownership model. Service teardown may interrupt them because teardown also destroys the authority
 whose state they govern.
 
-ACN implements these mechanics with a narrow service-operation coordinator owned by each
-participating domain service. The coordinator owns one active semantic key, an interruptible
-admission lock, equivalent-key joining, conflicting-key classification, a shared terminal outcome,
-the ACN activity claim, and the service-scoped owner fiber. It does not own product state,
-validation rules, conflict policy, operation persistence, or recovery.
+Domains that need shared ACN work may implement these mechanics with the narrow
+service-operation coordinator. It is not a universal operation registry.
 
 The domain derives the requested key and validates current authoritative state while holding the
 coordinator's admission lock. If idle work is needed, only the admission commit is masked:
@@ -74,10 +71,33 @@ operation state merely to manage cancellation.
 
 ## Domain applications
 
-Model load, unload, and replacement are one serialized residency domain. Explicit commands and
-chat preparation use the same coordinator. `LoadingLocalModel` and `UnloadingLocalModel` are valid
-only while their matching coordinator owner exists. Chat preparation joins load completion and
-holds residency admission until ICN accepts the generation lease; loading is never readiness.
+Model load, stop, replacement, worker supervision, and inference leasing are owned by ICN's
+`ModelInstanceController`. ACN's `ModelSlotController` submits finite idempotent commands and
+projects `ModelInstancesSnapshot`; it does not own a second physical operation or admission gate.
+Loading and Stopping are valid because their exact native instance has a live ICN owner.
+
+The slot controller does own the finite command-admission boundary: equivalent concurrent load
+requests serialize, re-read canonical slot state, and share an already Loading or Ready instance.
+This prevents two callers from deriving distinct native IDs from one loadable slot observation
+without making ACN an owner of the physical load operation.
+
+One branded model-instance identity is created before load admission and remains unchanged through
+loading, readiness, and stopping. Stop is keyed only by that identity; slot and provider-model
+identity are intentionally absent because they would be redundant and could disagree. Absence of
+an instance is represented with `Option`, never `undefined`.
+
+Stop enters the exact instance's native transition. Unknown and terminal IDs are idempotent.
+Loading transitions through Stopping, cancels its owned operation, reaps its owned worker, and
+becomes Stopped. Ready closes exact lease admission, drains accepted leases, reaps its worker, and
+becomes Stopped.
+
+Slot reconciliation cannot author physical lifecycle. It retains durable selection and directly
+projects the exact bound native instance. Catalog and provider changes affect availability;
+readiness affects new-load actions; neither can overwrite instance lifecycle.
+
+Local slot assignment preflights the exact installed serving configuration and commits only after
+it is load-admissible. Success establishes the postcondition required by an immediate slot-load
+command. Slot actions remain presentation and are never used as command authorization.
 
 Provider catalog refresh is a catalog-owned single flight. Equivalent callers join it, conflicting
 targeted refreshes serialize, and every exit publishes a terminal catalog state.
@@ -90,21 +110,26 @@ ICN owns accepted download attempts durably. ACN observes attempts independently
 request, polling quickly while active and periodically while idle so missed request-side wake-ups
 cannot hide shared work.
 
-The onboarding model-selection mutation is outcome-total after download admission: it persists the
-selected offering and slot independently of the initiating transport. While the onboarding flow is
-open, an ACN-owned activation reconciler observes that durable selection. It waits for package and
-catalog availability, admits the ordinary slot-owned load, and completes onboarding only after the
-slot is ready. Its cancellation mutation waits for matching download attempts to become terminal
-before clearing the selection; clearing a loading or loaded selection uses the ordinary slot
-replacement lifecycle. Retrying either command converges from any observable partial result.
+A completed attempt remains successful while installed inventory converges. ACN refreshes and waits
+for that authority instead of interpreting the absence of an active attempt as failure.
+
+Onboarding is a client-owned composition of ordinary model commands. An explicit choice waits for
+the target-level download command to observe authoritative installation, assigns the offering to the
+primary slot, invokes the ordinary slot load, and marks onboarding complete only after that load
+observes the exact selected instance as Ready. ACN owns only the generic commands and the durable
+onboarding boolean; it has no onboarding-specific model operation, activation service, or startup
+reconciler. The client retains only its submitted choice while mounted. Cancellation uses the
+ordinary target-download or slot-clear command. Interruption or restart never reconstructs command
+intent from onboarding, download, assignment, or instance snapshots.
 
 ## Conformance
 
-- Disconnecting the initiating client during load, unload, or refresh cannot strand nonterminal
+- Disconnecting the initiating client during load, stop, or refresh cannot strand nonterminal
   state.
 - Equivalent commands from multiple clients cause one effective operation and expose the same
   snapshots.
 - A client connecting after completion receives the terminal snapshot.
 - Interrupting draft preload or claim leaves no orphaned phase.
 - An accepted native download becomes observable without further initiating-client action.
+- Starting ACN or reopening onboarding never turns a saved slot assignment into a model load.
 - Tests assert only current intended states and never preserve a legacy stranded state.

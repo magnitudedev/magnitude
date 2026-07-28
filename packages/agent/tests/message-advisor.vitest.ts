@@ -20,7 +20,7 @@ import type {
   ProviderRejection,
 } from '@magnitudedev/sdk'
 import {
-  ModelSlotReady,
+  ModelSlotConfiguredRemote,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
   type ModelSlotsState,
@@ -376,8 +376,28 @@ describe('messageAdvisor toolkit registration', () => {
       catalogModel('secondary-model', 'Secondary', SECONDARY_SLOT_ID),
     ] as const satisfies readonly ProviderModelCatalogEntry[]
     const slots: ModelSlotsState['slots'] = {
-      primary: new ModelSlotReady({ slotId: PRIMARY_SLOT_ID, selection: { providerId, providerModelId: catalogModels[0].providerModelId, reasoningEffort } }),
-      secondary: new ModelSlotReady({ slotId: SECONDARY_SLOT_ID, selection: { providerId, providerModelId: catalogModels[1].providerModelId, reasoningEffort } }),
+      primary: new ModelSlotConfiguredRemote({
+        slotId: PRIMARY_SLOT_ID,
+        selection: { providerId, providerModelId: catalogModels[0].providerModelId, reasoningEffort },
+        descriptor: {
+          providerId,
+          providerModelId: catalogModels[0].providerModelId,
+          displayName: catalogModels[0].displayName,
+        },
+        availability: { _tag: 'Available' },
+        actions: [],
+      }),
+      secondary: new ModelSlotConfiguredRemote({
+        slotId: SECONDARY_SLOT_ID,
+        selection: { providerId, providerModelId: catalogModels[1].providerModelId, reasoningEffort },
+        descriptor: {
+          providerId,
+          providerModelId: catalogModels[1].providerModelId,
+          displayName: catalogModels[1].displayName,
+        },
+        availability: { _tag: 'Available' },
+        actions: [],
+      }),
     }
     const config = buildConfigStateFromSlots(catalogModels, slots, {
       softCapRatio: 0.9,

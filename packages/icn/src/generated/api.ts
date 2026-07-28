@@ -93,6 +93,19 @@ export const getModelDownload = HttpApiEndpoint.get("getModelDownload", "/v1/mod
     { status: 404 },
   )
 
+export const getModelInstances = HttpApiEndpoint.get("getModelInstances", "/v1/models/instances")
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.ModelInstancesSnapshot, Schemas.ModelInstancesSnapshotEncoded> =>
+        Schemas.ModelInstancesSnapshot,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const getModelProperties = HttpApiEndpoint.get("getModelProperties", "/v1/props")
   .addSuccess(
     S.suspend((): S.Schema<Schemas.PropsResponse, Schemas.PropsResponseEncoded> => Schemas.PropsResponse),
@@ -141,6 +154,32 @@ export const listModelDownloads = HttpApiEndpoint.get("listModelDownloads", "/v1
         Schemas.ModelDownloadsResponse,
     ),
     { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/v1/models/load/preview")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.PreviewModelLoadRequest, Schemas.PreviewModelLoadRequestEncoded> =>
+        Schemas.PreviewModelLoadRequest,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.ModelLoadAllocation, Schemas.ModelLoadAllocationEncoded> => Schemas.ModelLoadAllocation,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -233,13 +272,9 @@ export const startModelDownload = HttpApiEndpoint.post("startModelDownload", "/v
     { status: 500 },
   )
 
-export const unloadModelResidency = HttpApiEndpoint.del("unloadModelResidency", "/v1/models/residencies/:residency_id")
-  .setPath(S.Struct({ residency_id: S.String }))
+export const stopModelInstance = HttpApiEndpoint.post("stopModelInstance", "/v1/models/instances/:instance_id/stop")
+  .setPath(S.Struct({ instance_id: S.String }))
   .addSuccess(S.Void, { status: 204 })
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 404 },
-  )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
@@ -256,13 +291,15 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(cancelModelDownload)
   .add(fitModels)
   .add(getModelDownload)
+  .add(getModelInstances)
   .add(getModelProperties)
   .add(getRecommendableModelCatalog)
   .add(listInstalledModels)
   .add(listModelDownloads)
+  .add(previewModelLoad)
   .add(removeInstalledModel)
   .add(startModelDownload)
-  .add(unloadModelResidency)
+  .add(stopModelInstance)
 
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 

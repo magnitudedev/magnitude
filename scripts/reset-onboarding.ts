@@ -4,15 +4,15 @@ import {
   GlobalStorageLive,
   makeConfigStorage,
 } from "@magnitudedev/storage"
-import { Console, Effect } from "effect"
+import { Console, Effect, Option } from "effect"
 
 const resetOnboarding = Effect.gen(function* () {
   const config = yield* makeConfigStorage()
 
-  yield* config.update((current) => {
-    const { onboarding: _onboarding, ...remaining } = current
-    return remaining
-  })
+  yield* config.update((current) => ({
+    ...current,
+    onboarding: Option.none(),
+  }))
 
   yield* Console.log("Onboarding state reset.")
 })

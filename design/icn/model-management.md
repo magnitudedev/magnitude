@@ -147,6 +147,10 @@ Successful publication is atomic: incomplete staging is never reported as instal
 the complete package before publication. Interrupted attempts recover as terminal failures or are
 cleaned without leaving a false installed record.
 
+`Completed` is authoritative success for the attempt. While installed-package observation catches
+up, ACN retains a nonterminal target-acquisition projection and refreshes inventory; it never
+reclassifies this convergence interval as an inactive-download failure.
+
 ICN owns an accepted attempt independently of the HTTP caller. ACN's download observer periodically
 refreshes even when its last snapshot is idle, then uses the faster active interval until every
 attempt is terminal. Observation therefore cannot depend on the initiating request completing a

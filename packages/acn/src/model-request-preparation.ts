@@ -4,10 +4,10 @@ import {
   type PrepareModelRequest,
 } from "@magnitudedev/agent"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import type { ModelSlotCoordinatorApi } from "./model-slot-coordinator"
+import type { ModelSlotControllerApi } from "./model-slot-controller"
 
 export const makeModelRequestPreparation = (
-  modelSlots: Pick<ModelSlotCoordinatorApi, "acquireLocalModel">,
+  modelSlots: Pick<ModelSlotControllerApi, "acquireLocalModel">,
 ): PrepareModelRequest => ({ slotId, providerId, providerModelId, reportProgress }) => {
   if (providerId !== LOCAL_PROVIDER_ID) return Effect.void
 

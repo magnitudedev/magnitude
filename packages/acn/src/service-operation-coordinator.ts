@@ -33,9 +33,23 @@ export interface ServiceOperationRequest<K, E, AdmissionError> {
   >
 }
 
+export interface ServiceOperationSupersession<K, E, AdmissionError>
+  extends ServiceOperationRequest<K, E, AdmissionError> {
+  readonly whenConflicting: (
+    currentKey: K,
+    currentOutcome: Effect.Effect<Exit.Exit<void, E>>,
+  ) => Effect.Effect<Option.Option<ServiceOperationDefinition<E>>, AdmissionError>
+}
+
 export interface ServiceOperationCoordinator<K, E> {
   readonly admit: <AdmissionError>(
     request: Effect.Effect<ServiceOperationRequest<K, E, AdmissionError>, AdmissionError>,
+  ) => Effect.Effect<ServiceOperationAdmission<E>, AdmissionError | ResourceRetired>
+  readonly supersede: <AdmissionError>(
+    request: Effect.Effect<
+      ServiceOperationSupersession<K, E, AdmissionError>,
+      AdmissionError
+    >,
   ) => Effect.Effect<ServiceOperationAdmission<E>, AdmissionError | ResourceRetired>
 }
 
@@ -61,12 +75,9 @@ export const makeServiceOperationCoordinator = <K, E>(
     exit: Exit.Exit<void, E>,
   ) => Effect.gen(function* () {
     const current = yield* Ref.get(active)
-    if (Option.isNone(current) || current.value.outcome !== operation.outcome) {
-      return yield* Effect.die(
-        new Error("Service operation lost coordinator ownership before terminalization"),
-      )
+    if (Option.isSome(current) && current.value.outcome === operation.outcome) {
+      yield* Ref.set(active, Option.none())
     }
-    yield* Ref.set(active, Option.none())
     yield* Deferred.succeed(operation.outcome, exit)
   })
 
@@ -142,5 +153,33 @@ export const makeServiceOperationCoordinator = <K, E>(
       return yield* start(prepared.key, definition.value)
     }))
 
-  return { admit }
+  const supersede: ServiceOperationCoordinator<K, E>["supersede"] = (request) =>
+    admissionLock.withPermits(1)(Effect.gen(function* () {
+      const prepared = yield* request
+      const current = yield* Ref.get(active)
+      if (Option.isNone(current)) {
+        const definition = yield* prepared.whenIdle
+        if (Option.isNone(definition)) return { _tag: "Satisfied" as const }
+        return yield* start(prepared.key, definition.value)
+      }
+      if (equivalent(current.value.key, prepared.key)) {
+        return {
+          _tag: "Current" as const,
+          outcome: Deferred.await(current.value.outcome),
+        }
+      }
+      const definition = yield* prepared.whenConflicting(
+        current.value.key,
+        Deferred.await(current.value.outcome),
+      )
+      if (Option.isNone(definition)) {
+        return {
+          _tag: "Conflicting" as const,
+          outcome: Deferred.await(current.value.outcome),
+        }
+      }
+      return yield* start(prepared.key, definition.value)
+    }))
+
+  return { admit, supersede }
 })

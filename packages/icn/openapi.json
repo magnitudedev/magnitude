@@ -186,7 +186,7 @@
         "operationId": "getHardware",
         "responses": {
           "200": {
-            "description": "Hardware visible to the pinned ICN runtime",
+            "description": "Hardware visible to the pinned ICN process",
             "content": {
               "application/json": {
                 "schema": {
@@ -649,12 +649,40 @@
         }
       }
     },
-    "/v1/models/load": {
+    "/v1/models/instances": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelInstances",
+        "responses": {
+          "200": {
+            "description": "Authoritative native model instances",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelInstancesSnapshot"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "tags": [
           "models"
         ],
-        "operationId": "loadModelConfiguration",
+        "operationId": "loadModelInstance",
         "requestBody": {
           "content": {
             "application/json": {
@@ -706,17 +734,64 @@
         }
       }
     },
-    "/v1/models/residencies/{residency_id}": {
-      "delete": {
+    "/v1/models/instances/watch": {
+      "get": {
         "tags": [
           "models"
         ],
-        "operationId": "unloadModelResidency",
+        "operationId": "watchModelInstances",
+        "responses": {
+          "200": {
+            "description": "Coalescing native model-instance invalidations",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/ModelInstancesInvalidation"
+            }
+          },
+          "framing": "sse",
+          "reconnect": {
+            "type": "last-event-id"
+          },
+          "responseStatus": 200,
+          "termination": {
+            "type": "long-lived"
+          },
+          "version": 1
+        }
+      }
+    },
+    "/v1/models/instances/{instance_id}/stop": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "stopModelInstance",
         "parameters": [
           {
-            "name": "residency_id",
+            "name": "instance_id",
             "in": "path",
-            "description": "Runtime residency ID",
+            "description": "Model instance ID",
             "required": true,
             "schema": {
               "type": "string"
@@ -725,10 +800,60 @@
         ],
         "responses": {
           "204": {
-            "description": "Residency is no longer loaded"
+            "description": "The exact model instance is stopped"
           },
-          "404": {
-            "description": "Residency not found",
+          "500": {
+            "description": "Model instance stop failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/load/preview": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "previewModelLoad",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewModelLoadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Allocation ICN would select from current admission evidence",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelLoadAllocation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Configuration cannot be resolved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model cannot currently be admitted",
             "content": {
               "application/json": {
                 "schema": {
@@ -738,7 +863,7 @@
             }
           },
           "500": {
-            "description": "Runtime unload failed",
+            "description": "Load preview failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -874,9 +999,13 @@
       "ApplyTemplateRequest": {
         "type": "object",
         "required": [
+          "model_instance_id",
           "messages"
         ],
         "properties": {
+          "model_instance_id": {
+            "type": "string"
+          },
           "model": {
             "type": "string"
           },
@@ -1271,10 +1400,14 @@
       "ChatCompletionRequest": {
         "type": "object",
         "required": [
+          "model_instance_id",
           "messages",
           "stream"
         ],
         "properties": {
+          "model_instance_id": {
+            "type": "string"
+          },
           "model": {
             "type": "string"
           },
@@ -2567,36 +2700,6 @@
             "items": {
               "$ref": "#/components/schemas/HardwareMemoryDomain"
             }
-          },
-          "resident_memory": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ResidentMemory"
-              }
-            ]
-          },
-          "resident_execution": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ResidentExecution"
-              }
-            ]
-          },
-          "runtime_failure": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/RuntimeFailureObservation"
-              }
-            ]
           }
         },
         "additionalProperties": false
@@ -2948,31 +3051,19 @@
       "LoadModelReady": {
         "type": "object",
         "required": [
-          "residencyId",
+          "instanceId",
           "configurationId",
-          "executionEvidenceId",
-          "parallelSequences",
-          "physicalContextTokens"
+          "allocation"
         ],
         "properties": {
-          "residencyId": {
-            "$ref": "#/components/schemas/RuntimeResidencyId"
+          "instanceId": {
+            "$ref": "#/components/schemas/ModelInstanceId"
           },
           "configurationId": {
             "$ref": "#/components/schemas/ModelServingConfigurationId"
           },
-          "executionEvidenceId": {
-            "type": "string"
-          },
-          "parallelSequences": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "physicalContextTokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
+          "allocation": {
+            "$ref": "#/components/schemas/ModelInstanceAllocation"
           }
         },
         "additionalProperties": false
@@ -2980,9 +3071,13 @@
       "LoadModelRequest": {
         "type": "object",
         "required": [
+          "instanceId",
           "configuration"
         ],
         "properties": {
+          "instanceId": {
+            "$ref": "#/components/schemas/ModelInstanceId"
+          },
           "configuration": {
             "$ref": "#/components/schemas/ModelServingConfiguration"
           }
@@ -3262,6 +3357,270 @@
           "auxiliary"
         ]
       },
+      "ModelInstance": {
+        "type": "object",
+        "required": [
+          "id",
+          "configurationId",
+          "lifecycle"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelInstanceId"
+          },
+          "configurationId": {
+            "$ref": "#/components/schemas/ModelServingConfigurationId"
+          },
+          "lifecycle": {
+            "$ref": "#/components/schemas/ModelInstanceLifecycle"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelInstanceAllocation": {
+        "type": "object",
+        "required": [
+          "contextWindowTokens",
+          "parallelSequences",
+          "physicalContextTokens",
+          "memoryDomains"
+        ],
+        "properties": {
+          "contextWindowTokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "parallelSequences": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "physicalContextTokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "memoryDomains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelInstanceMemoryDomain"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelInstanceId": {
+        "type": "string"
+      },
+      "ModelInstanceLifecycle": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "stage",
+              "_tag"
+            ],
+            "properties": {
+              "stage": {
+                "$ref": "#/components/schemas/ModelLoadStage"
+              },
+              "progress": {
+                "type": "number",
+                "format": "float"
+              },
+              "plannedAllocation": {
+                "$ref": "#/components/schemas/ModelLoadAllocation"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Loading"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "allocation",
+              "_tag"
+            ],
+            "properties": {
+              "allocation": {
+                "$ref": "#/components/schemas/ModelInstanceAllocation"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "allocation",
+              "_tag"
+            ],
+            "properties": {
+              "reason": {
+                "$ref": "#/components/schemas/ModelReleaseReason"
+              },
+              "allocation": {
+                "$ref": "#/components/schemas/ModelStoppingAllocation"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Stopping"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "_tag"
+            ],
+            "properties": {
+              "reason": {
+                "$ref": "#/components/schemas/ModelReleaseReason"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Stopped"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ModelInstanceMemoryDomain": {
+        "type": "object",
+        "required": [
+          "memoryDomainId",
+          "modelBytes",
+          "contextBytes",
+          "computeBytes",
+          "auxiliaryBytes"
+        ],
+        "properties": {
+          "memoryDomainId": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "modelBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "contextBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "computeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "auxiliaryBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelInstancesInvalidation": {
+        "type": "object",
+        "required": [
+          "revision"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelInstancesSnapshot": {
+        "type": "object",
+        "required": [
+          "revision",
+          "instances"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "instances": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelInstance"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelLoadAllocation": {
+        "type": "object",
+        "required": [
+          "contextWindowTokens",
+          "parallelSequences",
+          "physicalContextTokens",
+          "requiredSystemMemoryBytes"
+        ],
+        "properties": {
+          "contextWindowTokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "parallelSequences": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "physicalContextTokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "requiredSystemMemoryBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "ModelLoadEvent": {
         "oneOf": [
           {
@@ -3280,6 +3639,16 @@
                   "null"
                 ],
                 "format": "float"
+              },
+              "allocation": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ModelLoadAllocation"
+                  }
+                ]
               },
               "_tag": {
                 "type": "string",
@@ -3303,6 +3672,24 @@
                 "type": "string",
                 "enum": [
                   "Ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "instance_id",
+              "_tag"
+            ],
+            "properties": {
+              "instance_id": {
+                "$ref": "#/components/schemas/ModelInstanceId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Stopped"
                 ]
               }
             }
@@ -3636,6 +4023,14 @@
         },
         "additionalProperties": false
       },
+      "ModelReleaseReason": {
+        "type": "string",
+        "enum": [
+          "explicit_stop",
+          "replacement",
+          "idle_timeout"
+        ]
+      },
       "ModelServingConfiguration": {
         "type": "object",
         "required": [
@@ -3658,6 +4053,45 @@
       },
       "ModelServingConfigurationId": {
         "type": "string"
+      },
+      "ModelStoppingAllocation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "allocation": {
+                "$ref": "#/components/schemas/ModelLoadAllocation"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Planned"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "allocation",
+              "_tag"
+            ],
+            "properties": {
+              "allocation": {
+                "$ref": "#/components/schemas/ModelInstanceAllocation"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Resident"
+                ]
+              }
+            }
+          }
+        ]
       },
       "ModelTargetInput": {
         "oneOf": [
@@ -3913,6 +4347,18 @@
         },
         "additionalProperties": false
       },
+      "PreviewModelLoadRequest": {
+        "type": "object",
+        "required": [
+          "configuration"
+        ],
+        "properties": {
+          "configuration": {
+            "$ref": "#/components/schemas/ModelServingConfiguration"
+          }
+        },
+        "additionalProperties": false
+      },
       "PropsResponse": {
         "type": "object",
         "required": [
@@ -4114,97 +4560,6 @@
           }
         }
       },
-      "ResidentExecution": {
-        "type": "object",
-        "required": [
-          "model_id",
-          "context_window_tokens",
-          "parallel_sequences",
-          "physical_context_tokens"
-        ],
-        "properties": {
-          "model_id": {
-            "type": "string"
-          },
-          "context_window_tokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "parallel_sequences": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "physical_context_tokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
-      },
-      "ResidentMemory": {
-        "type": "object",
-        "required": [
-          "model_id",
-          "runtime_generation",
-          "domains"
-        ],
-        "properties": {
-          "model_id": {
-            "type": "string"
-          },
-          "runtime_generation": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "domains": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResidentMemoryDomain"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
-      "ResidentMemoryDomain": {
-        "type": "object",
-        "required": [
-          "memory_domain_id",
-          "model_bytes",
-          "context_bytes",
-          "compute_bytes",
-          "auxiliary_bytes"
-        ],
-        "properties": {
-          "memory_domain_id": {
-            "$ref": "#/components/schemas/MemoryDomainId"
-          },
-          "model_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "context_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "compute_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "auxiliary_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
-      },
       "ResponseFormatRequest": {
         "oneOf": [
           {
@@ -4272,33 +4627,6 @@
             }
           }
         ]
-      },
-      "RuntimeFailureObservation": {
-        "type": "object",
-        "required": [
-          "model_id",
-          "code",
-          "message",
-          "retryable"
-        ],
-        "properties": {
-          "model_id": {
-            "type": "string"
-          },
-          "code": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
-          },
-          "retryable": {
-            "type": "boolean"
-          }
-        },
-        "additionalProperties": false
-      },
-      "RuntimeResidencyId": {
-        "type": "string"
       },
       "ServingProfile": {
         "type": "object",

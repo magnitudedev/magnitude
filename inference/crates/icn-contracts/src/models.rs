@@ -26,7 +26,105 @@ string_id!(ModelServingConfigurationId);
 string_id!(OfferingAssessmentId);
 string_id!(AssessmentEnvironmentId);
 string_id!(RecommendableModelId);
-string_id!(RuntimeResidencyId);
+string_id!(ModelInstanceId);
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelInstanceMemoryDomain {
+    pub memory_domain_id: crate::MemoryDomainId,
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub compute_bytes: u64,
+    pub auxiliary_bytes: u64,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelInstanceAllocation {
+    pub context_window_tokens: u32,
+    pub parallel_sequences: u32,
+    pub physical_context_tokens: u32,
+    pub memory_domains: Vec<ModelInstanceMemoryDomain>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelReleaseReason {
+    ExplicitStop,
+    Replacement,
+    IdleTimeout,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelStoppingAllocation {
+    Planned {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        allocation: Option<ModelLoadAllocation>,
+    },
+    Resident {
+        allocation: ModelInstanceAllocation,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelInstanceLifecycle {
+    #[serde(rename_all = "camelCase")]
+    Loading {
+        stage: ModelLoadStage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        progress: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        planned_allocation: Option<ModelLoadAllocation>,
+    },
+    Ready {
+        allocation: ModelInstanceAllocation,
+    },
+    #[serde(rename_all = "camelCase")]
+    Stopping {
+        reason: ModelReleaseReason,
+        allocation: ModelStoppingAllocation,
+    },
+    Stopped {
+        reason: ModelReleaseReason,
+    },
+    Failed {
+        failure: ModelFailure,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelInstance {
+    pub id: ModelInstanceId,
+    pub configuration_id: ModelServingConfigurationId,
+    pub lifecycle: ModelInstanceLifecycle,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelInstancesSnapshot {
+    pub revision: u64,
+    pub instances: Vec<ModelInstance>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelInstancesInvalidation {
+    pub revision: u64,
+}
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,6 +604,7 @@ pub enum DownloadAttempt {
         stage: DownloadStage,
         completed_bytes: u64,
         total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes_per_second: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
@@ -544,18 +643,34 @@ pub struct ModelDownloadsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoadModelRequest {
+    pub instance_id: ModelInstanceId,
     pub configuration: ModelServingConfiguration,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LoadModelReady {
-    pub residency_id: RuntimeResidencyId,
-    pub configuration_id: ModelServingConfigurationId,
-    pub execution_evidence_id: String,
+pub struct PreviewModelLoadRequest {
+    pub configuration: ModelServingConfiguration,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelLoadAllocation {
+    pub context_window_tokens: u32,
     pub parallel_sequences: u32,
     pub physical_context_tokens: u32,
+    pub required_system_memory_bytes: u64,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoadModelReady {
+    pub instance_id: ModelInstanceId,
+    pub configuration_id: ModelServingConfigurationId,
+    pub allocation: ModelInstanceAllocation,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -578,9 +693,14 @@ pub enum ModelLoadEvent {
         stage: ModelLoadStage,
         #[serde(skip_serializing_if = "Option::is_none")]
         fraction: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allocation: Option<ModelLoadAllocation>,
     },
     Ready {
         ready: LoadModelReady,
+    },
+    Stopped {
+        instance_id: ModelInstanceId,
     },
     Failed {
         failure: ModelFailure,

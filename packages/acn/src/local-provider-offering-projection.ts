@@ -155,7 +155,7 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
         providerId: LOCAL_PROVIDER_ID,
         providerModelId: offering.providerModelId,
         modelFamilyId: Option.none(),
-        displayName: curatedNames.get(offering.modelId) ?? (target._tag === "Package"
+        displayName: curatedNames.get(offering.targetId) ?? (target._tag === "Package"
           ? `${sourceName} ${targetPackage.properties.quantization}`
           : `${sourceName} + speculative draft`),
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
@@ -218,7 +218,7 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
     offerings.changes,
     catalog.changes.pipe(Stream.map(() => undefined)),
     packages.changes.pipe(Stream.map(() => undefined)),
-    hardware.changes.pipe(Stream.map(() => undefined)),
+    hardware.fittingChanges.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" }).pipe(
     Stream.runForEach(() => project),
     Effect.forkScoped,

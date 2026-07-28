@@ -5,12 +5,12 @@ import {
   LocalModelsMirror,
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
-  type CatalogCandidateId,
+  type ModelInstanceId,
   type ModelOfferingTargetId,
+  type ProviderModelId,
   type SlotId,
   type SlotSelection,
 } from "@magnitudedev/sdk"
-import { Option } from "effect"
 import { useAgentClient } from "../state/agent-client-context"
 import type { LocalInferenceView } from "../types/local-inference"
 import { useMirroredState, useMirroredStateAtom } from "./use-mirrored-state"
@@ -38,6 +38,7 @@ export const makeLocalInferenceQueryAtom = <E>(
 })))
 
 export const useLocalInferenceHardware = () => useMirroredState(LocalInferenceHardwareMirror)
+
 export const useLocalModels = () => useMirroredState(LocalModelsMirror)
 export const useModelSlots = () => useMirroredState(ModelSlotsMirror)
 
@@ -56,87 +57,56 @@ export function useLocalInferenceQuery() {
 export function useLocalInferenceState() {
   const client = useAgentClient()
   const state = useLocalInferenceQuery()
-  const downloadCatalogAtom = useMemo(() => client.mutation("DownloadCatalogModel"), [client])
-  const cancelCatalogDownloadAtom = useMemo(
-    () => client.mutation("CancelCatalogModelDownload"),
-    [client],
-  )
-  const deleteCatalogModelAtom = useMemo(() => client.mutation("DeleteCatalogModel"), [client])
-  const selectCatalogModelAtom = useMemo(() => client.mutation("SelectCatalogModel"), [client])
-  const retryAtom = useMemo(() => client.mutation("RetryModelDownload"), [client])
+  const downloadAtom = useMemo(() => client.mutation("DownloadModel"), [client])
   const cancelAtom = useMemo(() => client.mutation("CancelModelDownload"), [client])
   const dismissAtom = useMemo(() => client.mutation("DismissModelDownloadFailure"), [client])
   const deleteAtom = useMemo(() => client.mutation("DeleteLocalModel"), [client])
   const assignAtom = useMemo(() => client.mutation("AssignSlot"), [client])
   const clearAtom = useMemo(() => client.mutation("ClearSlot"), [client])
   const loadAtom = useMemo(() => client.mutation("LoadModel"), [client])
-  const unloadAtom = useMemo(() => client.mutation("UnloadModel"), [client])
+  const stopAtom = useMemo(() => client.mutation("StopModel"), [client])
+  const downloadResult = useAtomValue(downloadAtom)
+  const cancelDownloadResult = useAtomValue(cancelAtom)
+  const dismissDownloadFailureResult = useAtomValue(dismissAtom)
+  const deleteLocalModelResult = useAtomValue(deleteAtom)
   const slotAssignment = useAtomValue(assignAtom)
-  const mutations = [
-    useAtomValue(downloadCatalogAtom),
-    useAtomValue(cancelCatalogDownloadAtom),
-    useAtomValue(deleteCatalogModelAtom),
-    useAtomValue(selectCatalogModelAtom),
-    useAtomValue(retryAtom),
-    useAtomValue(cancelAtom),
-    useAtomValue(dismissAtom),
-    useAtomValue(deleteAtom),
-    slotAssignment,
-    useAtomValue(clearAtom),
-    useAtomValue(loadAtom),
-    useAtomValue(unloadAtom),
-  ]
-  const downloadCatalog = useAtomSet(downloadCatalogAtom)
-  const cancelCatalogDownload = useAtomSet(cancelCatalogDownloadAtom)
-  const removeCatalogModel = useAtomSet(deleteCatalogModelAtom)
-  const assignCatalogModel = useAtomSet(selectCatalogModelAtom)
-  const retry = useAtomSet(retryAtom)
+  const clearSlotResult = useAtomValue(clearAtom)
+  const loadModelResult = useAtomValue(loadAtom)
+  const stopModelResult = useAtomValue(stopAtom)
+  const download = useAtomSet(downloadAtom, { mode: "promise" })
   const cancel = useAtomSet(cancelAtom)
   const dismiss = useAtomSet(dismissAtom)
   const deleteModel = useAtomSet(deleteAtom)
   const assign = useAtomSet(assignAtom, { mode: "promise" })
   const clear = useAtomSet(clearAtom)
-  const load = useAtomSet(loadAtom)
-  const unload = useAtomSet(unloadAtom)
+  const load = useAtomSet(loadAtom, { mode: "promise" })
+  const stop = useAtomSet(stopAtom)
   const modelKeys = [LocalModelsMirror.id, ProviderModelCatalogMirror.id] as const
   return {
     state,
+    downloadResult,
+    cancelDownloadResult,
+    dismissDownloadFailureResult,
+    deleteLocalModelResult,
     slotAssignment,
-    mutationFailure: Option.fromNullable(mutations.find(Result.isFailure)),
-    downloadCatalogModel: useCallback((id: CatalogCandidateId) =>
-      downloadCatalog({
-        payload: { id },
+    clearSlotResult,
+    loadModelResult,
+    stopModelResult,
+    downloadModel: useCallback((targetId: ModelOfferingTargetId) =>
+      download({
+        payload: { targetId },
         reactivityKeys: modelKeys,
-      }), [downloadCatalog]),
-    cancelCatalogModelDownload: useCallback((id: CatalogCandidateId) =>
-      cancelCatalogDownload({
-        payload: { id },
-        reactivityKeys: [LocalModelsMirror.id],
-      }), [cancelCatalogDownload]),
-    deleteCatalogModel: useCallback((id: CatalogCandidateId) =>
-      removeCatalogModel({
-        payload: { id },
-        reactivityKeys: modelKeys,
-      }), [removeCatalogModel]),
-    selectCatalogModel: useCallback((id: CatalogCandidateId) =>
-      assignCatalogModel({
-        payload: { id },
-        reactivityKeys: [ModelSlotsMirror.id, ProviderModelCatalogMirror.id],
-      }), [assignCatalogModel]),
-    retryModelDownload: useCallback((modelId: ModelOfferingTargetId) => retry({
-      payload: { modelId },
-      reactivityKeys: modelKeys,
-    }), [retry]),
-    cancelModelDownload: useCallback((modelId: ModelOfferingTargetId) => cancel({
-      payload: { modelId },
+      }), [download]),
+    cancelModelDownload: useCallback((targetId: ModelOfferingTargetId) => cancel({
+      payload: { targetId },
       reactivityKeys: [LocalModelsMirror.id],
     }), [cancel]),
-    dismissModelDownloadFailure: useCallback((modelId: ModelOfferingTargetId) => dismiss({
-      payload: { modelId },
+    dismissModelDownloadFailure: useCallback((targetId: ModelOfferingTargetId) => dismiss({
+      payload: { targetId },
       reactivityKeys: [LocalModelsMirror.id],
     }), [dismiss]),
-    deleteLocalModel: useCallback((modelId: ModelOfferingTargetId) => deleteModel({
-      payload: { modelId },
+    deleteLocalModel: useCallback((targetId: ModelOfferingTargetId) => deleteModel({
+      payload: { targetId },
       reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id, ModelSlotsMirror.id],
     }), [deleteModel]),
     assignSlot: useCallback((slotId: SlotId, selection: SlotSelection) => assign({
@@ -151,9 +121,9 @@ export function useLocalInferenceState() {
       payload: { slotId },
       reactivityKeys: [ModelSlotsMirror.id],
     }), [load]),
-    unloadModel: useCallback((slotId: SlotId) => unload({
-      payload: { slotId },
+    stopModel: useCallback((instanceId: ModelInstanceId) => stop({
+      payload: { instanceId },
       reactivityKeys: [ModelSlotsMirror.id],
-    }), [unload]),
+    }), [stop]),
   }
 }

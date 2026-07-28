@@ -116,7 +116,7 @@ response metadata.
 Every operation in the normalized IR is emitted into the callable client automatically. There is
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
 and identity, hardware, live Hugging Face discovery, recommendable catalog, installed packages,
-assessment, automatic fitting, downloads, exact configuration load, residency unload, template
+assessment, automatic fitting, downloads, exact configuration load, exact model-instance Stop, template
 application, model properties, and streamed chat completion. Generator tests
 prove that the manifest, descriptors, and callable client contain the same operation set.
 
@@ -124,8 +124,18 @@ The ICN package checks in generated schemas and operations. Its public authored 
 `IcnProcess`, which proves one ready scoped child, and `IcnClient`, which requires that process and
 constructs the generated callable API. The generated service tag and standalone live layer are not
 public construction paths because they would permit a client without process ownership. No
-hand-authored model-runtime facade duplicates or renames generated operations. The
+hand-authored model-serving facade duplicates or renames generated operations. The
 admitted stream owns its response body until that Stream terminates or is canceled.
+
+ICN also exposes a private revisioned model-instance snapshot and coalescing invalidation watch.
+The authored ICN package admits the watch before fetching its initial snapshot, refetches on every
+newer invalidation, and converges from a fresh invalidation after reconnect. A transient snapshot
+failure is retried without abandoning its invalidation, and a terminal watch failure re-admits the
+watch before refreshing current state. An explicit exact-instance check preserves refresh failure
+instead of authorizing from a cached snapshot. ACN is the only consumer; native instance types
+are not a client-facing product mirror. Instance identity, allocation, release, and failure
+semantics are defined by
+[local model instance lifecycle](./model-instance-lifecycle.md), not by the hardware API.
 
 Chat's `[DONE]` sentinel and download's successful EOF are OpenAPI extension semantics consumed by
 the generator. They are not ICN-specific parser branches.
@@ -282,16 +292,16 @@ before cleanup. For abrupt death, ICN watches parent-PID liveness and EOF on a p
 stdin pipe. The EOF wait runs on a detached OS thread, not Tokio's blocking pool. These are crash
 backstops, not child adoption or sharing.
 
-## Runtime model lifecycle
+## Model instance lifecycle
 
-The singleton starts with no loaded model. Catalog, installed-package, assessment, fitting,
-download, and deletion
-remain available in that state. ICN owns the native backend, the currently resident target, and
-generation leases needed to keep that target alive during inference. ACN owns the product model
-slots and is the sole policy authority that decides when a selected local model is loaded or
-unloaded. A slot is not an ICN resource and ICN does not expose a separate public runtime resource.
+The singleton starts with no model instances. Catalog, installed-package, assessment, fitting,
+download, and deletion remain available in that state. ICN's `ModelInstanceController` owns
+physical instance admission, native workers, backends, exact-instance leases, lifecycle
+publication, and terminal cleanup. ACN owns product slots and explicit load/Stop policy. A slot is
+not an ICN resource.
 
-Runtime load accepts one exact model serving configuration. The configuration contains the target
+Model load accepts one exact model serving configuration plus the branded model-instance identity
+created by ACN before admission. The configuration contains the target
 and per-request context length; ICN owns its stable identity and ACN passes it unchanged from the
 selected provider offering. After proving the exact one-sequence baseline, load selects the largest
 native sequence capacity from one through four whose full-context allocation fits stable and live
@@ -302,14 +312,13 @@ ICN reassesses the exact plan and streams typed progress through resolution, ass
 unload/replacement, loading, verification, and ready or failed termination. Loading percentage
 begins only after the exact native plan is prepared and prior residency is released. ICN estimates
 total progress from the prepared plan's semantic phase sequence and phase-duration estimates,
-updates it on a 100-millisecond cadence, keeps it monotonic, and caps it at 99%; only the terminal
-ready event means 100%. Load of the
-already-resident identical model and profile is idempotent. Concurrent identical explicit loads
-serialize, recheck residency, and perform at most one effective successful native load. Concurrent
-incompatible mutations are serialized by the native coordinator; they never race native
-process-global state or rely on ACN-side locking.
-The terminal ready event and subsequent live hardware snapshots expose the selected parallelism
-and physical context allocation as execution evidence. That evidence disappears with residency.
+keeps it monotonic, and caps it below completion; only Ready means complete. Loading, progress,
+Ready, Stopping, Stopped, and Failed are published in the revisioned
+`ModelInstancesSnapshot`. ICN admits one exact instance identity idempotently; a later load of the
+same configuration uses a new identity. Reusing an active identity for another configuration is a
+conflict. Concurrent incompatible mutations are serialized by `ModelInstanceController`; they
+never rely on ACN-side locking. Ready state carries the actual selected parallelism, physical
+context allocation, and memory-domain allocation. Hardware snapshots do not own that evidence.
 The ICN composition root creates no resident native backend before readiness. Each resident load
 creates one private `inference-worker` child; that child initializes its own process-lifetime
 native-backend capability, prepares and loads exactly one topology, and owns the executor until it
@@ -322,43 +331,38 @@ core dumps and run a dedicated parent-liveness watchdog; Linux additionally requ
 `PR_SET_PDEATHSIG`. Windows workers are assigned to a kill-on-close Job Object. The retained child
 or Job handle, rather than a later PID lookup, performs forced termination and reaping.
 
-An ordinary chat request names the exact serving-configuration identity and may proceed only when
-that configuration is already resident. ICN acquires a generation lease and holds it until the
-response stream succeeds, fails, or is canceled. A nonresident or differently configured target is
-rejected as not ready; chat never starts a model transition. Before starting a local provider
-request, ACN injects a pre-provider preparation phase that acquires the selected slot's local-model
-admission as a scoped resource. That acquisition performs or joins the slot's explicit load
-operation and remains held until ICN accepts the chat request and takes its generation lease.
-Preparation failure remains outside the provider error contract.
+An ordinary chat request names the exact model-instance identity and serving-configuration identity.
+ICN atomically acquires `ModelInstanceLease` only when that exact pair is Ready and admission is
+open, and holds it until the response stream succeeds, fails, or is canceled. A missing,
+non-Ready, or differently configured instance is rejected; chat never starts a model transition.
+Before constructing a local-provider request, ACN's `ModelSlotController` observes or loads the
+selected slot's exact instance, waits for that ID to become Ready, rechecks the slot binding, and
+installs the exact pair in the request fiber. Preparation failure remains outside the provider error
+contract.
 
-ACN consumes the admitted load operation's stream directly. A missing fraction leaves the current
-percentage unchanged, and ACN neither invents phase timers nor maps verification to 100%. Loading
-fractions update every product slot selecting that local offering, the ready event transitions them
-to Ready, and a failed or
-incomplete stream transitions them to a typed blocked state. Explicit unload similarly moves slots
-through Unloading to Unloaded. Because ICN has one resident target, a replacement load moves every
-slot selecting a different local model through Unloading to Unloaded before the target slot becomes
-Ready. The target-level local-model projection does not duplicate this operation lifecycle or
-expose native residency.
+ACN observes `ModelInstancesSnapshot`; it never derives canonical lifecycle from the load response
+stream. The load stream is observational output for the initiating caller only. ACN projects the
+matching instance into every slot selecting that configuration. Explicit Stop and autonomous ICN
+release therefore produce the same Stopping and Stopped projection on every surface.
 
 Replacing a model must not claim the new model is ready until its backend is usable. Failure leaves
-the runtime in an explicitly reported state and must not make requests route to a half-loaded
-backend. Unload is idempotent, closes mutation admission and waits for protected inference leases
-to drain, and returns only after native resources are released. Chat requests bind
-to the active runtime generation they began with and cannot silently continue on a replacement.
+the model instance in an explicitly reported state and must not make requests route to a
+half-loaded backend. One Stop endpoint accepts only the exact model-instance identity. During
+loading it cancels and cleans partial resources; after readiness it closes mutation admission,
+waits for protected inference leases, and releases native resources. Stop is idempotent for an
+ended identity and cannot affect a newer occurrence of the same configuration. Chat requests bind
+to the active native generation they began with and cannot silently continue on a replacement.
 
-Every inference request holds an exact backend-generation lease through stream end or cancellation.
-Explicit load, replacement, and unload share backend admission and mutation authority. Unload and
-replacement close new inference admission and wait for existing leases to drain. Memory-pressure
+Every inference request holds an exact model-instance lease through stream end or cancellation.
+Explicit load, replacement, and Stop share controller mutation authority. Stop and replacement
+close new inference admission and wait for existing leases to drain. Memory-pressure
 eviction is deliberately different: persistent ICN observes whole-system available memory every
 100 milliseconds while a worker exists, and every second while idle. It immediately terminates
 the inference worker when availability reaches the configured system reserve. After eviction,
 one-second observations must remain above the recovery threshold for the full recovery interval
 before load admission reopens. Eviction does not wait for leases or native cleanup. Worker exit, protocol
-loss, or unavailable memory supervision clears residency and fails affected streams without
-terminating persistent ICN. There is no automatic reload. Outside this safety transition, ICN does
-not perform idle unloading; a loaded model remains resident until explicit replacement, explicit
-unload, pressure eviction, worker loss, or ICN exit.
+loss, or unavailable memory supervision terminalizes the affected instance and fails its streams
+without terminating persistent ICN. There is no automatic reload.
 
 ICN's pinned runtime is part of the ICN build, so ACN has no separate native-runtime install,
 discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
@@ -415,16 +419,15 @@ The lifecycle conforms when:
   pinned-runtime management;
 - the public local provider ID is exactly `local`, and its bound model streams through the scoped
   ordinary generated chat client rather than an endpoint URL adapter;
-- chat leases only an already-resident matching target and never starts a load or replacement;
+- chat leases only an exact Ready model instance and never starts a load or replacement;
 - ACN slot commands and scoped local-request preparation are the only product paths that start
-  explicit ICN load operations; only ACN slot operations start unload;
-- load-stream fractions and terminal events drive the matching slot FSMs without an inventory poll,
-  revision counter, or second residency projection;
-- loading one local model unloads every slot selecting a different local model, so two different
-  local models can never both be advertised as Ready against the singleton executor;
-- a resident model remains loaded until explicit replacement, explicit unload, memory-pressure
+  explicit ICN load operations; explicit stopping uses only the exact model-instance identity;
+- `ModelInstancesSnapshot` drives matching slot projections; the load response stream never owns
+  lifecycle;
+- loading one local model terminalizes the prior instance before the replacement becomes Ready;
+- a resident model remains loaded until explicit replacement, exact-instance Stop, memory-pressure
   eviction, inference-worker loss, or ICN process exit;
-- replacement, load, and explicit unload serialize through native mutation authority and cannot
+- replacement, load, and Stop serialize through native mutation authority and cannot
   invalidate an admitted inference lease;
 - product model-download, activation, deletion, hardware, and fit operations reach ICN only through
   the generated client, with no alternate model-repository or host-inspection path in ACN;

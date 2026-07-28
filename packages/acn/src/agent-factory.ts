@@ -12,7 +12,7 @@ import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
 import { ProviderClientRegistry } from "./shared-client"
-import { ModelSlotCoordinator } from "./model-slot-coordinator"
+import { ModelSlotController } from "./model-slot-controller"
 import { makeModelRequestPreparation } from "./model-request-preparation"
 
 export interface AgentFactoryApi {
@@ -33,13 +33,13 @@ export class AgentFactory extends Context.Tag("AgentFactory")<
 export const AgentFactoryLive = (options: {
   readonly debug: boolean
   readonly version: string
-}): Layer.Layer<AgentFactory, never, MagnitudeStorage | ProviderClientRegistry | ModelSlotCoordinator> =>
+}): Layer.Layer<AgentFactory, never, MagnitudeStorage | ProviderClientRegistry | ModelSlotController> =>
   Layer.effect(
     AgentFactory,
     Effect.gen(function* () {
       const storage = yield* MagnitudeStorage
       const providerClients = yield* ProviderClientRegistry
-      const modelSlots = yield* ModelSlotCoordinator
+      const modelSlots = yield* ModelSlotController
 
       return {
         createSession: Effect.fn("acn.agent-factory.create-session")(function* (input) {

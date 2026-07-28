@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest"
 import { IcnClient } from "../client.js"
 import { makeIcnApiClient } from "../generated/client.js"
 import { IcnProvider, IcnProviderModelResolver, makeIcnProvider } from "./source.js"
+import { CurrentModelInstance } from "./contract.js"
 
 const TEST_BASE_URL = "http://icn.test"
 
@@ -142,7 +143,11 @@ describe("ICN local provider", () => {
     ])))
     const progress: ModelRequestProgress[] = []
 
-    const output = await Effect.runPromise(Effect.gen(function* () {
+    const output = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
+        instanceId: "instance-test",
+        configurationId: "configuration-test",
+      }))
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId, {
         requestAttribution: {
@@ -155,7 +160,7 @@ describe("ICN local provider", () => {
       })
       const result = yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
       return yield* Stream.runCollect(result.events)
-    }).pipe(Effect.provide(makeTestLayer(http, modelId))))
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
 
     expect(Array.from(output).map((event) => event._tag)).toEqual([
       "message_start",
