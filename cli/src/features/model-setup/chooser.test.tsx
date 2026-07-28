@@ -433,6 +433,78 @@ test("keeps four rows per section and scrolls only the installed-model window", 
   }
 })
 
+test("excludes unrelated failed downloads and unusable installed models", async () => {
+  const base = chooserViewWithInventory(0, 4)
+  const state = {
+    ...base,
+    models: {
+      ...base.models,
+      models: [
+        ...base.models.models,
+        makeModel({
+          targetId: ModelOfferingTargetIdSchema.make("target_failed"),
+          displayName: "Unrelated Failed Download",
+          download: {
+            _tag: "Failed" as const,
+            completedBytes: 4 * GIB,
+            totalBytes: 16 * GIB,
+            failure: {
+              code: "download_failed",
+              message: "Download failed",
+              retryable: true,
+            },
+          },
+          preparation: { _tag: "NotDownloaded" as const },
+        }),
+        makeModel({
+          targetId: ModelOfferingTargetIdSchema.make("target_unusable"),
+          displayName: "Unusable Installed Model",
+          preparation: {
+            _tag: "Unavailable" as const,
+            providerModelIds: [],
+            failure: {
+              code: "does_not_fit",
+              message: "Requires more memory",
+              retryable: false,
+            },
+          },
+        }),
+      ],
+    },
+  }
+  const view = await testRender(
+    <OnboardingModelChooser
+      state={state}
+      width={100}
+      pending={false}
+      error={null}
+      operation={null}
+      onChoose={onChoose}
+      onContinue={onContinue}
+      onSkip={onSkip}
+    />,
+    { width: 100, height: 30 },
+  )
+  try {
+    await act(view.renderOnce)
+    const frame = view.captureCharFrame()
+    expect(frame).not.toContain("Unrelated Failed Download")
+    expect(frame).not.toContain("Unusable Installed Model")
+
+    for (let index = 0; index < 4; index += 1) {
+      await act(async () => press("down"))
+    }
+    await act(async () => press("enter"))
+    expect(onChoose).toHaveBeenCalledWith({
+      targetId: ModelOfferingTargetIdSchema.make("target_remote_4"),
+      providerModelId: ProviderModelIdSchema.make("configuration_remote_4"),
+      reasoningEffort: "none",
+    })
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
 test("stacks the informational pane without clipping actions on narrower terminals", async () => {
   const view = await testRender(
     <OnboardingModelChooser
