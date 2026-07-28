@@ -16,12 +16,14 @@ import {
   RecommendationIdSchema,
   SECONDARY_SLOT_ID,
   type LocalInferenceHardware,
+  type LocalModelsState,
   type ModelInstanceAllocation,
+  type ModelSlotsState,
   type LocalModel,
   type LocalModelCatalogCandidate,
   type LocalModelRecommendation,
+  type ProviderModelCatalogState,
 } from "@magnitudedev/sdk"
-import type { LocalInferenceView } from "@magnitudedev/client-common"
 
 export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
@@ -135,7 +137,12 @@ export const makeView = (options: {
   readonly recommendations?: readonly LocalModelRecommendation[]
   readonly allocation?: ModelInstanceAllocation
   readonly ready?: boolean
-} = {}): LocalInferenceView => {
+} = {}): {
+  readonly hardware: LocalInferenceHardware
+  readonly models: LocalModelsState
+  readonly catalog: ProviderModelCatalogState
+  readonly slots: ModelSlotsState
+} => {
   const models = options.models ?? [makeModel()]
   const selection = {
     providerId: LOCAL_PROVIDER_ID,

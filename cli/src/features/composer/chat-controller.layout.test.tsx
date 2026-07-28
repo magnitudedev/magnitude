@@ -224,7 +224,8 @@ function makeProps(): ComposerProps {
     modelSetupInProgress: false,
     modelSetupPlaceholder: null,
     modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
-    localInferenceState: null,
+    localModels: null,
+    modelSlots: null,
     selectedProviderId: null,
     selectedSlotId: PRIMARY_SLOT_ID,
     tokenUsage: 5_000,
@@ -310,7 +311,8 @@ test('shows resident memory three spaces after context and links it to hardware'
   const html = render(
     <Composer
       {...makeProps()}
-      localInferenceState={localInferenceState}
+      localModels={localInferenceState.models}
+      modelSlots={localInferenceState.slots}
       selectedProviderId={LOCAL_PROVIDER_ID}
       openHardware={openHardware}
     />,
@@ -325,7 +327,8 @@ test('shows resident memory three spaces after context and links it to hardware'
     view = create(
       <Composer
         {...makeProps()}
-        localInferenceState={localInferenceState}
+        localModels={localInferenceState.models}
+        modelSlots={localInferenceState.slots}
         selectedProviderId={LOCAL_PROVIDER_ID}
         openHardware={openHardware}
       />,
@@ -378,7 +381,8 @@ test('clicking effort opens the footer selector and clicking an option commits i
     view = create(
       <Composer
         {...makeProps()}
-        localInferenceState={localInferenceState}
+        localModels={localInferenceState.models}
+        modelSlots={localInferenceState.slots}
         selectedProviderId={LOCAL_PROVIDER_ID}
         thinkingOptions={thinkingOptions}
         applyThinking={(effort) => { applied.push(effort) }}
@@ -447,7 +451,8 @@ test('disables footer settings controls while onboarding downloads a model', () 
       <Composer
         {...makeProps()}
         modelSetupInProgress
-        localInferenceState={localInferenceState}
+        localModels={localInferenceState.models}
+        modelSlots={localInferenceState.slots}
         selectedProviderId={LOCAL_PROVIDER_ID}
         thinkingOptions={thinkingOptions}
         openSettings={openSettings}

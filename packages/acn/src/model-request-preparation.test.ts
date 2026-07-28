@@ -3,6 +3,8 @@ import { Effect } from "effect"
 import {
   PRIMARY_SLOT_ID,
   LocalModelMutationFailed,
+  ModelInstanceIdSchema,
+  ModelServingConfigurationIdSchema,
 } from "@magnitudedev/protocol"
 import {
   ProviderIdSchema,
@@ -14,6 +16,11 @@ import { makeModelRequestPreparation } from "./model-request-preparation"
 const localProviderId = ProviderIdSchema.make("local")
 const remoteProviderId = ProviderIdSchema.make("magnitude")
 const modelId = ProviderModelIdSchema.make("model")
+const ready = {
+  _tag: "Ready" as const,
+  instanceId: ModelInstanceIdSchema.make("instance"),
+  configurationId: ModelServingConfigurationIdSchema.make("configuration"),
+}
 
 describe("model request preparation", () => {
   it("acquires the local model without fabricating request progress", async () => {
@@ -23,6 +30,7 @@ describe("model request preparation", () => {
       acquireLocalModel: () => Effect.acquireRelease(
         Effect.sync(() => {
           order.push("acquire")
+          return ready
         }),
         () => Effect.sync(() => {
           order.push("release")
@@ -46,9 +54,11 @@ describe("model request preparation", () => {
 
   it("does not prepare remote provider requests", async () => {
     let acquired = false
+    let reported = false
     const prepare = makeModelRequestPreparation({
       acquireLocalModel: () => Effect.sync(() => {
         acquired = true
+        return ready
       }),
     })
 
@@ -56,10 +66,13 @@ describe("model request preparation", () => {
       slotId: PRIMARY_SLOT_ID,
       providerId: remoteProviderId,
       providerModelId: modelId,
-      reportProgress: () => Effect.die("remote requests must not report local preparation"),
+      reportProgress: () => Effect.sync(() => {
+        reported = true
+      }),
     })))
 
     expect(acquired).toBe(false)
+    expect(reported).toBe(false)
   })
 
   it("preserves admission failure details without constructing a provider error", async () => {
@@ -83,6 +96,28 @@ describe("model request preparation", () => {
       code: "low_memory",
       message: "Not enough memory",
       retryable: true,
+    })
+  })
+
+  it("preserves an explicit model stop as preparation cancellation", async () => {
+    const prepare = makeModelRequestPreparation({
+      acquireLocalModel: () => Effect.succeed({
+        _tag: "Cancelled",
+        instanceId: ModelInstanceIdSchema.make("stopped-instance"),
+        reason: "user_stop",
+      }),
+    })
+
+    const cancellation = await Effect.runPromise(Effect.flip(Effect.scoped(prepare({
+      slotId: PRIMARY_SLOT_ID,
+      providerId: localProviderId,
+      providerModelId: modelId,
+      reportProgress: () => Effect.void,
+    }))))
+
+    expect(cancellation).toMatchObject({
+      _tag: "ModelRequestPreparationCancelled",
+      reason: "user_stop",
     })
   })
 })

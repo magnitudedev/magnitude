@@ -1,12 +1,13 @@
 import { act } from "react"
 import { testRender } from "@opentui/react/test-utils"
 import { RegistryProvider, Result } from "@effect-atom/atom-react"
-import { Cause, Option } from "effect"
+import { Option } from "effect"
 import { expect, test, vi } from "vitest"
 import {
   AgentClientProvider,
   createAgentClient,
-  useLocalInferenceQuery,
+  useLocalModels,
+  useModelSlots,
 } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema, protocolLayer } from "@magnitudedev/sdk"
 import { deriveLocalInferenceFooterView } from "./footer-status"
@@ -22,17 +23,20 @@ vi.mock("../../hooks/use-theme", () => ({
 
 const acnUrl = Option.fromNullable(process.env.LIVE_ACN_URL)
 
-test.skipIf(Option.isNone(acnUrl))("live independent mirrors compose into the local inference view", async () => {
+test.skipIf(Option.isNone(acnUrl))("live independent mirrors remain independently observable", async () => {
   const rendered: string[] = []
   const Probe = () => {
-    const result = useLocalInferenceQuery()
-    if (!Result.isSuccess(result)) {
-      rendered.push(Result.isFailure(result) ? Cause.pretty(result.cause) : result._tag)
-      return <text>mirror:{result._tag}</text>
+    const models = useLocalModels()
+    const slots = useModelSlots()
+    if (!Result.isSuccess(models) || !Result.isSuccess(slots)) {
+      const status = `${models._tag}/${slots._tag}`
+      rendered.push(status)
+      return <text>mirrors:{status}</text>
     }
     rendered.push("success")
     const footer = deriveLocalInferenceFooterView(
-      result.value,
+      models.value,
+      slots.value,
       null,
       LOCAL_PROVIDER_ID,
       PRIMARY_SLOT_ID,
@@ -45,7 +49,8 @@ test.skipIf(Option.isNone(acnUrl))("live independent mirrors compose into the lo
     )
   }
 
-  const url = Option.getOrThrow(acnUrl)
+  const url = Option.getOrUndefined(acnUrl)
+  if (url === undefined) return
   const agentClient = createAgentClient(protocolLayer(url))
   const view = await testRender(
     <RegistryProvider defaultIdleTTL={5_000}>

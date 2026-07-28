@@ -587,6 +587,79 @@ describe("ModelSlotController load admission", () => {
     })))
   })
 
+  it("returns cancellation for an explicit stop and binds retry to the replacement instance", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness()
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        const firstLoad = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* Deferred.await(harness.loadEntered)
+        const firstLoading = yield* harness.instances.changes.pipe(
+          Stream.filter((snapshot) =>
+            snapshot.instances.some((instance) => instance.lifecycle._tag === "Loading")),
+          Stream.runHead,
+          Effect.fork,
+        )
+        yield* Deferred.succeed(harness.releaseLoad, undefined)
+        const firstSnapshot = yield* Fiber.join(firstLoading)
+        expect(Option.isSome(firstSnapshot)).toBe(true)
+        if (Option.isNone(firstSnapshot)) return
+        const firstInstance = firstSnapshot.value.instances[0]
+        expect(firstInstance).toBeDefined()
+        if (firstInstance === undefined) return
+
+        yield* SubscriptionRef.set(harness.instances, {
+          revision: firstSnapshot.value.revision + 1,
+          instances: [{
+            ...firstInstance,
+            lifecycle: { _tag: "Stopped", reason: "user_stop" },
+          }],
+        })
+        expect(yield* Fiber.join(firstLoad)).toEqual({
+          _tag: "Cancelled",
+          instanceId: firstInstance.id,
+          reason: "user_stop",
+        })
+
+        const replacementLoading = yield* harness.instances.changes.pipe(
+          Stream.filter((snapshot) => snapshot.instances.some((instance) =>
+            instance.id !== firstInstance.id && instance.lifecycle._tag === "Loading")),
+          Stream.runHead,
+          Effect.fork,
+        )
+        const retry = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        const replacementSnapshot = yield* Fiber.join(replacementLoading)
+        expect(Option.isSome(replacementSnapshot)).toBe(true)
+        if (Option.isNone(replacementSnapshot)) return
+        const replacement = replacementSnapshot.value.instances[0]
+        expect(replacement).toBeDefined()
+        if (replacement === undefined) return
+        expect(replacement.id).not.toBe(firstInstance.id)
+
+        yield* SubscriptionRef.set(harness.instances, {
+          revision: replacementSnapshot.value.revision + 1,
+          instances: [{
+            ...replacement,
+            lifecycle: {
+              _tag: "Ready",
+              allocation: {
+                contextWindowTokens: 8_192,
+                parallelSequences: 1,
+                physicalContextTokens: 8_192,
+                memoryDomains: [],
+              },
+            },
+          }],
+        })
+        expect(yield* Fiber.join(retry)).toMatchObject({
+          _tag: "Ready",
+          instanceId: replacement.id,
+        })
+        expect(yield* Ref.get(harness.loadCalls)).toBe(2)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
   it("publishes catalog-derived agent configuration changes even when slot identity is unchanged", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness()

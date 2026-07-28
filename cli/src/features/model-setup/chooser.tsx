@@ -1,17 +1,22 @@
 import { useCallback, useMemo, useState, useSyncExternalStore, type ReactNode } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
+import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   getAnimationTickSnapshot,
   subscribeAnimationTick,
   truncateToDisplayWidth,
-  type LocalInferenceView,
+  type LocalInferenceHardwareResult,
   type OnboardingModelChoice,
 } from "@magnitudedev/client-common"
 import type {
   LocalModelCatalogCandidate,
+  LocalModelRecommendationProgressStep,
+  LocalModelsState,
+  ModelSlotsState,
   ProviderModelId,
+  ProviderModelCatalogState,
 } from "@magnitudedev/sdk"
 import { ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -75,7 +80,6 @@ const matchesOnboardingSelection = (
 const ModelRow = ({
   selection,
   selected,
-  pending,
   disabled,
   width,
   onHover,
@@ -83,7 +87,6 @@ const ModelRow = ({
 }: {
   readonly selection: LocalInferenceSelection
   readonly selected: boolean
-  readonly pending: boolean
   readonly disabled: boolean
   readonly width: number
   readonly onHover: () => void
@@ -114,7 +117,7 @@ const ModelRow = ({
           : selection.kind === "recommendation" || selected
             ? theme.primary
             : theme.muted}>
-          {pending && selected ? "Selecting" : action}
+          {action}
         </span>
       </text>
     </Button>
@@ -142,34 +145,23 @@ const DetailRow = ({
 )
 
 const OnboardingHardwareContext = ({
-  state,
+  hardware,
   width,
   spinnerFrame,
 }: {
-  readonly state: LocalInferenceView | null
+  readonly hardware: LocalInferenceHardwareResult
   readonly width: number
   readonly spinnerFrame: string
 }): ReactNode => {
   const theme = useTheme()
-  const hardwareStep = state?.models.recommendations.progress.find(({ id }) => id === "hardware")
-  const hardwareReady = state !== null && (
-    state.models.recommendations._tag === "Ready"
-    || hardwareStep?.status._tag === "Completed"
-  )
-  if (hardwareReady) {
-    return describeLocalHardwareSummary(state.hardware).map((row) => (
-      <text key={`${row.name}:${row.details.join(":")}`} style={{ width }} wrapMode="word">
-        <span fg={slate[300]}>{row.name}</span>
-        <span fg={slate[400]}>{` · ${row.details.join(" · ")}`}</span>
-      </text>
-    ))
-  }
-  if (hardwareStep?.status._tag === "Failed") {
-    return (
-      <text style={{ fg: theme.error, width }} wrapMode="word">
-        ! Hardware detection failed · {hardwareStep.status.failure.message}
-      </text>
-    )
+  if (Result.isSuccess(hardware)) return describeLocalHardwareSummary(hardware.value).map((row) => (
+    <text key={`${row.name}:${row.details.join(":")}`} style={{ width }} wrapMode="word">
+      <span fg={slate[300]}>{row.name}</span>
+      <span fg={slate[400]}>{` · ${row.details.join(" · ")}`}</span>
+    </text>
+  ))
+  if (Result.isFailure(hardware)) {
+    return <text style={{ fg: theme.error, width }}>! Hardware detection failed</text>
   }
   return (
     <text style={{ width }}>
@@ -182,13 +174,13 @@ const OnboardingHardwareContext = ({
 const OnboardingSetupCard = ({
   cardWidth,
   title,
-  state,
+  hardware,
   spinnerFrame = SPINNER_FRAMES[0],
   children,
 }: {
   readonly cardWidth: number
   readonly title: string
-  readonly state: LocalInferenceView | null
+  readonly hardware: LocalInferenceHardwareResult
   readonly spinnerFrame?: string
   readonly children: ReactNode
 }): ReactNode => {
@@ -208,7 +200,7 @@ const OnboardingSetupCard = ({
       }}>
         <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{title}</text>
         <OnboardingHardwareContext
-          state={state}
+          hardware={hardware}
           width={Math.max(1, cardWidth - 6)}
           spinnerFrame={spinnerFrame}
         />
@@ -229,29 +221,41 @@ export type OnboardingModelChooserOperation =
       readonly onRetry: () => void
     }
   | {
+      readonly _tag: "DownloadFailed"
+      readonly candidate: LocalModelCatalogCandidate
+      readonly onChooseAnother: () => void
+      readonly onRetry: () => void
+    }
+  | {
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly displayName: string
-      readonly phase: "Preparing" | "Loading" | "Ready" | "Failed"
+      readonly phase: "Loading" | "Ready" | "Failed"
       readonly failure: string | null
       readonly onRetry: () => void
       readonly onChooseAnother: () => void
     }
 
 export function OnboardingModelChooser({
-  state,
+  hardware,
+  models,
+  catalog,
+  slots,
   width,
-  pending,
   error,
+  submitting,
   operation,
   onChoose,
   onContinue,
   onSkip,
 }: {
-  readonly state: LocalInferenceView
+  readonly hardware: LocalInferenceHardwareResult
+  readonly models: LocalModelsState
+  readonly catalog: ProviderModelCatalogState
+  readonly slots: ModelSlotsState
   readonly width: number
-  readonly pending: boolean
   readonly error: string | null
+  readonly submitting: boolean
   readonly operation: OnboardingModelChooserOperation | null
   readonly onChoose: (choice: OnboardingModelChoice) => void
   readonly onContinue: () => void
@@ -259,19 +263,15 @@ export function OnboardingModelChooser({
 }): ReactNode {
   const theme = useTheme()
   const selections = useMemo(() =>
-    buildLocalInferenceSelections(state).filter((selection) =>
+    buildLocalInferenceSelections(models, catalog, slots).filter((selection) =>
       selection.kind === "recommendation"
         ? Option.isSome(selection.recommendation)
-        : Option.isSome(selection.providerModelId)), [state])
+        : Option.isSome(selection.providerModelId)), [catalog, models, slots])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
-  const [submittedSelection, setSubmittedSelection] =
-    useState<ProviderModelId | null>(null)
   const activeSelectionId = operation === null
-    ? Option.fromNullable(submittedSelection === null
-      ? undefined
-      : selections.find((selection) =>
-          matchesOnboardingSelection(selection, submittedSelection))?.id)
-    : Option.fromNullable(selections.find((selection) => operation._tag === "Downloading"
+    ? Option.none<string>()
+    : Option.fromNullable(selections.find((selection) =>
+      operation._tag === "Downloading" || operation._tag === "DownloadFailed"
       ? selection.model.catalogCandidateIds.includes(operation.candidate.id)
       : Option.contains(selection.providerModelId, operation.providerModelId))?.id)
   const selectedIndex = selectedInferenceIndex(
@@ -279,8 +279,7 @@ export function OnboardingModelChooser({
     Option.isSome(activeSelectionId) ? activeSelectionId : selectedId,
   )
   const selected = selections[selectedIndex]
-  const starting = operation === null && submittedSelection !== null && error === null
-  const locked = pending || operation !== null || starting
+  const locked = submitting || operation !== null
   const local = selections.filter(({ kind }) => kind === "running" || kind === "stored")
   const downloads = selections.filter(({ kind }) => kind === "recommendation")
   const selectedLocalIndex = Math.min(selectedIndex, Math.max(0, local.length - 1))
@@ -302,14 +301,12 @@ export function OnboardingModelChooser({
   const contentHeight = Math.max(DETAIL_FIXED_ROWS, localRows + sectionGap + downloadRows)
   const detailContentHeight = Math.max(1, contentHeight - (wide ? 0 : 1))
   const choose = useCallback((selection: LocalInferenceSelection) => {
-    if (pending) return
     if (selection.kind === "running") {
       onContinue()
       return
     }
     const value = onboardingSelection(selection)
     if (value) {
-      setSubmittedSelection(value)
       onChoose({
         targetId: selection.model.targetId,
         providerModelId: value,
@@ -319,7 +316,7 @@ export function OnboardingModelChooser({
         ),
       })
     }
-  }, [onChoose, onContinue, pending])
+  }, [onChoose, onContinue])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) {
@@ -348,7 +345,7 @@ export function OnboardingModelChooser({
       key.preventDefault()
       onSkip()
     }
-  }, [choose, locked, onSkip, pending, selected, selectedIndex, selections]))
+  }, [choose, locked, onSkip, selected, selectedIndex, selections]))
 
   const list = (
     <box style={{ width: wide ? leftWidth : "100%", flexDirection: "column", paddingRight: wide ? 1 : 0 }}>
@@ -367,7 +364,6 @@ export function OnboardingModelChooser({
               key={selection.id}
               selection={selection}
               selected={selection.id === selected?.id}
-              pending={pending}
               disabled={locked}
               width={leftWidth}
               onHover={() => setSelectedId(Option.some(selection.id))}
@@ -395,7 +391,6 @@ export function OnboardingModelChooser({
               key={selection.id}
               selection={selection}
               selected={selection.id === selected?.id}
-              pending={pending}
               disabled={locked}
               width={leftWidth}
               onHover={() => setSelectedId(Option.some(selection.id))}
@@ -467,15 +462,6 @@ export function OnboardingModelChooser({
   ) : (
     <text style={{ fg: theme.muted }}>No compatible models found.</text>
   )
-  const startingDownloadCandidate = starting
-    && submittedSelection !== null
-    && state.models.recommendations._tag === "Ready"
-    ? state.models.recommendations.catalog.find(({ providerModelId }) =>
-        providerModelId === submittedSelection)
-      ?? (selected && Option.isSome(selected.recommendation)
-        ? selected.recommendation.value.candidate
-        : undefined)
-    : undefined
   const detailsContent = operation?._tag === "Downloading" ? (
     <OnboardingModelDownloadDetails
       candidate={operation.candidate}
@@ -485,10 +471,18 @@ export function OnboardingModelChooser({
         _tag: "Active",
         cancelling: operation.cancelling,
         cancelError: operation.cancelError,
-        onCancel: () => {
-          setSubmittedSelection(null)
-          operation.onCancel()
-        },
+        onCancel: operation.onCancel,
+        onRetry: operation.onRetry,
+      }}
+    />
+  ) : operation?._tag === "DownloadFailed" ? (
+    <OnboardingModelDownloadDetails
+      candidate={operation.candidate}
+      width={detailWidth}
+      height={detailContentHeight}
+      operation={{
+        _tag: "Failed",
+        onChooseAnother: operation.onChooseAnother,
         onRetry: operation.onRetry,
       }}
     />
@@ -500,27 +494,7 @@ export function OnboardingModelChooser({
       phase={operation.phase}
       failed={operation.failure}
       onRetry={operation.onRetry}
-      onChooseAnother={() => {
-        setSubmittedSelection(null)
-        operation.onChooseAnother()
-      }}
-    />
-  ) : startingDownloadCandidate ? (
-    <OnboardingModelDownloadDetails
-      candidate={startingDownloadCandidate}
-      width={detailWidth}
-      height={detailContentHeight}
-      operation={{ _tag: "Starting" }}
-    />
-  ) : starting && selected ? (
-    <OnboardingModelLoadingDetails
-      displayName={selected.model.displayName}
-      width={detailWidth}
-      height={detailContentHeight}
-      phase="Preparing"
-      failed={null}
-      onRetry={() => undefined}
-      onChooseAnother={() => undefined}
+      onChooseAnother={operation.onChooseAnother}
     />
   ) : regularDetails
   const details = (
@@ -542,26 +516,24 @@ export function OnboardingModelChooser({
       {detailsContent}
     </box>
   )
-  const interactionHint = pending
-    ? startingDownloadCandidate ? "Starting download…" : "Preparing model…"
-    : operation?._tag === "Downloading"
-      ? operation.candidate.download._tag === "Failed"
+  const interactionHint = operation?._tag === "Downloading"
+      ? "Download in progress · Esc cancel"
+      : operation?._tag === "DownloadFailed"
         ? "Download failed · Retry or choose another model"
-        : "Download in progress · Esc cancel"
       : operation?._tag === "Activating"
         ? operation.phase === "Failed"
           ? "Model loading failed"
           : operation.phase === "Loading"
             ? "Loading model into memory…"
-            : operation.phase === "Ready"
-              ? "Finishing setup…"
-              : "Preparing model…"
-        : starting
-          ? startingDownloadCandidate ? "Starting download…" : "Preparing model…"
-          : "↑/↓ choose · Enter select · Esc skip for now"
+            : "Finishing setup…"
+    : "↑/↓ choose · Enter select · Esc skip for now"
 
   return (
-    <OnboardingSetupCard cardWidth={cardWidth} title="Choose a local model" state={state}>
+    <OnboardingSetupCard
+      cardWidth={cardWidth}
+      title="Choose a local model"
+      hardware={hardware}
+    >
       <box style={{
         flexDirection: wide ? "row" : "column",
         width: "100%",
@@ -582,11 +554,15 @@ export function OnboardingModelChooser({
 }
 
 export function OnboardingModelPreparation({
-  state,
+  hardware,
+  progress,
+  error,
   width,
   onSkip,
 }: {
-  readonly state: LocalInferenceView | null
+  readonly hardware: LocalInferenceHardwareResult
+  readonly progress: readonly LocalModelRecommendationProgressStep[]
+  readonly error: string | null
   readonly width: number
   readonly onSkip: () => void
 }): ReactNode {
@@ -597,10 +573,8 @@ export function OnboardingModelPreparation({
     getAnimationTickSnapshot,
   )
   const spinner = SPINNER_FRAMES[tick % SPINNER_FRAMES.length]
-  const lines = state
-    ? localInferenceProgressLines(state.models.recommendations.progress)
-        .filter(({ id }) => id !== "hardware")
-    : []
+  const lines = localInferenceProgressLines(progress)
+    .filter(({ id }) => id !== "hardware")
   const cardWidth = setupCardWidth(width)
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.name === "escape") {
@@ -612,7 +586,7 @@ export function OnboardingModelPreparation({
     <OnboardingSetupCard
       cardWidth={cardWidth}
       title="Preparing local models"
-      state={state}
+      hardware={hardware}
       spinnerFrame={spinner}
     >
       {lines.map((line) => (
@@ -623,6 +597,7 @@ export function OnboardingModelPreparation({
           {line.label}<span fg={line.state === "failed" ? theme.error : theme.muted}>{line.metadata}</span>
         </text>
       ))}
+      {error && <text style={{ fg: theme.error }}>{error}</text>}
       <box style={{ height: 1 }} />
       <text style={{ fg: theme.muted }}>Esc skip for now</text>
     </OnboardingSetupCard>
@@ -641,7 +616,7 @@ function OnboardingModelLoadingDetails({
   readonly displayName: string
   readonly width: number
   readonly height: number
-  readonly phase: "Preparing" | "Loading" | "Ready" | "Failed"
+  readonly phase: "Loading" | "Ready" | "Failed"
   readonly failed: string | null
   readonly onRetry: () => void
   readonly onChooseAnother: () => void
@@ -667,9 +642,7 @@ function OnboardingModelLoadingDetails({
               ? `Couldn’t load ${displayName}`
               : phase === "Loading"
                 ? `Loading ${displayName} into memory`
-                : phase === "Ready"
-                  ? `Finishing setup for ${displayName}`
-                  : `Preparing ${displayName}`,
+                : `Finishing setup for ${displayName}`,
             width,
           )}
         </text>
@@ -695,11 +668,7 @@ function OnboardingModelLoadingDetails({
             {spinner}
           </text>
           <text style={{ fg: theme.muted, width: Math.max(1, width - 2) }} wrapMode="none">
-            {phase === "Loading"
-              ? "Loading model weights…"
-              : phase === "Ready"
-                ? "Finishing setup…"
-                : "Preparing the model for use…"}
+            {phase === "Loading" ? "Loading model weights…" : "Finishing setup…"}
           </text>
         </box>
       )}

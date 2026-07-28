@@ -4,7 +4,10 @@ import {
   agentModelStartRetryability,
   finalizeAgentModelStartFailure,
 } from '../src/errors'
-import { ModelRequestPreparationFailed } from '../src/model/model-request-preparation'
+import {
+  ModelRequestPreparationCancelled,
+  ModelRequestPreparationFailed,
+} from '../src/model/model-request-preparation'
 
 describe('agent model start failures', () => {
   it('classifies preparation failure as model-not-ready without automatic retry', () => {
@@ -60,5 +63,26 @@ describe('agent model start failures', () => {
     expect(decision.outcome._tag).toBe('ConnectionFailure')
     expect(decision.retry._tag).toBe('retry')
     expect(agentModelStartRetryability(failure)._tag).toBe('UpstreamRetryable')
+  })
+
+  it('finalizes an explicit model stop as silent cancellation', () => {
+    const decision = finalizeAgentModelStartFailure({
+      failure: new ModelRequestPreparationCancelled({
+        reason: 'user_stop',
+      }),
+      retryCount: 0,
+      maxRetries: 3,
+    })
+
+    expect(decision.outcome).toEqual({
+      _tag: 'Cancelled',
+      reason: {
+        _tag: 'ModelStopped',
+        reason: 'user_stop',
+      },
+      requestId: null,
+    })
+    expect(decision.presentation.surface).toBe('silent')
+    expect(decision.retry).toEqual({ _tag: 'none' })
   })
 })

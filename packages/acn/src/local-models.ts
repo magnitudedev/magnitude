@@ -1,5 +1,6 @@
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Context, Effect, Either, Layer, Option, Schema, Stream } from "effect"
 import {
+  LocalModelMutationFailed,
   LocalModelsMirror,
   type LocalModel,
   type LocalInferenceError,
@@ -65,23 +66,21 @@ const aggregateDownload = (
   if (packageEntries.every((entry) => entry?.localState._tag === "Installed")) {
     return { _tag: "Downloaded", installedBytes }
   }
-  const downloading = packageEntries.filter((entry) => entry?.localState._tag === "Downloading")
+  const downloading = packageEntries.flatMap((entry) =>
+    entry?.localState._tag === "Downloading" ? [entry.localState] : [])
   const completedBytes = installedBytes + downloading.reduce(
-    (total, entry) => total + (entry?.localState._tag === "Downloading"
-      ? entry.localState.completedBytes
-      : 0),
+    (total, state) => total + state.completedBytes,
     0,
   )
   if (downloading.length > 0) {
-    const active = downloading.flatMap((entry) =>
-      entry?.localState._tag === "Downloading" ? [entry.localState] : [])
-    const stages = active.map(({ stage }) => stage)
+    const stages = downloading.map(({ stage }) => stage)
     const stage = stages.every((value) => value === "verifying" || value === "publishing")
       ? "verifying" as const
       : stages.some((value) => value === "downloading")
         ? "downloading" as const
         : stages[0] ?? "queued"
-    const rates = active.flatMap(({ bytesPerSecond }) => Option.toArray(bytesPerSecond))
+    const rates = downloading.flatMap(({ bytesPerSecond }) =>
+      Option.toArray(bytesPerSecond))
     return {
       _tag: "Downloading",
       stage,
@@ -93,17 +92,12 @@ const aggregateDownload = (
     }
   }
   const failed = packageEntries.flatMap((entry) =>
-    entry
-      && entry.localState._tag !== "Installed"
-      && Option.isSome(entry.lastDownloadFailure)
-      ? [entry.lastDownloadFailure.value]
-      : [])[0]
+    entry?.localState._tag === "DownloadFailed" ? [entry.localState] : [])[0]
   const failedBytes = installedBytes + packages.reduce((total, modelPackage, index) => {
     const entry = packageEntries[index]
     if (!entry
-      || entry.localState._tag === "Installed"
-      || Option.isNone(entry.lastDownloadFailure)) return total
-    return total + entry.lastDownloadFailure.value.completedBytes
+      || entry.localState._tag !== "DownloadFailed") return total
+    return total + entry.localState.completedBytes
   }, 0)
   return failed
     ? { _tag: "Failed", completedBytes: failedBytes, totalBytes, failure: failed.failure }
@@ -195,12 +189,32 @@ const aggregatePreparation = (
 export interface LocalModelsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: LocalModelsState }>
+  readonly awaitTargetPrepared: (
+    targetId: ModelOfferingTargetId,
+  ) => Effect.Effect<void, LocalModelMutationFailed>
   readonly target: (
     targetId: ModelOfferingTargetId,
   ) => Effect.Effect<ModelOfferingTarget | undefined, LocalInferenceError>
 }
 
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
+
+export const localModelTargetPreparationOutcome = (
+  state: LocalModelsState,
+  targetId: ModelOfferingTargetId,
+): Option.Option<Either.Either<void, LocalModelMutationFailed>> => {
+  const model = state.models.find((candidate) => candidate.targetId === targetId)
+  if (!model || model.preparation._tag === "NotDownloaded"
+    || model.preparation._tag === "Preparing") {
+    return Option.none()
+  }
+  if (model.preparation._tag === "Unavailable") {
+    return Option.some(Either.left(new LocalModelMutationFailed(
+      model.preparation.failure,
+    )))
+  }
+  return Option.some(Either.right(undefined))
+}
 
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
@@ -437,6 +451,28 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     snapshot: mirror.get,
     changes: mirror.changes,
+    awaitTargetPrepared: (targetId) => Effect.gen(function* () {
+      const current = localModelTargetPreparationOutcome(
+        (yield* mirror.get).state,
+        targetId,
+      )
+      const outcome = Option.isSome(current)
+        ? current.value
+        : yield* mirror.changes.pipe(
+            Stream.filterMap(({ state }) =>
+              localModelTargetPreparationOutcome(state, targetId)),
+            Stream.runHead,
+            Effect.flatMap(Option.match({
+              onNone: () => new LocalModelMutationFailed({
+                code: "local_model_observation_ended",
+                message: "Local model preparation observation ended",
+                retryable: true,
+              }),
+              onSome: Effect.succeed,
+            })),
+          )
+      if (Either.isLeft(outcome)) return yield* outcome.left
+    }),
     target: (targetId) => Effect.gen(function* () {
       const recommendationState = (yield* recommendations.snapshot).state
       const recommendation = recommendationState._tag === "Ready"

@@ -28,12 +28,16 @@ const progressBar = (fraction: number, width: number): string => {
 type ConfirmationChoice = "yes" | "no"
 
 type DownloadDetailsOperation =
-  | { readonly _tag: "Starting" }
   | {
       readonly _tag: "Active"
       readonly cancelling: boolean
       readonly cancelError: string | null
       readonly onCancel: () => void
+      readonly onRetry: () => void
+    }
+  | {
+      readonly _tag: "Failed"
+      readonly onChooseAnother: () => void
       readonly onRetry: () => void
     }
 
@@ -52,29 +56,29 @@ export function OnboardingModelDownloadDetails({
   const [confirming, setConfirming] = useState(false)
   const [choice, setChoice] = useState<ConfirmationChoice>("yes")
   const [hovered, setHovered] = useState<string | null>(null)
-  const active = operation._tag === "Active" ? operation : null
-  const starting = operation._tag === "Starting"
-  const cancelling = active?.cancelling ?? false
+  const cancelling = operation._tag === "Active" && operation.cancelling
   const contentWidth = Math.max(1, width)
   const download = candidate.download
   const downloading = download._tag === "Downloading"
   const failed = download._tag === "Failed"
   const preparing = download._tag === "Downloaded" && candidate.preparation._tag === "Calibrating"
-  const cancelable = !starting && (downloading || preparing)
-  const fraction = downloading || failed
+  const cancelable = downloading || preparing
+  const fraction = downloading
     ? download.completedBytes / Math.max(1, download.totalBytes)
     : preparing ? 1 : 0
   const percentage = Math.round(Math.max(0, Math.min(1, fraction)) * 100)
   const percentageLabel = `${percentage}%`
   const barWidth = Math.max(8, contentWidth - percentageLabel.length - 2)
-  const heading = preparing
+  const heading = failed
+    ? `Couldn’t download ${candidate.displayName} · ${candidate.quantization}`
+    : preparing
     ? `Preparing ${candidate.displayName} · ${candidate.quantization}`
     : `Downloading ${candidate.displayName} · ${candidate.quantization}`
   const rate = downloading ? Option.getOrNull(download.bytesPerSecond) : null
   const detail = useMemo(() => {
     if (preparing) return "Preparing this model for your machine…"
     if (failed) return download.failure.message
-    if (!downloading) return "Starting download…"
+    if (!downloading) return null
     if (download.stage === "verifying" || download.stage === "publishing") {
       return "Verifying download…"
     }
@@ -88,9 +92,9 @@ export function OnboardingModelDownloadDetails({
   }, [])
 
   const confirmCancellation = useCallback(() => {
-    if (cancelling || active === null) return
-    active.onCancel()
-  }, [active, cancelling])
+    if (operation._tag !== "Active" || cancelling) return
+    operation.onCancel()
+  }, [cancelling, operation])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (cancelling) {
@@ -121,6 +125,8 @@ export function OnboardingModelDownloadDetails({
       else declineCancellation()
     }
   }, [cancelable, cancelling, choice, confirmCancellation, confirming, declineCancellation]))
+
+  if (detail === null) return null
 
   const choiceButton = (value: ConfirmationChoice, label: string) => (
     <Button
@@ -156,10 +162,12 @@ export function OnboardingModelDownloadDetails({
           {truncateToDisplayWidth(heading, contentWidth)}
         </text>
         <box style={{ height: 1 }} />
-        <text wrapMode="none">
-          <span style={{ fg: theme.primary }}>{progressBar(fraction, barWidth)}</span>
-          <span style={{ fg: theme.muted }}>{`  ${percentageLabel}`}</span>
-        </text>
+        {!failed && (
+          <text wrapMode="none">
+            <span style={{ fg: theme.primary }}>{progressBar(fraction, barWidth)}</span>
+            <span style={{ fg: theme.muted }}>{`  ${percentageLabel}`}</span>
+          </text>
+        )}
         <box style={{ height: 1 }} />
         {(download._tag === "NotDownloaded" || downloading || failed) && (
           <text style={{ fg: theme.muted }}>
@@ -171,17 +179,17 @@ export function OnboardingModelDownloadDetails({
         <box style={{ height: 2, flexDirection: "column" }}>
           {cancelling ? (
             <text style={{ fg: theme.muted }}>Cancelling download…</text>
-          ) : failed && active !== null ? (
+          ) : failed ? (
             <box style={{ flexDirection: "row", gap: 2 }}>
               <Button
-                onClick={active.onRetry}
+                onClick={operation.onRetry}
                 onMouseOver={() => setHovered("retry")}
                 onMouseOut={() => setHovered((current) => current === "retry" ? null : current)}
               >
                 <text style={{ fg: hovered === "retry" ? theme.primary : theme.foreground }}>Retry</text>
               </Button>
               <Button
-                onClick={active.onCancel}
+                onClick={operation._tag === "Failed" ? operation.onChooseAnother : operation.onCancel}
                 onMouseOver={() => setHovered("choose")}
                 onMouseOut={() => setHovered((current) => current === "choose" ? null : current)}
               >
@@ -205,7 +213,9 @@ export function OnboardingModelDownloadDetails({
               <text style={{ fg: hovered === "cancel" ? theme.error : theme.muted }}>Cancel (Esc)</text>
             </Button>
           ) : null}
-          {active?.cancelError && <text style={{ fg: theme.error }}>{active.cancelError}</text>}
+          {operation._tag === "Active" && operation.cancelError && (
+            <text style={{ fg: theme.error }}>{operation.cancelError}</text>
+          )}
         </box>
     </box>
   )

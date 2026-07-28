@@ -17,8 +17,10 @@ export {
 export { deriveSessionWorkStatus, type SessionWorkSnapshot, type SessionWorkStatus } from './session-work-status'
 export type { CreateClientOptions } from './coding-agent'
 export {
+  ModelRequestPreparationCancelled,
   ModelRequestPreparationFailed,
   type AgentModelStartFailure,
+  type ModelRequestPreparationError,
   type ModelRequestPreparationInput,
   type PrepareModelRequest,
 } from './model/model-request-preparation'

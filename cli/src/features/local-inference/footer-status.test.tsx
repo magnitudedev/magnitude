@@ -67,7 +67,41 @@ test("ready status exposes the model, residency, and complete resident allocatio
       }],
     },
   })
-  expect(deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)).toEqual({
+  expect(deriveLocalInferenceFooterView(
+    state.models,
+    state.slots,
+    "Qwen Test",
+    LOCAL_PROVIDER_ID,
+    PRIMARY_SLOT_ID,
+  )).toEqual({
+    modelName: "Qwen Test",
+    residency: "loaded",
+    memoryLabel: "16 GB mem",
+  })
+})
+
+test("slot residency remains visible when local-model inventory is unavailable", () => {
+  const state = makeView({
+    allocation: {
+      contextWindowTokens: 32_768,
+      parallelSequences: 1,
+      physicalContextTokens: 32_768,
+      memoryDomains: [{
+        memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+        modelBytes: 13 * GIB,
+        contextBytes: 2 * GIB,
+        computeBytes: GIB,
+        auxiliaryBytes: 0,
+      }],
+    },
+  })
+  expect(deriveLocalInferenceFooterView(
+    null,
+    state.slots,
+    "Qwen Test",
+    LOCAL_PROVIDER_ID,
+    PRIMARY_SLOT_ID,
+  )).toEqual({
     modelName: "Qwen Test",
     residency: "loaded",
     memoryLabel: "16 GB mem",
@@ -86,7 +120,13 @@ test("loading status remains in the activity rail", () => {
       },
     },
   }
-  const footer = deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)
+  const footer = deriveLocalInferenceFooterView(
+    state.models,
+    state.slots,
+    "Qwen Test",
+    LOCAL_PROVIDER_ID,
+    PRIMARY_SLOT_ID,
+  )
   expect(footer).toEqual({ modelName: "Qwen Test", residency: "loading", memoryLabel: null })
 })
 
@@ -103,7 +143,8 @@ test("memory state comes from the selected slot", () => {
     },
   }
   expect(deriveLocalInferenceFooterView(
-    state,
+    state.models,
+    state.slots,
     "Qwen Test",
     LOCAL_PROVIDER_ID,
     SECONDARY_SLOT_ID,
@@ -125,7 +166,13 @@ test("idle status keeps reasoning available and hides memory", () => {
       },
     },
   }
-  expect(deriveLocalInferenceFooterView(state, "Qwen Test", LOCAL_PROVIDER_ID, PRIMARY_SLOT_ID)).toEqual({
+  expect(deriveLocalInferenceFooterView(
+    state.models,
+    state.slots,
+    "Qwen Test",
+    LOCAL_PROVIDER_ID,
+    PRIMARY_SLOT_ID,
+  )).toEqual({
     modelName: "Qwen Test",
     residency: "not_loaded",
     memoryLabel: null,
@@ -134,6 +181,7 @@ test("idle status keeps reasoning available and hides memory", () => {
 
 test("cloud selection exposes the model with no local runtime status", () => {
   expect(deriveLocalInferenceFooterView(
+    null,
     null,
     "Claude Max",
     ProviderIdSchema.make("magnitude"),

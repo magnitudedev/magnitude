@@ -17,7 +17,7 @@ type RpcPayload<Tag extends Rpc.Tag<MagnitudeRpc>> = Rpc.PayloadConstructor<Rpc.
 type AgentClientInstance = ReturnType<typeof useAgentClient>
 
 interface ResidentWatch {
-  readonly atom: Atom.Atom<unknown>
+  readonly atom: Atom.Atom<Result.Result<void, never>>
   readonly mountedMirrorIds: Set<string>
 }
 
@@ -52,7 +52,10 @@ const runInvalidationWatch = <R>(
   )
 }
 
-const getResidentWatch = (client: AgentClientInstance, mirrorId: string): Atom.Atom<unknown> => {
+const getResidentWatch = (
+  client: AgentClientInstance,
+  mirrorId: string,
+): Atom.Atom<Result.Result<void, never>> => {
   const existing = residentWatches.get(client)
   if (existing) {
     existing.mountedMirrorIds.add(mirrorId)
@@ -91,9 +94,9 @@ export function useMirroredState<
 }
 
 /**
- * Returns the query atom for a mirrored state and keeps the shared invalidation
- * watch resident. Consumers that compose multiple mirrors should derive one
- * atom from these query atoms so React observes a single coherent value.
+ * Returns the query atom for one mirrored domain and keeps the shared
+ * invalidation watch resident. Consumers must preserve each domain's Result;
+ * successful values may be composed purely at the rendering boundary.
  */
 export function useMirroredStateAtom<
   const Id extends Rpc.Tag<MagnitudeRpc>,

@@ -5,12 +5,14 @@ import {
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
+  type LocalModelsState,
   type LocalModelRecommendation,
   type LocalModelRecommendationProgressStep,
+  type ModelSlotsState,
+  type ProviderModelCatalogState,
   type ProviderModelId,
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
-import type { LocalInferenceView } from "@magnitudedev/client-common"
 
 const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 
@@ -36,18 +38,6 @@ const recommendationIntentOrder = {
   lightweight: 3,
 } as const
 
-export type LocalInferenceSetupPhase = "discovering" | "ready" | "failed"
-
-export const localInferenceSetupPhase = (
-  view: LocalInferenceView,
-): LocalInferenceSetupPhase => {
-  if (view.models.recommendations._tag === "Failed") return "failed"
-  if (view.models.recommendations._tag === "Loading" || view.catalog._tag === "Loading") {
-    return "discovering"
-  }
-  return "ready"
-}
-
 const compareSelections = (
   left: LocalInferenceSelection,
   right: LocalInferenceSelection,
@@ -64,14 +54,16 @@ const compareSelections = (
   || left.model.displayName.localeCompare(right.model.displayName)
 
 export const buildLocalInferenceSelections = (
-  view: LocalInferenceView,
+  models: LocalModelsState,
+  catalog: ProviderModelCatalogState,
+  slots: ModelSlotsState,
 ): readonly LocalInferenceSelection[] => {
-  const running = new Set([view.slots.slots.primary, view.slots.slots.secondary].flatMap((slot) =>
+  const running = new Set([slots.slots.primary, slots.slots.secondary].flatMap((slot) =>
     slot._tag === "ConfiguredLocal"
       && Option.exists(slot.instance, (instance) => instance.lifecycle._tag === "Ready")
       ? [slot.selection.providerModelId]
       : []))
-  const catalogModels = ProviderModelCatalogLifecycle.match(view.catalog, {
+  const catalogModels = ProviderModelCatalogLifecycle.match(catalog, {
     Loading: () => [],
     Ready: ({ models }) => models,
     Refreshing: ({ models }) => models,
@@ -82,7 +74,7 @@ export const buildLocalInferenceSelections = (
     .filter(({ providerId, availability }) =>
       providerId === LOCAL_PROVIDER_ID && availability._tag === "Available")
     .map(({ providerModelId }) => providerModelId))
-  const stored = view.models.models
+  const stored = models.models
     .filter(({ download }) => download._tag === "Downloaded")
     .map((model): LocalInferenceSelection => {
       const providerModelId = model.preparation._tag === "Available"
@@ -102,9 +94,9 @@ export const buildLocalInferenceSelections = (
         ),
       }
     })
-  const recommendations = view.models.recommendations._tag === "Ready"
-    ? view.models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
-        const model = view.models.models.find(({ catalogCandidateIds }) =>
+  const recommendations = models.recommendations._tag === "Ready"
+    ? models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
+        const model = models.models.find(({ catalogCandidateIds }) =>
           catalogCandidateIds.includes(recommendation.candidate.id))
         if (!model || model.download._tag === "Downloaded") return []
         return [{
@@ -118,7 +110,7 @@ export const buildLocalInferenceSelections = (
       })
     : []
   const representedModelIds = new Set(recommendations.map(({ model }) => model.targetId))
-  const transientDownloads = view.models.models
+  const transientDownloads = models.models
     .filter((model) =>
       (model.download._tag === "Downloading" || model.download._tag === "Failed")
       && !representedModelIds.has(model.targetId))

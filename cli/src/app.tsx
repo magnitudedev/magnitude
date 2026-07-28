@@ -28,7 +28,14 @@ import {
   isModelSlotConfigured,
   deriveLocalModelLoadActivity,
 } from '@magnitudedev/client-common'
-import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type SessionOptions } from '@magnitudedev/sdk'
+import {
+  PRIMARY_SLOT_ID,
+  ReasoningEffortSchema,
+  type LocalModelsState,
+  type ModelSlotsState,
+  type ProviderModelCatalogState,
+  type SessionOptions,
+} from '@magnitudedev/sdk'
 import { authSourceAtom, modelMenuStateAtom, selectedFileSectionAtom, type AuthSource } from './state/cli-atoms'
 import { useSessionStartup, type SessionStart } from './hooks/use-session-startup'
 import { useTerminalBgDetection } from './hooks/use-terminal-bg-detection'
@@ -63,6 +70,16 @@ import { registerCliCommands } from './commands/register'
 registerCliCommands()
 
 export type { SessionStart }
+
+const mutationFailureMessage = <A, E extends { readonly message: string }>(
+  result: Result.Result<A, E>,
+  fallback: string,
+): string | null => Result.matchWithError(result, {
+  onInitial: () => null,
+  onError: (failure) => failure.message,
+  onDefect: () => fallback,
+  onSuccess: () => null,
+})
 
 export interface CliAppProps {
   sessionStart: SessionStart
@@ -223,34 +240,41 @@ function CliAppContent(props: CliAppProps & {
   const widget = useRecentChatsWidgetState()
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy()
   const ephemeralMessage = useSyncExternalStore(subscribeEphemeralMessage, getEphemeralMessageSnapshot)
-  const onboardingSetup = useOnboardingModelSetup(props.updateOnboarding)
-  const local = onboardingSetup.local
-  const localInference = local.state
-  const localInferenceSnapshot = Result.value(localInference)
-  const localInferenceView = onboardingSetup.view
-  const downloadingModelCount = Option.match(localInferenceSnapshot, {
-    onNone: () => 0,
-    onSome: ({ models }) => models.models.filter((model) => model.download._tag === 'Downloading').length,
+  const onboardingSetup = useOnboardingModelSetup()
+  const downloadingModelCount = Result.match(onboardingSetup.models, {
+    onInitial: () => 0,
+    onFailure: () => 0,
+    onSuccess: ({ value }) =>
+      value.models.filter((model) => model.download._tag === 'Downloading').length,
   })
   const downloadSummary = downloadingModelCount === 0
     ? null
     : `${downloadingModelCount} ${downloadingModelCount === 1 ? 'model' : 'models'} downloading`
   const { rootSlotId } = useSlotProfiles()
-  const localModelLoadActivity = Option.match(localInferenceSnapshot, {
-    onNone: () => null,
-    onSome: (state) => deriveLocalModelLoadActivity(state.slots, rootSlotId),
+  const localModelLoadActivity = Result.match(onboardingSetup.slots, {
+    onInitial: () => null,
+    onFailure: () => null,
+    onSuccess: ({ value }) => deriveLocalModelLoadActivity(value, rootSlotId),
   })
-  const cancelDownloadError = Result.isFailure(local.cancelDownloadResult)
-    ? Cause.pretty(local.cancelDownloadResult.cause)
-    : null
-  const activationMutationError = Result.isFailure(local.loadModelResult)
-    ? Cause.pretty(local.loadModelResult.cause)
-    : Result.isFailure(local.slotAssignment)
-      ? Cause.pretty(local.slotAssignment.cause)
-      : null
-  const completionMutationError = Result.isFailure(props.updateOnboardingResult)
-    ? Cause.pretty(props.updateOnboardingResult.cause)
-    : null
+  const cancelDownloadError = mutationFailureMessage(
+    onboardingSetup.cancelDownloadResult,
+    "Could not cancel the model download.",
+  )
+  const workflowError = (
+    command: "download" | "assign" | "load" | "complete",
+  ): string | null => Result.matchWithError(onboardingSetup.workflowResult, {
+    onInitial: () => null,
+    onError: (failure) =>
+      failure.command === command ? failure.message : null,
+    onDefect: (_, failure) => Cause.isInterruptedOnly(failure.cause)
+      ? null
+      : "The local model setup command failed unexpectedly.",
+    onSuccess: () => null,
+  })
+  const downloadMutationError = workflowError("download")
+  const loadMutationError = workflowError("load")
+  const assignmentMutationError = workflowError("assign")
+  const completionMutationError = workflowError("complete")
   const completeModelSetup = useCallback(() => {
     void props.updateOnboarding(true)
   }, [props.updateOnboarding])
@@ -275,110 +299,199 @@ function CliAppContent(props: CliAppProps & {
     recentChatsEnabled: !props.modelSetupActive,
   })
 
-  const setupView = deriveOnboardingModelSetupView({
-    active: props.modelSetupActive,
-    submittedProviderModelId: onboardingSetup.submittedProviderModelId,
-    state: localInferenceView,
+  const setupPreparation = (
+    progress: LocalModelsState["recommendations"]["progress"],
+    error: string | null,
+  ) => ({
+    surface: (
+      <OnboardingModelPreparation
+        hardware={onboardingSetup.hardware}
+        progress={progress}
+        error={error}
+        width={chatColumnWidth}
+        onSkip={completeModelSetup}
+      />
+    ),
+    placeholder: "Preparing local models…",
   })
-  const setupSurface = (() => {
-    switch (setupView._tag) {
-      case 'Inactive': return undefined
-      case 'Preparing': return (
-        <OnboardingModelPreparation
-          state={setupView.state}
-          width={chatColumnWidth}
-          onSkip={completeModelSetup}
-        />
-      )
-      case 'Downloading': return (
-        <OnboardingModelChooser
-          state={setupView.state}
-          width={chatColumnWidth}
-          pending={false}
-          error={null}
-          operation={{
-            _tag: 'Downloading',
-            candidate: setupView.candidate,
-            cancelling: Result.isWaiting(local.cancelDownloadResult),
-            cancelError: cancelDownloadError,
-            onCancel: cancelOnboardingModelSetup,
-            onRetry: () => selectOnboardingModel({
-              targetId: setupView.candidate.targetId,
-              providerModelId: setupView.candidate.providerModelId,
-              reasoningEffort: Option.getOrElse(
-                setupView.candidate.capabilities.reasoning.defaultEffort,
-                () => ReasoningEffortSchema.make("none"),
-              ),
-            }),
-          }}
-          onChoose={selectOnboardingModel}
-          onContinue={completeModelSetup}
-          onSkip={completeModelSetup}
-        />
-      )
-      case 'Activating': return (
-        <OnboardingModelChooser
-          state={setupView.state}
-          width={chatColumnWidth}
-          pending={false}
-          error={null}
-          operation={{
-            _tag: 'Activating',
-            providerModelId: setupView.providerModelId,
-            displayName: setupView.displayName,
-            phase: setupView.phase === "Ready" && completionMutationError !== null
-              ? "Failed"
-              : setupView.phase === "Preparing" && activationMutationError !== null
-              ? "Failed"
-              : setupView.phase,
-            failure: setupView.failure
-              ?? (setupView.phase === "Ready"
-                ? completionMutationError
-                : activationMutationError),
-            onRetry: () => {
-              const candidate = setupView.state.models.recommendations._tag === "Ready"
-                ? setupView.state.models.recommendations.catalog.find(({ providerModelId }) =>
-                    providerModelId === setupView.providerModelId)
-                : undefined
-              if (candidate) {
-                void selectOnboardingModel({
-                  targetId: candidate.targetId,
-                  providerModelId: candidate.providerModelId,
-                  reasoningEffort: Option.getOrElse(
-                    candidate.capabilities.reasoning.defaultEffort,
-                    () => ReasoningEffortSchema.make("none"),
-                  ),
-                })
-              } else {
-                void local.loadModel(PRIMARY_SLOT_ID)
-              }
-            },
-            onChooseAnother: cancelOnboardingModelSetup,
-          }}
-          onChoose={selectOnboardingModel}
-          onContinue={completeModelSetup}
-          onSkip={completeModelSetup}
-        />
-      )
-      case 'Choosing': return (
-        <OnboardingModelChooser
-          state={setupView.state}
-          width={chatColumnWidth}
-          pending={false}
-          error={null}
-          operation={null}
-          onChoose={selectOnboardingModel}
-          onContinue={completeModelSetup}
-          onSkip={completeModelSetup}
-        />
+  const setupWithDomains = (
+    models: LocalModelsState,
+    catalog: ProviderModelCatalogState,
+    slots: ModelSlotsState,
+  ) => {
+    const submitting = Result.isWaiting(onboardingSetup.workflowResult)
+    if (models.recommendations._tag === "Loading") {
+      return setupPreparation(models.recommendations.progress, null)
+    }
+    if (models.recommendations._tag === "Failed") {
+      return setupPreparation(
+        models.recommendations.progress,
+        models.recommendations.failure.message,
       )
     }
-  })()
-  const modelSetupPlaceholder = onboardingModelSetupPlaceholder(setupView)
+    const recommendations = models.recommendations
+    if (catalog._tag === "Loading") {
+      return setupPreparation(models.recommendations.progress, null)
+    }
+    if (catalog._tag === "Unavailable") {
+      return setupPreparation(
+        models.recommendations.progress,
+        "The model catalog is unavailable.",
+      )
+    }
+    const setupView = deriveOnboardingModelSetupView({
+      active: true,
+      submittedProviderModelId: onboardingSetup.submittedChoice?.providerModelId ?? null,
+      models,
+      catalog,
+      slots,
+    })
+    const surface = (() => {
+      switch (setupView._tag) {
+        case 'Inactive': return undefined
+        case 'Downloading': return (
+          <OnboardingModelChooser
+            hardware={onboardingSetup.hardware}
+            models={models}
+            catalog={catalog}
+            slots={slots}
+            width={chatColumnWidth}
+            error={null}
+            submitting={submitting}
+            operation={{
+              _tag: 'Downloading',
+              candidate: setupView.candidate,
+              cancelling: Result.isWaiting(onboardingSetup.cancelDownloadResult),
+              cancelError: cancelDownloadError,
+              onCancel: cancelOnboardingModelSetup,
+              onRetry: () => selectOnboardingModel({
+                targetId: setupView.candidate.targetId,
+                providerModelId: setupView.candidate.providerModelId,
+                reasoningEffort: Option.getOrElse(
+                  setupView.candidate.capabilities.reasoning.defaultEffort,
+                  () => ReasoningEffortSchema.make("none"),
+                ),
+              }),
+            }}
+            onChoose={selectOnboardingModel}
+            onContinue={completeModelSetup}
+            onSkip={completeModelSetup}
+          />
+        )
+        case 'DownloadFailed': return (
+          <OnboardingModelChooser
+            hardware={onboardingSetup.hardware}
+            models={models}
+            catalog={catalog}
+            slots={slots}
+            width={chatColumnWidth}
+            error={null}
+            submitting={submitting}
+            operation={{
+              _tag: 'DownloadFailed',
+              candidate: setupView.candidate,
+              onChooseAnother: cancelOnboardingModelSetup,
+              onRetry: () => selectOnboardingModel({
+                targetId: setupView.candidate.targetId,
+                providerModelId: setupView.candidate.providerModelId,
+                reasoningEffort: Option.getOrElse(
+                  setupView.candidate.capabilities.reasoning.defaultEffort,
+                  () => ReasoningEffortSchema.make("none"),
+                ),
+              }),
+            }}
+            onChoose={selectOnboardingModel}
+            onContinue={completeModelSetup}
+            onSkip={completeModelSetup}
+          />
+        )
+        case 'Activating': return (
+          <OnboardingModelChooser
+            hardware={onboardingSetup.hardware}
+            models={models}
+            catalog={catalog}
+            slots={slots}
+            width={chatColumnWidth}
+            error={setupView.phase === "Ready" ? completionMutationError : loadMutationError}
+            submitting={submitting}
+            operation={{
+              _tag: 'Activating',
+              providerModelId: setupView.providerModelId,
+              displayName: setupView.displayName,
+              phase: setupView.phase,
+              failure: setupView.failure,
+              onRetry: () => {
+                const candidate = recommendations.catalog.find(({ providerModelId }) =>
+                  providerModelId === setupView.providerModelId)
+                if (candidate) {
+                  selectOnboardingModel({
+                    targetId: candidate.targetId,
+                    providerModelId: candidate.providerModelId,
+                    reasoningEffort: Option.getOrElse(
+                      candidate.capabilities.reasoning.defaultEffort,
+                      () => ReasoningEffortSchema.make("none"),
+                    ),
+                  })
+                } else {
+                  void onboardingSetup.slotActions.load(PRIMARY_SLOT_ID)
+                }
+              },
+              onChooseAnother: cancelOnboardingModelSetup,
+            }}
+            onChoose={selectOnboardingModel}
+            onContinue={completeModelSetup}
+            onSkip={completeModelSetup}
+          />
+        )
+        case 'Choosing': return (
+          <OnboardingModelChooser
+            hardware={onboardingSetup.hardware}
+            models={models}
+            catalog={catalog}
+            slots={slots}
+            width={chatColumnWidth}
+            error={downloadMutationError ?? assignmentMutationError ?? loadMutationError}
+            submitting={submitting}
+            operation={null}
+            onChoose={selectOnboardingModel}
+            onContinue={completeModelSetup}
+            onSkip={completeModelSetup}
+          />
+        )
+      }
+    })()
+    return {
+      surface,
+      placeholder: onboardingModelSetupPlaceholder(setupView),
+    }
+  }
+  const setupPresentation = !props.modelSetupActive
+    ? { surface: undefined, placeholder: null }
+    : Result.match(onboardingSetup.models, {
+        onInitial: () => setupPreparation([], null),
+        onFailure: () => setupPreparation([], "Local model discovery is unavailable."),
+        onSuccess: ({ value: models }) => Result.match(onboardingSetup.catalog, {
+          onInitial: () => setupPreparation(models.recommendations.progress, null),
+          onFailure: () => setupPreparation(
+            models.recommendations.progress,
+            "The model catalog is unavailable.",
+          ),
+          onSuccess: ({ value: catalog }) => Result.match(onboardingSetup.slots, {
+            onInitial: () => setupPreparation(models.recommendations.progress, null),
+            onFailure: () => setupPreparation(
+              models.recommendations.progress,
+              "Model selection is unavailable.",
+            ),
+            onSuccess: ({ value: slots }) => setupWithDomains(models, catalog, slots),
+          }),
+        }),
+      })
+  const setupSurface = setupPresentation.surface
+  const modelSetupPlaceholder = setupPresentation.placeholder
   const activityRail = (
     <ActivityRailContainer
       modelLoadActivity={localModelLoadActivity}
-      onStopModel={local.stopModel}
+      onStopModel={onboardingSetup.slotActions.stop}
       width={chatColumnWidth}
       agentActivityEnabled={!props.modelSetupActive}
     />

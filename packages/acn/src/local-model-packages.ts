@@ -180,50 +180,36 @@ export const LocalModelPackagesLive: Layer.Layer<
           ? { _tag: "Installed", path: installedEntry.path }
           : Option.match(latest, {
               onNone: () => ({ _tag: "NotInstalled" as const }),
-              onSome: (attempt): ModelPackageEntry["localState"] =>
-                attempt._tag === "Pending" || attempt._tag === "Downloading"
-                  ? ({
-                      _tag: "Downloading" as const,
-                      attemptId: attempt.id,
-                      stage: attempt._tag === "Downloading" ? attempt.stage : "queued",
-                      completedBytes: attempt._tag === "Downloading" ? attempt.completedBytes : 0,
-                      totalBytes: attempt._tag === "Downloading" ? attempt.totalBytes : 0,
-                      bytesPerSecond: attempt._tag === "Downloading"
-                        ? attempt.bytesPerSecond
-                        : Option.none(),
-                    })
-                  : attempt._tag === "Completed"
-                    ? ({
-                        _tag: "Downloading" as const,
-                        attemptId: attempt.id,
-                        stage: "publishing" as const,
-                        completedBytes: modelPackage.files.reduce(
-                          (total, file) => total + file.sizeBytes,
-                          0,
-                        ),
-                        totalBytes: modelPackage.files.reduce(
-                          (total, file) => total + file.sizeBytes,
-                          0,
-                        ),
-                        bytesPerSecond: Option.none(),
-                      })
-                  : ({ _tag: "NotInstalled" as const }),
+              onSome: (attempt): ModelPackageEntry["localState"] => {
+                if (attempt._tag === "Pending" || attempt._tag === "Downloading") {
+                  return {
+                    _tag: "Downloading",
+                    attemptId: attempt.id,
+                    stage: attempt._tag === "Downloading" ? attempt.stage : "queued",
+                    completedBytes: attempt._tag === "Downloading" ? attempt.completedBytes : 0,
+                    totalBytes: attempt._tag === "Downloading" ? attempt.totalBytes : 0,
+                    bytesPerSecond: attempt._tag === "Downloading"
+                      ? attempt.bytesPerSecond
+                      : Option.none(),
+                  }
+                }
+                if (attempt._tag === "Failed" && !dismissed.has(modelPackage.id)) {
+                  return {
+                    _tag: "DownloadFailed",
+                    attemptId: attempt.id,
+                    completedBytes: attempt.completedBytes,
+                    totalBytes: attempt.totalBytes,
+                    failure: attempt.failure,
+                  }
+                }
+                return { _tag: "NotInstalled" }
+              },
             })
         return {
           package: modelPackage,
           targetId: Option.fromNullable(targetIds.get(modelPackage.id)),
           localState,
           inspection: installedEntry?.inspection ?? { _tag: "Pending" },
-          lastDownloadFailure: dismissed.has(modelPackage.id)
-            ? Option.none()
-            : Option.flatMap(latest, (attempt) =>
-                attempt._tag === "Failed"
-                  ? Option.some({
-                      completedBytes: attempt.completedBytes,
-                      totalBytes: attempt.totalBytes,
-                      failure: attempt.failure,
-                    })
-                  : Option.none()),
         }
       })
     yield* mirror.setIfChanged({ entries }, equivalent)
@@ -282,15 +268,15 @@ export const LocalModelPackagesLive: Layer.Layer<
     if (entries.every(({ localState }) => localState._tag === "Installed")) {
       return Option.some({ _tag: "Installed" })
     }
-    const failed = entries.find(({ lastDownloadFailure }) =>
-      Option.isSome(lastDownloadFailure))
-    if (failed && Option.isSome(failed.lastDownloadFailure)) {
+    const failed = entries.find(({ localState }) =>
+      localState._tag === "DownloadFailed")
+    if (failed?.localState._tag === "DownloadFailed") {
       return Option.some({
         _tag: "Failed",
         failure: new LocalModelMutationFailed({
-          code: failed.lastDownloadFailure.value.failure.code,
-          message: failed.lastDownloadFailure.value.failure.message,
-          retryable: failed.lastDownloadFailure.value.failure.retryable,
+          code: failed.localState.failure.code,
+          message: failed.localState.failure.message,
+          retryable: failed.localState.failure.retryable,
         }),
       })
     }
@@ -348,7 +334,8 @@ export const LocalModelPackagesLive: Layer.Layer<
       const entries = (yield* mirror.get).state.entries
       yield* Effect.forEach(targetPackages(target), (modelPackage) => {
         const entry = entries.find((candidate) => candidate.package.id === modelPackage.id)
-        return entry?.localState._tag === "Installed" || entry?.localState._tag === "Downloading"
+        return entry?.localState._tag === "Installed"
+          || entry?.localState._tag === "Downloading"
           ? Effect.void
           : startDownload(modelPackage).pipe(Effect.asVoid)
       }, { concurrency: "unbounded", discard: true })
@@ -358,7 +345,8 @@ export const LocalModelPackagesLive: Layer.Layer<
     cancelTargetDownload: (target) => Effect.gen(function* () {
       const entries = (yield* mirror.get).state.entries
       const attempts = targetPackages(target).flatMap((modelPackage) => {
-        const state = entries.find((entry) => entry.package.id === modelPackage.id)?.localState
+        const state = entries.find((entry) =>
+          entry.package.id === modelPackage.id)?.localState
         return state?._tag === "Downloading" ? [state.attemptId] : []
       })
       yield* Effect.forEach(attempts, (attemptId) => client.models.cancelModelDownload({

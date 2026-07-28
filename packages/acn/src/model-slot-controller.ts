@@ -24,6 +24,7 @@ import {
   ModelSlotMutationRejected,
   ModelSlotUnassigned,
   ModelSlotsMirror,
+  ModelServingConfigurationIdSchema,
   ModelServingConfigurationSchema,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
@@ -32,6 +33,7 @@ import {
   type MirroredSnapshot,
   type ModelFailure,
   type ModelInstanceId,
+  type ModelLoadResult,
   type ModelLoadPlan,
   type ModelSlot,
   type ModelSlotAvailability,
@@ -82,11 +84,11 @@ export interface ModelSlotControllerApi {
   readonly acquireLocalModel: (
     slotId: SlotId,
     providerModelId: ProviderModelId,
-  ) => Effect.Effect<void, LocalInferenceError, Scope.Scope>
+  ) => Effect.Effect<ModelLoadResult, LocalInferenceError, Scope.Scope>
   readonly ensureLocalModelReady: (
     slotId: SlotId,
     providerModelId: ProviderModelId,
-  ) => Effect.Effect<void, LocalInferenceError>
+  ) => Effect.Effect<ModelLoadResult, LocalInferenceError>
   readonly updateModelSlot: (
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
@@ -95,7 +97,7 @@ export interface ModelSlotControllerApi {
     model: ProviderModelIdentity,
     favorite: boolean,
   ) => Effect.Effect<void, ModelPreferenceMutationFailed>
-  readonly loadModel: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
+  readonly loadModel: (slotId: SlotId) => Effect.Effect<ModelLoadResult, LocalInferenceError>
   readonly previewModelLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopModel: (instanceId: ModelInstanceId) => Effect.Effect<void, LocalInferenceError>
 }
@@ -109,6 +111,10 @@ interface ControllerAggregate {
   readonly snapshot: MirroredSnapshot<ModelSlotsState>
   readonly agentConfiguration: ConfigState
   readonly loadTargets: Readonly<Record<"primary" | "secondary", Option.Option<SlotLoadTarget>>>
+  readonly instanceBindings: Readonly<Record<
+    "primary" | "secondary",
+    Option.Option<SlotInstanceBinding>
+  >>
 }
 
 interface SlotLoadTarget {
@@ -116,15 +122,20 @@ interface SlotLoadTarget {
   readonly configuration: LocalProviderOffering["configuration"]
 }
 
+interface SlotInstanceBinding {
+  readonly configurationId: ModelServingConfigurationId
+  readonly instanceId: ModelInstanceId
+}
+
 interface ModelLoadCommand {
   readonly requestedBy: SlotId
   readonly configuration: LocalProviderOffering["configuration"]
   readonly instanceId: ModelInstanceId
-  readonly result: Deferred.Deferred<void, LocalInferenceError>
+  readonly result: Deferred.Deferred<ModelLoadResult, LocalInferenceError>
 }
 
 type ModelLoadClaim =
-  | { readonly _tag: "Complete" }
+  | { readonly _tag: "Complete"; readonly result: ModelLoadResult }
   | { readonly _tag: "Observe"; readonly instanceId: ModelInstanceId }
   | { readonly _tag: "Join"; readonly command: ModelLoadCommand }
   | { readonly _tag: "Owner"; readonly command: ModelLoadCommand }
@@ -144,6 +155,16 @@ const sameLoadTarget = (
   onSome: (leftTarget) => Option.exists(right, (rightTarget) =>
     sameSelection(leftTarget.selection, rightTarget.selection)
     && sameServingConfiguration(leftTarget.configuration, rightTarget.configuration)),
+})
+
+const sameInstanceBinding = (
+  left: Option.Option<SlotInstanceBinding>,
+  right: Option.Option<SlotInstanceBinding>,
+): boolean => Option.match(left, {
+  onNone: () => Option.isNone(right),
+  onSome: (leftBinding) => Option.exists(right, (rightBinding) =>
+    leftBinding.configurationId === rightBinding.configurationId
+    && leftBinding.instanceId === rightBinding.instanceId),
 })
 
 const normalizeSelectionReasoning = (
@@ -179,11 +200,11 @@ const catalogContents = (state: ProviderModelCatalogState): {
 
 const failure = (
   code: string,
-  error: unknown,
+  error: string | { readonly message: string },
   retryable = true,
 ): LocalModelMutationFailed => new LocalModelMutationFailed({
   code,
-  message: error instanceof Error ? error.message : String(error),
+  message: typeof error === "string" ? error : error.message,
   retryable,
 })
 
@@ -236,6 +257,10 @@ export const ModelSlotControllerLive: Layer.Layer<
       primary: Option.none(),
       secondary: Option.none(),
     },
+    instanceBindings: {
+      primary: Option.none(),
+      secondary: Option.none(),
+    },
   })
 
   const commit = (
@@ -243,6 +268,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     catalogModels: readonly ProviderModelCatalogEntry[],
     contextLimits: typeof initialConfiguration.contextLimits,
     loadTargets: ControllerAggregate["loadTargets"],
+    instanceBindings: ControllerAggregate["instanceBindings"],
   ) => Effect.gen(function* () {
     const previous = yield* SubscriptionRef.get(aggregate)
     const stateChanged = !Schema.equivalence(
@@ -265,7 +291,15 @@ export const ModelSlotControllerLive: Layer.Layer<
       previous.loadTargets.secondary,
       loadTargets.secondary,
     )
-    if (!stateChanged && !agentConfigurationChanged && !loadTargetsChanged) {
+    const instanceBindingsChanged = !sameInstanceBinding(
+      previous.instanceBindings.primary,
+      instanceBindings.primary,
+    ) || !sameInstanceBinding(
+      previous.instanceBindings.secondary,
+      instanceBindings.secondary,
+    )
+    if (!stateChanged && !agentConfigurationChanged && !loadTargetsChanged
+      && !instanceBindingsChanged) {
       return previous
     }
     const revision = stateChanged
@@ -280,6 +314,9 @@ export const ModelSlotControllerLive: Layer.Layer<
         ? { ...candidateAgentConfiguration, revision: agentRevision }
         : previous.agentConfiguration,
       loadTargets: loadTargetsChanged ? loadTargets : previous.loadTargets,
+      instanceBindings: instanceBindingsChanged
+        ? instanceBindings
+        : previous.instanceBindings,
     }
     yield* SubscriptionRef.set(aggregate, next)
     if (stateChanged) {
@@ -351,7 +388,8 @@ export const ModelSlotControllerLive: Layer.Layer<
     const contents = catalogContents(catalogState)
     const packages = yield* localPackages.installedPackageIds
     const native = yield* observedInstances.get
-    const previous = (yield* SubscriptionRef.get(aggregate)).snapshot.state
+    const previousAggregate = yield* SubscriptionRef.get(aggregate)
+    const previous = previousAggregate.snapshot.state
     const offerings = yield* localOfferings.list.pipe(Effect.orElseSucceed(() => []))
 
     const buildSlot = (slotId: SlotId, selection: Option.Option<SlotSelection>): ModelSlot =>
@@ -396,23 +434,15 @@ export const ModelSlotControllerLive: Layer.Layer<
             offering !== undefined,
             downloaded,
           )
-          const previousSlot = current
-          const samePrevious = previousSlot._tag === "ConfiguredLocal"
-            && sameSelection(previousSlot.selection, selected)
           const configurationId = offering?.configuration.id
-          const previousInstanceId = samePrevious
-            ? Option.map(previousSlot.instance, (instance) => instance.id)
-            : Option.none<ModelInstanceId>()
-          const exact = Option.flatMap(previousInstanceId, (id) =>
-            Option.fromNullable(native.instances.find((instance) =>
-              instance.id === id && instance.configurationId === configurationId)))
-          const recoverable = native.instances.findLast((instance) =>
-            instance.configurationId === configurationId
-            && (instance.lifecycle._tag === "Loading"
-              || instance.lifecycle._tag === "Ready"
-              || instance.lifecycle._tag === "Stopping"))
+          const binding = previousAggregate.instanceBindings[slotKey(slotId)]
+          const exact = Option.flatMap(binding, ({ configurationId: boundConfigurationId, instanceId }) =>
+            boundConfigurationId === configurationId
+              ? Option.fromNullable(native.instances.find((instance) =>
+                instance.id === instanceId && instance.configurationId === configurationId))
+              : Option.none())
           const instance = Option.map(
-            Option.orElse(exact, () => Option.fromNullable(recoverable)),
+            exact,
             projectModelInstance,
           )
           const props = {
@@ -453,13 +483,27 @@ export const ModelSlotControllerLive: Layer.Layer<
             })),
           )
         : Option.none())
+    const loadTargets: ControllerAggregate["loadTargets"] = {
+      primary: loadTargetFor(configured.slots.primary),
+      secondary: loadTargetFor(configured.slots.secondary),
+    }
+    const nextBindingFor = (
+      key: "primary" | "secondary",
+    ): Option.Option<SlotInstanceBinding> => Option.flatMap(
+      loadTargets[key],
+      (target) => Option.filter(
+        previousAggregate.instanceBindings[key],
+        (binding) => binding.configurationId === target.configuration.id,
+      ),
+    )
     return yield* commit(
       state,
       contents.models,
       configured.contextLimits,
+      loadTargets,
       {
-        primary: loadTargetFor(configured.slots.primary),
-        secondary: loadTargetFor(configured.slots.secondary),
+        primary: nextBindingFor("primary"),
+        secondary: nextBindingFor("secondary"),
       },
     )
   }))
@@ -477,6 +521,19 @@ export const ModelSlotControllerLive: Layer.Layer<
 
   const selectedSlot = (slotId: SlotId) => SubscriptionRef.get(aggregate).pipe(
     Effect.map(({ snapshot }) => snapshot.state.slots[slotKey(slotId)]),
+  )
+  const bindSlotInstance = (
+    slotId: SlotId,
+    configurationId: ModelServingConfigurationId,
+    instanceId: ModelInstanceId,
+  ) => stateLock.withPermits(1)(
+    SubscriptionRef.update(aggregate, (current) => ({
+      ...current,
+      instanceBindings: {
+        ...current.instanceBindings,
+        [slotKey(slotId)]: Option.some({ configurationId, instanceId }),
+      },
+    })),
   )
   const reject = (slotId: SlotId, message: string) =>
     new ModelSlotMutationRejected({ slotId, message })
@@ -557,47 +614,56 @@ export const ModelSlotControllerLive: Layer.Layer<
     )
     const current = (yield* observedInstances.get).instances.find((item) => item.id === instanceId)
     if (current && predicate(current)) return current
-    return yield* observedInstances.changes.pipe(
+    const observed = yield* observedInstances.changes.pipe(
       Stream.filterMap((snapshot) => Option.fromNullable(
         snapshot.instances.find((item) => item.id === instanceId && predicate(item)),
       )),
       Stream.runHead,
-      Effect.flatMap(Option.match({
-        onNone: () => Effect.die("ICN model-instance observation ended"),
-        onSome: Effect.succeed,
-      })),
+    )
+    if (Option.isSome(observed)) return observed.value
+    return yield* failure(
+      "model_instance_observation_ended",
+      "Model-instance observation ended before the requested state was published",
     )
   })
 
   const awaitReadyInstance = (
     instanceId: ModelInstanceId,
-  ): Effect.Effect<void, LocalInferenceError> => awaitInstance(
-    instanceId,
-    (instance) => instance.lifecycle._tag === "Ready"
-      || instance.lifecycle._tag === "Stopped"
-      || instance.lifecycle._tag === "Failed",
-  ).pipe(
-    Effect.flatMap((instance) => {
-      switch (instance.lifecycle._tag) {
-        case "Ready":
-          return Effect.void
-        case "Failed":
-          return Effect.fail(new LocalModelMutationFailed({
-            code: instance.lifecycle.failure.code,
-            message: instance.lifecycle.failure.message,
-            retryable: instance.lifecycle.failure.retryable,
-          }))
-        case "Stopped":
-          return Effect.fail(failure(
-            "model_instance_stopped_before_ready",
-            "The model stopped before it became ready",
-          ))
-        case "Loading":
-        case "Stopping":
-          return Effect.die("Terminal model-instance observation returned a nonterminal state")
-      }
-    }),
-  )
+  ): Effect.Effect<ModelLoadResult, LocalInferenceError> => Effect.gen(function* () {
+    const instance = yield* awaitInstance(
+      instanceId,
+      (candidate) => candidate.lifecycle._tag === "Ready"
+        || candidate.lifecycle._tag === "Stopped"
+        || candidate.lifecycle._tag === "Failed",
+    )
+    switch (instance.lifecycle._tag) {
+      case "Ready":
+        return {
+          _tag: "Ready" as const,
+          instanceId: ModelInstanceIdSchema.make(instance.id),
+          configurationId: ModelServingConfigurationIdSchema.make(instance.configurationId),
+        }
+      case "Failed":
+        return yield* new LocalModelMutationFailed({
+          code: instance.lifecycle.failure.code,
+          message: instance.lifecycle.failure.message,
+          retryable: instance.lifecycle.failure.retryable,
+        })
+      case "Stopped":
+        return {
+          _tag: "Cancelled" as const,
+          instanceId: ModelInstanceIdSchema.make(instance.id),
+          reason: instance.lifecycle.reason,
+        }
+      case "Loading":
+      case "Stopping":
+        return yield* failure(
+          "invalid_model_instance_terminal_state",
+          "Model-instance observation returned before the instance reached a terminal load state",
+          false,
+        )
+    }
+  })
 
   const commandIsCurrent = (command: ModelLoadCommand) =>
     SubscriptionRef.get(aggregate).pipe(
@@ -648,13 +714,14 @@ export const ModelSlotControllerLive: Layer.Layer<
       )
       return yield* reject(command.requestedBy, "The selected local model changed while loading")
     }
-    yield* awaitReadyInstance(command.instanceId)
+    const result = yield* awaitReadyInstance(command.instanceId)
     yield* rebuild
+    return result
   })
 
   const loadModel: ModelSlotControllerApi["loadModel"] = (slotId) => Effect.gen(function* () {
     yield* rebuild
-    const candidateResult = yield* Deferred.make<void, LocalInferenceError>()
+    const candidateResult = yield* Deferred.make<ModelLoadResult, LocalInferenceError>()
     const claim: ModelLoadClaim = yield* commandLock.withPermits(1)(Effect.gen(function* () {
       const current = yield* SubscriptionRef.get(aggregate)
       const key = slotKey(slotId)
@@ -667,15 +734,23 @@ export const ModelSlotControllerLive: Layer.Layer<
         || !sameSelection(loadTarget.value.selection, slot.selection)) {
         return yield* reject(slotId, "The selected local model configuration is unavailable")
       }
-      if (Option.exists(slot.instance, (instance) =>
-        instance.lifecycle._tag === "Ready")) {
-        return { _tag: "Complete" as const }
-      }
-      if (Option.exists(slot.instance, (instance) =>
-        instance.lifecycle._tag === "Loading")) {
-        return {
-          _tag: "Observe" as const,
-          instanceId: Option.getOrThrow(slot.instance).id,
+      if (Option.isSome(slot.instance)) {
+        const instance = slot.instance.value
+        if (instance.lifecycle._tag === "Ready") {
+          return {
+            _tag: "Complete" as const,
+            result: {
+              _tag: "Ready" as const,
+              instanceId: instance.id,
+              configurationId: instance.configurationId,
+            },
+          }
+        }
+        if (instance.lifecycle._tag === "Loading") {
+          return {
+            _tag: "Observe" as const,
+            instanceId: instance.id,
+          }
         }
       }
       if (slot.availability._tag === "Unavailable") {
@@ -696,20 +771,31 @@ export const ModelSlotControllerLive: Layer.Layer<
             "The serving configuration ID is already in use for different configuration data",
           )
         }
+        yield* bindSlotInstance(
+          slotId,
+          existing.configuration.id,
+          existing.instanceId,
+        )
         return { _tag: "Join" as const, command: existing }
       }
       yield* Ref.set(
         loadCommands,
         new Map(currentCommands).set(candidate.configuration.id, candidate),
       )
+      yield* bindSlotInstance(
+        slotId,
+        candidate.configuration.id,
+        candidate.instanceId,
+      )
       return { _tag: "Owner" as const, command: candidate }
     }))
-    if (claim._tag === "Complete") return
+    if (claim._tag === "Complete") return claim.result
     if (claim._tag === "Observe") {
-      yield* awaitReadyInstance(claim.instanceId)
+      const result = yield* awaitReadyInstance(claim.instanceId)
       yield* rebuild
-      return
+      return result
     }
+    yield* rebuild
     if (claim._tag === "Owner") {
       yield* Effect.forkIn(Effect.gen(function* () {
         const result = yield* Effect.exit(runLoadCommand(claim.command))
@@ -772,10 +858,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   const ensureLocalModelReady = (
     slotId: SlotId,
     providerModelId: ProviderModelId,
-  ): Effect.Effect<{
-    readonly instanceId: ModelInstanceId
-    readonly configurationId: ModelServingConfigurationId
-  }, LocalInferenceError> =>
+  ): Effect.Effect<ModelLoadResult, LocalInferenceError> =>
     Effect.suspend(() => Effect.gen(function* () {
       yield* rebuild
       const current = yield* SubscriptionRef.get(aggregate)
@@ -790,6 +873,7 @@ export const ModelSlotControllerLive: Layer.Layer<
         switch (instance.lifecycle._tag) {
           case "Ready":
             return {
+              _tag: "Ready" as const,
               instanceId: instance.id,
               configurationId: instance.configurationId,
             }
@@ -808,21 +892,40 @@ export const ModelSlotControllerLive: Layer.Layer<
               )
             }
             if (terminal.lifecycle._tag === "Stopped") {
-              return yield* failure(
-                "model_instance_stopped",
-                "The model instance stopped before becoming ready",
-                false,
-              )
+              return {
+                _tag: "Cancelled" as const,
+                instanceId: ModelInstanceIdSchema.make(terminal.id),
+                reason: terminal.lifecycle.reason,
+              }
             }
             return yield* ensureLocalModelReady(slotId, providerModelId)
           }
-          case "Stopping":
-            yield* awaitInstance(
+          case "Stopping": {
+            const terminal = yield* awaitInstance(
               instance.id,
               (observed) => observed.lifecycle._tag === "Stopped"
                 || observed.lifecycle._tag === "Failed",
             )
-            return yield* ensureLocalModelReady(slotId, providerModelId)
+            if (terminal.lifecycle._tag === "Stopped") {
+              return {
+                _tag: "Cancelled" as const,
+                instanceId: ModelInstanceIdSchema.make(terminal.id),
+                reason: terminal.lifecycle.reason,
+              }
+            }
+            if (terminal.lifecycle._tag === "Failed") {
+              return yield* failure(
+                terminal.lifecycle.failure.code,
+                terminal.lifecycle.failure.message,
+                terminal.lifecycle.failure.retryable,
+              )
+            }
+            return yield* failure(
+              "invalid_model_instance_terminal_state",
+              "Model-instance observation returned before stopping completed",
+              false,
+            )
+          }
           case "Failed":
             if (!instance.lifecycle.failure.retryable) {
               return yield* failure(
@@ -837,7 +940,8 @@ export const ModelSlotControllerLive: Layer.Layer<
         }
       }
 
-      yield* loadModel(slotId)
+      const result = yield* loadModel(slotId)
+      if (result._tag === "Cancelled") return result
       return yield* ensureLocalModelReady(slotId, providerModelId)
     }))
 
@@ -845,8 +949,14 @@ export const ModelSlotControllerLive: Layer.Layer<
     slotId,
     providerModelId,
   ) => Effect.gen(function* () {
-    const binding = yield* ensureLocalModelReady(slotId, providerModelId)
-    yield* Effect.locallyScoped(CurrentModelInstance, Option.some(binding))
+    const result = yield* ensureLocalModelReady(slotId, providerModelId)
+    if (result._tag === "Ready") {
+      yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
+        instanceId: result.instanceId,
+        configurationId: result.configurationId,
+      }))
+    }
+    return result
   })
 
   const updateModelSlot: ModelSlotControllerApi["updateModelSlot"] = (slotId, selection) =>
@@ -913,7 +1023,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     ),
     acquireLocalModel,
     ensureLocalModelReady: (slotId, providerModelId) =>
-      ensureLocalModelReady(slotId, providerModelId).pipe(Effect.asVoid),
+      ensureLocalModelReady(slotId, providerModelId),
     updateModelSlot,
     setModelFavorite,
     loadModel,

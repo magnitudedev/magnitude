@@ -7,7 +7,7 @@ import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
-import { deriveHardwareMemoryView, modelSlotResidentAllocation, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
+import { deriveHardwareMemoryView, modelSlotResidentAllocation, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceHardware, useModelSlots, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, ProviderModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
@@ -87,12 +87,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onManageLocalModels,
 }: SettingsOverlayProps) {
   const theme = useTheme()
-  const localInferenceState = useLocalInferenceQuery()
-  const localInferenceSnapshot = Result.value(localInferenceState)
-  const hardwareState = Option.map(localInferenceSnapshot, (state) => state.hardware)
+  const hardwareResult = useLocalInferenceHardware()
+  const slotsResult = useModelSlots()
+  const hardwareState = Result.value(hardwareResult)
   const residentAllocation = Option.flatMap(
-    localInferenceSnapshot,
-    (state) => modelSlotResidentAllocation(state.slots.slots.primary),
+    Result.value(slotsResult),
+    (state) => modelSlotResidentAllocation(state.slots.primary),
   )
   const hardware = Option.map(hardwareState, describeLocalHardware)
   const hardwareMemory = Option.map(
@@ -342,8 +342,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         </box>
         {Option.match(hardware, {
           onNone: () => (
-            <text style={{ fg: Result.isFailure(localInferenceState) ? theme.warning : theme.muted }}>
-              {Result.isFailure(localInferenceState) ? 'Hardware detection unavailable' : 'Detecting hardware…'}
+            <text style={{ fg: Result.isFailure(hardwareResult) ? theme.warning : theme.muted }}>
+              {Result.isFailure(hardwareResult) ? 'Hardware detection unavailable' : 'Detecting hardware…'}
             </text>
           ),
           onSome: (detected) => (

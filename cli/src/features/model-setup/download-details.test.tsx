@@ -66,10 +66,8 @@ test("shows compact download details with progress, rate, and ETA", async () => 
       width={56}
       height={11}
       operation={{
-        _tag: "Active",
-        cancelling: false,
-        cancelError: null,
-        onCancel,
+        _tag: "Failed",
+        onChooseAnother: onCancel,
         onRetry,
       }}
     />,
@@ -159,7 +157,9 @@ test("shows failed-download actions in the details pane", async () => {
   try {
     await act(view.renderOnce)
     const frame = view.captureCharFrame()
+    expect(frame).toContain("Couldn’t download Qwen Test")
     expect(frame).toContain("Download failed")
+    expect(frame).not.toContain("63%")
     expect(frame).toMatch(/Retry\s+Choose another model/)
   } finally {
     await act(async () => view.renderer.destroy())

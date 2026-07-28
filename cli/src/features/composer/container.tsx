@@ -27,7 +27,8 @@ import {
   reasoningEffortControl,
   selectedSlotModel,
   useModelConfig,
-  useLocalInferenceQuery,
+  useLocalModels,
+  useModelSlots,
 } from '@magnitudedev/client-common'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { addEphemeralMessage } from '@magnitudedev/client-common'
@@ -110,8 +111,18 @@ export function ComposerContainer({
   const { interrupt, interruptAll } = useInterruptActions()
   const { rootRoleLabel, rootProfile, rootSlotId } = useSlotProfiles()
   const modelConfig = useModelConfig()
-  const localInference = useLocalInferenceQuery()
-  const localInferenceState = Option.getOrNull(Result.value(localInference))
+  const localModels = useLocalModels()
+  const localSlots = useModelSlots()
+  const localModelsState = Result.match(localModels, {
+    onInitial: () => null,
+    onFailure: () => null,
+    onSuccess: ({ value }) => value,
+  })
+  const modelSlotsState = Result.match(localSlots, {
+    onInitial: () => null,
+    onFailure: () => null,
+    onSuccess: ({ value }) => value,
+  })
   const selectedModel = Option.flatMap(
     Option.all({
       catalog: Result.value(modelConfig.catalog),
@@ -179,7 +190,8 @@ export function ComposerContainer({
           ? rootProfile.reasoningEffort.charAt(0).toUpperCase() + rootProfile.reasoningEffort.slice(1)
           : '-',
       }}
-      localInferenceState={localInferenceState}
+      localModels={localModelsState}
+      modelSlots={modelSlotsState}
       selectedProviderId={rootProfile?.providerId ?? null}
       selectedSlotId={rootSlotId}
       tokenUsage={tokenUsage}

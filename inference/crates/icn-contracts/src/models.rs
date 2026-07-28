@@ -53,9 +53,32 @@ pub struct ModelInstanceAllocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelReleaseReason {
-    ExplicitStop,
-    Replacement,
+    UserStop,
     IdleTimeout,
+    Replacement,
+    MemoryPressure,
+}
+
+#[cfg(test)]
+mod model_release_reason_tests {
+    use super::ModelReleaseReason;
+
+    #[test]
+    fn serializes_the_complete_product_release_vocabulary() {
+        let cases = [
+            (ModelReleaseReason::UserStop, "\"user_stop\""),
+            (ModelReleaseReason::IdleTimeout, "\"idle_timeout\""),
+            (ModelReleaseReason::Replacement, "\"replacement\""),
+            (ModelReleaseReason::MemoryPressure, "\"memory_pressure\""),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&reason).expect("serialize reason"),
+                expected
+            );
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

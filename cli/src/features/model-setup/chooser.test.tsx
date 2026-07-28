@@ -1,6 +1,7 @@
 import { act, useState } from "react"
 import { KeyEvent } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
+import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   CatalogCandidateIdSchema,
@@ -90,6 +91,14 @@ const chooserView = () => {
   })
 }
 
+const chooserProps = (state: ReturnType<typeof chooserView>) => ({
+  hardware: Result.success(state.hardware),
+  models: state.models,
+  catalog: state.catalog,
+  slots: state.slots,
+  submitting: false,
+})
+
 const chooserViewWithInventory = (installedCount: number, downloadCount: number) => {
   const installed = Array.from({ length: installedCount }, (_, index) => makeModel({
     targetId: ModelOfferingTargetIdSchema.make(`target_installed_${index + 1}`),
@@ -133,9 +142,8 @@ const chooserViewWithInventory = (installedCount: number, downloadCount: number)
 test("renders compact installed and downloadable rows with an informational detail pane", async () => {
   const view = await testRender(
     <OnboardingModelChooser
-      state={chooserView()}
+      {...chooserProps(chooserView())}
       width={100}
-      pending={false}
       error={null}
       operation={null}
       onChoose={onChoose}
@@ -165,9 +173,34 @@ test("renders compact installed and downloadable rows with an informational deta
   }
 })
 
+test("does not accept another selection while command submission is pending", async () => {
+  const view = await testRender(
+    <OnboardingModelChooser
+      {...chooserProps(chooserView())}
+      submitting
+      width={100}
+      error={null}
+      operation={null}
+      onChoose={onChoose}
+      onContinue={onContinue}
+      onSkip={onSkip}
+    />,
+    { width: 100, height: 30 },
+  )
+  try {
+    await act(view.renderOnce)
+    await act(async () => press("down"))
+    await act(async () => press("enter"))
+    expect(onChoose).not.toHaveBeenCalled()
+    expect(onContinue).not.toHaveBeenCalled()
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
 test("shows hardware detection in the persistent metadata position before state arrives", async () => {
   const view = await testRender(
-    <OnboardingModelPreparation state={null} width={100} onSkip={onSkip} />,
+    <OnboardingModelPreparation hardware={Result.initial()} progress={[]} error={null} width={100} onSkip={onSkip} />,
     { width: 100, height: 16 },
   )
   try {
@@ -233,7 +266,7 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
     },
   }
   const view = await testRender(
-    <OnboardingModelPreparation state={state} width={100} onSkip={onSkip} />,
+    <OnboardingModelPreparation hardware={Result.success(state.hardware)} progress={state.models.recommendations.progress} error={null} width={100} onSkip={onSkip} />,
     { width: 100, height: 24 },
   )
   try {
@@ -253,7 +286,7 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
   }
 })
 
-test("transitions directly from selection to starting and authoritative download details", async () => {
+test("keeps the chooser unchanged until authoritative download state arrives", async () => {
   const candidate = makeCatalogCandidate({
     id: CatalogCandidateIdSchema.make("candidate_remote"),
     targetId: ModelOfferingTargetIdSchema.make("target_remote"),
@@ -273,9 +306,8 @@ test("transitions directly from selection to starting and authoritative download
     publishAuthoritativeDownload = () => setDownloading(true)
     return (
       <OnboardingModelChooser
-        state={chooserView()}
+        {...chooserProps(chooserView())}
         width={100}
-        pending={false}
         error={null}
         operation={downloading ? {
           _tag: "Downloading",
@@ -305,11 +337,9 @@ test("transitions directly from selection to starting and authoritative download
       reasoningEffort: "none",
     })
     await act(view.renderOnce)
-    const startingFrame = view.captureCharFrame()
-    expect(startingFrame).toContain("Downloading Remote Model")
-    expect(startingFrame).toContain("Starting download…")
-    expect(startingFrame).toContain("0 MB / 17.2 GB")
-    expect(startingFrame).not.toContain("Balanced local inference")
+    const preMirrorFrame = view.captureCharFrame()
+    expect(preMirrorFrame).toContain("Balanced local inference")
+    expect(preMirrorFrame).not.toContain("Downloading Remote Model")
 
     await act(async () => publishAuthoritativeDownload())
     await act(view.renderOnce)
@@ -337,9 +367,8 @@ test("keeps the chosen row highlighted and locks navigation while download detai
   })
   const view = await testRender(
     <OnboardingModelChooser
-      state={chooserView()}
+      {...chooserProps(chooserView())}
       width={70}
-      pending={false}
       error={null}
       operation={{
         _tag: "Downloading",
@@ -378,19 +407,18 @@ test("keeps the chosen row highlighted and locks navigation while download detai
   }
 })
 
-test("keeps the animated activation spinner isolated from its status label", async () => {
+test("renders the authoritative loading lifecycle", async () => {
   vi.useFakeTimers()
   const view = await testRender(
     <OnboardingModelChooser
-      state={chooserView()}
+      {...chooserProps(chooserView())}
       width={100}
-      pending={false}
       error={null}
       operation={{
         _tag: "Activating",
         providerModelId: ProviderModelIdSchema.make("configuration_remote"),
         displayName: "Remote Model",
-        phase: "Preparing",
+        phase: "Loading",
         failure: null,
         onRetry: vi.fn(),
         onChooseAnother: vi.fn(),
@@ -403,13 +431,13 @@ test("keeps the animated activation spinner isolated from its status label", asy
   )
   try {
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("Preparing the model for use…")
+    expect(view.captureCharFrame()).toContain("Loading model weights…")
 
     await act(async () => {
       vi.advanceTimersByTime(8_000)
     })
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("Preparing the model for use…")
+    expect(view.captureCharFrame()).toContain("Loading model weights…")
   } finally {
     await act(async () => view.renderer.destroy())
     vi.useRealTimers()
@@ -419,9 +447,8 @@ test("keeps the animated activation spinner isolated from its status label", asy
 test("keeps four rows per section and scrolls only the installed-model window", async () => {
   const view = await testRender(
     <OnboardingModelChooser
-      state={chooserViewWithInventory(6, 4)}
+      {...chooserProps(chooserViewWithInventory(6, 4))}
       width={100}
-      pending={false}
       error={null}
       operation={null}
       onChoose={onChoose}
@@ -512,9 +539,8 @@ test("excludes unrelated failed downloads and unusable installed models", async 
   }
   const view = await testRender(
     <OnboardingModelChooser
-      state={state}
+      {...chooserProps(state)}
       width={100}
-      pending={false}
       error={null}
       operation={null}
       onChoose={onChoose}
@@ -546,9 +572,8 @@ test("excludes unrelated failed downloads and unusable installed models", async 
 test("stacks the informational pane without clipping actions on narrower terminals", async () => {
   const view = await testRender(
     <OnboardingModelChooser
-      state={chooserView()}
+      {...chooserProps(chooserView())}
       width={70}
-      pending={false}
       error={null}
       operation={null}
       onChoose={onChoose}

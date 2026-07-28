@@ -8,7 +8,7 @@
 import { useState, useCallback, type ReactNode } from "react"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceQuery, visionPropertyLabel } from "@magnitudedev/client-common"
+import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalModels, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
 import type { CloudUsageResponse, UsagePeriod, SlotId, LocalModel, ProviderModelCatalogEntry } from "@magnitudedev/sdk"
 import { ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
@@ -174,10 +174,10 @@ function SettingsTab({
   const [inputKey, setInputKey] = useState("")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const localInference = useLocalInferenceQuery()
-  const localModels = Option.match(Result.value(localInference), {
+  const localModelsState = useLocalModels()
+  const localModels = Option.match(Result.value(localModelsState), {
     onNone: () => [] as readonly LocalModel[],
-    onSome: ({ models }) => models.models,
+    onSome: ({ models }) => models,
   })
   const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
   const catalogLoading = Option.match(catalogState, {

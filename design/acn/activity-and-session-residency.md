@@ -185,13 +185,11 @@ master-detail chooser groups compact rows into models on the computer and models
 download; arrow keys move one selection across both groups, the right pane is informational until
 selection, and Enter or a row click performs the row's `Load` or `Download` action.
 
-After selection, the chooser remains mounted while its selected row stays highlighted and its
-other rows stop accepting keyboard, hover, or click input. The right pane advances through
+After selection, the chooser remains unchanged until an authoritative target download or exact
+slot instance appears. The right pane then advances through
 download, preparation, and loading without a screen transition, deriving model identity,
 quantization, byte progress, transfer rate, and remaining-time presentation from authoritative
-local-model mirrors. The initiating Enter or click event may bridge server acknowledgement with a
-presentation-only starting state for that exact selection; it reports no inferred progress and
-cannot regress to the informational chooser before authoritative download or loading state arrives.
+local-model mirrors. Command submission creates no presentation lifecycle.
 The presentation says Loading only while the selected slot projects an exact ICN instance in its
 Loading lifecycle; assignment or package preparation alone never implies loading. Detailed
 residency progress remains in the activity rail. The explicit selection action

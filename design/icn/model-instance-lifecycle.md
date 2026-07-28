@@ -80,6 +80,12 @@ Caller cancellation cannot cancel an admitted instance. Success, typed failure, 
 worker loss, pressure release, idle release, and controller shutdown all terminalize the instance
 through the controller.
 
+Stopped instances preserve one native release reason: `user_stop` for an exact Stop command,
+`idle_timeout` for inactivity policy, `replacement` when admission of a specifically requested
+model supersedes the instance, or `memory_pressure` when system capacity policy releases it without
+a specific replacement. Controller shutdown destroys the controller authority and is not a
+model-instance release reason.
+
 ## Resource and lease invariant
 
 Every worker, backend, lease runtime, package claim, allocation, load operation, and failure is
@@ -137,7 +143,8 @@ and filtered stream, so a change relevant to only one does not create a false ch
 Clients read `ModelSlotsMirror` for canonical state; the Hardware view independently queries the
 advisory plan only while it needs unloaded-model presentation.
 
-That aggregate also retains the private exact serving configuration derived for each local slot.
+That aggregate also retains the private exact serving configuration and the exact admitted
+instance ID for each local slot.
 Load commands take their immutable target from this same commit rather than resolving an offering
 through a second race-prone read. A serving-configuration change can therefore update command
 intent even when the public slot and agent projections are otherwise equivalent.
@@ -159,6 +166,11 @@ short controller boundary; transport and observation run outside that boundary i
 scope. The command remains current while any slot selects its exact configuration. A superseded
 command stops only its own exact instance. This is command deduplication, not a second physical
 lifecycle or inference-admission gate.
+
+Slot projection resolves only the retained exact instance ID. It never searches by configuration
+or prefers a previous projected tombstone. Retry replaces the binding before the replacement
+lifecycle is projected. A pre-ready Stopped lifecycle returns a typed cancellation and its exact
+release reason; it is not a model failure.
 
 Waiting for a model is represented by the canonical slot and model-instance lifecycle, not by a
 synthetic request-progress phase. Request progress begins only after ICN admits the inference
