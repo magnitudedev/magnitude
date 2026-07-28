@@ -42,12 +42,10 @@ export const deriveModelSetupActive = ({
 
 export const deriveOnboardingModelSetupView = ({
   active,
-  onboardingRequired,
   submittedProviderModelId,
   state,
 }: {
   readonly active: boolean
-  readonly onboardingRequired: boolean
   readonly submittedProviderModelId: ProviderModelId | null
   readonly state: LocalInferenceView | null
 }): OnboardingModelSetupView => {
@@ -55,7 +53,6 @@ export const deriveOnboardingModelSetupView = ({
   if (state === null || localInferenceSetupPhase(state) !== "ready") {
     return { _tag: "Preparing", state }
   }
-  if (!onboardingRequired) return { _tag: "Choosing", state }
 
   const submittedCandidate = submittedProviderModelId === null
     || state.models.recommendations._tag !== "Ready"

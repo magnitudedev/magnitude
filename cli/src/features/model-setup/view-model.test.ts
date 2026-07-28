@@ -64,7 +64,6 @@ describe("deriveOnboardingModelSetupView", () => {
   it("shows the chooser inside setup once recommendations are ready", () => {
     expect(deriveOnboardingModelSetupView({
       active: true,
-      onboardingRequired: true,
       submittedProviderModelId: null,
       state: makeView({ ready: false }),
     })._tag).toBe("Choosing")
@@ -95,13 +94,11 @@ describe("deriveOnboardingModelSetupView", () => {
     }
     expect(deriveOnboardingModelSetupView({
       active: true,
-      onboardingRequired: true,
       submittedProviderModelId: null,
       state,
     })._tag).toBe("Choosing")
     const view = deriveOnboardingModelSetupView({
       active: true,
-      onboardingRequired: true,
       submittedProviderModelId: TEST_MODEL_ID,
       state,
     })
@@ -138,7 +135,6 @@ describe("deriveOnboardingModelSetupView", () => {
     })
     const view = deriveOnboardingModelSetupView({
       active: true,
-      onboardingRequired: true,
       submittedProviderModelId: TEST_MODEL_ID,
       state: {
         ...base,
@@ -152,7 +148,7 @@ describe("deriveOnboardingModelSetupView", () => {
     expect(onboardingModelSetupPlaceholder(view)).toBe("Loading Qwen Test…")
   })
 
-  it("projects the selected candidate download from authoritative model state", () => {
+  it("projects the selected candidate download during forced setup", () => {
     const candidate = makeCatalogCandidate({
       download: {
         _tag: "Downloading",
@@ -178,8 +174,11 @@ describe("deriveOnboardingModelSetupView", () => {
       },
     }
     const view = deriveOnboardingModelSetupView({
-      active: true,
-      onboardingRequired: true,
+      active: deriveModelSetupActive({
+        forceSetup: true,
+        onboardingRequired: false,
+        completionSucceeded: false,
+      }),
       submittedProviderModelId: TEST_MODEL_ID,
       state,
     })
