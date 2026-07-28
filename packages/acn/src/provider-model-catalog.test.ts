@@ -40,15 +40,19 @@ const model = (providerId: typeof providerA, name: string): ProviderModel => ({
 })
 
 describe("provider model catalog", () => {
-  it("retains failures for providers omitted by a targeted refresh", async () => {
+  it("degrades an empty catalog and retains failures for providers omitted by a targeted refresh", async () => {
     const failure = new ModelCatalogError({ message: "provider B unavailable" })
-    const initial: readonly ProviderCatalogOutcome[] = [
+    const initialFailures: readonly ProviderCatalogOutcome[] = [
+      { _tag: "Failure", providerId: providerA, failure },
+      { _tag: "Failure", providerId: providerB, failure },
+    ]
+    const available: readonly ProviderCatalogOutcome[] = [
       { _tag: "Success", providerId: providerA, models: [model(providerA, "A")] },
       { _tag: "Success", providerId: providerB, models: [model(providerB, "B")] },
     ]
 
-    const state = await Effect.runPromise(Effect.gen(function* () {
-      const outcomes = yield* Ref.make(initial)
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const outcomes = yield* Ref.make(initialFailures)
       const refreshCalls = yield* Ref.make(0)
       const refreshEntered = yield* Deferred.make<void>()
       const releaseRefresh = yield* Deferred.make<void>()
@@ -108,10 +112,14 @@ describe("provider model catalog", () => {
       )
       return yield* Effect.gen(function* () {
         const catalog = yield* ProviderModelCatalog
+        const initialState = (yield* catalog.snapshot).state
+        yield* Ref.set(outcomes, available)
+        yield* catalog.refresh(Option.none())
         yield* Ref.set(outcomes, [
           { _tag: "Success", providerId: providerA, models: [model(providerA, "A")] },
           { _tag: "Failure", providerId: providerB, failure },
         ])
+        const refreshCallsBeforeConcurrency = yield* Ref.get(refreshCalls)
         yield* Ref.set(pauseRefresh, true)
         const firstCaller = yield* catalog.refresh(Option.none()).pipe(Effect.fork)
         yield* Deferred.await(refreshEntered)
@@ -121,7 +129,7 @@ describe("provider model catalog", () => {
         yield* Deferred.succeed(releaseRefresh, undefined)
         yield* Fiber.join(joiningCaller)
         yield* Fiber.join(conflictingCaller)
-        expect(yield* Ref.get(refreshCalls)).toBe(2)
+        expect(yield* Ref.get(refreshCalls)).toBe(refreshCallsBeforeConcurrency + 2)
         yield* Ref.set(pauseRefresh, false)
         yield* Ref.set(outcomes, [{ _tag: "Success", providerId: providerA, models: [model(providerA, "A")] }])
         yield* catalog.refresh(Option.some(providerA))
@@ -141,10 +149,19 @@ describe("provider model catalog", () => {
         expect(yield* Ref.get(refreshCalls)).toBe(refreshCount)
         yield* Ref.set(defectRefresh, true)
         yield* catalog.refresh(Option.some(providerB))
-        return (yield* catalog.snapshot).state
+        return {
+          initialState,
+          finalState: (yield* catalog.snapshot).state,
+        }
       }).pipe(Effect.provide(ProviderModelCatalogLive.pipe(Layer.provide(dependencies))))
     }))
 
+    expect(result.initialState._tag).toBe("Degraded")
+    if (result.initialState._tag !== "Degraded") return
+    expect(result.initialState.models).toEqual([])
+    expect(result.initialState.failures).toHaveLength(2)
+
+    const state = result.finalState
     expect(state._tag).toBe("Degraded")
     if (state._tag !== "Degraded") return
     expect(state.failures).toContainEqual({

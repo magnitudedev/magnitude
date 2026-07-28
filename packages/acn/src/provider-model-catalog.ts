@@ -214,8 +214,7 @@ export const ProviderModelCatalogLive: Layer.Layer<
   ) => updateCatalog((state) => {
     if (state._tag !== "Loading" && state._tag !== "Refreshing") return state
     if (failures.length === 0) return ProviderModelCatalogLifecycle.transition(state, "Ready", { providers, models })
-    if (models.length > 0) return ProviderModelCatalogLifecycle.transition(state, "Degraded", { providers, models, failures })
-    return ProviderModelCatalogLifecycle.transition(state, "Unavailable", { providers, failures })
+    return ProviderModelCatalogLifecycle.transition(state, "Degraded", { providers, models, failures })
   })
 
   const reconcile = (outcomes: readonly ProviderCatalogOutcome[]) => Effect.gen(function* () {

@@ -46,6 +46,11 @@ system-domain load admission, and warning presentation from that one value. They
 parallel aggregate or fit-label fields. Generic and cloud provider entries do not fabricate local
 memory accounting.
 
+The aggregate provider catalog remains usable when aggregation completes with typed provider or
+catalog failures. Such a snapshot is `Degraded`, including when every successful source contributes
+an empty model list; an empty result does not turn a partial provider failure into aggregate
+unavailability.
+
 The target ID groups every serving configuration of the same standalone package or speculative
 pair into one product model. Provider model IDs continue to distinguish configurations.
 
@@ -160,6 +165,7 @@ drafting actually ran.
 - Every local provider call resolves through one durable offering.
 - Runtime load receives the stored ICN configuration unchanged.
 - Local availability is derived in one ACN projection.
+- A completed aggregate catalog with provider failures is degraded even when it contains no models.
 - Every assessed local provider catalog entry exposes ICN's complete per-domain memory accounting
   for that exact serving configuration.
 - Provider binding does not load a model.
