@@ -75,7 +75,12 @@ const chooserView = () => {
     ready: false,
     models: [makeModel({ displayName: "Installed Model" }), remoteModel],
     recommendations: [makeRecommendation({
-      candidate: makeCatalogCandidate({ id: remoteCandidateId, displayName: "Remote Model" }),
+      candidate: makeCatalogCandidate({
+        id: remoteCandidateId,
+        displayName: "Remote Model",
+        profile: { contextLength: 200_000 },
+        estimatedTokensPerSecond: Option.some(36.2),
+      }),
     })],
   })
 }
@@ -143,6 +148,9 @@ test("renders compact installed and downloadable rows with an informational deta
     expect(frame).not.toContain("Download & load")
     expect(frame).not.toContain("[ Load ]")
     expect(frame).toContain("Enter select")
+    await act(async () => press("down"))
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain("~36 tok/s at 200K ctx")
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -436,7 +444,7 @@ test("stacks the informational pane without clipping actions on narrower termina
     expect(frame).toContain("Load")
     expect(frame).toContain("Remote Model")
     expect(frame).toMatch(/Remote Model\s+Balanced/)
-    expect(frame).toContain("Q4_K_M · 17.2 GB · 32K context")
+    expect(frame).toContain("Q4_K_M · 17.2 GB · 200K ctx")
     expect(frame).toContain("Balanced local inference.")
     expect(frame).toContain("Test CPU")
     expect(frame).toContain("Test GPU · 24 GiB VRAM · CUDA")
