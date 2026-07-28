@@ -68,6 +68,13 @@ const onboardingSelection = (
   })
 }
 
+const matchesOnboardingSelection = (
+  selection: LocalInferenceSelection,
+  submitted: OnboardingLocalModelSelection,
+): boolean => submitted._tag === "CatalogCandidate"
+  ? selection.model.catalogCandidateIds.includes(submitted.candidateId)
+  : Option.contains(selection.providerModelId, submitted.providerModelId)
+
 const ModelRow = ({
   selection,
   selected,
@@ -255,8 +262,13 @@ export function OnboardingModelChooser({
   const theme = useTheme()
   const selections = useMemo(() => buildLocalInferenceSelections(state), [state])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
+  const [submittedSelection, setSubmittedSelection] =
+    useState<OnboardingLocalModelSelection | null>(null)
   const activeSelectionId = operation === null
-    ? Option.none<string>()
+    ? Option.fromNullable(submittedSelection === null
+      ? undefined
+      : selections.find((selection) =>
+          matchesOnboardingSelection(selection, submittedSelection))?.id)
     : Option.fromNullable(selections.find((selection) => operation._tag === "Downloading"
       ? selection.model.catalogCandidateIds.includes(operation.candidate.id)
       : Option.contains(selection.providerModelId, operation.providerModelId))?.id)
@@ -265,7 +277,8 @@ export function OnboardingModelChooser({
     Option.isSome(activeSelectionId) ? activeSelectionId : selectedId,
   )
   const selected = selections[selectedIndex]
-  const locked = pending || operation !== null
+  const starting = operation === null && submittedSelection !== null && error === null
+  const locked = pending || operation !== null || starting
   const local = selections.filter(({ kind }) => kind === "running" || kind === "stored")
   const downloads = selections.filter(({ kind }) => kind === "recommendation")
   const selectedLocalIndex = Math.min(selectedIndex, Math.max(0, local.length - 1))
@@ -293,12 +306,15 @@ export function OnboardingModelChooser({
       return
     }
     const value = onboardingSelection(selection)
-    if (value) onChoose(value)
+    if (value) {
+      setSubmittedSelection(value)
+      onChoose(value)
+    }
   }, [onChoose, onContinue, pending])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) {
-      if (pending) key.preventDefault()
+      key.preventDefault()
       return
     }
     if (key.name === "up" || key.name === "k") {
@@ -442,15 +458,30 @@ export function OnboardingModelChooser({
   ) : (
     <text style={{ fg: theme.muted }}>No compatible models found.</text>
   )
+  const startingDownloadCandidate = starting
+    && submittedSelection?._tag === "CatalogCandidate"
+    && state.models.recommendations._tag === "Ready"
+    ? state.models.recommendations.catalog.find(({ id }) =>
+        id === submittedSelection.candidateId)
+      ?? (selected && Option.isSome(selected.recommendation)
+        ? selected.recommendation.value.candidate
+        : undefined)
+    : undefined
   const detailsContent = operation?._tag === "Downloading" ? (
     <OnboardingModelDownloadDetails
       candidate={operation.candidate}
       width={detailWidth}
       height={detailContentHeight}
-      cancelling={operation.cancelling}
-      cancelError={operation.cancelError}
-      onCancel={operation.onCancel}
-      onRetry={operation.onRetry}
+      operation={{
+        _tag: "Active",
+        cancelling: operation.cancelling,
+        cancelError: operation.cancelError,
+        onCancel: () => {
+          setSubmittedSelection(null)
+          operation.onCancel()
+        },
+        onRetry: operation.onRetry,
+      }}
     />
   ) : operation?._tag === "Loading" ? (
     <OnboardingModelLoadingDetails
@@ -459,7 +490,26 @@ export function OnboardingModelChooser({
       height={detailContentHeight}
       failed={operation.failure}
       onRetry={operation.onRetry}
-      onChooseAnother={operation.onChooseAnother}
+      onChooseAnother={() => {
+        setSubmittedSelection(null)
+        operation.onChooseAnother()
+      }}
+    />
+  ) : startingDownloadCandidate ? (
+    <OnboardingModelDownloadDetails
+      candidate={startingDownloadCandidate}
+      width={detailWidth}
+      height={detailContentHeight}
+      operation={{ _tag: "Starting" }}
+    />
+  ) : starting && submittedSelection?._tag === "InstalledModel" && selected ? (
+    <OnboardingModelLoadingDetails
+      displayName={selected.model.displayName}
+      width={detailWidth}
+      height={detailContentHeight}
+      failed={null}
+      onRetry={() => undefined}
+      onChooseAnother={() => undefined}
     />
   ) : regularDetails
   const details = (
@@ -482,7 +532,7 @@ export function OnboardingModelChooser({
     </box>
   )
   const interactionHint = pending
-    ? "Selecting model…"
+    ? submittedSelection?._tag === "CatalogCandidate" ? "Starting download…" : "Preparing model…"
     : operation?._tag === "Downloading"
       ? operation.candidate.download._tag === "Failed"
         ? "Download failed · Retry or choose another model"
@@ -491,7 +541,9 @@ export function OnboardingModelChooser({
         ? operation.failure
           ? "Model loading failed"
           : "Loading model into memory…"
-        : "↑/↓ choose · Enter select · Esc skip for now"
+        : starting
+          ? submittedSelection?._tag === "CatalogCandidate" ? "Starting download…" : "Preparing model…"
+          : "↑/↓ choose · Enter select · Esc skip for now"
 
   return (
     <OnboardingSetupCard cardWidth={cardWidth} title="Choose a local model" state={state}>

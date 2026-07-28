@@ -1,4 +1,4 @@
-import { act } from "react"
+import { act, useState } from "react"
 import { KeyEvent } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
@@ -236,18 +236,44 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
   }
 })
 
-test("arrow navigation crosses sections and Enter selects the highlighted download", async () => {
+test("transitions directly from selection to starting and authoritative download details", async () => {
+  const candidate = makeCatalogCandidate({
+    id: CatalogCandidateIdSchema.make("candidate_remote"),
+    displayName: "Remote Model",
+    download: {
+      _tag: "Downloading",
+      stage: "downloading",
+      completedBytes: 8 * GIB,
+      totalBytes: 16 * GIB,
+      bytesPerSecond: Option.some(32 * 1024 ** 2),
+    },
+  })
+  let publishAuthoritativeDownload: () => void = () => undefined
+  const TransitionHarness = () => {
+    const [downloading, setDownloading] = useState(false)
+    publishAuthoritativeDownload = () => setDownloading(true)
+    return (
+      <OnboardingModelChooser
+        state={chooserView()}
+        width={100}
+        pending={false}
+        error={null}
+        operation={downloading ? {
+          _tag: "Downloading",
+          candidate,
+          cancelling: false,
+          cancelError: null,
+          onCancel: vi.fn(),
+          onRetry: vi.fn(),
+        } : null}
+        onChoose={onChoose}
+        onContinue={onContinue}
+        onSkip={onSkip}
+      />
+    )
+  }
   const view = await testRender(
-    <OnboardingModelChooser
-      state={chooserView()}
-      width={100}
-      pending={false}
-      error={null}
-      operation={null}
-      onChoose={onChoose}
-      onContinue={onContinue}
-      onSkip={onSkip}
-    />,
+    <TransitionHarness />,
     { width: 100, height: 30 },
   )
   try {
@@ -258,6 +284,19 @@ test("arrow navigation crosses sections and Enter selects the highlighted downlo
       _tag: "CatalogCandidate",
       candidateId: CatalogCandidateIdSchema.make("candidate_remote"),
     })
+    await act(view.renderOnce)
+    const startingFrame = view.captureCharFrame()
+    expect(startingFrame).toContain("Downloading Remote Model")
+    expect(startingFrame).toContain("Starting download…")
+    expect(startingFrame).toContain("0 MB / 17.2 GB")
+    expect(startingFrame).not.toContain("Balanced local inference")
+
+    await act(async () => publishAuthoritativeDownload())
+    await act(view.renderOnce)
+    const downloadingFrame = view.captureCharFrame()
+    expect(downloadingFrame).toContain("50%")
+    expect(downloadingFrame).toContain("8.59 GB / 17.2 GB")
+    expect(downloadingFrame).not.toContain("Balanced local inference")
   } finally {
     await act(async () => view.renderer.destroy())
   }

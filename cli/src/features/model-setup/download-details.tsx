@@ -27,36 +27,43 @@ const progressBar = (fraction: number, width: number): string => {
 
 type ConfirmationChoice = "yes" | "no"
 
+type DownloadDetailsOperation =
+  | { readonly _tag: "Starting" }
+  | {
+      readonly _tag: "Active"
+      readonly cancelling: boolean
+      readonly cancelError: string | null
+      readonly onCancel: () => void
+      readonly onRetry: () => void
+    }
+
 export function OnboardingModelDownloadDetails({
   candidate,
   width,
   height,
-  cancelling,
-  cancelError,
-  onCancel,
-  onRetry,
+  operation,
 }: {
   readonly candidate: LocalModelCatalogCandidate
   readonly width: number
   readonly height: number
-  readonly cancelling: boolean
-  readonly cancelError: string | null
-  readonly onCancel: () => void
-  readonly onRetry: () => void
+  readonly operation: DownloadDetailsOperation
 }): ReactNode {
   const theme = useTheme()
   const [confirming, setConfirming] = useState(false)
   const [choice, setChoice] = useState<ConfirmationChoice>("yes")
   const [hovered, setHovered] = useState<string | null>(null)
+  const active = operation._tag === "Active" ? operation : null
+  const starting = operation._tag === "Starting"
+  const cancelling = active?.cancelling ?? false
   const contentWidth = Math.max(1, width)
   const download = candidate.download
   const downloading = download._tag === "Downloading"
   const failed = download._tag === "Failed"
   const preparing = download._tag === "Downloaded" && candidate.preparation._tag === "Calibrating"
-  const cancelable = downloading || preparing
+  const cancelable = !starting && (downloading || preparing)
   const fraction = downloading || failed
     ? download.completedBytes / Math.max(1, download.totalBytes)
-    : 1
+    : preparing ? 1 : 0
   const percentage = Math.round(Math.max(0, Math.min(1, fraction)) * 100)
   const percentageLabel = `${percentage}%`
   const barWidth = Math.max(8, contentWidth - percentageLabel.length - 2)
@@ -67,7 +74,7 @@ export function OnboardingModelDownloadDetails({
   const detail = useMemo(() => {
     if (preparing) return "Preparing this model for your machine…"
     if (failed) return download.failure.message
-    if (!downloading) return "Preparing download…"
+    if (!downloading) return "Starting download…"
     if (download.stage === "verifying" || download.stage === "publishing") {
       return "Verifying download…"
     }
@@ -81,9 +88,9 @@ export function OnboardingModelDownloadDetails({
   }, [])
 
   const confirmCancellation = useCallback(() => {
-    if (cancelling) return
-    onCancel()
-  }, [cancelling, onCancel])
+    if (cancelling || active === null) return
+    active.onCancel()
+  }, [active, cancelling])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (cancelling) {
@@ -154,7 +161,7 @@ export function OnboardingModelDownloadDetails({
           <span style={{ fg: theme.muted }}>{`  ${percentageLabel}`}</span>
         </text>
         <box style={{ height: 1 }} />
-        {(downloading || failed) && (
+        {(download._tag === "NotDownloaded" || downloading || failed) && (
           <text style={{ fg: theme.muted }}>
             {formatDownloadBytes(download.completedBytes)} / {formatDownloadBytes(download.totalBytes)}
           </text>
@@ -164,17 +171,17 @@ export function OnboardingModelDownloadDetails({
         <box style={{ height: 2, flexDirection: "column" }}>
           {cancelling ? (
             <text style={{ fg: theme.muted }}>Cancelling download…</text>
-          ) : failed ? (
+          ) : failed && active !== null ? (
             <box style={{ flexDirection: "row", gap: 2 }}>
               <Button
-                onClick={onRetry}
+                onClick={active.onRetry}
                 onMouseOver={() => setHovered("retry")}
                 onMouseOut={() => setHovered((current) => current === "retry" ? null : current)}
               >
                 <text style={{ fg: hovered === "retry" ? theme.primary : theme.foreground }}>Retry</text>
               </Button>
               <Button
-                onClick={onCancel}
+                onClick={active.onCancel}
                 onMouseOver={() => setHovered("choose")}
                 onMouseOut={() => setHovered((current) => current === "choose" ? null : current)}
               >
@@ -198,7 +205,7 @@ export function OnboardingModelDownloadDetails({
               <text style={{ fg: hovered === "cancel" ? theme.error : theme.muted }}>Cancel (Esc)</text>
             </Button>
           ) : null}
-          {cancelError && <text style={{ fg: theme.error }}>{cancelError}</text>}
+          {active?.cancelError && <text style={{ fg: theme.error }}>{active.cancelError}</text>}
         </box>
     </box>
   )
