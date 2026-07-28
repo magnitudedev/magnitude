@@ -833,11 +833,11 @@
         },
         "responses": {
           "200": {
-            "description": "Allocation ICN would select from current admission evidence",
+            "description": "Plan ICN would select from current admission evidence",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ModelLoadAllocation"
+                  "$ref": "#/components/schemas/ModelLoadPlan"
                 }
               }
             }
@@ -3430,7 +3430,7 @@
                 "format": "float"
               },
               "plannedAllocation": {
-                "$ref": "#/components/schemas/ModelLoadAllocation"
+                "$ref": "#/components/schemas/ModelLoadPlan"
               },
               "_tag": {
                 "type": "string",
@@ -3589,38 +3589,6 @@
         },
         "additionalProperties": false
       },
-      "ModelLoadAllocation": {
-        "type": "object",
-        "required": [
-          "contextWindowTokens",
-          "parallelSequences",
-          "physicalContextTokens",
-          "requiredSystemMemoryBytes"
-        ],
-        "properties": {
-          "contextWindowTokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "parallelSequences": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "physicalContextTokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "requiredSystemMemoryBytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
-      },
       "ModelLoadEvent": {
         "oneOf": [
           {
@@ -3640,13 +3608,13 @@
                 ],
                 "format": "float"
               },
-              "allocation": {
+              "plan": {
                 "oneOf": [
                   {
                     "type": "null"
                   },
                   {
-                    "$ref": "#/components/schemas/ModelLoadAllocation"
+                    "$ref": "#/components/schemas/ModelLoadPlan"
                   }
                 ]
               },
@@ -3713,6 +3681,38 @@
             }
           }
         ]
+      },
+      "ModelLoadPlan": {
+        "type": "object",
+        "required": [
+          "contextWindowTokens",
+          "parallelSequences",
+          "physicalContextTokens",
+          "requiredSystemMemoryBytes"
+        ],
+        "properties": {
+          "contextWindowTokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "parallelSequences": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "physicalContextTokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "requiredSystemMemoryBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "ModelLoadStage": {
         "type": "string",
@@ -4063,7 +4063,7 @@
             ],
             "properties": {
               "allocation": {
-                "$ref": "#/components/schemas/ModelLoadAllocation"
+                "$ref": "#/components/schemas/ModelLoadPlan"
               },
               "_tag": {
                 "type": "string",

@@ -65,7 +65,7 @@ pub enum ModelStoppingAllocation {
     Planned {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        allocation: Option<ModelLoadAllocation>,
+        allocation: Option<ModelLoadPlan>,
     },
     Resident {
         allocation: ModelInstanceAllocation,
@@ -84,7 +84,7 @@ pub enum ModelInstanceLifecycle {
         progress: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        planned_allocation: Option<ModelLoadAllocation>,
+        planned_allocation: Option<ModelLoadPlan>,
     },
     Ready {
         allocation: ModelInstanceAllocation,
@@ -657,7 +657,7 @@ pub struct PreviewModelLoadRequest {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelLoadAllocation {
+pub struct ModelLoadPlan {
     pub context_window_tokens: u32,
     pub parallel_sequences: u32,
     pub physical_context_tokens: u32,
@@ -694,7 +694,7 @@ pub enum ModelLoadEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         fraction: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        allocation: Option<ModelLoadAllocation>,
+        plan: Option<ModelLoadPlan>,
     },
     Ready {
         ready: LoadModelReady,

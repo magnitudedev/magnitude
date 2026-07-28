@@ -1093,7 +1093,7 @@ export const ModelInstanceLifecycle = S.Union(
   S.extend(
     S.TaggedStruct("Loading", {
       plannedAllocation: S.optionalWith(
-        S.suspend((): S.Schema<ModelLoadAllocation, ModelLoadAllocationEncoded> => ModelLoadAllocation),
+        S.suspend((): S.Schema<ModelLoadPlan, ModelLoadPlanEncoded> => ModelLoadPlan),
         { exact: true, as: "Option" },
       ),
       progress: S.optionalWith(S.Number, { exact: true, as: "Option" }),
@@ -1157,26 +1157,17 @@ export const ModelInstancesSnapshot = S.Struct({
 export type ModelInstancesSnapshot = S.Schema.Type<typeof ModelInstancesSnapshot>
 export type ModelInstancesSnapshotEncoded = S.Schema.Encoded<typeof ModelInstancesSnapshot>
 
-export const ModelLoadAllocation = S.Struct({
-  contextWindowTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  requiredSystemMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type ModelLoadAllocation = S.Schema.Type<typeof ModelLoadAllocation>
-export type ModelLoadAllocationEncoded = S.Schema.Encoded<typeof ModelLoadAllocation>
-
 export const ModelLoadEvent = S.Union(
   S.extend(
     S.TaggedStruct("Progress", {
-      allocation: S.optionalWith(
+      fraction: S.optionalWith(S.Union(S.Number, S.Null), { exact: true, as: "Option" }),
+      plan: S.optionalWith(
         S.Union(
           S.Null,
-          S.suspend((): S.Schema<ModelLoadAllocation, ModelLoadAllocationEncoded> => ModelLoadAllocation),
+          S.suspend((): S.Schema<ModelLoadPlan, ModelLoadPlanEncoded> => ModelLoadPlan),
         ),
         { exact: true, as: "Option" },
       ),
-      fraction: S.optionalWith(S.Union(S.Number, S.Null), { exact: true, as: "Option" }),
       stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1202,6 +1193,15 @@ export const ModelLoadEvent = S.Union(
 )
 export type ModelLoadEvent = S.Schema.Type<typeof ModelLoadEvent>
 export type ModelLoadEventEncoded = S.Schema.Encoded<typeof ModelLoadEvent>
+
+export const ModelLoadPlan = S.Struct({
+  contextWindowTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  requiredSystemMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelLoadPlan = S.Schema.Type<typeof ModelLoadPlan>
+export type ModelLoadPlanEncoded = S.Schema.Encoded<typeof ModelLoadPlan>
 
 export const ModelLoadStage = S.Union(
   S.Literal("queued"),
@@ -1357,7 +1357,7 @@ export const ModelStoppingAllocation = S.Union(
   S.extend(
     S.TaggedStruct("Planned", {
       allocation: S.optionalWith(
-        S.suspend((): S.Schema<ModelLoadAllocation, ModelLoadAllocationEncoded> => ModelLoadAllocation),
+        S.suspend((): S.Schema<ModelLoadPlan, ModelLoadPlanEncoded> => ModelLoadPlan),
         { exact: true, as: "Option" },
       ),
     }),

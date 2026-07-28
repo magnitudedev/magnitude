@@ -4,6 +4,7 @@ import type {
   ModelOfferingTarget,
   ModelPackage,
   ModelPackageInspection,
+  ModelServingConfiguration,
   RecommendableModel,
   ServingProfile,
 } from "@magnitudedev/protocol"
@@ -21,6 +22,7 @@ import type {
   ModelPackageInspection as NativeModelPackageInspection,
   ModelPackage as NativeModelPackage,
   ModelPackageOperand,
+  ModelServingConfiguration as NativeModelServingConfiguration,
   ModelTargetInput,
   RecommendableModel as NativeRecommendableModel,
   ServingProfile as NativeServingProfile,
@@ -64,6 +66,17 @@ export const offeringTargetToIcn = (
   target: ModelOfferingTarget,
 ): Effect.Effect<NativeModelOfferingTarget, ParseResult.ParseError> =>
   Schema.validate(NativeModelOfferingTargetSchema)(target)
+
+export const modelServingConfigurationToIcn = (
+  configuration: ModelServingConfiguration,
+): Effect.Effect<NativeModelServingConfiguration, ParseResult.ParseError> =>
+  offeringTargetToIcn(configuration.target).pipe(
+    Effect.map((target) => ({
+      id: configuration.id,
+      target,
+      profile: servingProfileToIcn(configuration.profile),
+    })),
+  )
 
 export const recommendableModelFromIcn = (
   model: NativeRecommendableModel,

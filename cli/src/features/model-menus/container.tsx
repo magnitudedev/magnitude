@@ -23,6 +23,7 @@ import {
   usePlatform,
   useLocalInferenceHardware,
   useLocalInferenceState,
+  usePreviewModelLoad,
   useModelConfig,
   useSettingsState,
 } from "@magnitudedev/client-common"
@@ -1131,30 +1132,11 @@ const HardwareMenu = memo(function HardwareMenu({
           {currentModel._tag === "NoSelection"
             ? <text style={{ fg: theme.muted }}>No local model selected</text>
             : (() => {
-              const actualAllocation =
-                currentModel._tag === "Running"
-                  ? Option.some(currentModel.allocation)
-                  : currentModel._tag === "Loading"
-                  || currentModel._tag === "Stopping"
+              const actualAllocation = currentModel._tag === "Running"
+                ? Option.some(currentModel.allocation)
+                : currentModel._tag === "Loading" || currentModel._tag === "Stopping"
                   ? currentModel.allocation
-                  : Option.flatMap(currentModel.preview, (currentPreview) =>
-                    currentPreview._tag === "Available"
-                      ? Option.some(currentPreview.allocation)
-                      : Option.none())
-              const parallelismLabel = Option.match(actualAllocation, {
-                onNone: () =>
-                  (currentModel._tag === "NotLoaded" || currentModel._tag === "Failed")
-                    && Option.exists(
-                      currentModel.preview,
-                      (currentPreview) => currentPreview._tag === "Unavailable",
-                    )
-                    ? "Unable to load now"
-                    : "—",
-                onSome: (allocation) =>
-                  currentModel._tag === "NotLoaded" || currentModel._tag === "Failed"
-                    ? `${allocation.parallelSequences} if loaded now`
-                    : String(allocation.parallelSequences),
-              })
+                  : Option.none()
               const status = currentModel._tag === "NotLoaded"
                 ? "NOT LOADED"
                 : currentModel._tag === "Loading"
@@ -1170,19 +1152,26 @@ const HardwareMenu = memo(function HardwareMenu({
                     <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD}>{currentModel.displayName}</text>
                     <text style={{ fg: currentModel._tag === "Running" ? theme.primary : theme.muted }}>{status}</text>
                   </box>
-                  <box style={{ flexDirection: "row" }}>
-                    <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
-                    <text style={{ fg: theme.foreground, width: 16 }}>
-                      {Option.match(currentModel.contextWindow, {
-                        onNone: () => "—",
-                        onSome: (tokens) => `${formatContextWindow(tokens)} tokens`,
-                      })}
-                    </text>
-                    <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
-                    <text style={{ fg: theme.foreground }}>
-                      {parallelismLabel}
-                    </text>
-                  </box>
+                  {currentModel._tag === "NotLoaded" || currentModel._tag === "Failed"
+                    ? <ModelLoadPlanDetails />
+                    : (
+                        <box style={{ flexDirection: "row" }}>
+                          <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
+                          <text style={{ fg: theme.foreground, width: 16 }}>
+                            {Option.match(currentModel.contextWindow, {
+                              onNone: () => "—",
+                              onSome: (tokens) => `${formatContextWindow(tokens)} tokens`,
+                            })}
+                          </text>
+                          <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
+                          <text style={{ fg: theme.foreground }}>
+                            {Option.match(actualAllocation, {
+                              onNone: () => "—",
+                              onSome: (allocation) => String(allocation.parallelSequences),
+                            })}
+                          </text>
+                        </box>
+                      )}
                 </>
               )
             })()}
@@ -1204,8 +1193,8 @@ const HardwareMenu = memo(function HardwareMenu({
                 Option.exists(currentSlot.value.instance, (instance) =>
                   instance.lifecycle._tag === "Stopping")
                   ? <text style={{ fg: theme.muted }}>Stopping model…</text>
-                  : currentSlot.value.readiness._tag === "Unavailable"
-                    ? <text style={{ fg: theme.muted }}>Unable to load model with current resources</text>
+                  : currentSlot.value.availability._tag === "Unavailable"
+                    ? <text style={{ fg: theme.muted }}>Unable to load model</text>
                     : <text style={{ fg: theme.muted }}>{"  "}Load model</text>,
               onSome: (currentAction) => (
                 <MenuAction
@@ -1221,6 +1210,31 @@ const HardwareMenu = memo(function HardwareMenu({
         )}
       </scrollbox>
     </>
+  )
+})
+
+const ModelLoadPlanDetails = memo(function ModelLoadPlanDetails() {
+  const theme = useTheme()
+  const preview = usePreviewModelLoad(PRIMARY_SLOT_ID)
+  const plan = Result.value(preview)
+  return (
+    <box style={{ flexDirection: "row" }}>
+      <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
+      <text style={{ fg: theme.foreground, width: 16 }}>
+        {Option.match(plan, {
+          onNone: () => "—",
+          onSome: ({ contextWindowTokens }) =>
+            `${formatContextWindow(contextWindowTokens)} tokens`,
+        })}
+      </text>
+      <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
+      <text style={{ fg: theme.foreground }}>
+        {Option.match(plan, {
+          onNone: () => Result.isFailure(preview) ? "Unable to load now" : "—",
+          onSome: ({ parallelSequences }) => `${parallelSequences} if loaded now`,
+        })}
+      </text>
+    </box>
   )
 })
 

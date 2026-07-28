@@ -193,8 +193,8 @@ local-model mirrors. The initiating Enter or click event may bridge server ackno
 presentation-only starting state for that exact selection; it reports no inferred progress and
 cannot regress to the informational chooser before authoritative download or loading state arrives.
 The presentation says Loading only while the selected slot projects an exact ICN instance in its
-Loading lifecycle; assignment, package preparation, or readiness assessment alone never implies
-loading. Detailed residency progress remains in the activity rail. The explicit selection action
+Loading lifecycle; assignment or package preparation alone never implies loading. Detailed
+residency progress remains in the activity rail. The explicit selection action
 composes the ordinary target download, primary-slot assignment, and slot load commands; the client
 marks onboarding complete only after the exact selected instance is Ready. Cancel uses the ordinary
 download-cancel or slot-clear command. ACN has no onboarding-specific model operation and startup
@@ -237,8 +237,8 @@ There is no separate local-inference badge or client-owned transition state.
 
 While the root slot is loading, the rail may present its authoritative percentage as well as
 persistent model chrome. Both presentations derive from the one mirrored slot lifecycle state;
-readiness hands the rail from model loading to request prefill without a client-owned loading state
-or timer. A typed low-memory load failure or residency loss uses that same slot state to
+the Ready lifecycle hands the rail from model loading to request prefill without a client-owned
+loading state or timer. A typed low-memory load failure or residency loss uses that same slot state to
 replace progress with the durable low-memory stopped message until the user retries or changes the
 selection.
 

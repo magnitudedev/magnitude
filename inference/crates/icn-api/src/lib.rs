@@ -19,7 +19,7 @@ use icn_contracts::models::{
     FitModelsRequest, FitModelsResponse, InstalledModelPackages, InstalledModelPackagesResponse,
     LoadModelRequest, ModelDownloads, ModelDownloadsResponse, ModelEvaluator, ModelInstance,
     ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadAllocation, ModelLoadEvent, ModelPackageId,
+    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelPackageId,
     ModelServingConfigurationId, PreviewModelLoadRequest, RecommendableModelCatalog,
     RecommendableModelCatalogProvider, RemoveInstalledModelPackageResponse,
     StartModelDownloadRequest, StartModelDownloadResponse,
@@ -340,7 +340,7 @@ pub trait ModelInstanceController: Send + Sync + 'static {
     fn preview_load(
         &self,
         request: PreviewModelLoadRequest,
-    ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>>;
+    ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>>;
     fn load_instance(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent>;
     fn stop_instance(
         &self,
@@ -384,7 +384,7 @@ impl ModelInstanceController for StaticModelInstanceController {
     fn preview_load(
         &self,
         _request: PreviewModelLoadRequest,
-    ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>> {
+    ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>> {
         Box::pin(async {
             Err(InventoryError::Unsupported(
                 "static test model cannot preview loading".to_owned(),
@@ -1218,7 +1218,7 @@ async fn load_model_instance(
 #[utoipa::path(post, path = "/v1/models/load/preview", operation_id = "previewModelLoad", tag = "models",
     request_body(content = PreviewModelLoadRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Allocation ICN would select from current admission evidence", body = ModelLoadAllocation),
+        (status = 200, description = "Plan ICN would select from current admission evidence", body = ModelLoadPlan),
         (status = 400, description = "Configuration cannot be resolved", body = ErrorResponse),
         (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
         (status = 500, description = "Load preview failed", body = ErrorResponse)
@@ -1228,7 +1228,7 @@ async fn load_model_instance(
 async fn preview_model_load(
     State(state): State<AppState>,
     Json(request): Json<PreviewModelLoadRequest>,
-) -> Result<Json<ModelLoadAllocation>, ApiError> {
+) -> Result<Json<ModelLoadPlan>, ApiError> {
     let controller = state
         .model_controller
         .as_ref()
@@ -2730,7 +2730,7 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         DownloadAttempt,
         LoadModelRequest,
         PreviewModelLoadRequest,
-        ModelLoadAllocation,
+        ModelLoadPlan,
         ModelLoadEvent,
         ModelInstancesSnapshot,
         ModelInstancesInvalidation,
@@ -3390,7 +3390,7 @@ mod tests {
         fn preview_load(
             &self,
             _request: PreviewModelLoadRequest,
-        ) -> BoxFuture<'_, Result<ModelLoadAllocation, InventoryError>> {
+        ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>> {
             Box::pin(async {
                 Err(InventoryError::Unsupported(
                     "model load preview is unavailable in the stub model controller".to_owned(),

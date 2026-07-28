@@ -57,7 +57,7 @@ export {
   SlotSelectionSchema,
   ModelSlotDescriptorSchema,
   ModelSlotAvailabilitySchema,
-  ModelLoadReadinessSchema,
+  ModelLoadPlanSchema,
   ModelSlotInstanceLifecycleSchema,
   ModelSlotInstanceSchema,
   ModelSlotActionSchema,

@@ -49,7 +49,6 @@ const configured = (lifecycle: {
   selection,
   descriptor,
   availability: { _tag: "Available" },
-  readiness: { _tag: "Assessing" },
   instance: Option.some({ id: instanceId, configurationId, lifecycle }),
   actions: lifecycle._tag === "Ready" || lifecycle._tag === "Loading" ? ["Stop"] : [],
 })

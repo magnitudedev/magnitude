@@ -92,12 +92,13 @@ becomes Stopped. Ready closes exact lease admission, drains accepted leases, rea
 becomes Stopped.
 
 Slot reconciliation cannot author physical lifecycle. It retains durable selection and directly
-projects the exact bound native instance. Catalog and provider changes affect availability;
-readiness affects new-load actions; neither can overwrite instance lifecycle.
+projects the exact bound native instance. Catalog and provider changes affect availability; they
+cannot overwrite instance lifecycle.
 
-Local slot assignment preflights the exact installed serving configuration and commits only after
-it is load-admissible. Success establishes the postcondition required by an immediate slot-load
-command. Slot actions remain presentation and are never used as command authorization.
+Local slot assignment validates the exact installed serving configuration and commits that durable
+selection. Slot actions remain presentation and are never used as command authorization.
+Assignment and load never invoke the preview operation; ICN load admission is the only
+authoritative load-time hardware decision.
 
 Provider catalog refresh is a catalog-owned single flight. Equivalent callers join it, conflicting
 targeted refreshes serialize, and every exit publishes a terminal catalog state.

@@ -168,9 +168,7 @@ export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/v1/mo
     ),
   )
   .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.ModelLoadAllocation, Schemas.ModelLoadAllocationEncoded> => Schemas.ModelLoadAllocation,
-    ),
+    S.suspend((): S.Schema<Schemas.ModelLoadPlan, Schemas.ModelLoadPlanEncoded> => Schemas.ModelLoadPlan),
     { status: 200 },
   )
   .addError(

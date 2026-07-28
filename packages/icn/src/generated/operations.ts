@@ -387,9 +387,7 @@ export const previewModelLoadOperation = {
   successes: [
     {
       status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.ModelLoadAllocation, Schemas.ModelLoadAllocationEncoded> => Schemas.ModelLoadAllocation,
-      ),
+      schema: S.suspend((): S.Schema<Schemas.ModelLoadPlan, Schemas.ModelLoadPlanEncoded> => Schemas.ModelLoadPlan),
       mediaType: "application/json",
     },
   ],

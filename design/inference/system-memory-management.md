@@ -156,8 +156,10 @@ load retains the tagged planned-allocation form. The hardware mirror supplies on
 topology, capacity, and live availability. While unloaded, an authoritative ICN preview runs the
 same exact configuration planner,
 one-through-four candidate assessment, and fresh admission policy as a real load, and displays the
-parallelism it would select now. Clients never estimate this value. Load remains unavailable while
-preview evidence is pending or failed.
+parallelism it would select now. Clients never estimate this value. Preview evidence is advisory
+and never gates assignment or load; ICN repeats authoritative admission when the actual load is
+submitted. The mounted Hardware view requests this plan through one observational ACN query.
+Neither ACN nor the client stores it in canonical model state or evaluates it in the background.
 
 Frozen-topology candidate assessments are cached as disposable derived evidence and shared by
 preview and load. Live hardware polling therefore reruns only the fresh admission selection when

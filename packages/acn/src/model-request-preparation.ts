@@ -8,14 +8,10 @@ import type { ModelSlotControllerApi } from "./model-slot-controller"
 
 export const makeModelRequestPreparation = (
   modelSlots: Pick<ModelSlotControllerApi, "acquireLocalModel">,
-): PrepareModelRequest => ({ slotId, providerId, providerModelId, reportProgress }) => {
+): PrepareModelRequest => ({ slotId, providerId, providerModelId }) => {
   if (providerId !== LOCAL_PROVIDER_ID) return Effect.void
 
-  return reportProgress({
-    phase: "preparing",
-    requestId: null,
-  }).pipe(
-    Effect.zipRight(modelSlots.acquireLocalModel(slotId, providerModelId)),
+  return modelSlots.acquireLocalModel(slotId, providerModelId).pipe(
     Effect.mapError((cause) => new ModelRequestPreparationFailed({
       code: "code" in cause ? cause.code : cause._tag,
       message: cause.message,

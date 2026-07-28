@@ -192,15 +192,6 @@ export const makeView = (options: {
                 displayName: "Qwen Test",
               },
               availability: { _tag: "Available" },
-              readiness: {
-                _tag: "Loadable",
-                allocation: {
-                  contextWindowTokens: 32_768,
-                  parallelSequences: 1,
-                  physicalContextTokens: 32_768,
-                  requiredSystemMemoryBytes: 0,
-                },
-              },
               instance: Option.some({
                 id: ModelInstanceIdSchema.make("test-instance"),
                 configurationId: TEST_CONFIGURATION_ID,
