@@ -137,6 +137,12 @@ jobs:
           if (-not $sdk) { throw "Vulkan SDK installation did not publish VULKAN_SDK" }
           "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
           "$sdk\Bin" >> $env:GITHUB_PATH
+      - name: Use Ninja for Windows backend build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ninja --version
+          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
       - name: Install Linux CUDA toolkit
         if: runner.os == 'Linux' && matrix.backend == 'cuda'
         shell: bash
