@@ -34,3 +34,5 @@ desktop/out
 desktop/node_modules
 
 packages/cli/lib/release-runtime.cjs
+
+.humanlayer/tasks/

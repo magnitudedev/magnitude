@@ -3,7 +3,7 @@ applies_to:
   - .github/workflows/changesets.yml
   - .github/workflows/release.yml
   - .github/workflows/release-checks.yml
-  - .github/workflows/direct-publish-npm.yml
+  - .github/workflows/publish-npm.yml
   - packages/release/**
   - packages/cli/bin/magnitude.js
   - packages/cli/lib/**
@@ -16,12 +16,14 @@ applies_to:
 # Release distribution
 
 Changesets is the sole authority for the CLI version, npm publication, and npm dist-tag. It
-maintains one version PR. Merging that PR automatically releases its exact merge commit. Ordinary
-pushes and manual dispatch do not start a normal release.
+maintains one version PR. Merging that PR automatically releases its exact versioned source commit.
+Ordinary pushes do not start a normal release. A parameterless manual dispatch resolves the latest
+merged Changesets PR for the current version and reconciles that same release without accepting a
+version or commit from the operator.
 
-The separate direct-npm workflow exists only to complete a release whose GitHub assets are already
-public while npm is absent. It checks out the exact release tag and invokes the same Changesets
-publisher. It never rebuilds or replaces native assets.
+The separate npm workflow completes a release whose GitHub assets are already public while npm is
+absent. It checks out the exact release tag and invokes the same Changesets publisher. It never
+rebuilds or replaces native assets.
 
 ## Artifacts
 
@@ -89,8 +91,9 @@ treated as success only when the registry exposes that exact integrity.
 
 An interrupted private draft is discovered through authenticated release listing and can be
 retried. Public assets are immutable. The only supported public partial state is
-GitHub-public/npm-absent, handled by direct npm publication from the exact tag after the same
-public CLI acquisition check.
+GitHub-public/npm-absent, handled by the npm-only path from the exact tag after the same public CLI
+acquisition check. Release reconciliation selects that path automatically, and an exact GitHub/npm
+publication is a successful no-op.
 
 ## Required guarantees
 

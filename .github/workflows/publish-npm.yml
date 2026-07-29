@@ -1,6 +1,14 @@
-name: Direct publish npm
+name: Publish npm
 
 on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      within_release:
+        required: true
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -9,7 +17,10 @@ on:
         type: string
 
 concurrency:
-  group: magnitude-production-release
+  group: >-
+    ${{ inputs.within_release
+      && format('magnitude-npm-completion-{0}', github.run_id)
+      || 'magnitude-production-release' }}
   cancel-in-progress: false
 
 permissions:
