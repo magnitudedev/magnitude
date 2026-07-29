@@ -19,8 +19,10 @@ applies_to:
 Changesets is the sole authority for the CLI version, npm publication, and npm dist-tag. It
 maintains one version PR. Merging that PR automatically releases its exact versioned source commit.
 Ordinary pushes do not start a normal release. A parameterless manual dispatch resolves the latest
-merged Changesets PR for the current version and reconciles that same release without accepting a
-version or commit from the operator.
+merged Changesets PR for the current version and reconciles that same release. Before publication,
+an operator may explicitly pin a later commit on `main` to recover that still-unpublished version.
+The recovery commit must descend from the Changesets merge and retain its exact version; it becomes
+the source identity for every build, package, manifest, and publication step.
 
 The separate npm workflow completes a release whose GitHub assets are already public while npm is
 absent. It checks out the exact release tag and invokes the same Changesets publisher. It never
@@ -107,7 +109,8 @@ publication is a successful no-op.
 
 ## Required guarantees
 
-- Unrelated commits cannot publish.
+- Ordinary unrelated pushes cannot start publication, and every published source commit is pinned
+  before builds begin.
 - Changesets alone controls npm version and dist-tag behavior.
 - Every acquired native artifact matches the size and SHA-256 in its release manifest.
 - Final host archives execute before publication.

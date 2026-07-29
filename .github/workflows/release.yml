@@ -5,6 +5,11 @@ on:
     branches: [main]
     types: [closed]
   workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact main commit to release when retrying the current unpublished version
+        required: false
+        type: string
 
 concurrency:
   group: magnitude-production-release
@@ -33,6 +38,7 @@ jobs:
       action: ${{ steps.preflight.outputs.action }}
       version: ${{ steps.preflight.outputs.version }}
       source_commit: ${{ steps.source.outputs.commit }}
+      release_commit: ${{ steps.source.outputs.release_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,12 +50,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_COMMIT: ${{ github.event_name == 'pull_request' && github.sha || '' }}
+          SOURCE_COMMIT_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.source_commit || '' }}
         run: |
-          commit="$EVENT_COMMIT"
-          if [ -z "$commit" ]; then
+          release_commit="$EVENT_COMMIT"
+          if [ -z "$release_commit" ]; then
             test "$GITHUB_REF" = "refs/heads/main"
             owner="${GITHUB_REPOSITORY%%/*}"
-            commit="$(
+            release_commit="$(
               gh pr list \
                 --repo "$GITHUB_REPOSITORY" \
                 --state merged \
@@ -62,18 +69,31 @@ jobs:
                   'map(select(.headRepositoryOwner.login == $owner)) |
                     sort_by(.mergedAt) | last | .mergeCommit.oid // empty'
             )"
-            test -n "$commit"
+            test -n "$release_commit"
             current_version="$(jq -r '.version // empty' packages/cli/package.json)"
             release_version="$(
-              git show "${commit}:packages/cli/package.json" |
+              git show "${release_commit}:packages/cli/package.json" |
                 jq -r '.version // empty'
             )"
             test -n "$current_version"
             test "$release_version" = "$current_version"
           fi
+          commit="${SOURCE_COMMIT_OVERRIDE:-$release_commit}"
+          [[ "$release_commit" =~ ^[a-f0-9]{40}$ ]]
           [[ "$commit" =~ ^[a-f0-9]{40}$ ]]
+          git merge-base --is-ancestor "$release_commit" "$commit"
           git merge-base --is-ancestor "$commit" origin/main
+          source_version="$(
+            git show "${commit}:packages/cli/package.json" |
+              jq -r '.version // empty'
+          )"
+          test -n "$source_version"
+          test "$source_version" = "$(
+            git show "${release_commit}:packages/cli/package.json" |
+              jq -r '.version // empty'
+          )"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
       - name: Validate the release commit
         shell: bash
         env:
@@ -95,6 +115,7 @@ jobs:
         run: bun run packages/release/scripts/preflight.ts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAGNITUDE_RELEASE_COMMIT: ${{ steps.source.outputs.release_commit }}
           MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Validate the preflight action
@@ -122,6 +143,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -150,6 +172,7 @@ jobs:
         run: bun run packages/release/scripts/preflight.ts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAGNITUDE_RELEASE_COMMIT: ${{ needs.preflight.outputs.release_commit }}
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           MAGNITUDE_REQUIRE_RELEASE: "true"
