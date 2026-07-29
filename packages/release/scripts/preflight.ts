@@ -58,8 +58,6 @@ const previousPackageJson = JSON.parse(await run([
 if (!previousPackageJson.version || previousPackageJson.version === version) {
   throw new Error("release commit did not change the Changesets-owned CLI version")
 }
-required("NODE_AUTH_TOKEN")
-await run(["npm", "whoami", "--registry", "https://registry.npmjs.org"])
 
 const repository = required("GITHUB_REPOSITORY")
 const tag = `@magnitudedev/cli@${version}`
@@ -73,27 +71,46 @@ const [tagRef, release, npmVersion] = await Promise.all([
   ),
   npm(version),
 ])
-if (npmVersion) throw new Error(`${version} already exists on npm`)
-if (release) {
-  if (
-    release.draft !== true ||
-    release.tag_name !== tag ||
-    release.target_commitish !== sourceCommit ||
-    tagRef
-  ) {
+const exactRelease = release?.tag_name === tag &&
+  release.target_commitish === sourceCommit
+let action: "release" | "publish-npm" | "complete"
+if (npmVersion) {
+  if (!exactRelease || release?.draft || !tagRef) {
+    throw new Error("npm version does not have the exact public GitHub release")
+  }
+  action = "complete"
+} else if (release?.draft) {
+  if (!exactRelease || tagRef) {
     throw new Error("existing GitHub release is not the exact resumable draft")
   }
+  action = "release"
+} else if (release) {
+  if (!exactRelease || !tagRef) {
+    throw new Error("existing public GitHub release is inconsistent")
+  }
+  action = "publish-npm"
 } else if (tagRef) {
   throw new Error("GitHub has an orphan release tag")
+} else {
+  action = "release"
+}
+
+if (process.env.MAGNITUDE_REQUIRE_RELEASE === "true" && action !== "release") {
+  throw new Error("release state changed before publication")
+}
+if (action !== "complete") {
+  required("NODE_AUTH_TOKEN")
+  await run(["npm", "whoami", "--registry", "https://registry.npmjs.org"])
 }
 
 const output = process.env.GITHUB_OUTPUT
 if (output) {
   await appendFile(output, [
+    `action=${action}`,
     `version=${version}`,
     `source_commit=${sourceCommit}`,
     "",
   ].join("\n"))
 } else {
-  console.log(JSON.stringify({ version, tag, sourceCommit }, null, 2))
+  console.log(JSON.stringify({ action, version, tag, sourceCommit }, null, 2))
 }
