@@ -151,6 +151,17 @@ Successful publication is atomic: incomplete staging is never reported as instal
 the complete package before publication. Interrupted attempts recover as terminal failures or are
 cleaned without leaving a false installed record.
 
+Source-integrity hashing is part of the download write path. A fresh managed transfer feeds each
+successfully written source chunk into its whole-file SHA-256 accumulator and never rereads the
+completed file merely to reconstruct the digest. The downloader durably checkpoints the serializable
+digest state and its exact byte offset alongside each partial component. Recovery restores that
+constant-size state, truncates any uncommitted tail, and resumes the range transfer without reading
+the downloaded prefix. Controlled interruption checkpoints the current offset; unclean interruption
+may redownload only the bounded interval after the latest periodic checkpoint. A completed blob has
+a content-bound final checkpoint, so reuse also requires no integrity reread. Missing or invalid
+checkpoint state is never repaired by hashing a large artifact; the untrusted artifact is discarded
+and downloaded again. Final verification compares the accumulated digest before atomic publication.
+
 `Completed` records that the attempt successfully published its exact package. Installed inventory,
 not attempt history, owns whether the package is currently present; a user may remove a package
 after a successful attempt. When ACN observes `Completed`, it refreshes its installed observer
@@ -229,6 +240,7 @@ intentionally outside this cache contract.
 - Installed listing performs no hardware assessment and isolates artifact inspection failures.
 - Draft and MTP execution companions are never listed as standalone installed models.
 - Download failure belongs to one attempt and can be retried with a new attempt.
+- Managed download integrity never rereads completed or resumable model content.
 - A completed attempt records successful historical publication; installed inventory owns current
   presence.
 - `Completed` with an absent package projects as `NotInstalled`, never active progress or a failed

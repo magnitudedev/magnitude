@@ -20,6 +20,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha2-state = { package = "sha2", version = "0.11.0" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
 tempfile = "3.24.0"
