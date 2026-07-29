@@ -196,10 +196,15 @@ declarations name the curated checkpoints, formats, profiles, and recommendation
 explicit developer generation command resolves those declarations through ICN's production
 Hugging Face resolver, GGUF parser, package builder, template assessor, and native planner. It pins
 immutable commits and exact files, synchronously revalidates mutable upstream refs, and writes a
-deterministic manifest containing the exact byte ranges and content digests of the GGUF metadata
-the planner needs. An explicit hydration command retrieves and verifies those ranges from the
-pinned immutable revisions and materializes the deterministic compressed bundle. Release builds
-package the lock file and bundle as ICN catalog sidecars, and local development constructs the same
+deterministic manifest containing exact source GGUF-header ranges and compact planner-stub
+identities. The compact form is standard GGUF: it preserves model metadata and tensor descriptors,
+omits lexical tokenizer payloads, and supplies a compressible placeholder vocabulary of the
+original cardinality so ordinary native vocabulary loading preserves graph-relevant state.
+Generation proves that source and compact sparse models produce identical native hardware
+assessments for every curated profile. Hydration
+retrieves and verifies the source ranges from pinned immutable revisions, reproduces and verifies
+the compact stubs, and materializes the deterministic compressed bundle. Release builds package
+the lock file and bundle as ICN catalog sidecars, and local development constructs the same
 installation layout. The bundle is not committed to source control.
 
 ICN validates the installed catalog sidecars' canonical source digest, template-assessor and native-planner

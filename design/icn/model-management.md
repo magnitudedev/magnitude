@@ -70,13 +70,21 @@ the target fits, is recommended, is installed, is offered, or is resident.
 
 Catalog publication is an explicit release-development operation. It resolves the human source
 catalog through production ICN code, pins immutable Hugging Face commits and exact files, and emits
-a deterministic manifest with the exact byte ranges and content digests of the GGUF metadata
-needed for native planning. Generation fails if any source entry produces a diagnostic.
-An explicit hydration command retrieves and verifies those ranges from the pinned immutable
-revisions and materializes the deterministic compressed bundle. Release builds package the lock
-file and bundle as ICN catalog sidecars; local development constructs the same installation
-layout. The bundle is not committed to source control, and release validation rejects a partial
-catalog.
+a deterministic manifest with both the exact source GGUF-header ranges and the identities of their
+compact planner stubs. A stub is standard GGUF: it retains all model metadata and tensor
+descriptors and supplies a compressible placeholder vocabulary of the original cardinality so
+retained graph metadata is loaded through llama.cpp's ordinary vocabulary path. Auxiliary split
+components receive no primary overrides. A stub contains no tensor payload and is not a runnable
+model. The transformation is generic across architectures and has no curated architecture-key
+table.
+
+Generation fails if any source entry produces a diagnostic or if the native planner gives a
+different hardware assessment for a source-header sparse model and its compact-stub sparse model
+at any curated serving profile. An explicit hydration command retrieves and verifies the source
+ranges from pinned immutable revisions, reruns the same deterministic compactor, verifies every
+stub identity, and materializes the compressed stub bundle. Release builds package the lock file
+and bundle as ICN catalog sidecars; local development constructs the same installation layout.
+The bundle is not committed to source control, and release validation rejects a partial catalog.
 Normal ICN startup validates the installed sidecars against the source declarations, native
 template and planner identities, bundle digest, and exact catalog coverage. It performs no remote
 catalog refresh.
@@ -264,5 +272,7 @@ intentionally outside this cache contract.
 - User setup never requires network access to reconstruct the curated release catalog.
 - A release catalog with unresolved entries or mismatched generation evidence fails release
   validation and ICN readiness.
+- Every generated compact planner stub is semantically identical to its source-header sparse model
+  for native hardware assessment at every curated serving profile.
 - Cache corruption cannot make a valid package permanently unloadable.
 - ICN stores no durable product serving configuration or slot selection.

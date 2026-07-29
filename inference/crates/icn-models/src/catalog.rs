@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -24,6 +25,7 @@ use crate::cache::ModelBlobKind;
 use crate::capabilities::model_capabilities;
 use crate::inventory::ModelManager;
 use crate::package_service::{offering_target_id, package_from_resolved};
+use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
 use crate::preview::ModelPreviewService;
 
 #[path = "../../../catalog/planner_bundle.rs"]
@@ -84,14 +86,17 @@ pub struct ReleasePlannerArtifact {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerComponent {
     component: ModelComponent,
-    header_digest: String,
-    header_size_bytes: u64,
+    source_header_digest: String,
+    source_header_size_bytes: u64,
+    planner_stub_digest: String,
+    planner_stub_size_bytes: u64,
 }
 
 pub struct GeneratedReleaseCatalog {
     pub catalog: RecommendableModelCatalog,
     planner_artifacts: Vec<ReleasePlannerArtifact>,
-    headers: BTreeMap<String, Vec<u8>>,
+    source_headers: BTreeMap<String, Vec<u8>>,
+    planner_stubs: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -145,22 +150,22 @@ pub fn catalog_source_digest() -> Result<String, InventoryError> {
 pub fn catalog_source_digest_from(bytes: &[u8]) -> Result<String, InventoryError> {
     let source: CatalogSource = serde_json::from_slice(bytes)
         .map_err(|error| InventoryError::Integrity(format!("invalid catalog source: {error}")))?;
-    let canonical = serde_json::to_vec(&source)
-        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+    let canonical =
+        serde_json::to_vec(&source).map_err(|error| InventoryError::Internal(error.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
 pub fn encode_release_planner_bundle(
-    headers: &BTreeMap<String, Vec<u8>>,
+    planner_stubs: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<u8>, InventoryError> {
-    encode_release_planner_bundle_with_progress(headers, |_, _| {})
+    encode_release_planner_bundle_with_progress(planner_stubs, |_, _| {})
 }
 
 pub fn encode_release_planner_bundle_with_progress(
-    headers: &BTreeMap<String, Vec<u8>>,
+    planner_stubs: &BTreeMap<String, Vec<u8>>,
     progress: impl FnMut(usize, usize),
 ) -> Result<Vec<u8>, InventoryError> {
-    planner_bundle::encode(headers, progress).map_err(InventoryError::Integrity)
+    planner_bundle::encode(planner_stubs, progress).map_err(InventoryError::Integrity)
 }
 
 pub fn release_catalog_manifest(
@@ -189,10 +194,8 @@ pub fn load_release_catalog(
     planner_identity: &str,
 ) -> Result<ReleaseCatalog, InventoryError> {
     let catalog_bytes = read_bounded_regular_file(catalog_path, MAX_RELEASE_CATALOG_BYTES)?;
-    let manifest: ReleaseCatalogManifest =
-        serde_json::from_slice(&catalog_bytes).map_err(|error| {
-            InventoryError::Integrity(format!("invalid release catalog: {error}"))
-        })?;
+    let manifest: ReleaseCatalogManifest = serde_json::from_slice(&catalog_bytes)
+        .map_err(|error| InventoryError::Integrity(format!("invalid release catalog: {error}")))?;
     if manifest.template_identity != template_identity {
         return Err(InventoryError::Integrity(
             "release catalog was generated with a different template assessor".to_owned(),
@@ -213,17 +216,16 @@ pub fn load_release_catalog(
     validate_runtime_catalog(&manifest.catalog)?;
     validate_planner_artifacts(&manifest.catalog, &manifest.planner_artifacts)?;
     // The catalog is loaded once for the process lifetime. Retaining its immutable bytes lets the
-    // indexed bundle lazily decompress individual headers without copying the complete bundle.
-    let planner_bundle_bytes: &'static [u8] =
-        Box::leak(planner_bundle_bytes.into_boxed_slice());
+    // indexed bundle lazily decompress individual inputs without copying the complete bundle.
+    let planner_bundle_bytes: &'static [u8] = Box::leak(planner_bundle_bytes.into_boxed_slice());
     let planner_bundle =
         PlannerBundle::parse(planner_bundle_bytes).map_err(InventoryError::Integrity)?;
     for artifact in &manifest.planner_artifacts {
         for component in &artifact.components {
-            if !planner_bundle.contains(&component.header_digest) {
+            if !planner_bundle.contains(&component.planner_stub_digest) {
                 return Err(InventoryError::Integrity(format!(
-                    "model planner input bundle is missing header {}",
-                    component.header_digest
+                    "model planner input bundle is missing stub {}",
+                    component.planner_stub_digest
                 )));
             }
         }
@@ -306,12 +308,12 @@ fn validate_planner_artifacts(
                 .iter()
                 .any(|component| component.component.path == artifact.primary_gguf)
             || artifact.components.iter().any(|component| {
-                component.header_digest.len() != 64
-                    || component.header_size_bytes == 0
-                    || !component
-                        .header_digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit())
+                component.source_header_digest.len() != 64
+                    || component.source_header_size_bytes == 0
+                    || component.planner_stub_digest.len() != 64
+                    || component.planner_stub_size_bytes == 0
+                    || !valid_hex_digest(&component.source_header_digest)
+                    || !valid_hex_digest(&component.planner_stub_digest)
             })
         {
             return Err(InventoryError::Integrity(format!(
@@ -323,9 +325,67 @@ fn validate_planner_artifacts(
     Ok(())
 }
 
+fn valid_hex_digest(value: &str) -> bool {
+    value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl GeneratedReleaseCatalog {
     pub fn encode_planner_bundle(&self) -> Result<Vec<u8>, InventoryError> {
-        encode_release_planner_bundle(&self.headers)
+        encode_release_planner_bundle(&self.planner_stubs)
+    }
+
+    pub fn resolve_source_planner_target(
+        &self,
+        target_id: &ModelOfferingTargetId,
+    ) -> Result<ResolvedModelTarget, InventoryError> {
+        self.resolve_generated_planner_target(target_id, false)
+    }
+
+    pub fn resolve_compact_planner_target(
+        &self,
+        target_id: &ModelOfferingTargetId,
+    ) -> Result<ResolvedModelTarget, InventoryError> {
+        self.resolve_generated_planner_target(target_id, true)
+    }
+
+    fn resolve_generated_planner_target(
+        &self,
+        target_id: &ModelOfferingTargetId,
+        compact: bool,
+    ) -> Result<ResolvedModelTarget, InventoryError> {
+        let (artifact, target) =
+            planner_artifact_and_target(&self.catalog, &self.planner_artifacts, target_id)?;
+        materialize_planner_target(
+            artifact,
+            target,
+            |component| {
+                let (digest, expected_size) = if compact {
+                    (
+                        &component.planner_stub_digest,
+                        component.planner_stub_size_bytes,
+                    )
+                } else {
+                    (
+                        &component.source_header_digest,
+                        component.source_header_size_bytes,
+                    )
+                };
+                let inputs = if compact {
+                    &self.planner_stubs
+                } else {
+                    &self.source_headers
+                };
+                let input = inputs.get(digest).ok_or_else(|| {
+                    InventoryError::Integrity(format!("missing planner input {digest}"))
+                })?;
+                Ok((Cow::Borrowed(input.as_slice()), expected_size))
+            },
+            if compact {
+                "generated_compact_planner_stub"
+            } else {
+                "generated_source_planner_header"
+            },
+        )
     }
 }
 
@@ -354,33 +414,96 @@ impl ReleaseCatalog {
                     target_id.0
                 ))
             })?;
-        let workspace =
-            tempfile::tempdir().map_err(|error| InventoryError::Io(error.to_string()))?;
-        for component in &artifact.components {
-            let header = self
-                .planner_bundle
-                .header(&component.header_digest)
-                .map_err(InventoryError::Integrity)?;
-            let path = workspace.path().join(&component.component.path);
-            let parent = path.parent().ok_or_else(|| {
-                InventoryError::Integrity("planner component has no parent".to_owned())
-            })?;
-            fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-                .map_err(|error| InventoryError::Io(error.to_string()))?;
-            file.write_all(&header)
-                .and_then(|()| file.set_len(component.component.size_bytes))
-                .map_err(|error| InventoryError::Io(error.to_string()))?;
+        Ok(Some(materialize_planner_target(
+            artifact,
+            target,
+            |component| {
+                let stub = self
+                    .planner_bundle
+                    .input(&component.planner_stub_digest)
+                    .map_err(InventoryError::Integrity)?;
+                Ok((Cow::Owned(stub), component.planner_stub_size_bytes))
+            },
+            "release_catalog_planner_stub_digest",
+        )?))
+    }
+}
+
+fn planner_artifact_and_target<'a>(
+    catalog: &'a RecommendableModelCatalog,
+    artifacts: &'a [ReleasePlannerArtifact],
+    target_id: &ModelOfferingTargetId,
+) -> Result<(&'a ReleasePlannerArtifact, ModelOfferingTarget), InventoryError> {
+    let artifact = artifacts
+        .iter()
+        .find(|artifact| &artifact.target_id == target_id)
+        .ok_or_else(|| {
+            InventoryError::Integrity(format!(
+                "catalog target {} has no planner artifact",
+                target_id.0
+            ))
+        })?;
+    let target = catalog
+        .models
+        .iter()
+        .find(|model| &model.target_id == target_id)
+        .map(|model| model.target.clone())
+        .ok_or_else(|| {
+            InventoryError::Integrity(format!(
+                "catalog target {} has no model declaration",
+                target_id.0
+            ))
+        })?;
+    Ok((artifact, target))
+}
+
+fn materialize_planner_target<'a>(
+    artifact: &ReleasePlannerArtifact,
+    target: ModelOfferingTarget,
+    mut input_for: impl FnMut(&ReleasePlannerComponent) -> Result<(Cow<'a, [u8]>, u64), InventoryError>,
+    integrity_method: &str,
+) -> Result<ResolvedModelTarget, InventoryError> {
+    let workspace = tempfile::tempdir().map_err(|error| InventoryError::Io(error.to_string()))?;
+    for component in &artifact.components {
+        let (input, expected_size) = input_for(component)?;
+        if input.len()
+            != usize::try_from(expected_size)
+                .map_err(|_| InventoryError::Integrity("planner input is too large".to_owned()))?
+        {
+            return Err(InventoryError::Integrity(format!(
+                "planner input for {} has the wrong length",
+                component.component.path.display()
+            )));
         }
-        let components = artifact
-            .components
-            .iter()
-            .map(|component| component.component.clone())
-            .collect::<Vec<_>>();
-        let location = ModelLocation::Directory {
+        let path = workspace.path().join(&component.component.path);
+        let parent = path.parent().ok_or_else(|| {
+            InventoryError::Integrity("planner component has no parent".to_owned())
+        })?;
+        fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| InventoryError::Io(error.to_string()))?;
+        file.write_all(&input)
+            .and_then(|()| file.set_len(component.component.size_bytes))
+            .map_err(|error| InventoryError::Io(error.to_string()))?;
+    }
+    let components = artifact
+        .components
+        .iter()
+        .map(|component| component.component.clone())
+        .collect::<Vec<_>>();
+    let model = InventoryModel {
+        id: artifact.model_id.clone(),
+        content_id: artifact.content_id.clone(),
+        created: 0,
+        name: artifact.name.clone(),
+        supported_parameters: artifact.supported_parameters.clone(),
+        serving_configuration: None,
+        availability: ModelAvailability::Available { ready_at: 0 },
+        source: artifact.source.clone(),
+        location: ModelLocation::Directory {
             source_id: "release_catalog".to_owned(),
             root: workspace.path().to_path_buf(),
             components: components.clone(),
@@ -389,44 +512,33 @@ impl ReleaseCatalog {
                 .map(|component| component.size_bytes)
                 .sum(),
             integrity: Integrity::Verified {
-                method: "release_catalog_header_digest".to_owned(),
+                method: integrity_method.to_owned(),
             },
-        };
-        let model = InventoryModel {
-            id: artifact.model_id.clone(),
-            content_id: artifact.content_id.clone(),
-            created: 0,
-            name: artifact.name.clone(),
-            supported_parameters: artifact.supported_parameters.clone(),
-            serving_configuration: None,
-            availability: ModelAvailability::Available { ready_at: 0 },
-            source: artifact.source.clone(),
-            location,
-            properties: artifact.properties.clone(),
-            hardware: HardwareAssessment::NotAssessed {
-                reason: "release planner input".to_owned(),
-            },
-            operations: Vec::new(),
-            updated_at: 0,
-        };
-        let resolved = ResolvedModel {
-            model,
-            components: artifact
-                .components
-                .iter()
-                .map(|component| ResolvedComponent {
-                    path: workspace.path().join(&component.component.path),
-                    role: component.component.role.clone(),
-                    shard_index: component.component.shard_index,
-                    relationship: component.component.relationship.clone(),
-                })
-                .collect(),
-        };
-        Ok(Some(
-            ResolvedModelTarget::new(target_id.clone(), target, resolved, None)
-                .retain_resolution_guard(workspace),
-        ))
-    }
+        },
+        properties: artifact.properties.clone(),
+        hardware: HardwareAssessment::NotAssessed {
+            reason: "release planner input".to_owned(),
+        },
+        operations: Vec::new(),
+        updated_at: 0,
+    };
+    let resolved = ResolvedModel {
+        model,
+        components: artifact
+            .components
+            .iter()
+            .map(|component| ResolvedComponent {
+                path: workspace.path().join(&component.component.path),
+                role: component.component.role.clone(),
+                shard_index: component.component.shard_index,
+                relationship: component.component.relationship.clone(),
+            })
+            .collect(),
+    };
+    Ok(
+        ResolvedModelTarget::new(artifact.target_id.clone(), target, resolved, None)
+            .retain_resolution_guard(workspace),
+    )
 }
 
 fn validate_resolved_catalog(
@@ -513,6 +625,7 @@ impl ResolvingRecommendableCatalog {
             RecommendableModel,
             ReleasePlannerArtifact,
             BTreeMap<String, Vec<u8>>,
+            BTreeMap<String, Vec<u8>>,
         ),
         InventoryError,
     > {
@@ -595,6 +708,82 @@ impl ResolvingRecommendableCatalog {
                     })
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let primary_header = prepared
+            .headers
+            .iter()
+            .find(|header| header.path == primary.path)
+            .ok_or_else(|| {
+                InventoryError::Integrity("catalog primary has no planner header".to_owned())
+            })?;
+        let context = planner_stub_context(
+            headers
+                .get(&primary_header.digest)
+                .ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "catalog generation lost primary header {}",
+                        primary_header.digest
+                    ))
+                })?
+                .as_slice(),
+        )
+        .map_err(|error| InventoryError::Integrity(error.to_string()))?;
+        let mut planner_stubs = BTreeMap::new();
+        let components = prepared
+            .components
+            .iter()
+            .map(|component| {
+                let header = prepared
+                    .headers
+                    .iter()
+                    .find(|header| header.path == component.path)
+                    .ok_or_else(|| {
+                        InventoryError::Integrity(format!(
+                            "catalog component {} has no planner header",
+                            component.path.display()
+                        ))
+                    })?;
+                let source = headers.get(&header.digest).ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "catalog generation lost planner header {}",
+                        header.digest
+                    ))
+                })?;
+                if planner_bundle::sha256(source) != header.digest {
+                    return Err(InventoryError::Integrity(format!(
+                        "catalog source header {} failed integrity validation",
+                        header.digest
+                    )));
+                }
+                let kind = if component.path == primary.path {
+                    PlannerStubComponent::Primary
+                } else {
+                    PlannerStubComponent::Auxiliary
+                };
+                let stub = compact_planner_stub(source, &context, kind)
+                    .map_err(|error| InventoryError::Integrity(error.to_string()))?;
+                let planner_stub_digest = planner_bundle::sha256(&stub);
+                let planner_stub_size_bytes = u64::try_from(stub.len()).map_err(|_| {
+                    InventoryError::Integrity("planner stub is too large".to_owned())
+                })?;
+                if let Some(previous) =
+                    planner_stubs.insert(planner_stub_digest.clone(), stub.clone())
+                    && previous != stub
+                {
+                    return Err(InventoryError::Integrity(format!(
+                        "planner stub digest collision {planner_stub_digest}"
+                    )));
+                }
+                Ok(ReleasePlannerComponent {
+                    component: component.clone(),
+                    source_header_digest: header.digest.clone(),
+                    source_header_size_bytes: u64::try_from(source.len()).map_err(|_| {
+                        InventoryError::Integrity("planner source header is too large".to_owned())
+                    })?,
+                    planner_stub_digest,
+                    planner_stub_size_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, InventoryError>>()?;
         let planner = ReleasePlannerArtifact {
             target_id: model.target_id.clone(),
             model_id: prepared.model.model.id.clone(),
@@ -604,42 +793,9 @@ impl ResolvingRecommendableCatalog {
             properties: prepared.model.model.properties.clone(),
             source: prepared.model.model.source.clone(),
             primary_gguf: primary.path.clone(),
-            components: prepared
-                .components
-                .iter()
-                .map(|component| {
-                    let header = prepared
-                        .headers
-                        .iter()
-                        .find(|header| header.path == component.path)
-                        .ok_or_else(|| {
-                            InventoryError::Integrity(format!(
-                                "catalog component {} has no planner header",
-                                component.path.display()
-                            ))
-                        })?;
-                    Ok(ReleasePlannerComponent {
-                        component: component.clone(),
-                        header_digest: header.digest.clone(),
-                        header_size_bytes: u64::try_from(
-                            headers
-                                .get(&header.digest)
-                                .ok_or_else(|| {
-                                    InventoryError::Integrity(format!(
-                                        "catalog generation lost planner header {}",
-                                        header.digest
-                                    ))
-                                })?
-                                .len(),
-                        )
-                        .map_err(|_| {
-                            InventoryError::Integrity("planner header is too large".to_owned())
-                        })?,
-                    })
-                })
-                .collect::<Result<Vec<_>, InventoryError>>()?,
+            components,
         };
-        Ok((model, planner, headers))
+        Ok((model, planner, headers, planner_stubs))
     }
 }
 
@@ -747,19 +903,31 @@ impl ResolvingRecommendableCatalog {
             });
             let mut models = Vec::new();
             let mut planner_artifacts = Vec::new();
-            let mut headers = BTreeMap::new();
+            let mut source_headers = BTreeMap::new();
+            let mut planner_stubs = BTreeMap::new();
             let mut diagnostics = Vec::new();
             for (_, _, declaration, format, result) in resolved {
                 match result {
-                    Ok((model, planner, model_headers)) => {
+                    Ok((model, planner, model_headers, model_stubs)) => {
                         models.push(model);
                         planner_artifacts.push(planner);
                         for (digest, header) in model_headers {
-                            if let Some(previous) = headers.insert(digest.clone(), header.clone())
+                            if let Some(previous) =
+                                source_headers.insert(digest.clone(), header.clone())
                                 && previous != header
                             {
                                 return Err(InventoryError::Integrity(format!(
-                                    "planner header digest collision {digest}"
+                                    "planner source header digest collision {digest}"
+                                )));
+                            }
+                        }
+                        for (digest, stub) in model_stubs {
+                            if let Some(previous) =
+                                planner_stubs.insert(digest.clone(), stub.clone())
+                                && previous != stub
+                            {
+                                return Err(InventoryError::Integrity(format!(
+                                    "planner stub digest collision {digest}"
                                 )));
                             }
                         }
@@ -783,7 +951,8 @@ impl ResolvingRecommendableCatalog {
                     diagnostics,
                 },
                 planner_artifacts,
-                headers,
+                source_headers,
+                planner_stubs,
             })
         })
     }
@@ -854,5 +1023,4 @@ mod tests {
         assert_eq!(catalog_source_digest().expect("source digest").len(), 64);
         assert!(!catalog_source().expect("catalog source").models.is_empty());
     }
-
 }

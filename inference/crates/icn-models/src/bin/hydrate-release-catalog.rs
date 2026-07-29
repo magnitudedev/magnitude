@@ -7,7 +7,8 @@ use std::time::Duration;
 use clap::Parser;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use icn_models::{
-    catalog_source_digest_from, encode_release_planner_bundle_with_progress,
+    PlannerStubComponent, catalog_source_digest_from, compact_planner_stub,
+    encode_release_planner_bundle_with_progress, planner_stub_context,
 };
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, RANGE, USER_AGENT};
@@ -45,24 +46,25 @@ struct Lock {
 #[derive(Deserialize)]
 struct Artifact {
     source: Source,
+    #[serde(rename = "primaryGguf")]
+    primary_gguf: PathBuf,
     components: Vec<Component>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Source {
-    HuggingFace {
-        repository: String,
-        commit: String,
-    },
+    HuggingFace { repository: String, commit: String },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Component {
     component: ComponentPath,
-    header_digest: String,
-    header_size_bytes: u64,
+    source_header_digest: String,
+    source_header_size_bytes: u64,
+    planner_stub_digest: String,
+    planner_stub_size_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -84,8 +86,7 @@ async fn main() -> anyhow::Result<()> {
     let lock_bytes = read_bounded(&arguments.lock, MAX_LOCK_BYTES).await?;
     let source_bytes = read_bounded(&arguments.source, MAX_SOURCE_BYTES).await?;
     let lock: Lock = serde_json::from_slice(&lock_bytes)?;
-    if catalog_source_digest_from(&source_bytes).map_err(anyhow::Error::msg)?
-        != lock.source_digest
+    if catalog_source_digest_from(&source_bytes).map_err(anyhow::Error::msg)? != lock.source_digest
     {
         anyhow::bail!(
             "models.json differs from release-catalog.lock.json; run `bun icn:catalog:update`"
@@ -119,11 +120,13 @@ async fn main() -> anyhow::Result<()> {
             if sources.len() == 1 { "" } else { "s" }
         );
         let headers = download_headers(sources).await?;
+        let planner_stubs = prepare_planner_stubs(&lock, &headers)?;
         eprintln!("Encoding model catalog bundle...");
-        let bytes = encode_release_planner_bundle_with_progress(&headers, |completed, total| {
-            report_progress("Encoded model catalog files", completed, total);
-        })
-        .map_err(anyhow::Error::msg)?;
+        let bytes =
+            encode_release_planner_bundle_with_progress(&planner_stubs, |completed, total| {
+                report_progress("Encoded model catalog files", completed, total);
+            })
+            .map_err(anyhow::Error::msg)?;
         require_digest(&bytes, &lock.planner_bundle_digest)?;
         if let Some(cache) = &cached {
             publish_pair(cache, &lock_bytes, &bytes).await?;
@@ -141,16 +144,20 @@ async fn main() -> anyhow::Result<()> {
 fn header_sources(lock: &Lock) -> anyhow::Result<BTreeMap<String, HeaderSource>> {
     let mut sources = BTreeMap::new();
     for artifact in &lock.planner_artifacts {
-        let Source::HuggingFace {
-            repository,
-            commit,
-        } = &artifact.source;
+        let Source::HuggingFace { repository, commit } = &artifact.source;
         for component in &artifact.components {
-            if component.header_size_bytes == 0
-                || component.header_size_bytes > MAX_HEADER_BYTES
-                || component.header_digest.len() != 64
+            if component.source_header_size_bytes == 0
+                || component.source_header_size_bytes > MAX_HEADER_BYTES
+                || component.source_header_digest.len() != 64
+                || component.planner_stub_size_bytes == 0
+                || component.planner_stub_size_bytes > MAX_HEADER_BYTES
+                || component.planner_stub_digest.len() != 64
                 || !component
-                    .header_digest
+                    .source_header_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || !component
+                    .planner_stub_digest
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
             {
@@ -160,9 +167,10 @@ fn header_sources(lock: &Lock) -> anyhow::Result<BTreeMap<String, HeaderSource>>
                 repository: repository.clone(),
                 commit: commit.clone(),
                 path: component.component.path.clone(),
-                bytes: component.header_size_bytes,
+                bytes: component.source_header_size_bytes,
             };
-            if let Some(previous) = sources.insert(component.header_digest.clone(), source.clone())
+            if let Some(previous) =
+                sources.insert(component.source_header_digest.clone(), source.clone())
                 && (previous.repository != source.repository
                     || previous.commit != source.commit
                     || previous.path != source.path
@@ -173,6 +181,50 @@ fn header_sources(lock: &Lock) -> anyhow::Result<BTreeMap<String, HeaderSource>>
         }
     }
     Ok(sources)
+}
+
+fn prepare_planner_stubs(
+    lock: &Lock,
+    headers: &BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    let mut stubs = BTreeMap::new();
+    for artifact in &lock.planner_artifacts {
+        let primary = artifact
+            .components
+            .iter()
+            .find(|component| component.component.path == artifact.primary_gguf)
+            .ok_or_else(|| anyhow::anyhow!("planner artifact has no primary component"))?;
+        let primary_header = headers
+            .get(&primary.source_header_digest)
+            .ok_or_else(|| anyhow::anyhow!("planner source is missing its primary header"))?;
+        let context = planner_stub_context(primary_header)?;
+        for component in &artifact.components {
+            let source = headers
+                .get(&component.source_header_digest)
+                .ok_or_else(|| anyhow::anyhow!("planner source header is missing"))?;
+            let kind = if component.component.path == artifact.primary_gguf {
+                PlannerStubComponent::Primary
+            } else {
+                PlannerStubComponent::Auxiliary
+            };
+            let stub = compact_planner_stub(source, &context, kind)?;
+            let digest = sha256(&stub);
+            if digest != component.planner_stub_digest
+                || u64::try_from(stub.len())? != component.planner_stub_size_bytes
+            {
+                anyhow::bail!(
+                    "planner stub for {} differs from the release catalog",
+                    component.component.path.display()
+                );
+            }
+            if let Some(previous) = stubs.insert(digest.clone(), stub.clone())
+                && previous != stub
+            {
+                anyhow::bail!("planner stub digest collision {digest}");
+            }
+        }
+    }
+    Ok(stubs)
 }
 
 async fn download_headers(
@@ -354,11 +406,15 @@ async fn publish_pair(directory: &Path, lock: &[u8], bundle: &[u8]) -> anyhow::R
 }
 
 fn require_digest(bytes: &[u8], expected: &str) -> anyhow::Result<()> {
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = sha256(bytes);
     if actual != expected {
         anyhow::bail!("catalog bundle digest {actual} differs from {expected}");
     }
     Ok(())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn monotonic_suffix() -> u128 {
