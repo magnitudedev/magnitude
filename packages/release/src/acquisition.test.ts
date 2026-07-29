@@ -2,7 +2,15 @@ import * as FetchHttpClient from "@effect/platform/FetchHttpClient"
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
 import * as NodePath from "@effect/platform-node/NodePath"
 import { createHash } from "node:crypto"
-import { mkdtemp, rm } from "node:fs/promises"
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer, Schema } from "effect"
@@ -158,6 +166,67 @@ describe("unsigned release acquisition", () => {
       )
       expect(error.stage).toBe("download")
       expect(error.message).toBe(message)
+    } finally {
+      server.stop(true)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("publishes an extracted installation without scoped staging cleanup failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "magnitude-release-test-"))
+    const payload = join(root, "payload")
+    const archivePath = join(root, "cli.tar.gz")
+    const destination = join(root, "installations", "digest")
+    await mkdir(join(payload, "bin"), { recursive: true })
+    const executable = join(payload, "bin", "magnitude-cli")
+    await writeFile(executable, "#!/bin/sh\nexit 0\n")
+    await chmod(executable, 0o755)
+    const tar = Bun.spawn([
+      "tar",
+      "-czf",
+      archivePath,
+      "-C",
+      payload,
+      "bin/magnitude-cli",
+    ], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    })
+    const [tarCode, tarError] = await Promise.all([
+      tar.exited,
+      new Response(tar.stderr).text(),
+    ])
+    expect(tarCode, tarError).toBe(0)
+    const archiveBytes = new Uint8Array(await readFile(archivePath))
+    const installable = Schema.decodeUnknownSync(ReleaseArtifactSchema)({
+      id: "cli-linux-x64-gnu",
+      kind: "cli",
+      host: "linux-x64-gnu",
+      filename: "magnitude-cli-linux-x64-gnu.tar.gz",
+      bytes: archiveBytes.byteLength,
+      sha256: sha256(archiveBytes),
+    })
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response(archiveBytes),
+    })
+    try {
+      await Effect.runPromise(
+        installArtifact(
+          `http://127.0.0.1:${server.port}`,
+          version,
+          installable,
+          destination,
+        ).pipe(Effect.provide(InstallationLayer)),
+      )
+      expect(await readFile(join(destination, "bin", "magnitude-cli"), "utf8"))
+        .toBe("#!/bin/sh\nexit 0\n")
+      expect(
+        (await readdir(join(root, "installations")))
+          .filter((entry) => entry.startsWith(".release-")),
+      ).toEqual([])
     } finally {
       server.stop(true)
       await rm(root, { recursive: true, force: true })

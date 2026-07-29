@@ -50,14 +50,33 @@ if (packageJson.version !== version) {
 if (!/^[a-f0-9]{40}$/.test(sourceCommit)) {
   throw new Error("source commit must be a full lowercase SHA")
 }
+const releaseCommit = required("MAGNITUDE_RELEASE_COMMIT", sourceCommit)
+if (!/^[a-f0-9]{40}$/.test(releaseCommit)) {
+  throw new Error("release commit must be a full lowercase SHA")
+}
+const releasePackageJson = JSON.parse(await run([
+  "git",
+  "show",
+  `${releaseCommit}:packages/cli/package.json`,
+], { cwd: PROJECT_ROOT })) as { readonly version?: string }
+if (releasePackageJson.version !== version) {
+  throw new Error("Changesets release commit differs from the requested version")
+}
 const previousPackageJson = JSON.parse(await run([
   "git",
   "show",
-  `${sourceCommit}^:packages/cli/package.json`,
+  `${releaseCommit}^:packages/cli/package.json`,
 ], { cwd: PROJECT_ROOT })) as { readonly version?: string }
 if (!previousPackageJson.version || previousPackageJson.version === version) {
   throw new Error("release commit did not change the Changesets-owned CLI version")
 }
+await run([
+  "git",
+  "merge-base",
+  "--is-ancestor",
+  releaseCommit,
+  sourceCommit,
+], { cwd: PROJECT_ROOT })
 
 const repository = required("GITHUB_REPOSITORY")
 const tag = `@magnitudedev/cli@${version}`

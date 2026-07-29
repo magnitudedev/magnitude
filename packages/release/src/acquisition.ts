@@ -326,26 +326,34 @@ export const installArtifact = (
         artifact,
         archive,
       )
-      const staging = yield* fs.makeTempDirectoryScoped({
+      const staging = yield* fs.makeTempDirectory({
         directory: parent,
         prefix: ".release-",
       }).pipe(
         Effect.mapError(() => failure("install", "unable to create extraction staging directory")),
       )
-      yield* extractor.extract(archive, staging, artifact)
-      yield* fs.rename(staging, destination).pipe(
-        Effect.catchAll((cause) =>
-          fs.stat(destination).pipe(
-            Effect.flatMap((info) =>
-              info.type === "Directory"
-                ? Effect.void
-                : Effect.fail(cause)
-            ),
-            Effect.mapError(() => cause),
-          )
-        ),
-        Effect.mapError(() =>
-          failure("install", "unable to publish release installation")
+      yield* Effect.gen(function* () {
+        yield* extractor.extract(archive, staging, artifact)
+        yield* fs.rename(staging, destination).pipe(
+          Effect.catchAll((cause) =>
+            fs.stat(destination).pipe(
+              Effect.flatMap((info) =>
+                info.type === "Directory"
+                  ? Effect.void
+                  : Effect.fail(cause)
+              ),
+              Effect.mapError(() => cause),
+            )
+          ),
+          Effect.mapError(() =>
+            failure("install", "unable to publish release installation")
+          ),
+        )
+      }).pipe(
+        Effect.ensuring(
+          fs.remove(staging, { recursive: true, force: true }).pipe(
+            Effect.catchAll(() => Effect.void),
+          ),
         ),
       )
       return destination
