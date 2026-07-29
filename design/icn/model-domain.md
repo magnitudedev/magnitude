@@ -241,13 +241,15 @@ failures from a user-initiated download or selection remain immediate and attach
 
 Choosing an installed or curated model starts one client-owned sequence of ordinary domain
 mutations. The target-level download command admits or joins required package work and returns only
-after authoritative installation. Generic slot assignment retains the selected serving
-configuration and stores the primary selection. Generic slot load returns only after the exact
-selected instance is Ready; the client then marks onboarding complete. The submitted choice is the
-only onboarding-specific transient state and exists only in the client that received the explicit
-action. ACN has no onboarding model command, activation service, or startup reconciler. Confirmed
-cancellation uses the ordinary target-download cancellation or slot-clear mutation. Interruption or
-restart never reconstructs command intent from onboarding, download, slot, or instance snapshots.
+after every exact admitted attempt reports successful publication. Generic slot assignment retains
+the selected serving configuration and stores the primary selection without using installed
+presentation as command authorization. Generic slot load lets ICN validate current package presence
+and returns only after the exact selected instance is Ready; the client then marks onboarding
+complete. The submitted choice is the only onboarding-specific transient state and exists only in
+the client that received the explicit action. ACN has no onboarding model command, activation
+service, or startup reconciler. Confirmed cancellation uses the ordinary target-download
+cancellation or slot-clear mutation. Interruption or restart never reconstructs command intent from
+onboarding, download, slot, or instance snapshots.
 
 The complete compatible recommendable-candidate projection is published beside the small labeled
 portfolio. Labeled portfolio members retain their intent and order. Remaining compatible

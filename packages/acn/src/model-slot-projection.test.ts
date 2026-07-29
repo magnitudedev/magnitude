@@ -2,7 +2,6 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelInstanceIdSchema,
-  ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
@@ -90,8 +89,7 @@ describe("model slot projection", () => {
     })
   })
 
-  it("admits an installed durable offering before catalog publication", () => {
-    const packageId = ModelPackageIdSchema.make("package")
+  it("admits a durable offering before catalog publication", () => {
     const effort = ReasoningEffortSchema.make("none")
     const capabilities = {
       vision: false,
@@ -106,8 +104,7 @@ describe("model slot projection", () => {
     expect(selectableModelCapabilities(
       PRIMARY_SLOT_ID,
       undefined,
-      { capabilities, packageIds: [packageId] },
-      new Set([packageId]),
+      { capabilities },
     )).toBe(capabilities)
 
     const catalogModel: ProviderModelCatalogEntry = {
@@ -126,8 +123,7 @@ describe("model slot projection", () => {
     expect(selectableModelCapabilities(
       PRIMARY_SLOT_ID,
       catalogModel,
-      { capabilities, packageIds: [packageId] },
-      new Set([packageId]),
+      { capabilities },
     )).toBeUndefined()
 
     expect(selectableModelCapabilities(
@@ -140,13 +136,11 @@ describe("model slot projection", () => {
           reason: "installation_unavailable",
         },
       },
-      { capabilities, packageIds: [packageId] },
-      new Set([packageId]),
+      { capabilities },
     )).toBe(capabilities)
   })
 
-  it("rejects an uninstalled durable offering", () => {
-    const packageId = ModelPackageIdSchema.make("package")
+  it("does not use installed presentation to authorize a durable offering", () => {
     const effort = ReasoningEffortSchema.make("none")
     const capabilities = {
       vision: false,
@@ -161,8 +155,7 @@ describe("model slot projection", () => {
     expect(selectableModelCapabilities(
       PRIMARY_SLOT_ID,
       undefined,
-      { capabilities, packageIds: [packageId] },
-      new Set(),
-    )).toBeUndefined()
+      { capabilities },
+    )).toBe(capabilities)
   })
 })

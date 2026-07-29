@@ -12,11 +12,15 @@ export interface IcnObservedState<A, E> {
   readonly refresh: Effect.Effect<void, E>
 }
 
+export interface IcnMutableObservedState<A, E> extends IcnObservedState<A, E> {
+  readonly update: (f: (state: A) => A) => Effect.Effect<void>
+}
+
 export const makeIcnObservedState = <A, E>(
   initial: A,
   read: Effect.Effect<A, E>,
   equivalent: Equivalence.Equivalence<A>,
-): Effect.Effect<IcnObservedState<A, E>> =>
+): Effect.Effect<IcnMutableObservedState<A, E>> =>
   Effect.gen(function* () {
     const current = yield* SubscriptionRef.make({
       initialized: false,
@@ -27,8 +31,7 @@ export const makeIcnObservedState = <A, E>(
     })
     const refreshLock = yield* Effect.makeSemaphore(1)
 
-    const refresh = refreshLock.withPermits(1)(Effect.gen(function* () {
-      const nextState = yield* read
+    const publish = (nextState: A) => Effect.gen(function* () {
       const previous = yield* SubscriptionRef.get(current)
       if (previous.initialized && equivalent(previous.snapshot.state, nextState)) return
       yield* SubscriptionRef.set(current, {
@@ -38,12 +41,21 @@ export const makeIcnObservedState = <A, E>(
           state: nextState,
         },
       })
-    }))
+    })
+
+    const refresh = refreshLock.withPermits(1)(read.pipe(Effect.flatMap(publish)))
+    const update = (f: (state: A) => A) => refreshLock.withPermits(1)(
+      SubscriptionRef.get(current).pipe(
+        Effect.map(({ snapshot }) => f(snapshot.state)),
+        Effect.flatMap(publish),
+      ),
+    )
 
     return {
       get: SubscriptionRef.get(current).pipe(Effect.map(({ snapshot }) => snapshot)),
       changes: current.changes.pipe(Stream.map(({ snapshot }) => snapshot)),
       initialized: SubscriptionRef.get(current).pipe(Effect.map(({ initialized }) => initialized)),
       refresh,
+      update,
     }
   })

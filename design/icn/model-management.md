@@ -136,11 +136,12 @@ Pending -> Downloading -> Completed
                       └-> Cancelled
 ```
 
-`POST /v1/models/downloads` starts an attempt. List, detail, and cancel operations return
-authoritative attempt snapshots. Active snapshots retain transfer stage, completed and total bytes,
-and the measured current-attempt transfer rate when sufficient evidence exists. Resumed bytes never
-count as bytes transferred during the current attempt. Product clients may derive a remaining-time
-estimate from those authoritative values but never measure transfer speed themselves.
+`POST /v1/models/downloads` starts or joins the exact package attempt and returns that attempt.
+List, detail, and cancel operations return authoritative attempt snapshots. Active snapshots retain
+transfer stage, completed and total bytes, and the measured current-attempt transfer rate when
+sufficient evidence exists. Resumed bytes never count as bytes transferred during the current
+attempt. Product clients may derive a remaining-time estimate from those authoritative values but
+never measure transfer speed themselves.
 
 Failure and cancellation are terminal attempt results, not package states. Retry creates a new
 attempt. ACN projects only the latest relevant attempt into package UI state and stores dismissal
@@ -149,7 +150,8 @@ counts so resumable progress remains observable.
 
 Successful publication is atomic: incomplete staging is never reported as installed. ICN validates
 the complete package before publication. Interrupted attempts recover as terminal failures or are
-cleaned without leaving a false installed record.
+cleaned without leaving a false installed record. Retrying reuses resumable partial data or
+recognizes a package that was already published.
 
 Source-integrity hashing is part of the download write path. A fresh managed transfer feeds each
 successfully written source chunk into its whole-file SHA-256 accumulator and never rereads the
@@ -163,11 +165,10 @@ checkpoint state is never repaired by hashing a large artifact; the untrusted ar
 and downloaded again. Final verification compares the accumulated digest before atomic publication.
 
 `Completed` records that the attempt successfully published its exact package. Installed inventory,
-not attempt history, owns whether the package is currently present; a user may remove a package
-after a successful attempt. When ACN observes `Completed`, it refreshes its installed observer
-before deriving the target outcome. If the package is absent, package presentation is
-`NotInstalled`, never 100% active progress or a fabricated failed attempt. A currently waiting
-target-acquisition operation fails because its required installation did not materialize.
+not attempt history, owns
+whether the package is currently present; a user may remove a package after a successful attempt.
+Package presentation then becomes `NotInstalled`, never 100% active progress or a fabricated failed
+attempt. This later current-state change does not rewrite or delay the completed command.
 
 ICN owns an accepted attempt independently of the HTTP caller. ACN's download observer periodically
 refreshes even when its last snapshot is idle, then uses the faster active interval until every
@@ -185,8 +186,9 @@ ACN builds `ModelPackageEntry` values by joining:
 
 This join changes only product presentation. The immutable `ModelPackage` value is reused unchanged.
 One package-acquisition derivation joins installed inventory with the latest relevant attempt and
-produces `NotInstalled`, `Downloading`, `DownloadFailed`, or `Installed`. Both package presentation
-and target acquisition consume that derivation; no waiter independently interprets attempts.
+produces `NotInstalled`, `Downloading`, `DownloadFailed`, or `Installed`. It owns presentation only.
+An admitted target-acquisition waiter instead retains its exact attempt identities and reads those
+attempts directly until each is terminal.
 The target-level product projection aggregates progress and concurrent transfer rates across every
 package required by that target.
 
@@ -195,12 +197,18 @@ the already-derived target download and preparation values to client-ready catal
 There are no placeholder candidate lifecycles and no fallback source of target state.
 
 `DownloadModel` is one idempotent target-acquisition operation: it admits missing package attempts
-and waits for their authoritative terminal outcome. Clients do not precompute whether a download is
-required. Observed inventory and attempt snapshots never gate admission; ACN sends the command
-directly to ICN, whose package operation is idempotent. Reconciliation therefore cannot delay the
-start of a download. A frontend flow that composes download, slot assignment, loading, completion, and
-cancellation represents the command and its lifecycle as one composite Effect Atom; React does not
-coordinate those mutation results or copy mirror state.
+and waits for their exact authoritative terminal outcomes. It performs no installed-inventory
+refresh. Clients do not precompute whether a download is required. Observed inventory and attempt
+snapshots never gate admission; ACN sends the command directly to ICN, whose package operation is
+idempotent. Every exact attempt snapshot returned by admission or command polling is immediately
+merged into the download observer so presentation does not wait for a periodic polling interval;
+this local publication is not external confirmation and cannot determine command completion.
+Reconciliation therefore cannot delay either the start or completion of a download.
+Local assignment records the exact provider offering without using cached installed presence as
+command authorization. ICN load admission validates the current package files and remains the final
+load-time authority. A frontend flow that composes download, slot
+assignment, loading, completion, and cancellation represents the command and its lifecycle as one
+composite Effect Atom; React does not coordinate those mutation results or copy mirror state.
 
 Installed packages appear even when catalog resolution or assessment is unavailable. Catalog-only
 packages appear as not installed. Download progress does not require inventory-wide reconciliation.
@@ -241,11 +249,15 @@ intentionally outside this cache contract.
 - Draft and MTP execution companions are never listed as standalone installed models.
 - Download failure belongs to one attempt and can be retried with a new attempt.
 - Managed download integrity never rereads completed or resumable model content.
-- A completed attempt records successful historical publication; installed inventory owns current
-  presence.
+- A completed attempt records successful historical publication; installed inventory independently
+  owns current presence.
 - `Completed` with an absent package projects as `NotInstalled`, never active progress or a failed
   historical attempt.
-- Target acquisition has one ACN operation and one package-outcome derivation.
+- Target acquisition waits only on its exact admitted attempts and performs no installed refresh.
+- Package and target presentation have one package-outcome derivation that does not authorize or
+  complete commands.
+- Assignment does not use cached installed presence as command authorization; load validation
+  belongs to ICN.
 - Composite client workflows are atom-owned and render authoritative mirror state.
 - Package identity is independent of paths and mutable repository refs.
 - Catalog failure does not hide installed packages.

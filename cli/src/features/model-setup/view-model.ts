@@ -76,15 +76,7 @@ export const deriveOnboardingModelSetupView = ({
   if (submittedProviderModelId === null
     || primary._tag !== "ConfiguredLocal"
     || primary.selection.providerModelId !== submittedProviderModelId) {
-    return submittedCandidate === null
-      ? { _tag: "Choosing" }
-      : {
-          _tag: "Activating",
-          providerModelId: submittedCandidate.providerModelId,
-          displayName: submittedCandidate.displayName,
-          phase: "Loading",
-          failure: null,
-        }
+    return { _tag: "Choosing" }
   }
   const candidate = deriveSelectedLocalModelCandidate(models, slots)
   const selection = buildLocalInferenceSelections(models, catalog, slots).find((item) =>

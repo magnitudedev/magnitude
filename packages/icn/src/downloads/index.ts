@@ -1,6 +1,9 @@
 import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
-import { ModelDownloadsResponse as ModelDownloadsResponseSchema } from "../generated/schemas.js"
+import {
+  ModelDownloadsResponse as ModelDownloadsResponseSchema,
+  type DownloadAttempt,
+} from "../generated/schemas.js"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
 
 type DownloadsReadError = Effect.Effect.Error<
@@ -8,7 +11,9 @@ type DownloadsReadError = Effect.Effect.Error<
 >
 
 export interface IcnDownloadsService
-  extends IcnObservedState<ModelDownloadsResponseSchema, DownloadsReadError> {}
+  extends IcnObservedState<ModelDownloadsResponseSchema, DownloadsReadError> {
+  readonly observeAttempt: (attempt: DownloadAttempt) => Effect.Effect<void>
+}
 
 export class IcnDownloads extends Context.Tag("@magnitudedev/icn/IcnDownloads")<
   IcnDownloads,
@@ -53,6 +58,22 @@ export const makeIcnDownloads = (
         Effect.forever,
         Effect.forkScoped,
       )
-      return IcnDownloads.of(observed)
+      const observeAttempt = (attempt: DownloadAttempt) => observed.update((state) => {
+        const existing = state.attempts.findIndex(({ id }) => id === attempt.id)
+        if (existing === -1) {
+          return { attempts: [...state.attempts, attempt] }
+        }
+        return {
+          attempts: state.attempts.map((current, index) =>
+            index === existing ? attempt : current),
+        }
+      })
+      return IcnDownloads.of({
+        get: observed.get,
+        changes: observed.changes,
+        initialized: observed.initialized,
+        refresh: observed.refresh,
+        observeAttempt,
+      })
     }),
   )
