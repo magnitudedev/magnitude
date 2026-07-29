@@ -1,1 +1,3 @@
-bin/
+bin/*
+!bin/rg.d.ts
+!bin/rg.exe.d.ts
