@@ -11,7 +11,7 @@ import {
   type SessionError,
   type SessionCwdSummary,
   type SessionMetadata as ProtocolSessionMetadata,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import type { SessionExecutionContext } from "./session-types"
 import { sessionErrorMessage } from "./session-errors"
 

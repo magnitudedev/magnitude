@@ -101,7 +101,7 @@ describe("ICN managed launch", () => {
       await writeFile(installation, "{}");
       await writeFile(
         executable,
-        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","target":"test-target","capabilities":["model_load_control"],"backends":["cpu"]}'\n`
+        `#!/bin/sh\nprintf '%s\\n' '{"version":"1.0.0","api_version":1,"native_build":"native-test","backend_module_abi":"abi-test","target":"test-target","profile":"test","rustc":"rustc test","capabilities":["model_load_control"],"backends":["cpu"]}'\n`
       );
       await chmod(executable, 0o755);
       try {

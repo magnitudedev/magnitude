@@ -20,7 +20,7 @@ import { readStructuredFile } from "@magnitudedev/storage";
 import {
   AcnVersionRegistrySchema,
   type AcnRegistration,
-} from "@magnitudedev/protocol";
+} from "@magnitudedev/acn-protocol";
 import {
   DaemonCrashed,
   DaemonError,

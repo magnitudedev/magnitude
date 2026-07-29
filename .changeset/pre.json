@@ -31,7 +31,7 @@
     "@magnitudedev/client-common": "0.0.1",
     "@magnitudedev/icn": "0.0.1",
     "@magnitudedev/openapi-effect": "0.0.1",
-    "@magnitudedev/protocol": "0.0.1",
+    "@magnitudedev/acn-protocol": "0.0.1",
     "@magnitudedev/providers": "0.0.0",
     "@magnitudedev/release": "0.0.1",
     "@magnitudedev/sdk": "0.0.1",

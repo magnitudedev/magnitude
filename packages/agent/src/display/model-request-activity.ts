@@ -1,6 +1,6 @@
 import type { ModelRequestProgress } from '@magnitudedev/ai'
 import { Ambient, Projection } from '@magnitudedev/event-core'
-import { forkIdToKey } from '@magnitudedev/protocol'
+import { forkIdToKey } from '@magnitudedev/acn-protocol'
 import { Schema } from 'effect'
 import type { AppEvent } from '../events'
 

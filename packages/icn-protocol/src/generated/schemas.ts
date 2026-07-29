@@ -149,6 +149,15 @@ export const AssessModelsResponse = S.Struct({
 export type AssessModelsResponse = S.Schema.Type<typeof AssessModelsResponse>
 export type AssessModelsResponseEncoded = S.Schema.Encoded<typeof AssessModelsResponse>
 
+export const BackendEligibilityReport = S.Struct({
+  cuda: S.suspend((): S.Schema<CudaEligibility, CudaEligibilityEncoded> => CudaEligibility),
+  metal: S.suspend((): S.Schema<MetalEligibility, MetalEligibilityEncoded> => MetalEligibility),
+  schemaVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1), S.lessThanOrEqualTo(1)),
+  vulkan: S.suspend((): S.Schema<VulkanEligibility, VulkanEligibilityEncoded> => VulkanEligibility),
+})
+export type BackendEligibilityReport = S.Schema.Type<typeof BackendEligibilityReport>
+export type BackendEligibilityReportEncoded = S.Schema.Encoded<typeof BackendEligibilityReport>
+
 export const CacheTypeResponse = S.Union(
   S.Literal("f32"),
   S.Literal("f16"),
@@ -438,6 +447,33 @@ export const ContentIdentity = S.Union(
 )
 export type ContentIdentity = S.Schema.Type<typeof ContentIdentity>
 export type ContentIdentityEncoded = S.Schema.Encoded<typeof ContentIdentity>
+
+export const CudaEligibility = S.Union(
+  S.extend(
+    S.Struct({
+      architectures: S.Array(S.String).pipe(S.minItems(1)),
+      driverApi: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+      state: S.Literal("usable"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      diagnostic: S.String,
+      state: S.Literal("absent"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      diagnostic: S.String,
+      state: S.Literal("failed"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CudaEligibility = S.Schema.Type<typeof CudaEligibility>
+export type CudaEligibilityEncoded = S.Schema.Encoded<typeof CudaEligibility>
 
 export const DefaultGenerationSettings = S.Struct({
   n_ctx: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -895,6 +931,54 @@ export const HuggingFaceRepositorySnapshot = S.Struct({
 export type HuggingFaceRepositorySnapshot = S.Schema.Type<typeof HuggingFaceRepositorySnapshot>
 export type HuggingFaceRepositorySnapshotEncoded = S.Schema.Encoded<typeof HuggingFaceRepositorySnapshot>
 
+export const IcnBinaryIdentity = S.Struct({
+  api_version: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  backend_module_abi: S.String.pipe(S.minLength(1)),
+  backends: S.Array(S.String).pipe(S.minItems(1)),
+  capabilities: S.Array(S.String).pipe(S.minItems(1)),
+  native_build: S.String.pipe(S.minLength(1)),
+  profile: S.String.pipe(S.minLength(1)),
+  rustc: S.String.pipe(S.minLength(1)),
+  target: S.String.pipe(S.minLength(1)),
+  version: S.String.pipe(S.minLength(1)),
+})
+export type IcnBinaryIdentity = S.Schema.Type<typeof IcnBinaryIdentity>
+export type IcnBinaryIdentityEncoded = S.Schema.Encoded<typeof IcnBinaryIdentity>
+
+export const IcnInstallationBackend = S.Union(
+  S.Literal("cpu"),
+  S.Literal("metal"),
+  S.Literal("cuda"),
+  S.Literal("vulkan"),
+)
+export type IcnInstallationBackend = S.Schema.Type<typeof IcnInstallationBackend>
+export type IcnInstallationBackendEncoded = S.Schema.Encoded<typeof IcnInstallationBackend>
+
+export const IcnInstallationDeclaration = S.Struct({
+  backend: S.suspend((): S.Schema<IcnInstallationBackend, IcnInstallationBackendEncoded> => IcnInstallationBackend),
+  backendModuleAbi: S.String.pipe(S.minLength(1)),
+  nativeBuild: S.String.pipe(S.minLength(1)),
+  schemaVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1), S.lessThanOrEqualTo(1)),
+})
+export type IcnInstallationDeclaration = S.Schema.Type<typeof IcnInstallationDeclaration>
+export type IcnInstallationDeclarationEncoded = S.Schema.Encoded<typeof IcnInstallationDeclaration>
+
+export const IcnStartupRecord = S.Struct({
+  apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  instanceId: S.String.pipe(S.minLength(1)),
+  nativeBuild: S.String.pipe(S.minLength(1)),
+  origin: S.String.pipe(S.minLength(1)),
+  pid: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  protocolVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1), S.lessThanOrEqualTo(1)),
+  type: S.suspend((): S.Schema<IcnStartupRecordType, IcnStartupRecordTypeEncoded> => IcnStartupRecordType),
+})
+export type IcnStartupRecord = S.Schema.Type<typeof IcnStartupRecord>
+export type IcnStartupRecordEncoded = S.Schema.Encoded<typeof IcnStartupRecord>
+
+export const IcnStartupRecordType = S.Literal("icn_ready")
+export type IcnStartupRecordType = S.Schema.Type<typeof IcnStartupRecordType>
+export type IcnStartupRecordTypeEncoded = S.Schema.Encoded<typeof IcnStartupRecordType>
+
 export const ImageUrlRequest = S.Struct({
   url: S.String,
 })
@@ -964,6 +1048,24 @@ export type MemoryAssessmentEncoded = S.Schema.Encoded<typeof MemoryAssessment>
 export const MemoryDomainId = S.String
 export type MemoryDomainId = S.Schema.Type<typeof MemoryDomainId>
 export type MemoryDomainIdEncoded = S.Schema.Encoded<typeof MemoryDomainId>
+
+export const MetalEligibility = S.Union(
+  S.extend(
+    S.Struct({
+      state: S.Literal("usable"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      diagnostic: S.String,
+      state: S.Literal("absent"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type MetalEligibility = S.Schema.Type<typeof MetalEligibility>
+export type MetalEligibilityEncoded = S.Schema.Encoded<typeof MetalEligibility>
 
 export const Modalities = S.Struct({
   audio: S.Boolean,
@@ -1721,3 +1823,29 @@ export type UsageEncoded = S.Schema.Encoded<typeof Usage>
 export const Value = JsonValue
 export type Value = S.Schema.Type<typeof Value>
 export type ValueEncoded = S.Schema.Encoded<typeof Value>
+
+export const VulkanEligibility = S.Union(
+  S.extend(
+    S.Struct({
+      loaderApi: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+      state: S.Literal("usable"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      diagnostic: S.String,
+      state: S.Literal("absent"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      diagnostic: S.String,
+      state: S.Literal("failed"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type VulkanEligibility = S.Schema.Type<typeof VulkanEligibility>
+export type VulkanEligibilityEncoded = S.Schema.Encoded<typeof VulkanEligibility>

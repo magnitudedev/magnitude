@@ -1,6 +1,6 @@
 import { Cause, Context, Duration, Effect, Layer, Schema, Stream } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
-import { HardwareSnapshot as HardwareSnapshotSchema } from "../generated/schemas.js"
+import { HardwareSnapshot as HardwareSnapshotSchema } from "@magnitudedev/icn-protocol/schemas"
 import {
   makeIcnObservedState,
   type IcnObservedSnapshot,

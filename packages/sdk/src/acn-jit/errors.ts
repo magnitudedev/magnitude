@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { Rpc, RpcClientError } from "@effect/rpc"
-import { StreamDisplayView, WatchFile } from "@magnitudedev/protocol"
+import { StreamDisplayView, WatchFile } from "@magnitudedev/acn-protocol"
 
 export class NoDaemon extends Schema.TaggedError<NoDaemon>()("NoDaemon", {}) {}
 

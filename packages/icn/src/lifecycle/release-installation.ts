@@ -6,9 +6,13 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
 import {
+  BackendEligibilityReport,
+  IcnBinaryIdentity,
+  IcnInstallationDeclaration,
+} from "@magnitudedev/icn-protocol"
+import {
   acquireRelease,
   currentHost,
-  IcnInstallationSchema,
   installArtifact,
   NodeArchiveExtractor,
   selectArtifact,
@@ -16,40 +20,6 @@ import {
   type ReleaseManifest,
 } from "@magnitudedev/release"
 import { Data, Effect, Option, Schema } from "effect"
-
-const CudaEligibility = Schema.Union(
-  Schema.TaggedStruct("usable", {
-    driverApi: Schema.Int,
-    architectures: Schema.Array(Schema.String),
-  }),
-  Schema.TaggedStruct("absent", { diagnostic: Schema.String }),
-  Schema.TaggedStruct("failed", { diagnostic: Schema.String }),
-)
-
-const VulkanEligibility = Schema.Union(
-  Schema.TaggedStruct("usable", { loaderApi: Schema.Int }),
-  Schema.TaggedStruct("absent", { diagnostic: Schema.String }),
-  Schema.TaggedStruct("failed", { diagnostic: Schema.String }),
-)
-
-const MetalEligibility = Schema.Union(
-  Schema.TaggedStruct("usable", {}),
-  Schema.TaggedStruct("absent", { diagnostic: Schema.String }),
-)
-
-const EligibilityReport = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  cuda: CudaEligibility,
-  vulkan: VulkanEligibility,
-  metal: MetalEligibility,
-})
-
-const BinaryIdentity = Schema.Struct({
-  native_build: Schema.String,
-  backend_module_abi: Schema.String,
-})
-
-type BinaryIdentity = typeof BinaryIdentity.Type
 type SelectedBackend = {
   readonly backend: "cpu" | "metal" | "cuda" | "vulkan"
   readonly pack: Option.Option<ReleaseArtifact>
@@ -170,7 +140,7 @@ const readIdentity = (
   base: string,
   artifact: ReleaseArtifact,
 ): Effect.Effect<
-  BinaryIdentity,
+  IcnBinaryIdentity,
   ReleaseIcnInstallationError,
   CommandExecutor.CommandExecutor | Path.Path
 > =>
@@ -180,7 +150,7 @@ const readIdentity = (
       [path.join(base, "bin", executableName()), "version", "--json"],
       loaderEnvironment(path.join(base, "runtime")),
     ).pipe(
-      Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(BinaryIdentity))),
+      Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(IcnBinaryIdentity))),
       Effect.mapError(() => installationError("verify", "ICN base identity is malformed")),
     )
     if (
@@ -249,12 +219,12 @@ const selectBackend = (
       [path.join(base, "bin", executableName()), "backend-eligibility", "--json"],
       loaderEnvironment(path.join(base, "runtime")),
     ).pipe(
-      Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(EligibilityReport))),
+      Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(BackendEligibilityReport))),
       Effect.mapError(() => installationError("probe", "ICN backend eligibility report is malformed")),
     )
 
     if (currentHost() === "darwin-arm64") {
-      if (report.metal._tag !== "usable") {
+      if (report.metal.state !== "usable") {
         return yield* installationError("probe", report.metal.diagnostic)
       }
       const pack = yield* selectArtifact(
@@ -266,10 +236,10 @@ const selectBackend = (
       return { backend: "metal", pack: Option.some(pack) }
     }
 
-    if (report.cuda._tag === "failed") {
+    if (report.cuda.state === "failed") {
       return yield* installationError("probe", report.cuda.diagnostic)
     }
-    if (report.cuda._tag === "usable") {
+    if (report.cuda.state === "usable") {
       const pack = compatibleCuda(
         manifest,
         report.cuda.driverApi,
@@ -278,10 +248,10 @@ const selectBackend = (
       if (Option.isSome(pack)) return { backend: "cuda", pack }
     }
 
-    if (report.vulkan._tag === "failed") {
+    if (report.vulkan.state === "failed") {
       return yield* installationError("probe", report.vulkan.diagnostic)
     }
-    if (report.vulkan._tag === "usable") {
+    if (report.vulkan.state === "usable") {
       const pack = compatibleVulkan(manifest, report.vulkan.loaderApi)
       if (Option.isSome(pack)) return { backend: "vulkan", pack }
     }
@@ -292,7 +262,7 @@ const compositionId = (
   manifestSha256: string,
   base: ReleaseArtifact,
   selected: SelectedBackend,
-  native: BinaryIdentity,
+  native: IcnBinaryIdentity,
 ): string =>
   createHash("sha256").update(JSON.stringify({
     manifestSha256,
@@ -350,7 +320,7 @@ const publishComposition = (
   base: string,
   pack: Option.Option<string>,
   selected: SelectedBackend,
-  native: BinaryIdentity,
+  native: IcnBinaryIdentity,
 ): Effect.Effect<
   ReleaseIcnInstallation,
   ReleaseIcnInstallationError,
@@ -396,7 +366,7 @@ const publishComposition = (
         backendModuleAbi: native.backend_module_abi,
       }
       const serialized = yield* Schema.encode(
-        Schema.parseJson(IcnInstallationSchema),
+        Schema.parseJson(IcnInstallationDeclaration),
       )(declaration).pipe(
         Effect.mapError(() => installationError("compose", "unable to encode ICN installation")),
       )

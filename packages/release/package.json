@@ -17,6 +17,7 @@
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@effect/platform-node": "0.107.0",
+    "@magnitudedev/icn-protocol": "workspace:*",
     "effect": "3.21.2",
     "mdast-util-from-markdown": "^2.0.3",
     "tar-stream": "3.2.0"

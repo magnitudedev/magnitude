@@ -14,8 +14,12 @@ import {
   type ModelOfferingTargetId,
   type ModelServingConfiguration,
   type ServingProfile,
-} from "@magnitudedev/protocol"
-import { IcnClient, type AssessModelResult, type OfferingAssessment } from "@magnitudedev/icn"
+} from "@magnitudedev/acn-protocol"
+import type {
+  AssessModelResult,
+  OfferingAssessment,
+} from "@magnitudedev/icn-protocol/schemas"
+import { IcnClient } from "@magnitudedev/icn"
 import { LocalModelPackages } from "./local-model-packages"
 import {
   offeringTargetFromIcn,

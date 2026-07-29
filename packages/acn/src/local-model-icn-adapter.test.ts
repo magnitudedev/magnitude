@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Option, Schema } from "effect"
-import { DownloadAttempt as NativeDownloadAttemptSchema } from "@magnitudedev/icn"
+import { DownloadAttempt as NativeDownloadAttemptSchema } from "@magnitudedev/icn-protocol/schemas"
 import { downloadAttemptFromIcn } from "./local-model-icn-adapter"
 
 describe("local model ICN adapter", () => {

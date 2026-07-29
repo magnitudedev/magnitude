@@ -1,6 +1,6 @@
 import * as HttpClient from "@effect/platform/HttpClient"
 import { Context, Effect, Layer } from "effect"
-import { makeIcnApiClient } from "./generated/client.js"
+import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
 import { IcnProcess } from "./lifecycle/index.js"
 
 export type IcnClientService = Effect.Effect.Success<ReturnType<typeof makeIcnApiClient>>

@@ -14,10 +14,10 @@ applies_to:
   - packages/acn/src/handlers.ts
   - packages/acn/src/ops.ts
   - packages/acn/src/server.ts
-  - packages/protocol/src/rpcs/**
-  - packages/protocol/src/schemas/subscription.ts
-  - packages/protocol/src/schemas/display.ts
-  - packages/protocol/src/schemas/shell.ts
+  - packages/acn-protocol/src/rpcs/**
+  - packages/acn-protocol/src/schemas/subscription.ts
+  - packages/acn-protocol/src/schemas/display.ts
+  - packages/acn-protocol/src/schemas/shell.ts
   - packages/sdk/src/jit-rpc/**
   - packages/sdk/src/acn-jit/**
   - packages/client-common/src/**

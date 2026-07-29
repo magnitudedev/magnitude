@@ -7,10 +7,14 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, delimiter, resolve } from "node:path"
+import { basename, delimiter, dirname, resolve } from "node:path"
 import { Option, Schema } from "effect"
 import {
-  IcnInstallationSchema,
+  BackendEligibilityReport,
+  IcnInstallationDeclaration,
+  IcnStartupRecord,
+} from "@magnitudedev/icn-protocol"
+import {
   type ReleaseArtifact,
 } from "../../src/contracts"
 import {
@@ -79,10 +83,9 @@ const smokeIcnServer = async (
           pending = pending.slice(newline + 1)
           const prefix = "MAGNITUDE_ICN_READY "
           if (line.startsWith(prefix)) {
-            const value = JSON.parse(line.slice(prefix.length)) as {
-              readonly origin?: string
-              readonly instanceId?: string
-            }
+            const value = Schema.decodeUnknownSync(
+              Schema.parseJson(IcnStartupRecord),
+            )(line.slice(prefix.length))
             if (value.instanceId !== instance || !value.origin) {
               throw new Error("ICN readiness record has the wrong identity")
             }
@@ -177,7 +180,7 @@ const smokeHostArchives = async (
 
     const declaration = resolve(icnRoot, "installation.json")
     await writeFile(declaration, `${Schema.encodeSync(
-      Schema.parseJson(IcnInstallationSchema),
+      Schema.parseJson(IcnInstallationDeclaration),
     )({
       schemaVersion: 1,
       backend: "cpu",
@@ -254,6 +257,27 @@ export const buildHostArtifacts = async (
   await chmod(cli, 0o755)
   await chmod(acn, 0o755)
   await chmod(icn.binary, 0o755)
+
+  const loader = host.id.startsWith("windows-")
+    ? "PATH"
+    : host.id.startsWith("darwin-")
+      ? "DYLD_LIBRARY_PATH"
+      : "LD_LIBRARY_PATH"
+  const eligibility = await run([
+    icn.binary,
+    "backend-eligibility",
+    "--json",
+  ], {
+    env: {
+      ...process.env,
+      [loader]: [...icn.runtimeLibraries.map(dirname), process.env[loader]]
+        .filter(Boolean)
+        .join(delimiter),
+    },
+  })
+  Schema.decodeUnknownSync(
+    Schema.parseJson(BackendEligibilityReport),
+  )(eligibility)
 
   const cliArchivePath = resolve(output, cliArchive(host.id))
   const acnArchivePath = resolve(output, acnArchive(host.id))

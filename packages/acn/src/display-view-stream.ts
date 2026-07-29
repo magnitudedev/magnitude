@@ -13,7 +13,7 @@ import {
   type DisplayViewStateEvent,
   type SessionError,
   type StreamEvent,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 
 export interface DisplayViewSource {
   readonly on: {

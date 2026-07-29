@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import {
   type ProviderOfferingPackageEvidence,

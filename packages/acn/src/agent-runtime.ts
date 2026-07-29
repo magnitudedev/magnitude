@@ -17,7 +17,7 @@ import {
   SessionNotFound,
   SessionOperationFailed,
   type SessionError,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
 import { AcnShutdown } from "./acn-shutdown"
 import { AcnActivityTracker } from "./activity-tracker"

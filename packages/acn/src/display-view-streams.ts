@@ -6,7 +6,7 @@ import {
   type DisplayViewStateEvent,
   type SessionError,
   type StreamEvent,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { AcnSubscriptions } from "./acn-subscriptions"
 import { AgentRuntime } from "./agent-runtime"
 import { formatUnknownCause } from "./session-errors"

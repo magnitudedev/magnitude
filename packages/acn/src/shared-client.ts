@@ -11,7 +11,7 @@ import {
 } from "@magnitudedev/storage"
 import { IcnProvider, createLocalProvider } from "@magnitudedev/icn/provider"
 import { ModelConfiguration } from "./model-configuration"
-import { SlotIdSchema } from "@magnitudedev/protocol"
+import { SlotIdSchema } from "@magnitudedev/acn-protocol"
 
 const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,

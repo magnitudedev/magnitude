@@ -27,7 +27,7 @@
     "@magnitudedev/ai": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
 
-    "@magnitudedev/protocol": "workspace:*",
+    "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/vcs": "workspace:*",
     "effect": "^3.21.2",
     "ignore": "^7.0.5",

@@ -14,7 +14,7 @@
     "@effect/platform-bun": "^0.90.0",
     "@magnitudedev/scratchpad": "workspace:*",
     "@magnitudedev/ai": "workspace:*",
-    "@magnitudedev/protocol": "workspace:*",
+    "@magnitudedev/acn-protocol": "workspace:*",
     "effect": "^3.21.2"
   },
   "devDependencies": {

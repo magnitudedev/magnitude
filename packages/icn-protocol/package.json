@@ -1,0 +1,32 @@
+{
+  "name": "@magnitudedev/icn-protocol",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/generated/index.ts",
+  "types": "src/generated/index.ts",
+  "exports": {
+    ".": "./src/generated/index.ts",
+    "./api": "./src/generated/api.ts",
+    "./client": "./src/generated/client.ts",
+    "./operations": "./src/generated/operations.ts",
+    "./schemas": "./src/generated/schemas.ts"
+  },
+  "scripts": {
+    "generate": "bun run scripts/generate.ts",
+    "check-generated": "bun run scripts/generate.ts --check",
+    "typecheck": "tsc --noEmit",
+    "test": "bunx --bun vitest run"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.96.0",
+    "@magnitudedev/openapi-effect": "workspace:*",
+    "effect": "3.21.2"
+  },
+  "devDependencies": {
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-bun": "^0.90.0",
+    "@types/bun": "latest",
+    "vitest": "^3.2.4"
+  }
+}

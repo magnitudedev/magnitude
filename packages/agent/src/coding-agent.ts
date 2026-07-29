@@ -98,7 +98,7 @@ import type { PrepareModelRequest } from './model/model-request-preparation'
 
 // Config & Auth
 import { ProviderClient, SlotIdSchema, type ProviderClientShape } from '@magnitudedev/sdk'
-import type { DisplayViewShape, DisplayViewSnapshot } from '@magnitudedev/protocol'
+import type { DisplayViewShape, DisplayViewSnapshot } from '@magnitudedev/acn-protocol'
 import type { ForkTurnState } from './projections/turn'
 import type { AgentLifecycleState } from './projections/agent-lifecycle'
 import { deriveSessionWorkStatus, type SessionWorkStatus } from './session-work-status'

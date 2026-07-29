@@ -3,7 +3,7 @@ import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpRouter from "@effect/platform/HttpRouter"
 import type { HttpServerRequest } from "@effect/platform/HttpServerRequest"
 import { Effect, Layer, Stream } from "effect"
-import { SessionError } from "@magnitudedev/protocol"
+import { SessionError } from "@magnitudedev/acn-protocol"
 import { sessionErrorMessage } from "../session-errors"
 import { AcnIntrospector } from "./service"
 

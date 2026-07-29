@@ -48,13 +48,13 @@ import {
   type ProviderModelIdentity,
   type SlotId,
   type SlotSelection,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   CurrentModelInstance,
   IcnClient,
   IcnInstances,
-  type Generated,
 } from "@magnitudedev/icn"
+import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import {
   ReasoningEffortSchema,
   type ProviderId,

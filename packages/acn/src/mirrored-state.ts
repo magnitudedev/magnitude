@@ -1,5 +1,5 @@
 import { Context, Effect, Layer, PubSub, Schema, Stream, SubscriptionRef, type Equivalence } from "effect"
-import type { MirroredSnapshot, MirroredStateInvalidation } from "@magnitudedev/protocol"
+import type { MirroredSnapshot, MirroredStateInvalidation } from "@magnitudedev/acn-protocol"
 
 export interface MirroredStateTransition<State, Result> {
   readonly state: State

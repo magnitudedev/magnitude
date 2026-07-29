@@ -1,5 +1,5 @@
 import { Context, Duration, Effect, Layer } from "effect"
-import { AcnRpcDemand } from "@magnitudedev/protocol"
+import { AcnRpcDemand } from "@magnitudedev/acn-protocol"
 import { AcnShutdown } from "./acn-shutdown"
 import {
   makeResourceUseGate,

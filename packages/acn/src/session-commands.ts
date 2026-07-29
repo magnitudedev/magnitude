@@ -3,7 +3,7 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { createId } from "@magnitudedev/generate-id"
 import type { AppEvent } from "@magnitudedev/agent"
-import { SessionStartFailed, type InterruptTarget, type SessionError } from "@magnitudedev/protocol"
+import { SessionStartFailed, type InterruptTarget, type SessionError } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
 import type {
   SendUserMessageInput,

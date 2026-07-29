@@ -1,6 +1,6 @@
 import { Effect, Fiber, Stream } from "effect"
 import { describe, expect, it } from "vitest"
-import type { DisplayViewShape } from "@magnitudedev/protocol"
+import type { DisplayViewShape } from "@magnitudedev/acn-protocol"
 import { AcnDisplayViewIntrospector, AcnDisplayViewIntrospectorLive } from "./display-views"
 
 const rootShape: DisplayViewShape = {

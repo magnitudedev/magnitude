@@ -30,7 +30,7 @@ import type {
   WorkerResumedMessage,
   WorkerUserKilledMessage,
   ForkResultMessage,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import { Addressed } from '@magnitudedev/event-core'
 import { Schema } from 'effect'
 import type { PendingInboundCommunication } from '../projections/turn'

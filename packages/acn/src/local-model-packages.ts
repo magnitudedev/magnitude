@@ -24,7 +24,7 @@ import {
   type ModelOfferingTargetId,
   type RecommendableModel,
   modelOfferingTargetPackageIds,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   IcnCatalog,
   IcnClient,

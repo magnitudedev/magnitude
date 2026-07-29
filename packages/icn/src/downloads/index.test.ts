@@ -1,7 +1,7 @@
 import { Effect, Layer, Ref } from "effect"
 import { describe, expect, it } from "vitest"
 import { IcnClient, type IcnClientService } from "../client.js"
-import type { DownloadAttempt } from "../generated/schemas.js"
+import type { DownloadAttempt } from "@magnitudedev/icn-protocol/schemas"
 import { IcnDownloads, makeIcnDownloads } from "./index.js"
 
 const pending: DownloadAttempt = {

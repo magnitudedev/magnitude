@@ -21,7 +21,7 @@ import type { ToolKeyErased } from './tools/types'
 
 import type { Skill } from '@magnitudedev/skills'
 import type { RoleId } from '@magnitudedev/roles'
-import type { ModelReleaseReason } from '@magnitudedev/protocol'
+import type { ModelReleaseReason } from '@magnitudedev/acn-protocol'
 import type { TaskAssignee } from './tasks/types'
 import type { ErrorPresentation } from './errors/present'
 import type { CompletedTurn } from './window/types'

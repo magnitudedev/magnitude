@@ -92,7 +92,7 @@ export type {
 } from "@magnitudedev/providers"
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
-export type { UsagePeriod } from "@magnitudedev/protocol"
+export type { UsagePeriod } from "@magnitudedev/acn-protocol"
 
 // =============================================================================
 // Re-exported constants and helpers

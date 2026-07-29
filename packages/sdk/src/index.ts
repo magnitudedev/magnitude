@@ -70,7 +70,7 @@ export {
   ModelInstanceIdSchema,
   RecommendationIdSchema,
   LocalModelsStateSchema,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 
 export type {
   ModelOfferingTargetId,
@@ -151,8 +151,8 @@ export type {
   SpawnWorkerPresentation,
   GenericToolPresentation,
   QueryImagePresentation,
-} from "@magnitudedev/protocol"
-export type * from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
+export type * from "@magnitudedev/acn-protocol"
 
 export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS } from "@magnitudedev/roles"
 export type { RoleId } from "@magnitudedev/roles"

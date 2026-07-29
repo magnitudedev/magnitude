@@ -10,12 +10,12 @@ import { FetchHttpClient } from "@effect/platform"
 import { HttpClient } from "@effect/platform/HttpClient"
 import { Context, Effect, Layer } from "effect"
 import type { Scope } from "effect/Scope"
-import { MagnitudeRpcs } from "@magnitudedev/protocol"
+import { MagnitudeRpcs } from "@magnitudedev/acn-protocol"
 
 const { Protocol } = RpcClient
 
-export { MagnitudeRpcs } from "@magnitudedev/protocol"
-export type * from "@magnitudedev/protocol"
+export { MagnitudeRpcs } from "@magnitudedev/acn-protocol"
+export type * from "@magnitudedev/acn-protocol"
 
 export type AcnClient = RpcClient.FromGroup<typeof MagnitudeRpcs, RpcClientError.RpcClientError>
 

@@ -5,7 +5,7 @@ import { Schema } from 'effect'
 import {
   AcnVersionRegistryJson,
   type AcnRegistration,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import type { AcnInfo, KillAllAcnResult, RpcTraceSummary } from './lib/types'
 
 const PORT = Number(process.env.ACN_DASH_API_PORT ?? 4886)

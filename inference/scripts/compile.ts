@@ -4,6 +4,8 @@ import {
   stat,
 } from "node:fs/promises"
 import { basename, delimiter, dirname, resolve } from "node:path"
+import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
+import { Schema } from "effect"
 import { getTargetInfo } from "../../scripts/release-target"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../..")
@@ -40,17 +42,9 @@ const run = async (
   return stdout
 }
 
-export interface IcnBuildIdentity {
-  readonly api_version: number
-  readonly native_build: string
-  readonly backend_module_abi: string
-  readonly target: string
-  readonly backends: readonly string[]
-}
-
 export interface IcnBuild {
   readonly binary: string
-  readonly identity: IcnBuildIdentity
+  readonly identity: IcnBinaryIdentity
   readonly backendModules: readonly string[]
   readonly runtimeLibraries: readonly string[]
 }
@@ -125,7 +119,7 @@ const isBackendModule = (file: string): boolean => {
 const readIdentity = async (
   binary: string,
   runtimeDirectories: readonly string[],
-): Promise<IcnBuildIdentity> => {
+): Promise<IcnBinaryIdentity> => {
   const loader = process.platform === "win32"
     ? "PATH"
     : process.platform === "darwin"
@@ -139,19 +133,13 @@ const readIdentity = async (
         .join(delimiter),
     },
   })
-  const value = JSON.parse(stdout) as Partial<IcnBuildIdentity>
-  if (
-    value.api_version !== 1 ||
-    typeof value.native_build !== "string" ||
-    value.native_build.length === 0 ||
-    typeof value.backend_module_abi !== "string" ||
-    value.backend_module_abi.length === 0 ||
-    typeof value.target !== "string" ||
-    !Array.isArray(value.backends)
-  ) {
+  const value = Schema.decodeUnknownSync(
+    Schema.parseJson(IcnBinaryIdentity),
+  )(stdout)
+  if (value.api_version !== 1) {
     throw new Error("ICN identity probe returned an invalid contract")
   }
-  return value as IcnBuildIdentity
+  return value
 }
 
 export interface BuildIcnInput {

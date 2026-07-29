@@ -79,7 +79,7 @@ export {
   ModelServingConfigurationIdSchema,
   RecommendationIdSchema,
   LocalModelsStateSchema,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 
 export {
   ProviderIdSchema,
@@ -137,8 +137,8 @@ export type {
   TaskDisplayRow,
   TimelineActivity,
   ToolMessage,
-} from "@magnitudedev/protocol"
-export type * from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
+export type * from "@magnitudedev/acn-protocol"
 
 export {
   isRoleId,
@@ -155,4 +155,4 @@ export type {
   CloudUsageResponse,
 } from "@magnitudedev/providers"
 export type { UsageQuery } from "@magnitudedev/ai"
-export type { UsagePeriod } from "@magnitudedev/protocol"
+export type { UsagePeriod } from "@magnitudedev/acn-protocol"

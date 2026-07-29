@@ -7,7 +7,7 @@ import {
   SessionOperationFailed,
   SessionStartFailed,
   type SessionError,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 
 export const tryPromiseNull = <T>(fn: () => Promise<T>): Effect.Effect<T | null, never> =>
   Effect.tryPromise(fn).pipe(

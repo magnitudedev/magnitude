@@ -1,11 +1,11 @@
 ---
 applies_to:
-  - packages/protocol/src/schemas/mirrored-state.ts
-  - packages/protocol/src/rpcs/config.ts
-  - packages/protocol/src/rpcs/local-inference.ts
-  - packages/protocol/src/rpcs/onboarding.ts
-  - packages/protocol/src/schemas/model-state.ts
-  - packages/protocol/src/rpcs/group.ts
+  - packages/acn-protocol/src/schemas/mirrored-state.ts
+  - packages/acn-protocol/src/rpcs/config.ts
+  - packages/acn-protocol/src/rpcs/local-inference.ts
+  - packages/acn-protocol/src/rpcs/onboarding.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/rpcs/group.ts
   - packages/acn/src/mirrored-state.ts
   - packages/acn/src/observed-state.ts
   - packages/acn/src/provider-model-catalog.ts

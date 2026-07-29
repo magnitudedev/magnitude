@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Fiber, Layer, Option, Queue, Scope, Stream } from "effect"
 import type { AgentIntrospection, CodingAgentSession } from "@magnitudedev/agent"
-import type { DisplayViewShape } from "@magnitudedev/protocol"
+import type { DisplayViewShape } from "@magnitudedev/acn-protocol"
 import { AcnActivityTrackerLive } from "../activity-tracker"
 import { AcnShutdownLive } from "../acn-shutdown"
 import { AgentRuntime, type AgentRuntimeApi } from "../agent-runtime"

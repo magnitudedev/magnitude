@@ -1,4 +1,4 @@
-import type { AcnRegistration } from '@magnitudedev/protocol'
+import type { AcnRegistration } from '@magnitudedev/acn-protocol'
 
 export type {
   AcnDisplayViewIntrospection,

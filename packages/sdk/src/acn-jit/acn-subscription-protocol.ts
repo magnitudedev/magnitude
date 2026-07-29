@@ -4,7 +4,7 @@ import {
   AcnSubscriptionWireItem,
   MagnitudeRpcs,
   ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   isCleanOrInterruptedExit,
   type RecoveringStreamProtocol,

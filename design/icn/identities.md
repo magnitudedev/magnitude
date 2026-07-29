@@ -1,7 +1,7 @@
 ---
 applies_to:
   - inference/crates/icn-contracts/src/**
-  - packages/protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
   - packages/acn/src/local-provider-**
   - packages/acn/src/model-slot-**
 ---

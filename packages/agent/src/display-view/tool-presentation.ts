@@ -21,7 +21,7 @@ import type {
   ToolTone,
   WebFetchPresentation,
   WebSearchPresentation,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import type { ToolHandleFromSchema } from '../models/tool-handle-schema'
 import type {
   CheckpointChangesState,

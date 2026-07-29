@@ -5,8 +5,9 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   type LocalInferenceHardware as LocalInferenceHardwareState,
   type MirroredSnapshot,
-} from "@magnitudedev/protocol"
-import { IcnHardware, IcnInstances, type Generated } from "@magnitudedev/icn"
+} from "@magnitudedev/acn-protocol"
+import type * as Generated from "@magnitudedev/icn-protocol/schemas"
+import { IcnHardware, IcnInstances } from "@magnitudedev/icn"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 
 export class LocalInferenceHardwareProjectionFailure extends Data.TaggedError("LocalInferenceHardwareProjectionFailure")<{

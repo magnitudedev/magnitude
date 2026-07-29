@@ -1,7 +1,7 @@
 import { Effect, Option, Ref } from "effect"
 import { describe, expect, it } from "vitest"
 import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/ai"
-import { PRIMARY_SLOT_ID } from "@magnitudedev/protocol"
+import { PRIMARY_SLOT_ID } from "@magnitudedev/acn-protocol"
 import type { MagnitudeConfig } from "@magnitudedev/storage"
 import { makeModelConfiguration } from "./model-configuration"
 

@@ -9,7 +9,7 @@ import {
   SubscriptionRef,
 } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
-import type { ModelInstancesSnapshot } from "../generated/schemas.js"
+import type { ModelInstancesSnapshot } from "@magnitudedev/icn-protocol/schemas"
 
 type InstancesReadError = Effect.Effect.Error<
   ReturnType<IcnClientService["models"]["getModelInstances"]>

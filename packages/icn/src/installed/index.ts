@@ -1,6 +1,6 @@
 import { Cause, Context, Duration, Effect, Layer, Schedule, Schema } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
-import { InstalledModelPackagesResponse as InstalledModelPackagesResponseSchema } from "../generated/schemas.js"
+import { InstalledModelPackagesResponse as InstalledModelPackagesResponseSchema } from "@magnitudedev/icn-protocol/schemas"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
 
 type InstalledReadError = Effect.Effect.Error<

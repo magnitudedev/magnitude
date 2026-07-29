@@ -1224,6 +1224,33 @@
       "AssessmentEnvironmentId": {
         "type": "string"
       },
+      "BackendEligibilityReport": {
+        "type": "object",
+        "required": [
+          "schemaVersion",
+          "cuda",
+          "vulkan",
+          "metal"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "cuda": {
+            "$ref": "#/components/schemas/CudaEligibility"
+          },
+          "vulkan": {
+            "$ref": "#/components/schemas/VulkanEligibility"
+          },
+          "metal": {
+            "$ref": "#/components/schemas/MetalEligibility"
+          }
+        },
+        "additionalProperties": false
+      },
       "CacheTypeResponse": {
         "type": "string",
         "enum": [
@@ -1840,6 +1867,74 @@
                 "type": "string",
                 "enum": [
                   "unknown"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CudaEligibility": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "driverApi",
+              "architectures",
+              "state"
+            ],
+            "properties": {
+              "driverApi": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 1
+              },
+              "architectures": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "usable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "diagnostic",
+              "state"
+            ],
+            "properties": {
+              "diagnostic": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "absent"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "diagnostic",
+              "state"
+            ],
+            "properties": {
+              "diagnostic": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "failed"
                 ]
               }
             }
@@ -2979,6 +3074,156 @@
         },
         "additionalProperties": false
       },
+      "IcnBinaryIdentity": {
+        "type": "object",
+        "required": [
+          "version",
+          "api_version",
+          "native_build",
+          "backend_module_abi",
+          "capabilities",
+          "target",
+          "profile",
+          "rustc",
+          "backends"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "api_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "native_build": {
+            "type": "string",
+            "minLength": 1
+          },
+          "backend_module_abi": {
+            "type": "string",
+            "minLength": 1
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "profile": {
+            "type": "string",
+            "minLength": 1
+          },
+          "rustc": {
+            "type": "string",
+            "minLength": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "IcnInstallationBackend": {
+        "type": "string",
+        "enum": [
+          "cpu",
+          "metal",
+          "cuda",
+          "vulkan"
+        ]
+      },
+      "IcnInstallationDeclaration": {
+        "type": "object",
+        "required": [
+          "schemaVersion",
+          "backend",
+          "nativeBuild",
+          "backendModuleAbi"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backend": {
+            "$ref": "#/components/schemas/IcnInstallationBackend"
+          },
+          "nativeBuild": {
+            "type": "string",
+            "minLength": 1
+          },
+          "backendModuleAbi": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "IcnStartupRecord": {
+        "type": "object",
+        "required": [
+          "type",
+          "protocolVersion",
+          "origin",
+          "instanceId",
+          "pid",
+          "apiVersion",
+          "nativeBuild"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/IcnStartupRecordType"
+          },
+          "protocolVersion": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "origin": {
+            "type": "string",
+            "minLength": 1
+          },
+          "instanceId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "apiVersion": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "nativeBuild": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "IcnStartupRecordType": {
+        "type": "string",
+        "enum": [
+          "icn_ready"
+        ]
+      },
       "ImageUrlRequest": {
         "type": "object",
         "required": [
@@ -3128,6 +3373,42 @@
       "MemoryDomainId": {
         "type": "string",
         "description": "Stable identity of one physical memory pool."
+      },
+      "MetalEligibility": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "usable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "diagnostic",
+              "state"
+            ],
+            "properties": {
+              "diagnostic": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "absent"
+                ]
+              }
+            }
+          }
+        ]
       },
       "Modalities": {
         "type": "object",
@@ -4974,7 +5255,67 @@
         },
         "additionalProperties": false
       },
-      "Value": {}
+      "Value": {},
+      "VulkanEligibility": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "loaderApi",
+              "state"
+            ],
+            "properties": {
+              "loaderApi": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 1
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "usable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "diagnostic",
+              "state"
+            ],
+            "properties": {
+              "diagnostic": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "absent"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "diagnostic",
+              "state"
+            ],
+            "properties": {
+              "diagnostic": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            }
+          }
+        ]
+      }
     }
   }
 }

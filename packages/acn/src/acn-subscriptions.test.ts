@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Ref } from "effect"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
-import type { AcnSubscriptionControl } from "@magnitudedev/protocol"
+import type { AcnSubscriptionControl } from "@magnitudedev/acn-protocol"
 
 describe("AcnSubscriptions", () => {
   it("targets session suspension and broadcasts ACN termination", async () => {

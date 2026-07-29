@@ -21,7 +21,7 @@ import type {
   SessionWorkStatus,
 } from "@magnitudedev/agent"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
-import { SessionOperationFailed } from "@magnitudedev/protocol"
+import { SessionOperationFailed } from "@magnitudedev/acn-protocol"
 import { AcnShutdown, type AcnShutdownApi } from "./acn-shutdown"
 import { AgentFactory, type AgentFactoryApi } from "./agent-factory"
 import {

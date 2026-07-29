@@ -3,7 +3,7 @@ import type { FromClientEncoded, FromServerEncoded } from "@effect/rpc/RpcMessag
 import {
   AcnSubscriptionMetadataTag,
   MagnitudeRpcs,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
 import { AcnSubscriptions } from "./acn-subscriptions"
 

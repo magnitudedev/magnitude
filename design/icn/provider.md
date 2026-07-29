@@ -10,7 +10,7 @@ applies_to:
   - packages/acn/src/provider-model-catalog.ts
   - packages/agent/src/model/**
   - packages/agent/src/errors/model-start.ts
-  - packages/protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
 ---

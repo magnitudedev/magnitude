@@ -51,14 +51,6 @@ export const ReleaseManifestSchema = Schema.Struct({
 })
 export type ReleaseManifest = typeof ReleaseManifestSchema.Type
 
-export const IcnInstallationSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  backend: BackendSchema,
-  nativeBuild: NonEmpty,
-  backendModuleAbi: NonEmpty,
-})
-export type IcnInstallation = typeof IcnInstallationSchema.Type
-
 export class InvalidReleaseManifest extends Data.TaggedError("InvalidReleaseManifest")<{
   readonly message: string
 }> {}

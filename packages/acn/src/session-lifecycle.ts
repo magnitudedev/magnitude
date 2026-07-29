@@ -11,7 +11,7 @@ import {
   type SessionCwdSummary,
   type SessionMetadata as ProtocolSessionMetadata,
   type SessionOptions,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
 import { SessionDrafts } from "./session-drafts"
 import { SessionCommands } from "./session-commands"

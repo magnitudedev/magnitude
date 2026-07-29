@@ -4,7 +4,7 @@ import type {
   DisplayTimelineMessages,
   DisplayTimelinePresentation,
   DisplayTimelineWindowInfo,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 
 export interface DisplayTimelineOrdinary {
   readonly mode: DisplayTimeline['mode']

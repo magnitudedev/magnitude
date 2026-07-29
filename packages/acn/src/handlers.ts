@@ -6,7 +6,7 @@ import {
   type DisplayViewShape,
   type ModelOfferingTargetId,
   type SessionError,
-} from "@magnitudedev/protocol";
+} from "@magnitudedev/acn-protocol";
 import { Cause, Chunk, Effect, Option, Stream } from "effect";
 import { SessionCommands } from "./session-commands";
 import { SessionLifecycle } from "./session-lifecycle";
@@ -41,7 +41,7 @@ import { LocalInferenceHardware } from "./local-inference-hardware";
 import { LocalModelPackages } from "./local-model-packages";
 import { LocalModels } from "./local-models";
 import { LocalProviderOfferings } from "./local-provider-offerings";
-import { modelOfferingTargetPackageIds } from "@magnitudedev/protocol";
+import { modelOfferingTargetPackageIds } from "@magnitudedev/acn-protocol";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
