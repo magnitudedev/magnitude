@@ -5,6 +5,7 @@ import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as Path from "@effect/platform/Path"
 import { Effect, Option, Schedule, Stream } from "effect"
 import { ArchiveExtractor } from "./archive"
+import { downloadArtifact as downloadReleaseArtifact } from "./artifact-download"
 import { ReleaseAcquisitionError } from "./errors"
 import {
   decodeReleaseManifest,
@@ -13,7 +14,8 @@ import {
 } from "./contracts"
 
 const MANIFEST_LIMIT = 16 * 1024 * 1024
-const ARCHIVE_LIMIT = 4 * 1024 * 1024 * 1024
+const MAXIMUM_DOWNLOAD_CHUNK_SIZE = 16 * 1024 * 1024
+const PARALLEL_DOWNLOAD_CONCURRENCY = 4
 
 export interface AcquiredRelease {
   readonly manifest: ReleaseManifest
@@ -224,76 +226,6 @@ export const selectArtifact = (
     ))
 }
 
-const downloadArtifact = (
-  url: string,
-  artifact: ReleaseArtifact,
-  destination: string,
-): Effect.Effect<
-  void,
-  ReleaseAcquisitionError,
-  FileSystem.FileSystem | HttpClient.HttpClient
-> =>
-  Effect.suspend(() => {
-    const digest = createHash("sha256")
-    let bytes = 0
-    return Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem
-      const client = yield* HttpClient.HttpClient
-      yield* fs.truncate(destination, 0).pipe(
-        Effect.mapError(() => failure("download", "unable to reset release staging file")),
-      )
-      const response = yield* client.execute(HttpClientRequest.get(url)).pipe(
-        Effect.mapError(() => failure("download", "release artifact request failed", true)),
-      )
-      if (response.status < 200 || response.status >= 300) {
-        return yield* failure(
-          "download",
-          `release endpoint returned HTTP ${response.status}`,
-          transientStatus(response.status),
-        )
-      }
-      const declared = Number(response.headers["content-length"])
-      if (Number.isFinite(declared) && declared !== artifact.bytes) {
-        return yield* failure("download", "release artifact size differs from its manifest")
-      }
-      yield* response.stream.pipe(
-        Stream.tap((chunk) =>
-          bytes + chunk.byteLength > artifact.bytes ||
-          bytes + chunk.byteLength > ARCHIVE_LIMIT
-            ? Effect.fail(failure(
-              "download",
-              "release artifact exceeds its declared size",
-            ))
-            : Effect.sync(() => {
-              bytes += chunk.byteLength
-              digest.update(chunk)
-            })
-        ),
-        Stream.run(fs.sink(destination, { flag: "w", mode: 0o600 })),
-        Effect.mapError((cause) =>
-          cause instanceof ReleaseAcquisitionError
-            ? cause
-            : failure("download", "release artifact stream failed", true)
-        ),
-      )
-      if (bytes !== artifact.bytes || digest.digest("hex") !== artifact.sha256) {
-        return yield* failure("download", "release artifact digest or size differs from manifest")
-      }
-    })
-  }).pipe(
-    Effect.timeoutFail({
-      duration: "10 minutes",
-      onTimeout: () => failure("download", "release artifact response timed out", true),
-    }),
-    Effect.retry({
-      while: (error) => error.transient,
-      schedule: Schedule.exponential("500 millis").pipe(
-        Schedule.jittered,
-        Schedule.intersect(Schedule.recurs(2)),
-      ),
-    }),
-  )
-
 export const installArtifact = (
   baseUrl: string,
   version: string,
@@ -315,16 +247,33 @@ export const installArtifact = (
       yield* fs.makeDirectory(parent, { recursive: true, mode: 0o700 }).pipe(
         Effect.mapError(() => failure("install", "unable to create release directory")),
       )
-      const archive = yield* fs.makeTempFileScoped({
+      const downloadDirectory = yield* fs.makeTempDirectoryScoped({
         directory: parent,
         prefix: ".download-",
       }).pipe(
-        Effect.mapError(() => failure("install", "unable to create release staging file")),
+        Effect.mapError(() =>
+          failure("install", "unable to create release download directory")
+        ),
       )
-      yield* downloadArtifact(
-        releaseUrl(baseUrl, version, artifact.filename),
-        artifact,
-        archive,
+      const archive = path.join(downloadDirectory, "artifact")
+      yield* downloadReleaseArtifact({
+        url: releaseUrl(baseUrl, version, artifact.filename),
+        destination: archive,
+        bytes: artifact.bytes,
+        sha256: artifact.sha256,
+        strategy: {
+          _tag: "Segmented",
+          concurrency: PARALLEL_DOWNLOAD_CONCURRENCY,
+          chunkBytes: Math.min(
+            MAXIMUM_DOWNLOAD_CHUNK_SIZE,
+            Math.ceil(artifact.bytes / PARALLEL_DOWNLOAD_CONCURRENCY),
+          ),
+          fallbackToSequential: true,
+        },
+      }).pipe(
+        Effect.mapError((error) =>
+          failure("download", error.message, error.transient)
+        ),
       )
       const staging = yield* fs.makeTempDirectory({
         directory: parent,
