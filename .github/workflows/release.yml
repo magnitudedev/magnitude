@@ -32,7 +32,7 @@ jobs:
     outputs:
       action: ${{ steps.preflight.outputs.action }}
       version: ${{ steps.preflight.outputs.version }}
-      source_commit: ${{ steps.preflight.outputs.source_commit }}
+      source_commit: ${{ steps.source.outputs.commit }}
       hosts: ${{ steps.matrix.outputs.hosts }}
       backends: ${{ steps.matrix.outputs.backends }}
     steps:
@@ -45,7 +45,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_COMMIT: ${{ github.event.pull_request.head.sha }}
+          EVENT_COMMIT: ${{ github.event_name == 'pull_request' && github.sha || '' }}
         run: |
           commit="$EVENT_COMMIT"
           if [ -z "$commit" ]; then
@@ -76,18 +76,13 @@ jobs:
           [[ "$commit" =~ ^[a-f0-9]{40}$ ]]
           git merge-base --is-ancestor "$commit" origin/main
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.source.outputs.commit }}
-          fetch-depth: 0
-      - name: Require the exact commit on main
+      - name: Validate the release commit
         shell: bash
         env:
           RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           test "${{ github.ref }}" = "refs/heads/main"
           [[ "$RELEASE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
-          test "$RELEASE_COMMIT" = "$(git rev-parse HEAD)"
           git fetch origin main
           git merge-base --is-ancestor "$RELEASE_COMMIT" origin/main
       - uses: oven-sh/setup-bun@v2
@@ -104,6 +99,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Validate the preflight action
+        shell: bash
+        env:
+          ACTION: ${{ steps.preflight.outputs.action }}
+        run: |
+          case "$ACTION" in
+            release|publish-npm|complete) ;;
+            *) echo "::error::Invalid preflight action: '${ACTION}'"; exit 1 ;;
+          esac
       - id: matrix
         if: steps.preflight.outputs.action == 'release'
         run: bun run packages/release/scripts/matrix.ts
