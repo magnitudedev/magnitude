@@ -5,8 +5,8 @@ generator resolves it through ICN's production repository resolver, GGUF parser,
 template assessor, and native planner. It emits one reviewed release manifest:
 
 - `generated/release-catalog.lock.json` contains the resolved catalog and hardware-independent
-  model-planning metadata, including immutable Hugging Face revisions and the exact byte length and
-  digest of every GGUF header required by the native planner.
+  model-planning metadata, including immutable Hugging Face revisions, exact source GGUF-header
+  ranges, and the digest and size of every compact planner stub.
 
 After editing the source or when intentionally updating pinned upstream revisions, run from the
 repository root:
@@ -17,13 +17,18 @@ bun run icn:catalog:hydrate
 bun run icn:catalog:check
 ```
 
-Update synchronously conditionally revalidates every upstream repository, fails rather than
-publishing a partial catalog, and writes the manifest atomically. Review the source and generated
-diffs together. Stable upstream and source inputs produce byte-identical output.
+Update synchronously conditionally revalidates every upstream repository, generates standard-GGUF
+planner stubs without lexical tokenizer payloads, and compares the native planning result of each
+source header and stub at every curated profile. Each primary stub contains a compressible
+placeholder vocabulary of the original cardinality so llama.cpp follows its ordinary vocabulary
+loading path and preserves graph-relevant metadata. Any resolution or parity failure prevents
+publication. Review the source and generated diffs together. Stable upstream and source inputs
+produce byte-identical output.
 
-Hydrate downloads only the pinned header byte ranges from Hugging Face, verifies each digest,
-deterministically packs them, and verifies the aggregate digest from the lock file. `check` repeats
-that validation offline. The bundle is not committed to the repository.
+Hydrate downloads only the pinned source-header byte ranges from Hugging Face, verifies each
+digest, reproduces and verifies each compact stub, deterministically packs the stubs, and verifies
+the aggregate digest from the lock file. `check` repeats that validation offline. The bundle is not
+committed to the repository.
 
 Normal product startup never runs this workflow and never reconstructs this catalog from the
 network. Release builds package the lock file and planner bundle beside ICN under `catalog/`; local

@@ -874,8 +874,9 @@ fn native_template_identity() -> &'static str {
 
 fn native_planner_identity() -> String {
     format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         native_template_identity(),
+        icn_models::PLANNER_STUB_FORMAT_IDENTITY,
         llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
         llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
     )
@@ -4179,12 +4180,18 @@ async fn generate_release_catalog(
     inventory
         .set_hardware_assessor(assessor.clone())
         .context("failed to configure catalog generation hardware assessment")?;
-    let repositories = Arc::new(ModelPreviewService::new(inventory.clone(), assessor));
+    let repositories = Arc::new(ModelPreviewService::new(
+        inventory.clone(),
+        assessor.clone(),
+    ));
     let resolver = ResolvingRecommendableCatalog::new(inventory, repositories);
     let generated = resolver
         .resolve_release_catalog()
         .await
         .context("failed to resolve the curated model catalog")?;
+    verify_compact_planner_parity(&generated, assessor.as_ref())
+        .await
+        .context("compact planner inputs changed native planning results")?;
     let planner_bundle = generated
         .encode_planner_bundle()
         .context("failed to encode release planner inputs")?;
@@ -4211,6 +4218,45 @@ async fn generate_release_catalog(
         .await
         .context("failed to publish the generated catalog")?;
     println!("generated {}", output.display());
+    Ok(())
+}
+
+async fn verify_compact_planner_parity(
+    generated: &icn_models::GeneratedReleaseCatalog,
+    assessor: &NativeHardwareAssessor,
+) -> anyhow::Result<()> {
+    for model in &generated.catalog.models {
+        let profiles = model
+            .eligible_serving_profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| ModelPreviewProfile {
+                id: format!("release-{index}"),
+                context_length: profile.context_length,
+                parallel_sequences: 1,
+            })
+            .collect::<Vec<_>>();
+        let source = generated
+            .resolve_source_planner_target(&model.target_id)
+            .with_context(|| format!("failed to materialize source input for {}", model.id.0))?;
+        let compact = generated
+            .resolve_compact_planner_target(&model.target_id)
+            .with_context(|| format!("failed to materialize compact input for {}", model.id.0))?;
+        let source_assessments = assessor
+            .assess_resolved_profiles(source.target_model.clone(), profiles.clone())
+            .await
+            .with_context(|| format!("failed to plan source input for {}", model.id.0))?;
+        let compact_assessments = assessor
+            .assess_resolved_profiles(compact.target_model.clone(), profiles)
+            .await
+            .with_context(|| format!("failed to plan compact input for {}", model.id.0))?;
+        if compact_assessments != source_assessments {
+            anyhow::bail!(
+                "native planning parity failed for catalog target {}",
+                model.id.0
+            );
+        }
+    }
     Ok(())
 }
 

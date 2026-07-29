@@ -7,41 +7,42 @@ use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
-const MAGIC: &[u8; 8] = b"MAGPLAN1";
+const MAGIC: &[u8; 8] = b"MAGPLAN2";
+const MAX_PLANNER_INPUT_BYTES: usize = 128 * 1024 * 1024;
 
 pub fn encode(
-    headers: &BTreeMap<String, Vec<u8>>,
+    inputs: &BTreeMap<String, Vec<u8>>,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Vec<u8>, String> {
     let mut encoded = Vec::new();
-    let total = headers.len();
+    let total = inputs.len();
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(
-        &u32::try_from(headers.len())
-            .map_err(|_| "too many planner headers".to_owned())?
+        &u32::try_from(inputs.len())
+            .map_err(|_| "too many planner inputs".to_owned())?
             .to_le_bytes(),
     );
-    for (index, (digest, header)) in headers.iter().enumerate() {
+    for (index, (digest, input)) in inputs.iter().enumerate() {
         validate_digest(digest)?;
-        if sha256(header) != *digest {
+        if sha256(input) != *digest {
             return Err(format!(
-                "planner header {digest} failed integrity validation"
+                "planner input {digest} failed integrity validation"
             ));
         }
         let mut compressor = GzEncoder::new(Vec::new(), Compression::fast());
         compressor
-            .write_all(header)
+            .write_all(input)
             .map_err(|error| error.to_string())?;
         let compressed = compressor.finish().map_err(|error| error.to_string())?;
         encoded.extend_from_slice(digest.as_bytes());
         encoded.extend_from_slice(
-            &u64::try_from(header.len())
-                .map_err(|_| "planner header is too large".to_owned())?
+            &u64::try_from(input.len())
+                .map_err(|_| "planner input is too large".to_owned())?
                 .to_le_bytes(),
         );
         encoded.extend_from_slice(
             &u64::try_from(compressed.len())
-                .map_err(|_| "compressed planner header is too large".to_owned())?
+                .map_err(|_| "compressed planner input is too large".to_owned())?
                 .to_le_bytes(),
         );
         encoded.extend_from_slice(&compressed);
@@ -76,9 +77,12 @@ impl<'a> PlannerBundle<'a> {
                 .to_owned();
             validate_digest(&digest)?;
             let uncompressed_len = usize::try_from(read_u64(bytes, &mut cursor)?)
-                .map_err(|_| "planner header is too large".to_owned())?;
+                .map_err(|_| "planner input is too large".to_owned())?;
+            if uncompressed_len == 0 || uncompressed_len > MAX_PLANNER_INPUT_BYTES {
+                return Err("planner input length is outside the supported bound".to_owned());
+            }
             let compressed_len = usize::try_from(read_u64(bytes, &mut cursor)?)
-                .map_err(|_| "compressed planner header is too large".to_owned())?;
+                .map_err(|_| "compressed planner input is too large".to_owned())?;
             let start = cursor;
             read_bytes(bytes, &mut cursor, compressed_len)?;
             if entries
@@ -91,7 +95,7 @@ impl<'a> PlannerBundle<'a> {
                 )
                 .is_some()
             {
-                return Err("planner bundle contains a duplicate header".to_owned());
+                return Err("planner bundle contains a duplicate input".to_owned());
             }
         }
         if cursor != bytes.len() {
@@ -104,22 +108,22 @@ impl<'a> PlannerBundle<'a> {
         self.entries.contains_key(digest)
     }
 
-    pub fn header(&self, digest: &str) -> Result<Vec<u8>, String> {
+    pub fn input(&self, digest: &str) -> Result<Vec<u8>, String> {
         let entry = self
             .entries
             .get(digest)
-            .ok_or_else(|| format!("planner bundle is missing header {digest}"))?;
+            .ok_or_else(|| format!("planner bundle is missing input {digest}"))?;
         let mut decoder = GzDecoder::new(&self.bytes[entry.compressed.clone()]);
-        let mut header = Vec::with_capacity(entry.uncompressed_len);
+        let mut input = Vec::with_capacity(entry.uncompressed_len);
         decoder
-            .read_to_end(&mut header)
+            .read_to_end(&mut input)
             .map_err(|error| error.to_string())?;
-        if header.len() != entry.uncompressed_len || sha256(&header) != digest {
+        if input.len() != entry.uncompressed_len || sha256(&input) != digest {
             return Err(format!(
-                "planner header {digest} failed integrity validation"
+                "planner input {digest} failed integrity validation"
             ));
         }
-        Ok(header)
+        Ok(input)
     }
 }
 
@@ -131,7 +135,7 @@ fn validate_digest(digest: &str) -> Result<(), String> {
     if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err(format!("invalid planner header digest {digest}"))
+        Err(format!("invalid planner input digest {digest}"))
     }
 }
 
@@ -158,4 +162,39 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
         .try_into()
         .map_err(|_| "invalid planner bundle integer".to_owned())?;
     Ok(u64::from_le_bytes(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_round_trips_verified_inputs() {
+        let input = b"compact planner input".to_vec();
+        let digest = sha256(&input);
+        let encoded = encode(
+            &BTreeMap::from([(digest.clone(), input.clone())]),
+            |_, _| {},
+        )
+        .unwrap();
+        let bundle = PlannerBundle::parse(&encoded).unwrap();
+        assert!(bundle.contains(&digest));
+        assert_eq!(bundle.input(&digest).unwrap(), input);
+    }
+
+    #[test]
+    fn old_bundle_format_is_not_accepted() {
+        assert!(PlannerBundle::parse(b"MAGPLAN1\0\0\0\0").is_err());
+    }
+
+    #[test]
+    fn invalid_declared_input_size_is_rejected_before_decompression() {
+        let input = b"x".to_vec();
+        let digest = sha256(&input);
+        let mut encoded = encode(&BTreeMap::from([(digest, input)]), |_, _| {}).unwrap();
+        let size_offset = MAGIC.len() + 4 + 64;
+        encoded[size_offset..size_offset + 8]
+            .copy_from_slice(&((MAX_PLANNER_INPUT_BYTES as u64) + 1).to_le_bytes());
+        assert!(PlannerBundle::parse(&encoded).is_err());
+    }
 }
