@@ -28,8 +28,9 @@ rebuilds or replaces native assets.
 
 ## Artifacts
 
-Magnitude publishes CLI, ACN, and ICN-base archives for Apple arm64 and x64, Linux GNU arm64 and
-x64, and Windows MSVC x64.
+Magnitude publishes CLI, ACN, and ICN-base archives for Apple arm64 and x64 and Linux GNU arm64
+and x64. Windows release artifacts are intentionally disabled until the Windows product path and
+release builds are reliable.
 
 CLI and ACN archives contain one executable under `bin/`. ICN bases contain the executable, common
 runtime libraries, CPU modules, the release catalog lock, and the model-planner-input bundle.
@@ -37,6 +38,12 @@ runtime libraries, CPU modules, the release catalog lock, and the model-planner-
 Metal, CUDA, and Vulkan are separate backend packs. Each pack contains one backend module family
 and only its required redistributable runtime libraries. The supported hosts and packs are fixed
 product configuration, not a plugin system.
+
+CUDA backend packs currently contain PTX only for compute capabilities 8.0, 9.0, and 12.0. These
+tiers preserve the Ampere-and-newer compatibility baseline and the dedicated Hopper and Blackwell
+compile-time paths while keeping release build time bounded. Additional compatibility tiers or
+native cubins may be restored when measured startup latency or runtime performance justifies their
+build cost.
 
 One manifest records every native archive's release identity, filename, size, SHA-256, native-build
 identity, backend ABI, and compatibility facts used at runtime. Production acquisition trusts the
