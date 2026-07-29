@@ -104,6 +104,6 @@ Forward reuse requires newer ACNs to preserve released request and response mean
 registration, health, and subscription fields used by older clients. Breaking wire changes require
 explicit compatibility negotiation.
 
-Downloaded ACN binaries use authenticated digest paths under their version and host, with a small
-validated pointer selecting the current digest. ACN receives the same data root used for
+Downloaded ACN binaries use manifest-declared digest paths under their version and host, with a
+small validated pointer selecting the current digest. ACN receives the same data root used for
 registration, election, ownership, storage, and ICN storage.

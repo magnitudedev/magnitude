@@ -1,10 +1,4 @@
-import {
-  createHash,
-  createPrivateKey,
-  createPublicKey,
-  sign,
-  verify,
-} from "node:crypto"
+import { createHash } from "node:crypto"
 import {
   copyFile,
   mkdir,
@@ -19,10 +13,8 @@ import { Option, Schema } from "effect"
 import {
   ReleaseArtifactSchema,
   ReleaseManifestSchema,
-  ReleaseSignatureSchema,
   type ReleaseArtifact,
 } from "../src/contracts"
-import { embeddedTrustedReleaseKeys } from "../src/trust"
 import {
   acnArchive,
   backendArchive,
@@ -253,41 +245,10 @@ const manifest = Schema.decodeUnknownSync(ReleaseManifestSchema)({
 const manifestBytes = new TextEncoder().encode(
   `${JSON.stringify(Schema.encodeSync(ReleaseManifestSchema)(manifest), null, 2)}\n`,
 )
-const keyId = required("MAGNITUDE_RELEASE_SIGNING_KEY_ID")
-const privateKey = createPrivateKey({
-  key: Buffer.from(required("MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8"), "base64"),
-  format: "der",
-  type: "pkcs8",
-})
-const signatureValue = sign(null, manifestBytes, privateKey)
-const signature = Schema.decodeUnknownSync(ReleaseSignatureSchema)({
-  schemaVersion: 1,
-  algorithm: "ed25519",
-  keyId,
-  signature: signatureValue.toString("base64"),
-})
-const trustedKeys = embeddedTrustedReleaseKeys()
-const trusted = trustedKeys.find((key) => key.keyId === keyId)
-if (!trusted) throw new Error("signing key is absent from the production trust ring")
-const publicKey = createPublicKey({
-  key: Buffer.from(trusted.publicKeySpki, "base64"),
-  format: "der",
-  type: "spki",
-})
-if (
-  !verify(null, manifestBytes, publicKey, signatureValue) ||
-  !createPublicKey(privateKey).equals(publicKey)
-) {
-  throw new Error("signing key does not match the production trust ring")
-}
 
 await rm(output, { recursive: true, force: true })
 await mkdir(output, { recursive: true, mode: 0o700 })
 await writeFile(resolve(output, "magnitude-release.json"), manifestBytes)
-await writeFile(
-  resolve(output, "magnitude-release.json.sig"),
-  `${JSON.stringify(Schema.encodeSync(ReleaseSignatureSchema)(signature), null, 2)}\n`,
-)
 for (const artifact of artifacts) {
   await copyFile(archiveById.get(artifact.id)!, resolve(output, artifact.filename))
 }

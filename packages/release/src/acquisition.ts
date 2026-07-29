@@ -1,26 +1,22 @@
-import { createHash, createPublicKey, verify } from "node:crypto"
+import { createHash } from "node:crypto"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as Path from "@effect/platform/Path"
-import { Effect, Option, Schedule, Schema, Stream } from "effect"
+import { Effect, Option, Schedule, Stream } from "effect"
 import { ArchiveExtractor } from "./archive"
 import { ReleaseAcquisitionError } from "./errors"
 import {
   decodeReleaseManifest,
-  ReleaseSignatureSchema,
   type ReleaseArtifact,
   type ReleaseManifest,
-  type TrustedReleaseKey,
 } from "./contracts"
 
 const MANIFEST_LIMIT = 16 * 1024 * 1024
-const SIGNATURE_LIMIT = 16 * 1024
 const ARCHIVE_LIMIT = 4 * 1024 * 1024 * 1024
 
-export interface AuthenticatedRelease {
+export interface AcquiredRelease {
   readonly manifest: ReleaseManifest
-  readonly manifestBytes: Uint8Array
   readonly manifestSha256: string
 }
 
@@ -109,143 +105,104 @@ const getBounded = (
     }),
   )
 
-export const authenticateRelease = (
+export const validateReleaseManifestBytes = (
   manifestBytes: Uint8Array,
-  signatureBytes: Uint8Array,
-  trustedKeys: readonly TrustedReleaseKey[],
-): Effect.Effect<AuthenticatedRelease, ReleaseAcquisitionError> =>
+): Effect.Effect<AcquiredRelease, ReleaseAcquisitionError> =>
   Effect.gen(function* () {
-    const signature = yield* Schema.decodeUnknown(
-      Schema.parseJson(ReleaseSignatureSchema),
-    )(new TextDecoder().decode(signatureBytes)).pipe(
-      Effect.mapError(() => failure("authenticate", "release signature is malformed")),
-    )
-    const trusted = trustedKeys.find((key) => key.keyId === signature.keyId)
-    if (!trusted) return yield* failure("authenticate", "release signature uses an untrusted key")
-    const valid = yield* Effect.sync(() => {
-      try {
-        return verify(
-          null,
-          manifestBytes,
-          createPublicKey({
-            key: Buffer.from(trusted.publicKeySpki, "base64"),
-            format: "der",
-            type: "spki",
-          }),
-          Buffer.from(signature.signature, "base64"),
-        )
-      } catch {
-        return false
-      }
-    })
-    if (!valid) return yield* failure("authenticate", "release signature is invalid")
     const manifest = yield* decodeReleaseManifest(manifestBytes).pipe(
-      Effect.mapError((error) => failure("authenticate", error.message)),
+      Effect.mapError((error) => failure("validate", error.message)),
     )
     return {
       manifest,
-      manifestBytes,
       manifestSha256: createHash("sha256").update(manifestBytes).digest("hex"),
     }
   })
 
-const readCachedPair = (
+const readCachedManifest = (
   directory: string,
 ): Effect.Effect<
-  Option.Option<readonly [Uint8Array, Uint8Array]>,
+  Option.Option<Uint8Array>,
   never,
   FileSystem.FileSystem | Path.Path
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const path = yield* Path.Path
-    const pair = yield* Effect.all([
-      fs.readFile(path.join(directory, "magnitude-release.json")),
-      fs.readFile(path.join(directory, "magnitude-release.json.sig")),
-    ]).pipe(Effect.option)
-    if (Option.isNone(pair)) return Option.none()
-    const [manifest, signature] = pair.value
-    return manifest.byteLength <= MANIFEST_LIMIT && signature.byteLength <= SIGNATURE_LIMIT
-      ? Option.some([manifest, signature] as const)
+    const manifest = yield* fs.readFile(
+      path.join(directory, "magnitude-release.json"),
+    ).pipe(Effect.option)
+    if (Option.isNone(manifest)) return Option.none()
+    return manifest.value.byteLength <= MANIFEST_LIMIT
+      ? manifest
       : Option.none()
   })
 
-const publishCachedPair = (
+const publishCachedManifest = (
   directory: string,
   manifest: Uint8Array,
-  signature: Uint8Array,
 ): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem
-      const path = yield* Path.Path
-      const parent = path.dirname(directory)
-      yield* fs.makeDirectory(parent, { recursive: true, mode: 0o700 })
-      const staging = yield* fs.makeTempDirectoryScoped({
-        directory: parent,
-        prefix: ".manifest-",
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const path = yield* Path.Path
+    const parent = path.dirname(directory)
+    yield* fs.makeDirectory(parent, { recursive: true, mode: 0o700 })
+    const staging = yield* fs.makeTempDirectory({
+      directory: parent,
+      prefix: ".manifest-",
+    })
+    yield* Effect.gen(function* () {
+      yield* fs.writeFile(path.join(staging, "magnitude-release.json"), manifest, {
+        flag: "wx",
+        mode: 0o600,
       })
-      yield* Effect.all([
-        fs.writeFile(path.join(staging, "magnitude-release.json"), manifest, {
-          flag: "wx",
-          mode: 0o600,
-        }),
-        fs.writeFile(path.join(staging, "magnitude-release.json.sig"), signature, {
-          flag: "wx",
-          mode: 0o600,
-        }),
-      ])
       yield* fs.rename(staging, directory).pipe(
         Effect.catchAll(() => Effect.void),
       )
-    }),
-  ).pipe(Effect.catchAll(() => Effect.void))
+    }).pipe(
+      Effect.ensuring(
+        fs.remove(staging, { recursive: true, force: true }).pipe(
+          Effect.catchAll(() => Effect.void),
+        ),
+      ),
+    )
+  }).pipe(Effect.catchAll(() => Effect.void))
 
 export const acquireRelease = (
   baseUrl: string,
   version: string,
-  trustedKeys: readonly TrustedReleaseKey[],
   cacheDirectory: string,
 ): Effect.Effect<
-  AuthenticatedRelease,
+  AcquiredRelease,
   ReleaseAcquisitionError,
   FileSystem.FileSystem | Path.Path | HttpClient.HttpClient
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
-    const cached = yield* readCachedPair(cacheDirectory)
+    const cached = yield* readCachedManifest(cacheDirectory)
     if (Option.isSome(cached)) {
-      const authenticated = yield* authenticateRelease(
-        cached.value[0],
-        cached.value[1],
-        trustedKeys,
-      ).pipe(Effect.option)
-      if (Option.isSome(authenticated) && authenticated.value.manifest.version === version) {
-        return authenticated.value
+      const acquired = yield* validateReleaseManifestBytes(cached.value).pipe(
+        Effect.option,
+      )
+      if (
+        Option.isSome(acquired) &&
+        acquired.value.manifest.version === version &&
+        acquired.value.manifest.tag === releaseTag(version)
+      ) {
+        return acquired.value
       }
     }
     yield* fs.remove(cacheDirectory, { recursive: true, force: true }).pipe(
       Effect.catchAll(() => Effect.void),
     )
     const manifestUrl = releaseUrl(baseUrl, version, "magnitude-release.json")
-    const [manifestBytes, signatureBytes] = yield* Effect.all(
-      [
-        getBounded(manifestUrl, MANIFEST_LIMIT),
-        getBounded(`${manifestUrl}.sig`, SIGNATURE_LIMIT),
-      ],
-      { concurrency: 2 },
-    )
-    const authenticated = yield* authenticateRelease(
-      manifestBytes,
-      signatureBytes,
-      trustedKeys,
-    )
+    const manifestBytes = yield* getBounded(manifestUrl, MANIFEST_LIMIT)
+    const acquired = yield* validateReleaseManifestBytes(manifestBytes)
     if (
-      authenticated.manifest.version !== version ||
-      authenticated.manifest.tag !== releaseTag(version)
-    ) return yield* failure("authenticate", "release identity differs from requested version")
-    yield* publishCachedPair(cacheDirectory, manifestBytes, signatureBytes)
-    return authenticated
+      acquired.manifest.version !== version ||
+      acquired.manifest.tag !== releaseTag(version)
+    ) return yield* failure("validate", "release identity differs from requested version")
+    yield* publishCachedManifest(cacheDirectory, manifestBytes)
+    return acquired
   })
 
 export const selectArtifact = (
@@ -262,7 +219,7 @@ export const selectArtifact = (
   return matches.length === 1
     ? Effect.succeed(matches[0]!)
     : Effect.fail(failure(
-      "authenticate",
+      "validate",
       `release has ${matches.length} matching ${kind} artifacts`,
     ))
 }
@@ -305,7 +262,7 @@ const downloadArtifact = (
           bytes + chunk.byteLength > ARCHIVE_LIMIT
             ? Effect.fail(failure(
               "download",
-              "release artifact exceeds its authenticated size",
+              "release artifact exceeds its declared size",
             ))
             : Effect.sync(() => {
               bytes += chunk.byteLength

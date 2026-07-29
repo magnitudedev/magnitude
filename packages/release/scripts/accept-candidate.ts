@@ -28,7 +28,6 @@ if (!cliArtifact) {
 const routes = new Map(
   [
     "magnitude-release.json",
-    "magnitude-release.json.sig",
     ...manifest.artifacts.map((artifact) => artifact.filename),
   ].map((name) => [
     new URL(releaseUrl("http://release.invalid", manifest.version, name)).pathname,

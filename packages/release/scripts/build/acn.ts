@@ -39,11 +39,6 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
     "bin",
     `magnitude-acn${info.executableExt}`,
   )
-  const trustedKeys = process.env.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON?.trim()
-  if (!trustedKeys) {
-    throw new Error("MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON is required")
-  }
-  JSON.parse(trustedKeys)
   await mkdir(resolve(PROJECT_ROOT, "bin"), { recursive: true })
   await downloadRg(
     resolve(PROJECT_ROOT, "packages/ripgrep/bin"),
@@ -57,8 +52,6 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
       "--compile",
       `--target=${target}`,
       `--outfile=${binary}`,
-      "--define",
-      `MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON=${JSON.stringify(trustedKeys)}`,
     ], { cwd: PROJECT_ROOT }),
   )
   if (info.platform === "darwin") {

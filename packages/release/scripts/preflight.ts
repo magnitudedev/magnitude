@@ -1,7 +1,5 @@
 import { appendFile, readFile } from "node:fs/promises"
-import { createPrivateKey, createPublicKey } from "node:crypto"
 import { resolve } from "node:path"
-import { embeddedTrustedReleaseKeys } from "../src/trust"
 import { run } from "./build/common"
 import { findGithubRelease } from "./github-release"
 
@@ -59,24 +57,6 @@ const previousPackageJson = JSON.parse(await run([
 ], { cwd: PROJECT_ROOT })) as { readonly version?: string }
 if (!previousPackageJson.version || previousPackageJson.version === version) {
   throw new Error("release commit did not change the Changesets-owned CLI version")
-}
-const signingKeyId = required("MAGNITUDE_RELEASE_SIGNING_KEY_ID")
-const signingKey = createPrivateKey({
-  key: Buffer.from(required("MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8"), "base64"),
-  format: "der",
-  type: "pkcs8",
-})
-const trustedKey = embeddedTrustedReleaseKeys().find(
-  (candidate) => candidate.keyId === signingKeyId,
-)
-if (!trustedKey) throw new Error("signing key is absent from the release trust ring")
-const trustedPublicKey = createPublicKey({
-  key: Buffer.from(trustedKey.publicKeySpki, "base64"),
-  format: "der",
-  type: "spki",
-})
-if (!createPublicKey(signingKey).equals(trustedPublicKey)) {
-  throw new Error("signing key does not match the release trust ring")
 }
 required("NODE_AUTH_TOKEN")
 await run(["npm", "whoami", "--registry", "https://registry.npmjs.org"])

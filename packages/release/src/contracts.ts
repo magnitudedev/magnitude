@@ -51,20 +51,6 @@ export const ReleaseManifestSchema = Schema.Struct({
 })
 export type ReleaseManifest = typeof ReleaseManifestSchema.Type
 
-export const ReleaseSignatureSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  algorithm: Schema.Literal("ed25519"),
-  keyId: NonEmpty,
-  signature: NonEmpty,
-})
-export type ReleaseSignature = typeof ReleaseSignatureSchema.Type
-
-export const TrustedReleaseKeySchema = Schema.Struct({
-  keyId: NonEmpty,
-  publicKeySpki: NonEmpty,
-})
-export type TrustedReleaseKey = typeof TrustedReleaseKeySchema.Type
-
 export const IcnInstallationSchema = Schema.Struct({
   schemaVersion: Schema.Literal(1),
   backend: BackendSchema,
