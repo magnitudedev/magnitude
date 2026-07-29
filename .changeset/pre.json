@@ -25,7 +25,18 @@
     "@magnitudedev/ai": "0.0.1",
     "@magnitudedev/harness": "0.0.1",
     "@magnitudedev/scratchpad": "0.0.1",
-    "@magnitudedev/vcs": "0.0.1"
+    "@magnitudedev/vcs": "0.0.1",
+    "@magnitudedev/acn": "0.0.1",
+    "@magnitudedev/acn-dashboard": "0.0.1",
+    "@magnitudedev/client-common": "0.0.1",
+    "@magnitudedev/icn": "0.0.1",
+    "@magnitudedev/openapi-effect": "0.0.1",
+    "@magnitudedev/protocol": "0.0.1",
+    "@magnitudedev/providers": "0.0.0",
+    "@magnitudedev/release": "0.0.1",
+    "@magnitudedev/sdk": "0.0.1",
+    "@magnitudedev/utils": "0.0.1",
+    "@magnitudedev/version": "0.0.1"
   },
   "changesets": [
     "blue-candles-lie",
@@ -39,6 +50,7 @@
     "fine-things-invent",
     "hip-ads-sleep",
     "linux-x64-baseline-fix",
+    "loose-times-write",
     "loud-worlds-attend",
     "many-doors-doubt",
     "many-maps-drive",
