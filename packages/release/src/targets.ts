@@ -75,16 +75,10 @@ export const releaseHosts = [
     executableExtension: "",
     cargoFeatures: ["mtmd", "dynamic-backends"],
   },
-  {
-    id: "windows-x64-msvc",
-    runner: "windows-latest",
-    bunTarget: "bun-windows-x64",
-    rustTarget: "x86_64-pc-windows-msvc",
-    executableExtension: ".exe",
-    cargoFeatures: ["mtmd", "dynamic-backends"],
-  },
 ] as const satisfies readonly ReleaseHost[]
 
+// Windows release artifacts are intentionally disabled for now. Runtime support outside the
+// release system remains available to revisit once Windows builds are reliable.
 export const backendPacks = [
   {
     id: "metal-darwin-arm64",
@@ -104,21 +98,15 @@ export const backendPacks = [
     cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
     module: "libggml-cuda.so",
     runtimeLibraries: ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"],
-    cudaArchitectures: [
-      "75-virtual",
-      "80-virtual",
-      "86-real",
-      "87-real",
-      "89-real",
-      "90-virtual",
-      "120a-real",
-      "121a-real",
-    ],
+    // PTX-only tiers keep release builds manageable while retaining the CUDA code paths that
+    // matter most today: Ampere+, Hopper, and Blackwell. Additional compatibility tiers or native
+    // cubins can be restored later if measured startup or runtime performance justifies the cost.
+    cudaArchitectures: ["80-virtual", "90-virtual", "120-virtual"],
     compatibility: {
       kind: "cuda",
       toolkit: "13.0",
       minimumDriverApi: 13000,
-      minimumArchitecture: 75,
+      minimumArchitecture: 80,
     },
   },
   {
@@ -129,50 +117,13 @@ export const backendPacks = [
     cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
     module: "libggml-cuda.so",
     runtimeLibraries: ["libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12"],
-    cudaArchitectures: [
-      "50-virtual",
-      "61-virtual",
-      "70-virtual",
-      "75-virtual",
-      "80-virtual",
-      "86-real",
-      "89-real",
-      "90-virtual",
-      "120a-real",
-      "121a-real",
-    ],
+    // Keep this list aligned with the ARM64 pack above.
+    cudaArchitectures: ["80-virtual", "90-virtual", "120-virtual"],
     compatibility: {
       kind: "cuda",
       toolkit: "12.9",
       minimumDriverApi: 12000,
-      minimumArchitecture: 50,
-    },
-  },
-  {
-    id: "cuda12-windows-x64-msvc",
-    host: "windows-x64-msvc",
-    backend: "cuda",
-    runner: "windows-latest",
-    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
-    module: "ggml-cuda.dll",
-    runtimeLibraries: ["cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"],
-    cudaArchitectures: [
-      "50-virtual",
-      "61-virtual",
-      "70-virtual",
-      "75-virtual",
-      "80-virtual",
-      "86-real",
-      "89-real",
-      "90-virtual",
-      "120a-real",
-      "121a-real",
-    ],
-    compatibility: {
-      kind: "cuda",
-      toolkit: "12.9",
-      minimumDriverApi: 12000,
-      minimumArchitecture: 50,
+      minimumArchitecture: 80,
     },
   },
   {
@@ -192,16 +143,6 @@ export const backendPacks = [
     runner: "ubuntu-latest",
     cargoFeatures: ["dynamic-backends", "vulkan"],
     module: "libggml-vulkan.so",
-    runtimeLibraries: [],
-    compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
-  },
-  {
-    id: "vulkan1-windows-x64-msvc",
-    host: "windows-x64-msvc",
-    backend: "vulkan",
-    runner: "windows-latest",
-    cargoFeatures: ["dynamic-backends", "vulkan"],
-    module: "ggml-vulkan.dll",
     runtimeLibraries: [],
     compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
   },
