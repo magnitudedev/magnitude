@@ -5,7 +5,7 @@ import type {
   SlotId,
 } from '@magnitudedev/sdk'
 import type { ModelRequestProgress, StreamStartFailure } from '@magnitudedev/ai'
-import { ModelReleaseReasonSchema } from '@magnitudedev/protocol'
+import { ModelReleaseReasonSchema } from '@magnitudedev/acn-protocol'
 
 export class ModelRequestPreparationFailed extends Schema.TaggedError<ModelRequestPreparationFailed>()(
   'ModelRequestPreparationFailed',

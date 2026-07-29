@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Ref } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import type { ProviderAuth } from "@magnitudedev/protocol"
+import type { ProviderAuth } from "@magnitudedev/acn-protocol"
 import {
   ModelDiscoveryOperationIdSchema,
   ModelFamilyIdSchema,

@@ -7,8 +7,8 @@ applies_to:
   - packages/acn/src/session-*.ts
   - packages/acn/src/local-model-*.ts
   - packages/icn/src/downloads/**
-  - packages/protocol/src/rpcs/local-inference.ts
-  - packages/protocol/src/rpcs/session.ts
+  - packages/acn-protocol/src/rpcs/local-inference.ts
+  - packages/acn-protocol/src/rpcs/session.ts
 ---
 
 # Operation ownership

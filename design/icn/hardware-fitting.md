@@ -8,7 +8,7 @@ applies_to:
   - packages/acn/src/local-model-evaluations.ts
   - packages/acn/src/local-model-recommendations.ts
   - packages/acn/src/local-provider-offering-projection.ts
-  - packages/protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
 ---
 
 # ICN hardware fitting

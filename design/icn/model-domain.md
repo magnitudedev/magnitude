@@ -6,7 +6,7 @@ applies_to:
   - packages/acn/src/local-model-**
   - packages/acn/src/local-models.ts
   - packages/acn/src/local-provider-**
-  - packages/protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
   - cli/src/features/local-inference/**
   - cli/src/features/model-setup/**
   - cli/src/features/model-menus/**

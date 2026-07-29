@@ -4,6 +4,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod bootstrap_protocol;
 pub mod inventory;
 pub mod models;
 pub mod output;

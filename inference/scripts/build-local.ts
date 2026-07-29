@@ -9,6 +9,8 @@ import {
 } from "node:fs/promises"
 import { constants } from "node:fs"
 import { basename, delimiter, resolve } from "node:path"
+import { IcnInstallationDeclaration } from "@magnitudedev/icn-protocol"
+import { Schema } from "effect"
 import { getDefaultBunTarget } from "../../scripts/release-target"
 import { buildIcnBinary } from "./compile"
 
@@ -119,12 +121,15 @@ export const buildLocalIcn = async (): Promise<{
       resolve(staging, "catalog/model-planner-inputs.bundle"),
     )
     const installation = resolve(staging, "installation.json")
-    await writeFile(installation, `${JSON.stringify({
-      schemaVersion: 1,
-      backend,
-      nativeBuild: build.identity.native_build,
-      backendModuleAbi: build.identity.backend_module_abi,
-    }, null, 2)}\n`)
+    await writeFile(
+      installation,
+      `${Schema.encodeSync(Schema.parseJson(IcnInstallationDeclaration))({
+        schemaVersion: 1,
+        backend,
+        nativeBuild: build.identity.native_build,
+        backendModuleAbi: build.identity.backend_module_abi,
+      })}\n`,
+    )
     const loader = process.platform === "win32"
       ? "PATH"
       : process.platform === "darwin"

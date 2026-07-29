@@ -7,7 +7,6 @@
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./generated": "./src/generated/schemas.ts",
     "./lifecycle": "./src/lifecycle/index.ts",
     "./hardware": "./src/hardware/index.ts",
     "./catalog": "./src/catalog/index.ts",
@@ -17,14 +16,13 @@
     "./instances": "./src/instances/index.ts"
   },
   "scripts": {
-    "generate": "bun run scripts/generate.ts",
-    "check-generated": "bun run scripts/generate.ts --check",
     "typecheck": "tsc --noEmit",
     "test": "bunx --bun vitest run"
   },
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@magnitudedev/ai": "workspace:*",
+    "@magnitudedev/icn-protocol": "workspace:*",
     "@magnitudedev/openapi-effect": "workspace:*",
     "@magnitudedev/release": "workspace:*",
     "@noble/hashes": "^2.2.0",

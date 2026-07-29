@@ -5,7 +5,7 @@ import {
   type Recommendation,
   type RecommendableModel,
   type ServingProfile,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 
 export const RECOMMENDATION_POLICY_VERSION =
   "local-model-multicriteria-v10-human-readable-fidelity"

@@ -11,7 +11,7 @@ import {
   type ProviderCatalogFailure,
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   ProviderClient,
   type ProviderCatalogOutcome,

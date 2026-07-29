@@ -6,6 +6,7 @@ applies_to:
   - .github/workflows/release-checks.yml
   - .github/workflows/publish-npm.yml
   - packages/release/**
+  - packages/icn-protocol/**
   - packages/cli/bin/magnitude.js
   - packages/cli/lib/**
   - packages/cli/scripts/prepare-release-runtime.ts
@@ -59,7 +60,9 @@ same lock and planner bundle. Ordinary Cargo builds perform no model-data networ
 
 Each host job builds and extracts its final CLI, ACN, and ICN-base archives. It verifies exact
 versions, embedded ripgrep, native installation loading, server readiness, health, and an
-authenticated ICN endpoint.
+authenticated ICN endpoint. Binary identity, backend eligibility, installation, and readiness
+records are validated with Effect Schemas generated from the canonical Rust bootstrap protocol;
+generated drift fails release checks.
 
 CUDA and Vulkan jobs prove that the configured module and redistributable files were produced and
 that their native-build and backend ABI identities match their host base. Jobs without matching GPU

@@ -9,7 +9,7 @@ import {
   Stream,
 } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
-import { RecommendableModelCatalog as RecommendableModelCatalogSchema } from "../generated/schemas.js"
+import { RecommendableModelCatalog as RecommendableModelCatalogSchema } from "@magnitudedev/icn-protocol/schemas"
 import { makeIcnObservedState, type IcnObservedSnapshot } from "../observed-state.js"
 
 type CatalogReadError = Effect.Effect.Error<

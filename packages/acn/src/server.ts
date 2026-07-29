@@ -12,7 +12,7 @@ import {
   ProjectStorageLiveFromCwd,
   VersionLive,
 } from "@magnitudedev/storage"
-import { MagnitudeRpcs } from "@magnitudedev/protocol"
+import { MagnitudeRpcs } from "@magnitudedev/acn-protocol"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { HandlersLive } from "./handlers"
 import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"

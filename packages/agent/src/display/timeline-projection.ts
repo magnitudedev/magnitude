@@ -11,8 +11,8 @@
  */
 
 import { Signal, Projection } from '@magnitudedev/event-core'
-import { DisplayMessage as ProtocolDisplayMessageSchema } from '@magnitudedev/protocol'
-import type { ToolStepPresentation } from '@magnitudedev/protocol'
+import { DisplayMessage as ProtocolDisplayMessageSchema } from '@magnitudedev/acn-protocol'
+import type { ToolStepPresentation } from '@magnitudedev/acn-protocol'
 import { Effect, Option } from 'effect'
 import type { AppEvent } from '../events'
 import { outcomeWillChainContinue } from '../events'

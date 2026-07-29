@@ -1,42 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use icn_contracts::bootstrap_protocol::{IcnInstallationBackend, IcnInstallationDeclaration};
 
 const MAX_DECLARATION_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Backend {
-    Cpu,
-    Metal,
-    Cuda,
-    Vulkan,
-}
-
-impl Backend {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Metal => "metal",
-            Self::Cuda => "cuda",
-            Self::Vulkan => "vulkan",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Declaration {
-    schema_version: u32,
-    backend: Backend,
-    native_build: String,
-    backend_module_abi: String,
-}
-
 pub(crate) struct Installation {
     root: PathBuf,
-    declaration: Declaration,
+    declaration: IcnInstallationDeclaration,
 }
 
 impl Installation {
@@ -51,7 +22,7 @@ impl Installation {
         {
             anyhow::bail!("ICN installation declaration is not a bounded regular file");
         }
-        let declaration: Declaration = serde_json::from_slice(&fs::read(path)?)?;
+        let declaration: IcnInstallationDeclaration = serde_json::from_slice(&fs::read(path)?)?;
         if declaration.schema_version != 1
             || declaration.native_build.trim().is_empty()
             || declaration.backend_module_abi.trim().is_empty()
@@ -67,7 +38,7 @@ impl Installation {
         Ok(installation)
     }
 
-    pub(crate) fn backend(&self) -> Backend {
+    pub(crate) fn backend(&self) -> IcnInstallationBackend {
         self.declaration.backend
     }
 

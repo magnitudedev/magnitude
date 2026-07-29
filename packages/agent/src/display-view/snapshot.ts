@@ -9,7 +9,7 @@ import {
   type DisplayViewShape,
   type DisplayViewSnapshot,
   type ForkKey,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import { SessionOptionsAmbient } from '../ambient/session-ambient'
 import { ChatTitleProjection } from '../projections/chat-title'
 import { AgentLifecycleProjection } from '../projections/agent-lifecycle'

@@ -4,7 +4,7 @@ import {
   OnboardingMirror,
   type MirroredSnapshot,
   type OnboardingState,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import type { ConfigStorageShape } from "@magnitudedev/storage"
 import { makeMirroredState, MirroredStateChanges } from "../mirrored-state"

@@ -85,6 +85,10 @@
     },
     "inference": {
       "name": "@magnitudedev/inference",
+      "dependencies": {
+        "@magnitudedev/icn-protocol": "workspace:*",
+        "effect": "3.21.2",
+      },
     },
     "packages/acn": {
       "name": "@magnitudedev/acn",
@@ -95,10 +99,11 @@
         "@effect/platform": "^0.96.0",
         "@effect/platform-bun": "^0.90.0",
         "@effect/rpc": "0.75.1",
+        "@magnitudedev/acn-protocol": "workspace:*",
         "@magnitudedev/agent": "workspace:*",
         "@magnitudedev/generate-id": "workspace:*",
         "@magnitudedev/icn": "workspace:*",
-        "@magnitudedev/protocol": "workspace:*",
+        "@magnitudedev/icn-protocol": "workspace:*",
         "@magnitudedev/ripgrep": "workspace:*",
         "@magnitudedev/roles": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
@@ -115,8 +120,8 @@
       "version": "0.0.1",
       "dependencies": {
         "@magnitudedev/acn": "workspace:*",
+        "@magnitudedev/acn-protocol": "workspace:*",
         "@magnitudedev/agent": "workspace:*",
-        "@magnitudedev/protocol": "workspace:*",
       },
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "^5.0.3",
@@ -130,16 +135,27 @@
         "vite": "^6.3.2",
       },
     },
+    "packages/acn-protocol": {
+      "name": "@magnitudedev/acn-protocol",
+      "version": "0.0.1",
+      "dependencies": {
+        "@effect/platform": "^0.96.0",
+        "@effect/rpc": "0.75.1",
+        "@magnitudedev/ai": "workspace:*",
+        "@magnitudedev/utils": "workspace:*",
+        "effect": "^3.21.2",
+      },
+    },
     "packages/agent": {
       "name": "@magnitudedev/agent",
       "version": "0.0.1",
       "dependencies": {
         "@effect/platform": "^0.96.0",
         "@effect/platform-bun": "^0.90.0",
+        "@magnitudedev/acn-protocol": "workspace:*",
         "@magnitudedev/ai": "workspace:*",
         "@magnitudedev/dom-extract": "workspace:*",
         "@magnitudedev/generate-id": "workspace:*",
-        "@magnitudedev/protocol": "workspace:*",
         "@magnitudedev/ripgrep": "workspace:*",
         "@magnitudedev/roles": "workspace:*",
         "@magnitudedev/scratchpad": "workspace:*",
@@ -178,7 +194,7 @@
     },
     "packages/cli": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.1-alpha.22",
+      "version": "0.0.1-alpha.24",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
@@ -255,12 +271,28 @@
       "dependencies": {
         "@effect/platform": "^0.96.0",
         "@magnitudedev/ai": "workspace:*",
+        "@magnitudedev/icn-protocol": "workspace:*",
         "@magnitudedev/openapi-effect": "workspace:*",
         "@magnitudedev/release": "workspace:*",
         "@noble/hashes": "^2.2.0",
         "effect": "3.21.2",
       },
       "devDependencies": {
+        "@effect/platform-bun": "^0.90.0",
+        "@types/bun": "latest",
+        "vitest": "^3.2.4",
+      },
+    },
+    "packages/icn-protocol": {
+      "name": "@magnitudedev/icn-protocol",
+      "version": "0.0.1",
+      "dependencies": {
+        "@effect/platform": "^0.96.0",
+        "@magnitudedev/openapi-effect": "workspace:*",
+        "effect": "3.21.2",
+      },
+      "devDependencies": {
+        "@effect/platform": "^0.96.0",
         "@effect/platform-bun": "^0.90.0",
         "@types/bun": "latest",
         "vitest": "^3.2.4",
@@ -299,17 +331,6 @@
         "vitest": "^3.2.4",
       },
     },
-    "packages/protocol": {
-      "name": "@magnitudedev/protocol",
-      "version": "0.0.1",
-      "dependencies": {
-        "@effect/platform": "^0.96.0",
-        "@effect/rpc": "0.75.1",
-        "@magnitudedev/ai": "workspace:*",
-        "@magnitudedev/utils": "workspace:*",
-        "effect": "^3.21.2",
-      },
-    },
     "packages/providers": {
       "name": "@magnitudedev/providers",
       "version": "0.0.0",
@@ -331,6 +352,7 @@
       "dependencies": {
         "@effect/platform": "^0.96.0",
         "@effect/platform-node": "0.107.0",
+        "@magnitudedev/icn-protocol": "workspace:*",
         "effect": "3.21.2",
         "mdast-util-from-markdown": "^2.0.3",
         "tar-stream": "3.2.0",
@@ -375,8 +397,8 @@
         "@effect/opentelemetry": "^0.63.0",
         "@effect/platform": "^0.96.0",
         "@effect/rpc": "0.75.1",
+        "@magnitudedev/acn-protocol": "workspace:*",
         "@magnitudedev/ai": "workspace:*",
-        "@magnitudedev/protocol": "workspace:*",
         "@magnitudedev/providers": "workspace:*",
         "@magnitudedev/release": "workspace:*",
         "@magnitudedev/roles": "workspace:*",
@@ -420,8 +442,8 @@
       "dependencies": {
         "@effect/platform": "^0.96.0",
         "@effect/platform-bun": "^0.90.0",
+        "@magnitudedev/acn-protocol": "workspace:*",
         "@magnitudedev/ai": "workspace:*",
-        "@magnitudedev/protocol": "workspace:*",
         "@magnitudedev/scratchpad": "workspace:*",
         "effect": "^3.21.2",
       },
@@ -797,6 +819,8 @@
 
     "@magnitudedev/acn-dashboard": ["@magnitudedev/acn-dashboard@workspace:packages/acn-dashboard"],
 
+    "@magnitudedev/acn-protocol": ["@magnitudedev/acn-protocol@workspace:packages/acn-protocol"],
+
     "@magnitudedev/agent": ["@magnitudedev/agent@workspace:packages/agent"],
 
     "@magnitudedev/ai": ["@magnitudedev/ai@workspace:packages/ai"],
@@ -819,13 +843,13 @@
 
     "@magnitudedev/icn": ["@magnitudedev/icn@workspace:packages/icn"],
 
+    "@magnitudedev/icn-protocol": ["@magnitudedev/icn-protocol@workspace:packages/icn-protocol"],
+
     "@magnitudedev/inference": ["@magnitudedev/inference@workspace:inference"],
 
     "@magnitudedev/logger": ["@magnitudedev/logger@workspace:packages/logger"],
 
     "@magnitudedev/openapi-effect": ["@magnitudedev/openapi-effect@workspace:packages/openapi-effect"],
-
-    "@magnitudedev/protocol": ["@magnitudedev/protocol@workspace:packages/protocol"],
 
     "@magnitudedev/providers": ["@magnitudedev/providers@workspace:packages/providers"],
 

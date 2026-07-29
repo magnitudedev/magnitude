@@ -9,7 +9,7 @@ import {
   filenameWithImageExtension,
   type RawImageAttachment,
   type SessionError,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { uploadAttachment } from "../attachment-upload"
 
 export interface CaptureRawImagesInput {

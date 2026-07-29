@@ -7,7 +7,7 @@ import type {
   RawImageAttachment,
   RawMentionOccurrence,
   StreamEvent as ProtocolStreamEvent,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 
 export interface RuntimeEntry {
   readonly id: string

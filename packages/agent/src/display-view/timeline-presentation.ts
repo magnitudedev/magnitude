@@ -8,7 +8,7 @@ import type {
   DisplayTimelineWindowInfo,
   ToolMessage,
   ToolStepPresentation,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import {
   getToolSummaryFamily,
   HIDDEN_TOOL_KEYS,

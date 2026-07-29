@@ -10,7 +10,7 @@ import {
   SessionOperationFailed,
   type SessionError,
   SessionOptions as SessionOptionsSchema,
-} from "@magnitudedev/protocol";
+} from "@magnitudedev/acn-protocol";
 
 export interface SessionRuntimeOptions {
   readonly disableShellSafeguards: boolean;

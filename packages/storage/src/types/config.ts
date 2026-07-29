@@ -10,7 +10,7 @@ import {
   SlotSelectionSchema,
   type ModelPackageId,
   type SlotId,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {

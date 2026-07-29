@@ -23,7 +23,7 @@ import {
   type LocalProviderOffering,
   type ProviderModelCatalogEntry,
   type SlotSelection,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -33,9 +33,9 @@ import { resolveContextLimitPolicy } from "@magnitudedev/storage"
 import {
   IcnClient,
   IcnInstances,
-  Generated,
   type IcnClientService,
 } from "@magnitudedev/icn"
+import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { ModelConfiguration } from "./model-configuration"
 import { LocalModelPackages } from "./local-model-packages"

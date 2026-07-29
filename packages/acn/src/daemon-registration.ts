@@ -11,7 +11,7 @@ import {
   AcnVersionRegistrySchema,
   type AcnRegistration,
   type AcnVersionRegistry,
-} from "@magnitudedev/protocol";
+} from "@magnitudedev/acn-protocol";
 
 export type { AcnRegistration, AcnVersionRegistry };
 

@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use icn_contracts::bootstrap_protocol::IcnBinaryIdentity;
 use sha2::{Digest, Sha256};
 
 pub(crate) const BINDINGS_REVISION: &str = env!("ICN_BINDINGS_REVISION");
@@ -23,14 +23,13 @@ pub(crate) fn enabled_backends() -> Vec<&'static str> {
     backends
 }
 
-pub(crate) fn json() -> Value {
-    let native_build = native_build();
-    json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "api_version": 1,
-        "native_build": native_build,
-        "backend_module_abi": backend_module_abi(),
-        "capabilities": [
+pub(crate) fn identity() -> IcnBinaryIdentity {
+    IcnBinaryIdentity {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        api_version: 1,
+        native_build: native_build(),
+        backend_module_abi: backend_module_abi(),
+        capabilities: [
             "hardware",
             "model_catalog",
             "model_installed",
@@ -38,13 +37,16 @@ pub(crate) fn json() -> Value {
             "model_fit",
             "model_downloads",
             "model_residency",
-            "chat_streaming"
-        ],
-        "target": TARGET,
-        "profile": PROFILE,
-        "rustc": RUSTC_VERSION,
-        "backends": enabled_backends(),
-    })
+            "chat_streaming",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        target: TARGET.to_owned(),
+        profile: PROFILE.to_owned(),
+        rustc: RUSTC_VERSION.to_owned(),
+        backends: enabled_backends().into_iter().map(str::to_owned).collect(),
+    }
 }
 
 pub(crate) fn native_build() -> String {
@@ -69,12 +71,8 @@ mod tests {
         assert_eq!(NATIVE_BACKEND_REVISION.len(), 40);
         assert!(enabled_backends().contains(&"cpu"));
 
-        let identity = json();
-        assert_eq!(identity["native_build"], native_build());
-        assert!(
-            identity["target"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
-        );
+        let identity = identity();
+        assert_eq!(identity.native_build, native_build());
+        assert!(!identity.target.is_empty());
     }
 }

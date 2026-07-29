@@ -4,7 +4,7 @@ import {
   sameDisplayViewShape,
   type DisplayViewShape,
   type DisplayViewSnapshot,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import { buildDisplayViewSnapshot } from './snapshot'
 
 export class DisplayViewNotFoundError extends Data.TaggedError('DisplayViewNotFoundError')<{

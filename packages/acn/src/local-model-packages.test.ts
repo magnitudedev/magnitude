@@ -4,7 +4,7 @@ import {
   DownloadAttemptIdSchema,
   ModelPackageIdSchema,
   type DownloadAttempt,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { exactAttemptDecision } from "./local-model-packages"
 
 const attemptId = DownloadAttemptIdSchema.make("download_test")

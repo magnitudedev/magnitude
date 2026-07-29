@@ -7,7 +7,7 @@ applies_to:
   - packages/icn/src/provider/**
   - packages/acn/src/local-inference-hardware.ts
   - packages/acn/src/model-slot-controller.ts
-  - packages/protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/utils/current-local-model.ts
   - packages/client-common/src/utils/model-slots.ts
   - cli/src/features/local-inference/**

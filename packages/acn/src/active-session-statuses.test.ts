@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Layer, PubSub, Ref, Stream } from "effect"
-import type { SessionMetadata } from "@magnitudedev/protocol"
+import type { SessionMetadata } from "@magnitudedev/acn-protocol"
 import { AgentRuntime, type AgentRuntimeApi, type ResidentSessionSnapshot } from "./agent-runtime"
 import { ActiveSessionStatusesLive, ActiveSessionStatusesService } from "./active-session-statuses"
 import { SessionStore, type SessionStoreApi } from "./session-store"

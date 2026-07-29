@@ -7,7 +7,7 @@ import {
   type CodingAgentSession,
 } from "@magnitudedev/agent"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
-import type { SessionError } from "@magnitudedev/protocol"
+import type { SessionError } from "@magnitudedev/acn-protocol"
 import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"

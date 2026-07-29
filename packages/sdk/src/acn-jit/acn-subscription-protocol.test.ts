@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Exit } from "effect"
-import { ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS } from "@magnitudedev/protocol"
+import { ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS } from "@magnitudedev/acn-protocol"
 import { acnSubscriptionProtocol, acnSubscriptionTags } from "./acn-subscription-protocol"
 
 describe("ACN subscription protocol", () => {

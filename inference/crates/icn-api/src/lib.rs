@@ -14,6 +14,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
+use icn_contracts::bootstrap_protocol::{
+    BackendEligibilityReport, CudaEligibility, IcnBinaryIdentity, IcnInstallationBackend,
+    IcnInstallationDeclaration, IcnStartupRecord, IcnStartupRecordType, MetalEligibility,
+    VulkanEligibility,
+};
 use icn_contracts::models::{
     AssessModelsRequest, AssessModelsResponse, DownloadAttempt, DownloadAttemptId,
     FitModelsRequest, FitModelsResponse, InstalledModelPackages, InstalledModelPackagesResponse,
@@ -2779,7 +2784,16 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         Usage,
         Timings,
         ErrorResponse,
-        ApiErrorBody
+        ApiErrorBody,
+        BackendEligibilityReport,
+        CudaEligibility,
+        VulkanEligibility,
+        MetalEligibility,
+        IcnBinaryIdentity,
+        IcnStartupRecord,
+        IcnStartupRecordType,
+        IcnInstallationDeclaration,
+        IcnInstallationBackend
     ))
 )]
 struct IcnOpenApi;

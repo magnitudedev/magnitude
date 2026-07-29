@@ -31,7 +31,7 @@ import {
   type ToolDefinition,
 } from "@magnitudedev/ai"
 import { IcnClient, type IcnClientService } from "../client.js"
-import * as Generated from "../generated/schemas.js"
+import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import {
   GeneratedClientInvalidResponseError,
   type GeneratedClientError,

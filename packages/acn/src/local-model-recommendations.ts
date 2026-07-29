@@ -15,7 +15,7 @@ import {
   type ModelFailure,
   type Recommendation,
   type RecommendableModel,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnHardware, IcnInstalledModels } from "@magnitudedev/icn"
 import {
   ProviderModelIdSchema,

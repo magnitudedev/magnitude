@@ -12,7 +12,7 @@ import { IcnClient, type IcnClientService } from "../client.js"
 import type {
   ModelInstancesInvalidation,
   ModelInstancesSnapshot,
-} from "../generated/schemas.js"
+} from "@magnitudedev/icn-protocol/schemas"
 import { IcnInstances, makeIcnInstances } from "./index.js"
 
 class TestFailure extends Data.TaggedError("TestFailure")<{

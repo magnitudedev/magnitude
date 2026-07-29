@@ -10,7 +10,7 @@ applies_to:
   - packages/acn/src/model-slot-projection.ts
   - packages/acn/src/model-request-preparation.ts
   - packages/agent/src/errors/model-start.ts
-  - packages/protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
   - packages/sdk/src/index.ts
   - packages/client-common/src/utils/model-memory.ts
   - packages/client-common/src/utils/model-slots.ts

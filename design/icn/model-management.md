@@ -11,7 +11,7 @@ applies_to:
   - packages/acn/src/local-model-recommendations.ts
   - packages/acn/src/local-models.ts
   - packages/client-common/src/hooks/use-onboarding-model-setup.ts
-  - packages/protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/model-state.ts
   - inference/catalog/**
 ---
 

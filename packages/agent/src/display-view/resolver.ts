@@ -1,4 +1,4 @@
-import { forkKeyToForkId, type ForkKey } from '@magnitudedev/protocol'
+import { forkKeyToForkId, type ForkKey } from '@magnitudedev/acn-protocol'
 import { Addressed } from '@magnitudedev/event-core'
 import type { DisplayTimelineWindowShape, DisplayViewShape } from './shape'
 

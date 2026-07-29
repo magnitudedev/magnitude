@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Deferred, Effect, Fiber, Layer, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import type { AgentLifecycleState, CodingAgentSession, ForkTurnState } from "@magnitudedev/agent"
-import { type DisplayState, type DisplayViewShape } from "@magnitudedev/protocol"
+import { type DisplayState, type DisplayViewShape } from "@magnitudedev/acn-protocol"
 import {
   AgentRuntime,
   type AgentRuntimeApi,

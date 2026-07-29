@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Option } from 'effect'
-import type { DisplayMessage, DisplayTimelineWindowInfo, ToolMessage, ToolStepPresentation } from '@magnitudedev/protocol'
+import type { DisplayMessage, DisplayTimelineWindowInfo, ToolMessage, ToolStepPresentation } from '@magnitudedev/acn-protocol'
 import { buildDisplayTimelinePresentation } from '../../src/display-view/timeline-presentation'
 
 const windowFor = (messages: readonly DisplayMessage[]): DisplayTimelineWindowInfo => ({

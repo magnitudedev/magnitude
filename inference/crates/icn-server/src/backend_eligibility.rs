@@ -1,45 +1,8 @@
 use ash::{Entry, vk};
+use icn_contracts::bootstrap_protocol::{
+    BackendEligibilityReport, CudaEligibility, MetalEligibility, VulkanEligibility,
+};
 use libloading::Library;
-use serde::Serialize;
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Report {
-    schema_version: u32,
-    cuda: Cuda,
-    vulkan: Vulkan,
-    metal: Metal,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "state", rename_all = "lowercase", rename_all_fields = "camelCase")]
-enum Cuda {
-    Usable {
-        driver_api: i32,
-        architectures: Vec<String>,
-    },
-    Absent {
-        diagnostic: String,
-    },
-    Failed {
-        diagnostic: String,
-    },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "state", rename_all = "lowercase", rename_all_fields = "camelCase")]
-enum Vulkan {
-    Usable { loader_api: u32 },
-    Absent { diagnostic: String },
-    Failed { diagnostic: String },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "state", rename_all = "lowercase")]
-enum Metal {
-    Usable,
-    Absent { diagnostic: String },
-}
 
 fn bounded(value: impl std::fmt::Display) -> String {
     value
@@ -65,7 +28,7 @@ fn cuda_library_names() -> &'static [&'static str] {
     }
 }
 
-fn cuda() -> Cuda {
+fn cuda() -> CudaEligibility {
     type Init = unsafe extern "C" fn(u32) -> i32;
     type DriverVersion = unsafe extern "C" fn(*mut i32) -> i32;
     type DeviceCount = unsafe extern "C" fn(*mut i32) -> i32;
@@ -76,7 +39,7 @@ fn cuda() -> Cuda {
         .iter()
         .find_map(|name| unsafe { Library::new(name).ok() });
     let Some(library) = library else {
-        return Cuda::Absent {
+        return CudaEligibility::Absent {
             diagnostic: "CUDA driver library is unavailable".to_owned(),
         };
     };
@@ -128,30 +91,30 @@ fn cuda() -> Cuda {
         Ok((init, version, count, driver_api, devices, architectures))
             if init == 0 && version == 0 && count == 0 && devices > 0 && driver_api > 0 =>
         {
-            Cuda::Usable {
+            CudaEligibility::Usable {
                 driver_api,
                 architectures,
             }
         }
-        Ok((0, _, 0, _, 0, _)) => Cuda::Absent {
+        Ok((0, _, 0, _, 0, _)) => CudaEligibility::Absent {
             diagnostic: "no CUDA device is available".to_owned(),
         },
-        Ok((init, version, count, _, _, _)) => Cuda::Failed {
+        Ok((init, version, count, _, _, _)) => CudaEligibility::Failed {
             diagnostic: bounded(format!(
                 "CUDA probe failed (init={init}, version={version}, count={count})"
             )),
         },
-        Err(message) => Cuda::Failed {
+        Err(message) => CudaEligibility::Failed {
             diagnostic: message.to_owned(),
         },
     }
 }
 
-fn vulkan() -> Vulkan {
+fn vulkan() -> VulkanEligibility {
     let entry = match unsafe { Entry::load() } {
         Ok(entry) => entry,
         Err(error) => {
-            return Vulkan::Absent {
+            return VulkanEligibility::Absent {
                 diagnostic: bounded(error),
             };
         }
@@ -167,7 +130,7 @@ fn vulkan() -> Vulkan {
     let instance = match unsafe { entry.create_instance(&create, None) } {
         Ok(instance) => instance,
         Err(error) => {
-            return Vulkan::Failed {
+            return VulkanEligibility::Failed {
                 diagnostic: bounded(error),
             };
         }
@@ -181,26 +144,26 @@ fn vulkan() -> Vulkan {
     });
     unsafe { instance.destroy_instance(None) };
     match devices {
-        Err(error) => Vulkan::Failed {
+        Err(error) => VulkanEligibility::Failed {
             diagnostic: bounded(error),
         },
-        Ok(_) if usable => Vulkan::Usable { loader_api: api },
-        Ok(_) => Vulkan::Absent {
+        Ok(_) if usable => VulkanEligibility::Usable { loader_api: api },
+        Ok(_) => VulkanEligibility::Absent {
             diagnostic: "no non-CPU Vulkan device is available".to_owned(),
         },
     }
 }
 
-pub(crate) fn probe() -> Report {
+pub(crate) fn probe() -> BackendEligibilityReport {
     let metal = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    Report {
+    BackendEligibilityReport {
         schema_version: 1,
         cuda: cuda(),
         vulkan: vulkan(),
         metal: if metal {
-            Metal::Usable
+            MetalEligibility::Usable
         } else {
-            Metal::Absent {
+            MetalEligibility::Absent {
                 diagnostic: "Metal requires Apple Silicon".to_owned(),
             }
         },

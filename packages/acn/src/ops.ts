@@ -18,8 +18,8 @@ import type {
   SessionError,
   SkillContent,
   SkillListEntry,
-} from "@magnitudedev/protocol"
-import { SessionOperationFailed } from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
+import { SessionOperationFailed } from "@magnitudedev/acn-protocol"
 
 // ---------------------------------------------------------------------------
 // Helpers

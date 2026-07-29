@@ -183,10 +183,10 @@ under `results/parity/`.
 Downloaded parity models live under `target/parity-models/`. Both locations, all native/Rust build
 trees, and candidate artifacts are generated and ignored by the repository.
 
-`bun icn:generate` runs the Rust OpenAPI exporter and regenerates `packages/icn/openapi.json` plus
-the Effect Schema, HttpApi, and streaming descriptors under `packages/icn/src/generated`.
-`bun icn:check-generated` performs the same derivation without writing and fails if committed output
-is stale.
+`bun icn:generate` runs the Rust OpenAPI exporter and regenerates the complete ICN protocol under
+`packages/icn-protocol`: bootstrap records, HTTP schemas, HttpApi declarations, operation and
+streaming descriptors, generated client, and manifest. `bun icn:check-generated` performs the same
+derivation without writing and fails if any committed output is stale.
 
 The `inference/` directory is also a Bun workspace, so the equivalent short forms work:
 

@@ -12,7 +12,7 @@ import {
   type ModelPackageEntry,
   type ProviderModelCatalogEntry,
   modelOfferingTargetPackageIds,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import { IcnCatalog } from "@magnitudedev/icn"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"

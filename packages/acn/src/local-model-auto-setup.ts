@@ -3,7 +3,7 @@ import {
   modelOfferingTargetPackageIds,
   type ModelFailure,
   type ModelOfferingTargetId,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { LocalModelEvaluations } from "./local-model-evaluations"
 import { LocalModelPackages } from "./local-model-packages"

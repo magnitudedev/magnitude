@@ -4,6 +4,10 @@ import * as FileSystem from "@effect/platform/FileSystem";
 import * as HttpClient from "@effect/platform/HttpClient";
 import * as HttpClientError from "@effect/platform/HttpClientError";
 import * as Path from "@effect/platform/Path";
+import {
+  IcnBinaryIdentity,
+  IcnStartupRecord,
+} from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
 import { delimiter, dirname, join } from "node:path";
 import {
@@ -24,7 +28,7 @@ import {
 } from "effect";
 import {
   makeIcnApiClient,
-} from "../generated/client.js";
+} from "@magnitudedev/icn-protocol/client";
 import { resolveReleaseIcnInstallation } from "./release-installation.js";
 
 const PositiveInt = Schema.Int.pipe(Schema.greaterThan(0));
@@ -82,16 +86,6 @@ export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
   outputLimitBytes: PositiveInt,
   parentPid: PositiveInt,
 }) {}
-
-export const IcnBinaryIdentity = Schema.Struct({
-  version: NonEmpty,
-  api_version: PositiveInt,
-  native_build: NonEmpty,
-  target: NonEmpty,
-  capabilities: Schema.Array(NonEmpty),
-  backends: Schema.Array(NonEmpty),
-});
-export type IcnBinaryIdentity = typeof IcnBinaryIdentity.Type;
 
 export interface ResolvedIcnBinary {
   readonly path: string;
@@ -360,17 +354,6 @@ export const makeIcnBinaryResolver = () => Layer.effect(
     });
   })
 );
-
-export const IcnStartupRecord = Schema.Struct({
-  type: Schema.Literal("icn_ready"),
-  protocolVersion: Schema.Literal(1),
-  origin: NonEmpty,
-  instanceId: NonEmpty,
-  pid: PositiveInt,
-  apiVersion: PositiveInt,
-  nativeBuild: NonEmpty,
-});
-export type IcnStartupRecord = typeof IcnStartupRecord.Type;
 
 export interface IcnExit {
   readonly code: number;

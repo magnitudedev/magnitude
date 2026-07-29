@@ -6,7 +6,7 @@ applies_to:
   - packages/sdk/src/local-spawner.ts
   - packages/sdk/src/remote-spawner.ts
   - packages/sdk/src/binary.ts
-  - packages/protocol/src/acn-registry.ts
+  - packages/acn-protocol/src/acn-registry.ts
   - cli/src/platform/**
   - desktop/src/platform.ts
   - desktop/src/main.ts

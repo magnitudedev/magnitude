@@ -12,6 +12,9 @@ use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use icn_api::{
     AppState, FakeBackend, ModelInstanceController, ModelInstanceLease, ServerIdentity, app,
 };
+use icn_contracts::bootstrap_protocol::{
+    IcnInstallationBackend, IcnStartupRecord, IcnStartupRecordType,
+};
 use icn_contracts::models::{
     AssessModelResult, AssessModelsRequest, AssessModelsResponse, AssessmentEnvironmentId,
     FitModelResult, FitModelsRequest, FitModelsResponse, InstalledModelPackages as _,
@@ -4262,7 +4265,7 @@ fn validate_registered_backend(installation: &installation::Installation) -> any
     {
         anyhow::bail!("ICN installation did not register a CPU backend");
     }
-    if installation.backend() == installation::Backend::Cpu {
+    if installation.backend() == IcnInstallationBackend::Cpu {
         if devices.iter().any(|device| {
             device.device_type != LlamaBackendDeviceType::Cpu
                 && device.device_type != LlamaBackendDeviceType::Unknown
@@ -4410,18 +4413,16 @@ async fn main() -> anyhow::Result<()> {
                 .local_addr()
                 .context("failed to read bound address")?;
             let origin = format!("http://{address}");
-            println!(
-                "MAGNITUDE_ICN_READY {}",
-                serde_json::json!({
-                    "type": "icn_ready",
-                    "protocolVersion": 1,
-                    "origin": origin,
-                    "instanceId": instance_id,
-                    "pid": std::process::id(),
-                    "apiVersion": 1,
-                    "nativeBuild": native_build,
-                })
-            );
+            let startup = IcnStartupRecord {
+                record_type: IcnStartupRecordType::IcnReady,
+                protocol_version: 1,
+                origin,
+                instance_id: instance_id.clone(),
+                pid: std::process::id(),
+                api_version: 1,
+                native_build: native_build.clone(),
+            };
+            println!("MAGNITUDE_ICN_READY {}", serde_json::to_string(&startup)?);
             tracing::info!(
                 service.name = telemetry::SERVICE_NAME,
                 server.address = %address,
@@ -4475,7 +4476,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Version { json } => {
             if json {
-                println!("{}", build_identity::json());
+                println!("{}", serde_json::to_string(&build_identity::identity())?);
             } else {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
@@ -5193,16 +5194,10 @@ mod tests {
 
     #[test]
     fn version_json_reports_native_and_build_provenance() {
-        let value = build_identity::json();
-        assert_eq!(value["native_build"], build_identity::native_build());
-        assert!(value.get("bindings_revision").is_none());
-        assert!(value.get("native_backend_revision").is_none());
-        assert_eq!(value["target"], build_identity::TARGET);
-        assert_eq!(value["profile"], build_identity::PROFILE);
-        assert!(
-            value["backends"]
-                .as_array()
-                .is_some_and(|values| !values.is_empty())
-        );
+        let value = build_identity::identity();
+        assert_eq!(value.native_build, build_identity::native_build());
+        assert_eq!(value.target, build_identity::TARGET);
+        assert_eq!(value.profile, build_identity::PROFILE);
+        assert!(!value.backends.is_empty());
     }
 }

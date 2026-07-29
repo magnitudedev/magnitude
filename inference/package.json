@@ -1,6 +1,10 @@
 {
   "name": "@magnitudedev/inference",
   "private": true,
+  "dependencies": {
+    "@magnitudedev/icn-protocol": "workspace:*",
+    "effect": "3.21.2"
+  },
   "scripts": {
     "build": "bun run scripts/build-local.ts",
     "build:reference": "bun run scripts/build-reference.ts",

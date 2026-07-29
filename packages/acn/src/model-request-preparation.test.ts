@@ -5,7 +5,7 @@ import {
   LocalModelMutationFailed,
   ModelInstanceIdSchema,
   ModelServingConfigurationIdSchema,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   ProviderIdSchema,
   ProviderModelIdSchema,

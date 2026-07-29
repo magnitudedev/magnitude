@@ -10,7 +10,7 @@ import { outcomeWillChainContinue } from '../events'
 import type { AppEvent } from '../events'
 import { ROLE_IDS, type RoleId } from '../agents/role-validation'
 import { Option, Schema } from 'effect'
-import { DisplayActivity, type WorkSummaryPerformance } from '@magnitudedev/protocol'
+import { DisplayActivity, type WorkSummaryPerformance } from '@magnitudedev/acn-protocol'
 
 export const AgentLifecycleSchema = Schema.Literal('working', 'idle', 'killed')
 export type AgentLifecycleStatus = typeof AgentLifecycleSchema.Type

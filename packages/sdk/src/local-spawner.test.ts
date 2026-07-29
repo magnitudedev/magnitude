@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Option } from "effect";
-import type { AcnRegistration } from "@magnitudedev/protocol";
+import type { AcnRegistration } from "@magnitudedev/acn-protocol";
 import { decideDaemonAction, type HealthResponse } from "./local-spawner";
 
 const registration: AcnRegistration = {

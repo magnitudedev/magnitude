@@ -9,7 +9,7 @@ import {
   OfferingAssessmentIdSchema,
   RecommendableModelIdSchema,
   type Recommendation,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   MINIMUM_EXPECTED_TOKENS_PER_SECOND,
   assembleRecommendationCatalogCandidates,

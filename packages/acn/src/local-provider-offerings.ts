@@ -14,7 +14,7 @@ import {
   modelOfferingTargetPackageIds,
   ModelOfferingTargetSchema,
   ModelServingConfigurationSchema,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   ProviderModelIdSchema,
   type ProviderModelId,

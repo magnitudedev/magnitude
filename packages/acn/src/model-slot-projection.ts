@@ -10,8 +10,8 @@ import {
   type ModelSlotInstance,
   type ProviderModelCatalogEntry,
   type SlotId,
-} from "@magnitudedev/protocol"
-import type { Generated } from "@magnitudedev/icn"
+} from "@magnitudedev/acn-protocol"
+import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 
 export const projectModelInstanceAllocation = (
   allocation: Generated.ModelInstanceAllocation,

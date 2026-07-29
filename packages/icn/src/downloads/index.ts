@@ -3,7 +3,7 @@ import { IcnClient, type IcnClientService } from "../client.js"
 import {
   ModelDownloadsResponse as ModelDownloadsResponseSchema,
   type DownloadAttempt,
-} from "../generated/schemas.js"
+} from "@magnitudedev/icn-protocol/schemas"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
 
 type DownloadsReadError = Effect.Effect.Error<

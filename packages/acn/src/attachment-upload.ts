@@ -1,4 +1,4 @@
-import { type SessionError, SessionOperationFailed } from "@magnitudedev/protocol"
+import { type SessionError, SessionOperationFailed } from "@magnitudedev/acn-protocol"
 import { Effect, Option } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"

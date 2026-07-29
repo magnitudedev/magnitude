@@ -4,7 +4,7 @@ import {
   DisplayState as DisplayStateSchema,
   type DisplayState,
   type ToolMessage,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import { ToolStateSchema, type ToolStateFromSchema } from './models/tool-state'
 import type { ToolHandleFromSchema } from './models/tool-handle-schema'
 

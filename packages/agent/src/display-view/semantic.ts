@@ -8,7 +8,7 @@ import {
   type DisplayState,
   type TaskAssignee,
   type TaskDisplayRow,
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 import { DEFAULT_CHAT_NAME } from '../constants'
 import type { AgentLifecycleState, AgentInfo } from '../projections/agent-lifecycle'
 import type { TaskAssignmentRow, TaskAssignmentState, WorkerActivity } from '../projections/task-assignment'

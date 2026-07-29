@@ -2,7 +2,7 @@ import type {
   DisplayTimelinePresentationMode,
   DisplayTimelineWindowShape,
   DisplayViewShape
-} from '@magnitudedev/protocol'
+} from '@magnitudedev/acn-protocol'
 
 export const DEFAULT_TIMELINE_WINDOW_LIMIT = 300
 

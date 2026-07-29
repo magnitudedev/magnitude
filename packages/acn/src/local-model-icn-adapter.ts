@@ -7,7 +7,7 @@ import type {
   ModelServingConfiguration,
   RecommendableModel,
   ServingProfile,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import {
   DownloadAttemptSchema,
   ModelOfferingTargetSchema,
@@ -15,7 +15,7 @@ import {
   ModelPackageSchema,
   RecommendableModelSchema,
   ServingProfileSchema,
-} from "@magnitudedev/protocol"
+} from "@magnitudedev/acn-protocol"
 import type {
   DownloadAttempt as NativeDownloadAttempt,
   ModelOfferingTarget as NativeModelOfferingTarget,
@@ -26,12 +26,12 @@ import type {
   ModelTargetInput,
   RecommendableModel as NativeRecommendableModel,
   ServingProfile as NativeServingProfile,
-} from "@magnitudedev/icn"
+} from "@magnitudedev/icn-protocol/schemas"
 import {
   ModelOfferingTarget as NativeModelOfferingTargetSchema,
   ModelPackage as NativeModelPackageSchema,
   ModelTargetInput as NativeModelTargetInputSchema,
-} from "@magnitudedev/icn"
+} from "@magnitudedev/icn-protocol/schemas"
 
 export const modelPackageFromIcn = (
   modelPackage: NativeModelPackage,

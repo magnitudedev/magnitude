@@ -19,9 +19,10 @@
     "@magnitudedev/agent": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/icn": "workspace:*",
+    "@magnitudedev/icn-protocol": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
 
-    "@magnitudedev/protocol": "workspace:*",
+    "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/ripgrep": "workspace:*",
     "@magnitudedev/roles": "workspace:*",
     "@magnitudedev/skills": "workspace:*",
