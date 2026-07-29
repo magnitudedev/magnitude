@@ -9,7 +9,6 @@ import { join } from "node:path"
 import {
   acquireRelease,
   currentHost,
-  embeddedTrustedReleaseKeys,
   installArtifact,
   NodeArchiveExtractor,
   selectArtifact,
@@ -162,14 +161,13 @@ const ensureAcn = (
     const cached = yield* cachedAcn(dataDir, version)
     if (Option.isSome(cached)) return { path: cached.value, acquired: false }
 
-    const authenticated = yield* acquireRelease(
+    const release = yield* acquireRelease(
       releaseBaseUrl(),
       version,
-      embeddedTrustedReleaseKeys(),
       path.join(releaseRoot(dataDir), "manifests", version),
     ).pipe(Effect.mapError(acquisitionFailure(version)))
     const artifact = yield* selectArtifact(
-      authenticated.manifest,
+      release.manifest,
       "acn",
       currentHost(),
     ).pipe(Effect.mapError(acquisitionFailure(version)))

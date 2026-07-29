@@ -72,10 +72,10 @@ endpoint-specific transport error mapper.
 
 The native ICN process owns hardware discovery, model acquisition and inventory, artifact
 inspection, model fitting, the pinned inference runtime, active-model state, and inference request
-execution. `@magnitudedev/icn` acquires a signed release base plus an optional concrete accelerator
+execution. `@magnitudedev/icn` acquires a release-manifest base plus an optional concrete accelerator
 pack; ICN is not downloaded from a model repository or selected from a user-installed runtime.
 The installation carries the release-bound catalog lock and hardware-independent planner-input
-bundle as authenticated sidecars. Native startup validates their source, template, planner,
+bundle as integrity-checked sidecars. Native startup validates their source, template, planner,
 integrity, and exact-coverage identities before becoming ready. Ordinary startup and setup
 therefore do not contact a catalog service, fetch model headers, or depend on a user cache.
 Development hydration and release CI obtain the sidecars explicitly from immutable catalog
@@ -180,8 +180,8 @@ inference, and model-resource release do not extend this deadline.
 ## Binary resolution and compatibility
 
 Production releases publish a CPU-capable ICN base per host and distinct accelerator packs. The ICN
-package shares signed-manifest authentication, bounded download, safe extraction, and
-digest-addressed artifact installation with CLI and SDK acquisition. It alone owns native
+package shares release-manifest validation, bounded download, safe extraction, and digest-addressed
+artifact installation with CLI and SDK acquisition. It alone owns native
 eligibility probing, concrete backend resolution, base/pack composition, installation declaration,
 and native validation.
 
@@ -191,8 +191,8 @@ that no supported accelerator is usable. Probe or operational failure fails ACN 
 changing backend. Every supervised start probes again before deriving the concrete composition
 identity, so installing a driver can change the next composition without manual cache repair.
 
-An installation is immutable and identified by the authenticated manifest, base, optional pack,
-concrete backend, native build, and backend-module ABI. Its fixed layout contains executable,
+An installation is immutable and identified by the release manifest, base, optional pack, concrete
+backend, native build, and backend-module ABI. Its fixed layout contains executable,
 runtime, backend modules, catalog sidecars, and a minimal declaration. Native validation proves the
 running executable belongs to that installation, the selected backend directory contains only the
 declared accelerator family, required devices register, and catalog sidecars are complete.

@@ -57,9 +57,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAGNITUDE_SOURCE_COMMIT: ${{ github.sha }}
-          MAGNITUDE_RELEASE_SIGNING_KEY_ID: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_ID }}
-          MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8 }}
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - id: matrix
         run: bun run packages/release/scripts/matrix.ts
@@ -111,8 +108,6 @@ jobs:
           name: catalog-inputs
           path: catalog-inputs
       - run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
-        env:
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
       - uses: actions/upload-artifact@v4
         with:
           name: host-${{ matrix.id }}
@@ -208,15 +203,10 @@ jobs:
       - run: npm install --global "npm@${NPM_VERSION}"
       - id: npm-candidate
         run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
-        env:
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
       - run: bun run packages/release/scripts/assemble.ts release-artifacts release-candidate
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-          MAGNITUDE_RELEASE_SIGNING_KEY_ID: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_ID }}
-          MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8 }}
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
       - run: bun run packages/release/scripts/accept-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
       - name: Commit-point recheck
         run: bun run packages/release/scripts/preflight.ts
@@ -224,9 +214,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-          MAGNITUDE_RELEASE_SIGNING_KEY_ID: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_ID }}
-          MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8: ${{ secrets.MAGNITUDE_RELEASE_SIGNING_KEY_PKCS8 }}
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: bun run packages/release/scripts/publish.ts release-candidate
         env:
@@ -244,7 +231,6 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   public-smoke:

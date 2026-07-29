@@ -95,7 +95,6 @@ const prerelease = manifest.version.includes("-alpha.") ||
   manifest.version.includes("-beta.")
 const expectedNames = new Set([
   "magnitude-release.json",
-  "magnitude-release.json.sig",
   ...manifest.artifacts.map((artifact) => artifact.filename),
 ])
 const localNames = new Set(await readdir(candidate))
@@ -103,7 +102,7 @@ if (
   localNames.size !== expectedNames.size ||
   [...localNames].some((name) => !expectedNames.has(name))
 ) {
-  throw new Error("candidate directory differs from the signed release graph")
+  throw new Error("candidate directory differs from the release graph")
 }
 let release = await findGithubRelease(
   repository,

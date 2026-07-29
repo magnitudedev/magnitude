@@ -8,7 +8,6 @@ import * as Path from "@effect/platform/Path"
 import {
   acquireRelease,
   currentHost,
-  embeddedTrustedReleaseKeys,
   IcnInstallationSchema,
   installArtifact,
   NodeArchiveExtractor,
@@ -190,7 +189,7 @@ const readIdentity = (
     ) {
       return yield* installationError(
         "verify",
-        "ICN base identity differs from the authenticated release manifest",
+        "ICN base identity differs from the release manifest",
       )
     }
     return value
@@ -438,14 +437,13 @@ export const resolveReleaseIcnInstallation = (
     const path = yield* Path.Path
     const host = currentHost()
     const releaseRoot = path.join(dataDir, "releases")
-    const authenticated = yield* acquireRelease(
+    const release = yield* acquireRelease(
       baseUrl,
       version,
-      embeddedTrustedReleaseKeys(),
       path.join(releaseRoot, "manifests", version),
     ).pipe(Effect.mapError((cause) => installationError("acquire", cause.message)))
     const baseArtifact = yield* selectArtifact(
-      authenticated.manifest,
+      release.manifest,
       "icn-base",
       host,
       "cpu",
@@ -455,7 +453,7 @@ export const resolveReleaseIcnInstallation = (
       Effect.gen(function* () {
         const base = yield* ensureArtifact(baseUrl, version, baseArtifact, artifactRoot)
         const native = yield* readIdentity(base, baseArtifact)
-        const selected = yield* selectBackend(authenticated.manifest, base)
+        const selected = yield* selectBackend(release.manifest, base)
         const pack = yield* Option.match(selected.pack, {
           onNone: () => Effect.succeed(Option.none<string>()),
           onSome: (artifact) =>
@@ -464,7 +462,7 @@ export const resolveReleaseIcnInstallation = (
             ),
         })
         const id = compositionId(
-          authenticated.manifestSha256,
+          release.manifestSha256,
           baseArtifact,
           selected,
           native,

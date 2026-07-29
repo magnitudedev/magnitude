@@ -49,11 +49,8 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
       - id: npm-candidate
         run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
-        env:
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
       - name: Verify public CLI acquisition
         run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
         env:
@@ -66,5 +63,4 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
           MAGNITUDE_EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
-          MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON: ${{ vars.MAGNITUDE_RELEASE_TRUSTED_KEYS_JSON }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

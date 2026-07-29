@@ -1,5 +1,7 @@
-import { authenticateRelease, releaseUrl } from "../src/acquisition"
-import { embeddedTrustedReleaseKeys } from "../src/trust"
+import {
+  releaseUrl,
+  validateReleaseManifestBytes,
+} from "../src/acquisition"
 import { Effect } from "effect"
 
 const version = process.env.MAGNITUDE_RELEASE_VERSION?.trim()
@@ -17,16 +19,13 @@ const download = async (name: string, maximum: number): Promise<Uint8Array> => {
   if (bytes.byteLength > maximum) throw new Error(`${name} exceeds its size bound`)
   return bytes
 }
-const [manifest, signature] = await Promise.all([
-  download("magnitude-release.json", 16 * 1024 * 1024),
-  download("magnitude-release.json.sig", 16 * 1024),
-])
-const authenticated = await Effect.runPromise(
-  authenticateRelease(manifest, signature, embeddedTrustedReleaseKeys()),
+const manifest = await download("magnitude-release.json", 16 * 1024 * 1024)
+const release = await Effect.runPromise(
+  validateReleaseManifestBytes(manifest),
 )
 if (
-  authenticated.manifest.version !== version ||
-  authenticated.manifest.sourceCommit !== sourceCommit
+  release.manifest.version !== version ||
+  release.manifest.sourceCommit !== sourceCommit
 ) {
   throw new Error("public release does not match the released source")
 }

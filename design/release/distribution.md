@@ -35,9 +35,10 @@ Metal, CUDA, and Vulkan are separate backend packs. Each pack contains one backe
 and only its required redistributable runtime libraries. The supported hosts and packs are fixed
 product configuration, not a plugin system.
 
-One signed manifest records every native archive's release identity, filename, size, SHA-256,
-native-build identity, backend ABI, and compatibility facts used at runtime. Its Ed25519 signature
-is verified with the trust ring embedded in the npm launcher, CLI, and ACN.
+One manifest records every native archive's release identity, filename, size, SHA-256, native-build
+identity, backend ABI, and compatibility facts used at runtime. Production acquisition trusts the
+GitHub release origin and its HTTPS transport for the manifest. Artifact sizes and hashes prove that
+downloaded bytes match that manifest; they do not provide an independent publishing identity.
 
 ## Build and validation
 
@@ -61,9 +62,10 @@ The npm package contains a small Node entry and a bundled Effect acquisition run
 CLI only. SDK acquires ACN. The ICN lifecycle acquires ICN artifacts and constructs an exact local
 installation. These responsibilities do not overlap.
 
-All remote native bytes are selected from an authenticated manifest and installed under their
-digest. Downloads and extraction are bounded. Archives accept regular files at fixed safe paths
-only. Corrupt or incomplete installations are replaced as complete units.
+All remote native bytes are selected from the release manifest and installed under their digest.
+Downloads and extraction are bounded, and every artifact must match its declared size and SHA-256.
+Archives accept regular files at fixed safe paths only. Corrupt or incomplete installations are
+replaced as complete units.
 
 Apple arm64 always resolves its Metal pack. Other hosts select compatible CUDA, then compatible
 Vulkan, then CPU only when successful probes show that no supported accelerator is usable.
@@ -73,12 +75,11 @@ startup; none silently becomes CPU.
 ## Publication
 
 Before expensive builds, preflight freezes the merge commit and Changesets-owned version, verifies
-the npm token and signing key, and rejects conflicting GitHub or npm state. Immediately before
-publication, it repeats the remote-state check.
+the npm token, and rejects conflicting GitHub or npm state. Immediately before publication, it
+repeats the remote-state check.
 
 Candidate validation packs npm from the released source and exercises its launcher through Node,
-npx, Bun, and bunx against the local signed CLI candidate. Host jobs already validate native
-archives.
+npx, Bun, and bunx against the local CLI candidate. Host jobs already validate native archives.
 
 Publication creates or resumes the exact private GitHub draft, uploads and verifies the complete
 candidate, then makes GitHub public. The accepted npm pack must acquire and execute the CLI from
@@ -95,8 +96,7 @@ public CLI acquisition check.
 
 - Unrelated commits cannot publish.
 - Changesets alone controls npm version and dist-tag behavior.
-- Every acquired native byte is authenticated.
-- A mismatched signing key fails before publication.
+- Every acquired native artifact matches the size and SHA-256 in its release manifest.
 - Final host archives execute before publication.
 - Accelerator operational failure never becomes CPU fallback.
 - Valid cached installations work offline; unavailable repair fails explicitly.

@@ -17,7 +17,6 @@ import {
 import { ArchiveExtractor, NodeArchiveExtractor } from "./archive"
 import { ReleaseAcquisitionError } from "./errors"
 import { currentHost } from "./targets"
-import { embeddedTrustedReleaseKeys } from "./trust"
 
 const releaseBaseUrl = () => (
   process.env.MAGNITUDE_RELEASE_BASE_URL ??
@@ -164,13 +163,12 @@ const ensureBinaryEffect = (
     const path = yield* Path.Path
     const fs = yield* FileSystem.FileSystem
     const host = currentHost()
-    const authenticated = yield* acquireRelease(
+    const release = yield* acquireRelease(
       releaseBaseUrl(),
       version,
-      embeddedTrustedReleaseKeys(),
       path.join(releaseRoot(), "manifests", version),
     )
-    const artifact = yield* selectArtifact(authenticated.manifest, "cli", host)
+    const artifact = yield* selectArtifact(release.manifest, "cli", host)
     const destination = path.join(
       releaseRoot(),
       "cli",
