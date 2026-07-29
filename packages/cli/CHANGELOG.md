@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.24
+
+### Patch Changes
+
+- [`6401c9c`](https://github.com/magnitudedev/magnitude/commit/6401c9c0346a98e47cd8a3de31452bd6ac36ff3d) Thanks [@anerli](https://github.com/anerli)! - fix linux arm64 dynamic bindings
+
 ## 0.0.1-alpha.23
 
 ### Patch Changes
