@@ -15,8 +15,11 @@ use icn_contracts::{
     InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
     ModelDownloadEvent, ModelLocation, ModelSource,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use sha2_state::digest::common::hazmat::{SerializableState, SerializedState};
+use sha2_state::{Digest as StateDigest, Sha256 as StatefulSha256};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::identity::{content_id, model_id};
@@ -25,6 +28,8 @@ use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationComponent, Ope
 use crate::validation::validate_download_request;
 
 const MAX_ATTEMPTS: usize = 5;
+const INTEGRITY_CHECKPOINT_INTERVAL: u64 = 256 * 1024 * 1024;
+const MAX_INTEGRITY_RECORD_BYTES: u64 = 4 * 1024;
 
 pub(crate) struct DownloadOperation {
     sender: watch::Sender<ModelDownloadEvent>,
@@ -88,6 +93,153 @@ struct HubApiLfs {
 struct ResolvedRemoteMetadata {
     size: u64,
     content: ContentIdentity,
+}
+
+struct DownloadComponentPaths {
+    partial: PathBuf,
+    blob: PathBuf,
+    checkpoint: PathBuf,
+}
+
+#[derive(Clone)]
+struct DownloadIntegrity {
+    digest: Option<StatefulSha256>,
+    bytes: u64,
+    checkpointed_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DownloadIntegrityRecord {
+    content: ContentIdentity,
+    expected_size: u64,
+    completed_bytes: u64,
+    sha256_state: Option<Vec<u8>>,
+}
+
+impl DownloadComponentPaths {
+    fn new(blobs: &Path, content_key: &str) -> Self {
+        Self {
+            blob: blobs.join(content_key),
+            partial: blobs.join(format!("{content_key}.incomplete")),
+            checkpoint: blobs.join(format!("{content_key}.integrity")),
+        }
+    }
+}
+
+impl DownloadIntegrityRecord {
+    fn restore(self, content: &ContentIdentity, expected_size: u64) -> Option<DownloadIntegrity> {
+        if &self.content != content
+            || self.expected_size != expected_size
+            || self.completed_bytes > expected_size
+        {
+            return None;
+        }
+        let digest = match (content, self.sha256_state) {
+            (ContentIdentity::Sha256 { .. }, Some(bytes)) => {
+                let serialized =
+                    SerializedState::<StatefulSha256>::try_from(bytes.as_slice()).ok()?;
+                Some(StatefulSha256::deserialize(&serialized).ok()?)
+            }
+            (ContentIdentity::Sha256 { .. }, None) | (_, Some(_)) => return None,
+            (_, None) => None,
+        };
+        Some(DownloadIntegrity {
+            digest,
+            bytes: self.completed_bytes,
+            checkpointed_bytes: self.completed_bytes,
+        })
+    }
+}
+
+impl DownloadIntegrity {
+    fn empty(component: &RemoteComponent) -> Self {
+        Self {
+            digest: matches!(&component.content, ContentIdentity::Sha256 { .. })
+                .then(StatefulSha256::new),
+            bytes: 0,
+            checkpointed_bytes: 0,
+        }
+    }
+
+    fn restore(
+        component: &RemoteComponent,
+        record: DownloadIntegrityRecord,
+    ) -> Result<Self, DownloadError> {
+        record
+            .restore(&component.content, component.size)
+            .ok_or_else(|| invalid_checkpoint(component))
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> Result<(), DownloadError> {
+        let count = u64::try_from(bytes.len()).map_err(|_| DownloadError {
+            code: "size_overflow",
+            message: "download chunk size overflows u64".to_owned(),
+            retryable: false,
+            resumable: false,
+        })?;
+        self.bytes = self.bytes.checked_add(count).ok_or_else(|| DownloadError {
+            code: "size_overflow",
+            message: "download byte count overflows u64".to_owned(),
+            retryable: false,
+            resumable: false,
+        })?;
+        if let Some(digest) = self.digest.as_mut() {
+            digest.update(bytes);
+        }
+        Ok(())
+    }
+
+    fn record(&self, component: &RemoteComponent) -> DownloadIntegrityRecord {
+        DownloadIntegrityRecord {
+            content: component.content.clone(),
+            expected_size: component.size,
+            completed_bytes: self.bytes,
+            sha256_state: self
+                .digest
+                .as_ref()
+                .map(|digest| digest.serialize().as_slice().to_vec()),
+        }
+    }
+
+    fn needs_checkpoint(&self) -> bool {
+        self.bytes.saturating_sub(self.checkpointed_bytes) >= INTEGRITY_CHECKPOINT_INTERVAL
+    }
+
+    fn mark_checkpointed(&mut self) {
+        self.checkpointed_bytes = self.bytes;
+    }
+
+    fn verify(&self, component: &RemoteComponent) -> Result<(), DownloadError> {
+        if self.bytes != component.size {
+            return Err(DownloadError {
+                code: "size_mismatch",
+                message: format!("unexpected size for {}", component.request.path.display()),
+                retryable: true,
+                resumable: true,
+            });
+        }
+        let ContentIdentity::Sha256 { value: expected } = &component.content else {
+            return Ok(());
+        };
+        let actual = self
+            .digest
+            .clone()
+            .expect("SHA-256 content has an integrity digest")
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if &actual != expected {
+            return Err(DownloadError {
+                code: "integrity_failed",
+                message: format!("SHA-256 mismatch for {}", component.request.path.display()),
+                retryable: false,
+                resumable: false,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -278,8 +430,21 @@ impl ModelManager {
         let snapshot = repo_root.join("snapshots").join(&commit);
         let model_id = model_id("magnitude-cache", &snapshot, &content_id);
         let total_bytes: u64 = remote.iter().map(|component| component.size).sum();
-        let previous = read_operation_manifest(&self.config.root, &model_id).await;
-        let completed_bytes = resumable_bytes(&repo_root, &remote, previous.as_ref()).await;
+        let existing = self.models.read().ok().and_then(|models| {
+            models
+                .get(&model_id)
+                .filter(|model| matches!(model.availability, ModelAvailability::Available { .. }))
+                .cloned()
+        });
+        if let Some(model) = existing {
+            operation.sender.send_replace(ModelDownloadEvent::Ready {
+                operation_id: operation_id.to_owned(),
+                model: Box::new(model),
+            });
+            return Ok(());
+        }
+
+        let completed_bytes = resumable_bytes(&repo_root, &remote).await;
         let missing_bytes = total_bytes.saturating_sub(completed_bytes);
         let available_bytes =
             fs2::available_space(&self.config.root).map_err(|error| DownloadError {
@@ -309,20 +474,6 @@ impl ModelManager {
                 retryable: false,
                 resumable: true,
             });
-        }
-
-        let existing = self.models.read().ok().and_then(|models| {
-            models
-                .get(&model_id)
-                .filter(|model| matches!(model.availability, ModelAvailability::Available { .. }))
-                .cloned()
-        });
-        if existing.is_some() {
-            operation.sender.send_replace(ModelDownloadEvent::Ready {
-                operation_id: operation_id.to_owned(),
-                model: Box::new(existing.expect("existing model was checked")),
-            });
-            return Ok(());
         }
 
         let started_at = now();
@@ -460,7 +611,7 @@ impl ModelManager {
                 &self.config.root,
                 &commit,
                 component,
-                |file_completed| {
+                |file_completed, stage| {
                     let timestamp = Instant::now();
                     if file_completed != component.size
                         && timestamp.duration_since(last_progress_emit) < Duration::from_millis(100)
@@ -483,11 +634,6 @@ impl ModelManager {
                         .saturating_add(file_completed.saturating_sub(resumed_from));
                     let rate =
                         (elapsed > 0.0 && transferred > 0).then(|| transferred as f64 / elapsed);
-                    let stage = if file_completed == component.size {
-                        DownloadStage::Verifying
-                    } else {
-                        DownloadStage::Downloading
-                    };
                     operation.sender.send_replace(ModelDownloadEvent::Progress {
                         operation_id: operation_id.to_owned(),
                         model_id: model_id.clone(),
@@ -630,19 +776,36 @@ async fn download_component_with_retry(
     root: &Path,
     commit: &str,
     component: &RemoteComponent,
-    mut progress: impl FnMut(u64),
+    mut progress: impl FnMut(u64, DownloadStage),
     cancelled: &AtomicBool,
 ) -> Result<(), DownloadError> {
+    let blobs = root
+        .join("hub")
+        .join(hf_repo_dir(&repo.repo_path()))
+        .join("blobs");
+    let paths = DownloadComponentPaths::new(&blobs, &component.content_key);
+    if recover_completed_blob(&paths, component).await? {
+        progress(component.size, DownloadStage::Verifying);
+        return Ok(());
+    }
+    let mut integrity = recover_partial(&paths, component).await?;
+    progress(integrity.bytes, DownloadStage::Downloading);
+
     for attempt in 0..MAX_ATTEMPTS {
         if cancelled.load(Ordering::Acquire) {
-            return Err(DownloadError {
-                code: "cancelled",
-                message: "download was cancelled".to_owned(),
-                retryable: true,
-                resumable: true,
-            });
+            persist_integrity_checkpoint(&paths, component, &mut integrity, None).await?;
+            return Err(cancelled_error());
         }
-        match download_component_once(repo, root, commit, component, &mut progress, cancelled).await
+        match download_component_once(
+            repo,
+            commit,
+            component,
+            &paths,
+            &mut integrity,
+            &mut progress,
+            cancelled,
+        )
+        .await
         {
             Ok(()) => return Ok(()),
             Err(error) if error.retryable && attempt + 1 < MAX_ATTEMPTS => {
@@ -656,44 +819,48 @@ async fn download_component_with_retry(
 
 async fn download_component_once(
     repo: &hf_hub::HFRepository<hf_hub::RepoTypeModel>,
-    root: &Path,
     commit: &str,
     component: &RemoteComponent,
-    progress: &mut impl FnMut(u64),
+    paths: &DownloadComponentPaths,
+    integrity: &mut DownloadIntegrity,
+    progress: &mut impl FnMut(u64, DownloadStage),
     cancelled: &AtomicBool,
 ) -> Result<(), DownloadError> {
-    let blobs = root
-        .join("hub")
-        .join(hf_repo_dir(&repo.repo_path()))
-        .join("blobs");
-    let blob = blobs.join(&component.content_key);
-    if tokio::fs::metadata(&blob)
-        .await
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == component.size)
-    {
-        verify_file(&blob, component).await?;
-        progress(component.size);
-        return Ok(());
-    }
-    let partial = blobs.join(format!("{}.incomplete", component.content_key));
-    let mut offset = tokio::fs::metadata(&partial)
+    let mut offset = integrity.bytes;
+    let partial_len = tokio::fs::metadata(&paths.partial)
         .await
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    if offset > component.size {
-        quarantine(&partial).await?;
-        offset = 0;
-    }
-    if offset == component.size {
-        verify_file(&partial, component).await?;
-        tokio::fs::rename(&partial, &blob)
+    if partial_len > offset {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths.partial)
+            .await
+            .map_err(download_io)?
+            .set_len(offset)
             .await
             .map_err(download_io)?;
-        progress(component.size);
+    } else if partial_len < offset {
+        return Err(DownloadError {
+            code: "size_mismatch",
+            message: format!(
+                "partial download is shorter than verified progress for {}",
+                component.request.path.display()
+            ),
+            retryable: true,
+            resumable: false,
+        });
+    }
+    if offset == component.size {
+        progress(component.size, DownloadStage::Verifying);
+        if let Err(error) = integrity.verify(component) {
+            quarantine_component_files(paths).await?;
+            return Err(error);
+        }
+        publish_verified_blob(paths).await?;
         return Ok(());
     }
 
-    let original_offset = offset;
     let (_reported_length, mut stream) = repo
         .download_file_stream()
         .filename(component.request.path.to_string_lossy().into_owned())
@@ -702,22 +869,23 @@ async fn download_component_once(
         .send()
         .await
         .map_err(map_hf_error)?;
-    let std_file = open_partial(&partial)?;
+    let std_file = open_partial(&paths.partial)?;
     let mut file = tokio::fs::File::from_std(std_file);
     file.seek(std::io::SeekFrom::Start(offset))
         .await
         .map_err(download_io)?;
     while let Some(chunk) = stream.next().await {
         if cancelled.load(Ordering::Acquire) {
-            file.flush().await.map_err(download_io)?;
-            return Err(DownloadError {
-                code: "cancelled",
-                message: "download was cancelled".to_owned(),
-                retryable: true,
-                resumable: true,
-            });
+            persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
+            return Err(cancelled_error());
         }
-        let chunk = chunk.map_err(map_hf_error)?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
+                return Err(map_hf_error(error));
+            }
+        };
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| DownloadError {
             code: "size_overflow",
             message: "download chunk size overflows u64".to_owned(),
@@ -728,7 +896,6 @@ async fn download_component_once(
             .checked_add(chunk_len)
             .is_none_or(|next| next > component.size)
         {
-            file.set_len(original_offset).await.map_err(download_io)?;
             return Err(DownloadError {
                 code: "size_mismatch",
                 message: format!(
@@ -740,13 +907,15 @@ async fn download_component_once(
             });
         }
         file.write_all(&chunk).await.map_err(download_io)?;
+        integrity.update(&chunk)?;
         offset += chunk_len;
-        progress(offset);
+        progress(offset, DownloadStage::Downloading);
+        if integrity.needs_checkpoint() {
+            persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
+        }
     }
-    file.flush().await.map_err(download_io)?;
-    file.sync_all().await.map_err(download_io)?;
     if offset != component.size {
-        file.set_len(original_offset).await.map_err(download_io)?;
+        persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
         return Err(DownloadError {
             code: "size_mismatch",
             message: format!(
@@ -758,48 +927,153 @@ async fn download_component_once(
             resumable: true,
         });
     }
+    persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
     drop(file);
-    verify_file(&partial, component).await?;
-    tokio::fs::rename(&partial, &blob)
-        .await
-        .map_err(download_io)?;
+    progress(component.size, DownloadStage::Verifying);
+    if let Err(error) = integrity.verify(component) {
+        quarantine_component_files(paths).await?;
+        return Err(error);
+    }
+    publish_verified_blob(paths).await?;
     Ok(())
 }
 
-async fn verify_file(path: &Path, component: &RemoteComponent) -> Result<(), DownloadError> {
-    let metadata = tokio::fs::metadata(path).await.map_err(download_io)?;
-    if !metadata.is_file() || metadata.len() != component.size {
-        return Err(DownloadError {
-            code: "size_mismatch",
-            message: format!("unexpected size for {}", component.request.path.display()),
-            retryable: false,
-            resumable: false,
-        });
-    }
-    let ContentIdentity::Sha256 { value: expected } = &component.content else {
-        return Ok(());
-    };
-    let mut file = tokio::fs::File::open(path).await.map_err(download_io)?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).await.map_err(download_io)?;
-        if read == 0 {
-            break;
+async fn recover_partial(
+    paths: &DownloadComponentPaths,
+    component: &RemoteComponent,
+) -> Result<DownloadIntegrity, DownloadError> {
+    let partial_len = regular_file_len(&paths.partial).await;
+    let record = read_integrity_record(&paths.checkpoint).await;
+    let Some((partial_len, record)) = partial_len.zip(record) else {
+        if partial_len.is_some() || paths.checkpoint.exists() {
+            quarantine_component_files(paths).await?;
         }
-        digest.update(&buffer[..read]);
+        return Ok(DownloadIntegrity::empty(component));
+    };
+    let integrity = match DownloadIntegrity::restore(component, record) {
+        Ok(integrity) if partial_len >= integrity.bytes => integrity,
+        _ => {
+            quarantine_component_files(paths).await?;
+            return Ok(DownloadIntegrity::empty(component));
+        }
+    };
+    if partial_len > integrity.bytes {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths.partial)
+            .await
+            .map_err(download_io)?
+            .set_len(integrity.bytes)
+            .await
+            .map_err(download_io)?;
     }
-    let actual = format!("{:x}", digest.finalize());
-    if &actual != expected {
+    Ok(integrity)
+}
+
+async fn recover_completed_blob(
+    paths: &DownloadComponentPaths,
+    component: &RemoteComponent,
+) -> Result<bool, DownloadError> {
+    let Some(blob_len) = regular_file_len(&paths.blob).await else {
+        return Ok(false);
+    };
+    let checkpoint = read_integrity_record(&paths.checkpoint)
+        .await
+        .and_then(|record| DownloadIntegrity::restore(component, record).ok());
+    if blob_len == component.size
+        && let Some(integrity) = checkpoint
+        && integrity.bytes == component.size
+        && integrity.verify(component).is_ok()
+    {
+        return Ok(true);
+    }
+
+    quarantine_component_files(paths).await?;
+    Ok(false)
+}
+
+async fn persist_integrity_checkpoint(
+    paths: &DownloadComponentPaths,
+    component: &RemoteComponent,
+    integrity: &mut DownloadIntegrity,
+    file: Option<&mut tokio::fs::File>,
+) -> Result<(), DownloadError> {
+    if integrity.bytes == integrity.checkpointed_bytes {
+        return Ok(());
+    }
+    if let Some(file) = file {
+        file.flush().await.map_err(download_io)?;
+        file.sync_data().await.map_err(download_io)?;
+    } else {
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&paths.partial)
+            .await
+            .map_err(download_io)?
+            .sync_data()
+            .await
+            .map_err(download_io)?;
+    }
+    atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
+    integrity.mark_checkpointed();
+    Ok(())
+}
+
+async fn publish_verified_blob(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
+    tokio::fs::rename(&paths.partial, &paths.blob)
+        .await
+        .map_err(download_io)?;
+    sync_parent(&paths.blob).await
+}
+
+async fn read_integrity_record(path: &Path) -> Option<DownloadIntegrityRecord> {
+    read_bounded_json(path).await
+}
+
+async fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let metadata = tokio::fs::symlink_metadata(path).await.ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    if metadata.len() > MAX_INTEGRITY_RECORD_BYTES {
+        return None;
+    }
+    let bytes = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn regular_file_len(path: &Path) -> Option<u64> {
+    let metadata = tokio::fs::symlink_metadata(path).await.ok()?;
+    (metadata.is_file() && !metadata.file_type().is_symlink()).then_some(metadata.len())
+}
+
+async fn quarantine_component_files(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
+    for path in [&paths.partial, &paths.blob, &paths.checkpoint] {
         quarantine(path).await?;
-        return Err(DownloadError {
-            code: "integrity_failed",
-            message: format!("SHA-256 mismatch for {}", component.request.path.display()),
-            retryable: false,
-            resumable: false,
-        });
     }
     Ok(())
+}
+
+fn invalid_checkpoint(component: &RemoteComponent) -> DownloadError {
+    DownloadError {
+        code: "invalid_checkpoint",
+        message: format!(
+            "download integrity checkpoint does not match {}",
+            component.request.path.display()
+        ),
+        retryable: true,
+        resumable: false,
+    }
+}
+
+fn cancelled_error() -> DownloadError {
+    DownloadError {
+        code: "cancelled",
+        message: "download was cancelled".to_owned(),
+        retryable: true,
+        resumable: true,
+    }
 }
 
 async fn publish_snapshot_link(
@@ -914,11 +1188,15 @@ async fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), D
     // Persist the directory entry as well as the manifest contents. Without
     // this fsync a power loss can lose the rename even though the file itself
     // was synced successfully.
-    if let Some(parent) = path.parent() {
-        let directory = tokio::fs::File::open(parent).await.map_err(download_io)?;
-        directory.sync_all().await.map_err(download_io)?;
-    }
-    Ok(())
+    sync_parent(path).await
+}
+
+async fn sync_parent(path: &Path) -> Result<(), DownloadError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let directory = tokio::fs::File::open(parent).await.map_err(download_io)?;
+    directory.sync_all().await.map_err(download_io)
 }
 
 async fn read_operation_manifest(
@@ -938,23 +1216,10 @@ async fn persist_operation_failure(root: &Path, model_id: &icn_contracts::ModelI
     manifest.last_error = Some(code.to_owned());
     manifest.updated_at = now();
     for component in &mut manifest.components {
-        let blobs = root
-            .join("hub")
-            .join(hf_repo_dir(&manifest.repository))
-            .join("blobs");
-        let blob = blobs.join(&component.content_key);
-        let partial = blobs.join(format!("{}.incomplete", component.content_key));
-        component.completed_bytes = if tokio::fs::metadata(&blob)
-            .await
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == component.expected_size)
-        {
-            component.expected_size
-        } else {
-            tokio::fs::metadata(partial)
-                .await
-                .map(|metadata| metadata.len().min(component.expected_size))
-                .unwrap_or(0)
-        };
+        let repo_root = root.join("hub").join(hf_repo_dir(&manifest.repository));
+        let paths = DownloadComponentPaths::new(&repo_root.join("blobs"), &component.content_key);
+        component.completed_bytes =
+            recoverable_download_bytes(&paths, &component.content, component.expected_size).await;
     }
     let _ = persist_operation_manifest(root, &manifest).await;
 }
@@ -963,53 +1228,41 @@ fn operation_manifest_path(root: &Path, model_id: &icn_contracts::ModelId) -> Pa
     root.join("operations").join(format!("{}.json", model_id.0))
 }
 
-async fn resumable_bytes(
-    repo_root: &Path,
-    components: &[RemoteComponent],
-    previous: Option<&OperationManifest>,
-) -> u64 {
+async fn resumable_bytes(repo_root: &Path, components: &[RemoteComponent]) -> u64 {
     let mut total = 0_u64;
     for component in components {
-        let blob = repo_root.join("blobs").join(&component.content_key);
-        if tokio::fs::metadata(&blob)
-            .await
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == component.size)
-        {
-            total = total.saturating_add(component.size);
-            continue;
-        }
-        let matches_sidecar = previous.is_some_and(|manifest| {
-            manifest.components.iter().any(|candidate| {
-                candidate.path == component.request.path
-                    && candidate.expected_size == component.size
-                    && candidate.content_key == component.content_key
-            })
-        });
-        let partial = component_partial(repo_root, component);
-        let length = tokio::fs::metadata(&partial)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if matches_sidecar || length == component.size {
-            total = total.saturating_add(length.min(component.size));
-        } else if length > 0 {
-            let _ = quarantine(&partial).await;
-        }
+        total = total.saturating_add(component_partial_len(repo_root, component).await);
     }
     total
 }
 
 async fn component_partial_len(repo_root: &Path, component: &RemoteComponent) -> u64 {
-    tokio::fs::metadata(component_partial(repo_root, component))
-        .await
-        .map(|metadata| metadata.len().min(component.size))
-        .unwrap_or(0)
+    let paths = DownloadComponentPaths::new(&repo_root.join("blobs"), &component.content_key);
+    recoverable_download_bytes(&paths, &component.content, component.size).await
 }
 
-fn component_partial(repo_root: &Path, component: &RemoteComponent) -> PathBuf {
-    repo_root
-        .join("blobs")
-        .join(format!("{}.incomplete", component.content_key))
+async fn recoverable_download_bytes(
+    paths: &DownloadComponentPaths,
+    content: &ContentIdentity,
+    expected_size: u64,
+) -> u64 {
+    if regular_file_len(&paths.blob).await == Some(expected_size)
+        && read_integrity_record(&paths.checkpoint)
+            .await
+            .and_then(|record| record.restore(content, expected_size))
+            .is_some_and(|integrity| integrity.bytes == expected_size)
+    {
+        return expected_size;
+    }
+    let Some(partial_len) = regular_file_len(&paths.partial).await else {
+        return 0;
+    };
+    read_integrity_record(&paths.checkpoint)
+        .await
+        .and_then(|record| record.restore(content, expected_size))
+        .map(|integrity| integrity.bytes)
+        .filter(|completed| *completed <= partial_len)
+        .unwrap_or(0)
 }
 
 async fn quarantine(path: &Path) -> Result<(), DownloadError> {
@@ -1329,5 +1582,159 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
                 .sum(),
         ),
         ModelDownloadEvent::Resolving { .. } => (0, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use icn_contracts::{ComponentRole, DownloadComponent};
+
+    fn remote_component(contents: &[u8]) -> RemoteComponent {
+        let digest = format!("{:x}", Sha256::digest(contents));
+        RemoteComponent {
+            request: DownloadComponent {
+                path: PathBuf::from("model.gguf"),
+                role: ComponentRole::Weights,
+                shard_index: None,
+                expected_sha256: Some(digest.clone()),
+            },
+            size: contents.len() as u64,
+            content: ContentIdentity::Sha256 { value: digest },
+            content_key: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn streamed_integrity_matches_the_complete_source_digest() {
+        let contents = b"streamed model contents";
+        let component = remote_component(contents);
+        let mut integrity = DownloadIntegrity::empty(&component);
+
+        integrity.update(&contents[..8]).expect("first chunk");
+        integrity.update(&contents[8..]).expect("second chunk");
+
+        integrity.verify(&component).expect("matching digest");
+    }
+
+    #[tokio::test]
+    async fn resumed_integrity_restores_the_existing_prefix_without_reading_it() {
+        let contents = b"resumed model contents";
+        let split = 9;
+        let component = remote_component(contents);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        tokio::fs::write(&paths.partial, &contents[..split])
+            .await
+            .expect("partial contents");
+        let mut original = DownloadIntegrity::empty(&component);
+        original
+            .update(&contents[..split])
+            .expect("downloaded prefix");
+        atomic_json(&paths.checkpoint, &original.record(&component))
+            .await
+            .expect("integrity checkpoint");
+
+        let mut integrity = recover_partial(&paths, &component)
+            .await
+            .expect("resume integrity");
+        integrity
+            .update(&contents[split..])
+            .expect("remaining bytes");
+
+        integrity.verify(&component).expect("matching digest");
+    }
+
+    #[tokio::test]
+    async fn resume_truncates_bytes_beyond_the_durable_checkpoint() {
+        let contents = b"checkpoint plus uncommitted tail";
+        let split = 10;
+        let component = remote_component(contents);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        tokio::fs::write(&paths.partial, contents)
+            .await
+            .expect("partial contents");
+        let mut original = DownloadIntegrity::empty(&component);
+        original
+            .update(&contents[..split])
+            .expect("checkpointed prefix");
+        atomic_json(&paths.checkpoint, &original.record(&component))
+            .await
+            .expect("integrity checkpoint");
+
+        let integrity = recover_partial(&paths, &component)
+            .await
+            .expect("resume integrity");
+
+        assert_eq!(integrity.bytes, split as u64);
+        assert_eq!(
+            tokio::fs::metadata(&paths.partial)
+                .await
+                .expect("partial metadata")
+                .len(),
+            split as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_blob_uses_the_final_checkpoint_without_rehashing() {
+        let contents = b"completed model contents";
+        let component = remote_component(contents);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        tokio::fs::write(&paths.blob, contents)
+            .await
+            .expect("completed blob");
+        let mut integrity = DownloadIntegrity::empty(&component);
+        integrity.update(contents).expect("downloaded contents");
+        atomic_json(&paths.checkpoint, &integrity.record(&component))
+            .await
+            .expect("final integrity checkpoint");
+
+        assert!(
+            recover_completed_blob(&paths, &component)
+                .await
+                .expect("completed blob recovery")
+        );
+        assert!(paths.checkpoint.is_file());
+    }
+
+    #[tokio::test]
+    async fn partial_without_a_valid_checkpoint_restarts_cleanly() {
+        let contents = b"untrusted partial model contents";
+        let component = remote_component(contents);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        tokio::fs::write(&paths.partial, contents)
+            .await
+            .expect("partial contents");
+        tokio::fs::write(&paths.checkpoint, b"not a checkpoint")
+            .await
+            .expect("invalid checkpoint");
+
+        let integrity = recover_partial(&paths, &component)
+            .await
+            .expect("clean restart");
+
+        assert_eq!(integrity.bytes, 0);
+        assert!(!paths.partial.exists());
+        assert!(!paths.checkpoint.exists());
+    }
+
+    #[test]
+    fn streamed_integrity_rejects_mismatched_content() {
+        let expected = b"expected model contents";
+        let component = remote_component(expected);
+        let mut different = expected.to_vec();
+        different[0] ^= 1;
+        let mut integrity = DownloadIntegrity::empty(&component);
+        integrity.update(&different).expect("streamed bytes");
+
+        let error = integrity.verify(&component).expect_err("digest mismatch");
+
+        assert_eq!(error.code, "integrity_failed");
+        assert!(!error.retryable);
+        assert!(!error.resumable);
     }
 }
