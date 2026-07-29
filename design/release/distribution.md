@@ -81,8 +81,12 @@ installation. These responsibilities do not overlap.
 
 All remote native bytes are selected from the release manifest and installed under their digest.
 Downloads and extraction are bounded, and every artifact must match its declared size and SHA-256.
-Archives accept regular files at fixed safe paths only. Corrupt or incomplete installations are
-replaced as complete units.
+Artifacts use up to four validated HTTP byte ranges with dynamically sized work units, independent
+part retries, and ordered assembly. Work units keep available workers active without allowing one
+retry to repeat more than a bounded maximum range. Range responses must describe the exact
+requested bytes and one consistent representation; unsupported ranges fall back to the bounded
+sequential transfer. Archives accept regular files at fixed safe paths only. Corrupt or incomplete
+downloads and installations are never published and are replaced as complete units.
 
 Apple arm64 always resolves its Metal pack. Other hosts select compatible CUDA, then compatible
 Vulkan, then CPU only when successful probes show that no supported accelerator is usable.

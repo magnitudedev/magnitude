@@ -30,6 +30,12 @@ const archive = new TextEncoder().encode("archive")
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex")
 
+const parseRange = (value: string): { start: number; end: number } => {
+  const match = /^bytes=(\d+)-(\d+)$/.exec(value)
+  if (!match) throw new Error(`invalid test range ${value}`)
+  return { start: Number(match[1]), end: Number(match[2]) }
+}
+
 const artifact = Schema.decodeUnknownSync(ReleaseArtifactSchema)({
   id: "cli-linux-x64-gnu",
   kind: "cli",
@@ -143,8 +149,8 @@ describe("unsigned release acquisition", () => {
   })
 
   it.each([
-    ["digest", "corrupt", "release artifact digest or size differs from manifest"],
-    ["size", "short", "release artifact size differs from its manifest"],
+    ["digest", "corrupt", "downloaded artifact SHA-256"],
+    ["size", "short", "artifact response declares 5 bytes, expected 7"],
   ])("rejects artifact bytes that differ from the manifest %s", async (_field, body, message) => {
     const root = await mkdtemp(join(tmpdir(), "magnitude-release-test-"))
     const server = Bun.serve({
@@ -165,7 +171,7 @@ describe("unsigned release acquisition", () => {
         ),
       )
       expect(error.stage).toBe("download")
-      expect(error.message).toBe(message)
+      expect(error.message).toContain(message)
     } finally {
       server.stop(true)
       await rm(root, { recursive: true, force: true })
@@ -207,10 +213,29 @@ describe("unsigned release acquisition", () => {
       bytes: archiveBytes.byteLength,
       sha256: sha256(archiveBytes),
     })
+    const requestedRanges: string[] = []
+    let sequentialRequests = 0
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
-      fetch: () => new Response(archiveBytes),
+      fetch: (request) => {
+        const range = request.headers.get("range")
+        if (!range) {
+          sequentialRequests += 1
+          return new Response(archiveBytes)
+        }
+        requestedRanges.push(range)
+        const { start, end } = parseRange(range)
+        const part = archiveBytes.slice(start, end + 1)
+        return new Response(part, {
+          status: 206,
+          headers: {
+            "content-range": `bytes ${start}-${end}/${archiveBytes.byteLength}`,
+            "content-length": String(part.byteLength),
+            etag: "\"installation-test\"",
+          },
+        })
+      },
     })
     try {
       await Effect.runPromise(
@@ -223,6 +248,9 @@ describe("unsigned release acquisition", () => {
       )
       expect(await readFile(join(destination, "bin", "magnitude-cli"), "utf8"))
         .toBe("#!/bin/sh\nexit 0\n")
+      expect(sequentialRequests).toBe(0)
+      expect(requestedRanges[0]).toBe("bytes=0-0")
+      expect(requestedRanges.slice(1)).toHaveLength(4)
       expect(
         (await readdir(join(root, "installations")))
           .filter((entry) => entry.startsWith(".release-")),
