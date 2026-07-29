@@ -29,8 +29,12 @@ const run = async (
     new Response(child.stderr).text(),
   ])
   if (code !== 0) {
+    const diagnostics = [stderr, stdout]
+      .filter((value) => value.trim().length > 0)
+      .join("\n")
+      .trim()
     throw new Error(
-      `${command[0]} failed with exit ${code}: ${(stderr || stdout).trim().slice(0, 4_000)}`,
+      `${command[0]} failed with exit ${code}: ${diagnostics}`,
     )
   }
   return stdout

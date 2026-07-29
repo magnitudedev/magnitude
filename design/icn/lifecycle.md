@@ -21,6 +21,7 @@ applies_to:
   - scripts/dev.ts
   - inference/catalog/**
   - .github/workflows/release.yml
+  - .github/workflows/release-build.yml
 ---
 
 # ICN process lifecycle and Bun boundary

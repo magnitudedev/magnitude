@@ -2,6 +2,7 @@
 applies_to:
   - .github/workflows/changesets.yml
   - .github/workflows/release.yml
+  - .github/workflows/release-build.yml
   - .github/workflows/release-checks.yml
   - .github/workflows/publish-npm.yml
   - packages/release/**
@@ -55,8 +56,10 @@ CUDA and Vulkan jobs prove that the configured module and redistributable files 
 that their native-build and backend ABI identities match their host base. Jobs without matching GPU
 hardware do not claim device execution.
 
-Pull requests run one representative Linux x64 release build when release-relevant code changes.
-An actual release builds the complete artifact graph.
+Pull requests build and validate the complete release artifact graph from the exact proposed commit
+using the same reusable build workflow as production. They stop before creating or modifying a
+GitHub release or publishing npm. Production consumes those same build jobs and adds the remote
+publication steps only after the complete graph succeeds.
 
 ## Runtime ownership
 
