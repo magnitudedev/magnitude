@@ -96,10 +96,11 @@ Slot reconciliation cannot author physical lifecycle. It retains durable selecti
 projects the exact bound native instance. Catalog and provider changes affect availability; they
 cannot overwrite instance lifecycle.
 
-Local slot assignment validates the exact installed serving configuration and commits that durable
-selection. Slot actions remain presentation and are never used as command authorization.
-Assignment and load never invoke the preview operation; ICN load admission is the only
-authoritative load-time hardware decision.
+Local slot assignment validates the selected durable serving configuration and its slot
+capabilities; installed-inventory presentation does not authorize the assignment. Slot actions
+remain presentation and are never used as command authorization. Assignment and load never invoke
+the preview operation; ICN load admission is the authoritative check that the selected package is
+still present and the only authoritative load-time hardware decision.
 
 Provider catalog refresh is a catalog-owned single flight. Equivalent callers join it, conflicting
 targeted refreshes serialize, and every exit publishes a terminal catalog state.
@@ -112,12 +113,17 @@ ICN owns accepted download attempts durably. ACN observes attempts independently
 request, polling quickly while active and periodically while idle so missed request-side wake-ups
 cannot hide shared work.
 
-A completed attempt remains successful while installed inventory converges. ACN refreshes and waits
-for that authority instead of interpreting the absence of an active attempt as failure.
+A completed attempt is the authoritative result of its successful atomic publication. ACN retains
+the exact attempt identity returned by ICN and completes the target command from that terminal
+result. It never refreshes or waits for installed inventory to reconfirm the same operation.
+Every exact attempt snapshot obtained by admission or waiting is also published immediately to the
+download observer so presentation does not wait for periodic polling; that local publication does
+not gate the command on another observation. Installed inventory independently owns current
+presence and presentation.
 
 Onboarding is a client-owned composition of ordinary model commands. An explicit choice waits for
-the target-level download command to observe authoritative installation, assigns the offering to the
-primary slot, invokes the ordinary slot load, and marks onboarding complete only after that load
+the target-level download command's exact acquisition result, assigns the offering to the primary
+slot, invokes the ordinary slot load, and marks onboarding complete only after that load
 observes the exact selected instance as Ready. ACN owns only the generic commands and the durable
 onboarding boolean; it has no onboarding-specific model operation, activation service, or startup
 reconciler. The client retains only its submitted choice while mounted. Cancellation uses the
@@ -133,5 +139,8 @@ intent from onboarding, download, assignment, or instance snapshots.
 - A client connecting after completion receives the terminal snapshot.
 - Interrupting draft preload or claim leaves no orphaned phase.
 - An accepted native download becomes observable without further initiating-client action.
+- A target download returns from exact attempt completion without waiting for inventory
+  reconciliation.
+- Local assignment and load cannot be rejected or authorized by a stale ACN availability mirror.
 - Starting ACN or reopening onboarding never turns a saved slot assignment into a model load.
 - Tests assert only current intended states and never preserve a legacy stranded state.

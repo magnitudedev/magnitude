@@ -2,52 +2,22 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
   DownloadAttemptIdSchema,
-  ModelFileIdSchema,
   ModelPackageIdSchema,
   type DownloadAttempt,
-  type ModelOfferingTarget,
 } from "@magnitudedev/protocol"
-import { targetInstallationOutcome } from "./local-model-packages"
+import { exactAttemptDecision } from "./local-model-packages"
 
+const attemptId = DownloadAttemptIdSchema.make("download_test")
 const packageId = ModelPackageIdSchema.make("package_test")
-const target: ModelOfferingTarget = {
-  _tag: "Package",
-  package: {
-    id: packageId,
-    source: {
-      _tag: "HuggingFace",
-      repository: "owner/repository",
-      revision: "commit",
-    },
-    files: [{
-      id: ModelFileIdSchema.make("file_test"),
-      path: "model.gguf",
-      role: "weights",
-      sizeBytes: 1,
-      sha256: "a".repeat(64),
-    }],
-    relationships: [],
-    properties: {
-      format: "gguf",
-      quantization: "Q4",
-      quantizationName: "4-bit",
-      architecture: "test",
-      maximumContextLength: 1,
-    },
-  },
-}
 
-const attempt = (
-  state: DownloadAttempt["_tag"],
-): DownloadAttempt => {
-  const id = DownloadAttemptIdSchema.make(`download_${state}`)
+const attempt = (state: DownloadAttempt["_tag"]): DownloadAttempt => {
   switch (state) {
     case "Pending":
-      return { _tag: state, id, packageId }
+      return { _tag: state, id: attemptId, packageId }
     case "Downloading":
       return {
         _tag: state,
-        id,
+        id: attemptId,
         packageId,
         stage: "downloading",
         completedBytes: 1,
@@ -55,13 +25,15 @@ const attempt = (
         bytesPerSecond: Option.some(1),
       }
     case "Completed":
-      return { _tag: state, id, packageId }
-    case "Cancelled":
-      return { _tag: state, id, packageId }
+      return {
+        _tag: state,
+        id: attemptId,
+        packageId,
+      }
     case "Failed":
       return {
         _tag: state,
-        id,
+        id: attemptId,
         packageId,
         completedBytes: 1,
         totalBytes: 2,
@@ -71,79 +43,34 @@ const attempt = (
           retryable: true,
         },
       }
+    case "Cancelled":
+      return { _tag: state, id: attemptId, packageId }
   }
 }
 
-describe("target installation outcome", () => {
-  it("completes from authoritative installed inventory", () => {
-    expect(targetInstallationOutcome(
-      target,
-      new Map([[packageId, "/models/test"]]),
-      [],
-    )).toEqual(Option.some({ _tag: "Installed" }))
+describe("exact download-attempt completion", () => {
+  it.each(["Pending", "Downloading"] as const)("waits for %s", (state) => {
+    expect(exactAttemptDecision(attempt(state))).toEqual({ _tag: "Wait" })
   })
 
-  it.each(["Pending", "Downloading"] as const)(
-    "waits while the latest attempt is %s and installation has not converged",
-    (state) => {
-      expect(Option.isNone(targetInstallationOutcome(
-        target,
-        new Map(),
-        [attempt(state)],
-      ))).toBe(true)
-    },
-  )
-
-  it("does not treat historical completion as current installation", () => {
-    const outcome = targetInstallationOutcome(
-      target,
-      new Map(),
-      [attempt("Completed")],
-    )
-    expect(Option.isSome(outcome) && outcome.value._tag === "Failed"
-      ? outcome.value.failure
-      : null).toMatchObject({
-        code: "local_model_download_not_active",
-        retryable: true,
-      })
+  it("completes from the exact terminal attempt", () => {
+    expect(exactAttemptDecision(attempt("Completed"))).toEqual({ _tag: "Complete" })
   })
 
-  it("preserves a terminal download failure", () => {
-    const outcome = targetInstallationOutcome(
-      target,
-      new Map(),
-      [attempt("Failed")],
-    )
-    expect(Option.isSome(outcome) && outcome.value._tag === "Failed"
-      ? outcome.value.failure
-      : null).toMatchObject({
-        code: "download_failed",
-        message: "Download failed",
-        retryable: true,
+  it("preserves an exact terminal failure", () => {
+    const decision = exactAttemptDecision(attempt("Failed"))
+    expect(decision._tag === "Fail" ? decision.failure : null).toMatchObject({
+      code: "download_failed",
+      message: "Download failed",
+      retryable: true,
     })
   })
 
-  it("fails when the download is cancelled", () => {
-    const outcome = targetInstallationOutcome(
-      target,
-      new Map(),
-      [attempt("Cancelled")],
-    )
-    expect(Option.isSome(outcome) && outcome.value._tag === "Failed"
-      ? outcome.value.failure
-      : null).toMatchObject({
-        code: "local_model_download_cancelled",
-        retryable: true,
-      })
-  })
-
-  it("fails when an uninstalled target has no admitted attempt", () => {
-    const outcome = targetInstallationOutcome(target, new Map(), [])
-    expect(Option.isSome(outcome) && outcome.value._tag === "Failed"
-      ? outcome.value.failure
-      : null).toMatchObject({
-        code: "local_model_download_not_active",
-        retryable: true,
-      })
+  it("maps exact cancellation to the target command failure", () => {
+    const decision = exactAttemptDecision(attempt("Cancelled"))
+    expect(decision._tag === "Fail" ? decision.failure : null).toMatchObject({
+      code: "local_model_download_cancelled",
+      retryable: true,
+    })
   })
 })

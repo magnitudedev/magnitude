@@ -84,10 +84,6 @@ const latestAttempt = (
   return Option.none()
 }
 
-type TargetInstallationOutcome =
-  | { readonly _tag: "Installed" }
-  | { readonly _tag: "Failed"; readonly failure: LocalModelMutationFailed }
-
 type PackageAcquisition =
   | { readonly _tag: "NotInstalled" }
   | { readonly _tag: "Downloading"; readonly attempt: Extract<DownloadAttempt, {
@@ -97,6 +93,37 @@ type PackageAcquisition =
       readonly totalBytes: number; readonly failure: LocalModelMutationFailed }
   | { readonly _tag: "Cancelled" }
   | { readonly _tag: "Installed"; readonly path: string }
+
+export type ExactAttemptDecision =
+  | { readonly _tag: "Wait" }
+  | { readonly _tag: "Complete" }
+  | { readonly _tag: "Fail"; readonly failure: LocalModelMutationFailed }
+
+export const exactAttemptDecision = (
+  attempt: DownloadAttempt,
+): ExactAttemptDecision => {
+  switch (attempt._tag) {
+    case "Pending":
+    case "Downloading":
+      return { _tag: "Wait" }
+    case "Completed":
+      return { _tag: "Complete" }
+    case "Failed":
+      return {
+        _tag: "Fail",
+        failure: new LocalModelMutationFailed(attempt.failure),
+      }
+    case "Cancelled":
+      return {
+        _tag: "Fail",
+        failure: new LocalModelMutationFailed({
+          code: "local_model_download_cancelled",
+          message: "The selected local model download was cancelled",
+          retryable: true,
+        }),
+      }
+  }
+}
 
 const packageAcquisition = (
   modelPackage: ModelPackage,
@@ -122,51 +149,6 @@ const packageAcquisition = (
     }
   }
   return { _tag: "NotInstalled" }
-}
-
-export const targetInstallationOutcome = (
-  target: ModelOfferingTarget,
-  installedPackages: ReadonlyMap<ModelPackageId, string>,
-  attempts: readonly DownloadAttempt[],
-): Option.Option<TargetInstallationOutcome> => {
-  const packages = target._tag === "Package"
-    ? [target.package]
-    : [target.target, target.draft]
-  const acquisitions = packages.map((modelPackage) =>
-    packageAcquisition(modelPackage, installedPackages, attempts))
-  if (acquisitions.every(({ _tag }) => _tag === "Installed")) {
-    return Option.some({ _tag: "Installed" })
-  }
-  for (const acquisition of acquisitions) {
-    if (acquisition._tag === "Installed") continue
-    if (acquisition._tag === "NotInstalled") {
-      return Option.some({
-        _tag: "Failed",
-        failure: new LocalModelMutationFailed({
-          code: "local_model_download_not_active",
-          message: "The selected local model download is no longer active",
-          retryable: true,
-        }),
-      })
-    }
-    if (acquisition._tag === "Failed") {
-      return Option.some({
-        _tag: "Failed",
-        failure: acquisition.failure,
-      })
-    }
-    if (acquisition._tag === "Cancelled") {
-      return Option.some({
-        _tag: "Failed",
-        failure: new LocalModelMutationFailed({
-          code: "local_model_download_cancelled",
-          message: "The selected local model download was cancelled",
-          retryable: true,
-        }),
-      })
-    }
-  }
-  return Option.none()
 }
 
 export interface LocalModelPackagesApi {
@@ -327,72 +309,41 @@ export const LocalModelPackagesLive: Layer.Layer<
 
   const startDownload = (modelPackage: ModelPackage) => Effect.gen(function* () {
     const nativePackage = yield* modelPackageToIcn(modelPackage)
-    return yield* client.models.startModelDownload({ payload: { package: nativePackage } }).pipe(
-      Effect.map(({ attempt }) => DownloadAttemptIdSchema.make(attempt.id)),
-      Effect.tap(() => storage.config.clearDismissedDownloadFailure(
-        ModelPackageIdSchema.make(modelPackage.id),
-      )),
-      Effect.tap(() => downloads.refresh),
+    const { attempt } = yield* client.models.startModelDownload({
+      payload: { package: nativePackage },
+    })
+    yield* downloads.observeAttempt(attempt)
+    yield* storage.config.clearDismissedDownloadFailure(
+      ModelPackageIdSchema.make(modelPackage.id),
     )
+    return DownloadAttemptIdSchema.make(attempt.id)
   }).pipe(Effect.mapError((error) => mutationFailure("start_model_download_failed", error)))
 
   const targetPackages = (target: ModelOfferingTarget) =>
     target._tag === "Package" ? [target.package] : [target.target, target.draft]
 
-  const resolveTargetInstallation = (
-    target: ModelOfferingTarget,
-  ): Effect.Effect<Option.Option<TargetInstallationOutcome>, LocalInferenceError> =>
-    Effect.gen(function* () {
-      const attempts = yield* Effect.forEach(
-        (yield* downloads.get).state.attempts,
-        downloadAttemptFromIcn,
-      ).pipe(
-        Effect.mapError((error) =>
-          mutationFailure("decode_model_download_attempt_failed", error)),
-      )
-      if (modelOfferingTargetPackageIds(target).some((packageId) =>
-        Option.exists(latestAttempt(attempts, packageId), (attempt) =>
-          attempt._tag === "Completed"))) {
-        yield* installed.refresh
-      }
-      const installedPackages = new Map(
-        (yield* installed.get).state.packages.map(({ package: modelPackage, path }) => [
-          ModelPackageIdSchema.make(modelPackage.id),
-          path,
-        ]),
-      )
-      return targetInstallationOutcome(target, installedPackages, attempts)
-    }).pipe(
-      Effect.mapError((error) => mutationFailure(
-        "resolve_model_target_installation_failed",
-        error,
-      )),
-    )
-
-  const awaitTargetInstalled = (
-    target: ModelOfferingTarget,
+  const awaitAttempt = (
+    attemptId: DownloadAttemptId,
   ): Effect.Effect<void, LocalInferenceError> => Effect.gen(function* () {
-    const immediate = yield* resolveTargetInstallation(target)
-    const outcome = Option.isSome(immediate)
-      ? immediate.value
-      : yield* Stream.merge(
-          downloads.changes.pipe(Stream.map(() => undefined)),
-          installed.changes.pipe(Stream.map(() => undefined)),
-        ).pipe(
-          Stream.mapEffect(() => resolveTargetInstallation(target)),
-          Stream.filterMap((observed) => observed),
-          Stream.runHead,
-          Effect.flatMap(Option.match({
-            onNone: () => new LocalModelMutationFailed({
-              code: "local_model_observation_ended",
-              message: "Local model package observation ended",
-              retryable: true,
-            }),
-            onSome: Effect.succeed,
-          })),
-        )
-    yield* project
-    if (outcome._tag === "Failed") return yield* outcome.failure
+    const native = yield* client.models.getModelDownload({
+      path: { attempt_id: attemptId },
+    }).pipe(
+      Effect.mapError((error) => mutationFailure("get_model_download_failed", error)),
+    )
+    yield* downloads.observeAttempt(native)
+    const attempt = yield* downloadAttemptFromIcn(native).pipe(
+      Effect.mapError((error) => mutationFailure("decode_model_download_attempt_failed", error)),
+    )
+    const decision = exactAttemptDecision(attempt)
+    switch (decision._tag) {
+      case "Complete":
+        return
+      case "Fail":
+        return yield* decision.failure
+      case "Wait":
+        yield* Effect.sleep("250 millis")
+        return yield* awaitAttempt(attemptId)
+    }
   })
 
   return LocalModelPackages.of({
@@ -401,13 +352,16 @@ export const LocalModelPackagesLive: Layer.Layer<
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
     acquireTarget: (target) => Effect.gen(function* () {
-      yield* Effect.forEach(
+      const attemptIds = yield* Effect.forEach(
         targetPackages(target),
-        (modelPackage) => startDownload(modelPackage).pipe(Effect.asVoid),
+        startDownload,
+        { concurrency: "unbounded" },
+      )
+      yield* Effect.forEach(
+        attemptIds,
+        awaitAttempt,
         { concurrency: "unbounded", discard: true },
       )
-      yield* project
-      yield* awaitTargetInstalled(target)
     }),
     cancelTargetDownload: (target) => Effect.gen(function* () {
       const entries = (yield* mirror.get).state.entries

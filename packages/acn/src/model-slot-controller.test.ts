@@ -153,6 +153,7 @@ const makeHarness = (options: {
   readonly initialOfferings?: readonly LocalProviderOffering[]
   readonly exposeRecommendation?: boolean
   readonly installed?: boolean
+  readonly projectedInstalled?: boolean
   readonly catalogAvailability?: ProviderModelCatalogEntry["availability"]
 } = {}) => Effect.gen(function* () {
   const configuration = yield* SubscriptionRef.make({
@@ -252,7 +253,7 @@ const makeHarness = (options: {
       snapshot: Effect.succeed({ revision: 0, state: { entries: [] } }),
       changes: Stream.empty,
       installedPackageIds: Effect.succeed(
-        new Set(options.installed === false ? [] : [packageId]),
+        new Set((options.projectedInstalled ?? options.installed) === false ? [] : [packageId]),
       ),
       acquireTarget: () => Effect.void,
       cancelTargetDownload: () => Effect.void,
@@ -361,7 +362,7 @@ const releaseLoadAsReady = (
 })
 
 describe("ModelSlotController load admission", () => {
-  it("rejects an uninstalled assignment without changing the slot", async () => {
+  it("records a local selection without using installed presentation as authorization", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness({
         initiallyAssigned: false,
@@ -369,12 +370,14 @@ describe("ModelSlotController load admission", () => {
       })
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        const outcome = yield* Effect.exit(controller.updateModelSlot(
+        yield* controller.updateModelSlot(
           PRIMARY_SLOT_ID,
           Option.some(selection),
-        ))
-        expect(outcome._tag).toBe("Failure")
-        expect((yield* controller.snapshot).state.slots.primary._tag).toBe("Unassigned")
+        )
+        expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
+          _tag: "ConfiguredLocal",
+          availability: { _tag: "Unavailable" },
+        })
       }).pipe(Effect.provide(harness.layer))
     })))
   })
@@ -451,6 +454,30 @@ describe("ModelSlotController load admission", () => {
           availability: { _tag: "Available" },
           actions: ["Load"],
         })
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("assigns and loads from direct ICN truth while the installed mirror is stale", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        initiallyAssigned: false,
+        installed: true,
+        projectedInstalled: false,
+      })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        yield* controller.updateModelSlot(
+          PRIMARY_SLOT_ID,
+          Option.some(selection),
+        )
+        expect((yield* controller.snapshot).state.slots.primary._tag).toBe("ConfiguredLocal")
+
+        const loading = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* Deferred.await(harness.loadEntered)
+        yield* releaseLoadAsReady(harness)
+        yield* Fiber.join(loading)
+        expect(yield* Ref.get(harness.loadCalls)).toBe(1)
       }).pipe(Effect.provide(harness.layer))
     })))
   })

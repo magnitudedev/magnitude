@@ -17,6 +17,7 @@ import {
 } from "@magnitudedev/agent"
 import {
   LocalModelMutationFailed,
+  modelOfferingTargetPackageIds,
   ModelInstanceIdSchema,
   ModelPreferenceMutationFailed,
   ModelSlotLifecycle,
@@ -67,7 +68,6 @@ import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
 import { modelServingConfigurationToIcn } from "./local-model-icn-adapter"
-import { modelOfferingTargetPackageIds } from "@magnitudedev/protocol"
 import {
   localModelAvailability,
   modelSlotActions,
@@ -549,17 +549,15 @@ export const ModelSlotControllerLive: Layer.Layer<
     const offering = selection.providerId === LOCAL_PROVIDER_ID
       ? yield* Effect.option(localOfferings.resolve(selection.providerModelId))
       : Option.none()
-    const installed = Option.isSome(offering)
-      ? yield* localPackages.installedPackageIds
-      : new Set<string>()
+    if (selection.providerId === LOCAL_PROVIDER_ID && Option.isNone(offering)) {
+      return yield* reject(slotId, "The selected local model configuration is unavailable")
+    }
     const capabilities = selectableModelCapabilities(
       slotId,
       model,
       Option.getOrUndefined(Option.map(offering, (value) => ({
         capabilities: value.capabilities,
-        packageIds: modelOfferingTargetPackageIds(value.configuration.target),
       }))),
-      installed,
     )
     if (!capabilities) {
       return yield* reject(slotId, "The selected model is unavailable for this slot")
@@ -752,9 +750,6 @@ export const ModelSlotControllerLive: Layer.Layer<
             instanceId: instance.id,
           }
         }
-      }
-      if (slot.availability._tag === "Unavailable") {
-        return yield* new LocalModelMutationFailed(slot.availability.failure)
       }
       const candidate: ModelLoadCommand = {
         requestedBy: slotId,

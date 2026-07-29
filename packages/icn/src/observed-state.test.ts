@@ -58,4 +58,29 @@ describe("ICN observed state", () => {
     expect(result.initialized).toBe(true)
     expect(result.snapshot).toEqual({ revision: 2, state: { value: 2 } })
   })
+
+  it("publishes operation evidence immediately without reading", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const reads = yield* Ref.make(0)
+      const observed = yield* makeIcnObservedState(
+        { value: 1 },
+        Ref.updateAndGet(reads, (count) => count + 1).pipe(
+          Effect.as({ value: 99 }),
+        ),
+        (left, right) => left.value === right.value,
+      )
+
+      yield* observed.update(() => ({ value: 2 }))
+
+      return {
+        reads: yield* Ref.get(reads),
+        snapshot: yield* observed.get,
+      }
+    }))
+
+    expect(result).toEqual({
+      reads: 0,
+      snapshot: { revision: 1, state: { value: 2 } },
+    })
+  })
 })

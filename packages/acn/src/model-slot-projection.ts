@@ -141,19 +141,14 @@ export const localModelAvailability = (
 
 export interface LocalOfferingSelectionEvidence {
   readonly capabilities: ModelCapabilities
-  readonly packageIds: readonly string[]
 }
 
 export const selectableModelCapabilities = (
   slotId: SlotId,
   catalogModel: ProviderModelCatalogEntry | undefined,
   localOffering: LocalOfferingSelectionEvidence | undefined,
-  installedPackageIds: ReadonlySet<string>,
 ): ModelCapabilities | undefined => {
   if (localOffering) {
-    if (localOffering.packageIds.some((packageId) => !installedPackageIds.has(packageId))) {
-      return undefined
-    }
     if (catalogModel && !catalogModel.supportedSlots.includes(slotId)) {
       return undefined
     }

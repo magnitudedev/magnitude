@@ -11,6 +11,7 @@ applies_to:
 | Identity | Meaning |
 |---|---|
 | `ModelPackageId` | One immutable artifact package. |
+| `DownloadAttemptId` | One admitted attempt to install an exact package. |
 | `ModelOfferingTargetId` | One installable package set: a package or target/draft pair. |
 | `ModelServingConfigurationId` | One target plus serving profile, currently chiefly context length. Multiple configurations may share a target. |
 | `ModelInstanceId` | One physical loaded occurrence of a configuration. |
@@ -28,6 +29,6 @@ For the local provider, `ProviderModelId` is the `ModelServingConfigurationId` v
 
 | Layer | IDs it uses |
 |---|---|
-| **ICN** | `ModelPackageId`, `ModelOfferingTargetId`, `ModelServingConfigurationId`, `ModelInstanceId`. It never knows provider, slot, catalog-candidate, or onboarding identity. |
+| **ICN** | `ModelPackageId`, `DownloadAttemptId`, `ModelOfferingTargetId`, `ModelServingConfigurationId`, `ModelInstanceId`. It never knows provider, slot, catalog-candidate, or onboarding identity. |
 | **ACN** | ICN identities when observing or commanding ICN; `(ProviderId, ProviderModelId)` for offerings; `SlotId` for assignments. `CatalogCandidateId` may appear only in presentation projections. |
 | **Client** | `(ProviderId, ProviderModelId)` and `SlotId` for selection; `ModelOfferingTargetId` for artifact actions; `ModelInstanceId` for exact Stop; `CatalogCandidateId` only as a row key. It does not use package or configuration IDs. |
