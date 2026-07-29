@@ -1,7 +1,7 @@
 {
   "sourceDigest": "b8e07c973209ab6edd44feff4d0f6b8337acc82f1483436bd3100d0a0d60b005",
-  "templateIdentity": "icn-native-model-template:0.1.0:41a9afdac7f4a722fc536199e529c1e6f20f3dd6:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
-  "plannerIdentity": "icn-native-model-template:0.1.0:41a9afdac7f4a722fc536199e529c1e6f20f3dd6:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v2",
+  "templateIdentity": "icn-native-model-template:0.1.0:c434543fbf094ccf89ead7e0584f74ebfd374a1b:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
+  "plannerIdentity": "icn-native-model-template:0.1.0:c434543fbf094ccf89ead7e0584f74ebfd374a1b:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v2",
   "plannerBundleDigest": "336af9d9240d5d87102264ec34fffa372f19b70a07c83b6ad72d3c67550d87e1",
   "plannerArtifacts": [
     {
