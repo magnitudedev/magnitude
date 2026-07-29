@@ -135,7 +135,7 @@ const validateLayout = async (
 const archiveEntry = async (
   archive: string,
   entry: string,
-): Promise<Uint8Array> => {
+): Promise<Buffer> => {
   const child = Bun.spawn(["tar", "-xOf", archive, entry], {
     stdin: "ignore",
     stdout: "pipe",
@@ -143,7 +143,7 @@ const archiveEntry = async (
   })
   const [code, bytes, stderr] = await Promise.all([
     child.exited,
-    new Response(child.stdout).bytes(),
+    new Response(child.stdout).arrayBuffer().then((value) => Buffer.from(value)),
     new Response(child.stderr).text(),
   ])
   if (code !== 0) {
@@ -191,7 +191,7 @@ for (const [id, filename] of expectedArtifacts) {
   archiveById.set(id, archive)
 }
 
-let catalogLock: Uint8Array | undefined
+let catalogLock: Buffer | undefined
 let plannerBundleDigest: string | undefined
 for (const host of releaseHosts) {
   const base = byId.get(`icn-base-${host.id}`)!
@@ -199,7 +199,7 @@ for (const host of releaseHosts) {
   const lock = await archiveEntry(archive, "catalog/release-catalog.lock.json")
   const bundle = await archiveEntry(archive, "catalog/model-planner-inputs.bundle")
   const bundleDigest = createHash("sha256").update(bundle).digest("hex")
-  if (catalogLock && !Buffer.from(catalogLock).equals(lock)) {
+  if (catalogLock && !catalogLock.equals(lock)) {
     throw new Error(`${base.id} contains a different catalog lock`)
   }
   if (plannerBundleDigest && plannerBundleDigest !== bundleDigest) {
