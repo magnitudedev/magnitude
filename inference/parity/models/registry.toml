@@ -60,10 +60,10 @@ sha256 = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
 url = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf"
 
 [[models]]
-id = "qwen3.6-35b-a3b-mtp-ud-q4-k-m"
+id = "qwen3.6-35b-a3b-mtp-ud-q4-k-xl"
 status = "accepted"
 kind = "model"
-display_name = "Qwen3.6 35B-A3B MTP UD Q4_K_M"
+display_name = "Qwen3.6 35B-A3B MTP UD Q4_K_XL"
 valid_for = ["C1", "C9", "P5"]
 
 [models.source]
@@ -87,12 +87,12 @@ note = "Local benchmark use is accepted by exact artifact digest; this registry 
 architecture_tags = ["decoder-only", "moe", "mtp", "qwen3.5", "qwen3.6", "production-benchmark"]
 tokenizer_family = "qwen"
 template_family = "qwen"
-quantization = "UD-Q4_K_M"
+quantization = "UD-Q4_K_XL"
 parameter_scale = "35B-A3B"
 
 [[models.files]]
 role = "model"
-path = "qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-bytes = 22663387424
-sha256 = "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b"
-url = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+path = "qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+bytes = 22853663008
+sha256 = "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"
+url = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
