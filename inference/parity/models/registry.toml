@@ -60,18 +60,18 @@ sha256 = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
 url = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf"
 
 [[models]]
-id = "qwen3.6-35b-a3b-ud-q4-k-m"
+id = "qwen3.6-35b-a3b-mtp-ud-q4-k-m"
 status = "accepted"
 kind = "model"
-display_name = "Qwen3.6 35B-A3B UD Q4_K_M"
+display_name = "Qwen3.6 35B-A3B MTP UD Q4_K_M"
 valid_for = ["C1", "C9", "P5"]
 
 [models.source]
 provider = "huggingface"
-repository = "unsloth/Qwen3.6-35B-A3B-GGUF"
-revision = "a483e9e6cbd595906af30beda3187c2663a1118c"
+repository = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+revision = "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d"
 integrity = "digest-pinned"
-note = "The managed-model end-to-end test resolved this immutable commit and verified the complete GGUF digest before parity registration."
+note = "The artifact is pinned to an immutable Hugging Face commit and its exact LFS content digest."
 
 [models.access]
 public = true
@@ -84,7 +84,7 @@ redistribution = "not-assumed"
 note = "Local benchmark use is accepted by exact artifact digest; this registry does not make a redistribution claim."
 
 [models.attributes]
-architecture_tags = ["decoder-only", "moe", "qwen3.5", "qwen3.6", "production-benchmark"]
+architecture_tags = ["decoder-only", "moe", "mtp", "qwen3.5", "qwen3.6", "production-benchmark"]
 tokenizer_family = "qwen"
 template_family = "qwen"
 quantization = "UD-Q4_K_M"
@@ -92,7 +92,7 @@ parameter_scale = "35B-A3B"
 
 [[models.files]]
 role = "model"
-path = "qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-bytes = 22134528992
-sha256 = "ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
-url = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+path = "qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+bytes = 22663387424
+sha256 = "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b"
+url = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
