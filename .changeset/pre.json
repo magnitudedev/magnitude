@@ -36,7 +36,8 @@
     "@magnitudedev/release": "0.0.1",
     "@magnitudedev/sdk": "0.0.1",
     "@magnitudedev/utils": "0.0.1",
-    "@magnitudedev/version": "0.0.1"
+    "@magnitudedev/version": "0.0.1",
+    "@magnitudedev/icn-protocol": "0.0.1"
   },
   "changesets": [
     "blue-candles-lie",
@@ -61,6 +62,7 @@
     "rich-seas-tie",
     "salty-dancers-throw",
     "shiny-baths-design",
+    "shy-doors-divide",
     "six-pandas-smile",
     "sixty-cycles-knock",
     "slow-bobcats-strive",
