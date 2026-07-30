@@ -1,0 +1,4 @@
+{
+  "extends": "../tsconfig.json",
+  "include": ["accept-release-candidate.ts"]
+}

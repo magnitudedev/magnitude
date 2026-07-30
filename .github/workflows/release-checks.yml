@@ -9,7 +9,9 @@ on:
       - "inference/**"
       - "packages/**"
       - "patches/**"
+      - "scripts/accept-release-candidate.ts"
       - "scripts/release-target.ts"
+      - "scripts/tsconfig.release.json"
       - "bun.lock"
       - "package.json"
 
@@ -48,6 +50,7 @@ jobs:
       - run: bun run --cwd packages/icn typecheck
       - run: bun run --cwd packages/ripgrep prepare
       - run: bun run --cwd packages/acn typecheck
+      - run: bunx tsc -p scripts/tsconfig.release.json
       - run: bun run packages/release/scripts/matrix.ts
       - run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
 
