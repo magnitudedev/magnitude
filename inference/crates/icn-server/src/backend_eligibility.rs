@@ -4,6 +4,11 @@ use icn_contracts::bootstrap_protocol::{
 };
 use libloading::Library;
 
+const CUDA_ERROR_STUB_LIBRARY: i32 = 34;
+const CUDA_ERROR_NO_DEVICE: i32 = 100;
+
+type CudaProbeResult = Result<(i32, i32, i32, i32, i32, Vec<String>), &'static str>;
+
 fn bounded(value: impl std::fmt::Display) -> String {
     value
         .to_string()
@@ -25,6 +30,35 @@ fn cuda_library_names() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
         &[]
+    }
+}
+
+fn classify_cuda(result: CudaProbeResult) -> CudaEligibility {
+    match result {
+        Ok((init, version, count, driver_api, devices, architectures))
+            if init == 0 && version == 0 && count == 0 && devices > 0 && driver_api > 0 =>
+        {
+            CudaEligibility::Usable {
+                driver_api,
+                architectures,
+            }
+        }
+        Ok((0, _, 0, _, 0, _)) | Ok((CUDA_ERROR_NO_DEVICE, _, _, _, _, _)) => {
+            CudaEligibility::Absent {
+                diagnostic: "no CUDA device is available".to_owned(),
+            }
+        }
+        Ok((CUDA_ERROR_STUB_LIBRARY, _, _, _, _, _)) => CudaEligibility::Absent {
+            diagnostic: "only the CUDA stub driver is available".to_owned(),
+        },
+        Ok((init, version, count, _, _, _)) => CudaEligibility::Failed {
+            diagnostic: bounded(format!(
+                "CUDA probe failed (init={init}, version={version}, count={count})"
+            )),
+        },
+        Err(message) => CudaEligibility::Failed {
+            diagnostic: message.to_owned(),
+        },
     }
 }
 
@@ -87,27 +121,7 @@ fn cuda() -> CudaEligibility {
             _ => Err("CUDA driver is missing required API symbols"),
         }
     };
-    match result {
-        Ok((init, version, count, driver_api, devices, architectures))
-            if init == 0 && version == 0 && count == 0 && devices > 0 && driver_api > 0 =>
-        {
-            CudaEligibility::Usable {
-                driver_api,
-                architectures,
-            }
-        }
-        Ok((0, _, 0, _, 0, _)) => CudaEligibility::Absent {
-            diagnostic: "no CUDA device is available".to_owned(),
-        },
-        Ok((init, version, count, _, _, _)) => CudaEligibility::Failed {
-            diagnostic: bounded(format!(
-                "CUDA probe failed (init={init}, version={version}, count={count})"
-            )),
-        },
-        Err(message) => CudaEligibility::Failed {
-            diagnostic: message.to_owned(),
-        },
-    }
+    classify_cuda(result)
 }
 
 fn vulkan() -> VulkanEligibility {
@@ -167,5 +181,47 @@ pub(crate) fn probe() -> BackendEligibilityReport {
                 diagnostic: "Metal requires Apple Silicon".to_owned(),
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_stub_library_is_absent() {
+        assert_eq!(
+            classify_cuda(Ok((CUDA_ERROR_STUB_LIBRARY, 34, 34, 0, 0, vec![]))),
+            CudaEligibility::Absent {
+                diagnostic: "only the CUDA stub driver is available".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn cuda_no_device_is_absent() {
+        assert_eq!(
+            classify_cuda(Ok((
+                CUDA_ERROR_NO_DEVICE,
+                0,
+                CUDA_ERROR_NO_DEVICE,
+                0,
+                0,
+                vec![],
+            ))),
+            CudaEligibility::Absent {
+                diagnostic: "no CUDA device is available".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn other_cuda_probe_errors_still_fail() {
+        assert_eq!(
+            classify_cuda(Ok((35, 0, 35, 0, 0, vec![]))),
+            CudaEligibility::Failed {
+                diagnostic: "CUDA probe failed (init=35, version=0, count=35)".to_owned(),
+            }
+        );
     }
 }
