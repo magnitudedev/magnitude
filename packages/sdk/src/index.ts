@@ -1,15 +1,46 @@
 export { connect, makeClientLayer, protocolLayer, protocolLayerWithRecovery, AcnClientTag } from "./protocol"
 export type { AcnClient } from "./protocol"
 
-export { DaemonSpawnerTag } from "./daemon-spawner"
-export type { DaemonSpawner } from "./daemon-spawner"
-export { makeLocalDaemonSpawner, type SpawnProcess, type LocalSpawnerOptions } from "./local-spawner"
-export { makeRemoteDaemonSpawner } from "./remote-spawner"
+export {
+  DaemonSpawnerTag,
+  DaemonSpawnEventSchema,
+  runDaemonSpawn,
+} from "./daemon-spawner"
+export type { DaemonSpawner, DaemonSpawnEvent } from "./daemon-spawner"
+export {
+  makeLocalDaemonSpawner,
+  SpawnProcess,
+  type SpawnedProcess,
+  type LocalSpawnerOptions,
+} from "./local-spawner"
+export { BunDetachedSpawnProcess } from "./acn-jit/bun-spawn-process"
+export {
+  captureSpawnDiagnostics,
+  type SpawnDiagnosticCapture,
+} from "./acn-jit/spawn-diagnostic"
+export {
+  makeRemoteDaemonSpawner,
+  RemoteDaemonSpawnMessageSchema,
+  type RemoteDaemonSpawnMessage,
+} from "./remote-spawner"
 export {
   makeAcnJitRuntime,
+  type AcnStartup,
   type AcnJitRuntime,
   type AcnJitRuntimeOptions,
 } from "./acn-jit/acn-recovering-client"
+export {
+  AcnLifecycleStateSchema,
+  AcnLifecycleObservationSchema,
+  AcnStartingPhaseSchema,
+  AcnFailureStageSchema,
+  type AcnLifecycle,
+  type AcnLifecycleState,
+  type AcnStartingPhase,
+  type AcnInstallationPhase,
+  type AcnFailureStage,
+  type AcnStartupProgress,
+} from "./acn-jit/lifecycle"
 
 export { TracingLayer, makeTracingLayer, type MakeTracingLayerOptions } from "./tracing"
 

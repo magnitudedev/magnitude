@@ -8,6 +8,7 @@ export * from './state/session-atoms'
 export * from './state/display-state-store'
 export * from './state/file-watch-atom'
 export * from './state/active-session-statuses'
+export * from './state/acn-lifecycle'
 export * from './display-view-controller/hooks'
 
 // Platform

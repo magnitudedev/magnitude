@@ -7,7 +7,8 @@ applies_to:
   - packages/sdk/src/remote-spawner.ts
   - packages/sdk/src/binary.ts
   - packages/acn-protocol/src/acn-registry.ts
-  - cli/src/platform/**
+  - packages/acn-protocol/src/schemas/acn-health.ts
+  - cli/src/**
   - desktop/src/platform.ts
   - desktop/src/main.ts
   - desktop/src/preload.ts
@@ -21,6 +22,8 @@ applies_to:
   - packages/acn/src/machine-ownership.ts
   - packages/acn/src/identity.ts
   - packages/acn/src/server.ts
+  - packages/acn/src/startup-state.ts
+  - packages/acn/src/icn/**
 ---
 
 # Shared ACN startup and upgrades
@@ -30,8 +33,13 @@ All clients using the same data root share one ACN. That ACN owns one private IC
 ## Connecting from a client
 
 Each client process creates one `AcnJitRuntime`. All RPC consumers share its protocol layer,
-coordinator, and cached endpoint. Runtime construction ensures ACN once; concurrent recovery also
-shares one discovery or spawn attempt.
+coordinator, lifecycle state, and cached endpoint. Runtime construction itself does not start ACN.
+
+The runtime exposes lifecycle control to clients only through its narrow `AcnStartup` capability:
+read-only state, pre-render `prepare`, and `retry`. The SDK owns discovery, cold-start handoff,
+single-flight ensure, and retry coordination. `Platform` does not expose the complete runtime.
+client-common observes the SDK stream through a private read-only Effect Atom; it does not copy
+daemon state into writable client state.
 
 Cached endpoints are generation-specific. A failed request can invalidate only the endpoint it used,
 not a newer endpoint discovered by another request. Domain errors and caller cancellation do not
@@ -39,24 +47,42 @@ invalidate ACN.
 
 ## Finding the current ACN
 
-The data root contains one canonical registration with ACN identity, version, URL, PID, and a private
-shutdown token. Registration is atomically published as mode `0600` under a mode-`0700` directory.
+The data root contains one canonical registration with ACN identity, version, URL, and PID.
+Registration is atomically published as mode `0600` under a mode-`0700` directory. Its version-1
+ownership envelope is the stable cross-version handoff boundary: an ACN retires itself when the
+canonical registration no longer contains its exact opaque owner ID.
 
 A client reuses the registration only when `/health` reports the same service, owner, version, and
-PID. Missing, invalid, unhealthy, or mismatched registration is stale.
+PID in `Ready`. A matching `Starting` owner is joined rather than duplicated, and its installation
+activity is reflected into the client lifecycle. Missing, invalid, unhealthy, or mismatched
+registration is stale.
+
+ACN binds its one final HTTP server and publishes that server's URL before preparing its private
+ICN. The server serves canonical health and rejects RPC with `503` while starting. Once application
+construction succeeds, the same router on the same server admits RPC and health reports `Ready`;
+the URL, owner identity, PID, and registration never change. Health startup activity is
+authoritative and may include byte progress only for actual artifact downloads.
 
 ## Starting one ACN
 
 Before spawning, a client acquires a global spawn election and then checks registration again. This
 prevents a client that waited for the election from acting on an earlier observation.
 
-The ACN process separately acquires machine ownership before starting HTTP or ICN. This prevents
-duplicate ICNs even after direct launch, client crash, or election failure. Ownership remains held
-until ACN finalization and ICN reaping finish.
+The candidate starts its final HTTP server and atomically becomes the canonical registered process
+before acquiring active machine ownership. A predecessor observes that registration change and
+requests its own scoped shutdown. The candidate reports that it is waiting and acquires machine
+ownership only after predecessor application disposal and ICN reaping release it. It then constructs
+its application and private ICN. This permits overlapping process shells but never overlapping
+active ACN applications or ICNs.
+
+The election is released as soon as the candidate publishes its early endpoint; readiness waiting
+does not serialize other clients behind the election. A follower waits without a deadline while an
+exact live election owner exists and can then join the registered starting ACN.
 
 Election and ownership records contain a PID and unique identity. Stale recovery requires proof that
 the PID is dead and removal of the exact observed record; timeout alone cannot steal a live record
-or remove its successor.
+or remove its successor. A candidate that loses canonical registration while waiting retires itself
+and cannot retain active ownership.
 
 ## Version policy
 
@@ -64,34 +90,42 @@ or remove its successor.
 | --- | --- |
 | Same version | Reuse |
 | Older | Reuse the newer ACN |
-| Newer | Replace through authenticated shutdown |
+| Newer | Start the expected ACN, which becomes canonical and causes self-retirement |
 | Same SemVer precedence with different build identities | Naturally order the build identities |
 | Arbitrary non-SemVer identities | Naturally order the complete identities |
 
-The same comparison is used during discovery, after election, before shutdown, and while waiting for
-a spawned candidate. Magnitude development identities have the form
+Release comparison is applied only after the observed health contract decodes and matches the
+registered identity. Any health-incompatible incumbent is replaced by the expected ACN. Magnitude
+development identities have the form
 `<version>+dev.<commit>.<timestamp>` and are naturally ordered, including numeric timestamp ordering.
 A published release outranks a development build with the same SemVer base. Every distinct identity
 has a deterministic order, so version comparison cannot produce an unorderable conflict.
 
-A replacement client revalidates the incumbent and requests shutdown with its registered token.
-Shutdown immediately cancels resident work. If the authenticated owner does not exit within a short
-cooperative window, replacement escalates through `SIGTERM` and `SIGKILL` with bounded waits before
-starting its candidate. Signals are never sent before authenticated shutdown acceptance. The
-candidate must acquire machine ownership. If a newer candidate won meanwhile, the client uses that
-winner instead.
+The client never asks an incumbent to shut down and never signals it as part of upgrade. The
+incumbent's ownership watchdog is responsible for invoking its own shutdown semantics. This avoids
+an upgrade command whose authentication and meaning would have to remain compatible across
+arbitrary versions.
 
-The old ACN has a hard five-second retirement budget measured from authenticated shutdown
-acceptance:
+Candidate startup has a ten-second deadline only to publish registration and startup health. After
+publication there is no global readiness or ownership-wait timeout. Exact candidate exit wins
+immediately over registration polling. Platform process-spawn services continuously drain stdout
+and stderr into a bounded diagnostic tail. Exact exit includes that diagnostic, while publication
+timeout terminates and reaps the candidate before one final compatible-owner check. A live
+predecessor is never considered stale because of elapsed time.
 
-1. three seconds for cooperative cancellation, persistence flush, child cleanup, and normal exit;
-2. one additional second after `SIGTERM`;
-3. `SIGKILL` at four seconds if the process is still alive; and
-4. one final second to confirm that the process was reaped.
+## Client startup presentation
 
-Failure to reap the exact incumbent PID within that fifth second fails takeover. Candidate startup
-has a separate ten-second registration-and-health deadline and does not extend the old ACN's
-retirement budget.
+The CLI calls `AcnStartup.prepare` before creating its renderer. A ready owner enters the ordinary
+TUI without a bootstrap frame. Otherwise prepare starts the shared ensure attempt and waits only
+for its first non-Checking lifecycle state, making the root bootstrap surface the first frame.
+
+`Starting Magnitude` covers cached process startup. `Installing Magnitude` has one bar and only
+three subtitles: `Downloading daemon`, `Downloading inference engine`, and `Starting Magnitude`.
+The first 90% is bundle-size-weighted download progress; the final 10% is asymptotic startup
+progress. A provisional cross-platform accelerator reservation is marked non-authoritative and is
+replaced by the exact selected CPU/CUDA/Vulkan plan before accelerator acquisition. Failure replaces
+the surface with the causal safe error and Retry/Quit actions. Ctrl-C remains available throughout.
+Individual commands and screens do not own startup hooks, retry loops, or copies of lifecycle state.
 
 ## Recovery and compatibility
 
@@ -101,8 +135,9 @@ without invalidation, spawn, or downgrade. Recovery from retirement does not imm
 to the draining URL.
 
 Forward reuse requires newer ACNs to preserve released request and response meanings plus the
-registration, health, and subscription fields used by older clients. Breaking wire changes require
-explicit compatibility negotiation.
+registration, health, and subscription fields used by older clients. An incompatible health
+contract causes the client to start its expected ACN; self-retirement still depends only on the
+stable registration owner ID.
 
 Downloaded ACN binaries use manifest-declared digest paths under their version and host, with a
 small validated pointer selecting the current digest. ACN receives the same data root used for

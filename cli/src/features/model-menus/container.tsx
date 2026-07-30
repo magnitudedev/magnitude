@@ -2,7 +2,6 @@ import {
   memo,
   useCallback,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from "react"
@@ -41,6 +40,8 @@ import {
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { HardwareMemoryDomain } from "../../components/hardware-memory-domain"
+import { useSpinnerFrame } from "../../hooks/use-spinner-frame"
+import { useBoundedCursor } from "../../hooks/use-bounded-cursor"
 import { useTheme } from "../../hooks/use-theme"
 import {
   authSourceAtom,
@@ -66,13 +67,24 @@ const MENU_HEIGHT = 32
 const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 const MAGNITUDE_CLOUD_URL = "https://app.magnitude.dev"
 type CloudActionId = "add" | "update" | "disconnect" | "link"
+const EMPTY_MODEL_ACTIONS = [
+  { label: "Find a local model", root: "catalog" },
+  { label: "Connect cloud models", root: "cloud" },
+] as const satisfies readonly { readonly label: string; readonly root: ModelMenuRoot }[]
 
-interface MenuRootProps {
+interface ModelsMenuProps {
   readonly openRoot: (root: ModelMenuRoot) => void
   readonly openCatalogDetail: (candidateId: string) => void
+  readonly setRootSwitchingEnabled: (enabled: boolean) => void
+}
+
+interface CatalogMenuProps {
   readonly initialCatalogDetailId: string | null
   readonly setRootSwitchingEnabled: (enabled: boolean) => void
-  readonly bindMenuKeyHandler: (handler: (key: KeyEvent) => void) => void
+}
+
+interface CloudMenuProps {
+  readonly setRootSwitchingEnabled: (enabled: boolean) => void
 }
 
 const nextRoot = (root: ModelMenuRoot, direction: -1 | 1): ModelMenuRoot => {
@@ -115,11 +127,6 @@ export function ModelMenusContainer({
   const [rootSwitchingEnabled, setRootSwitchingEnabled] = useState(true)
   const [hoveredRoot, setHoveredRoot] = useState<ModelMenuRoot | null>(null)
   const [catalogDetailId, setCatalogDetailId] = useState<string | null>(null)
-  const menuKeyHandlerRef = useRef<(key: KeyEvent) => void>(() => {})
-  const bindMenuKeyHandler = useCallback((handler: (key: KeyEvent) => void) => {
-    menuKeyHandlerRef.current = handler
-  }, [])
-
   const openRoot = useCallback((root: ModelMenuRoot) => {
     setCatalogDetailId(null)
     setRootSwitchingEnabled(true)
@@ -136,20 +143,20 @@ export function ModelMenusContainer({
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (!menu.open || key.defaultPrevented) return
-    menuKeyHandlerRef.current(key)
-    if (key.defaultPrevented) return
-    if ((key.name === "left" || key.name === "right")
+    if (rootSwitchingEnabled
+      && (key.name === "left" || key.name === "right")
       && !key.ctrl && !key.meta && !key.option) {
       key.preventDefault()
       openRoot(nextRoot(menu.root, key.name === "left" ? -1 : 1))
       return
     }
-    if (key.name === "tab" && !key.ctrl && !key.meta && !key.option) {
+    if (rootSwitchingEnabled
+      && key.name === "tab" && !key.ctrl && !key.meta && !key.option) {
       key.preventDefault()
       openRoot(nextRoot(menu.root, key.shift ? -1 : 1))
       return
     }
-    if (key.name === "escape") {
+    if (rootSwitchingEnabled && key.name === "escape") {
       key.preventDefault()
       close()
     }
@@ -170,10 +177,10 @@ export function ModelMenusContainer({
       }}
     >
       <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", backgroundColor: theme.menuBg }}>
-        {menu.root === "models" && <ModelsMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setRootSwitchingEnabled} bindMenuKeyHandler={bindMenuKeyHandler} />}
-        {menu.root === "catalog" && <CatalogMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setRootSwitchingEnabled} bindMenuKeyHandler={bindMenuKeyHandler} />}
-        {menu.root === "hardware" && <HardwareMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setRootSwitchingEnabled} bindMenuKeyHandler={bindMenuKeyHandler} />}
-        {menu.root === "cloud" && <CloudMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setRootSwitchingEnabled} bindMenuKeyHandler={bindMenuKeyHandler} />}
+        {menu.root === "models" && <ModelsMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} setRootSwitchingEnabled={setRootSwitchingEnabled} />}
+        {menu.root === "catalog" && <CatalogMenu initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setRootSwitchingEnabled} />}
+        {menu.root === "hardware" && <HardwareMenu />}
+        {menu.root === "cloud" && <CloudMenu setRootSwitchingEnabled={setRootSwitchingEnabled} />}
       </box>
       <box
         style={{
@@ -241,7 +248,7 @@ export function ModelMenusContainer({
         )}
         <box style={{ flexGrow: 1 }} />
         <text style={{ fg: theme.muted }}>
-          {rootSwitchingEnabled ? "←/→ switch menus" : "←/→ switch menus · Esc back"}
+          {rootSwitchingEnabled ? "←/→ switch menus" : "Esc back"}
         </text>
       </box>
     </box>
@@ -333,8 +340,7 @@ const ModelsMenu = memo(function ModelsMenu({
   openRoot,
   openCatalogDetail,
   setRootSwitchingEnabled,
-  bindMenuKeyHandler,
-}: MenuRootProps) {
+}: ModelsMenuProps) {
   const theme = useTheme()
   const config = useModelConfig()
   const localModels = useLocalModels()
@@ -389,7 +395,6 @@ const ModelsMenu = memo(function ModelsMenu({
     })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(null)
-  const [detailActionIndex, setDetailActionIndex] = useState(0)
   const cursorIndex = Math.max(0, eligible.findIndex((model) => providerModelKey(model) === cursorId))
   const cursor = eligible[cursorIndex]
   const detail = eligible.find((model) => providerModelKey(model) === detailId) ?? null
@@ -457,7 +462,9 @@ const ModelsMenu = memo(function ModelsMenu({
     if (detailCatalogCandidate) actions.push("catalog")
     return actions
   }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, hardware, primarySlot, residentAllocation])
-  const focusedDetailAction = detailActions[Math.min(detailActionIndex, Math.max(0, detailActions.length - 1))]
+  const detailActionCursor = useBoundedCursor(detailActions.length)
+  const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
+  const focusedDetailAction = detailActions[detailActionCursor.index]
 
   const statusFor = useCallback((model: ProviderModelCatalogEntry): string => {
     const isSelected = providerModelKey(model) === selectedKey
@@ -501,7 +508,7 @@ const ModelsMenu = memo(function ModelsMenu({
     else if (detailCatalogCandidate) openCatalogDetail(detailCatalogCandidate.id)
   }, [choose, detail, detailCatalogCandidate, openCatalogDetail, primarySlot, slotActions])
 
-  bindMenuKeyHandler(useCallback((key: KeyEvent) => {
+  useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
     if (detail) {
       if (key.name === "f" && !key.ctrl && !key.meta && !key.option) {
@@ -517,12 +524,12 @@ const ModelsMenu = memo(function ModelsMenu({
       }
       if (key.name === "up" && detailActions.length > 0) {
         key.preventDefault()
-        setDetailActionIndex((current) => Math.max(0, Math.min(detailActions.length - 1, current - 1)))
+        detailActionCursor.previous()
         return
       }
       if (key.name === "down" && detailActions.length > 0) {
         key.preventDefault()
-        setDetailActionIndex((current) => Math.min(detailActions.length - 1, current + 1))
+        detailActionCursor.next()
         return
       }
       if ((key.name === "return" || key.name === "enter") && focusedDetailAction) {
@@ -530,6 +537,23 @@ const ModelsMenu = memo(function ModelsMenu({
         runDetailAction(focusedDetailAction)
       }
       return
+    }
+    if (eligible.length === 0) {
+      if (key.name === "up" || key.name === "k") {
+        key.preventDefault()
+        emptyActionCursor.previous()
+        return
+      }
+      if (key.name === "down" || key.name === "j") {
+        key.preventDefault()
+        emptyActionCursor.next()
+        return
+      }
+      if (key.name === "return" || key.name === "enter") {
+        key.preventDefault()
+        openRoot(EMPTY_MODEL_ACTIONS[emptyActionCursor.index]!.root)
+        return
+      }
     }
     if ((key.name === "up" || key.name === "k") && eligible.length > 0) {
       key.preventDefault()
@@ -553,7 +577,7 @@ const ModelsMenu = memo(function ModelsMenu({
     }
     if (key.name === "d" && cursor) {
       key.preventDefault()
-      setDetailActionIndex(0)
+      detailActionCursor.reset()
       setDetailId(providerModelKey(cursor))
       setRootSwitchingEnabled(false)
       return
@@ -563,7 +587,7 @@ const ModelsMenu = memo(function ModelsMenu({
       config.refreshModels()
       return
     }
-  }, [config, cursor, cursorIndex, detail, detailActions.length, eligible, focusedDetailAction, runDetailAction, setRootSwitchingEnabled, toggleFavorite]))
+  }, [choose, config, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, eligible, emptyActionCursor, focusedDetailAction, openRoot, runDetailAction, setRootSwitchingEnabled, toggleFavorite]))
 
   if (detail) {
     const detailActionLabel = {
@@ -604,10 +628,10 @@ const ModelsMenu = memo(function ModelsMenu({
               <MenuAction
                 key={action}
                 label={detailActionLabel[action]}
-                focused={index === Math.min(detailActionIndex, Math.max(0, detailActions.length - 1))}
+                focused={index === detailActionCursor.index}
                 tone={action === "select" ? "primary" : action === "catalog" ? "link" : "normal"}
                 onClick={() => runDetailAction(action)}
-                onMouseOver={() => setDetailActionIndex(index)}
+                onMouseOver={() => detailActionCursor.select(index)}
               />
             ))}
           </box>
@@ -622,7 +646,9 @@ const ModelsMenu = memo(function ModelsMenu({
         title="Models"
         subtitle="Choose a model"
         summary={`${eligible.filter((model) => model.providerId === LOCAL_PROVIDER_ID).length} local · ${eligible.filter((model) => model.providerId !== LOCAL_PROVIDER_ID).length} cloud`}
-        hints="↑↓ choose · Enter select · F favorite · D details · R refresh · Esc close"
+        hints={eligible.length === 0
+          ? "↑↓ choose · Enter open · R refresh · Esc close"
+          : "↑↓ choose · Enter select · F favorite · D details · R refresh · Esc close"}
       />
       <scrollbox
         scrollX={false}
@@ -661,10 +687,17 @@ const ModelsMenu = memo(function ModelsMenu({
           </box>
         ))}
         {eligible.length === 0 ? (
-          <box style={{ flexDirection: "column" }}>
-            <text style={{ fg: theme.warning }}>No model is currently available.</text>
-            <Button onClick={() => openRoot("cloud")}><text style={{ fg: theme.link }}>› Connect cloud models →</text></Button>
-            <Button onClick={() => openRoot("catalog")}><text style={{ fg: theme.link }}>  Find a local model →</text></Button>
+          <box style={{ flexDirection: "column", paddingLeft: 2 }}>
+            <text style={{ fg: theme.warning, marginLeft: 2 }}>No model is currently available.</text>
+            {EMPTY_MODEL_ACTIONS.map((action, index) => (
+              <MenuAction
+                key={action.root}
+                label={action.label}
+                focused={index === emptyActionCursor.index}
+                onClick={() => openRoot(action.root)}
+                onMouseOver={() => emptyActionCursor.select(index)}
+              />
+            ))}
           </box>
         ) : eligible.map((model, index) => {
           const focused = index === cursorIndex
@@ -735,11 +768,9 @@ const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
 }
 
 const CatalogMenu = memo(function CatalogMenu({
-  openRoot,
   initialCatalogDetailId,
   setRootSwitchingEnabled,
-  bindMenuKeyHandler,
-}: MenuRootProps) {
+}: CatalogMenuProps) {
   const theme = useTheme()
   const localModels = useLocalModels()
   const modelActions = useLocalModelActions()
@@ -755,6 +786,10 @@ const CatalogMenu = memo(function CatalogMenu({
     onSome: (models) =>
       models.recommendations._tag === "Ready" ? models.recommendations.entries : [],
   })
+  const recommendationsReady = Option.exists(
+    snapshot,
+    (models) => models.recommendations._tag === "Ready",
+  )
   const recommendationFor = useCallback((candidate: LocalModelCatalogCandidate) =>
     Option.fromNullable(recommendations.find((recommendation) =>
       recommendation.candidate.id === candidate.id)), [recommendations])
@@ -765,7 +800,6 @@ const CatalogMenu = memo(function CatalogMenu({
   })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
-  const [detailActionIndex, setDetailActionIndex] = useState(0)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const cursorIndex = Math.max(0, candidates.findIndex(({ id }) => id === cursorId))
   const cursor = candidates[cursorIndex]
@@ -775,6 +809,7 @@ const CatalogMenu = memo(function CatalogMenu({
     onSome: (models) => localInferenceProgressLines(models.recommendations.progress),
   })
   const runningProgress = progress.find((line) => line.state === "running")
+  const spinner = useSpinnerFrame(runningProgress !== undefined)
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("primary" | "cancel" | "select")[]
     const actions: ("primary" | "cancel" | "select")[] = []
@@ -785,7 +820,8 @@ const CatalogMenu = memo(function CatalogMenu({
     else actions.push("primary")
     return actions
   }, [detail])
-  const focusedDetailAction = detailActions[Math.min(detailActionIndex, Math.max(0, detailActions.length - 1))]
+  const detailActionCursor = useBoundedCursor(detailActions.length)
+  const focusedDetailAction = detailActions[detailActionCursor.index]
 
   const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.download._tag === "Downloading"
@@ -821,7 +857,7 @@ const CatalogMenu = memo(function CatalogMenu({
     }
   }, [detail, modelActions, primaryAction, selectCandidate])
 
-  bindMenuKeyHandler(useCallback((key: KeyEvent) => {
+  useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
     if (detail) {
       if (key.name === "escape") {
@@ -830,10 +866,10 @@ const CatalogMenu = memo(function CatalogMenu({
         setRootSwitchingEnabled(true)
       } else if (key.name === "up" && detailActions.length > 0) {
         key.preventDefault()
-        setDetailActionIndex((current) => Math.max(0, Math.min(detailActions.length - 1, current - 1)))
+        detailActionCursor.previous()
       } else if (key.name === "down" && detailActions.length > 0) {
         key.preventDefault()
-        setDetailActionIndex((current) => Math.min(detailActions.length - 1, current + 1))
+        detailActionCursor.next()
       } else if ((key.name === "return" || key.name === "enter") && focusedDetailAction) {
         key.preventDefault()
         runDetailAction(focusedDetailAction)
@@ -866,7 +902,7 @@ const CatalogMenu = memo(function CatalogMenu({
       setCursorId(candidates[Math.min(candidates.length - 1, cursorIndex + 1)]!.id)
     } else if ((key.name === "return" || key.name === "enter") && cursor) {
       key.preventDefault()
-      setDetailActionIndex(0)
+      detailActionCursor.reset()
       setDetailId(cursor.id)
       setRootSwitchingEnabled(false)
     } else if (key.name === "d" && cursor) {
@@ -884,7 +920,7 @@ const CatalogMenu = memo(function CatalogMenu({
         key.preventDefault()
       }
     }
-  }, [candidates, cursor, cursorIndex, detail, detailActions.length, focusedDetailAction, modelActions, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
+  }, [candidates, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, focusedDetailAction, modelActions, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
 
   if (detail) {
     const recommendation = recommendationFor(detail)
@@ -939,10 +975,10 @@ const CatalogMenu = memo(function CatalogMenu({
               <MenuAction
                 key={action}
                 label={detailActionLabel[action]}
-                focused={index === Math.min(detailActionIndex, Math.max(0, detailActions.length - 1))}
+                focused={index === detailActionCursor.index}
                 tone={action === "primary" || action === "select" ? "primary" : "warning"}
                 onClick={() => runDetailAction(action)}
-                onMouseOver={() => setDetailActionIndex(index)}
+                onMouseOver={() => detailActionCursor.select(index)}
               />
             ))}
           </box>
@@ -969,7 +1005,6 @@ const CatalogMenu = memo(function CatalogMenu({
         viewportOptions: { backgroundColor: theme.menuBg },
         contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
       }}>
-        {runningProgress && <text style={{ fg: theme.primary }}>⠹ {runningProgress.label}{runningProgress.metadata}</text>}
         <box style={{ flexDirection: "row", width: "100%" }}>
           <text style={{ fg: theme.muted, width: 2 }}> </text>
           <text style={{ fg: theme.muted, flexGrow: 1 }}>MODEL</text>
@@ -980,8 +1015,15 @@ const CatalogMenu = memo(function CatalogMenu({
           <text style={{ fg: theme.muted, width: 12 }}>SPEED</text>
           <text style={{ fg: theme.muted, width: 18 }}>STATUS</text>
         </box>
-        {candidates.length === 0 ? (
-          <text style={{ fg: theme.warning }}>No compatible recommended models are currently available.</text>
+        {runningProgress && (
+          <text style={{ fg: theme.primary, marginLeft: 2 }}>
+            {spinner} {runningProgress.label}{runningProgress.metadata}
+          </text>
+        )}
+        {candidates.length === 0 && recommendationsReady ? (
+          <text style={{ fg: theme.warning, marginLeft: 2 }}>
+            No compatible recommended models are currently available.
+          </text>
         ) : candidates.map((candidate, index) => {
           const focused = index === cursorIndex
           const pendingDelete = pendingDeleteId === candidate.id
@@ -990,7 +1032,7 @@ const CatalogMenu = memo(function CatalogMenu({
               key={candidate.id}
               onClick={() => {
                 setPendingDeleteId(null)
-                setDetailActionIndex(0)
+                detailActionCursor.reset()
                 setDetailId(candidate.id)
                 setRootSwitchingEnabled(false)
               }}
@@ -1037,9 +1079,7 @@ const CatalogMenu = memo(function CatalogMenu({
   )
 })
 
-const HardwareMenu = memo(function HardwareMenu({
-  bindMenuKeyHandler,
-}: MenuRootProps) {
+const HardwareMenu = memo(function HardwareMenu() {
   const theme = useTheme()
   const hardwareState = useLocalInferenceHardware()
   const config = useModelConfig()
@@ -1081,7 +1121,7 @@ const HardwareMenu = memo(function HardwareMenu({
     )
   }, [action, currentSlot, slotActions])
 
-  bindMenuKeyHandler(useCallback((key: KeyEvent) => {
+  useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
     if (key.name === "up" || key.name === "down") {
       key.preventDefault()
@@ -1242,8 +1282,7 @@ const ModelLoadPlanDetails = memo(function ModelLoadPlanDetails() {
 
 const CloudMenu = memo(function CloudMenu({
   setRootSwitchingEnabled,
-  bindMenuKeyHandler,
-}: MenuRootProps) {
+}: CloudMenuProps) {
   const theme = useTheme()
   const platform = usePlatform()
   const settings = useSettingsState()
@@ -1252,8 +1291,6 @@ const CloudMenu = memo(function CloudMenu({
   const [mode, setMode] = useState<"root" | "edit" | "disconnect">("root")
   const [keyValue, setKeyValue] = useState("")
   const [validationError, setValidationError] = useState<string | null>(null)
-  const [cursorIndex, setCursorIndex] = useState(0)
-  const [disconnectActionIndex, setDisconnectActionIndex] = useState(0)
   const auth = useMemo(() => deriveSettingsAuthInfo({
     apiKey: settings.apiKey,
     authSource,
@@ -1272,7 +1309,9 @@ const CloudMenu = memo(function CloudMenu({
     : auth.source === "config"
       ? ["update", "disconnect", "link"]
       : ["link"], [auth.source])
-  const selectedAction = actionIds[Math.min(cursorIndex, actionIds.length - 1)]
+  const actionCursor = useBoundedCursor(actionIds.length)
+  const disconnectCursor = useBoundedCursor(2)
+  const selectedAction = actionIds[actionCursor.index]
 
   const save = useCallback(() => {
     const trimmed = keyValue.trim()
@@ -1291,15 +1330,15 @@ const CloudMenu = memo(function CloudMenu({
       return
     }
     if (action === "disconnect") {
-      setDisconnectActionIndex(0)
+      disconnectCursor.reset()
       setMode("disconnect")
       setRootSwitchingEnabled(false)
       return
     }
     void platform.openLink(MAGNITUDE_CLOUD_URL)
-  }, [platform, setRootSwitchingEnabled])
+  }, [disconnectCursor, platform, setRootSwitchingEnabled])
 
-  bindMenuKeyHandler(useCallback((key: KeyEvent) => {
+  useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
     if (mode === "edit") {
       if (key.name === "escape") {
@@ -1323,17 +1362,17 @@ const CloudMenu = memo(function CloudMenu({
       }
       if (key.name === "up") {
         key.preventDefault()
-        setDisconnectActionIndex((current) => Math.max(0, current - 1))
+        disconnectCursor.previous()
         return
       }
       if (key.name === "down") {
         key.preventDefault()
-        setDisconnectActionIndex((current) => Math.min(1, current + 1))
+        disconnectCursor.next()
         return
       }
       if (key.name === "return" || key.name === "enter") {
         key.preventDefault()
-        if (disconnectActionIndex === 1) auth.clear()
+        if (disconnectCursor.index === 1) auth.clear()
         setMode("root")
         setRootSwitchingEnabled(true)
       }
@@ -1341,19 +1380,19 @@ const CloudMenu = memo(function CloudMenu({
     }
     if (key.name === "up" && actionIds.length > 0) {
       key.preventDefault()
-      setCursorIndex((current) => Math.max(0, Math.min(actionIds.length - 1, current - 1)))
+      actionCursor.previous()
       return
     }
     if (key.name === "down" && actionIds.length > 0) {
       key.preventDefault()
-      setCursorIndex((current) => Math.min(actionIds.length - 1, current + 1))
+      actionCursor.next()
       return
     }
     if ((key.name === "return" || key.name === "enter") && selectedAction) {
       key.preventDefault()
       runAction(selectedAction)
     }
-  }, [actionIds.length, auth, disconnectActionIndex, mode, runAction, save, selectedAction, setRootSwitchingEnabled]))
+  }, [actionCursor, actionIds.length, auth, disconnectCursor, mode, runAction, save, selectedAction, setRootSwitchingEnabled]))
 
   if (mode === "edit") {
     const error = validationError ?? auth.error
@@ -1406,23 +1445,23 @@ const CloudMenu = memo(function CloudMenu({
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
             <MenuAction
               label="Cancel"
-              focused={disconnectActionIndex === 0}
+              focused={disconnectCursor.index === 0}
               onClick={() => {
                 setMode("root")
                 setRootSwitchingEnabled(true)
               }}
-              onMouseOver={() => setDisconnectActionIndex(0)}
+              onMouseOver={() => disconnectCursor.select(0)}
             />
             <MenuAction
               label="Disconnect"
-              focused={disconnectActionIndex === 1}
+              focused={disconnectCursor.index === 1}
               tone="error"
               onClick={() => {
                 auth.clear()
                 setMode("root")
                 setRootSwitchingEnabled(true)
               }}
-              onMouseOver={() => setDisconnectActionIndex(1)}
+              onMouseOver={() => disconnectCursor.select(1)}
             />
           </box>
         </box>
@@ -1450,7 +1489,7 @@ const CloudMenu = memo(function CloudMenu({
           {auth.source === "none" && (
             <Button
               onClick={() => runAction("add")}
-              onMouseOver={() => setCursorIndex(actionIds.indexOf("add"))}
+              onMouseOver={() => actionCursor.select(actionIds.indexOf("add"))}
             >
               <text style={{ fg: theme.primary }}>{selectedAction === "add" ? "› " : "  "}Add API key</text>
             </Button>
@@ -1459,7 +1498,7 @@ const CloudMenu = memo(function CloudMenu({
             <>
               <Button
                 onClick={() => runAction("update")}
-                onMouseOver={() => setCursorIndex(actionIds.indexOf("update"))}
+                onMouseOver={() => actionCursor.select(actionIds.indexOf("update"))}
               >
                 <text style={{ fg: selectedAction === "update" ? theme.primary : theme.foreground }}>
                   {selectedAction === "update" ? "› " : "  "}Update API key
@@ -1467,7 +1506,7 @@ const CloudMenu = memo(function CloudMenu({
               </Button>
               <Button
                 onClick={() => runAction("disconnect")}
-                onMouseOver={() => setCursorIndex(actionIds.indexOf("disconnect"))}
+                onMouseOver={() => actionCursor.select(actionIds.indexOf("disconnect"))}
               >
                 <text style={{ fg: selectedAction === "disconnect" ? theme.primary : theme.foreground }}>
                   {selectedAction === "disconnect" ? "› " : "  "}Disconnect
@@ -1479,7 +1518,7 @@ const CloudMenu = memo(function CloudMenu({
             <text style={{ fg: theme.primary }}>{selectedAction === "link" ? "› " : "  "}</text>
             <Button
               onClick={() => runAction("link")}
-              onMouseOver={() => setCursorIndex(actionIds.indexOf("link"))}
+              onMouseOver={() => actionCursor.select(actionIds.indexOf("link"))}
             >
               <text style={{ fg: theme.foreground }}>
                 View dashboard{" "}

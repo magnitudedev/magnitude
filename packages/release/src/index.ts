@@ -1,6 +1,7 @@
 export * from "./acquisition"
 export * from "./archive"
 export * from "./artifact-download"
+export * from "./installation-progress"
 export * from "./contracts"
 export * from "./errors"
 export * from "./targets"

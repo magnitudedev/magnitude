@@ -93,8 +93,8 @@ function makeDesktopApi(): DesktopApi {
       async discover(): Promise<string | null> {
         return desktopRpc.run((client) => client.DaemonDiscover({}))
       },
-      async spawn(command?: string[]): Promise<string> {
-        return desktopRpc.run((client) => client.DaemonSpawn({ command: command ?? null }))
+      async spawn(command): Promise<string> {
+        return desktopRpc.run((client) => client.DaemonSpawn({ command }))
       },
     },
     onMenuAction(cb: (action: MenuAction) => void): () => void {

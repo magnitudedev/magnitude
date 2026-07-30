@@ -1,1 +1,5 @@
-export { makeRemoteDaemonSpawner } from "./acn-jit/remote-daemon-spawner"
+export {
+  makeRemoteDaemonSpawner,
+  RemoteDaemonSpawnMessageSchema,
+  type RemoteDaemonSpawnMessage,
+} from "./acn-jit/remote-daemon-spawner"

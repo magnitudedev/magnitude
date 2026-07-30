@@ -1,9 +1,25 @@
-import { BunHttpServer, BunFileSystem, BunPath, BunCommandExecutor } from "@effect/platform-bun"
+import {
+  BunHttpServer,
+  BunFileSystem,
+  BunPath,
+  BunCommandExecutor,
+} from "@effect/platform-bun"
 import { FetchHttpClient, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
+import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
-import { Context, Effect, Exit, Layer, Runtime, Scope } from "effect"
+import {
+  Cause,
+  Context,
+  Effect,
+  Exit,
+  Layer,
+  Option,
+  Runtime,
+  Schema,
+  Scope,
+} from "effect"
 import {
   StorageLive,
   GlobalStorage,
@@ -12,7 +28,10 @@ import {
   ProjectStorageLiveFromCwd,
   VersionLive,
 } from "@magnitudedev/storage"
-import { MagnitudeRpcs } from "@magnitudedev/acn-protocol"
+import {
+  AcnHealthResponseSchema,
+  MagnitudeRpcs,
+} from "@magnitudedev/acn-protocol"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { HandlersLive } from "./handlers"
 import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
@@ -22,7 +41,10 @@ import { ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderCredentialsLive } from "./provider-credentials"
 import { ModelSlotControllerLive } from "./model-slot-controller"
 import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
-import { ProviderClientRegistryLive, SharedProviderClientLive } from "./shared-client"
+import {
+  ProviderClientRegistryLive,
+  SharedProviderClientLive,
+} from "./shared-client"
 import { ActiveSessionStatusesLive } from "./active-session-statuses"
 import {
   AcnActivityTracker,
@@ -33,7 +55,9 @@ import { DisplayViewStreamsLive } from "./display-view-streams"
 import {
   AcnDisplayViewIntrospectorLive,
   AcnIntrospectorLive,
-  AcnIntrospectionRoutes,
+  AcnIntrospector,
+  installAcnIntrospectionRoutes,
+  type AcnIntrospectorApi,
 } from "./introspection"
 import { SessionCommandsLive } from "./session-commands"
 import { SessionDraftsLive } from "./session-drafts"
@@ -54,12 +78,22 @@ import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
-import { ACN_OWNER_ID, ACN_SHUTDOWN_TOKEN, makeHealthResponse } from "./identity"
+import {
+  ACN_OWNER_ID,
+  makeHealthResponse,
+} from "./identity"
 import { MirroredStateChangesLive } from "./mirrored-state"
 import { AcnShutdown, AcnShutdownLive } from "./acn-shutdown"
 import { acquireAcnMachineOwnership } from "./machine-ownership"
+import {
+  readRegistrationOwnership,
+  registrationIsOwnedBy,
+  registrationPath,
+} from "./daemon-registration"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
-import { acnSubscriptionProtocolLayer } from "./acn-subscription-protocol"
+import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
+import { AcnStartupState } from "./startup-state"
+import { makeAcnStartupState } from "./startup-state"
 
 export interface AcnServerOptions {
   readonly register?: boolean
@@ -69,14 +103,17 @@ export interface AcnServerOptions {
 
 const CORS_ALLOWED_HEADERS =
   "Content-Type, Content-Length, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
-const LOCAL_HTTP_ORIGIN = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
+const LOCAL_HTTP_ORIGIN =
+  /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
 
 function isAllowedCorsOrigin(origin: string): boolean {
-  return LOCAL_HTTP_ORIGIN.test(origin) || origin === "file://" || origin === "null"
+  return (
+    LOCAL_HTTP_ORIGIN.test(origin) || origin === "file://" || origin === "null"
+  )
 }
 
 function corsHeadersFor(
-  request: HttpServerRequest.HttpServerRequest,
+  request: HttpServerRequest.HttpServerRequest
 ): Record<string, string> | null {
   const origin = request.headers.origin
   if (!origin || !isAllowedCorsOrigin(origin)) return null
@@ -92,79 +129,26 @@ function corsHeadersFor(
 
 function withCors(
   response: HttpServerResponse.HttpServerResponse,
-  request: HttpServerRequest.HttpServerRequest,
+  request: HttpServerRequest.HttpServerRequest
 ) {
   const headers = corsHeadersFor(request)
   return headers ? HttpServerResponse.setHeaders(response, headers) : response
 }
 
 const disallowedCorsResponse = HttpServerResponse.empty({ status: 403 })
-
-// CORS middleware — browser clients are limited to local web origins and
-// Electron's packaged renderer origin. Non-browser clients normally omit
-// Origin and do not need CORS headers.
-const CorsMiddleware = HttpLayerRouter.use((router) =>
-  router.addGlobalMiddleware((effect) =>
-    Effect.gen(function* () {
-      const request = yield* HttpServerRequest.HttpServerRequest
-      const response = yield* effect
-      return withCors(response, request)
-    }),
-  ),
-)
+const encodeHealthResponse = Schema.encode(AcnHealthResponseSchema)
 
 // OPTIONS preflight handler — catches all OPTIONS requests.
-const OptionsRoute = HttpLayerRouter.add("OPTIONS", "*", (request) => {
+const OptionsRouteHandler = (request: HttpServerRequest.HttpServerRequest) => {
   const headers = corsHeadersFor(request)
   if (!headers) return Effect.succeed(disallowedCorsResponse)
   return Effect.succeed(
-    HttpServerResponse.setHeaders(HttpServerResponse.empty({ status: 204 }), headers),
+    HttpServerResponse.setHeaders(
+      HttpServerResponse.empty({ status: 204 }),
+      headers
+    )
   )
-})
-
-// Health route
-const HealthRoute = HttpLayerRouter.add(
-  "GET",
-  "/health",
-  HttpServerResponse.json(makeHealthResponse(ACN_VERSION)),
-)
-
-const ShutdownRoute = HttpLayerRouter.add("POST", "/shutdown", (request) =>
-  Effect.gen(function* () {
-    if (request.headers.authorization !== `Bearer ${ACN_SHUTDOWN_TOKEN}`) {
-      return HttpServerResponse.empty({ status: 401 })
-    }
-    yield* (yield* AcnShutdown).request({ reason: "upgrade" })
-    return HttpServerResponse.empty({ status: 202 })
-  }),
-)
-
-// RPC route
-const RpcHttpProtocol = RpcServer.layerProtocolHttpRouter({
-  path: "/rpc",
-}).pipe(Layer.provide(RpcSerialization.layerNdjson))
-
-const RpcRoute = RpcServer.layer(MagnitudeRpcs).pipe(
-  Layer.provide(acnSubscriptionProtocolLayer(RpcHttpProtocol)),
-)
-
-// Combine routes
-const AllDebugRoutes = Layer.mergeAll(
-  CorsMiddleware,
-  OptionsRoute,
-  HealthRoute,
-  ShutdownRoute,
-  RpcRoute,
-  AcnIntrospectionRoutes(true),
-)
-const AllBaseRoutes = Layer.mergeAll(
-  CorsMiddleware,
-  OptionsRoute,
-  HealthRoute,
-  ShutdownRoute,
-  RpcRoute,
-  AcnIntrospectionRoutes(false),
-)
+}
 
 const AcnProcessHandlersLive = Layer.scopedDiscard(
   Effect.gen(function* () {
@@ -176,13 +160,13 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
         runtime,
         Effect.gen(function* () {
           yield* Effect.logError("Uncaught exception in ACN process").pipe(
-            Effect.annotateLogs({ error: error.stack ?? String(error) }),
+            Effect.annotateLogs({ error: error.stack ?? String(error) })
           )
           yield* shutdown.request({
             reason: "fatal",
             detail: error.stack ?? String(error),
           })
-        }),
+        })
       ).catch(() => undefined)
     }
 
@@ -190,22 +174,25 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
       Runtime.runPromise(
         runtime,
         Effect.gen(function* () {
-          const message = reason instanceof Error ? reason.stack ?? String(reason) : String(reason)
-          yield* Effect.logError("Unhandled promise rejection in ACN process").pipe(
-            Effect.annotateLogs({ reason: message }),
-          )
+          const message =
+            reason instanceof Error
+              ? reason.stack ?? String(reason)
+              : String(reason)
+          yield* Effect.logError(
+            "Unhandled promise rejection in ACN process"
+          ).pipe(Effect.annotateLogs({ reason: message }))
           yield* shutdown.request({
             reason: "fatal",
             detail: message,
           })
-        }),
+        })
       ).catch(() => undefined)
     }
 
     const requestSignalShutdown = (signal: NodeJS.Signals) => {
       Runtime.runPromise(
         runtime,
-        shutdown.request({ reason: "signal", detail: signal }),
+        shutdown.request({ reason: "signal", detail: signal })
       ).catch(() => undefined)
     }
     const sigintHandler = () => requestSignalShutdown("SIGINT")
@@ -222,35 +209,63 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
         process.off("unhandledRejection", unhandledRejectionHandler)
         process.off("SIGINT", sigintHandler)
         process.off("SIGTERM", sigtermHandler)
-      }),
+      })
     )
-  }),
+  })
 )
 
 const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
   const storageBase = Layer.mergeAll(
     VersionLive(ACN_VERSION),
-    ProjectStorageLiveFromCwd(process.cwd()),
+    ProjectStorageLiveFromCwd(process.cwd())
   )
 
   const storageLayer = StorageLive.pipe(Layer.provide(storageBase))
 
-  const storageServices = Layer.mergeAll(SessionStoreLive, SessionRuntimeOptionsStoreLive).pipe(
-    Layer.provideMerge(storageLayer),
-  )
+  const storageServices = Layer.mergeAll(
+    SessionStoreLive,
+    SessionRuntimeOptionsStoreLive
+  ).pipe(Layer.provideMerge(storageLayer))
 
-  const withActivity = Layer.provideMerge(AcnActivityTrackerLive("30 minutes", false), storageServices)
-  const withSubscriptions = Layer.provideMerge(AcnSubscriptionsLive, withActivity)
-  const withMirroredStateChanges = Layer.provideMerge(MirroredStateChangesLive, withSubscriptions)
-  const localServices = addLocalInferenceServices(withMirroredStateChanges, dataDir)
-  const withSharedClient = Layer.provideMerge(SharedProviderClientLive, localServices)
-  const withCatalog = Layer.provideMerge(ProviderModelCatalogLive, withSharedClient)
-  const withCredentials = Layer.provideMerge(ProviderCredentialsLive, withCatalog)
-  const withCloudUsage = Layer.provideMerge(MagnitudeCloudUsageLive, withCredentials)
-  const withModelSlots = Layer.provideMerge(ModelSlotControllerLive, withCloudUsage)
+  const withActivity = Layer.provideMerge(
+    AcnActivityTrackerLive("30 minutes", false),
+    storageServices
+  )
+  const withSubscriptions = Layer.provideMerge(
+    AcnSubscriptionsLive,
+    withActivity
+  )
+  const withMirroredStateChanges = Layer.provideMerge(
+    MirroredStateChangesLive,
+    withSubscriptions
+  )
+  const localServices = addLocalInferenceServices(
+    withMirroredStateChanges,
+    dataDir
+  )
+  const withSharedClient = Layer.provideMerge(
+    SharedProviderClientLive,
+    localServices
+  )
+  const withCatalog = Layer.provideMerge(
+    ProviderModelCatalogLive,
+    withSharedClient
+  )
+  const withCredentials = Layer.provideMerge(
+    ProviderCredentialsLive,
+    withCatalog
+  )
+  const withCloudUsage = Layer.provideMerge(
+    MagnitudeCloudUsageLive,
+    withCredentials
+  )
+  const withModelSlots = Layer.provideMerge(
+    ModelSlotControllerLive,
+    withCloudUsage
+  )
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
-    withModelSlots,
+    withModelSlots
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
@@ -259,28 +274,49 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
 
 const addLocalInferenceServices = <A, E, R>(
   base: Layer.Layer<A, E, R>,
-  dataDir: string,
+  dataDir: string
 ) => {
   const withIcn = Layer.provideMerge(makeAcnIcn(dataDir), base)
-  const withConfiguration = Layer.provideMerge(makeModelConfigurationLayer(), withIcn)
-  const withHardware = Layer.provideMerge(LocalInferenceHardwareLive, withConfiguration)
+  const withConfiguration = Layer.provideMerge(
+    makeModelConfigurationLayer(),
+    withIcn
+  )
+  const withHardware = Layer.provideMerge(
+    LocalInferenceHardwareLive,
+    withConfiguration
+  )
   const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
-  const withEvaluations = Layer.provideMerge(LocalModelEvaluationsLive, withPackages)
-  const withOfferings = Layer.provideMerge(LocalProviderOfferingsLive, withEvaluations)
+  const withEvaluations = Layer.provideMerge(
+    LocalModelEvaluationsLive,
+    withPackages
+  )
+  const withOfferings = Layer.provideMerge(
+    LocalProviderOfferingsLive,
+    withEvaluations
+  )
   const withOfferingProjection = Layer.provideMerge(
     LocalProviderOfferingProjectionLive,
-    withOfferings,
+    withOfferings
   )
   const withRecommendations = Layer.provideMerge(
     makeLocalModelRecommendationsLive(dataDir),
-    withOfferingProjection,
+    withOfferingProjection
   )
-  const withAutoSetup = Layer.provideMerge(LocalModelAutoSetupLive, withRecommendations)
+  const withAutoSetup = Layer.provideMerge(
+    LocalModelAutoSetupLive,
+    withRecommendations
+  )
   const withLocalModels = Layer.provideMerge(LocalModelsLive, withAutoSetup)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)
-  const withResolver = Layer.provideMerge(LocalProviderResolverLive, withOnboarding)
+  const withResolver = Layer.provideMerge(
+    LocalProviderResolverLive,
+    withOnboarding
+  )
   const withIcnProvider = Layer.provideMerge(makeIcnProvider(), withResolver)
-  const withProviderClients = Layer.provideMerge(ProviderClientRegistryLive, withIcnProvider)
+  const withProviderClients = Layer.provideMerge(
+    ProviderClientRegistryLive,
+    withIcnProvider
+  )
   return withProviderClients
 }
 
@@ -288,8 +324,14 @@ const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
   const withDemand = Layer.provideMerge(AcnRpcDemandLive, services)
   const withCommands = Layer.provideMerge(SessionCommandsLive, withDemand)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
-  const withActiveSessionStatuses = Layer.provideMerge(ActiveSessionStatusesLive, withLifecycle)
-  const withStreams = Layer.provideMerge(DisplayViewStreamsLive, withActiveSessionStatuses)
+  const withActiveSessionStatuses = Layer.provideMerge(
+    ActiveSessionStatusesLive,
+    withLifecycle
+  )
+  const withStreams = Layer.provideMerge(
+    DisplayViewStreamsLive,
+    withActiveSessionStatuses
+  )
   return withStreams
 }
 
@@ -298,65 +340,37 @@ const AcnBaseServicesLayer = (dataDir: string) =>
 
 const AcnDebugServicesLayer = (dataDir: string) => {
   const withActivity = makeAcnServicesBase(true, dataDir)
-  const withDisplayIntrospection = Layer.provideMerge(AcnDisplayViewIntrospectorLive, withActivity)
-  return addCommonAcnServices(Layer.provideMerge(AcnIntrospectorLive, withDisplayIntrospection))
+  const withDisplayIntrospection = Layer.provideMerge(
+    AcnDisplayViewIntrospectorLive,
+    withActivity
+  )
+  return addCommonAcnServices(
+    Layer.provideMerge(AcnIntrospectorLive, withDisplayIntrospection)
+  )
 }
 
-const makeAcnApplication = <A, E, R>(
-  routes: Layer.Layer<A, E, R>,
+const makeAcnInfrastructure = (
   options: AcnServerOptions,
-  debug: boolean,
-) =>
-  HttpLayerRouter.serve(routes).pipe(
-    // HandlersLive consumes the ACN services directly.
-    Layer.provide(HandlersLive),
-    // DaemonLifecycle needs runtime/activity + HttpServer + FileSystem.
-    Layer.provide(
-      DaemonLifecycleLive({
-        version: ACN_VERSION,
-        register: options.register ?? false,
-        debug,
-        dataDir: options.dataDir ?? defaultDataDir(),
-      }),
-    ),
-    Layer.provide(AcnProcessHandlersLive),
-  )
-
-const makeAcnServerLayer = (options: AcnServerOptions, debug: boolean) => {
+  startup: AcnStartupState
+) => {
   const dataDir = options.dataDir ?? defaultDataDir()
-  const application = debug
-    ? makeAcnApplication(AllDebugRoutes, options, true).pipe(
-        Layer.provideMerge(AcnDebugServicesLayer(dataDir)),
-      )
-    : makeAcnApplication(AllBaseRoutes, options, false).pipe(
-        Layer.provideMerge(AcnBaseServicesLayer(dataDir)),
-      )
-
-  return application.pipe(
-    Layer.provideMerge(AcnShutdownLive),
-    Layer.provide(
-      Layer.succeed(
-        GlobalStorage,
-        GlobalStorage.of(makeGlobalStorage({ root: dataDir })),
-      ),
+  return Layer.mergeAll(
+    Layer.succeed(AcnStartupState, startup),
+    AcnShutdownLive,
+    Layer.succeed(
+      GlobalStorage,
+      GlobalStorage.of(makeGlobalStorage({ root: dataDir }))
     ),
-    // CommandExecutor (used by ops.ts) requires FileSystem, so provide it before BunFileSystem
-    Layer.provide(BunCommandExecutor.layer),
-    // FileSystem (shared by Daemon + CommandExecutor)
-    Layer.provide(BunFileSystem.layer),
-    Layer.provide(BunPath.layer),
-    Layer.provide(FetchHttpClient.layer),
-    // HttpServer (shared by Daemon + HttpLayerRouter.serve)
-    Layer.provide(BunHttpServer.layer({ port: 0, hostname: "127.0.0.1", idleTimeout: 255 })),
-    // OTLP tracing — only active when MAGNITUDE_OTEL_ENDPOINT or
-    // MAGNITUDE_OTEL=1 is set. Exports all RPC + HTTP spans to motel (or
-    // any OTLP-compatible collector). Zero overhead when disabled.
-    Layer.provide(TracingLayer),
+    BunFileSystem.layer,
+    BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
+    BunPath.layer,
+    FetchHttpClient.layer,
+    BunHttpServer.layer({ port: 0, hostname: "127.0.0.1", idleTimeout: 255 }),
+    HttpLayerRouter.layer,
+    RpcSerialization.layerNdjson,
+    TracingLayer
   )
 }
-
-const AcnServerLayer = (options: AcnServerOptions = {}) =>
-  makeAcnServerLayer(options, options.debug === true)
 
 /**
  * Runs one ACN generation until its shutdown coordinator is requested. Scope
@@ -365,25 +379,170 @@ const AcnServerLayer = (options: AcnServerOptions = {}) =>
 export const launchAcnServer = (options: AcnServerOptions = {}) =>
   Effect.scoped(
     Effect.gen(function* () {
-      yield* acquireAcnMachineOwnership({
-        dataDir: options.dataDir ?? defaultDataDir(),
-        id: ACN_OWNER_ID,
-        version: ACN_VERSION,
-      })
+      const dataDir = options.dataDir ?? defaultDataDir()
+      const debug = options.debug === true
+      const startup = yield* makeAcnStartupState()
+      yield* startup.starting("WaitingForOwnership", Option.none())
       const applicationScope = yield* Scope.make()
       yield* Effect.addFinalizer(() => Scope.close(applicationScope, Exit.void))
-      const services = yield* Layer.buildWithScope(AcnServerLayer(options), applicationScope)
-      const shutdown = Context.get(services, AcnShutdown)
-      const subscriptions = Context.get(services, AcnSubscriptions)
-      const icn = Context.get(services, IcnProcess)
-      const activity = Context.get(services, AcnActivityTracker)
+
+      const infrastructure = yield* Layer.buildWithScope(
+        makeAcnInfrastructure(options, startup),
+        applicationScope
+      )
+      const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
+      const server = Context.get(infrastructure, HttpServer.HttpServer)
+      const shutdown = Context.get(infrastructure, AcnShutdown)
+
+      yield* router.addGlobalMiddleware((responseEffect) =>
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest
+          return withCors(yield* responseEffect, request)
+        })
+      )
+      yield* router.add("OPTIONS", "*", OptionsRouteHandler)
+      yield* router.add(
+        "GET",
+        "/health",
+        startup.get.pipe(
+          Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
+          Effect.flatMap(encodeHealthResponse),
+          Effect.flatMap(HttpServerResponse.json),
+          Effect.orDie
+        )
+      )
+      yield* router.add("POST", "/rpc", startup.rpc)
+      yield* server
+        .serve(router.asHttpEffect())
+        .pipe(Effect.provide(infrastructure))
+      yield* Layer.buildWithScope(
+        Layer.merge(
+          DaemonLifecycleLive({
+            version: ACN_VERSION,
+            register: options.register ?? false,
+            debug,
+            dataDir,
+          }),
+          AcnProcessHandlersLive
+        ),
+        applicationScope
+      ).pipe(Effect.provide(infrastructure))
+
+      const ownership = yield* Effect.raceFirst(
+        acquireAcnMachineOwnership({
+          dataDir,
+          id: ACN_OWNER_ID,
+          version: ACN_VERSION,
+        }).pipe(Effect.as(true)),
+        shutdown.await.pipe(Effect.as(false))
+      ).pipe(Effect.provide(infrastructure))
+      if (!ownership) {
+        const request = yield* shutdown.await
+        yield* Effect.logInfo(
+          "ACN retired before acquiring active runtime ownership"
+        ).pipe(
+          Effect.annotateLogs({
+            reason: request.reason,
+            detail: request.detail ?? null,
+          })
+        )
+        return
+      }
+      if (options.register ?? false) {
+        const registration = yield* readRegistrationOwnership(
+          registrationPath(dataDir)
+        ).pipe(Effect.provide(infrastructure))
+        if (!registrationIsOwnedBy(registration, ACN_OWNER_ID)) {
+          yield* shutdown.request({ reason: "ownership-lost" })
+          return
+        }
+      }
+      const pendingShutdown = yield* shutdown.current
+      if (Option.isSome(pendingShutdown)) return
+      yield* startup.starting("Resolving", Option.none())
+
+      const application = Effect.gen(function* () {
+        const builtServices = yield* debug
+          ? Layer.buildWithScope(
+              AcnDebugServicesLayer(dataDir),
+              applicationScope
+            ).pipe(
+              Effect.provide(infrastructure),
+              Effect.map((context) => ({
+                context,
+                introspector: Option.some(
+                  Context.get(context, AcnIntrospector)
+                ),
+              }))
+            )
+          : Layer.buildWithScope(
+              AcnBaseServicesLayer(dataDir),
+              applicationScope
+            ).pipe(
+              Effect.provide(infrastructure),
+              Effect.map((context) => ({
+                context,
+                introspector: Option.none<AcnIntrospectorApi>(),
+              }))
+            )
+        const acnServices = builtServices.context
+        const serviceContext = Context.merge(infrastructure, acnServices)
+        const handlers = yield* Layer.buildWithScope(
+          HandlersLive,
+          applicationScope
+        ).pipe(Effect.provide(serviceContext))
+        const applicationContext = Context.merge(serviceContext, handlers)
+
+        const rpcRouter = yield* HttpLayerRouter.make
+        const rawProtocol = yield* RpcServer.makeProtocolHttpRouter({
+          path: "/rpc",
+        }).pipe(
+          Effect.provideService(HttpLayerRouter.HttpRouter, rpcRouter),
+          Effect.provide(infrastructure)
+        )
+        const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
+          Effect.provide(applicationContext)
+        )
+        yield* RpcServer.make(MagnitudeRpcs).pipe(
+          Effect.provideService(RpcServer.Protocol, protocol),
+          Effect.provide(applicationContext),
+          Effect.forkIn(applicationScope)
+        )
+        if (Option.isSome(builtServices.introspector)) {
+          yield* installAcnIntrospectionRoutes(
+            router,
+            builtServices.introspector.value
+          )
+        }
+
+        yield* startup.ready(rpcRouter.asHttpEffect().pipe(Effect.orDie))
+        return {
+          subscriptions: Context.get(applicationContext, AcnSubscriptions),
+          icn: Context.get(applicationContext, IcnProcess),
+          activity: Context.get(applicationContext, AcnActivityTracker),
+        }
+      })
+
+      const { subscriptions, icn, activity } = yield* application.pipe(
+        Effect.tapErrorCause((cause) =>
+          startup
+            .failed("Magnitude could not prepare local inference", true)
+            .pipe(
+              Effect.zipRight(
+                Effect.logError("ACN application startup failed").pipe(
+                  Effect.annotateLogs({ cause: Cause.pretty(cause) })
+                )
+              )
+            )
+        )
+      )
       yield* activity.ready
       const request = yield* shutdown.await
       yield* Effect.logInfo("ACN shutdown requested").pipe(
         Effect.annotateLogs({
           reason: request.reason,
           detail: request.detail ?? null,
-        }),
+        })
       )
       // Linearize shutdown against RPC admission before any application
       // finalizer begins. Existing exact leases remain releasable while HTTP
@@ -396,5 +555,5 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       // internal requests.
       yield* Scope.close(applicationScope, Exit.void)
       yield* icn.shutdownResult.pipe(Effect.orDie)
-    }),
+    })
   )

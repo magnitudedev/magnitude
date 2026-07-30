@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { Option } from "effect";
-import type { AcnRegistration } from "@magnitudedev/acn-protocol";
+import {
+  AcnOwnerIdSchema,
+  type AcnRegistration,
+} from "@magnitudedev/acn-protocol";
 import { decideDaemonAction, type HealthResponse } from "./local-spawner";
 
 const registration: AcnRegistration = {
-  id: "acn-1",
+  id: AcnOwnerIdSchema.make("acn-1"),
   version: "1.0.0",
   url: "http://127.0.0.1:1234",
   pid: 1234,
@@ -14,8 +17,9 @@ const registration: AcnRegistration = {
 const health = (version: string): HealthResponse => ({
   service: "magnitude-acn",
   version,
-  id: registration.id,
+  id: AcnOwnerIdSchema.make(registration.id),
   pid: registration.pid,
+  state: { _tag: "Ready" },
 });
 
 describe("decideDaemonAction", () => {
@@ -58,7 +62,10 @@ describe("decideDaemonAction", () => {
       decideDaemonAction({
         candidateVersion: "1.0.0",
         registration: Option.some(registration),
-        health: Option.some({ ...health("1.0.0"), id: "other-acn" }),
+        health: Option.some({
+          ...health("1.0.0"),
+          id: AcnOwnerIdSchema.make("other-acn"),
+        }),
       })
     ).toEqual({ type: "unavailable", reason: "stale" });
   });

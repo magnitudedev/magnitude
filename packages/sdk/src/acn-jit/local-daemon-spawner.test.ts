@@ -1,11 +1,48 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { FetchHttpClient } from "@effect/platform";
 import { BunContext } from "@effect/platform-bun";
-import { Effect } from "effect";
-import { chmod, mkdir, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
+import { Effect, Option, Stream } from "effect";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeLocalDaemonSpawner } from "./local-daemon-spawner";
+import { SpawnProcess, type SpawnedProcess } from "./local-daemon-spawner";
+import { runDaemonSpawn, type DaemonSpawner } from "./daemon-spawner";
+
+const spawn = (
+  spawner: DaemonSpawner,
+  command: Option.Option<ReadonlyArray<string>>
+) => runDaemonSpawn(spawner.spawn(command));
+
+const testProcess = (
+  exited: Promise<number | null> = new Promise(() => {}),
+  pid = 9999
+): SpawnedProcess => ({
+  pid: Option.some(pid),
+  exited: Effect.promise(() => exited).pipe(Effect.map((code) => code ?? 1)),
+  diagnostic: Effect.succeed(Option.none()),
+  kill: () => Effect.void,
+});
+
+const testSpawner = (
+  spawnProcess: (command: ReadonlyArray<string>) => {
+    readonly pid: number;
+    readonly exited: Promise<number | null>;
+  }
+): SpawnProcess => ({
+  spawn: (command) =>
+    Effect.sync(() => {
+      const process = spawnProcess(command);
+      return testProcess(process.exited, process.pid);
+    }),
+});
 
 describe("local daemon spawner rendezvous", () => {
   let server: ReturnType<typeof Bun.serve> | undefined;
@@ -18,7 +55,9 @@ describe("local daemon spawner rendezvous", () => {
   it.runIf(process.platform !== "win32")(
     "threads the elected data root into the resolved ACN command",
     async () => {
-      const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-data-root-"));
+      const dataDir = await mkdtemp(
+        join(tmpdir(), "magnitude-spawner-data-root-")
+      );
       const version = "1.2.3";
       const id = "data-root-owner";
       const pid = 6543;
@@ -27,7 +66,14 @@ describe("local daemon spawner rendezvous", () => {
       await chmod(binary, 0o755);
       server = Bun.serve({
         port: 0,
-        fetch: () => Response.json({ service: "magnitude-acn", version, id, pid }),
+        fetch: () =>
+          Response.json({
+            service: "magnitude-acn",
+            version,
+            id,
+            pid,
+            state: { _tag: "Ready" },
+          }),
       });
       const registryDirectory = join(dataDir, "acn");
       const registryPath = join(registryDirectory, "registry.json");
@@ -37,104 +83,125 @@ describe("local daemon spawner rendezvous", () => {
       const spawnProcess = (command: readonly string[]) => {
         launched = command;
         setTimeout(() => {
-          void writeFile(registryPath, JSON.stringify({
-            schemaVersion: 1,
-            registration: {
-              id,
-              version,
-              url: `http://127.0.0.1:${server!.port}`,
-              pid,
-              timestamp: Date.now(),
-            },
-          }));
+          void writeFile(
+            registryPath,
+            JSON.stringify({
+              schemaVersion: 1,
+              registration: {
+                id,
+                version,
+                url: `http://127.0.0.1:${server!.port}`,
+                pid,
+                timestamp: Date.now(),
+              },
+            })
+          );
         }, 25);
         return { pid: 9999, exited: new Promise<number | null>(() => {}) };
       };
 
-      const url = await makeLocalDaemonSpawner(spawnProcess, {
+      const url = await makeLocalDaemonSpawner({
         binaryPath: binary,
         dataDir,
         version,
-        spawnTimeoutMs: 2_000,
+        publicationTimeoutMs: 2_000,
         probeTimeoutMs: 200,
       }).pipe(
-        Effect.flatMap((spawner) => spawner.spawn(undefined)),
+        Effect.provideService(SpawnProcess, testSpawner(spawnProcess)),
+        Effect.flatMap((spawner) => spawn(spawner, Option.none())),
         Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-        Effect.runPromise,
+        Effect.runPromise
       );
 
       expect(url).toBe(`http://127.0.0.1:${server.port}`);
-      expect(launched).toEqual([binary, "serve", "--register", "--data-dir", dataDir]);
-    },
+      expect(launched).toEqual([
+        binary,
+        "serve",
+        "--register",
+        "--data-dir",
+        dataDir,
+      ]);
+    }
   );
 
-  it("accepts a newer winner after its older candidate exits and releases election", async () => {
+  it("fails immediately when its exact spawned candidate exits", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-"));
     const candidateVersion = "1.0.0";
-    const winnerVersion = "2.0.0";
-    const id = "winning-owner";
-    const pid = 4321;
-    server = Bun.serve({
-      port: 0,
-      fetch: () =>
-        Response.json({
-          service: "magnitude-acn",
-          version: winnerVersion,
-          id,
-          pid,
-        }),
-    });
     const registryDirectory = join(dataDir, "acn");
-    const registryPath = join(registryDirectory, "registry.json");
     await mkdir(registryDirectory, { recursive: true });
 
-    const spawnProcess = () => {
-      setTimeout(() => {
-        void writeFile(
-          registryPath,
-          JSON.stringify({
-            schemaVersion: 1,
-            registration: {
-              id,
-              version: winnerVersion,
-              url: `http://127.0.0.1:${server!.port}`,
-              pid,
-              timestamp: Date.now(),
-            },
-          })
-        );
-      }, 25);
-      return { pid: 9999, exited: Promise.resolve(1) };
-    };
+    const spawnProcess = () => ({
+      pid: 9999,
+      exited: Promise.resolve(1),
+    });
 
-    const url = await makeLocalDaemonSpawner(spawnProcess, {
+    const attempt = makeLocalDaemonSpawner({
       dataDir,
       version: candidateVersion,
-      spawnTimeoutMs: 2000,
+      publicationTimeoutMs: 2000,
       probeTimeoutMs: 200,
     }).pipe(
-      Effect.flatMap((spawner) => spawner.spawn(["ignored"])),
+      Effect.provideService(SpawnProcess, testSpawner(spawnProcess)),
+      Effect.flatMap((spawner) => spawn(spawner, Option.some(["ignored"]))),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
       Effect.runPromise
     );
 
-    expect(url).toBe(`http://127.0.0.1:${server.port}`);
+    await expect(attempt).rejects.toThrow('"exitCode": 1');
     expect(
-      await Bun.file(
-        join(registryDirectory, "spawn-election")
-      ).exists()
+      await Bun.file(join(registryDirectory, "spawn-election")).exists()
     ).toBe(false);
   });
 
+  it("includes the bounded candidate diagnostic in an exact-exit failure", async () => {
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "magnitude-spawner-diagnostic-")
+    );
+    const processSpawner: SpawnProcess = {
+      spawn: () =>
+        Effect.succeed({
+          pid: Option.some(9999),
+          exited: Effect.succeed(17),
+          diagnostic: Effect.succeed(
+            Option.some("local inference contract rejected")
+          ),
+          kill: () => Effect.void,
+        }),
+    };
+
+    const attempt = makeLocalDaemonSpawner({
+      dataDir,
+      version: "1.0.0",
+      publicationTimeoutMs: 2_000,
+      probeTimeoutMs: 200,
+    }).pipe(
+      Effect.provideService(SpawnProcess, processSpawner),
+      Effect.flatMap((spawner) => spawn(spawner, Option.some(["ignored"]))),
+      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+      Effect.runPromise
+    );
+
+    await expect(attempt).rejects.toThrow("local inference contract rejected");
+  });
+
   it("single-flights spawn across independent local spawners", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-election-"));
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "magnitude-spawner-election-")
+    );
     const version = "test-election-version";
     const id = "election-winner";
     const pid = 7654;
     let spawnCalls = 0;
     server = Bun.serve({
       port: 0,
-      fetch: () => Response.json({ service: "magnitude-acn", version, id, pid }),
+      fetch: () =>
+        Response.json({
+          service: "magnitude-acn",
+          version,
+          id,
+          pid,
+          state: { _tag: "Ready" },
+        }),
     });
     const registryDirectory = join(dataDir, "acn");
     const registryPath = join(registryDirectory, "registry.json");
@@ -143,110 +210,333 @@ describe("local daemon spawner rendezvous", () => {
     const spawnProcess = () => {
       spawnCalls++;
       setTimeout(() => {
-        void writeFile(registryPath, JSON.stringify({
-          schemaVersion: 1,
-          registration: {
-            id,
-            version,
-            url: `http://127.0.0.1:${server!.port}`,
-            pid,
-            timestamp: Date.now(),
-          },
-        }));
+        void writeFile(
+          registryPath,
+          JSON.stringify({
+            schemaVersion: 1,
+            registration: {
+              id,
+              version,
+              url: `http://127.0.0.1:${server!.port}`,
+              pid,
+              timestamp: Date.now(),
+            },
+          })
+        );
       }, 25);
       return { pid: 9999, exited: new Promise<number | null>(() => {}) };
     };
 
-    const makeSpawner = () => makeLocalDaemonSpawner(spawnProcess, {
-      dataDir,
-      version,
-      spawnTimeoutMs: 2000,
-      probeTimeoutMs: 200,
-    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]));
-    const [first, second] = await Effect.all([makeSpawner(), makeSpawner()]).pipe(
-      Effect.flatMap(([left, right]) => Effect.all([
-        left.spawn(["ignored"]),
-        right.spawn(["ignored"]),
-      ], { concurrency: "unbounded" })),
-      Effect.runPromise,
+    const makeSpawner = () =>
+      makeLocalDaemonSpawner({
+        dataDir,
+        version,
+        publicationTimeoutMs: 2000,
+        probeTimeoutMs: 200,
+      }).pipe(
+        Effect.provideService(SpawnProcess, testSpawner(spawnProcess)),
+        Effect.provide([BunContext.layer, FetchHttpClient.layer])
+      );
+    const [first, second] = await Effect.all([
+      makeSpawner(),
+      makeSpawner(),
+    ]).pipe(
+      Effect.flatMap(([left, right]) =>
+        Effect.all(
+          [
+            spawn(left, Option.some(["ignored"])),
+            spawn(right, Option.some(["ignored"])),
+          ],
+          { concurrency: "unbounded" }
+        )
+      ),
+      Effect.runPromise
     );
 
     expect(first).toBe(`http://127.0.0.1:${server.port}`);
     expect(second).toBe(first);
     expect(spawnCalls).toBe(1);
-    expect(await Bun.file(join(registryDirectory, "spawn-election")).exists()).toBe(false);
+    expect(
+      await Bun.file(join(registryDirectory, "spawn-election")).exists()
+    ).toBe(false);
   });
 
-  it("does not release another process's election when a contender times out", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-foreign-election-"));
+  it("joins a successor waiting for active ownership without spawning another", async () => {
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "magnitude-spawner-ownership-wait-")
+    );
+    const version = "1.0.0";
+    const id = "waiting-successor";
+    const pid = 7655;
+    let ready = false;
+    let spawnCalls = 0;
+    const reports: string[] = [];
+    server = Bun.serve({
+      port: 0,
+      fetch: () =>
+        Response.json({
+          service: "magnitude-acn",
+          version,
+          id,
+          pid,
+          state: ready
+            ? { _tag: "Ready" }
+            : {
+                _tag: "Starting",
+                activity: "WaitingForOwnership",
+              },
+        }),
+    });
+    const registryDirectory = join(dataDir, "acn");
+    await mkdir(registryDirectory, { recursive: true });
+    await writeFile(
+      join(registryDirectory, "registry.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        registration: {
+          id,
+          version,
+          url: `http://127.0.0.1:${server.port}`,
+          pid,
+          timestamp: Date.now(),
+        },
+      })
+    );
+    setTimeout(() => {
+      ready = true;
+    }, 200);
+
+    const attempt = makeLocalDaemonSpawner({
+      dataDir,
+      version,
+      publicationTimeoutMs: 2_000,
+      probeTimeoutMs: 200,
+    }).pipe(
+      Effect.provideService(
+        SpawnProcess,
+        testSpawner(() => {
+          spawnCalls++;
+          return { pid: 9999, exited: new Promise<number | null>(() => {}) };
+        })
+      ),
+      Effect.flatMap((spawner) =>
+        runDaemonSpawn(
+          spawner.spawn(Option.some(["ignored"])).pipe(
+            Stream.tap((event) =>
+              event._tag === "Observation"
+                ? Effect.sync(() => {
+                    if (event.observation._tag === "Starting") {
+                      reports.push(event.observation.phase);
+                    }
+                  })
+                : Effect.void
+            )
+          )
+        )
+      ),
+      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+      Effect.runPromise
+    );
+    await Bun.sleep(50);
+    expect(
+      await Bun.file(join(registryDirectory, "spawn-election")).exists()
+    ).toBe(false);
+    const url = await attempt;
+
+    expect(url).toBe(`http://127.0.0.1:${server.port}`);
+    expect(spawnCalls).toBe(0);
+    expect(reports).toContain("WaitingForOwner");
+  });
+
+  it("joins an ACN installation and forwards its health progress", async () => {
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "magnitude-spawner-installation-wait-")
+    );
+    const version = "1.0.0";
+    const id = "installing-successor";
+    const pid = 7656;
+    let ready = false;
+    let spawnCalls = 0;
+    const reports: Array<{
+      readonly phase: string;
+      readonly completed: number;
+    }> = [];
+    server = Bun.serve({
+      port: 0,
+      fetch: () =>
+        Response.json({
+          service: "magnitude-acn",
+          version,
+          id,
+          pid,
+          state: ready
+            ? { _tag: "Ready" }
+            : {
+                _tag: "Installing",
+                phase: "DownloadingInferenceEngine",
+                plan: {
+                  daemonBytes: 30,
+                  inferenceEngineBytes: 70,
+                  inferenceEngineBytesExact: true,
+                },
+                progress: {
+                  completed: 40,
+                  totalBytes: 100,
+                  unit: "Bytes",
+                },
+              },
+        }),
+    });
+    const registryDirectory = join(dataDir, "acn");
+    await mkdir(registryDirectory, { recursive: true });
+    await writeFile(
+      join(registryDirectory, "registry.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        registration: {
+          id,
+          version,
+          url: `http://127.0.0.1:${server.port}`,
+          pid,
+          timestamp: Date.now(),
+        },
+      })
+    );
+    setTimeout(() => {
+      ready = true;
+    }, 50);
+
+    const url = await makeLocalDaemonSpawner({
+      dataDir,
+      version,
+      publicationTimeoutMs: 2_000,
+      probeTimeoutMs: 200,
+    }).pipe(
+      Effect.provideService(
+        SpawnProcess,
+        testSpawner(() => {
+          spawnCalls++;
+          return { pid: 9999, exited: new Promise<number | null>(() => {}) };
+        })
+      ),
+      Effect.flatMap((spawner) =>
+        runDaemonSpawn(
+          spawner.spawn(Option.some(["ignored"])).pipe(
+            Stream.tap((event) =>
+              event._tag === "Observation"
+                ? Effect.sync(() => {
+                    const state = event.observation;
+                    if (
+                      state._tag === "Installing" &&
+                      Option.isSome(state.progress)
+                    ) {
+                      reports.push({
+                        phase: state.phase,
+                        completed: state.progress.value.completed,
+                      });
+                    }
+                  })
+                : Effect.void
+            )
+          )
+        )
+      ),
+      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+      Effect.runPromise
+    );
+
+    expect(url).toBe(`http://127.0.0.1:${server.port}`);
+    expect(spawnCalls).toBe(0);
+    expect(reports).toContainEqual({
+      phase: "DownloadingInferenceEngine",
+      completed: 40,
+    });
+  });
+
+  it("keeps waiting without stealing a live process's election", async () => {
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "magnitude-spawner-foreign-election-")
+    );
     const version = "test-foreign-election-version";
     const electionDirectory = join(dataDir, "acn", "spawn-election");
     await mkdir(dirname(electionDirectory), { recursive: true });
-    await writeFile(electionDirectory, JSON.stringify({
-      token: "foreign-owner",
-      pid: process.pid,
-    }));
+    await writeFile(
+      electionDirectory,
+      JSON.stringify({
+        token: "foreign-owner",
+        pid: process.pid,
+      })
+    );
     const staleTimestamp = new Date(Date.now() - 120_000);
     await utimes(electionDirectory, staleTimestamp, staleTimestamp);
 
-    const attempt = makeLocalDaemonSpawner(
-      () => ({ pid: 9999, exited: new Promise<number | null>(() => {}) }),
-      {
-        dataDir,
-        version,
-        spawnTimeoutMs: 100,
-        probeTimeoutMs: 20,
-      },
-    ).pipe(
-      Effect.flatMap((spawner) => spawner.spawn(["ignored"])),
+    const spawnProcess = () => ({
+      pid: 9999,
+      exited: new Promise<number | null>(() => {}),
+    });
+    const attempt = makeLocalDaemonSpawner({
+      dataDir,
+      version,
+      publicationTimeoutMs: 100,
+      probeTimeoutMs: 20,
+    }).pipe(
+      Effect.provideService(SpawnProcess, testSpawner(spawnProcess)),
+      Effect.flatMap((spawner) => spawn(spawner, Option.some(["ignored"]))),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-      Effect.runPromise,
+      Effect.timeoutOption("100 millis"),
+      Effect.runPromise
     );
 
-    await expect(attempt).rejects.toThrow("Timed out waiting for ACN spawn election");
+    await expect(attempt).resolves.toEqual(Option.none());
     expect(JSON.parse(await Bun.file(electionDirectory).text())).toEqual({
       token: "foreign-owner",
       pid: process.pid,
     });
   });
 
-  it("recovers a dead election within the current spawn wait budget", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-dead-election-"));
+  it("recovers a dead election and observes exact candidate exit", async () => {
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "magnitude-spawner-dead-election-")
+    );
     const version = "test-dead-election-version";
     const electionDirectory = join(dataDir, "acn", "spawn-election");
     await mkdir(dirname(electionDirectory), { recursive: true });
-    await writeFile(electionDirectory, JSON.stringify({
-      token: "dead-owner",
-      pid: 2_147_483_647,
-    }));
+    await writeFile(
+      electionDirectory,
+      JSON.stringify({
+        token: "dead-owner",
+        pid: 2_147_483_647,
+      })
+    );
     const staleTimestamp = new Date(Date.now() - 1_000);
     await utimes(electionDirectory, staleTimestamp, staleTimestamp);
 
     let spawnCalls = 0;
-    const attempt = makeLocalDaemonSpawner(
-      () => {
-        spawnCalls++;
-        return { pid: 9999, exited: Promise.resolve(1) };
-      },
-      {
-        dataDir,
-        version,
-        spawnTimeoutMs: 100,
-        probeTimeoutMs: 20,
-      },
-    ).pipe(
-      Effect.flatMap((spawner) => spawner.spawn(["ignored"])),
+    const spawnProcess = () => {
+      spawnCalls++;
+      return { pid: 9999, exited: Promise.resolve(1) };
+    };
+    const attempt = makeLocalDaemonSpawner({
+      dataDir,
+      version,
+      publicationTimeoutMs: 100,
+      probeTimeoutMs: 20,
+    }).pipe(
+      Effect.provideService(SpawnProcess, testSpawner(spawnProcess)),
+      Effect.flatMap((spawner) => spawn(spawner, Option.some(["ignored"]))),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-      Effect.runPromise,
+      Effect.runPromise
     );
 
-    await expect(attempt).rejects.toThrow("No compatible ACN became healthy");
+    await expect(attempt).rejects.toThrow('"exitCode": 1');
     expect(spawnCalls).toBe(1);
     expect(await Bun.file(electionDirectory).exists()).toBe(false);
-    expect((await stat(`${electionDirectory}.stale-dead-owner`)).isFile()).toBe(true);
+    expect((await stat(`${electionDirectory}.stale-dead-owner`)).isFile()).toBe(
+      true
+    );
   });
 
-  it("waits for an incompatible owner process to exit before spawning its replacement", async () => {
+  it("starts the successor without directing the incompatible owner to shut down", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-upgrade-"));
     const registryDirectory = join(dataDir, "acn");
     const registryPath = join(registryDirectory, "registry.json");
@@ -262,19 +552,19 @@ describe("local daemon spawner rendezvous", () => {
       stderr: "ignore",
     });
     let health = { version: "1.0.0", id: "old-owner", pid: old.pid };
-    let authenticatedShutdown = false;
+    let shutdownRequests = 0;
     server = Bun.serve({
       port: 0,
       fetch: (request) => {
         if (request.method === "POST") {
-          authenticatedShutdown = request.headers.get("authorization") === "Bearer takeover-token";
-          if (authenticatedShutdown) process.kill(old.pid, "SIGTERM");
-          return new Response(null, { status: authenticatedShutdown ? 202 : 401 });
+          shutdownRequests++;
+          return new Response(null, { status: 405 });
         }
-        if (authenticatedShutdown && health.version === "1.0.0") {
-          return new Response(null, { status: 503 });
-        }
-        return Response.json({ service: "magnitude-acn", ...health });
+        return Response.json({
+          service: "magnitude-acn",
+          ...health,
+          ...(health.version === "1.0.0" ? {} : { state: { _tag: "Ready" } }),
+        });
       },
     });
     await writeFile(
@@ -285,9 +575,8 @@ describe("local daemon spawner rendezvous", () => {
           ...health,
           url: `http://127.0.0.1:${server.port}`,
           timestamp: Date.now(),
-          shutdownToken: "takeover-token",
         },
-      }),
+      })
     );
 
     let oldWasGoneAtSpawn = false;
@@ -307,58 +596,74 @@ describe("local daemon spawner rendezvous", () => {
             url: `http://127.0.0.1:${server!.port}`,
             timestamp: Date.now(),
           },
-        }),
+        })
       );
       return { pid: health.pid, exited: new Promise<number | null>(() => {}) };
     };
 
-    const url = await makeLocalDaemonSpawner(spawnProcess, {
+    const url = await makeLocalDaemonSpawner({
       dataDir,
       version: "2.0.0",
-      spawnTimeoutMs: 2000,
+      publicationTimeoutMs: 2000,
       probeTimeoutMs: 200,
     }).pipe(
-      Effect.flatMap((spawner) => spawner.spawn(["ignored"])),
+      Effect.provideService(SpawnProcess, testSpawner(spawnProcess)),
+      Effect.flatMap((spawner) => spawn(spawner, Option.some(["ignored"]))),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-      Effect.runPromise,
+      Effect.runPromise
     );
 
     expect(url).toBe(`http://127.0.0.1:${server.port}`);
-    expect(oldWasGoneAtSpawn).toBe(true);
-    expect(authenticatedShutdown).toBe(true);
+    expect(oldWasGoneAtSpawn).toBe(false);
+    expect(shutdownRequests).toBe(0);
+    process.kill(old.pid, "SIGTERM");
     expect([0, 143]).toContain(await old.exited);
   });
 
   it("lets an older client reuse a newer healthy owner without spawning", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-downgrade-"));
+    const dataDir = await mkdtemp(
+      join(tmpdir(), "magnitude-spawner-downgrade-")
+    );
     const registryDirectory = join(dataDir, "acn");
     const registryPath = join(registryDirectory, "registry.json");
     await mkdir(registryDirectory, { recursive: true });
     const incumbent = { version: "2.0.0", id: "newer-owner", pid: process.pid };
     server = Bun.serve({
       port: 0,
-      fetch: () => Response.json({ service: "magnitude-acn", ...incumbent }),
+      fetch: () =>
+        Response.json({
+          service: "magnitude-acn",
+          ...incumbent,
+          state: { _tag: "Ready" },
+        }),
     });
-    await writeFile(registryPath, JSON.stringify({
-      schemaVersion: 1,
-      registration: {
-        ...incumbent,
-        url: `http://127.0.0.1:${server.port}`,
-        timestamp: Date.now(),
-      },
-    }));
+    await writeFile(
+      registryPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        registration: {
+          ...incumbent,
+          url: `http://127.0.0.1:${server.port}`,
+          timestamp: Date.now(),
+        },
+      })
+    );
     let spawned = false;
 
-    const url = await makeLocalDaemonSpawner(
-      () => {
-        spawned = true;
-        return { pid: 9999, exited: Promise.resolve(1) };
-      },
-      { dataDir, version: "1.0.0", spawnTimeoutMs: 500, probeTimeoutMs: 100 },
-    ).pipe(
-      Effect.flatMap((spawner) => spawner.spawn(["ignored"])),
+    const spawnProcess = () => {
+      spawned = true;
+      return { pid: 9999, exited: Promise.resolve(1) };
+    };
+    const url = await makeLocalDaemonSpawner({
+      dataDir,
+      version: "1.0.0",
+      publicationTimeoutMs: 500,
+      probeTimeoutMs: 100,
+    }).pipe(
+      Effect.provideService(SpawnProcess, testSpawner(spawnProcess)),
+      Effect.flatMap((spawner) => spawn(spawner, Option.some(["ignored"]))),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-      Effect.runPromise,
+      Effect.runPromise
     );
 
     expect(url).toBe(`http://127.0.0.1:${server.port}`);

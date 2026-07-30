@@ -19,6 +19,7 @@
     "acn:dash": "bun run --cwd packages/acn-dashboard dashboard",
     "build": "bun run packages/version/scripts/generate-version.ts && turbo build",
     "build:release": "bun run icn:catalog:hydrate && bun run packages/release/scripts/build/host.ts",
+    "test:release-bootstrap": "bun run packages/release/scripts/test-bootstrap.ts",
     "typecheck": "bun run packages/version/scripts/generate-version.ts && turbo typecheck",
     "test": "bun run packages/version/scripts/generate-version.ts && bun test",
     "cache:clear": "bun run scripts/clear-derived-cache.ts onboarding",

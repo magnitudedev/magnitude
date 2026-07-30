@@ -30,6 +30,12 @@ import {
   makeIcnApiClient,
 } from "@magnitudedev/icn-protocol/client";
 import { resolveReleaseIcnInstallation } from "./release-installation.js";
+import {
+  IcnPreparationReporter,
+  type IcnPreparationReporter as IcnPreparationReporterService,
+} from "./preparation.js";
+
+export * from "./preparation.js";
 
 const PositiveInt = Schema.Int.pipe(Schema.greaterThan(0));
 const NonEmpty = Schema.String.pipe(Schema.minLength(1));
@@ -157,6 +163,8 @@ const resolveCandidate = (
   source: IcnBinarySource,
 ) =>
   Effect.gen(function* () {
+    const reporter = yield* IcnPreparationReporter;
+    yield* reporter.report({ _tag: "Resolving" });
     if (source._tag === "Installation") {
       const root = dirname(source.path);
       const key = process.platform === "win32"
@@ -216,11 +224,14 @@ export const makeIcnBinaryResolver = () => Layer.effect(
     const executor = yield* CommandExecutor.CommandExecutor;
     const path = yield* Path.Path;
     const http = yield* HttpClient.HttpClient;
+    const preparation = yield* IcnPreparationReporter;
     return IcnBinaryResolver.of({
       resolve: (config) =>
         Effect.suspend(() =>
           Effect.gen(function* () {
-            const candidate = yield* resolveCandidate(config.source);
+            const candidate = yield* resolveCandidate(config.source).pipe(
+              Effect.provideService(IcnPreparationReporter, preparation),
+            );
             const exists = yield* fs
               .exists(candidate.path)
               .pipe(Effect.orElseSucceed(() => false));
@@ -457,7 +468,9 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       )
     );
     const resolver = yield* IcnBinaryResolver;
+    const reporter = yield* IcnPreparationReporter;
     const binary = yield* resolver.resolve(config.binary);
+    yield* reporter.report({ _tag: "Starting" });
     const instanceId = yield* opaqueInstanceId;
     const authorization = yield* opaqueInstanceId;
     const process = yield* Effect.uninterruptibleMask(() =>
@@ -787,6 +800,7 @@ export const makeIcnProcess = (
   | FileSystem.FileSystem
   | HttpClient.HttpClient
   | Path.Path
+  | IcnPreparationReporterService
 > =>
   Layer.scoped(
     IcnProcess,

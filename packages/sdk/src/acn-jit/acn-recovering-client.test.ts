@@ -10,6 +10,7 @@ import { DaemonSpawnerTag, type DaemonSpawner } from "./daemon-spawner"
 import { makeAcnJitRuntime } from "./acn-recovering-client"
 import { DaemonSpawnFailed } from "./errors"
 import type { AcnClient } from "../protocol"
+import { SDK_VERSION } from "../version"
 
 const getRpc = (tag: string) => {
   const rpc = MagnitudeRpcs.requests.get(tag)
@@ -71,12 +72,15 @@ const makeFakeSpawner = (options: {
       discoverCalls++
       return result
     }),
-    spawn: () => Effect.suspend(() => {
-      spawnCalls++
-      return options.spawnUrl === undefined
-        ? Effect.fail(new DaemonSpawnFailed({ reason: "spawn disabled in test" }))
-        : Effect.succeed(options.spawnUrl)
-    }),
+    spawn: () =>
+      Stream.suspend(() => {
+        spawnCalls++
+        return options.spawnUrl === undefined
+          ? Stream.fail(
+              new DaemonSpawnFailed({ reason: "spawn disabled in test" }),
+            )
+          : Stream.succeed({ _tag: "Ready", url: options.spawnUrl })
+      }),
   }
   return { spawner, discoverCalls: () => discoverCalls, spawnCalls: () => spawnCalls }
 }
@@ -126,6 +130,30 @@ const collectPaths = (client: AcnClient) =>
   )
 
 describe("AcnJitRuntime", () => {
+  it("performs read-only discovery without starting a daemon", async () => {
+    const { spawner, discoverCalls, spawnCalls } = makeFakeSpawner({
+      discover: [Option.some("http://daemon")],
+    })
+    const runtime = await Effect.runPromise(
+      makeAcnJitRuntime().pipe(
+        Effect.provideService(DaemonSpawnerTag, spawner),
+      ),
+    )
+
+    expect(await Effect.runPromise(runtime.startup.prepare)).toEqual({
+      _tag: "Ready",
+      endpoint: "http://daemon",
+      version: SDK_VERSION,
+    })
+    expect(await Effect.runPromise(runtime.startup.state.get)).toEqual({
+      _tag: "Ready",
+      endpoint: "http://daemon",
+      version: SDK_VERSION,
+    })
+    expect(discoverCalls()).toBe(1)
+    expect(spawnCalls()).toBe(0)
+  })
+
   it("performs startup demand once and shares one coordinator across protocol consumers", async () => {
     const { spawner, discoverCalls, spawnCalls } = makeFakeSpawner({
       discover: [Option.some("http://daemon")],

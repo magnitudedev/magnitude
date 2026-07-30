@@ -1,5 +1,7 @@
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Data, Effect, Schema, Scope } from "effect"
+import type { PlatformError } from "@effect/platform/Error"
+import { Data, Effect, Option, Schema, Scope } from "effect"
+import type * as ParseResult from "effect/ParseResult"
 import * as NodePath from "node:path"
 
 const OwnerSchema = Schema.Struct({
@@ -11,19 +13,19 @@ const OwnerSchema = Schema.Struct({
 
 type Owner = typeof OwnerSchema.Type
 
-export class AcnMachineAlreadyOwned extends Data.TaggedError("AcnMachineAlreadyOwned")<{
-  readonly owner: Owner
-}> {}
-
 export class AcnMachineOwnershipFailed extends Data.TaggedError("AcnMachineOwnershipFailed")<{
   readonly operation: string
-  readonly cause: unknown
+  readonly reason: string
 }> {}
 
-const reason = (cause: unknown): string | undefined =>
-  typeof cause === "object" && cause !== null && "reason" in cause
-    ? String(Reflect.get(cause, "reason"))
-    : undefined
+const platformErrorReason = (cause: PlatformError): Option.Option<string> =>
+  cause._tag === "SystemError" ? Option.some(cause.reason) : Option.none()
+
+const hasPlatformErrorReason = (
+  cause: PlatformError,
+  expected: string,
+): boolean =>
+  Option.exists(platformErrorReason(cause), (reason) => reason === expected)
 
 const isAlive = (pid: number): boolean => {
   try {
@@ -34,13 +36,16 @@ const isAlive = (pid: number): boolean => {
   }
 }
 
-const failure = (operation: string) => (cause: unknown) =>
-  new AcnMachineOwnershipFailed({ operation, cause })
+const failure =
+  (operation: string) =>
+  (cause: PlatformError | ParseResult.ParseError) =>
+    new AcnMachineOwnershipFailed({ operation, reason: String(cause) })
 
 /**
- * Acquires the machine-wide ACN ownership record before any server or ICN
- * resources are constructed. The exact hard-linked owner record makes stale
- * recovery safe against delayed contenders.
+ * Waits for and acquires the machine-wide active-runtime ownership record.
+ * The canonical ACN server is already registered while this waits, allowing
+ * the predecessor to observe ownership loss and retire itself. Exact
+ * hard-linked records make stale recovery safe against delayed contenders.
  */
 export const acquireAcnMachineOwnership = (input: {
   readonly dataDir: string
@@ -48,7 +53,7 @@ export const acquireAcnMachineOwnership = (input: {
   readonly version: string
 }): Effect.Effect<
   void,
-  AcnMachineAlreadyOwned | AcnMachineOwnershipFailed,
+  AcnMachineOwnershipFailed,
   FileSystem.FileSystem | Scope.Scope
 > =>
   Effect.gen(function* () {
@@ -68,19 +73,17 @@ export const acquireAcnMachineOwnership = (input: {
     const readOwner = (target: string) =>
       fs.readFileString(target).pipe(
         Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(OwnerSchema))),
-        Effect.map((value) => ({ raw: JSON.stringify(value), value })),
-        Effect.catchAll(() => Effect.succeed(null)),
+        Effect.option,
       )
 
-    const acquire: Effect.Effect<
-      void,
-      AcnMachineAlreadyOwned | AcnMachineOwnershipFailed
-    > = Effect.suspend(() =>
+    const acquire: Effect.Effect<void, AcnMachineOwnershipFailed> = Effect.suspend(() =>
       Effect.gen(function* () {
         yield* fs.makeDirectory(directory, { recursive: true }).pipe(
           Effect.mapError(failure("create ACN ownership directory")),
         )
-        yield* fs.chmod(directory, 0o700).pipe(Effect.ignore)
+        yield* fs.chmod(directory, 0o700).pipe(
+          Effect.mapError(failure("secure ACN ownership directory")),
+        )
         const publication = `${path}.publishing-${encodeURIComponent(input.id)}`
         yield* fs.writeFileString(publication, encoded, { mode: 0o600 }).pipe(
           Effect.mapError(failure("write ACN owner publication")),
@@ -88,7 +91,7 @@ export const acquireAcnMachineOwnership = (input: {
         const linked = yield* fs.link(publication, path).pipe(
           Effect.as(true),
           Effect.catchAll((cause) =>
-            reason(cause) === "AlreadyExists"
+            hasPlatformErrorReason(cause, "AlreadyExists")
               ? Effect.succeed(false)
               : Effect.fail(failure("publish ACN ownership")(cause)),
           ),
@@ -97,8 +100,9 @@ export const acquireAcnMachineOwnership = (input: {
         if (linked) return
 
         const observed = yield* readOwner(path)
-        if (observed && isAlive(observed.value.pid)) {
-          return yield* new AcnMachineAlreadyOwned({ owner: observed.value })
+        if (Option.exists(observed, (owner) => isAlive(owner.pid))) {
+          yield* Effect.sleep("100 millis")
+          return yield* acquire
         }
 
         // Preserve an exact hard link before removal. A delayed contender can
@@ -106,7 +110,8 @@ export const acquireAcnMachineOwnership = (input: {
         const tombstone = `${path}.stale-${encodeURIComponent(crypto.randomUUID())}`
         yield* fs.link(path, tombstone).pipe(
           Effect.catchAll((cause) =>
-            reason(cause) === "AlreadyExists" || reason(cause) === "NotFound"
+            hasPlatformErrorReason(cause, "AlreadyExists") ||
+            hasPlatformErrorReason(cause, "NotFound")
               ? Effect.void
               : Effect.fail(failure("quarantine stale ACN owner")(cause)),
           ),
@@ -129,7 +134,7 @@ export const acquireAcnMachineOwnership = (input: {
       }),
     )
 
-    yield* Effect.acquireRelease(acquire, () =>
+    yield* Effect.acquireReleaseInterruptible(acquire, () =>
       fs.readFileString(path).pipe(
         Effect.flatMap((current) =>
           current === encoded ? fs.remove(path, { force: true }) : Effect.void,

@@ -4,15 +4,15 @@
  * Uses Bun APIs for process spawning, clipboard (OSC 52), and terminal size.
  * Stubs for unsupported capabilities (storage, notifications, dialogs).
  */
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
   DaemonSpawnerTag,
+  BunDetachedSpawnProcess,
   makeAcnJitRuntime,
   makeLocalDaemonSpawner,
-  type DaemonSpawner,
-  type SpawnProcess,
+  SpawnProcess,
 } from "@magnitudedev/sdk"
 import type {
   Platform,
@@ -23,17 +23,6 @@ import type {
   TerminalCapabilities,
 } from "@magnitudedev/client-common"
 import { makeCliEffectLoggingLayer } from "./effect-logger"
-
-const bunSpawn: SpawnProcess = (command) => {
-  const proc = Bun.spawn({
-    cmd: command,
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore"],
-    env: process.env,
-  })
-  proc.unref()
-  return { pid: proc.pid, exited: proc.exited }
-}
 
 const noopStorage: Storage = {
   async getItem() { return null },
@@ -80,34 +69,33 @@ const terminalCapabilities: TerminalCapabilities = {
 }
 
 export interface TerminalPlatformOptions {
-  readonly spawnCommand?: string[]
-  readonly spawnTimeoutMs?: number
-  readonly debug?: boolean
-  readonly effectLoggingLayer?: Layer.Layer<never, never, never>
+  readonly spawnCommand: Option.Option<ReadonlyArray<string>>
+  readonly publicationTimeoutMs: Option.Option<number>
+  readonly debug: boolean
+  readonly effectLoggingLayer: Option.Option<Layer.Layer<never, never, never>>
 }
 
-export async function createTerminalPlatform(options: TerminalPlatformOptions = {}): Promise<Platform> {
-  const effectLoggingLayer = options.effectLoggingLayer
-    ?? makeCliEffectLoggingLayer({ debug: options.debug === true })
-  const withSpawnCommand = (spawner: DaemonSpawner): DaemonSpawner =>
-    options.spawnCommand
-      ? {
-          discover: spawner.discover,
-          spawn: () => spawner.spawn(options.spawnCommand),
-        }
-      : spawner
-
+export async function createTerminalPlatform(options: TerminalPlatformOptions): Promise<Platform> {
+  const effectLoggingLayer = Option.getOrElse(
+    options.effectLoggingLayer,
+    () => makeCliEffectLoggingLayer({ debug: options.debug }),
+  )
   const spawner = await Effect.runPromise(
-    makeLocalDaemonSpawner(bunSpawn, {
-      ...(options.spawnTimeoutMs === undefined ? {} : { spawnTimeoutMs: options.spawnTimeoutMs }),
+    makeLocalDaemonSpawner({
+      ...Option.match(options.publicationTimeoutMs, {
+        onNone: () => ({}),
+        onSome: (publicationTimeoutMs) => ({ publicationTimeoutMs }),
+      }),
       ...(options.debug ? { debug: true } : {}),
     }).pipe(
-      Effect.map(withSpawnCommand),
+      Effect.provideService(SpawnProcess, BunDetachedSpawnProcess),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
     ),
   )
   const acn = await Effect.runPromise(
-    makeAcnJitRuntime().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
+    makeAcnJitRuntime({ spawnCommand: options.spawnCommand }).pipe(
+      Effect.provideService(DaemonSpawnerTag, spawner),
+    ),
   )
   const transport = Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(transport))
@@ -115,6 +103,7 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions = 
   return {
     id: "terminal",
     protocolLayer,
+    acnStartup: acn.startup,
     clipboard: osc52Clipboard,
     storage: noopStorage,
     notifications: noopNotifications,

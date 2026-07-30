@@ -1,6 +1,11 @@
-import { homedir } from "node:os"
-import { join, resolve } from "node:path"
-import { Duration, Effect, Layer, Option } from "effect"
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { Duration, Effect, Layer, Option, Ref } from "effect";
+import {
+  type AcnInstallationPlan,
+  type AcnStartupProgress,
+} from "@magnitudedev/acn-protocol";
+import type { ArtifactInstallationEvent } from "@magnitudedev/release";
 import {
   IcnBinaryResolutionConfig,
   IcnLifecycleConfig,
@@ -13,28 +18,50 @@ import {
   makeIcnInstalledModels,
   IcnInstancesLive,
   IcnStorageConfig,
-} from "@magnitudedev/icn"
-import { ACN_VERSION } from "../version"
-import { AcnShutdown } from "../acn-shutdown"
-import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache"
-const defaultDataDir = () => join(homedir(), ".magnitude")
+  IcnPreparationReporter,
+} from "@magnitudedev/icn";
+import { ACN_VERSION } from "../version";
+import { AcnShutdown } from "../acn-shutdown";
+import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache";
+import { AcnStartupState } from "../startup-state";
+
+const artifactProgress = (
+  artifact: "Base" | "Accelerator",
+  event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>,
+  plan: AcnInstallationPlan
+): AcnStartupProgress => {
+  const completedBeforeArtifact =
+    artifact === "Accelerator"
+      ? plan.inferenceEngineBytes - event.progress.totalBytes
+      : 0;
+  return {
+    completed: Math.min(
+      plan.inferenceEngineBytes,
+      completedBeforeArtifact + event.progress.acceptedBytes
+    ),
+    totalBytes: plan.inferenceEngineBytes,
+    unit: "Bytes",
+    attempt: Option.some(event.progress.attempt),
+  };
+};
+const defaultDataDir = () => join(homedir(), ".magnitude");
 
 const binarySource = (dataDir: string) => {
-  const explicit = process.env.MAGNITUDE_ICN_PATH?.trim()
+  const explicit = process.env.MAGNITUDE_ICN_PATH?.trim();
   if (explicit) {
     return {
       _tag: "Installation" as const,
       path: explicit,
-    }
+    };
   }
   if (ACN_VERSION.includes("+dev.")) {
     return {
       _tag: "Installation" as const,
       path: resolve(
         import.meta.dir,
-        "../../../../inference/target/development/installation.json",
+        "../../../../inference/target/development/installation.json"
       ),
-    }
+    };
   }
   return {
     _tag: "Release" as const,
@@ -44,8 +71,8 @@ const binarySource = (dataDir: string) => {
       process.env.MAGNITUDE_RELEASE_BASE_URL ??
       "https://github.com/magnitudedev/magnitude/releases/download"
     ).replace(/\/+$/, ""),
-  }
-}
+  };
+};
 
 const makeProcess = (dataDir: string) =>
   makeIcnProcess(
@@ -79,36 +106,111 @@ const makeProcess = (dataDir: string) =>
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
       parentPid: process.pid,
-    }),
-  ).pipe(Layer.orDie)
+    })
+  ).pipe(Layer.orDie);
 
 const makeSupervision = () =>
   Layer.scopedDiscard(
     Effect.gen(function* () {
-      const icnProcess = yield* IcnProcess
-      const shutdown = yield* AcnShutdown
+      const icnProcess = yield* IcnProcess;
+      const shutdown = yield* AcnShutdown;
       yield* icnProcess.unexpectedExit.pipe(
         Effect.catchAll((error) =>
           Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
             Effect.annotateLogs({ cause: error.message }),
             Effect.zipRight(
-              shutdown.request({ reason: "icn-exited", detail: error.message }),
-            ),
-          ),
+              shutdown.request({ reason: "icn-exited", detail: error.message })
+            )
+          )
         ),
-        Effect.forkScoped,
-      )
-    }),
-  )
+        Effect.forkScoped
+      );
+    })
+  );
 
 export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
-  const process = makeProcess(dataDir)
-  const supervisedProcess = Layer.provideMerge(makeSupervision(), process)
-  const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess)
-  const withHardware = Layer.provideMerge(makeIcnHardware(), withClient)
-  const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware)
-  const withInstalled = Layer.provideMerge(makeIcnInstalledModels(), withCatalog)
-  const withInstances = Layer.provideMerge(IcnInstancesLive, withInstalled)
-  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withInstances)
-  return withDownloads.pipe(Layer.orDie)
-}
+  const preparation = Layer.effect(
+    IcnPreparationReporter,
+    Effect.gen(function* () {
+      const startup = yield* AcnStartupState;
+      const state = yield* Ref.make<{
+        readonly plan: Option.Option<AcnInstallationPlan>;
+        readonly installationRequired: boolean;
+      }>({
+        plan: Option.none(),
+        installationRequired: false,
+      });
+      return {
+        report: (event) =>
+          Effect.gen(function* () {
+            switch (event._tag) {
+              case "Resolving":
+                return yield* startup.starting("Resolving", Option.none());
+              case "Planned":
+                return yield* Ref.update(state, (current) => ({
+                  ...current,
+                  plan: Option.some(event.plan),
+                }));
+              case "InstallationRequired":
+                return yield* Ref.update(state, (current) => ({
+                  ...current,
+                  installationRequired: true,
+                }));
+              case "Artifact": {
+                if (event.event._tag !== "Downloading") return;
+                const current = yield* Ref.get(state);
+                if (Option.isNone(current.plan)) {
+                  return yield* Effect.dieMessage(
+                    "ICN artifact download began before its installation plan"
+                  );
+                }
+                yield* Ref.set(state, {
+                  ...current,
+                  installationRequired: true,
+                });
+                return yield* startup.installing(
+                  "DownloadingInferenceEngine",
+                  current.plan.value,
+                  Option.some(
+                    artifactProgress(
+                      event.artifact,
+                      event.event,
+                      current.plan.value
+                    )
+                  )
+                );
+              }
+              case "Starting": {
+                const current = yield* Ref.get(state);
+                if (!current.installationRequired) {
+                  return yield* startup.starting("Starting", Option.none());
+                }
+                if (Option.isNone(current.plan)) {
+                  return yield* Effect.dieMessage(
+                    "ICN installation started without an installation plan"
+                  );
+                }
+                return yield* startup.installing(
+                  "StartingMagnitude",
+                  current.plan.value,
+                  Option.none()
+                );
+              }
+            }
+          }),
+      };
+    })
+  );
+  const process = makeProcess(dataDir).pipe(Layer.provide(preparation));
+  const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
+  const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
+  const withHardware = Layer.provideMerge(makeIcnHardware(), withClient);
+  const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
+  const withInstalled = Layer.provideMerge(
+    makeIcnInstalledModels(),
+    withCatalog
+  );
+  const withInstances = Layer.provideMerge(IcnInstancesLive, withInstalled);
+  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withInstances);
+  return withDownloads.pipe(Layer.orDie);
+};

@@ -6,12 +6,23 @@
  * `DaemonSpawner` whose methods require only `never`. This keeps the
  * `DaemonSpawner` interface clean while the layer has the real requirements.
  *
- * The actual process spawning is delegated to the `spawnProcess` function,
- * which differs between Bun (`Bun.spawn`) and Node (`child_process.spawn`).
+ * The actual process spawning is delegated to the `SpawnProcess` service,
+ * whose implementation differs between Bun and Node hosts.
  */
-import { Effect, Option, Schedule, Schema } from "effect";
+import {
+  Array as Arr,
+  Context,
+  Effect,
+  Option,
+  Ref,
+  Schedule,
+  Schema,
+  Stream,
+} from "effect";
+import type * as ParseResult from "effect/ParseResult";
 import { FileSystem } from "@effect/platform/FileSystem";
 import * as CommandExecutor from "@effect/platform/CommandExecutor";
+import type { PlatformError } from "@effect/platform/Error";
 import * as HttpClient from "@effect/platform/HttpClient";
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
 import * as Path from "@effect/platform/Path";
@@ -19,8 +30,13 @@ import * as NodePath from "node:path";
 import { readStructuredFile } from "@magnitudedev/storage";
 import {
   AcnVersionRegistrySchema,
+  AcnHealthResponseSchema,
+  type AcnHealthResponse,
+  type AcnInstallationPlan,
   type AcnRegistration,
+  type AcnStartupProgress,
 } from "@magnitudedev/acn-protocol";
+import type { ArtifactInstallationEvent } from "@magnitudedev/release";
 import {
   DaemonCrashed,
   DaemonError,
@@ -30,72 +46,54 @@ import {
 } from "./errors";
 import { resolveBinaryCommand, defaultDataDir } from "../binary";
 import { SDK_VERSION } from "../version";
-import type { DaemonSpawner } from "./daemon-spawner";
+import type {
+  DaemonSpawner,
+  DaemonSpawnEvent,
+} from "./daemon-spawner";
 import { compareReleaseVersions } from "./release-precedence";
+import type { AcnLifecycleObservation } from "./lifecycle";
+
+type EmitStartupObservation = (
+  observation: AcnLifecycleObservation
+) => Effect.Effect<void>;
 
 /**
- * Function that spawns a detached process. Provided by the consumer —
- * `Bun.spawn` for Bun, `child_process.spawn` for Node.
+ * A host-owned detached process with Effect-native supervision operations.
  */
-export interface SpawnProcess {
-  (command: string[]): {
-    readonly pid: number | undefined;
-    readonly exited: Promise<number | null>;
-  };
+export interface SpawnedProcess {
+  readonly pid: Option.Option<number>;
+  readonly exited: Effect.Effect<number>;
+  readonly diagnostic: Effect.Effect<Option.Option<string>>;
+  readonly kill: (signal: NodeJS.Signals) => Effect.Effect<void>;
 }
+
+export interface SpawnProcess {
+  readonly spawn: (
+    command: Arr.NonEmptyReadonlyArray<string>
+  ) => Effect.Effect<SpawnedProcess, DaemonSpawnFailed>;
+}
+
+export const SpawnProcess = Context.GenericTag<SpawnProcess>(
+  "@magnitudedev/sdk/SpawnProcess"
+);
 
 // ─── Internal types ──────────────────────────────────────────────────────────
-
-export interface HealthResponse {
-  readonly service: string;
-  readonly version: string;
-  readonly id: string;
-  readonly pid: number;
-}
-
-const HealthResponseSchema = Schema.Struct({
-  service: Schema.String,
-  version: Schema.String,
-  id: Schema.String,
-  pid: Schema.Number,
-});
 
 type DebugField =
   | string
   | number
   | boolean
   | null
-  | undefined
   | ReadonlyArray<string | number | boolean | null>;
 
 const debugLog = (
   enabled: boolean,
   message: string,
-  fields?: Readonly<Record<string, DebugField>>
+  fields: Readonly<Record<string, DebugField>> = {}
 ): Effect.Effect<void> =>
   enabled
-    ? Effect.logDebug(message).pipe(Effect.annotateLogs(fields ?? {}))
+    ? Effect.logDebug(message).pipe(Effect.annotateLogs(fields))
     : Effect.void;
-
-const UPGRADE_GRACE_MS = 3_000;
-const UPGRADE_TERM_MS = 1_000;
-const UPGRADE_KILL_MS = 1_000;
-
-const awaitProcessExit = (pid: number, timeoutMs: number): Effect.Effect<boolean> => {
-  const attempts = Math.max(1, Math.ceil(timeoutMs / 25));
-  return Effect.sync(() => processIsAlive(pid)).pipe(
-    Effect.filterOrFail((alive) => !alive, () => new NoDaemon()),
-    Effect.retry({
-      schedule: Schedule.spaced("25 millis").pipe(Schedule.intersect(Schedule.recurs(attempts))),
-      while: (error) => error._tag === "NoDaemon",
-    }),
-    Effect.as(true),
-    Effect.catchTag("NoDaemon", () => Effect.succeed(false)),
-  );
-};
-
-const signalProcess = (pid: number, signal: NodeJS.Signals): Effect.Effect<void> =>
-  Effect.sync(() => process.kill(pid, signal)).pipe(Effect.catchAllCause(() => Effect.void));
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
@@ -121,31 +119,49 @@ const SpawnElectionOwnerSchema = Schema.Struct({
 });
 type SpawnElectionOwner = typeof SpawnElectionOwnerSchema.Type;
 
-const platformErrorReason = (cause: unknown): string | undefined =>
-  typeof cause === "object" && cause !== null && "reason" in cause
-    ? String(cause.reason)
-    : undefined;
+const platformErrorReason = (
+  cause: PlatformError
+): Option.Option<string> =>
+  cause._tag === "SystemError"
+    ? Option.some(cause.reason)
+    : Option.none();
 
-const electionFailure = (operation: string, cause: unknown) =>
+const hasPlatformErrorReason = (
+  cause: PlatformError,
+  expected: string
+): boolean =>
+  Option.exists(platformErrorReason(cause), (reason) => reason === expected);
+
+const electionFailure = (
+  operation: string,
+  cause: PlatformError | ParseResult.ParseError
+) =>
   new DaemonSpawnFailed({
     reason: `${operation}: ${String(cause)}`,
   });
 
 const readSpawnElectionOwner = (
   path: string,
-  fs: FileSystem,
-): Effect.Effect<Option.Option<SpawnElectionOwner>> => fs.readFileString(path).pipe(
-  Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(SpawnElectionOwnerSchema))),
-  Effect.map(Option.some),
-  Effect.catchAll(() => Effect.succeed(Option.none())),
-);
+  fs: FileSystem
+): Effect.Effect<Option.Option<SpawnElectionOwner>> =>
+  fs.readFileString(path).pipe(
+    Effect.flatMap(
+      Schema.decodeUnknown(Schema.parseJson(SpawnElectionOwnerSchema))
+    ),
+    Effect.map(Option.some),
+    Effect.catchAll(() => Effect.succeed(Option.none()))
+  );
 
 const processIsAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
   } catch (cause) {
-    return !(cause instanceof Error && "code" in cause && cause.code === "ESRCH");
+    return !(
+      cause instanceof Error &&
+      "code" in cause &&
+      cause.code === "ESRCH"
+    );
   }
 };
 
@@ -154,127 +170,182 @@ const SPAWN_ELECTION_PUBLICATION_GRACE_MS = 250;
 const tryAcquireSpawnElection = (
   path: string,
   staleAfterMs: number,
-  fs: FileSystem,
-): Effect.Effect<Option.Option<SpawnElectionClaim>, DaemonSpawnFailed> => Effect.gen(function* () {
-  yield* fs.makeDirectory(NodePath.dirname(path), { recursive: true }).pipe(
-    Effect.mapError((cause) => electionFailure("Failed to create ACN registry directory", cause)),
-  );
-  yield* fs.chmod(NodePath.dirname(path), 0o700).pipe(Effect.ignore);
-  const claim = { path, token: crypto.randomUUID() } satisfies SpawnElectionClaim;
-  const encodedOwner = yield* Schema.encode(
-    Schema.parseJson(SpawnElectionOwnerSchema),
-  )({ token: claim.token, pid: process.pid }).pipe(
-    Effect.mapError((cause) => electionFailure("Failed to encode ACN spawn election owner", cause)),
-  );
-  const publicationPath = `${path}.publishing-${encodeURIComponent(claim.token)}`;
-  const acquired = yield* fs.writeFileString(publicationPath, encodedOwner, { mode: 0o600 }).pipe(
-    Effect.flatMap(() => fs.link(publicationPath, path)),
-    Effect.as(true),
-    Effect.catchAll((cause) => platformErrorReason(cause) === "AlreadyExists"
-      ? Effect.succeed(false)
-      : Effect.fail(electionFailure("Failed to acquire ACN spawn election", cause))),
-    Effect.ensuring(fs.remove(publicationPath, { force: true }).pipe(Effect.ignore)),
-  );
-  if (acquired) {
-    return Option.some(claim);
-  }
-
-  // A crash can leave the claim directory behind. Age-based recovery is
-  // deliberately conservative: a healthy contender normally releases it as
-  // soon as registration becomes observable.
-  const info = yield* fs.stat(path).pipe(
-    Effect.map(Option.some),
-    Effect.catchAll((cause) => platformErrorReason(cause) === "NotFound"
-      ? Effect.succeed(Option.none())
-      : Effect.fail(electionFailure("Failed to inspect ACN spawn election", cause))),
-  );
-  if (Option.isSome(info)) {
-    const modifiedAt = Option.getOrUndefined(info.value.mtime);
-    if (modifiedAt && Date.now() - modifiedAt.getTime() > staleAfterMs) {
-      const observedOwner = yield* readSpawnElectionOwner(path, fs);
-      if (Option.isSome(observedOwner) && !processIsAlive(observedOwner.value.pid)) {
-        const tombstone = staleSpawnElectionPath(path, observedOwner.value.token);
-        // Claim recovery by atomically hard-linking the exact owner record to
-        // its retained tombstone. Only one contender can publish that link.
-        // A later contender may finish removal if the winner crashed after
-        // linking, but the token checks prevent it from touching a new owner.
-        const linked = yield* fs.link(path, tombstone).pipe(
-          Effect.as(true),
-          Effect.catchAll((cause) => platformErrorReason(cause) === "AlreadyExists"
+  fs: FileSystem
+): Effect.Effect<Option.Option<SpawnElectionClaim>, DaemonSpawnFailed> =>
+  Effect.gen(function* () {
+    yield* fs
+      .makeDirectory(NodePath.dirname(path), { recursive: true })
+      .pipe(
+        Effect.mapError((cause) =>
+          electionFailure("Failed to create ACN registry directory", cause)
+        )
+      );
+    yield* fs.chmod(NodePath.dirname(path), 0o700).pipe(
+      Effect.mapError((cause) =>
+        electionFailure("Failed to secure ACN registry directory", cause)
+      )
+    );
+    const claim = {
+      path,
+      token: crypto.randomUUID(),
+    } satisfies SpawnElectionClaim;
+    const encodedOwner = yield* Schema.encode(
+      Schema.parseJson(SpawnElectionOwnerSchema)
+    )({ token: claim.token, pid: process.pid }).pipe(
+      Effect.mapError((cause) =>
+        electionFailure("Failed to encode ACN spawn election owner", cause)
+      )
+    );
+    const publicationPath = `${path}.publishing-${encodeURIComponent(
+      claim.token
+    )}`;
+    const acquired = yield* fs
+      .writeFileString(publicationPath, encodedOwner, { mode: 0o600 })
+      .pipe(
+        Effect.flatMap(() => fs.link(publicationPath, path)),
+        Effect.as(true),
+        Effect.catchAll((cause) =>
+          hasPlatformErrorReason(cause, "AlreadyExists")
             ? Effect.succeed(false)
-            : Effect.fail(electionFailure("Failed to quarantine stale ACN spawn election", cause))),
-        );
-        const quarantinedOwner = linked
-          ? observedOwner
-          : yield* readSpawnElectionOwner(tombstone, fs);
-        const currentOwner = yield* readSpawnElectionOwner(path, fs);
+            : Effect.fail(
+                electionFailure("Failed to acquire ACN spawn election", cause)
+              )
+        ),
+        Effect.ensuring(
+          fs.remove(publicationPath, { force: true }).pipe(Effect.ignore)
+        )
+      );
+    if (acquired) {
+      return Option.some(claim);
+    }
+
+    // A crash can leave the claim directory behind. Age-based recovery is
+    // deliberately conservative: a healthy contender normally releases it as
+    // soon as registration becomes observable.
+    const info = yield* fs.stat(path).pipe(
+      Effect.map(Option.some),
+      Effect.catchAll((cause) =>
+        hasPlatformErrorReason(cause, "NotFound")
+          ? Effect.succeed(Option.none())
+          : Effect.fail(
+              electionFailure("Failed to inspect ACN spawn election", cause)
+            )
+      )
+    );
+    if (Option.isSome(info)) {
+      const isStale = Option.exists(
+        info.value.mtime,
+        (modifiedAt) => Date.now() - modifiedAt.getTime() > staleAfterMs
+      );
+      if (isStale) {
+        const observedOwner = yield* readSpawnElectionOwner(path, fs);
         if (
-          Option.isSome(quarantinedOwner) &&
-          Option.isSome(currentOwner) &&
-          quarantinedOwner.value.token === observedOwner.value.token &&
-          quarantinedOwner.value.pid === observedOwner.value.pid &&
-          currentOwner.value.token === observedOwner.value.token &&
-          currentOwner.value.pid === observedOwner.value.pid
+          Option.isSome(observedOwner) &&
+          !processIsAlive(observedOwner.value.pid)
         ) {
-          yield* fs.remove(path).pipe(
-            Effect.catchAll((cause) => platformErrorReason(cause) === "NotFound"
-              ? Effect.void
-              : Effect.fail(electionFailure("Failed to recover stale ACN spawn election", cause))),
+          const tombstone = staleSpawnElectionPath(
+            path,
+            observedOwner.value.token
           );
+          // Claim recovery by atomically hard-linking the exact owner record to
+          // its retained tombstone. Only one contender can publish that link.
+          // A later contender may finish removal if the winner crashed after
+          // linking, but the token checks prevent it from touching a new owner.
+          const linked = yield* fs.link(path, tombstone).pipe(
+            Effect.as(true),
+            Effect.catchAll((cause) =>
+              hasPlatformErrorReason(cause, "AlreadyExists")
+                ? Effect.succeed(false)
+                : Effect.fail(
+                    electionFailure(
+                      "Failed to quarantine stale ACN spawn election",
+                      cause
+                    )
+                  )
+            )
+          );
+          const quarantinedOwner = linked
+            ? observedOwner
+            : yield* readSpawnElectionOwner(tombstone, fs);
+          const currentOwner = yield* readSpawnElectionOwner(path, fs);
+          if (
+            Option.isSome(quarantinedOwner) &&
+            Option.isSome(currentOwner) &&
+            quarantinedOwner.value.token === observedOwner.value.token &&
+            quarantinedOwner.value.pid === observedOwner.value.pid &&
+            currentOwner.value.token === observedOwner.value.token &&
+            currentOwner.value.pid === observedOwner.value.pid
+          ) {
+            yield* fs
+              .remove(path)
+              .pipe(
+                Effect.catchAll((cause) =>
+                  hasPlatformErrorReason(cause, "NotFound")
+                    ? Effect.void
+                    : Effect.fail(
+                        electionFailure(
+                          "Failed to recover stale ACN spawn election",
+                          cause
+                        )
+                      )
+                )
+              );
+          }
         }
       }
     }
-  }
-  return Option.none();
-});
+    return Option.none();
+  });
 
 const releaseSpawnElection = (
   claim: SpawnElectionClaim,
-  fs: FileSystem,
-): Effect.Effect<void> => readSpawnElectionOwner(claim.path, fs).pipe(
-  Effect.flatMap(Option.match({
-    onNone: () => Effect.void,
-    onSome: (owner) => owner.token === claim.token
-      ? fs.remove(claim.path)
-      : Effect.void,
-  })),
-  Effect.catchAll(() => Effect.void),
-);
+  fs: FileSystem
+): Effect.Effect<void> =>
+  readSpawnElectionOwner(claim.path, fs).pipe(
+    Effect.flatMap(
+      Option.match({
+        onNone: () => Effect.void,
+        onSome: (owner) =>
+          owner.token === claim.token ? fs.remove(claim.path) : Effect.void,
+      })
+    ),
+    Effect.catchAll(() => Effect.void)
+  );
 
 const withSpawnElection = <A, E>(
   path: string,
-  timeoutMs: number,
   fs: FileSystem,
+  emitObservation: EmitStartupObservation,
   effect: Effect.Effect<A, E, never>
 ): Effect.Effect<A, E | DaemonSpawnFailed, never> => {
-  // Recovery must become eligible within this caller's own wait budget. The
-  // owner record and liveness proof protect a live claimant; the short age
-  // threshold only gives a newly acquired claim time to publish that record.
-  const staleAfterMs = Math.max(
-    1,
-    Math.min(SPAWN_ELECTION_PUBLICATION_GRACE_MS, Math.floor(timeoutMs / 2)),
-  );
-  const retryCount = Math.max(1, Math.ceil(timeoutMs / 50));
-  const acquire = tryAcquireSpawnElection(path, staleAfterMs, fs).pipe(
-    Effect.filterOrFail(
-      Option.isSome,
-      () => new NoDaemon(),
+  const acquire = tryAcquireSpawnElection(
+    path,
+    SPAWN_ELECTION_PUBLICATION_GRACE_MS,
+    fs
+  ).pipe(
+    Effect.tap((claim) =>
+      Option.isNone(claim)
+        ? emitObservation({ _tag: "Starting", phase: "WaitingForOwner" })
+        : Effect.void
     ),
+    Effect.filterOrFail(Option.isSome, () => new NoDaemon()),
     Effect.map((claim) => claim.value),
     Effect.retry({
-      schedule: Schedule.spaced("50 millis").pipe(
-        Schedule.intersect(Schedule.recurs(retryCount)),
-      ),
+      schedule: Schedule.spaced("50 millis"),
       while: (failure) => failure._tag === "NoDaemon",
     }),
-    Effect.mapError((failure) => failure instanceof NoDaemon
-      ? new DaemonSpawnFailed({ reason: "Timed out waiting for ACN spawn election" })
-      : failure),
+    Effect.mapError((failure) =>
+      failure._tag === "NoDaemon"
+        ? new DaemonSpawnFailed({
+            reason: "ACN spawn election ended unexpectedly",
+          })
+        : failure
+    )
   );
-  return Effect.acquireUseRelease(
-    acquire,
-    () => effect,
-    (claim) => releaseSpawnElection(claim, fs),
+  return acquire.pipe(
+    Effect.flatMap((claim) =>
+      effect.pipe(Effect.ensuring(releaseSpawnElection(claim, fs)))
+    )
   );
 };
 
@@ -301,7 +372,7 @@ const readRegistration = (
       ).pipe(Effect.annotateLogs({ path, reason: result.error.reason }));
       return Option.none();
     }
-    return Option.fromNullable(result.value.registration);
+    return result.value.registration;
   });
 
 // ─── Health probing ──────────────────────────────────────────────────────────
@@ -310,7 +381,7 @@ const probeHealth = (
   url: string,
   timeoutMs: number,
   client: HttpClient.HttpClient
-): Effect.Effect<HealthResponse, NoDaemon, never> =>
+): Effect.Effect<AcnHealthResponse, NoDaemon, never> =>
   Effect.gen(function* () {
     const response = yield* client
       .execute(HttpClientRequest.get(`${url}/health`))
@@ -326,9 +397,9 @@ const probeHealth = (
     const json = yield* response.json.pipe(
       Effect.mapError(() => new NoDaemon())
     );
-    const health = yield* Schema.decodeUnknown(HealthResponseSchema)(json).pipe(
-      Effect.mapError(() => new NoDaemon())
-    );
+    const health = yield* Schema.decodeUnknown(AcnHealthResponseSchema)(
+      json
+    ).pipe(Effect.mapError(() => new NoDaemon()));
 
     if (health.service !== "magnitude-acn") {
       return yield* new NoDaemon();
@@ -337,87 +408,60 @@ const probeHealth = (
     return health;
   });
 
-/**
- * Retire a healthy ACN owned by another release and wait for the owning
- * process to finish all scoped cleanup (including ICN reaping) before a new
- * candidate may be spawned. The global spawn election serializes this handoff.
- */
-const retireIncumbent = (
-  owner: AcnRegistration,
-  options: {
-    readonly dataDir: string;
-    readonly probeTimeoutMs: number;
-    readonly debug: boolean;
-  },
-  deps: { readonly fs: FileSystem; readonly client: HttpClient.HttpClient }
-): Effect.Effect<boolean, DaemonError, never> =>
-  Effect.gen(function* () {
-    const current = yield* readRegistration(registrationPath(options.dataDir), deps.fs);
-    if (Option.isNone(current)) return false;
-    const registration = current.value;
-    if (
-      registration.id !== owner.id ||
-      registration.pid !== owner.pid ||
-      registration.version !== owner.version ||
-      registration.url !== owner.url
-    ) return false;
-
-    const health = yield* probeHealth(owner.url, options.probeTimeoutMs, deps.client).pipe(
-      Effect.option,
-    );
-    if (
-      Option.isNone(health) ||
-      health.value.id !== owner.id ||
-      health.value.pid !== owner.pid ||
-      health.value.version !== owner.version
-    ) return false;
-
-    if (owner.shutdownToken === undefined) {
-      return yield* new DaemonSpawnFailed({
-        reason: `ACN ${owner.pid} cannot be replaced without an authenticated shutdown capability`,
-      });
-    }
-
-    yield* debugLog(options.debug, "retiring ACN before global ownership handoff", {
-      pid: owner.pid,
-      currentVersion: owner.version,
+const reportHealthState = (
+  state: AcnHealthResponse["state"],
+  emitObservation: EmitStartupObservation
+): Effect.Effect<void> => {
+  if (state._tag === "Installing") {
+    return emitObservation({
+      _tag: "Installing",
+      phase: state.phase,
+      plan: state.plan,
+      progress: state.progress,
     });
-    const response = yield* deps.client.execute(
-      HttpClientRequest.post(`${owner.url}/shutdown`).pipe(
-        HttpClientRequest.bearerToken(owner.shutdownToken),
-      ),
-    ).pipe(
-      Effect.mapError((cause) => new DaemonSpawnFailed({
-        reason: `Failed to request authenticated shutdown from ACN ${owner.pid}: ${String(cause)}`,
-      })),
-    );
-    if (response.status !== 202) {
-      return yield* new DaemonSpawnFailed({
-        reason: `ACN ${owner.pid} rejected authenticated shutdown with HTTP ${response.status}`,
+  }
+  if (state._tag !== "Starting") return Effect.void;
+  switch (state.activity) {
+    case "WaitingForOwnership":
+      return emitObservation({ _tag: "Starting", phase: "WaitingForOwner" });
+    case "Resolving":
+      return emitObservation({
+        _tag: "Starting",
+        phase: "ResolvingLocalInference",
       });
-    }
+    case "Starting":
+      return emitObservation({
+        _tag: "Starting",
+        phase: "LaunchingLocalInference",
+      });
+  }
+};
 
-    if (yield* awaitProcessExit(owner.pid, UPGRADE_GRACE_MS)) return true;
-    yield* signalProcess(owner.pid, "SIGTERM");
-    if (yield* awaitProcessExit(owner.pid, UPGRADE_TERM_MS)) return true;
-    yield* signalProcess(owner.pid, "SIGKILL");
-    if (!(yield* awaitProcessExit(owner.pid, UPGRADE_KILL_MS))) {
-      return yield* new DaemonSpawnFailed({
-        reason: `ACN ${owner.pid} did not exit after authenticated shutdown and signal escalation`,
-      });
-    }
-    return true;
-  });
+const daemonDownloadObservation = (
+  plan: AcnInstallationPlan,
+  event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>
+): AcnLifecycleObservation => ({
+  _tag: "Installing",
+  phase: "DownloadingDaemon",
+  plan,
+  progress: Option.some({
+    completed: event.progress.acceptedBytes,
+    totalBytes: event.progress.totalBytes,
+    unit: "Bytes",
+    attempt: Option.some(event.progress.attempt),
+  }),
+});
 
 // ─── Spawn daemon (wait-for-registration pipeline) ───────────────────────────
 
 const spawnDaemon = (
-  command: string[],
+  command: Arr.NonEmptyReadonlyArray<string>,
   options: {
     readonly dataDir: string;
     readonly version: string;
-    readonly timeoutMs: number;
+    readonly publicationTimeoutMs: number;
     readonly debug: boolean;
+    readonly emitObservation: EmitStartupObservation;
   },
   deps: {
     readonly fs: FileSystem;
@@ -425,7 +469,13 @@ const spawnDaemon = (
     readonly spawnProcess: SpawnProcess;
   }
 ): Effect.Effect<
-  string,
+  {
+    readonly ready: Effect.Effect<
+      string,
+      DaemonSpawnFailed | DaemonCrashed | RegistrationFileInvalid,
+      never
+    >;
+  },
   DaemonSpawnFailed | DaemonCrashed | RegistrationFileInvalid,
   never
 > =>
@@ -436,15 +486,20 @@ const spawnDaemon = (
       detached: true,
     });
 
-    const proc = spawnProcess(command);
+    const proc = yield* spawnProcess.spawn(command);
 
-    yield* debugLog(options.debug, "ACN process spawned", { pid: proc.pid });
+    yield* debugLog(options.debug, "ACN process spawned", {
+      pid: Option.getOrNull(proc.pid),
+    });
 
     const regPath = registrationPath(options.dataDir);
 
-    const checkHealthyRegistration: Effect.Effect<
-      AcnRegistration,
-      NoDaemon | RegistrationFileInvalid,
+    const checkPublishedRegistration: Effect.Effect<
+      {
+        readonly registration: AcnRegistration;
+        readonly health: AcnHealthResponse;
+      },
+      NoDaemon | RegistrationFileInvalid | DaemonSpawnFailed,
       never
     > = Effect.gen(function* () {
       const registrationOption = yield* readRegistration(regPath, fs);
@@ -459,73 +514,120 @@ const spawnDaemon = (
       ) {
         return yield* new NoDaemon();
       }
-      if (compareReleaseVersions(options.version, registration.version) <= 0) return registration;
-      return yield* new NoDaemon();
+      if (compareReleaseVersions(options.version, registration.version) > 0) {
+        return yield* new NoDaemon();
+      }
+      yield* reportHealthState(health.state, options.emitObservation);
+      if (health.state._tag === "Failed") {
+        return yield* new DaemonSpawnFailed({
+          reason: health.state.message,
+        });
+      }
+      return { registration, health };
     });
 
-    const awaitHealthyRegistration = checkHealthyRegistration.pipe(
+    const awaitPublishedRegistration = checkPublishedRegistration.pipe(
       Effect.retry({
         schedule: Schedule.spaced("50 millis"),
         while: (error) => error._tag === "NoDaemon",
-      })
+      }),
+      Effect.catchTag("NoDaemon", () =>
+        Effect.fail(
+          new DaemonSpawnFailed({
+            reason: "ACN registration observation ended unexpectedly",
+          })
+        )
+      )
     );
 
-    const resultOption = yield* Effect.gen(function* () {
-      const first = yield* Effect.race(
-        awaitHealthyRegistration.pipe(
-          Effect.map(
-            (registration) => ({ _tag: "Registered", registration } as const)
-          )
-        ),
-        Effect.tryPromise({
-          try: () => proc.exited,
-          catch: () => new DaemonCrashed({ exitCode: 1 }),
-        }).pipe(
-          Effect.catchAll((error) => Effect.succeed(error.exitCode)),
-          Effect.map(
-            (exitCode) =>
-              ({ _tag: "CandidateExited", exitCode: exitCode ?? 1 } as const)
+    const candidateExit = proc.exited.pipe(
+      Effect.flatMap((exitCode) =>
+        proc.diagnostic.pipe(
+          Effect.flatMap((diagnostic) =>
+            Effect.fail(
+              new DaemonCrashed({
+                exitCode,
+                diagnostic,
+              })
+            )
           )
         )
-      );
-      if (first._tag === "Registered") return first.registration;
-
-      yield* debugLog(
-        options.debug,
-        "spawned ACN candidate exited while waiting for shared registration",
-        {
-          pid: proc.pid,
-          exitCode: first.exitCode,
-        }
-      );
-      return yield* awaitHealthyRegistration;
-    }).pipe(
-      Effect.catchTag(
-        "NoDaemon",
-        () =>
-          new DaemonSpawnFailed({
-            reason:
-              "No compatible ACN became healthy before the startup deadline",
-          })
-      ),
-      Effect.timeoutOption(`${options.timeoutMs} millis`)
+      )
     );
 
-    const result = yield* Option.match(resultOption, {
-      onNone: () =>
-        new DaemonSpawnFailed({
-          reason:
-            "No compatible ACN became healthy before the startup deadline",
-        }),
+    const publication = yield* Effect.raceFirst(
+      awaitPublishedRegistration,
+      candidateExit
+    ).pipe(
+      Effect.catchTag("DaemonCrashed", (candidateFailure) =>
+        checkPublishedRegistration.pipe(Effect.mapError(() => candidateFailure))
+      ),
+      Effect.timeoutOption(`${options.publicationTimeoutMs} millis`)
+    );
+    const published = yield* Option.match(publication, {
       onSome: Effect.succeed,
+      onNone: () =>
+        Effect.gen(function* () {
+          yield* proc.kill("SIGTERM");
+          const terminated = yield* proc.exited.pipe(
+            Effect.timeoutOption("1 second")
+          );
+          if (Option.isNone(terminated)) {
+            yield* proc.kill("SIGKILL");
+            yield* proc.exited.pipe(Effect.timeout("1 second"), Effect.ignore);
+          }
+          const diagnostic = yield* proc.diagnostic;
+          const publicationFailure = new DaemonSpawnFailed({
+            reason: Option.match(diagnostic, {
+              onNone: () =>
+                "ACN did not publish its startup endpoint before the deadline",
+              onSome: (detail) =>
+                `ACN did not publish its startup endpoint before the deadline: ${detail}`,
+            }),
+          });
+          return yield* checkPublishedRegistration.pipe(
+            Effect.mapError(() => publicationFailure)
+          );
+        }),
     });
+    const publicationBelongsToCandidate = Option.exists(
+      proc.pid,
+      (pid) => pid === published.registration.pid
+    );
 
-    yield* debugLog(options.debug, "spawned ACN became healthy", {
-      url: result.url,
-      pid: result.pid,
-      id: result.id,
-    });
-    return result.url;
+    const awaitReady = checkPublishedRegistration.pipe(
+      Effect.filterOrFail(
+        ({ health }) => health.state._tag === "Ready",
+        () => new NoDaemon()
+      ),
+      Effect.retry({
+        schedule: Schedule.spaced("100 millis"),
+        while: (error) => error._tag === "NoDaemon",
+      }),
+      Effect.catchTag("NoDaemon", () =>
+        Effect.fail(
+          new DaemonSpawnFailed({
+            reason: "ACN readiness observation ended unexpectedly",
+          })
+        )
+      )
+    );
+
+    return {
+      ready: (publicationBelongsToCandidate
+        ? Effect.raceFirst(awaitReady, candidateExit)
+        : awaitReady
+      ).pipe(
+        Effect.tap((result) =>
+          debugLog(options.debug, "spawned ACN became ready", {
+            url: result.registration.url,
+            pid: result.registration.pid,
+            id: result.registration.id,
+          })
+        ),
+        Effect.map((result) => result.registration.url)
+      ),
+    };
   });
 
 // ─── Daemon action decision ──────────────────────────────────────────────────
@@ -537,12 +639,17 @@ export type DaemonAction =
       readonly reason: "same-release" | "newer-release";
     }
   | { readonly type: "replace"; readonly owner: AcnRegistration }
+  | {
+      readonly type: "wait";
+      readonly owner: AcnRegistration;
+      readonly state: AcnHealthResponse["state"];
+    }
   | { readonly type: "unavailable"; readonly reason: "missing" | "stale" };
 
 export const decideDaemonAction = (input: {
   readonly candidateVersion: string;
   readonly registration: Option.Option<AcnRegistration>;
-  readonly health: Option.Option<HealthResponse>;
+  readonly health: Option.Option<AcnHealthResponse>;
 }): DaemonAction => {
   if (Option.isNone(input.registration)) {
     return { type: "unavailable", reason: "missing" };
@@ -561,9 +668,27 @@ export const decideDaemonAction = (input: {
   }
 
   const owner = input.registration.value;
-  const comparison = compareReleaseVersions(input.candidateVersion, owner.version);
-  if (comparison === 0) return { type: "reuse", url: owner.url, reason: "same-release" };
-  if (comparison < 0) return { type: "reuse", url: owner.url, reason: "newer-release" };
+  const comparison = compareReleaseVersions(
+    input.candidateVersion,
+    owner.version
+  );
+  if (comparison > 0 || input.health.value.state._tag === "Failed") {
+    return { type: "replace", owner };
+  }
+  if (
+    input.health.value.state._tag === "Starting" ||
+    input.health.value.state._tag === "Installing"
+  ) {
+    return {
+      type: "wait",
+      owner,
+      state: input.health.value.state,
+    };
+  }
+  if (comparison === 0)
+    return { type: "reuse", url: owner.url, reason: "same-release" };
+  if (comparison < 0)
+    return { type: "reuse", url: owner.url, reason: "newer-release" };
   return { type: "replace", owner };
 };
 
@@ -604,11 +729,13 @@ const inspectDaemon = (
     );
 
     const health = yield* Option.match(registration, {
-      onNone: () => Effect.succeed(Option.none<HealthResponse>()),
+      onNone: () => Effect.succeed(Option.none<AcnHealthResponse>()),
       onSome: (reg) =>
         probeHealth(reg.url, options.probeTimeoutMs, deps.client).pipe(
           Effect.map(Option.some),
-          Effect.catchAll(() => Effect.succeed(Option.none<HealthResponse>()))
+          Effect.catchAll(() =>
+            Effect.succeed(Option.none<AcnHealthResponse>())
+          )
         ),
     });
     yield* debugLog(
@@ -638,13 +765,14 @@ const discoverUrl = (
   deps: {
     readonly fs: FileSystem;
     readonly client: HttpClient.HttpClient;
-  },
+  }
 ): Effect.Effect<Option.Option<string>, DaemonError, never> =>
   inspectDaemon(options, deps).pipe(
     Effect.flatMap((action) => {
-      if (action.type === "reuse") return Effect.succeed(Option.some(action.url));
+      if (action.type === "reuse")
+        return Effect.succeed(Option.some(action.url));
       return Effect.succeed(Option.none<string>());
-    }),
+    })
   );
 
 // ─── Public factory ──────────────────────────────────────────────────────────
@@ -656,7 +784,8 @@ const discoverUrl = (
 export interface LocalSpawnerOptions {
   readonly binaryPath?: string;
   readonly version?: string;
-  readonly spawnTimeoutMs?: number;
+  /** Deadline from candidate spawn until its early registration is observable. */
+  readonly publicationTimeoutMs?: number;
   readonly probeTimeoutMs?: number;
   readonly debug?: boolean;
   /** Test/embedding override. Defaults to ~/.magnitude. */
@@ -670,11 +799,9 @@ export interface LocalSpawnerOptions {
  * The returned spawner's `discover` and `spawn` methods require only `never`
  * — all dependencies are sealed inside.
  *
- * @param spawnProcess — Bun.spawn or child_process.spawn adapter
  * @param options — version, timeouts, debug, binaryPath (passed from EnsureDaemonOptions)
  */
 export const makeLocalDaemonSpawner = (
-  spawnProcess: SpawnProcess,
   options: LocalSpawnerOptions = {}
 ): Effect.Effect<
   DaemonSpawner,
@@ -683,17 +810,19 @@ export const makeLocalDaemonSpawner = (
   | HttpClient.HttpClient
   | CommandExecutor.CommandExecutor
   | Path.Path
+  | SpawnProcess
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem;
     const client = yield* HttpClient.HttpClient;
     const cmd = yield* CommandExecutor.CommandExecutor;
     const path = yield* Path.Path;
+    const spawnProcess = yield* SpawnProcess;
 
     const dataDir = options.dataDir ?? defaultDataDir();
     const targetVersion = options.version ?? SDK_VERSION;
     const debug = options.debug ?? process.env.MAGNITUDE_ACN_DEBUG === "1";
-    const spawnTimeoutMs = options.spawnTimeoutMs ?? 10000;
+    const publicationTimeoutMs = options.publicationTimeoutMs ?? 10_000;
     const probeTimeoutMs = options.probeTimeoutMs ?? 2000;
 
     const deps = { fs, client };
@@ -706,71 +835,165 @@ export const makeLocalDaemonSpawner = (
         ),
 
       spawn: (command) =>
-        withSpawnElection(
-          spawnElectionPath(dataDir),
-          spawnTimeoutMs,
-          fs,
-          Effect.gen(function* () {
-            // Mandatory post-election convergence. Every observation is
-            // classified by the same release-policy function; a contender
-            // never acts on the stale state that caused it to enter election.
-            const settleIncumbent: Effect.Effect<Option.Option<string>, DaemonError> =
-              Effect.suspend(() =>
-                inspectDaemon(
-                  { dataDir, version: targetVersion, probeTimeoutMs, debug },
-                  deps,
-                ).pipe(
-                  Effect.flatMap((action) => {
-                    switch (action.type) {
-                      case "reuse":
-                        return Effect.succeed(Option.some(action.url));
-                      case "unavailable":
-                        return Effect.succeed(Option.none<string>());
-                      case "replace":
-                        return retireIncumbent(
-                          action.owner,
-                          {
-                            dataDir,
-                            probeTimeoutMs,
-                            debug,
-                          },
-                          deps,
-                        ).pipe(Effect.zipRight(settleIncumbent));
-                    }
-                  }),
-                ),
+        Stream.asyncPush<DaemonSpawnEvent, DaemonError>(
+          (emit) => {
+            const emitObservation: EmitStartupObservation = (observation) =>
+              Effect.sync(() => {
+                emit.single({ _tag: "Observation", observation });
+              });
+            const startup = Effect.gen(function* () {
+              let coordinate!: Effect.Effect<
+                { readonly ready: Effect.Effect<string, DaemonError> },
+                DaemonError
+              >;
+              const awaitIncumbent: Effect.Effect<string, DaemonError> =
+                Effect.suspend(() =>
+                  inspectDaemon(
+                    {
+                      dataDir,
+                      version: targetVersion,
+                      probeTimeoutMs,
+                      debug,
+                    },
+                    deps
+                  ).pipe(
+                    Effect.flatMap((action) => {
+                      switch (action.type) {
+                        case "reuse":
+                          return Effect.succeed(action.url);
+                        case "wait":
+                          return reportHealthState(
+                            action.state,
+                            emitObservation
+                          ).pipe(
+                            Effect.zipRight(Effect.sleep("100 millis")),
+                            Effect.zipRight(awaitIncumbent)
+                          );
+                        case "unavailable":
+                        case "replace":
+                          return coordinate.pipe(
+                            Effect.flatMap(({ ready }) => ready)
+                          );
+                      }
+                    })
+                  )
+                );
+              coordinate = withSpawnElection(
+                spawnElectionPath(dataDir),
+                fs,
+                emitObservation,
+                Effect.gen(function* () {
+                  // Mandatory post-election convergence. A contender never
+                  // acts on the stale state that caused it to enter election.
+                  const action = yield* inspectDaemon(
+                    {
+                      dataDir,
+                      version: targetVersion,
+                      probeTimeoutMs,
+                      debug,
+                    },
+                    deps
+                  );
+                  if (action.type === "wait") {
+                    yield* reportHealthState(action.state, emitObservation);
+                    return { ready: awaitIncumbent };
+                  }
+                  if (action.type === "reuse") {
+                    return { ready: Effect.succeed(action.url) };
+                  }
+
+                  const acquisitionPlan = yield* Ref.make<
+                    Option.Option<AcnInstallationPlan>
+                  >(Option.none());
+                  const resolvedCommand = yield* Option.match(command, {
+                    onSome: (value) => Effect.succeed(Array.from(value)),
+                    onNone: () =>
+                      resolveBinaryCommand({
+                        binaryPath: options.binaryPath,
+                        version: targetVersion,
+                        dataDir,
+                        acquisitionObserver: Option.some({
+                          report: (event) =>
+                            Effect.gen(function* () {
+                              switch (event._tag) {
+                                case "Planned":
+                                  return yield* Ref.set(
+                                    acquisitionPlan,
+                                    Option.some(event.plan)
+                                  );
+                                case "Artifact": {
+                                  if (event.event._tag !== "Downloading") return;
+                                  const plan = yield* Ref.get(acquisitionPlan);
+                                  if (Option.isNone(plan)) {
+                                    return yield* Effect.dieMessage(
+                                      "ACN artifact download began before its installation plan"
+                                    );
+                                  }
+                                  return yield* emitObservation(
+                                    daemonDownloadObservation(
+                                      plan.value,
+                                      event.event
+                                    )
+                                  );
+                                }
+                              }
+                            }),
+                        }),
+                      }).pipe(
+                        Effect.provideService(FileSystem, fs),
+                        Effect.provideService(HttpClient.HttpClient, client),
+                        Effect.provideService(
+                          CommandExecutor.CommandExecutor,
+                          cmd
+                        ),
+                        Effect.provideService(Path.Path, path),
+                        Effect.map((resolved) =>
+                          debug
+                            ? [...resolved.command, "--debug"]
+                            : resolved.command
+                        )
+                      ),
+                  });
+                  if (!Arr.isNonEmptyReadonlyArray(resolvedCommand)) {
+                    return yield* new DaemonSpawnFailed({
+                      reason: "Cannot spawn an empty Magnitude command",
+                    });
+                  }
+
+                  yield* emitObservation({
+                    _tag: "Starting",
+                    phase: "LaunchingAcn",
+                  });
+                  return yield* spawnDaemon(
+                    resolvedCommand,
+                    {
+                      dataDir,
+                      version: targetVersion,
+                      publicationTimeoutMs,
+                      debug,
+                      emitObservation,
+                    },
+                    { fs, client, spawnProcess }
+                  );
+                })
               );
-
-            const existing = yield* settleIncumbent;
-            if (Option.isSome(existing)) return existing.value;
-
-            const resolvedCommand =
-              command ??
-              (yield* resolveBinaryCommand({
-                binaryPath: options.binaryPath,
-                version: targetVersion,
-                dataDir,
-              }).pipe(
-                Effect.provideService(FileSystem, fs),
-                Effect.provideService(HttpClient.HttpClient, client),
-                Effect.provideService(CommandExecutor.CommandExecutor, cmd),
-                Effect.provideService(Path.Path, path),
-                Effect.map((resolved) =>
-                  debug ? [...resolved.command, "--debug"] : resolved.command
-                )
-              ));
-
-            return yield* spawnDaemon(
-              resolvedCommand,
-              {
-                dataDir,
-                version: targetVersion,
-                timeoutMs: spawnTimeoutMs,
-                debug,
-              },
-              { fs, client, spawnProcess }
+              const awaitReady = yield* coordinate;
+              return yield* awaitReady.ready;
+            });
+            return startup.pipe(
+              Effect.match({
+                onFailure: (error) => {
+                  emit.fail(error);
+                },
+                onSuccess: (url) => {
+                  emit.single({ _tag: "Ready", url });
+                  emit.end();
+                },
+              }),
+              Effect.forkScoped
             );
-          }),
+          },
+          { bufferSize: "unbounded" }
         ),
     } satisfies DaemonSpawner;
   });

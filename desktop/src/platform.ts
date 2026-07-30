@@ -4,9 +4,15 @@
  * Wraps the `__magnitudeDesktop` DesktopApi exposed by the preload bridge.
  * `DaemonSpawner` delegates daemon lifecycle to Electron main over IPC.
  */
-import { Effect, Layer, Option } from "effect"
+import { Effect, Layer, Option, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { DaemonSpawnFailed, DaemonSpawnerTag, makeAcnJitRuntime, type DaemonSpawner } from "@magnitudedev/sdk"
+import {
+  DaemonSpawnFailed,
+  DaemonSpawnerTag,
+  makeAcnJitRuntime,
+  type DaemonSpawnEvent,
+  type DaemonSpawner,
+} from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
 
@@ -54,6 +60,11 @@ let api: DesktopApi
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
+const daemonReady = (url: string): DaemonSpawnEvent => ({
+  _tag: "Ready",
+  url,
+})
+
 function createDesktopDaemonSpawner(desktopApi: DesktopApi): DaemonSpawner {
   return {
     discover: () =>
@@ -65,10 +76,12 @@ function createDesktopDaemonSpawner(desktopApi: DesktopApi): DaemonSpawner {
         catch: (cause) => new DaemonSpawnFailed({ reason: errorMessage(cause) }),
       }),
     spawn: (command) =>
-      Effect.tryPromise({
-        try: () => desktopApi.daemon.spawn(command),
-        catch: (cause) => new DaemonSpawnFailed({ reason: errorMessage(cause) }),
-      }),
+      Stream.fromEffect(
+        Effect.tryPromise({
+          try: () => desktopApi.daemon.spawn(command),
+          catch: (cause) => new DaemonSpawnFailed({ reason: errorMessage(cause) }),
+        }).pipe(Effect.map(daemonReady)),
+      ),
   }
 }
 
@@ -82,6 +95,7 @@ export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Pla
   return {
     id: "desktop",
     protocolLayer,
+    acnStartup: acn.startup,
     clipboard: desktopClipboard,
     storage: desktopStorage,
     notifications: desktopNotifications,

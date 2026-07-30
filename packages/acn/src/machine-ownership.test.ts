@@ -1,39 +1,38 @@
 import { describe, expect, it } from "vitest"
+import * as FileSystem from "@effect/platform/FileSystem"
 import { BunFileSystem } from "@effect/platform-bun"
-import { Effect, Either, Exit, Scope } from "effect"
+import { Deferred, Effect, Exit, Fiber, Option, Scope } from "effect"
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { AcnMachineAlreadyOwned, acquireAcnMachineOwnership } from "./machine-ownership"
+import { acquireAcnMachineOwnership } from "./machine-ownership"
 
-const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  Effect.runPromise(effect.pipe(Effect.provide(BunFileSystem.layer)) as Effect.Effect<A, E, never>)
+const run = <A, E>(
+  effect: Effect.Effect<A, E, FileSystem.FileSystem>
+) => Effect.runPromise(effect.pipe(Effect.provide(BunFileSystem.layer)))
 
 describe("ACN machine ownership", () => {
-  it("admits one owner and releases only its exact record", async () => {
+  it("waits for the exact live owner and acquires after its release", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "magnitude-acn-owner-"))
-    const result = await run(
+    await run(
       Effect.gen(function* () {
         const firstScope = yield* Scope.make()
         const secondScope = yield* Scope.make()
         yield* acquireAcnMachineOwnership({ dataDir, id: "first", version: "1" }).pipe(
           Effect.provideService(Scope.Scope, firstScope),
         )
-        const collision = yield* Effect.either(
+        const waiting = yield* Effect.fork(
           acquireAcnMachineOwnership({ dataDir, id: "second", version: "2" }).pipe(
             Effect.provideService(Scope.Scope, secondScope),
           ),
         )
+        yield* Effect.sleep("150 millis")
+        expect(Option.isNone(yield* Fiber.poll(waiting))).toBe(true)
         yield* Scope.close(firstScope, Exit.void)
-        yield* acquireAcnMachineOwnership({ dataDir, id: "second", version: "2" }).pipe(
-          Effect.provideService(Scope.Scope, secondScope),
-        )
+        yield* Fiber.join(waiting)
         yield* Scope.close(secondScope, Exit.void)
-        return collision
       }),
     )
-    expect(Either.isLeft(result)).toBe(true)
-    if (Either.isLeft(result)) expect(result.left).toBeInstanceOf(AcnMachineAlreadyOwned)
   })
 
   it("recovers a dead owner's exact record", async () => {
@@ -52,27 +51,64 @@ describe("ACN machine ownership", () => {
     expect(await Bun.file(join(directory, "owner")).exists()).toBe(false)
   })
 
-  it("linearizes simultaneous candidates to exactly one owner", async () => {
+  it("does not acquire after an interrupted ownership wait", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "magnitude-acn-owner-interrupt-"))
+    const ownerExists = await run(
+      Effect.gen(function* () {
+        const firstScope = yield* Scope.make()
+        yield* acquireAcnMachineOwnership({
+          dataDir,
+          id: "active",
+          version: "1",
+        }).pipe(Effect.provideService(Scope.Scope, firstScope))
+        const waiting = yield* acquireAcnMachineOwnership({
+          dataDir,
+          id: "superseded",
+          version: "2",
+        }).pipe(
+          Effect.scoped,
+          Effect.fork,
+        )
+        yield* Effect.sleep("150 millis")
+        yield* Fiber.interrupt(waiting)
+        yield* Scope.close(firstScope, Exit.void)
+        yield* Effect.sleep("150 millis")
+        const exists = yield* Effect.promise(() =>
+          Bun.file(join(dataDir, "acn", "owner")).exists()
+        )
+        return exists
+      }),
+    )
+    expect(ownerExists).toBe(false)
+  })
+
+  it("serializes simultaneous candidates without overlapping ownership", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "magnitude-acn-owner-race-"))
-    const outcomes = await run(
+    const order = await run(
       Effect.gen(function* () {
         const scopes = yield* Effect.all([Scope.make(), Scope.make()])
-        const attempts = yield* Effect.all(
+        const firstAcquired = yield* Deferred.make<string>()
+        const acquired = yield* Effect.all(
           ["left", "right"].map((id, index) =>
             acquireAcnMachineOwnership({ dataDir, id, version: "1.0.0" }).pipe(
               Effect.provideService(Scope.Scope, scopes[index]!),
-              Effect.either,
+              Effect.tap(() => Deferred.succeed(firstAcquired, id)),
+              Effect.as(id),
+              Effect.fork,
             ),
           ),
           { concurrency: "unbounded" },
         )
-        yield* Effect.forEach(scopes, (scope) => Scope.close(scope, Exit.void), {
-          discard: true,
-        })
-        return attempts
+        const first = yield* Deferred.await(firstAcquired)
+        const firstIndex = first === "left" ? 0 : 1
+        const secondIndex = firstIndex === 0 ? 1 : 0
+        expect(Option.isNone(yield* Fiber.poll(acquired[secondIndex]!))).toBe(true)
+        yield* Scope.close(scopes[firstIndex]!, Exit.void)
+        const second = yield* Fiber.join(acquired[secondIndex]!)
+        yield* Scope.close(scopes[secondIndex]!, Exit.void)
+        return [first, second]
       }),
     )
-    expect(outcomes.filter(Either.isRight)).toHaveLength(1)
-    expect(outcomes.filter(Either.isLeft)).toHaveLength(1)
+    expect(new Set(order)).toEqual(new Set(["left", "right"]))
   })
 })

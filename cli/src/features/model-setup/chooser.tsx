@@ -1,11 +1,9 @@
-import { useCallback, useMemo, useState, useSyncExternalStore, type ReactNode } from "react"
+import { useCallback, useMemo, useState, type ReactNode } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
-  getAnimationTickSnapshot,
-  subscribeAnimationTick,
   truncateToDisplayWidth,
   type LocalInferenceHardwareResult,
   type OnboardingModelChoice,
@@ -20,6 +18,7 @@ import type {
 } from "@magnitudedev/sdk"
 import { ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
+import { spinnerFrameForTick, useSpinnerFrame } from "../../hooks/use-spinner-frame"
 import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
@@ -35,7 +34,6 @@ import {
 import { slate } from "../../utils/theme"
 import { OnboardingModelDownloadDetails } from "./download-details"
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const
 const SECTION_VIEWPORT_ROWS = 4
 const DESCRIPTION_ROWS = 5
 const DETAIL_FIXED_ROWS = 10
@@ -175,7 +173,7 @@ const OnboardingSetupCard = ({
   cardWidth,
   title,
   hardware,
-  spinnerFrame = SPINNER_FRAMES[0],
+  spinnerFrame = spinnerFrameForTick(0),
   children,
 }: {
   readonly cardWidth: number
@@ -567,14 +565,12 @@ export function OnboardingModelPreparation({
   readonly onSkip: () => void
 }): ReactNode {
   const theme = useTheme()
-  const tick = useSyncExternalStore(
-    subscribeAnimationTick,
-    getAnimationTickSnapshot,
-    getAnimationTickSnapshot,
-  )
-  const spinner = SPINNER_FRAMES[tick % SPINNER_FRAMES.length]
   const lines = localInferenceProgressLines(progress)
     .filter(({ id }) => id !== "hardware")
+  const spinner = useSpinnerFrame(
+    Result.isInitial(hardware)
+      || lines.some(({ state }) => state === "running"),
+  )
   const cardWidth = setupCardWidth(width)
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.name === "escape") {
@@ -623,8 +619,7 @@ function OnboardingModelLoadingDetails({
 }): ReactNode {
   const theme = useTheme()
   const [hovered, setHovered] = useState<"retry" | "choose" | null>(null)
-  const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
-  const spinner = SPINNER_FRAMES[tick % SPINNER_FRAMES.length]
+  const spinner = useSpinnerFrame(failed === null)
   return (
     <box style={{
       width,

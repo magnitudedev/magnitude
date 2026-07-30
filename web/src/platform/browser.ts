@@ -119,6 +119,7 @@ export async function createBrowserPlatform(proxyUrl: string = ""): Promise<Plat
   return {
     id: "web",
     protocolLayer,
+    acnStartup: acn.startup,
     clipboard: browserClipboard,
     storage: browserStorage,
     notifications: browserNotifications,

@@ -18,6 +18,7 @@ import { ActiveSessionStatusesService } from "./active-session-statuses";
 import { DisplayViewStreams } from "./display-view-streams";
 import { ACN_VERSION } from "./version";
 import { makeHealthResponse } from "./identity";
+import { AcnStartupState } from "./startup-state";
 import { AcnDisplayViewIntrospector } from "./introspection";
 import { uploadAttachment } from "./attachment-upload";
 import {
@@ -52,6 +53,7 @@ const normalizeBashOutput = (output: string): string =>
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
+    const startup = yield* AcnStartupState;
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
     const providerCredentials = yield* ProviderCredentials;
@@ -185,7 +187,9 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
     return {
       // Connection
-      Health: () => Effect.succeed(makeHealthResponse(ACN_VERSION)),
+      Health: () => startup.get.pipe(
+        Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
+      ),
 
       // Session lifecycle
       PreloadSession: ({ cwd, options, draftOwnerId }) =>
