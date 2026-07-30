@@ -167,7 +167,7 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-      - run: bun run packages/release/scripts/accept-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
+      - run: bun run scripts/accept-release-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
       - name: Commit-point recheck
         run: bun run packages/release/scripts/preflight.ts
         env:
