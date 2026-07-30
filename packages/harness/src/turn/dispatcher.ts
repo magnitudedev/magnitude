@@ -38,6 +38,7 @@ export interface DispatchConfig<TDenial extends JsonValue = JsonValue> {
   readonly initialEngineState?: EngineState
   readonly emit: (event: HarnessEvent) => Effect.Effect<void>
   readonly maxThoughtChars?: number
+  readonly maxToolCalls?: number
   readonly requestId: string | null
 }
 
@@ -56,6 +57,7 @@ interface ToolCallAccumulator {
 
 export function dispatch<TDenial extends JsonValue = JsonValue>(config: DispatchConfig<TDenial>): Effect.Effect<void> {
   const { toolkit, hooks, emit, initialEngineState } = config
+  const maxToolCalls = config.maxToolCalls
 
   const withRequestId = <T extends object>(outcome: T): T & { readonly requestId: string | null } => ({
     ...outcome,
@@ -83,6 +85,8 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
   // Mutable dispatch state (scoped to this dispatch invocation)
   const accumulators = new Map<ToolCallId, ToolCallAccumulator>()
   let toolCallCount = 0
+  let completedToolCallCount = 0
+  let toolCallLimitExceeded = false
   let thoughtCharCount = 0
 
   // ── Provide layer to erased effect ───────────────────────────────
@@ -99,6 +103,16 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
 
   function defect(message: string): TurnAbort {
     return new TurnAbort({ outcome: withRequestId({ _tag: "EngineDefect", message }) })
+  }
+
+  function toolCallLimitAbort(limit: number): TurnAbort {
+    return new TurnAbort({
+      outcome: withRequestId({
+        _tag: "ToolCallLimitExceeded",
+        limit,
+        toolCallsCount: toolCallCount,
+      }),
+    })
   }
 
   function encodeSchemaJson(
@@ -340,6 +354,13 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
         return emit({ _tag: "MessageEnd" })
 
       case "tool_call_start": {
+        if (maxToolCalls !== undefined && toolCallCount >= maxToolCalls) {
+          toolCallLimitExceeded = true
+          return completedToolCallCount === toolCallCount
+            ? Effect.fail(toolCallLimitAbort(maxToolCalls))
+            : Effect.void
+        }
+
         const toolKey = toolNameToKey.get(event.toolName)
         if (!toolKey) {
           return Effect.fail(new TurnAbort({ outcome: withRequestId({ _tag: "EngineDefect", message: `Unknown tool name: ${event.toolName}` }) }))
@@ -464,6 +485,15 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
 
           // Execute tool inline — sequential ordering required for dependent tools
           yield* executeTool(acc.toolCallId, acc.providerToolCallId, acc.toolName, acc.toolKey, parser.decoded!)
+          completedToolCallCount++
+
+          if (
+            toolCallLimitExceeded
+            && maxToolCalls !== undefined
+            && completedToolCallCount === toolCallCount
+          ) {
+            return yield* toolCallLimitAbort(maxToolCalls)
+          }
         })
       }
 

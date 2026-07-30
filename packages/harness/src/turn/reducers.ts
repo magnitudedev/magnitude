@@ -85,6 +85,10 @@ export const StreamFailedTerminalSchema = Schema.TaggedStruct("StreamFailed", {
 
 export const TurnOutcomeSchema = Schema.Union(
   Schema.extend(Schema.TaggedStruct("Completed", { toolCallsCount: Schema.Number }), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
+  Schema.extend(Schema.TaggedStruct("ToolCallLimitExceeded", {
+    limit: Schema.Number,
+    toolCallsCount: Schema.Number,
+  }), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
   Schema.extend(Schema.TaggedStruct("OutputTruncated", {}), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
   Schema.extend(Schema.TaggedStruct("ContentFiltered", {}), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
   Schema.extend(Schema.TaggedStruct("SafetyStop", { reason: SafetyStopReasonSchema }), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),

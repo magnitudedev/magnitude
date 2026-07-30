@@ -230,6 +230,7 @@ export interface TurnCompletion {
 
 export type TurnFeedback =
   | { readonly _tag: 'InvalidMessageDestination'; readonly destination: string; readonly message: string }
+  | { readonly _tag: 'ToolCallLimitExceeded'; readonly limit: number }
   | { readonly _tag: 'OneshotLivenessRetriggered' }
 
 export type ProviderNotReadyDetail =

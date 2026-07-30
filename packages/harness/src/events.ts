@@ -52,7 +52,7 @@ export type SafetyStopReason =
 // ── Turn Outcome ─────────────────────────────────────────────────────
 
 interface TurnOutcomeBase {
-  readonly _tag: "Completed" | "OutputTruncated" | "ContentFiltered" | "SafetyStop" | "ToolInputValidationFailure" | "ToolExecutionError" | "GateRejected" | "StreamFailed" | "EngineDefect" | "Interrupted" | "ThoughtLimitExceeded"
+  readonly _tag: "Completed" | "ToolCallLimitExceeded" | "OutputTruncated" | "ContentFiltered" | "SafetyStop" | "ToolInputValidationFailure" | "ToolExecutionError" | "GateRejected" | "StreamFailed" | "EngineDefect" | "Interrupted" | "ThoughtLimitExceeded"
 }
 
 export type StreamFailedTerminal = Extract<ModelStreamTerminal, { readonly _tag: "StreamFailed" }>
@@ -61,6 +61,7 @@ type WithRequestId<T> = T & { readonly requestId: string | null }
 
 type TurnOutcomeConcrete<TInput> = WithRequestId<
   | { readonly _tag: "Completed"; readonly toolCallsCount: number }
+  | { readonly _tag: "ToolCallLimitExceeded"; readonly limit: number; readonly toolCallsCount: number }
   | { readonly _tag: "OutputTruncated" }
   | { readonly _tag: "ContentFiltered" }
   | { readonly _tag: "SafetyStop"; readonly reason: SafetyStopReason }
@@ -75,6 +76,7 @@ type TurnOutcomeConcrete<TInput> = WithRequestId<
 
 type TurnOutcomeErased = WithRequestId<
   | { readonly _tag: "Completed"; readonly toolCallsCount: number }
+  | { readonly _tag: "ToolCallLimitExceeded"; readonly limit: number; readonly toolCallsCount: number }
   | { readonly _tag: "OutputTruncated" }
   | { readonly _tag: "ContentFiltered" }
   | { readonly _tag: "SafetyStop"; readonly reason: SafetyStopReason }

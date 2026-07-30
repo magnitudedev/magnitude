@@ -40,6 +40,7 @@ export interface HarnessConfig<
   readonly layer?: Layer.Layer<ToolkitRequirements<TToolkit> | RHooks>
   readonly initialState?: EngineState
   readonly maxThoughtChars?: number
+  readonly maxToolCalls?: number
 }
 
 // ── Harness ──────────────────────────────────────────────────────────
@@ -130,6 +131,12 @@ export function createHarness<
   config: HarnessConfig<TCallOptions, TToolkit, RHooks, TStartFailure>,
 ): Harness<TCallOptions, TStartFailure> {
   const { toolkit, hooks, model } = config
+  if (
+    config.maxToolCalls !== undefined
+    && (!Number.isInteger(config.maxToolCalls) || config.maxToolCalls < 1)
+  ) {
+    throw new RangeError("maxToolCalls must be a positive integer")
+  }
 
   // Build tool definitions array from toolkit
   const toolDefs: ToolDefinition[] = []
@@ -232,6 +239,7 @@ export function createHarness<
         initialEngineState: config.initialState,
         emit: emitEvent,
         maxThoughtChars: config.maxThoughtChars,
+        maxToolCalls: config.maxToolCalls,
         requestId,
       })
 

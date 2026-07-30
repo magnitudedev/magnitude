@@ -509,6 +509,9 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
               case 'InvalidMessageDestination':
                 feedback.push({ kind: 'error', message: fb.message })
                 break
+              case 'ToolCallLimitExceeded':
+                feedback.push({ kind: 'tool_limit_reached', limit: fb.limit })
+                break
             }
           }
           break
