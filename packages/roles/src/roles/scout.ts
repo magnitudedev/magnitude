@@ -13,7 +13,7 @@ export function createScoutRole(): RoleDefinition {
     defaultRecipient: 'coordinator',
     agentKind: 'worker',
     spawnable: true,
-    maxThoughtChars: 2000,
+    maxThoughtChars: 20000,
     policy: [
       denyForbiddenCommands(),
       denyMutatingGit(),
