@@ -344,6 +344,15 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
               break
             }
 
+            case 'ToolCallLimitExceeded': {
+              feedback.push({
+                _tag: 'ToolCallLimitExceeded',
+                limit: outcome.limit,
+              })
+              executionResult = completed(outcome.toolCallsCount)
+              break
+            }
+
             case 'GateRejected': {
               executionResult = {
                 _tag: 'GateRejected',

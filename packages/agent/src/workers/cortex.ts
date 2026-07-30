@@ -239,6 +239,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           layer: turnLayer,
           initialState: hasRecoverableState ? engineState : undefined,
           maxThoughtChars: agentDef.maxThoughtChars,
+          maxToolCalls: agentModel.maxToolCalls,
           hooks: buildStandardHooks({
             forkId,
             turnId,

@@ -17,6 +17,9 @@ export function renderFeedbackText(feedback: readonly TurnFeedback[]): string {
       case 'overthinking':
         lines.push(`<overthinking>${fb.message}</overthinking>`)
         break
+      case 'tool_limit_reached':
+        lines.push(`<tool_limit_reached>\nAt most ${fb.limit} tool calls are allowed per turn.\n</tool_limit_reached>`)
+        break
       case 'interrupted':
         lines.push('<interrupted>The user pressed ESC and has interrupted your turn.</interrupted>')
         break

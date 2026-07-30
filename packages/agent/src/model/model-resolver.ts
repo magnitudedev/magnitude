@@ -8,10 +8,9 @@ import { TurnContextTag } from '../engine/turn-context'
 import { ModelRequestActivityAmbient } from '../display'
 import type { ModelRequestProgress } from '@magnitudedev/ai'
 import type { PrepareModelRequest } from './model-request-preparation'
+import { MAX_TOOL_CALLS_PER_TURN } from '../constants'
 
 export type { AgentBoundModel } from './agent-model'
-
-const MAX_TOOL_CALLS = 10
 
 const LEADER_TRAITS = ['ATTENTIVE', 'STRATEGIC', 'PROACTIVE', 'RESPECTFUL', 'GROUNDED', 'INTROSPECTIVE', 'TASK'] as const
 
@@ -138,7 +137,7 @@ export const AgentModelResolverLive = (
       return {
         resolveSlotConfig: (slot, agentId, roleId) => resolveFromSlot(slot, agentId ?? '000000000000', {
           roleId,
-          maxToolCalls: MAX_TOOL_CALLS,
+          maxToolCalls: MAX_TOOL_CALLS_PER_TURN,
           traits: roleId === 'leader' && !disableTraits ? LEADER_TRAITS : undefined,
         }),
         resolvePrimary: (roleId: RoleId, agentId?: string) =>
@@ -148,7 +147,7 @@ export const AgentModelResolverLive = (
             const slotConfig = getSlotConfigForRole(configState, roleId)
             return yield* resolveFromSlot(slotConfig, agentId ?? '000000000000', {
               roleId,
-              maxToolCalls: MAX_TOOL_CALLS,
+              maxToolCalls: MAX_TOOL_CALLS_PER_TURN,
               traits: roleId === 'leader' && !disableTraits ? LEADER_TRAITS : undefined,
             })
           }),
@@ -159,7 +158,7 @@ export const AgentModelResolverLive = (
             const configState = ambientService.getValue(ConfigAmbient)
             const slotConfig = getSlotConfig(configState, 'secondary')
             return yield* resolveFromSlot(slotConfig, agentId ?? 'secondary', {
-              maxToolCalls: MAX_TOOL_CALLS,
+              maxToolCalls: MAX_TOOL_CALLS_PER_TURN,
             })
           }),
       }

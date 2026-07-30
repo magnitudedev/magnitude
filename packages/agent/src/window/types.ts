@@ -12,6 +12,7 @@ export const TurnFeedbackSchema = Schema.Union(
   Schema.Struct({ kind: Schema.Literal('message_ack'), destination: Schema.Literal('coordinator'), chars: Schema.Number }),
   Schema.Struct({ kind: Schema.Literal('error'), message: Schema.String }),
   Schema.Struct({ kind: Schema.Literal('overthinking'), message: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal('tool_limit_reached'), limit: Schema.Number }),
   Schema.Struct({ kind: Schema.Literal('interrupted') }),
 )
 export type TurnFeedback = typeof TurnFeedbackSchema.Type

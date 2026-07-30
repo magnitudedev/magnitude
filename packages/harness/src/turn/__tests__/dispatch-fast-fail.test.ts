@@ -118,6 +118,7 @@ function runDispatch(
   opts?: {
     toolkit?: ReturnType<typeof defineToolkit>
     hooks?: Parameters<typeof dispatch>[0]['hooks']
+    maxToolCalls?: number
   },
 ): Effect.Effect<readonly HarnessEvent[]> {
   const tk = opts?.toolkit ?? toolkit
@@ -142,6 +143,7 @@ function runDispatch(
         toolkit: tk,
         hooks: opts?.hooks,
         emit,
+        maxToolCalls: opts?.maxToolCalls,
         requestId: null,
       }).pipe(Effect.ensuring(Queue.shutdown(queue))),
     )
@@ -188,6 +190,80 @@ describe('dispatch fast-fail', () => {
       const turnEnd = getTurnEnd(events)
       expect(turnEnd.outcome._tag).toBe('Completed')
       expect(turnEnd.outcome).toEqual({ _tag: 'Completed', toolCallsCount: 1, requestId: null })
+    }).pipe(Effect.runPromise)
+  )
+
+  it('executes only the accepted tool calls when the per-turn limit is exceeded', () =>
+    Effect.gen(function* () {
+      const events = yield* runDispatch(
+        [
+          ...toolCallEvents('call-1', 'succeed'),
+          ...toolCallEvents('call-2', 'succeed'),
+          ...toolCallEvents('call-3', 'succeed'),
+          ...messageEvents('should be ignored'),
+          streamEndCompleted(),
+        ],
+        { maxToolCalls: 2 },
+      )
+
+      expect(getTurnEnd(events).outcome).toEqual({
+        _tag: 'ToolCallLimitExceeded',
+        limit: 2,
+        toolCallsCount: 2,
+        requestId: null,
+      })
+      expect(tagsForToolCall(events, 'call-1')).toContain('ToolExecutionEnded')
+      expect(tagsForToolCall(events, 'call-2')).toContain('ToolExecutionEnded')
+      expect(tagsForToolCall(events, 'call-3')).toEqual([])
+      expect(eventTags(events)).not.toContain('MessageStart')
+    }).pipe(Effect.runPromise)
+  )
+
+  it('completes normally when the tool-call count equals the limit', () =>
+    Effect.gen(function* () {
+      const events = yield* runDispatch(
+        [
+          ...toolCallEvents('call-1', 'succeed'),
+          ...toolCallEvents('call-2', 'succeed'),
+          streamEndCompleted(),
+        ],
+        { maxToolCalls: 2 },
+      )
+
+      expect(getTurnEnd(events).outcome).toEqual({
+        _tag: 'Completed',
+        toolCallsCount: 2,
+        requestId: null,
+      })
+    }).pipe(Effect.runPromise)
+  )
+
+  it('finishes accepted interleaved calls before stopping the response', () =>
+    Effect.gen(function* () {
+      const call = (id: string) => ({
+        toolCallId: id as ToolCallId,
+        providerToolCallId: id as ProviderToolCallId,
+      })
+      const events = yield* runDispatch(
+        [
+          { _tag: 'tool_call_start', ...call('call-1'), toolName: 'succeed' },
+          { _tag: 'tool_call_start', ...call('call-2'), toolName: 'succeed' },
+          { _tag: 'tool_call_start', ...call('call-3'), toolName: 'succeed' },
+          { _tag: 'tool_call_field_delta', ...call('call-1'), path: ['value'], delta: '"x"' },
+          { _tag: 'tool_call_ready', ...call('call-1') },
+          { _tag: 'tool_call_field_delta', ...call('call-2'), path: ['value'], delta: '"x"' },
+          { _tag: 'tool_call_ready', ...call('call-2') },
+          { _tag: 'tool_call_field_delta', ...call('call-3'), path: ['value'], delta: '"x"' },
+          { _tag: 'tool_call_ready', ...call('call-3') },
+          streamEndCompleted(),
+        ],
+        { maxToolCalls: 2 },
+      )
+
+      expect(tagsForToolCall(events, 'call-1')).toContain('ToolExecutionEnded')
+      expect(tagsForToolCall(events, 'call-2')).toContain('ToolExecutionEnded')
+      expect(tagsForToolCall(events, 'call-3')).toEqual([])
+      expect(getTurnEnd(events).outcome._tag).toBe('ToolCallLimitExceeded')
     }).pipe(Effect.runPromise)
   )
 

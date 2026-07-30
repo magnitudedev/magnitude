@@ -37,6 +37,13 @@ export const PROSE_DELIM_CLOSE = '</raw>'
 export const OUTPUT_TOKEN_RESERVE = 8_192
 
 // =============================================================================
+// Tool Execution
+// =============================================================================
+
+/** Maximum tool calls accepted from one agent model response */
+export const MAX_TOOL_CALLS_PER_TURN = 10
+
+// =============================================================================
 // Compaction
 // =============================================================================
 
