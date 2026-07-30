@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.25
+
+### Patch Changes
+
+- [`94ecdde`](https://github.com/magnitudedev/magnitude/commit/94ecdde39a164c5791950a5b92fd106261a3493d) Thanks [@anerli](https://github.com/anerli)! - installation and acn lifecycle fixes
+
 ## 0.0.1-alpha.24
 
 ### Patch Changes
