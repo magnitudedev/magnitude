@@ -1,4 +1,4 @@
-import { memo, useSyncExternalStore } from 'react'
+import { memo } from 'react'
 import { Option } from 'effect'
 import { TextAttributes } from '@opentui/core'
 import type {
@@ -10,13 +10,13 @@ import type {
 import { useTheme } from '../../hooks/use-theme'
 import {
   slate,
-  subscribeAnimationTick,
-  getAnimationTickSnapshot,
   displayActorWorkElapsedMs,
   isDisplayActorWorkActive,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { red } from '../../utils/theme'
+import { spinnerFrameForTick } from '../../hooks/use-spinner-frame'
+import { useAnimationTick } from '../../hooks/use-animation-tick'
 import { modelRequestProgressSegments } from '../chat-timeline/model-request-progress'
 import { Button } from '../../components/button'
 
@@ -37,8 +37,6 @@ const THINKING_PULSE_COLORS = [
   '#b0bccd',       // 50%
   '#a2b0c3',       // 25%
 ] as const
-
-const BRAILLE_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
 
 interface ActivityRailProps {
   work: DisplayActorWork | null
@@ -70,13 +68,23 @@ export const ActivityRail = memo(function ActivityRail({
   advisorModelName,
 }: ActivityRailProps) {
   const theme = useTheme()
-  const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
 
   const active = work !== null && isDisplayActorWorkActive(work)
   const activity = work?.activity ?? null
   const hasSpinner = activity?.kind === 'tool' && Option.getOrNull(activity.decorator) === 'spinner'
   const hasActivity = activity !== null
   const isAdvisor = activity?.kind === 'advisor'
+  const modelLoadAnimating = modelLoadActivity !== null
+    && Option.exists(
+      modelLoadActivity.instance,
+      ({ lifecycle }) => lifecycle._tag !== "Failed",
+    )
+  const tick = useAnimationTick(
+    modelLoadAnimating
+      || modelRequestActivity !== null
+      || active
+      || isAdvisor,
+  )
 
   // Derive animation indices from tick (80ms per tick)
   // Thinking pulse: 250ms → ~3 ticks per step
@@ -84,8 +92,8 @@ export const ActivityRail = memo(function ActivityRail({
   // Dot pulse: 300ms → ~4 ticks per step
   const dotPulseIndex = active ? Math.floor(tick / 4) % WORKING_PULSE_COLORS.length : 0
   // Braille: 80ms → 1 tick per step
-  const brailleIndex = (hasSpinner && active) ? tick % BRAILLE_FRAMES.length : 0
-  const loadingBrailleIndex = tick % BRAILLE_FRAMES.length
+  const activitySpinner = spinnerFrameForTick(hasSpinner && active ? tick : 0)
+  const loadingSpinner = spinnerFrameForTick(tick)
 
   if (modelLoadActivity !== null) {
     const instance = Option.getOrThrow(modelLoadActivity.instance)
@@ -100,7 +108,7 @@ export const ActivityRail = memo(function ActivityRail({
       return (
         <box style={{ height: 1, flexShrink: 0 }}>
           <text>
-            <span style={{ fg: theme.muted }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
+            <span style={{ fg: theme.muted }}>{loadingSpinner}</span>
             {' '}
             <span style={{ fg: theme.muted }}>Stopping model…</span>
           </text>
@@ -110,7 +118,7 @@ export const ActivityRail = memo(function ActivityRail({
     return (
       <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
         <text>
-          <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
+          <span style={{ fg: theme.primary }}>{loadingSpinner}</span>
           {' '}
           <span style={{ fg: theme.foreground }}>Loading model into memory</span>
           <span style={{ fg: theme.muted }}>{` · ${Math.round(
@@ -138,7 +146,7 @@ export const ActivityRail = memo(function ActivityRail({
     return (
       <box style={{ height: 1, flexShrink: 0 }}>
         <text>
-          <span style={{ fg: theme.primary }}>{BRAILLE_FRAMES[loadingBrailleIndex]}</span>
+          <span style={{ fg: theme.primary }}>{loadingSpinner}</span>
           {' '}
           <span style={{ fg: theme.foreground }}>{compactLabel}</span>
           {progress.detail && (
@@ -170,7 +178,7 @@ export const ActivityRail = memo(function ActivityRail({
           {hasSpinner && (
             <>
               {' · '}
-              <span style={{ fg: theme.muted }}>{BRAILLE_FRAMES[brailleIndex]}</span>
+              <span style={{ fg: theme.muted }}>{activitySpinner}</span>
               {' '}
               {activity!.kind === 'tool' && activity.message}
             </>

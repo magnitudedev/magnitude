@@ -119,12 +119,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Validate a complete prepared ICN installation.
-    #[command(hide = true)]
-    InstallationCheck {
-        #[arg(long)]
-        installation: PathBuf,
-    },
     Version {
         #[arg(long)]
         json: bool,
@@ -4510,15 +4504,6 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
-        }
-        Command::InstallationCheck { installation } => {
-            let installation = installation::Installation::load(&installation)
-                .context("invalid ICN installation")?;
-            load_installation_backends(&installation)?;
-            NativeBackend::initialize().context("failed to initialize native backend")?;
-            validate_registered_backend(&installation)?;
-            open_installation_catalog(&installation)?;
-            println!("ICN installation is loadable");
         }
         Command::Version { json } => {
             if json {

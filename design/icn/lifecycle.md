@@ -260,9 +260,12 @@ usable; it does not perform an inventory-wide model inspection. Startup retry ap
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
-ACN does not advertise healthy service or complete daemon registration until this acquisition has
-succeeded. Concurrent consumers share the same memoized layer and cannot create additional
-children.
+Before this acquisition begins, ACN publishes its owner registration and a startup-only health
+endpoint. That endpoint reports the resolver's authoritative base download, accelerator download,
+installation, and launch activity; byte progress is present only while artifact bytes are being
+accepted. It rejects application RPC until acquisition succeeds. ACN reports `Ready` and admits RPC
+only after `IcnProcess` and the complete application layer exist. Concurrent consumers share the
+same memoized layer and cannot create additional children.
 
 ### Ready lifetime and unexpected exit
 

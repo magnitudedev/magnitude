@@ -12,34 +12,26 @@
  */
 import http, { createServer } from "node:http"
 import { createServer as createViteServer } from "vite"
-import { Effect, Layer, Runtime, Option } from "effect"
+import { Effect, Layer, Runtime, Option, Schema, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
   makeLocalDaemonSpawner,
-  type SpawnProcess,
+  BunDetachedSpawnProcess,
+  SpawnProcess,
+  RemoteDaemonSpawnMessageSchema,
+  runDaemonSpawn,
+  type RemoteDaemonSpawnMessage,
 } from "@magnitudedev/sdk"
 import { resolve } from "node:path"
-
-// ─── Bun spawner ──────────────────────────────────────────────────────
-
-const bunSpawn: SpawnProcess = (command) => {
-  const proc = Bun.spawn({
-    cmd: command,
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore"],
-    env: process.env,
-  })
-  proc.unref()
-  return { pid: proc.pid, exited: proc.exited }
-}
 
 // ─── Spawner for proxy endpoints ──────────────────────────────────────
 
 const rt = Runtime.defaultRuntime
 
 async function createSpawner() {
-  return Runtime.runPromise(rt)(makeLocalDaemonSpawner(bunSpawn).pipe(
+  return Runtime.runPromise(rt)(makeLocalDaemonSpawner().pipe(
+    Effect.provideService(SpawnProcess, BunDetachedSpawnProcess),
     Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer)),
   ))
 }
@@ -61,16 +53,35 @@ async function discoverDaemonUrl(): Promise<string | null> {
   return Option.getOrElse(result, () => null)
 }
 
-async function spawnDaemon(command: string[] | undefined): Promise<string> {
+async function spawnDaemon(
+  command: Option.Option<ReadonlyArray<string>>,
+): Promise<string> {
   const spawner = await getSpawner()
-  return Runtime.runPromise(rt)(spawner.spawn(command ?? defaultSpawnCommand))
+  return Runtime.runPromise(rt)(
+    runDaemonSpawn(
+      spawner.spawn(Option.orElse(command, () => defaultSpawnCommand)),
+    ),
+  )
 }
 
 // ─── Dev-mode spawn command ───────────────────────────────────────────
 
 const acnSourcePath = resolve(import.meta.dir, "..", "..", "packages", "acn", "src", "binary.ts")
-const defaultSpawnCommand = ["bun", acnSourcePath, "serve", "--register"]
-
+const defaultSpawnCommand = Option.some<ReadonlyArray<string>>([
+  "bun",
+  acnSourcePath,
+  "serve",
+  "--register",
+])
+const SpawnRequestSchema = Schema.Struct({
+  command: Schema.optionalWith(Schema.Array(Schema.String), {
+    as: "Option",
+    exact: true,
+  }),
+})
+const encodeSpawnMessage = Schema.encodeSync(
+  Schema.parseJson(RemoteDaemonSpawnMessageSchema),
+)
 // ─── HTTP server with Vite middleware ─────────────────────────────────
 
 const PORT = Number(process.env.PORT) || 5173
@@ -103,11 +114,39 @@ const server = createServer(async (req, res) => {
       const chunks: Buffer[] = []
       for await (const chunk of req) chunks.push(chunk as Buffer)
       const raw = Buffer.concat(chunks).toString()
-      const body = raw ? JSON.parse(raw) as { command?: string[] | null } : {}
-      const spawnedUrl = await spawnDaemon(body.command ?? undefined)
-      daemonUrl = spawnedUrl
-      res.writeHead(200, { "Content-Type": "application/json" })
-      res.end(JSON.stringify({ url: spawnedUrl }))
+      const body = await Runtime.runPromise(rt)(
+        Schema.decodeUnknown(SpawnRequestSchema)(
+          raw.length === 0 ? {} : JSON.parse(raw),
+        ),
+      )
+      res.writeHead(200, {
+        "Content-Type": "application/x-ndjson",
+        "Cache-Control": "no-store",
+      })
+      const write = (message: RemoteDaemonSpawnMessage): void => {
+        if (!res.destroyed) {
+          res.write(`${encodeSpawnMessage(message)}\n`)
+        }
+      }
+      try {
+        const spawner = await getSpawner()
+        await Runtime.runPromise(rt)(
+          spawner
+            .spawn(Option.orElse(body.command, () => defaultSpawnCommand))
+            .pipe(
+              Stream.runForEach((event) =>
+                Effect.sync(() => {
+                  if (event._tag === "Ready") daemonUrl = event.url
+                  write(event)
+                }),
+              ),
+            ),
+        )
+      } catch (err) {
+        const message = String(err).trim() || "Daemon startup failed"
+        write({ _tag: "Failed", message })
+      }
+      res.end()
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" })
       res.end(JSON.stringify({ error: String(err) }))

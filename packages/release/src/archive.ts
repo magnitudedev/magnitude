@@ -1,12 +1,14 @@
 import { createReadStream, createWriteStream } from "node:fs"
 import { chmod, mkdir } from "node:fs/promises"
 import { dirname, resolve, sep } from "node:path"
+import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { createGunzip } from "node:zlib"
 import { extract } from "tar-stream"
-import { Context, Effect, Layer, Option } from "effect"
+import { Context, Effect, Either, Layer, Option, Runtime } from "effect"
 import type { ReleaseArtifact } from "./contracts"
 import { ReleaseAcquisitionError } from "./errors"
+import type { ArtifactByteProgress } from "./installation-progress"
 
 const EXPANDED_LIMIT = 8 * 1024 * 1024 * 1024
 const ENTRY_LIMIT = 65_536
@@ -16,6 +18,9 @@ export interface ArchiveExtractorService {
     archive: string,
     destination: string,
     artifact: ReleaseArtifact,
+    onProgress: Option.Option<
+      (progress: ArtifactByteProgress) => Effect.Effect<void>
+    >,
   ) => Effect.Effect<void, ReleaseAcquisitionError>
 }
 
@@ -31,7 +36,9 @@ const archiveError = (message: string) =>
     transient: false,
   })
 
-const safePath = (value: string): string => {
+const safePath = (
+  value: string,
+): Either.Either<string, ReleaseAcquisitionError> => {
   if (
     value.length === 0 ||
     value.length > 1024 ||
@@ -41,19 +48,26 @@ const safePath = (value: string): string => {
     value.includes("\0") ||
     /^[a-zA-Z]:/.test(value) ||
     value.split("/").some((part) => part === "" || part === "." || part === "..")
-  ) throw archiveError(`unsafe archive path ${value}`)
-  return value
+  ) return Either.left(archiveError(`unsafe archive path ${value}`))
+  return Either.right(value)
 }
 
-const validateLayout = (artifact: ReleaseArtifact, paths: ReadonlySet<string>): void => {
-  const host = Option.getOrUndefined(artifact.host)
-  const extension = host === "windows-x64-msvc" ? ".exe" : ""
+const validateLayout = (
+  artifact: ReleaseArtifact,
+  paths: ReadonlySet<string>,
+): Effect.Effect<void, ReleaseAcquisitionError> => {
+  const extension = Option.exists(
+    artifact.host,
+    (host) => host === "windows-x64-msvc",
+  ) ? ".exe" : ""
   if (artifact.kind === "cli" || artifact.kind === "acn") {
     const expected = `bin/magnitude-${artifact.kind}${extension}`
     if (paths.size !== 1 || !paths.has(expected)) {
-      throw archiveError(`${artifact.id} has an invalid ${artifact.kind} layout`)
+      return archiveError(
+        `${artifact.id} has an invalid ${artifact.kind} layout`,
+      )
     }
-    return
+    return Effect.void
   }
   if (artifact.kind === "icn-base") {
     for (const required of [
@@ -61,25 +75,32 @@ const validateLayout = (artifact: ReleaseArtifact, paths: ReadonlySet<string>): 
       "catalog/release-catalog.lock.json",
       "catalog/model-planner-inputs.bundle",
     ]) {
-      if (!paths.has(required)) throw archiveError(`${artifact.id} is missing ${required}`)
+      if (!paths.has(required)) {
+        return archiveError(`${artifact.id} is missing ${required}`)
+      }
     }
     if (![...paths].some((path) => path.startsWith("backends/"))) {
-      throw archiveError(`${artifact.id} has no CPU backend`)
+      return archiveError(`${artifact.id} has no CPU backend`)
     }
     if ([...paths].some((path) =>
       !path.startsWith("bin/") &&
       !path.startsWith("runtime/") &&
       !path.startsWith("backends/") &&
       !path.startsWith("catalog/")
-    )) throw archiveError(`${artifact.id} has an unexpected path`)
-    return
+    )) {
+      return archiveError(`${artifact.id} has an unexpected path`)
+    }
+    return Effect.void
   }
   if (artifact.kind === "icn-backend") {
     if (
       ![...paths].some((path) => path.startsWith("backends/")) ||
       [...paths].some((path) => !path.startsWith("runtime/") && !path.startsWith("backends/"))
-    ) throw archiveError(`${artifact.id} has an invalid backend-pack layout`)
+    ) {
+      return archiveError(`${artifact.id} has an invalid backend-pack layout`)
+    }
   }
+  return Effect.void
 }
 
 // tar-stream exposes Node callback streams rather than Effect streams. This is the single
@@ -88,34 +109,75 @@ const extractWithNodeStreams = (
   archive: string,
   destination: string,
   artifact: ReleaseArtifact,
+  onProgress: Option.Option<
+    (progress: ArtifactByteProgress) => Effect.Effect<void>
+  >,
 ): Effect.Effect<void, ReleaseAcquisitionError> =>
-  Effect.async<void, ReleaseAcquisitionError>((resume) => {
-    const reader = extract()
-    const source = createReadStream(archive)
-    const gunzip = createGunzip()
-    const root = resolve(destination)
-    const paths = new Set<string>()
-    let entries = 0
-    let expanded = 0
-    reader.on("entry", (header, stream, next) => {
-      const fail = (cause: unknown): void => {
-        stream.resume()
-        reader.destroy(cause instanceof Error ? cause : new Error(String(cause)))
-      }
-      try {
-        if (header.type !== "file") throw archiveError("release archives may contain only files")
-        const relative = safePath(header.name)
-        if (paths.has(relative) || ++entries > ENTRY_LIMIT) {
-          throw archiveError(`duplicate or excessive archive entry ${relative}`)
+  Effect.gen(function* () {
+    const runtime = yield* Effect.runtime<never>()
+    return yield* Effect.async<void, ReleaseAcquisitionError>((resume) => {
+      const reader = extract()
+      const source = createReadStream(archive)
+      let compressed = 0
+      const reportProgress = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          compressed += chunk.byteLength
+          Option.match(onProgress, {
+            onNone: () => callback(null, chunk),
+            onSome: (report) => {
+              Runtime.runPromise(runtime)(
+                report({
+                  completedBytes: compressed,
+                  totalBytes: artifact.bytes,
+                })
+              ).then(
+                () => callback(null, chunk),
+                () => callback(new Error("archive progress reporter failed"))
+              )
+            },
+          })
+        },
+      })
+      const gunzip = createGunzip()
+      const root = resolve(destination)
+      const paths = new Set<string>()
+      let entries = 0
+      let expanded = 0
+      reader.on("entry", (header, stream, next) => {
+        const fail = (cause: Error): void => {
+          stream.resume()
+          reader.destroy(cause)
         }
-        paths.add(relative)
-        const output = resolve(root, relative)
-        if (!output.startsWith(`${root}${sep}`)) throw archiveError(`${relative} escapes staging`)
+        if (header.type !== "file") {
+          fail(archiveError("release archives may contain only files"))
+          return
+        }
+        const relative = safePath(header.name)
+        if (Either.isLeft(relative)) {
+          fail(relative.left)
+          return
+        }
+        if (paths.has(relative.right) || ++entries > ENTRY_LIMIT) {
+          fail(
+            archiveError(
+              `duplicate or excessive archive entry ${relative.right}`,
+            ),
+          )
+          return
+        }
+        paths.add(relative.right)
+        const output = resolve(root, relative.right)
+        if (!output.startsWith(`${root}${sep}`)) {
+          fail(archiveError(`${relative.right} escapes staging`))
+          return
+        }
         void (async () => {
           await mkdir(dirname(output), { recursive: true, mode: 0o700 })
           stream.on("data", (chunk: Buffer) => {
             expanded += chunk.byteLength
-            if (expanded > EXPANDED_LIMIT) stream.destroy(archiveError("expanded archive is too large"))
+            if (expanded > EXPANDED_LIMIT) {
+              stream.destroy(archiveError("expanded archive is too large"))
+            }
           })
           await pipeline(stream, createWriteStream(output, {
             flags: "wx",
@@ -123,35 +185,21 @@ const extractWithNodeStreams = (
           }))
           await chmod(output, (header.mode ?? 0o644) & 0o777)
           next()
-        })().catch(fail)
-      } catch (cause) {
-        fail(cause)
-      }
-    })
-    pipeline(source, gunzip, reader)
-      .then(() => {
-        try {
-          validateLayout(artifact, paths)
-          resume(Effect.void)
-        } catch (cause) {
-          resume(Effect.fail(
-            cause instanceof ReleaseAcquisitionError
-              ? cause
-              : archiveError("release archive layout validation failed"),
-          ))
-        }
+        })().catch((cause) => fail(new Error(String(cause))))
       })
-      .catch((cause) =>
-        resume(Effect.fail(
-          cause instanceof ReleaseAcquisitionError
-            ? cause
-            : archiveError(cause instanceof Error ? cause.message : "archive extraction failed"),
-        ))
-      )
-    return Effect.sync(() => {
-      source.destroy()
-      gunzip.destroy()
-      reader.destroy()
+      pipeline(source, reportProgress, gunzip, reader)
+        .then(() => resume(validateLayout(artifact, paths)))
+        .catch((cause) =>
+          resume(Effect.fail(
+            archiveError(`archive extraction failed: ${String(cause)}`),
+          ))
+        )
+      return Effect.sync(() => {
+        source.destroy()
+        reportProgress.destroy()
+        gunzip.destroy()
+        reader.destroy()
+      })
     })
   })
 

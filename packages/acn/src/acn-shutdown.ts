@@ -2,7 +2,6 @@ import { Context, Deferred, Effect, Layer, Option } from "effect";
 
 export type AcnShutdownReason =
   | "idle"
-  | "upgrade"
   | "ownership-lost"
   | "icn-exited"
   | "signal"

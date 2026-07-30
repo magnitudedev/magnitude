@@ -1,17 +1,16 @@
-import { memo, useState, useSyncExternalStore } from 'react'
+import { memo, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { Button } from '../../components/button'
+import { spinnerFrameForTick } from '../../hooks/use-spinner-frame'
+import { useAnimationTick } from '../../hooks/use-animation-tick'
 import { useTheme } from '../../hooks/use-theme'
-import { blue, slate, subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import { blue, slate } from '@magnitudedev/client-common'
 
 // Same pulse animation as subagent working state in task-list.tsx
 const PULSE_BLUE_SHADES = [
   blue[50], blue[100], blue[200], blue[300], blue[400], blue[500], blue[600], blue[700], blue[800], blue[900],
   blue[800], blue[700], blue[600], blue[500], blue[400], blue[300], blue[200], blue[100], blue[50],
 ] as const
-
-// Braille spinner frames (same as deleted workflow-phase-bar.tsx)
-const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 interface AutopilotIndicatorProps {
   enabled: boolean
@@ -26,11 +25,11 @@ export const AutopilotIndicator = memo(function AutopilotIndicator({
 }: AutopilotIndicatorProps) {
   const theme = useTheme()
   const [hovered, setHovered] = useState(false)
-  const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
+  const tick = useAnimationTick(enabled || generating)
 
   // Derive animation from tick (80ms per tick)
   const iconContent = generating
-    ? SPINNER_FRAMES[tick % SPINNER_FRAMES.length]
+    ? spinnerFrameForTick(tick)
     : '●'
 
   const iconColor = generating

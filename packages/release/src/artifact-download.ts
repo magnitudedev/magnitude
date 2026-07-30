@@ -4,7 +4,17 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import * as Path from "@effect/platform/Path"
-import { Data, Duration, Effect, Option, Ref, Schedule, Stream } from "effect"
+import {
+  Data,
+  Duration,
+  Effect,
+  Option,
+  Ref,
+  Schedule,
+  Sink,
+  Stream,
+} from "effect"
+import type { ArtifactByteProgress } from "./installation-progress"
 
 export type ArtifactDownloadStrategy =
   | { readonly _tag: "Sequential" }
@@ -22,20 +32,35 @@ export interface ArtifactDownloadProgress {
   readonly attempt: number
 }
 
+export interface ArtifactDownloadPolicy {
+  readonly retryCount: number
+  readonly retryDelay: Duration.DurationInput
+  readonly attemptTimeout: Duration.DurationInput
+  readonly stallTimeout: Duration.DurationInput
+  readonly totalTimeout: Duration.DurationInput
+}
+
+export const defaultArtifactDownloadPolicy: ArtifactDownloadPolicy = {
+  retryCount: 2,
+  retryDelay: "500 millis",
+  attemptTimeout: "10 minutes",
+  stallTimeout: "60 seconds",
+  totalTimeout: "31 minutes",
+}
+
 export interface ArtifactDownloadInput {
   readonly url: string
   readonly destination: string
   readonly bytes: number
   readonly sha256: string
   readonly strategy: ArtifactDownloadStrategy
-  readonly retryCount?: number
-  readonly retryDelay?: Duration.DurationInput
-  readonly attemptTimeout?: Duration.DurationInput
-  readonly stallTimeout?: Duration.DurationInput
-  readonly totalTimeout?: Duration.DurationInput
-  readonly onProgress?: (
-    progress: ArtifactDownloadProgress,
-  ) => Effect.Effect<void>
+  readonly policy: ArtifactDownloadPolicy
+  readonly onProgress: Option.Option<
+    (progress: ArtifactDownloadProgress) => Effect.Effect<void>
+  >
+  readonly onVerificationProgress: Option.Option<
+    (progress: ArtifactByteProgress) => Effect.Effect<void>
+  >
 }
 
 export interface ArtifactDownloadResult {
@@ -113,12 +138,29 @@ const report = (
   acceptedBytes: number,
   attempt: number,
 ) =>
-  input.onProgress?.({
-    strategy,
-    acceptedBytes,
-    totalBytes: input.bytes,
-    attempt,
-  }) ?? Effect.void
+  Option.match(input.onProgress, {
+    onNone: () => Effect.void,
+    onSome: (onProgress) =>
+      onProgress({
+        strategy,
+        acceptedBytes,
+        totalBytes: input.bytes,
+        attempt,
+      }),
+  })
+
+const reportVerification = (
+  input: ArtifactDownloadInput,
+  completedBytes: number,
+) =>
+  Option.match(input.onVerificationProgress, {
+    onNone: () => Effect.void,
+    onSome: (onProgress) =>
+      onProgress({
+        completedBytes,
+        totalBytes: input.bytes,
+      }),
+  })
 
 const discardResponse = (response: HttpClientResponse.HttpClientResponse) =>
   response.stream.pipe(
@@ -140,9 +182,12 @@ const streamResponse = (
     const fs = yield* FileSystem.FileSystem
     let received = 0
     yield* response.stream.pipe(
+      Stream.mapError(() =>
+        downloadError("stream", "artifact response stream failed", true)
+      ),
       Stream.timeoutFail(
         () => downloadError("stream", "artifact response stalled", true),
-        input.stallTimeout ?? "60 seconds",
+        input.policy.stallTimeout,
       ),
       Stream.tap((chunk) => {
         received += chunk.byteLength
@@ -158,11 +203,12 @@ const streamResponse = (
           ),
         )
       }),
-      Stream.run(fs.sink(destination, { flag: "w", mode: 0o600 })),
-      Effect.mapError((cause) =>
-        cause instanceof ArtifactDownloadError
-          ? cause
-          : downloadError("stream", "artifact response stream failed", true)
+      Stream.run(
+        fs.sink(destination, { flag: "w", mode: 0o600 }).pipe(
+          Sink.mapError(() =>
+            downloadError("filesystem", "unable to write downloaded artifact")
+          ),
+        ),
       ),
     )
     if (received !== expectedBytes) {
@@ -192,8 +238,16 @@ const validateCompleteFile = (
       )
     }
     const digest = createHash("sha256")
+    let completedBytes = 0
     yield* fs.stream(path).pipe(
-      Stream.tap((chunk) => Effect.sync(() => digest.update(chunk))),
+      Stream.tap((chunk) =>
+        Effect.sync(() => {
+          completedBytes += chunk.byteLength
+          digest.update(chunk)
+        }).pipe(
+          Effect.zipRight(reportVerification(input, completedBytes))
+        )
+      ),
       Stream.runDrain,
       Effect.mapError(() =>
         downloadError("filesystem", "unable to hash downloaded artifact")
@@ -256,7 +310,7 @@ const sequentialAttempt = (
     )
   }).pipe(
     Effect.timeoutFail({
-      duration: input.attemptTimeout ?? "10 minutes",
+      duration: input.policy.attemptTimeout,
       onTimeout: () =>
         downloadError("stream", "artifact attempt timed out", true),
     }),
@@ -278,7 +332,10 @@ const downloadSequential = (
       ),
       Effect.retry({
         while: (error) => error.transient,
-        schedule: retrySchedule(input.retryCount ?? 2, input.retryDelay ?? "500 millis"),
+        schedule: retrySchedule(
+          input.policy.retryCount,
+          input.policy.retryDelay,
+        ),
       }),
     )
     yield* validateCompleteFile(input, staging)
@@ -466,7 +523,7 @@ const downloadRange = (
       )
     }).pipe(
       Effect.timeoutFail({
-        duration: input.attemptTimeout ?? "10 minutes",
+        duration: input.policy.attemptTimeout,
         onTimeout: () =>
           downloadError("stream", `range ${range.index} timed out`, true),
       }),
@@ -474,7 +531,10 @@ const downloadRange = (
     yield* once.pipe(
       Effect.retry({
         while: (error) => error.transient,
-        schedule: retrySchedule(input.retryCount ?? 2, input.retryDelay ?? "500 millis"),
+        schedule: retrySchedule(
+          input.policy.retryCount,
+          input.policy.retryDelay,
+        ),
       }),
     )
   })
@@ -497,7 +557,7 @@ const assembleRanges = (
           Effect.sync(() => {
             bytes += chunk.byteLength
             digest.update(chunk)
-          })
+          }).pipe(Effect.zipRight(reportVerification(input, bytes)))
         ),
         Stream.run(fs.sink(staging, {
           flag: range.index === 0 ? "w" : "a",
@@ -546,16 +606,16 @@ const downloadSegmented = (
     const path = yield* Path.Path
     const representation = yield* probeRanges(input).pipe(
       Effect.timeoutFail({
-        duration: input.attemptTimeout ?? "10 minutes",
+        duration: input.policy.attemptTimeout,
         onTimeout: () =>
           downloadError("stream", "range probe timed out", true),
       }),
       Effect.retry({
         while: (error) =>
-          error instanceof ArtifactDownloadError && error.transient,
+          error._tag === "ArtifactDownloadError" && error.transient,
         schedule: retrySchedule(
-          input.retryCount ?? 2,
-          input.retryDelay ?? "500 millis",
+          input.policy.retryCount,
+          input.policy.retryDelay,
         ),
       }),
     )
@@ -599,8 +659,8 @@ export const downloadArtifact = (
         input.bytes <= 0 ||
         !/^[a-f0-9]{64}$/.test(input.sha256) ||
         (
-          input.retryCount !== undefined &&
-          (!Number.isSafeInteger(input.retryCount) || input.retryCount < 0)
+          !Number.isSafeInteger(input.policy.retryCount) ||
+          input.policy.retryCount < 0
         )
       ) {
         return yield* downloadError(
@@ -662,7 +722,7 @@ export const downloadArtifact = (
             return Effect.gen(function* () {
               const usedStrategy = yield* restore(transfer.pipe(
                 Effect.timeoutFail({
-                  duration: input.totalTimeout ?? "31 minutes",
+                  duration: input.policy.totalTimeout,
                   onTimeout: () =>
                     downloadError(
                       "stream",

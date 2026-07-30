@@ -19,6 +19,7 @@ import {
   IcnLifecycleConfig,
   IcnStorageConfig,
   renderIcnArguments,
+  IcnPreparationReporter,
 } from "./index.js";
 
 const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
@@ -124,6 +125,11 @@ describe("ICN managed launch", () => {
           }).pipe(
             Effect.provide(
               makeIcnBinaryResolver().pipe(
+                Layer.provide(
+                  Layer.succeed(IcnPreparationReporter, {
+                    report: () => Effect.void,
+                  }),
+                ),
                 Layer.provideMerge(
                   Layer.merge(BunContext.layer, FetchHttpClient.layer)
                 )

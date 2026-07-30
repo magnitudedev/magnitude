@@ -1,8 +1,9 @@
 export {
   makeLocalDaemonSpawner,
+  SpawnProcess,
   decideDaemonAction,
   type DaemonAction,
-  type HealthResponse,
   type LocalSpawnerOptions,
-  type SpawnProcess,
+  type SpawnedProcess,
 } from "./acn-jit/local-daemon-spawner"
+export type { AcnHealthResponse as HealthResponse } from "@magnitudedev/acn-protocol"

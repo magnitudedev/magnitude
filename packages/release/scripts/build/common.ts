@@ -94,7 +94,14 @@ export const buildArchive = async (
       "-C",
       staging,
       ...paths.slice().sort(),
-    ])
+    ], {
+      env: {
+        ...process.env,
+        // Prevent macOS tar from adding AppleDouble `._*` metadata entries,
+        // which would violate the release archive's exact file layout.
+        COPYFILE_DISABLE: "1",
+      },
+    })
     const info = await stat(archive)
     const artifact = Schema.validateSync(ReleaseArtifactSchema)({
       ...draft,

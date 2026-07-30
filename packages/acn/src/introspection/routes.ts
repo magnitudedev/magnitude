@@ -6,6 +6,7 @@ import { Effect, Layer, Stream } from "effect"
 import { SessionError } from "@magnitudedev/acn-protocol"
 import { sessionErrorMessage } from "../session-errors"
 import { AcnIntrospector } from "./service"
+import type { AcnIntrospectorApi } from "./service"
 
 const encoder = new TextEncoder()
 
@@ -104,3 +105,36 @@ export function AcnIntrospectionRoutes(
 export function AcnIntrospectionRoutes(enabled: boolean) {
   return enabled ? AcnIntrospectionRoutesLive : AcnIntrospectionRoutesDisabled
 }
+
+export const installAcnIntrospectionRoutes = (
+  router: HttpLayerRouter.HttpRouter,
+  introspector: AcnIntrospectorApi,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    yield* router.add(
+      "GET",
+      "/dev/introspection",
+      introspector.currentOverview.pipe(Effect.flatMap(json)),
+    )
+    yield* router.add("GET", "/dev/sessions", introspector.currentOverview.pipe(
+      Effect.flatMap((overview) => json({
+        sessions: overview.sessions,
+        activity: overview.activity,
+        timestamp: overview.timestamp,
+      })),
+    ))
+    yield* router.add(
+      "GET",
+      "/dev/sessions/:sessionId",
+      (request) => currentSessionResponse(request).pipe(
+        Effect.provideService(AcnIntrospector, introspector),
+      ),
+    )
+    yield* router.add(
+      "GET",
+      "/dev/sessions/:sessionId/stream",
+      (request) => sessionChangesResponse(request).pipe(
+        Effect.provideService(AcnIntrospector, introspector),
+      ),
+    )
+  })

@@ -8,9 +8,13 @@ import { createHash } from "node:crypto"
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Effect, Fiber, Layer } from "effect"
+import { Effect, Fiber, Layer, Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { downloadArtifact } from "./artifact-download"
+import {
+  defaultArtifactDownloadPolicy,
+  downloadArtifact,
+  type ArtifactDownloadPolicy,
+} from "./artifact-download"
 
 const DownloadLayer = Layer.mergeAll(
   NodeFileSystem.layer,
@@ -20,6 +24,13 @@ const DownloadLayer = Layer.mergeAll(
 
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex")
+
+const policy = (
+  overrides: Partial<ArtifactDownloadPolicy> = {},
+): ArtifactDownloadPolicy => ({
+  ...defaultArtifactDownloadPolicy,
+  ...overrides,
+})
 
 const run = <A, E>(
   effect: Effect.Effect<
@@ -60,7 +71,9 @@ describe("artifact downloader", () => {
         bytes: bytes.byteLength,
         sha256: sha256(bytes),
         strategy: { _tag: "Sequential" },
-        retryDelay: "1 millis",
+        policy: policy({ retryDelay: "1 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }))
       expect(result.strategy).toBe("Sequential")
       expect(requests).toBe(2)
@@ -118,7 +131,9 @@ describe("artifact downloader", () => {
           chunkBytes: 8,
           fallbackToSequential: false,
         },
-        retryDelay: "1 millis",
+        policy: policy({ retryDelay: "1 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }))
       expect(result.strategy).toBe("Segmented")
       expect(maximumActive).toBe(2)
@@ -162,7 +177,9 @@ describe("artifact downloader", () => {
           chunkBytes: 8,
           fallbackToSequential: true,
         },
-        retryDelay: "1 millis",
+        policy: policy({ retryDelay: "1 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }))
       expect(result.strategy).toBe("Sequential")
       expect(rangeRequests).toBe(1)
@@ -189,7 +206,9 @@ describe("artifact downloader", () => {
         bytes: bytes.byteLength,
         sha256: "0".repeat(64),
         strategy: { _tag: "Sequential" },
-        retryDelay: "1 millis",
+        policy: policy({ retryDelay: "1 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }).pipe(Effect.flip))
       expect(error.phase).toBe("integrity")
       await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" })
@@ -232,7 +251,9 @@ describe("artifact downloader", () => {
           chunkBytes: 8,
           fallbackToSequential: true,
         },
-        retryDelay: "1 millis",
+        policy: policy({ retryDelay: "1 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }).pipe(Effect.flip))
       expect(error.phase).toBe("protocol")
       expect(requests).toBe(1)
@@ -277,7 +298,9 @@ describe("artifact downloader", () => {
           chunkBytes: 8,
           fallbackToSequential: true,
         },
-        retryDelay: "1 millis",
+        policy: policy({ retryDelay: "1 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }).pipe(Effect.flip))
       expect(error.phase).toBe("protocol")
       expect(error.message).toContain("different ETag")
@@ -311,6 +334,9 @@ describe("artifact downloader", () => {
         bytes: bytes.byteLength,
         sha256: sha256(bytes),
         strategy: { _tag: "Sequential" },
+        policy: policy(),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }).pipe(Effect.provide(DownloadLayer)))
       await requestStarted
       await Effect.runPromise(Fiber.interrupt(fiber))
@@ -340,8 +366,12 @@ describe("artifact downloader", () => {
         bytes: bytes.byteLength,
         sha256: sha256(bytes),
         strategy: { _tag: "Sequential" },
-        attemptTimeout: "1 minute",
-        totalTimeout: "10 millis",
+        policy: policy({
+          attemptTimeout: "1 minute",
+          totalTimeout: "10 millis",
+        }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
       }).pipe(Effect.flip))
       expect(error.phase).toBe("stream")
       expect(error.message).toContain("total deadline")

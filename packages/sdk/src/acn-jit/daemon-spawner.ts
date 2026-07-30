@@ -1,32 +1,33 @@
-import { Effect, Context, Option } from "effect"
-import { DaemonError } from "./errors"
-import type { JitDaemonProvider } from "../jit-rpc"
+import { Context, Effect, Option, Schema, Stream } from "effect"
+import { DaemonError, DaemonSpawnFailed } from "./errors"
+import { AcnLifecycleObservationSchema } from "./lifecycle"
+
+export const DaemonSpawnEventSchema = Schema.Union(
+  Schema.TaggedStruct("Observation", {
+    observation: AcnLifecycleObservationSchema,
+  }),
+  Schema.TaggedStruct("Ready", {
+    url: Schema.String.pipe(Schema.minLength(1)),
+  }),
+)
+export type DaemonSpawnEvent = typeof DaemonSpawnEventSchema.Type
 
 /**
- * Spawner abstraction for daemon lifecycle.
+ * The environment-specific boundary for daemon discovery and startup.
  *
- * The spawner is the single variable point across environments:
- * - **Local (Bun/Node):** reads registration files, health-checks, spawns
- *   processes directly via `makeLocalDaemonSpawner`.
- * - **Remote (Browser):** delegates `discover`/`spawn` to a proxy server via
- *   HTTP fetch via `makeRemoteDaemonSpawner`.
- *
- * Both `discover` and `spawn` require `never` — all dependencies
- * (`FileSystem`, `HttpClient`, `CommandExecutor`) are captured at
- * construction time (see `makeLocalDaemonSpawner` /
- * `makeRemoteDaemonSpawner`) and sealed inside the returned spawner.
+ * Startup is a stream because observations occur before the final endpoint.
+ * Local implementations produce it directly; remote implementations transport
+ * the same schema. Failures remain in the typed stream error channel.
  */
 export interface DaemonSpawner {
-  /** Discover a healthy daemon URL. Returns `None` if none found. */
-  readonly discover: () => Effect.Effect<Option.Option<string>, DaemonError, never>
-  /**
-   * Spawn a daemon process and wait until it is healthy.
-   * Returns the URL of the now-healthy daemon.
-   * If `command` is `undefined`, the spawner resolves the binary itself
-   * (local spawners use `resolveBinaryCommand`; remote spawners delegate to
-   * the proxy's default).
-   */
-  readonly spawn: (command: string[] | undefined) => Effect.Effect<string, DaemonError, never>
+  readonly discover: () => Effect.Effect<
+    Option.Option<string>,
+    DaemonError,
+    never
+  >
+  readonly spawn: (
+    command: Option.Option<ReadonlyArray<string>>,
+  ) => Stream.Stream<DaemonSpawnEvent, DaemonError>
 }
 
 export class DaemonSpawnerTag extends Context.Tag("DaemonSpawner")<
@@ -34,16 +35,40 @@ export class DaemonSpawnerTag extends Context.Tag("DaemonSpawner")<
   DaemonSpawner
 >() {}
 
-export const toJitDaemonProvider = (
-  spawner: DaemonSpawner,
-  spawnCommand?: string[],
-): JitDaemonProvider<DaemonError> => ({
-  discover: () =>
-    spawner.discover().pipe(
-      Effect.map(Option.map((url) => ({ url }))),
+interface SpawnReduction {
+  readonly ready: Option.Option<string>
+}
+
+export const runDaemonSpawn = (
+  events: Stream.Stream<DaemonSpawnEvent, DaemonError>,
+): Effect.Effect<string, DaemonError> =>
+  events.pipe(
+    Stream.runFoldEffect(
+      { ready: Option.none<string>() } satisfies SpawnReduction,
+      (state, event) => {
+        if (event._tag === "Observation") {
+          if (Option.isSome(state.ready)) {
+            return new DaemonSpawnFailed({
+              reason: "Daemon spawn emitted an observation after readiness",
+            })
+          }
+          return Effect.succeed(state)
+        }
+        if (Option.isSome(state.ready)) {
+          return new DaemonSpawnFailed({
+            reason: "Daemon spawn emitted readiness more than once",
+          })
+        }
+        return Effect.succeed({ ready: Option.some(event.url) })
+      },
     ),
-  spawn: () =>
-    spawner.spawn(spawnCommand).pipe(
-      Effect.map((url) => ({ url })),
+    Effect.flatMap(({ ready }) =>
+      Option.match(ready, {
+        onNone: () =>
+          new DaemonSpawnFailed({
+            reason: "Daemon spawn ended without a ready endpoint",
+          }),
+        onSome: Effect.succeed,
+      }),
     ),
-})
+  )

@@ -18,12 +18,15 @@
  *
  * Browser-safe: only depends on `HttpClient` (fetch-based). Zero Node imports.
  */
-import { Effect, Option, Schema } from "effect"
+import { Effect, Option, Schema, Stream } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { DaemonSpawnFailed } from "./errors"
-import type { DaemonSpawner } from "./daemon-spawner"
+import {
+  DaemonSpawnEventSchema,
+  type DaemonSpawner,
+} from "./daemon-spawner"
 
 // ─── Response schemas ────────────────────────────────────────────────────────
 
@@ -31,9 +34,14 @@ const DiscoverResponse = Schema.Struct({
   url: Schema.Union(Schema.String, Schema.Null),
 })
 
-const SpawnResponse = Schema.Struct({
-  url: Schema.String,
-})
+export const RemoteDaemonSpawnMessageSchema = Schema.Union(
+  DaemonSpawnEventSchema,
+  Schema.TaggedStruct("Failed", {
+    message: Schema.String.pipe(Schema.minLength(1)),
+  }),
+)
+export type RemoteDaemonSpawnMessage =
+  typeof RemoteDaemonSpawnMessageSchema.Type
 
 const ErrorResponse = Schema.Struct({
   error: Schema.String,
@@ -91,40 +99,67 @@ export const makeRemoteDaemonSpawner = (
           Effect.catchAll(() => Effect.succeed(Option.none<string>())),
         ),
 
-      // POST {proxyUrl}/spawn with { command } → { url: string }
-      // Hard failure on any error — spawn is the fallback path, if it fails
-      // there's nothing else to try.
+      // POST {proxyUrl}/spawn streams observations followed by readiness.
       spawn: (command) =>
-        Effect.gen(function* () {
-          const req = yield* HttpClientRequest.post(`${proxyUrl}/spawn`).pipe(
-            HttpClientRequest.bodyJson({ command }),
-            Effect.mapError((cause) => new DaemonSpawnFailed({ reason: `Failed to build request: ${String(cause)}` })),
-          )
-          const response = yield* client.execute(req).pipe(
-            Effect.timeout("30 seconds"),
-            Effect.mapError((cause) =>
-              new DaemonSpawnFailed({ reason: `Proxy request timed out: ${String(cause)}` })
-            ),
-          )
-
-          if (response.status < 200 || response.status >= 300) {
-            const message = yield* extractErrorMessage(response)
-            return yield* new DaemonSpawnFailed({ reason: `Proxy returned error: ${message}` })
-          }
-
-          const json = yield* response.json.pipe(
-            Effect.mapError((cause) =>
-              new DaemonSpawnFailed({ reason: `Failed to parse proxy response: ${String(cause)}` })
-            ),
-          )
-
-          const parsed = yield* Schema.decodeUnknown(SpawnResponse)(json).pipe(
-            Effect.mapError((cause) =>
-              new DaemonSpawnFailed({ reason: `Invalid proxy response: ${String(cause)}` })
-            ),
-          )
-
-          return parsed.url
-        }),
+        Stream.unwrap(
+          Effect.gen(function* () {
+            const req = yield* HttpClientRequest.post(`${proxyUrl}/spawn`).pipe(
+              HttpClientRequest.bodyJson(
+                Option.match(command, {
+                  onNone: () => ({}),
+                  onSome: (value) => ({ command: value }),
+                }),
+              ),
+              Effect.mapError(
+                (cause) =>
+                  new DaemonSpawnFailed({
+                    reason: `Failed to build request: ${String(cause)}`,
+                  }),
+              ),
+            )
+            const response = yield* client.execute(req).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new DaemonSpawnFailed({
+                    reason: `Proxy request failed: ${String(cause)}`,
+                  }),
+              ),
+            )
+            if (response.status < 200 || response.status >= 300) {
+              const message = yield* extractErrorMessage(response)
+              return yield* new DaemonSpawnFailed({
+                reason: `Proxy returned error: ${message}`,
+              })
+            }
+            return response.stream.pipe(
+              Stream.mapError(
+                (cause) =>
+                  new DaemonSpawnFailed({
+                    reason: `Proxy startup stream failed: ${String(cause)}`,
+                  }),
+              ),
+              Stream.decodeText(),
+              Stream.splitLines,
+              Stream.filter((line) => line.trim().length > 0),
+              Stream.mapEffect((line) =>
+                Schema.decodeUnknown(
+                  Schema.parseJson(RemoteDaemonSpawnMessageSchema),
+                )(line).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new DaemonSpawnFailed({
+                        reason: `Invalid proxy startup message: ${String(cause)}`,
+                      }),
+                  ),
+                  Effect.flatMap((message) =>
+                    message._tag === "Failed"
+                      ? new DaemonSpawnFailed({ reason: message.message })
+                      : Effect.succeed(message),
+                  ),
+                ),
+              ),
+            )
+          }),
+        ),
     } satisfies DaemonSpawner
   })

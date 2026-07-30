@@ -21,6 +21,7 @@ import { RpcServer } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
 import { layer as nodeFileSystemLayer } from "@effect/platform-node-shared/NodeFileSystem"
 import { layer as nodeCommandExecutorLayer } from "@effect/platform-node-shared/NodeCommandExecutor"
+import { layer as nodePathLayer } from "@effect/platform-node-shared/NodePath"
 import { inheritLoginShellEnv } from "./shell-env"
 import { DesktopRpcError, DesktopRpcs, type MenuAction } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
@@ -28,23 +29,18 @@ import { makeElectronRpcServerLayer } from "./electron-rpc"
 // SDK imports — these run in the main process (Node)
 import {
   makeLocalDaemonSpawner,
-  type SpawnProcess,
-  type DaemonSpawner,
-  NoDaemon,
+  runDaemonSpawn,
+  SpawnProcess,
   DaemonSpawnFailed,
-  BinaryNotFound,
-  BinaryVersionMismatch,
-  RegistrationFileInvalid,
-  DownloadFailed,
-  ChecksumMismatch,
-  DaemonCrashed,
+  captureSpawnDiagnostics,
+  type DaemonError,
+  type DaemonSpawner,
 } from "@magnitudedev/sdk"
 
 // ESM doesn't have __dirname — polyfill it
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
-let daemonUrl: string = ""
 let daemonSpawnerPromise: Promise<DaemonSpawner> | null = null
 const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
 
@@ -52,19 +48,46 @@ const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
  * Node-compatible spawn function for makeLocalDaemonSpawner.
  * Uses child_process.spawn (NOT Bun.spawn) because Electron's main process is Node.
  */
-const nodeSpawn: SpawnProcess = (command) => {
-  const proc = spawn(command[0]!, command.slice(1), {
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore"],
-    env: process.env,
-  })
-  proc.unref()
-  return {
-    pid: proc.pid,
-    exited: new Promise<number | null>((resolve) => {
-      proc.on("exit", (code) => resolve(code))
+const nodeSpawn: SpawnProcess = {
+  spawn: (command) =>
+    Effect.try({
+      try: () => {
+        const [executable, ...args] = command
+        const proc = spawn(executable, args, {
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: process.env,
+        })
+        const diagnostics = captureSpawnDiagnostics(
+          [proc.stdout, proc.stderr].filter(
+            (output): output is NonNullable<typeof proc.stdout> =>
+              output !== null,
+          ),
+        )
+        for (const output of [proc.stdout, proc.stderr]) {
+          const unref = Reflect.get(output ?? {}, "unref")
+          if (typeof unref === "function") unref.call(output)
+        }
+        const exited = new Promise<number>((resolve) => {
+          proc.once("close", (code) => resolve(code ?? 1))
+          proc.once("error", () => resolve(1))
+        })
+        proc.unref()
+        return {
+          pid: Option.fromNullable(proc.pid),
+          exited: Effect.promise(() => exited),
+          diagnostic: diagnostics.diagnostic,
+          kill: (signal) =>
+            Effect.sync(() => {
+              proc.kill(signal)
+            }),
+        }
+      },
+      catch: (cause) =>
+        new DaemonSpawnFailed({
+          reason: `Failed to spawn Magnitude: ${String(cause)}`,
+        }),
     }),
-  }
 }
 
 /**
@@ -79,6 +102,7 @@ const nodePlatformLayer = Layer.mergeAll(
   FetchHttpClient.layer,
   nodeFileSystemLayer,
   nodeCommandExecutorLayer.pipe(Layer.provide(nodeFileSystemLayer)),
+  nodePathLayer,
 )
 
 /** Storage map for the preload bridge (simple in-memory + file-backed) */
@@ -116,59 +140,54 @@ function storageRemove(key: string): void {
  * In production, it's bundled in process.resourcesPath.
  * In development, let the SDK or source spawn command resolve the binary.
  */
-function findBinaryPath(): string | undefined {
+function findBinaryPath(): Option.Option<string> {
   // Check for bundled binary in resources (production)
   const resourcesPath = process.resourcesPath
   if (resourcesPath) {
     const bundledPath = nodePath.join(resourcesPath, "magnitude-acn")
     if (nodeFs.existsSync(bundledPath)) {
-      return bundledPath
+      return Option.some(bundledPath)
     }
     // Also check platform-specific subdirectory
     const platformName = `${process.platform}-${process.arch}`
     const platformPath = nodePath.join(resourcesPath, "bin", platformName, "magnitude-acn")
     if (nodeFs.existsSync(platformPath)) {
-      return platformPath
+      return Option.some(platformPath)
     }
   }
 
   // Let the SDK resolve/download its cache. Do not pass the SDK cache as an
   // explicit binaryPath, or version repair turns into explicit-path failure.
-  return undefined
+  return Option.none()
 }
 
 /**
  * Format a user-friendly error message for a DaemonError.
  */
-function formatDaemonError(err: unknown): string {
-  if (err instanceof NoDaemon) {
-    return "Could not connect to the Magnitude daemon. Please try again."
+function formatDaemonError(error: DaemonError): string {
+  switch (error._tag) {
+    case "NoDaemon":
+      return "Could not connect to the Magnitude daemon. Please try again."
+    case "DaemonSpawnFailed":
+      return `Failed to start the Magnitude daemon: ${error.reason}`
+    case "BinaryNotFound":
+      return `The Magnitude ACN binary was not found at: ${error.path}`
+    case "BinaryVersionMismatch":
+      return `Binary version mismatch. Expected ${error.expected}, found ${error.actual} at ${error.path}.`
+    case "RegistrationFileInvalid":
+      return `Registration file is invalid at ${error.path}: ${error.reason}`
+    case "DownloadFailed":
+      return `Failed to download the ACN binary: ${error.reason} (HTTP ${error.status})`
+    case "ChecksumMismatch":
+      return `Checksum mismatch for ${error.path}. Expected ${error.expected}, got ${error.actual}.`
+    case "DaemonCrashed":
+      return Option.match(error.diagnostic, {
+        onNone: () =>
+          `The Magnitude daemon crashed with exit code ${error.exitCode}.`,
+        onSome: (diagnostic) =>
+          `The Magnitude daemon crashed with exit code ${error.exitCode}: ${diagnostic}`,
+      })
   }
-  if (err instanceof DaemonSpawnFailed) {
-    return `Failed to start the Magnitude daemon: ${err.reason}`
-  }
-  if (err instanceof BinaryNotFound) {
-    return `The Magnitude ACN binary was not found at: ${err.path}`
-  }
-  if (err instanceof BinaryVersionMismatch) {
-    return `Binary version mismatch. Expected ${err.expected}, found ${err.actual} at ${err.path}.`
-  }
-  if (err instanceof RegistrationFileInvalid) {
-    return `Registration file is invalid at ${err.path}: ${err.reason}`
-  }
-  if (err instanceof DownloadFailed) {
-    return `Failed to download the ACN binary: ${err.reason} (HTTP ${err.status})`
-  }
-  if (err instanceof ChecksumMismatch) {
-    return `Checksum mismatch for ${err.path}. Expected ${err.expected}, got ${err.actual}.`
-  }
-  if (err instanceof DaemonCrashed) {
-    return `The Magnitude daemon crashed with exit code ${err.exitCode}.`
-  }
-  if (err instanceof Error) {
-    return err.message
-  }
-  return String(err)
 }
 
 function sendMenuAction(action: MenuAction): void {
@@ -328,59 +347,48 @@ function createWindow(): void {
   })
 }
 
-function defaultSpawnCommand(): string[] | undefined {
+function defaultSpawnCommand(): Option.Option<ReadonlyArray<string>> {
   const isDev = !app.isPackaged
   const acnSourcePath = nodePath.resolve(__dirname, "..", "..", "..", "packages", "acn", "src", "binary.ts")
-  return isDev ? ["bun", acnSourcePath, "serve", "--register"] : undefined
+  return isDev
+    ? Option.some(["bun", acnSourcePath, "serve", "--register"])
+    : Option.none()
 }
 
 async function getDaemonSpawner(): Promise<DaemonSpawner> {
   if (daemonSpawnerPromise) return daemonSpawnerPromise
 
   const binaryPath = findBinaryPath()
-  daemonSpawnerPromise = makeLocalDaemonSpawner(nodeSpawn, {
-    ...(binaryPath !== undefined ? { binaryPath } : {}),
+  daemonSpawnerPromise = makeLocalDaemonSpawner({
+    ...Option.match(binaryPath, {
+      onNone: () => ({}),
+      onSome: (path) => ({ binaryPath: path }),
+    }),
   }).pipe(
+    Effect.provideService(SpawnProcess, nodeSpawn),
     Effect.provide(nodePlatformLayer),
     Effect.runPromise,
   )
   return daemonSpawnerPromise
 }
 
-async function discoverDaemonUrl(): Promise<string | null> {
-  const spawner = await getDaemonSpawner()
-  const existing = await spawner.discover().pipe(Effect.runPromise)
-  if (Option.isNone(existing)) {
-    daemonUrl = ""
-    return null
-  }
+const daemonSpawner = Effect.promise(getDaemonSpawner)
 
-  daemonUrl = existing.value
-  return existing.value
-}
+const discoverDaemonUrl: Effect.Effect<
+  Option.Option<string>,
+  DaemonError
+> = daemonSpawner.pipe(Effect.flatMap((spawner) => spawner.discover()))
 
-async function spawnDaemon(command: readonly string[] | undefined): Promise<string> {
-  const spawner = await getDaemonSpawner()
-  const spawned = await spawner.spawn(command ? [...command] : defaultSpawnCommand()).pipe(Effect.runPromise)
-  daemonUrl = spawned
-  return spawned
-}
-
-async function ensureDaemonRunning(): Promise<string> {
-  const existing = await discoverDaemonUrl()
-  if (existing) {
-    return existing
-  }
-
-  return spawnDaemon(undefined)
-}
-
-async function daemonIpc<T>(operation: () => Promise<T>): Promise<T> {
-  try {
-    return await operation()
-  } catch (err) {
-    throw new Error(formatDaemonError(err))
-  }
+function spawnDaemon(
+  command: Option.Option<ReadonlyArray<string>>,
+): Effect.Effect<string, DaemonError> {
+  return daemonSpawner.pipe(
+    Effect.flatMap((spawner) =>
+      runDaemonSpawn(
+        spawner.spawn(Option.orElse(command, defaultSpawnCommand)),
+      ),
+    ),
+  )
 }
 
 function messageFromUnknown(cause: unknown): string {
@@ -391,11 +399,14 @@ function desktopRpcError(cause: unknown): DesktopRpcError {
   return new DesktopRpcError({ message: messageFromUnknown(cause) })
 }
 
-const daemonRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpcError> =>
-  Effect.tryPromise({
-    try: () => daemonIpc(operation),
-    catch: desktopRpcError,
-  })
+const daemonRpc = <A>(
+  operation: Effect.Effect<A, DaemonError>,
+): Effect.Effect<A, DesktopRpcError> =>
+  operation.pipe(
+    Effect.mapError(
+      (error) => new DesktopRpcError({ message: formatDaemonError(error) }),
+    ),
+  )
 
 const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpcError> =>
   Effect.tryPromise({
@@ -404,9 +415,10 @@ const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpc
   })
 
 const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
-  DaemonEnsure: () => daemonRpc(ensureDaemonRunning),
-  DaemonDiscover: () => daemonRpc(discoverDaemonUrl),
-  DaemonSpawn: ({ command }) => daemonRpc(() => spawnDaemon(command ?? undefined)),
+  DaemonDiscover: () => daemonRpc(discoverDaemonUrl).pipe(
+    Effect.map(Option.getOrNull),
+  ),
+  DaemonSpawn: ({ command }) => daemonRpc(spawnDaemon(command)),
   StorageGet: ({ key }) => Effect.sync(() => storageGet(key)),
   StorageSet: ({ key, value }) => Effect.sync(() => storageSet(key, value)).pipe(Effect.as({})),
   StorageRemove: ({ key }) => Effect.sync(() => storageRemove(key)).pipe(Effect.as({})),

@@ -1,24 +1,22 @@
 import { createId } from "@magnitudedev/generate-id";
+import {
+  AcnOwnerIdSchema,
+  type AcnHealthResponse,
+  type AcnHealthState,
+} from "@magnitudedev/acn-protocol";
 
 /** Stable for the lifetime of this ACN process and unique across candidates. */
-export const ACN_OWNER_ID = createId();
-/** Private capability published only in the mode-0600 local registry. */
-export const ACN_SHUTDOWN_TOKEN = crypto.randomUUID();
-
-export interface HealthResponse {
-  readonly service: "magnitude-acn";
-  readonly version: string;
-  readonly id: string;
-  readonly pid: number;
-}
+export const ACN_OWNER_ID = AcnOwnerIdSchema.make(createId());
 
 export const makeHealthResponse = (
   version: string,
+  state: AcnHealthState,
   id: string = ACN_OWNER_ID,
   pid: number = process.pid
-): HealthResponse => ({
+): AcnHealthResponse => ({
   service: "magnitude-acn",
   version,
-  id,
+  id: AcnOwnerIdSchema.make(id),
   pid,
+  state,
 });

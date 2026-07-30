@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   acquireRelease,
@@ -22,6 +22,7 @@ import {
 } from "./acquisition"
 import { NodeArchiveExtractor } from "./archive"
 import { ReleaseArtifactSchema } from "./contracts"
+import type { ArtifactInstallationEvent } from "./installation-progress"
 
 const version = "1.2.3"
 const tag = `@magnitudedev/cli@${version}`
@@ -237,6 +238,7 @@ describe("unsigned release acquisition", () => {
         })
       },
     })
+    const events: ArtifactInstallationEvent[] = []
     try {
       await Effect.runPromise(
         installArtifact(
@@ -244,6 +246,14 @@ describe("unsigned release acquisition", () => {
           version,
           installable,
           destination,
+          {
+            observer: Option.some({
+              report: (event) =>
+                Effect.sync(() => {
+                  events.push(event)
+                }),
+            }),
+          },
         ).pipe(Effect.provide(InstallationLayer)),
       )
       expect(await readFile(join(destination, "bin", "magnitude-cli"), "utf8"))
@@ -251,6 +261,17 @@ describe("unsigned release acquisition", () => {
       expect(sequentialRequests).toBe(0)
       expect(requestedRanges[0]).toBe("bytes=0-0")
       expect(requestedRanges.slice(1)).toHaveLength(4)
+      expect(new Set(events.map((event) => event._tag))).toEqual(
+        new Set(["Downloading", "Verifying", "Extracting"]),
+      )
+      const extracted = events.findLast(
+        (event) => event._tag === "Extracting",
+      )
+      expect(extracted?._tag).toBe("Extracting")
+      if (extracted?._tag === "Extracting") {
+        expect(extracted.progress.completedBytes).toBe(archiveBytes.byteLength)
+        expect(extracted.progress.totalBytes).toBe(archiveBytes.byteLength)
+      }
       expect(
         (await readdir(join(root, "installations")))
           .filter((entry) => entry.startsWith(".release-")),

@@ -1,5 +1,5 @@
 import { Rpc, RpcClient, RpcClientError, RpcGroup } from "@effect/rpc"
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 import { MenuActionSchema, type MenuAction } from "@magnitudedev/client-common/src/types/menu-action"
 
 export type { MenuAction }
@@ -25,18 +25,18 @@ export interface OpenFileOptions {
 }
 
 export const DesktopRpcs = RpcGroup.make(
-  Rpc.make("DaemonEnsure", {
-    payload: Unit,
-    success: Schema.String,
-    error: DesktopRpcError,
-  }),
   Rpc.make("DaemonDiscover", {
     payload: Unit,
     success: Schema.NullOr(Schema.String),
     error: DesktopRpcError,
   }),
   Rpc.make("DaemonSpawn", {
-    payload: Schema.Struct({ command: Schema.NullOr(Schema.Array(Schema.String)) }),
+    payload: Schema.Struct({
+      command: Schema.optionalWith(Schema.Array(Schema.String), {
+        as: "Option",
+        exact: true,
+      }),
+    }),
     success: Schema.String,
     error: DesktopRpcError,
   }),
@@ -96,7 +96,7 @@ export interface DesktopApi {
   readonly platform: DesktopPlatform
   readonly daemon: {
     discover(): Promise<string | null>
-    spawn(command?: string[]): Promise<string>
+    spawn(command: Option.Option<ReadonlyArray<string>>): Promise<string>
   }
   readonly onMenuAction: (cb: (action: MenuAction) => void) => () => void
   readonly quit: () => void

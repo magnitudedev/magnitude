@@ -2,6 +2,8 @@ import { Effect, Option, Ref } from "effect"
 import type { JitDaemonEndpoint, JitDaemonProvider } from "./daemon-provider"
 
 export interface JitDaemonCoordinator<E> {
+  /** Performs read-only discovery and caches a compatible endpoint. Never spawns. */
+  readonly discover: Effect.Effect<Option.Option<JitDaemonLease>, E, never>
   readonly ensure: Effect.Effect<JitDaemonLease, E, never>
   /** Waits for a discovered endpoint after an authoritative termination. Never spawns. */
   readonly awaitSuccessor: (lease: JitDaemonLease) => Effect.Effect<JitDaemonLease, E, never>
@@ -137,6 +139,7 @@ export const makeJitDaemonCoordinator = <E>(
       )
 
     return {
+      discover: observeNow,
       ensure,
       awaitSuccessor,
       invalidate,
