@@ -8,7 +8,7 @@ import * as NodeCommandExecutor from "@effect/platform-node/NodeCommandExecutor"
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
 import * as NodePath from "@effect/platform-node/NodePath"
 import { homedir } from "node:os"
-import { Effect, Layer, Option } from "effect"
+import { Effect, Exit, Layer, Option } from "effect"
 import {
   acquireRelease,
   installArtifact,
@@ -16,6 +16,7 @@ import {
 } from "./acquisition"
 import { ArchiveExtractor, NodeArchiveExtractor } from "./archive"
 import { ReleaseAcquisitionError } from "./errors"
+import { makeLauncherInstallationProgress } from "./launcher-progress"
 import { currentHost } from "./targets"
 
 const releaseBaseUrl = () => (
@@ -187,7 +188,18 @@ const ensureBinaryEffect = (
       if (!valid) yield* fs.remove(destination, { recursive: true, force: true })
     }
     if (!(yield* fs.exists(destination))) {
-      yield* installArtifact(releaseBaseUrl(), version, artifact, destination)
+      const progress = makeLauncherInstallationProgress()
+      yield* installArtifact(
+        releaseBaseUrl(),
+        version,
+        artifact,
+        destination,
+        { observer: Option.some(progress.observer) },
+      ).pipe(
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit) ? progress.succeeded : progress.failed
+        ),
+      )
     }
     yield* smokeCli(executable, version)
     yield* publishPointer(version, artifact.sha256)
