@@ -1,57 +1,155 @@
 ---
 title: Troubleshooting
-description: "Resolve common local model and Magnitude Cloud problems"
+description: "Resolve installation, local model, memory, performance, and Magnitude Cloud problems"
 icon: wrench
 ---
 
-## The model catalog is unavailable
+## Quick checks
+
+Start with the check that matches your problem:
+
+- **Magnitude won't open:** Exit it completely, launch it again from your project directory, then [update or reinstall it](/get-started#install) if the problem continues.
+- **Setup was skipped or did not finish:** Run `magnitude --setup` to set up Local Models or Magnitude Cloud again.
+- **A local model will not download or load:** Check the exact message, then see [Model setup and downloads](#model-setup-and-downloads) or [Model loading and memory](#model-loading-and-memory).
+- **Magnitude appears stuck:** Check the current status against [Magnitude is waiting or running slowly](#magnitude-is-waiting-or-running-slowly).
+- **A Cloud model is not working:** See [Magnitude Cloud problems](#magnitude-cloud-problems).
+
+<Warning>
+  Do not delete `~/.magnitude` as a general troubleshooting step. It contains downloaded models, conversations, settings, credentials, and disposable caches.
+</Warning>
+
+## Logs and local data
+
+Runtime logs are stored with each session:
+
+```text
+~/.magnitude/sessions/<session-id>/logs.jsonl
+```
+
+When Magnitude exits an active session, it prints a resume command containing the session ID. Review the log before sharing it because it may contain paths, errors, and other project information.
+
+| Path | Contents | Effect if removed |
+|---|---|---|
+| `~/.magnitude/cache/` | Derived model metadata, profiling results, and other caches | Magnitude recomputes the data when needed |
+| `~/.magnitude/models/` | Magnitude-managed local models | Models must be downloaded again |
+| `~/.magnitude/sessions/` | Conversations and session state | Conversation history is lost |
+| `~/.magnitude/config.json` | Settings and model selections | Settings and selections are reset |
+| `~/.magnitude/auth.json` | Stored credentials | Saved Cloud authentication is removed |
+
+Clearing `~/.magnitude/cache` does not delete downloaded models, but it may cause hardware profiling and model evaluation to run again. It does not restore a missing bundled model catalog. See [Files and directories](/reference#files-and-directories) for the complete storage reference.
+
+<Warning>
+  Never share `auth.json` or API keys. Do not upload a session's `events.jsonl`; it can contain prompts, conversation history, and project information.
+</Warning>
+
+## Magnitude won't start
+
+1. Confirm that `magnitude --version` works. If the command is missing, reinstall Magnitude using the instructions in [Get Started](/get-started#install).
+2. Update or reinstall the CLI if it exits before opening.
+3. On Windows, confirm that you are running Magnitude inside WSL. Native Windows is not supported.
+4. If initial setup did not finish, run `magnitude --setup`.
+
+If Magnitude still does not start, include the startup error and version when [getting help](#get-help).
+
+## Model setup and downloads
+
+### The model catalog is unavailable
 
 The catalog is installed with Magnitude rather than rebuilt from the internet during setup. Restart Magnitude once. If the message remains, update or reinstall the CLI so its bundled inference files and model catalog are restored together.
 
 Deleting `~/.magnitude/cache` does not restore a missing catalog.
 
-## A model download failed
+### A model download failed
 
-Magnitude automatically retries temporary network and server failures. If those retries are exhausted, the download view shows the failure and a **Retry** action. Retrying can continue a resumable partial download instead of starting from zero.
+Magnitude automatically retries temporary network and server failures. If those retries are exhausted, the download view shows the failure and a **Retry** action.
 
-Check the displayed error first. Authentication errors, insufficient disk space, and files that fail verification require correcting the reported cause before retrying. You can also cancel the download and choose another model.
+| Error shown | What to do |
+|---|---|
+| Temporary network or server failure | Wait for automatic retries, then use **Retry** |
+| Insufficient disk space | Free disk space, then retry |
+| Verification failure | Retry the download or choose another model |
 
-## An existing Hugging Face model is not shown
+Retrying can continue a resumable partial download instead of starting from zero. You can also cancel the download and choose another model.
+
+### An existing Hugging Face model is not shown
 
 Magnitude checks one standard Hugging Face Hub cache location. Open [Reference](/reference#environment-variables) and confirm which cache path applies to your environment.
 
 The model must be a compatible GGUF package. Incomplete, invalid, and incompatible packages are not available to load. After downloading a model with external Hugging Face tools, restart Magnitude to force a fresh inventory check.
 
-Magnitude treats files in the Hugging Face cache as externally managed and will not delete them.
-
-## A model is too large
-
-**Too large** means the model configuration cannot fit this system while preserving the memory Magnitude reserves for the operating system and other applications. Choose a smaller model, a lighter quantization, or a configuration with less context from the catalog.
-
-## There is not enough free memory
-
-**Not enough memory available** means the model normally fits the system, but other applications are currently using too much memory. Close memory-intensive applications and try loading the model again.
-
-This differs from **Too large**, which does not change when other applications close.
-
-## The model stopped because of low memory
-
-Magnitude monitors available memory while local inference runs. If memory becomes dangerously low, it stops the model and asks you to close memory-intensive apps before trying again.
-
-The model remains selected and downloaded. Close memory-intensive applications, then open `/settings → Hardware` and load it again.
-
-## A downloaded model is not using memory
+### A downloaded model is not using memory
 
 A model can be downloaded and selected without being loaded. This is normal after it has been stopped or remained inactive for an extended period.
 
-Open `/settings → Hardware` to check its state and choose **Load model**. Loading places the model and its context into memory; it does not download the files again.
+Open `/settings → Models` to check its state and choose **Load model**. Loading places the model and its context into memory; it does not download the files again.
 
-## Cloud models are not available
+## Model loading and memory
 
-Magnitude Cloud requires an active subscription and a valid API key. Open `/settings → Cloud` to add or update the key. Visit the [Magnitude Cloud console](https://app.magnitude.dev) to confirm the subscription and create an API key.
+| What you see | What it means | What to do |
+|---|---|---|
+| **Too large** | The configuration cannot fit while preserving the memory Magnitude reserves for the operating system and other applications | Choose a smaller model, lighter quantization, or configuration with less context |
+| **Not enough memory available** | The model normally fits, but other applications are currently using too much memory | Close memory-intensive applications and try loading it again |
+| **Model stopped · Low memory** | Available memory became dangerously low while local inference was running | Close memory-intensive applications, then load the selected model again from `/settings → Models` |
+| Downloaded but unloaded | The model files exist, but the model is not resident in memory | Load it from `/settings → Models` |
 
-If a rolling usage limit has been reached, open `/usage` or `/limits` to see when it resets.
+**Too large** does not change when other applications close. **Not enough memory available** can clear when more memory becomes free. A model stopped for low memory remains selected and downloaded.
+
+## Magnitude is waiting or running slowly
+
+### What the current status means
+
+| Status | Meaning |
+|---|---|
+| **Loading model into memory** | Magnitude is loading the selected model and context; the percentage is native load progress |
+| **Waiting for the local model** | The request is queued for available inference capacity |
+| **Loading conversation into the model** | Magnitude is preparing the request |
+| **Prefilling** | The engine is processing the displayed number of input tokens |
+| **Using cached tokens** | The engine reused compatible prompt state |
+| **Working** | The model is generating or the agent is executing work |
+
+### Prefill takes a long time
+
+Longer conversations require more input processing before generation begins. The displayed token counts show prefill progress, and **Using cached tokens** shows how much compatible prompt state was reused. Prefill is separate from the generation speed reported after work completes.
+
+### Generation is slower than expected
+
+Catalog speed is an estimate at the displayed context size. Actual performance varies with prompt length, other work running on the computer, and the exact model revision. Compare the completed work summary's `tok/s` with the catalog estimate. Choose **Fastest** to prioritize response speed or **Lightweight** to use fewer resources.
+
+## Magnitude Cloud problems
+
+| What you see | What to do |
+|---|---|
+| **Authentication failed** | Add or update the API key in `/settings → Cloud` |
+| **Subscription required** | Confirm the subscription in the [Magnitude Cloud console](https://app.magnitude.dev) |
+| **Usage limit reached** | Open `/usage` or `/limits` to see remaining usage and reset times |
+| Magnitude is out of sync with the server | Update Magnitude to the latest version |
+| Cloud model unavailable | Select an available Cloud model |
+| Temporary connection or upstream failure | Magnitude retries automatically; wait for the retry before restarting |
+
+Magnitude Cloud requires an active subscription and a valid API key. You can save the key in `/settings → Cloud` or provide it with `MAGNITUDE_API_KEY`. Visit the [Magnitude Cloud console](https://app.magnitude.dev) to confirm the subscription and create an API key.
+
+## Reset and reinstall
+
+Use the least disruptive recovery that applies to the problem:
+
+1. Restart Magnitude.
+2. Update Magnitude.
+3. Run `magnitude --setup` if Local Models or Cloud setup needs to be rerun.
+4. Clear only `~/.magnitude/cache` when the problem concerns derived profiling or model-evaluation data.
+5. Reinstall the CLI if bundled inference files or the bundled model catalog are missing.
+
+Do not remove models, sessions, `config.json`, or `auth.json` unless you intentionally want the data described in [Logs and local data](#logs-and-local-data) to be removed.
 
 ## Get help
 
-If the problem remains, include the Magnitude version, operating system, the exact error message, and relevant output from `~/.magnitude/logs` when opening a [GitHub issue](https://github.com/magnitudedev/magnitude/issues). Do not include API keys, private code, or other credentials.
+If the problem remains, include:
+
+- Magnitude version from `magnitude --version`
+- Operating system and version
+- Chip or GPU and total memory for local-model problems
+- Exact error message
+- Selected model and configuration, when relevant
+- Steps that reproduce the problem
+- Relevant, reviewed lines from the session's `logs.jsonl`
+
+Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC). Before sharing diagnostics, remove API keys, credentials, private code, prompts, project contents, and sensitive paths.
