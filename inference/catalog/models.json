@@ -141,7 +141,7 @@
       "displayName": "Qwen3.5 122B-A10B",
       "description": "Workstation-class MoE model with a large knowledge footprint and moderate active compute.",
       "repository": "unsloth/Qwen3.5-122B-A10B-MTP-GGUF",
-      "formats": ["UD-Q4_K_M"],
+      "formats": ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
       "contexts": [100000, 200000],
       "license": "apache-2.0",
       "qualityScore": 47.6,
