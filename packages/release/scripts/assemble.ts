@@ -26,6 +26,24 @@ import {
 import { fileSha256, run } from "./build/common"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../..")
+const input = resolve(process.argv[2] ?? "release-artifacts")
+const output = resolve(process.argv[3] ?? "release-candidate")
+
+const parseHostScope = (arguments_: readonly string[]): string | undefined => {
+  if (arguments_.length === 0) return undefined
+  if (arguments_.length === 2 && arguments_[0] === "--host") return arguments_[1]
+  throw new Error("usage: assemble.ts [input] [output] [--host <host-id>]")
+}
+
+const scopedHostId = parseHostScope(process.argv.slice(4))
+const scopedHost = scopedHostId === undefined
+  ? undefined
+  : releaseHosts.find((host) => host.id === scopedHostId)
+if (scopedHostId !== undefined && scopedHost === undefined) {
+  throw new Error(`unknown release host ${scopedHostId}`)
+}
+const candidateHosts = scopedHost === undefined ? releaseHosts : [scopedHost]
+const candidateBackendPacks = scopedHost === undefined ? backendPacks : []
 
 const files = async (root: string): Promise<readonly string[]> => {
   const found: string[] = []
@@ -47,12 +65,12 @@ const required = (name: string, fallback?: string): string => {
 }
 
 const expectedArtifacts = new Map<string, string>([
-  ...releaseHosts.flatMap((host) => [
+  ...candidateHosts.flatMap((host) => [
     [`cli-${host.id}`, cliArchive(host.id)] as const,
     [`acn-${host.id}`, acnArchive(host.id)] as const,
     [`icn-base-${host.id}`, icnBaseArchive(host.id)] as const,
   ]),
-  ...backendPacks.map((pack) =>
+  ...candidateBackendPacks.map((pack) =>
     [`icn-backend-${pack.id}`, backendArchive(pack)] as const
   ),
 ])
@@ -152,8 +170,6 @@ const archiveEntry = async (
   return bytes
 }
 
-const input = resolve(process.argv[2] ?? "release-artifacts")
-const output = resolve(process.argv[3] ?? "release-candidate")
 const allFiles = await files(input)
 const descriptorFiles = allFiles.filter((file) => file.endsWith(".artifact.json"))
 const artifacts = await Promise.all(descriptorFiles.map(async (file) =>
@@ -193,7 +209,7 @@ for (const [id, filename] of expectedArtifacts) {
 
 let catalogLock: Buffer | undefined
 let plannerBundleDigest: string | undefined
-for (const host of releaseHosts) {
+for (const host of candidateHosts) {
   const base = byId.get(`icn-base-${host.id}`)!
   const archive = archiveById.get(base.id)!
   const lock = await archiveEntry(archive, "catalog/release-catalog.lock.json")
@@ -208,7 +224,7 @@ for (const host of releaseHosts) {
   catalogLock = lock
   plannerBundleDigest = bundleDigest
 }
-for (const pack of backendPacks) {
+for (const pack of candidateBackendPacks) {
   const artifact = byId.get(`icn-backend-${pack.id}`)!
   const base = byId.get(`icn-base-${pack.host}`)!
   if (

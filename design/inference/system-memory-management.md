@@ -67,6 +67,11 @@ Internal fitting assessments name the post-reserve quantity `usable_capacity_byt
 `available` is reserved for live observations such as `current_available_bytes`; it never denotes
 cached compatibility capacity.
 
+Reserve selection produces one fingerprinted hardware snapshot whose topology contains the
+resulting stable capacity for every domain and device-local limit. Planning workers, load workers,
+accounting, and cache validation consume that same snapshot. They cannot receive or apply a second
+reserve policy after topology capture.
+
 Load admission uses a fresh whole-system availability sample `A`, taken again after planning and
 immediately before the worker is created:
 
@@ -83,6 +88,14 @@ Memory-domain identity is one typed physical-topology concept shared by discover
 assessment, cache validation, and resident allocation accounting. The planner and hardware topology
 use the single canonical identity `system` for memory shared with the operating system. Dedicated
 domain identities are derived from normalized physical-device identity, never display names.
+All native host/device locations are interpreted by that topology's single resolver. Native fit,
+speculative, projector, performance, and runtime evidence can report locations and bytes but cannot
+create domains or decide whether memory is shared.
+Each source normalizes its evidence into one charge per owner and allocation location. A charge
+carries one complete breakdown of model, context, compute, and auxiliary bytes. The shared
+accountant resolves that location once and aggregates the complete breakdown into both its physical
+domain and any applicable device-local limit. Category fragments and independently maintained
+required-byte totals are not valid accounting inputs.
 Every complete native assessment includes the system domain, including an explicit zero-byte
 requirement when all planned allocations are charged to dedicated devices. Missing, duplicate, or
 unknown domain identities are incomplete evidence and fail closed.

@@ -710,7 +710,7 @@ pub struct HardwareSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryTopology {
     capacities: BTreeMap<MemoryDomainId, MemoryDomainCapacity>,
-    device_limits: BTreeMap<HardwareDeviceId, HardwareDeviceMemoryLimit>,
+    devices: BTreeMap<HardwareDeviceId, MemoryTopologyDevice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,20 +719,339 @@ struct MemoryDomainCapacity {
     stable_bytes: u64,
 }
 
+/// One native device view bound by hardware inventory to one physical memory domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryTopologyDevice {
+    pub id: HardwareDeviceId,
+    pub memory_domain: MemoryDomainId,
+    pub identity: NativeDeviceIdentity,
+    pub name: String,
+    pub memory_limit: Option<HardwareDeviceMemoryLimit>,
+}
+
+/// Canonical identity of one device view in the process-global native registry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeDeviceIdentity {
+    backend: String,
+    physical_id: Option<String>,
+    native_index: usize,
+}
+
+impl NativeDeviceIdentity {
+    #[must_use]
+    pub fn new(
+        backend: impl AsRef<str>,
+        physical_id: Option<impl Into<String>>,
+        native_index: usize,
+    ) -> Self {
+        Self {
+            backend: canonical_backend(backend.as_ref()),
+            physical_id: physical_id.map(Into::into),
+            native_index,
+        }
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    #[must_use]
+    pub fn physical_id(&self) -> Option<&str> {
+        self.physical_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn native_index(&self) -> usize {
+        self.native_index
+    }
+}
+
+/// Available native identity evidence for one device allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDeviceLocator {
+    backend: Option<String>,
+    physical_id: Option<String>,
+    native_index: usize,
+}
+
+impl NativeDeviceLocator {
+    #[must_use]
+    pub fn exact(
+        backend: impl AsRef<str>,
+        physical_id: Option<impl Into<String>>,
+        native_index: usize,
+    ) -> Self {
+        Self {
+            backend: Some(canonical_backend(backend.as_ref())),
+            physical_id: physical_id.map(Into::into),
+            native_index,
+        }
+    }
+
+    #[must_use]
+    pub fn by_index(native_index: usize) -> Self {
+        Self {
+            backend: None,
+            physical_id: None,
+            native_index,
+        }
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> Option<&str> {
+        self.backend.as_deref()
+    }
+
+    #[must_use]
+    pub fn physical_id(&self) -> Option<&str> {
+        self.physical_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn native_index(&self) -> usize {
+        self.native_index
+    }
+
+    fn matches(&self, identity: &NativeDeviceIdentity) -> bool {
+        self.native_index == identity.native_index
+            && self
+                .backend
+                .as_ref()
+                .is_none_or(|backend| backend == &identity.backend)
+            && match (&self.physical_id, &identity.physical_id) {
+                (Some(expected), Some(actual)) => expected == actual,
+                (None, _) => true,
+                (Some(_), None) => false,
+            }
+    }
+}
+
+/// Process-local native allocation location interpreted exclusively by [`MemoryTopology`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryLocation {
+    Host,
+    NativeDevice(NativeDeviceLocator),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryChargeOwner {
+    Target,
+    Mtp,
+    Projector,
+    ResidentRuntime,
+}
+
+/// Categorized memory amounts reported for one allocation location.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryBreakdown {
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub compute_bytes: u64,
+    pub auxiliary_bytes: u64,
+}
+
+impl MemoryBreakdown {
+    #[must_use]
+    pub fn new(
+        model_bytes: u64,
+        context_bytes: u64,
+        compute_bytes: u64,
+        auxiliary_bytes: u64,
+    ) -> Self {
+        Self {
+            model_bytes,
+            context_bytes,
+            compute_bytes,
+            auxiliary_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn without_model(mut self) -> Self {
+        self.model_bytes = 0;
+        self
+    }
+
+    pub fn saturating_add_assign(&mut self, other: Self) {
+        self.model_bytes = self.model_bytes.saturating_add(other.model_bytes);
+        self.context_bytes = self.context_bytes.saturating_add(other.context_bytes);
+        self.compute_bytes = self.compute_bytes.saturating_add(other.compute_bytes);
+        self.auxiliary_bytes = self.auxiliary_bytes.saturating_add(other.auxiliary_bytes);
+    }
+
+    #[must_use]
+    pub fn total_bytes(self) -> u64 {
+        self.model_bytes
+            .saturating_add(self.context_bytes)
+            .saturating_add(self.compute_bytes)
+            .saturating_add(self.auxiliary_bytes)
+    }
+}
+
+/// One source's complete memory claim at one unresolved native allocation location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCharge {
+    pub owner: MemoryChargeOwner,
+    pub location: MemoryLocation,
+    pub memory: MemoryBreakdown,
+}
+
+impl MemoryCharge {
+    #[must_use]
+    pub fn new(
+        owner: MemoryChargeOwner,
+        location: MemoryLocation,
+        memory: MemoryBreakdown,
+    ) -> Self {
+        Self {
+            owner,
+            location,
+            memory,
+        }
+    }
+}
+
+/// Failure to resolve one charge against the captured memory topology.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{owner:?} allocation is absent from the captured memory topology: {location:?}")]
+pub struct MemoryAccountingError {
+    pub owner: MemoryChargeOwner,
+    pub location: MemoryLocation,
+}
+
+/// Aggregated memory charged to one physical domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDomainAccounting {
+    pub id: MemoryDomainId,
+    pub usable_capacity_bytes: u64,
+    pub memory: MemoryBreakdown,
+}
+
+/// Aggregated memory charged against one device-local limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDeviceAccounting {
+    pub device_id: HardwareDeviceId,
+    pub name: String,
+    pub kind: HardwareDeviceMemoryLimitKind,
+    pub usable_capacity_bytes: u64,
+    pub memory: MemoryBreakdown,
+}
+
+/// Complete physical-domain and device-limit accounting for a set of charges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAccounting {
+    pub domains: Vec<MemoryDomainAccounting>,
+    pub device_constraints: Vec<MemoryDeviceAccounting>,
+}
+
+/// The single resolver and aggregator for all native memory charges.
+pub struct MemoryAccountant<'a> {
+    topology: &'a MemoryTopology,
+    domains: BTreeMap<MemoryDomainId, MemoryDomainAccounting>,
+    device_constraints: BTreeMap<HardwareDeviceId, MemoryDeviceAccounting>,
+}
+
+impl<'a> MemoryAccountant<'a> {
+    #[must_use]
+    pub fn new(topology: &'a MemoryTopology) -> Self {
+        let system = topology.system_domain().clone();
+        let usable_capacity_bytes = topology
+            .stable_capacity(&system)
+            .expect("validated topology always has a stable system capacity");
+        Self {
+            topology,
+            domains: BTreeMap::from([(
+                system.clone(),
+                MemoryDomainAccounting {
+                    id: system,
+                    usable_capacity_bytes,
+                    memory: MemoryBreakdown::default(),
+                },
+            )]),
+            device_constraints: BTreeMap::new(),
+        }
+    }
+
+    pub fn record(&mut self, charge: MemoryCharge) -> Result<(), MemoryAccountingError> {
+        let resolved =
+            self.topology
+                .resolve(&charge.location)
+                .ok_or_else(|| MemoryAccountingError {
+                    owner: charge.owner,
+                    location: charge.location.clone(),
+                })?;
+        let domain_id = resolved.memory_domain.clone();
+        let usable_capacity_bytes = self
+            .topology
+            .stable_capacity(&domain_id)
+            .expect("resolved domain always has a stable capacity");
+        self.domains
+            .entry(domain_id.clone())
+            .or_insert(MemoryDomainAccounting {
+                id: domain_id,
+                usable_capacity_bytes,
+                memory: MemoryBreakdown::default(),
+            })
+            .memory
+            .saturating_add_assign(charge.memory);
+
+        if let Some(device) = resolved.device
+            && let Some(limit) = &device.memory_limit
+        {
+            self.device_constraints
+                .entry(device.id.clone())
+                .or_insert(MemoryDeviceAccounting {
+                    device_id: device.id.clone(),
+                    name: device.name.clone(),
+                    kind: limit.kind.clone(),
+                    usable_capacity_bytes: limit.stable_bytes,
+                    memory: MemoryBreakdown::default(),
+                })
+                .memory
+                .saturating_add_assign(charge.memory);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn finish(self) -> MemoryAccounting {
+        MemoryAccounting {
+            domains: self.domains.into_values().collect(),
+            device_constraints: self.device_constraints.into_values().collect(),
+        }
+    }
+}
+
+/// Canonical topology binding for one native allocation location.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedMemoryLocation<'a> {
+    pub memory_domain: &'a MemoryDomainId,
+    pub device: Option<&'a MemoryTopologyDevice>,
+}
+
 impl MemoryTopology {
     #[must_use]
     pub fn from_snapshot(snapshot: &HardwareSnapshot) -> Option<Self> {
         Self::from_domains(&snapshot.memory_domains)
     }
 
-    #[must_use]
-    pub fn from_domains(domains: &[HardwareMemoryDomain]) -> Option<Self> {
+    fn from_domains(domains: &[HardwareMemoryDomain]) -> Option<Self> {
         let mut capacities = BTreeMap::new();
-        let mut device_limits = BTreeMap::new();
-        let mut device_ids = BTreeSet::new();
+        let mut devices = BTreeMap::new();
+        let mut native_indices = BTreeSet::new();
         for domain in domains {
+            let kind_matches_identity = if domain.id.is_system() {
+                matches!(
+                    domain.kind,
+                    HardwareMemoryDomainKind::System | HardwareMemoryDomainKind::UnifiedMemory
+                )
+            } else {
+                domain.kind == HardwareMemoryDomainKind::PhysicalDevice
+            };
             if domain.id.as_str().is_empty()
                 || domain.id.is_system() != domain.shares_system_memory
+                || !kind_matches_identity
                 || domain.stable_capacity_bytes > domain.total_capacity_bytes
             {
                 return None;
@@ -750,17 +1069,28 @@ impl MemoryTopology {
                 return None;
             }
             for device in &domain.devices {
-                if device.id.as_str().is_empty() || !device_ids.insert(device.id.clone()) {
+                if device.id.as_str().is_empty() || !native_indices.insert(device.native_index) {
                     return None;
                 }
-                let Some(limit) = &device.memory_limit else {
-                    continue;
-                };
-                if limit.stable_bytes > limit.total_bytes
-                    || device_limits
-                        .insert(device.id.clone(), limit.clone())
-                        .is_some()
+                if device
+                    .memory_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.stable_bytes > limit.total_bytes)
                 {
+                    return None;
+                }
+                let binding = MemoryTopologyDevice {
+                    id: device.id.clone(),
+                    memory_domain: domain.id.clone(),
+                    identity: NativeDeviceIdentity::new(
+                        &device.backend,
+                        device.physical_id.clone(),
+                        device.native_index,
+                    ),
+                    name: device.name.clone(),
+                    memory_limit: device.memory_limit.clone(),
+                };
+                if devices.insert(device.id.clone(), binding).is_some() {
                     return None;
                 }
             }
@@ -769,7 +1099,7 @@ impl MemoryTopology {
             .contains_key(&MemoryDomainId::system())
             .then_some(Self {
                 capacities,
-                device_limits,
+                devices,
             })
     }
 
@@ -778,6 +1108,44 @@ impl MemoryTopology {
         self.capacities
             .get(domain)
             .map(|capacity| capacity.total_bytes)
+    }
+
+    #[must_use]
+    pub fn stable_capacity(&self, domain: &MemoryDomainId) -> Option<u64> {
+        self.capacities
+            .get(domain)
+            .map(|capacity| capacity.stable_bytes)
+    }
+
+    #[must_use]
+    pub fn system_domain(&self) -> &MemoryDomainId {
+        self.capacities
+            .keys()
+            .find(|domain| domain.is_system())
+            .expect("validated topology always has a system domain")
+    }
+
+    #[must_use]
+    pub fn resolve(&self, location: &MemoryLocation) -> Option<ResolvedMemoryLocation<'_>> {
+        match location {
+            MemoryLocation::Host => Some(ResolvedMemoryLocation {
+                memory_domain: self.system_domain(),
+                device: None,
+            }),
+            MemoryLocation::NativeDevice(locator) => {
+                let device = self
+                    .devices
+                    .values()
+                    .find(|device| device.identity.native_index == locator.native_index)?;
+                if !locator.matches(&device.identity) {
+                    return None;
+                }
+                Some(ResolvedMemoryLocation {
+                    memory_domain: &device.memory_domain,
+                    device: Some(device),
+                })
+            }
+        }
     }
 
     #[must_use]
@@ -849,7 +1217,10 @@ impl MemoryTopology {
     fn validates_device_constraints(&self, constraints: &[HardwareDeviceMemoryAssessment]) -> bool {
         let mut seen = BTreeMap::new();
         constraints.iter().all(|constraint| {
-            let Some(limit) = self.device_limits.get(&constraint.device_id) else {
+            let Some(device) = self.devices.get(&constraint.device_id) else {
+                return false;
+            };
+            let Some(limit) = &device.memory_limit else {
                 return false;
             };
             seen.insert(constraint.device_id.clone(), ()).is_none()
@@ -866,6 +1237,13 @@ impl MemoryTopology {
                         - i128::from(constraint.required_bytes))
                     .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         })
+    }
+}
+
+fn canonical_backend(backend: &str) -> String {
+    match backend.to_ascii_lowercase().as_str() {
+        "metal" | "mtl" => "metal".to_owned(),
+        backend => backend.to_owned(),
     }
 }
 
@@ -1392,6 +1770,119 @@ mod tests {
             },
             recommendation: HardwareRecommendation::Recommended,
         }
+    }
+
+    #[test]
+    fn memory_topology_is_the_only_allocation_location_resolver() {
+        let topology = test_memory_topology();
+        let host = topology
+            .resolve(&MemoryLocation::Host)
+            .expect("host location");
+        assert_eq!(host.memory_domain, &MemoryDomainId::system());
+        assert!(host.device.is_none());
+
+        let metal = topology
+            .resolve(&MemoryLocation::NativeDevice(NativeDeviceLocator::exact(
+                "Metal",
+                Some("metal-0"),
+                0,
+            )))
+            .expect("Metal aliases the inventory MTL backend");
+        assert_eq!(metal.memory_domain, &MemoryDomainId::system());
+        assert_eq!(metal.device.expect("device binding").name, "MTL0");
+
+        assert!(
+            topology
+                .resolve(&MemoryLocation::NativeDevice(NativeDeviceLocator::exact(
+                    "CUDA",
+                    Some("missing"),
+                    9,
+                )))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn memory_breakdown_owns_category_aggregation_and_totals() {
+        let mut memory = MemoryBreakdown::new(10, 20, 30, 40);
+        memory.saturating_add_assign(MemoryBreakdown::new(1, 2, 3, 4));
+
+        assert_eq!(memory, MemoryBreakdown::new(11, 22, 33, 44));
+        assert_eq!(memory.total_bytes(), 110);
+        assert_eq!(memory.without_model(), MemoryBreakdown::new(0, 22, 33, 44));
+    }
+
+    #[test]
+    fn memory_accountant_is_the_single_domain_and_device_aggregator() {
+        let topology = test_memory_topology();
+        let mut accountant = MemoryAccountant::new(&topology);
+        accountant
+            .record(MemoryCharge::new(
+                MemoryChargeOwner::Target,
+                MemoryLocation::Host,
+                MemoryBreakdown::new(1, 2, 3, 4),
+            ))
+            .unwrap();
+        accountant
+            .record(MemoryCharge::new(
+                MemoryChargeOwner::Mtp,
+                MemoryLocation::NativeDevice(NativeDeviceLocator::exact(
+                    "Metal",
+                    Some("metal-0"),
+                    0,
+                )),
+                MemoryBreakdown::new(10, 20, 30, 40),
+            ))
+            .unwrap();
+
+        let accounting = accountant.finish();
+        assert_eq!(accounting.domains.len(), 1);
+        assert_eq!(
+            accounting.domains[0].memory,
+            MemoryBreakdown::new(11, 22, 33, 44)
+        );
+        assert_eq!(accounting.device_constraints.len(), 1);
+        assert_eq!(
+            accounting.device_constraints[0].memory,
+            MemoryBreakdown::new(10, 20, 30, 40)
+        );
+    }
+
+    #[test]
+    fn memory_topology_rejects_ambiguous_native_indices() {
+        let device = |id: &str, backend: &str| HardwareDevice {
+            id: HardwareDeviceId::new(id),
+            native_index: 0,
+            backend: backend.to_owned(),
+            physical_id: None,
+            name: id.to_owned(),
+            description: id.to_owned(),
+            kind: HardwareDeviceKind::Gpu,
+            memory_limit: None,
+        };
+        assert!(
+            MemoryTopology::from_domains(&[
+                HardwareMemoryDomain {
+                    id: MemoryDomainId::system(),
+                    kind: HardwareMemoryDomainKind::System,
+                    total_capacity_bytes: 64,
+                    stable_capacity_bytes: 60,
+                    current_free_bytes: Some(40),
+                    shares_system_memory: true,
+                    devices: vec![device("cpu-view", "CPU")],
+                },
+                HardwareMemoryDomain {
+                    id: MemoryDomainId::new("gpu"),
+                    kind: HardwareMemoryDomainKind::PhysicalDevice,
+                    total_capacity_bytes: 16,
+                    stable_capacity_bytes: 14,
+                    current_free_bytes: Some(12),
+                    shares_system_memory: false,
+                    devices: vec![device("gpu-view", "CUDA")],
+                },
+            ])
+            .is_none()
+        );
     }
 
     #[test]

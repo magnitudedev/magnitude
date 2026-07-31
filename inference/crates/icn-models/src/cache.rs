@@ -303,6 +303,7 @@ fn valid_digest(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::system_memory_topology;
 
     #[test]
     fn namespaces_are_typed_and_fail_as_misses() {
@@ -349,16 +350,7 @@ mod tests {
             "recommendation": "recommended"
         }))
         .unwrap();
-        let topology = MemoryTopology::from_domains(&[icn_contracts::HardwareMemoryDomain {
-            id: icn_contracts::MemoryDomainId::system(),
-            kind: icn_contracts::HardwareMemoryDomainKind::System,
-            total_capacity_bytes: 2,
-            stable_capacity_bytes: 2,
-            current_free_bytes: Some(2),
-            shares_system_memory: true,
-            devices: Vec::new(),
-        }])
-        .unwrap();
+        let topology = system_memory_topology(2);
         cache.write_hardware_assessment(&content_id, "hardware", &assessment);
         assert_eq!(
             cache.read_hardware_assessment(&content_id, "hardware", &topology),

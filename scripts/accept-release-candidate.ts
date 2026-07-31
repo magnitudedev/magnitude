@@ -10,7 +10,7 @@ import {
   makeLocalDaemonSpawner,
   SpawnProcess,
 } from "@magnitudedev/sdk"
-import { Data, Effect, Layer, Option, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import {
   mkdir,
   mkdtemp,
@@ -26,13 +26,6 @@ import { currentHost } from "@magnitudedev/release/targets"
 
 const BOOTSTRAP_TIMEOUT_MS = 2 * 60_000
 const SHUTDOWN_TIMEOUT_MS = 20_000
-
-class CandidateLocalModelsFailed extends Data.TaggedError(
-  "CandidateLocalModelsFailed",
-)<{
-  readonly code: string
-  readonly message: string
-}> {}
 
 const candidate = resolve(process.argv[2] ?? "release-candidate")
 const tarballArgument = process.argv[3]
@@ -62,7 +55,7 @@ const run = async (
   ])
   if (code !== 0) {
     throw new Error(
-      `${command[0]} failed with exit ${code}: ${(stderr || stdout).trim().slice(0, 4_000)}`,
+      `${command[0]} failed with exit ${code}: ${(stderr || stdout).trim()}`,
     )
   }
   return stdout
@@ -226,10 +219,7 @@ const probeBootstrap = Effect.gen(function* () {
         case "Ready":
           return health
         case "Failed":
-          return yield* new CandidateLocalModelsFailed({
-            code: localModels.state.recommendations.failure.code,
-            message: localModels.state.recommendations.failure.message,
-          })
+          return yield* Effect.fail(localModels.state.recommendations)
         case "Loading":
           yield* Effect.sleep("250 millis")
       }

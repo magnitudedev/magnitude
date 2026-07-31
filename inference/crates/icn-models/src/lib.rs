@@ -13,6 +13,8 @@ mod package_service;
 mod planner_stub;
 mod preview;
 mod service;
+#[cfg(test)]
+mod test_support;
 mod validation;
 
 pub use cache::{ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind};

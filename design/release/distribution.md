@@ -74,6 +74,12 @@ using the same reusable build workflow as production. They stop before creating 
 GitHub release or publishing npm. Production consumes those same build jobs and adds the remote
 publication steps only after the complete graph succeeds.
 
+A manually dispatched Linux x64 dry run builds only the CPU host artifacts, packs npm, assembles a
+host-scoped candidate through the production assembler, and invokes the production candidate gate.
+It proves the critical packaged acquisition and isolated-planner path without building unrelated
+hosts or accelerator packs. Host-scoped assembly is validation-only and never authorizes
+publication; production assembly still requires the complete release graph.
+
 ## Runtime ownership
 
 The npm package contains a small Node entry and a bundled Effect acquisition runtime. It acquires

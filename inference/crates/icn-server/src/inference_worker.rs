@@ -40,6 +40,7 @@ enum HostMessage {
         model_id: String,
         plan: icn_contracts::ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
+        hardware: icn_contracts::HardwareSnapshot,
         trace: crate::telemetry::TraceCarrier,
     },
     Infer {
@@ -594,11 +595,13 @@ impl InferenceWorker {
         model_id: String,
         plan: icn_contracts::ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
+        hardware: icn_contracts::HardwareSnapshot,
     ) -> Result<(), InferenceError> {
         self.client.inner.send(HostMessage::Load {
             model_id,
             plan,
             mtp_selection,
+            hardware,
             trace: crate::telemetry::inject_current_trace(),
         })
     }
@@ -874,6 +877,7 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
         model_id,
         plan,
         mtp_selection,
+        hardware,
         trace,
     } = load.message
     else {
@@ -883,7 +887,7 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
     let load_span = tracing::info_span!("icn.worker.load", model.id = %model_id);
     crate::telemetry::set_parent_from_carrier(&load_span, &trace);
     let _load_entered = load_span.enter();
-    let prepared = match native.prepare_load(model_id.clone(), plan, mtp_selection) {
+    let prepared = match native.prepare_load(model_id.clone(), plan, mtp_selection, hardware) {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = responses.send(WorkerMessage::LoadFailed {
