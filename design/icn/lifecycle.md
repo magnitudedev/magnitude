@@ -46,7 +46,12 @@ The service process may own bounded, private native children. Planner workers ar
 metadata-only. The inference worker owns the one resident model topology and lives only for that
 residency generation. Both use the same verified executable, communicate only with their parent
 over private standard I/O, expose no listener or public lifecycle, and terminate with their request,
-residency, or parent. ACN still owns and observes exactly one ICN service child.
+residency, or parent. The service passes its verified installation authority to every native child.
+Each installed child registers and validates backend modules from that exact installation before
+native initialization, request decoding, or inference handshake; executable-relative, current-
+directory, and compiled build-tree discovery cannot satisfy installed-worker readiness. Explicit
+development tooling may name build-tree authority, but it is never inferred by an installed
+worker. ACN still owns and observes exactly one ICN service child.
 
 The hardware, fitting, and inventory meanings exposed through this boundary are defined by
 [hardware fitting](./hardware-fitting.md) and [model management](./model-management.md). This
@@ -339,7 +344,9 @@ creates one private `inference-worker` child; that child initializes its own pro
 native-backend capability, prepares and loads exactly one topology, and owns the executor until it
 exits. Persistent ICN exposes the loaded backend through a bounded framed-IPC proxy. Isolated
 planner and template workers remain separate metadata-only children with one backend for their
-private process lifetime.
+private process lifetime. All three worker kinds receive native-runtime authority from the same
+immutable worker-launch capability. An inference-worker handshake proves that its native runtime
+has already initialized.
 
 Inference-worker lifetime is subordinate to ICN even on abrupt failure. Unix children disable
 core dumps and run a dedicated parent-liveness watchdog; Linux additionally requests
@@ -458,4 +465,5 @@ The lifecycle conforms when:
 - abrupt parent death cannot leave an ICN indefinitely orphaned;
 - lifecycle and transport failures remain typed and retain bounded, redacted diagnostics; and
 - generated-artifact checks, package tests, native signal tests, and release smoke tests prove the
-  shipped ACN and ICN identities are compatible.
+  shipped ACN and ICN identities are compatible; candidate validation additionally requires local
+  model preparation to complete through the packaged isolated planner.

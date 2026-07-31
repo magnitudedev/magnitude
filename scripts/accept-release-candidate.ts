@@ -10,7 +10,7 @@ import {
   makeLocalDaemonSpawner,
   SpawnProcess,
 } from "@magnitudedev/sdk"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Data, Effect, Layer, Option, Schema } from "effect"
 import {
   mkdir,
   mkdtemp,
@@ -26,6 +26,13 @@ import { currentHost } from "@magnitudedev/release/targets"
 
 const BOOTSTRAP_TIMEOUT_MS = 2 * 60_000
 const SHUTDOWN_TIMEOUT_MS = 20_000
+
+class CandidateLocalModelsFailed extends Data.TaggedError(
+  "CandidateLocalModelsFailed",
+)<{
+  readonly code: string
+  readonly message: string
+}> {}
 
 const candidate = resolve(process.argv[2] ?? "release-candidate")
 const tarballArgument = process.argv[3]
@@ -212,7 +219,21 @@ const probeBootstrap = Effect.gen(function* () {
   )
   return yield* Effect.gen(function* () {
     const client = yield* RpcClient.make(MagnitudeRpcs)
-    return yield* client.Health({})
+    const health = yield* client.Health({})
+    while (true) {
+      const localModels = yield* client.GetLocalModels({})
+      switch (localModels.state.recommendations._tag) {
+        case "Ready":
+          return health
+        case "Failed":
+          return yield* new CandidateLocalModelsFailed({
+            code: localModels.state.recommendations.failure.code,
+            message: localModels.state.recommendations.failure.message,
+          })
+        case "Loading":
+          yield* Effect.sleep("250 millis")
+      }
+    }
   }).pipe(
     Effect.provide(protocolLayer),
     Effect.scoped,

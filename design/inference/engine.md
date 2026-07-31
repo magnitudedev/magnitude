@@ -92,7 +92,10 @@ selection, fit planning, and model construction occur inside that worker from th
 execution intent. The selected MTP configuration remains part of the execution intent passed to fitting, so
 target and draft memory are assessed together. A serving-process preflight must never initialize a
 temporary backend. Model-free preview and inventory assessment use isolated worker processes; each
-worker creates one backend capability for its own complete process lifetime.
+worker creates one backend capability for its own complete process lifetime. Worker capability
+construction is installation-bound: the persistent service transfers its verified installation
+authority to every installed worker, which registers and validates that exact runtime before
+initialization. Knowing the executable path is not native-runtime authority.
 The same MTP selector implementation and policy fingerprint are used in isolated assessment and
 resident loading. Target identity includes the selected component set and serving-configuration
 revision, and parity tests compare normalized fit evidence with loaded execution evidence.

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 #[cfg(not(test))]
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -54,11 +54,15 @@ mod installation;
 mod load_progress;
 mod memory_supervisor;
 mod telemetry;
+mod worker_process;
 
 use inference_worker::{InferenceWorker, LoadEvent, RemoteBackend};
 use load_progress::{LoadProgressEstimator, LoadProgressTracker};
 use memory_supervisor::{IDLE_POLL_INTERVAL, RECOVERY_STABLE_TIME};
 use memory_supervisor::{MONITOR_LOSS_DEADLINE, POLL_INTERVAL, SystemMemoryObserver};
+#[cfg(not(test))]
+use worker_process::NativeWorkerRole;
+use worker_process::{NativeRuntimeAuthority, NativeWorkerArgs, NativeWorkerLauncher};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -124,11 +128,20 @@ enum Command {
         json: bool,
     },
     #[command(hide = true)]
-    PlanWorker,
+    PlanWorker {
+        #[command(flatten)]
+        runtime: NativeWorkerArgs,
+    },
     #[command(hide = true)]
-    TemplateWorker,
+    TemplateWorker {
+        #[command(flatten)]
+        runtime: NativeWorkerArgs,
+    },
     #[command(hide = true)]
-    InferenceWorker,
+    InferenceWorker {
+        #[command(flatten)]
+        runtime: NativeWorkerArgs,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -760,6 +773,7 @@ struct NativeHardwareAssessor {
     defaults: ModelPlanDefaults,
     cache: Option<ModelCache>,
     native_backend: NativeBackend,
+    worker_launcher: NativeWorkerLauncher,
     native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
     gate: Arc<tokio::sync::Mutex<()>>,
     assessment_work_gates:
@@ -784,12 +798,14 @@ fn native_assessor_services(
     inventory: &Arc<ModelManager>,
     native_backend: NativeBackend,
     defaults: ModelPlanDefaults,
+    worker_launcher: NativeWorkerLauncher,
 ) -> NativeAssessorServices {
     let native_executor = Arc::new(RwLock::new(None));
     let assessor = Arc::new(NativeHardwareAssessor {
         defaults,
         cache: Some(inventory.derived_cache().clone()),
         native_backend,
+        worker_launcher,
         native_executor: Arc::clone(&native_executor),
         gate: Arc::new(tokio::sync::Mutex::new(())),
         assessment_work_gates: Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
@@ -852,8 +868,10 @@ struct TemplateWorkerRequest {
     model_path: PathBuf,
 }
 
-#[derive(Debug, Default)]
-struct NativeTemplateAssessor;
+#[derive(Debug)]
+struct NativeTemplateAssessor {
+    worker_launcher: NativeWorkerLauncher,
+}
 
 fn native_template_identity() -> &'static str {
     concat!(
@@ -885,9 +903,12 @@ impl TemplateAssessor for NativeTemplateAssessor {
         &self,
         inputs: &icn_contracts::EffectiveTemplateInputs,
     ) -> Result<TemplateAssessment, String> {
-        run_isolated_template_inspection(TemplateWorkerRequest {
-            model_path: inputs.model_path.clone(),
-        })
+        run_isolated_template_inspection(
+            TemplateWorkerRequest {
+                model_path: inputs.model_path.clone(),
+            },
+            &self.worker_launcher,
+        )
         .map_err(|error| format!("{error:#}"))
     }
 }
@@ -1170,9 +1191,10 @@ impl NativeHardwareAssessor {
             .acquire_owned()
             .await
             .map_err(|_| InventoryError::Internal("native planner pool closed".to_owned()))?;
+        let worker_launcher = self.worker_launcher.clone();
         let response = match spawn_blocking_traced(move || {
             let _permit = permit;
-            run_isolated_planning(request)
+            run_isolated_planning(request, &worker_launcher)
         })
         .await
         {
@@ -1986,13 +2008,6 @@ fn unavailable_performance(
     }
 }
 
-fn assess_planning_request(
-    request: PlanningWorkerRequest,
-) -> anyhow::Result<PlanningWorkerResponse> {
-    let native_backend = NativeBackend::initialize()?;
-    assess_planning_request_with_backend(request, &native_backend)
-}
-
 fn assess_planning_request_with_backend(
     request: PlanningWorkerRequest,
     native_backend: &NativeBackend,
@@ -2109,28 +2124,28 @@ fn test_native_backend() -> NativeBackend {
 }
 
 #[cfg(test)]
-fn run_isolated_planning(request: PlanningWorkerRequest) -> anyhow::Result<PlanningWorkerResponse> {
+fn run_isolated_planning(
+    request: PlanningWorkerRequest,
+    _worker_launcher: &NativeWorkerLauncher,
+) -> anyhow::Result<PlanningWorkerResponse> {
     icn_engine::disable_native_diagnostics();
     let native_backend = test_native_backend();
     assess_planning_request_with_backend(request, &native_backend)
 }
 
 #[cfg(not(test))]
-fn run_isolated_planning(request: PlanningWorkerRequest) -> anyhow::Result<PlanningWorkerResponse> {
+fn run_isolated_planning(
+    request: PlanningWorkerRequest,
+    worker_launcher: &NativeWorkerLauncher,
+) -> anyhow::Result<PlanningWorkerResponse> {
     use std::io::Write as _;
 
-    let executable = std::env::current_exe().context("failed to locate ICN planner executable")?;
-    let mut child = ProcessCommand::new(executable)
-        .arg("plan-worker")
-        .env("MAGNITUDE_OTEL", "0")
-        .env("RUST_LOG", "error")
-        .env_remove("MAGNITUDE_OTEL_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+    let mut child = worker_launcher.command(NativeWorkerRole::Planner)?;
+    child
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
         .spawn()
         .context("failed to start isolated native planner")?;
     serde_json::to_writer(
@@ -2183,19 +2198,14 @@ fn run_isolated_planning(request: PlanningWorkerRequest) -> anyhow::Result<Plann
         .context("isolated native planner returned an invalid assessment")
 }
 
-fn run_planning_worker() -> anyhow::Result<()> {
+fn run_planning_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> {
+    let native_backend = initialize_native_runtime(&authority)?;
     let request = serde_json::from_reader(std::io::stdin().lock())
         .context("failed to decode native planner request")?;
-    let assessment = assess_planning_request(request)?;
+    let assessment = assess_planning_request_with_backend(request, &native_backend)?;
     serde_json::to_writer(std::io::stdout().lock(), &assessment)
         .context("failed to encode native planner result")?;
     Ok(())
-}
-
-fn inspect_template_request(request: TemplateWorkerRequest) -> anyhow::Result<TemplateAssessment> {
-    icn_engine::disable_native_diagnostics();
-    let native_backend = NativeBackend::initialize()?;
-    inspect_template_request_with_backend(request, &native_backend)
 }
 
 fn inspect_template_request_with_backend(
@@ -2218,6 +2228,7 @@ fn inspect_template_request_with_backend(
 #[cfg(test)]
 fn run_isolated_template_inspection(
     request: TemplateWorkerRequest,
+    _worker_launcher: &NativeWorkerLauncher,
 ) -> anyhow::Result<TemplateAssessment> {
     let native_backend = test_native_backend();
     inspect_template_request_with_backend(request, &native_backend)
@@ -2226,21 +2237,16 @@ fn run_isolated_template_inspection(
 #[cfg(not(test))]
 fn run_isolated_template_inspection(
     request: TemplateWorkerRequest,
+    worker_launcher: &NativeWorkerLauncher,
 ) -> anyhow::Result<TemplateAssessment> {
     use std::io::Write as _;
 
-    let executable = std::env::current_exe().context("failed to locate ICN template worker")?;
-    let mut child = ProcessCommand::new(executable)
-        .arg("template-worker")
-        .env("MAGNITUDE_OTEL", "0")
-        .env("RUST_LOG", "error")
-        .env_remove("MAGNITUDE_OTEL_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+    let mut child = worker_launcher.command(NativeWorkerRole::Template)?;
+    child
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
         .spawn()
         .context("failed to start isolated native template worker")?;
     serde_json::to_writer(
@@ -2295,10 +2301,11 @@ fn run_isolated_template_inspection(
     serde_json::from_slice(&output.stdout).context("template worker returned an invalid assessment")
 }
 
-fn run_template_worker() -> anyhow::Result<()> {
+fn run_template_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> {
+    let native_backend = initialize_native_runtime(&authority)?;
     let request = serde_json::from_reader(std::io::stdin().lock())
         .context("failed to decode native template request")?;
-    let assessment = inspect_template_request(request)?;
+    let assessment = inspect_template_request_with_backend(request, &native_backend)?;
     serde_json::to_writer(std::io::stdout().lock(), &assessment)
         .context("failed to encode native template assessment")?;
     Ok(())
@@ -2437,6 +2444,7 @@ struct NativeModelInstanceController {
     inventory: Arc<ModelManager>,
     assessor: Arc<NativeHardwareAssessor>,
     native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
+    worker_launcher: NativeWorkerLauncher,
     memory_observer: Arc<SystemMemoryObserver>,
     next_worker_generation: Arc<AtomicU64>,
     admission_blocked_until: Arc<Mutex<Option<std::time::Instant>>>,
@@ -2551,6 +2559,7 @@ impl NativeModelInstanceController {
         inventory: Arc<ModelManager>,
         assessor: Arc<NativeHardwareAssessor>,
         native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
+        worker_launcher: NativeWorkerLauncher,
         defaults: ModelPlanDefaults,
         cache: ModelCache,
         native_build: String,
@@ -2559,6 +2568,7 @@ impl NativeModelInstanceController {
             inventory,
             assessor,
             native_executor,
+            worker_launcher,
             memory_observer: Arc::new(SystemMemoryObserver::new()),
             next_worker_generation: Arc::new(AtomicU64::new(1)),
             admission_blocked_until: Arc::new(Mutex::new(None)),
@@ -3349,8 +3359,9 @@ impl NativeModelInstanceController {
 
         let worker_generation = self.next_worker_generation.fetch_add(1, Ordering::Relaxed);
         let expected_build = build_identity::native_build();
+        let worker_launcher = self.worker_launcher.clone();
         let (worker, mut load_events) = tokio::task::spawn_blocking(move || {
-            InferenceWorker::spawn(worker_generation, expected_build)
+            InferenceWorker::spawn(worker_generation, expected_build, &worker_launcher)
         })
         .await
         .map_err(|error| {
@@ -4163,14 +4174,26 @@ async fn generate_release_catalog(
     let mut config = InventoryConfig::with_roots(model_store, cache_root)
         .context("invalid catalog generation inventory configuration")?;
     config.hf_cache_dirs.extend(hf_caches);
-    let native_backend = NativeBackend::initialize()
+    let runtime_authority = NativeRuntimeAuthority::development();
+    let native_backend = initialize_native_runtime(&runtime_authority)
         .context("failed to initialize the native backend for catalog generation")?;
+    let worker_launcher = NativeWorkerLauncher::new(runtime_authority);
     let inventory = Arc::new(
-        ModelManager::open_with_template_assessor(config, Some(Arc::new(NativeTemplateAssessor)))
-            .await
-            .context("failed to initialize catalog generation inventory")?,
+        ModelManager::open_with_template_assessor(
+            config,
+            Some(Arc::new(NativeTemplateAssessor {
+                worker_launcher: worker_launcher.clone(),
+            })),
+        )
+        .await
+        .context("failed to initialize catalog generation inventory")?,
     );
-    let (assessor, _) = native_assessor_services(&inventory, native_backend, model_plan_defaults());
+    let (assessor, _) = native_assessor_services(
+        &inventory,
+        native_backend,
+        model_plan_defaults(),
+        worker_launcher,
+    );
     inventory
         .set_hardware_assessor(assessor.clone())
         .context("failed to configure catalog generation hardware assessment")?;
@@ -4273,6 +4296,14 @@ fn open_installation_catalog(
 }
 
 fn load_installation_backends(installation: &installation::Installation) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        installation.native_build() == build_identity::native_build(),
+        "ICN installation native build does not match its executable"
+    );
+    anyhow::ensure!(
+        installation.backend_module_abi() == build_identity::backend_module_abi(),
+        "ICN installation backend module ABI does not match its executable"
+    );
     let declared = installation
         .executable()
         .canonicalize()
@@ -4293,6 +4324,27 @@ fn load_installation_backends(installation: &installation::Installation) -> anyh
         let _ = installation;
         anyhow::bail!("ICN executable does not support dynamic backend modules")
     }
+}
+
+fn initialize_native_runtime(authority: &NativeRuntimeAuthority) -> anyhow::Result<NativeBackend> {
+    if let Some(installation) = authority.installation() {
+        load_installation_backends(installation).with_context(|| {
+            format!(
+                "failed to load native runtime from {}",
+                installation.declaration_path().display()
+            )
+        })?;
+        // Prove that the declared modules registered before llama.cpp gets an
+        // opportunity to search its executable, cwd, or compiled build path.
+        validate_registered_backend(installation).with_context(|| {
+            format!(
+                "native runtime {} did not register the declared {} backend",
+                installation.declaration_path().display(),
+                installation.backend().name()
+            )
+        })?;
+    }
+    NativeBackend::initialize().context("failed to initialize the process native backend")
 }
 
 fn validate_registered_backend(installation: &installation::Installation) -> anyhow::Result<()> {
@@ -4356,9 +4408,11 @@ async fn main() -> anyhow::Result<()> {
                     "ICN installation is not prepared; run `bun icn:build` before development"
                 );
             }
-            if let Some(installation) = &installation {
-                load_installation_backends(installation)?;
-            }
+            let runtime_authority = installation
+                .clone()
+                .map(NativeRuntimeAuthority::installed)
+                .unwrap_or_else(NativeRuntimeAuthority::development);
+            let worker_launcher = NativeWorkerLauncher::new(runtime_authority.clone());
             let inventory_root = match model_store {
                 Some(root) => root,
                 None => InventoryConfig::default_root()
@@ -4374,21 +4428,23 @@ async fn main() -> anyhow::Result<()> {
             inventory_config.model_sources.extend(model_sources);
             inventory_config.hf_cache_dirs.extend(hf_caches);
             let plan_defaults = model_plan_defaults();
-            let native_backend = NativeBackend::initialize()
-                .context("failed to initialize the process native backend")?;
-            if let Some(installation) = &installation {
-                validate_registered_backend(installation)?;
-            }
+            let native_backend = initialize_native_runtime(&runtime_authority)?;
             let inventory = Arc::new(
                 ModelManager::open_with_template_assessor(
                     inventory_config,
-                    Some(Arc::new(NativeTemplateAssessor)),
+                    Some(Arc::new(NativeTemplateAssessor {
+                        worker_launcher: worker_launcher.clone(),
+                    })),
                 )
                 .await
                 .context("failed to initialize model inventory")?,
             );
-            let (inventory_hardware_assessor, native_executor_slot) =
-                native_assessor_services(&inventory, native_backend.clone(), plan_defaults.clone());
+            let (inventory_hardware_assessor, native_executor_slot) = native_assessor_services(
+                &inventory,
+                native_backend.clone(),
+                plan_defaults.clone(),
+                worker_launcher.clone(),
+            );
             inventory
                 .set_hardware_assessor(inventory_hardware_assessor.clone())
                 .context("failed to configure inventory hardware assessment")?;
@@ -4413,6 +4469,7 @@ async fn main() -> anyhow::Result<()> {
                     inventory.clone(),
                     inventory_hardware_assessor.clone(),
                     native_executor_slot,
+                    worker_launcher,
                     plan_defaults,
                     inventory.derived_cache().clone(),
                     native_build.clone(),
@@ -4512,9 +4569,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
         }
-        Command::PlanWorker => run_planning_worker()?,
-        Command::TemplateWorker => run_template_worker()?,
-        Command::InferenceWorker => inference_worker::run_worker(build_identity::native_build())?,
+        Command::PlanWorker { runtime } => run_planning_worker(runtime.authority()?)?,
+        Command::TemplateWorker { runtime } => run_template_worker(runtime.authority()?)?,
+        Command::InferenceWorker { runtime } => {
+            let authority = runtime.authority()?;
+            let native_backend = initialize_native_runtime(&authority)?;
+            inference_worker::run_worker(build_identity::native_build(), native_backend)?
+        }
     }
     Ok(())
 }
@@ -4793,7 +4854,10 @@ mod tests {
 
     #[test]
     fn native_template_cache_identity_tracks_both_native_pins() {
-        let identity = NativeTemplateAssessor.cache_identity();
+        let assessor = NativeTemplateAssessor {
+            worker_launcher: NativeWorkerLauncher::development(),
+        };
+        let identity = assessor.cache_identity();
 
         assert!(identity.contains(build_identity::BINDINGS_REVISION));
         assert!(identity.contains(build_identity::NATIVE_BACKEND_REVISION));
@@ -4824,6 +4888,7 @@ mod tests {
             defaults: parity_test_defaults(),
             cache: None,
             native_backend: test_native_backend(),
+            worker_launcher: NativeWorkerLauncher::development(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
@@ -4984,6 +5049,7 @@ mod tests {
             defaults: parity_test_defaults(),
             cache: None,
             native_backend: test_native_backend(),
+            worker_launcher: NativeWorkerLauncher::development(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
@@ -5106,6 +5172,7 @@ mod tests {
             defaults: parity_test_defaults(),
             cache: None,
             native_backend: test_native_backend(),
+            worker_launcher: NativeWorkerLauncher::development(),
             native_executor: Arc::new(RwLock::new(None)),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
@@ -5131,7 +5198,9 @@ mod tests {
             config.hf_cache_dirs.clear();
             let manager = ModelManager::open_with_template_assessor(
                 config,
-                Some(Arc::new(NativeTemplateAssessor)),
+                Some(Arc::new(NativeTemplateAssessor {
+                    worker_launcher: NativeWorkerLauncher::development(),
+                })),
             )
             .await
             .expect("open inventory");

@@ -103,8 +103,10 @@ repeats the remote-state check.
 Candidate validation packs npm from the released source and exercises its launcher through Node,
 npx, Bun, and bunx against the local CLI candidate. Host jobs already validate native archives.
 The same candidate gate uses the real SDK to acquire and start its packed ACN and ICN from an empty
-data root, proves readiness through an ACN RPC, terminates the exact owned processes, and repeats
-with the artifact endpoint unavailable to prove the resulting cache is sufficient.
+data root, proves readiness through an ACN RPC, and requires packaged local-model recommendation
+preparation to reach Ready through an isolated native planner. It terminates the exact owned
+processes and repeats with the artifact endpoint unavailable to prove the resulting cache is
+sufficient.
 
 Publication creates or resumes the exact private GitHub draft, uploads and verifies the complete
 candidate, then makes GitHub public. The accepted npm pack must acquire and execute the CLI from
