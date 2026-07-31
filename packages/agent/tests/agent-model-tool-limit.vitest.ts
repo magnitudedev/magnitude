@@ -5,7 +5,7 @@ import { Prompt, type BaseCallOptions, type BoundModel } from '@magnitudedev/ai'
 import { makeAgentBoundModel } from '../src/model/agent-model'
 
 describe('agent model tool-call prevention', () => {
-  it('applies the resolved limit to an ordinary auto-choice provider request', async () => {
+  it('does not alter provider options when tool choice is omitted', async () => {
     let receivedOptions: BaseCallOptions | undefined
     const rawModel: BoundModel<BaseCallOptions> = {
       stream: (_prompt, _tools, options) => {
@@ -46,14 +46,6 @@ describe('agent model tool-call prevention', () => {
       Effect.provideService(HttpClient.HttpClient, {} as HttpClient.HttpClient),
     ))
 
-    expect(receivedOptions?.toolChoice).toEqual({
-      type: 'grammar',
-      grammar: [
-        '<turn> ::= | <call1>',
-        '<call1> ::= <tool> | <tool> <call2>',
-        '<call2> ::= <tool>',
-        '<tool> ::= "read"',
-      ].join('\n'),
-    })
+    expect(receivedOptions?.toolChoice).toBeUndefined()
   })
 })
