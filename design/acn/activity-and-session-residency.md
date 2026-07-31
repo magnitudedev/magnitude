@@ -185,15 +185,14 @@ master-detail chooser groups compact rows into models on the computer and models
 download; arrow keys move one selection across both groups, the right pane is informational until
 selection, and Enter or a row click performs the row's `Load` or `Download` action.
 
-After selection, the chooser remains unchanged until an authoritative target download or exact
-slot instance appears. The right pane then advances through
-download, preparation, and loading without a screen transition, deriving model identity,
-quantization, byte progress, transfer rate, and remaining-time presentation from authoritative
-local-model mirrors. Command submission creates no presentation lifecycle.
-The presentation says Loading only while the selected slot projects an exact ICN instance in its
-Loading lifecycle; assignment or package preparation alone never implies loading. Detailed
-residency progress remains in the activity rail. The explicit selection action
-composes the ordinary target download, primary-slot assignment, and slot load commands; the client
+After selection, the composite onboarding workflow immediately records whether it admitted a load
+or a download-then-load action, so the right pane cannot remain as a locked chooser while server
+mirrors propagate. It then advances through download and loading without a screen transition.
+Transfer state, quantization, byte progress, rate, remaining time, and exact instance lifecycle
+remain authoritative mirror facts; the workflow intent supplies only the admitted action and its
+selected identity. Detailed residency progress remains in the activity rail. A stored-model action
+composes primary-slot assignment and slot load; a catalog action first composes the ordinary target
+download. The client
 marks onboarding complete only after the exact selected instance is Ready. Cancel uses the ordinary
 download-cancel or slot-clear command. ACN has no onboarding-specific model operation and startup
 never infers one from persisted state. Setup disappears only after completion. The composer remains

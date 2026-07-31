@@ -42,9 +42,11 @@ One validated memory-topology value owns the binding from every registered nativ
 its physical memory domain. CPU, integrated-GPU, and host-accelerator views are system-memory
 bindings; Apple Silicon accelerator views are also system-memory bindings; only genuinely
 dedicated devices create dedicated domains. Target, speculative, projector, performance, and
-resident-runtime evidence describe only host or exact native-device allocation locations. They
-never classify a memory domain. The shared topology resolver performs that classification for all
-of them, and an unregistered location fails closed with its native identity preserved.
+resident-runtime evidence describe only host or native-device allocation locations. A native
+observation may omit backend or physical identity while retaining its process-global native index;
+blank native strings are missing evidence, not identities. Allocation evidence never classifies a
+memory domain. The shared topology resolver performs that classification for all locations, and
+inconsistent non-empty evidence or an unregistered index fails closed.
 
 Hardware presentation keeps system-product identity, accelerator chip identity, native backend,
 and native device ordinal distinct. Product identity comes from operating-system firmware data;

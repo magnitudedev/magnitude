@@ -22,6 +22,7 @@ use sha2_state::{Digest as StateDigest, Sha256 as StatefulSha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
+use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, model_id};
 use crate::inventory::{ModelManager, build_model, hf_repo_dir, now};
 use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationComponent, OperationManifest};
@@ -374,6 +375,14 @@ impl ModelManager {
         let repo = self.client.model(owner.to_owned(), name.to_owned());
 
         let api_metadata = hub_api_metadata(&self.client, repository, revision).await?;
+        require_requested_revision(revision, api_metadata.sha.as_deref()).map_err(|message| {
+            DownloadError {
+                code: "revision_changed",
+                message,
+                retryable: false,
+                resumable: false,
+            }
+        })?;
         let commit = api_metadata.sha.clone().ok_or_else(|| DownloadError {
             code: "missing_metadata",
             message: "Hugging Face repository response did not include a commit".to_owned(),
@@ -1363,11 +1372,17 @@ async fn hub_api_metadata(
     repository: &str,
     revision: &str,
 ) -> Result<HubApiModel, DownloadError> {
-    let url = format!("{}/api/models/{repository}", client.endpoint());
+    let url =
+        revision_metadata_url(client.endpoint(), repository, revision).map_err(|message| {
+            DownloadError {
+                code: "invalid_request",
+                message,
+                retryable: false,
+                resumable: false,
+            }
+        })?;
     let http = reqwest::Client::builder().build().map_err(download_io)?;
-    let mut request = http
-        .get(url)
-        .query(&[("revision", revision), ("blobs", "true")]);
+    let mut request = http.get(url).query(&[("blobs", "true")]);
     if let Some(token) = std::env::var_os("HF_TOKEN").and_then(|value| value.into_string().ok()) {
         request = request.bearer_auth(token);
     }

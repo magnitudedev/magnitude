@@ -41,7 +41,8 @@ vi.mock("../../hooks/use-theme", () => ({
 
 const { OnboardingModelChooser, OnboardingModelPreparation } = await import("./chooser")
 
-const onChoose = vi.fn()
+const onLoad = vi.fn()
+const onDownload = vi.fn()
 const onContinue = vi.fn()
 const onSkip = vi.fn()
 
@@ -59,7 +60,8 @@ const press = (name: string) => keyboard.handler?.(new KeyEvent({
 }))
 
 beforeEach(() => {
-  onChoose.mockClear()
+  onLoad.mockClear()
+  onDownload.mockClear()
   onContinue.mockClear()
   onSkip.mockClear()
 })
@@ -96,7 +98,8 @@ const chooserProps = (state: ReturnType<typeof chooserView>) => ({
   models: state.models,
   catalog: state.catalog,
   slots: state.slots,
-  submitting: false,
+  onLoad,
+  onDownload,
 })
 
 const chooserViewWithInventory = (installedCount: number, downloadCount: number) => {
@@ -146,7 +149,6 @@ test("renders compact installed and downloadable rows with an informational deta
       width={100}
       error={null}
       operation={null}
-      onChoose={onChoose}
       onContinue={onContinue}
       onSkip={onSkip}
     />,
@@ -173,15 +175,46 @@ test("renders compact installed and downloadable rows with an informational deta
   }
 })
 
-test("does not accept another selection while command submission is pending", async () => {
+test("loads a stored model without invoking download", async () => {
   const view = await testRender(
     <OnboardingModelChooser
       {...chooserProps(chooserView())}
-      submitting
       width={100}
       error={null}
       operation={null}
-      onChoose={onChoose}
+      onContinue={onContinue}
+      onSkip={onSkip}
+    />,
+    { width: 100, height: 30 },
+  )
+  try {
+    await act(view.renderOnce)
+    await act(async () => press("enter"))
+    expect(onLoad).toHaveBeenCalledWith(expect.objectContaining({
+      displayName: "Installed Model",
+      reasoningEffort: "none",
+    }))
+    expect(onDownload).not.toHaveBeenCalled()
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("does not accept another selection while an operation is active", async () => {
+  const view = await testRender(
+    <OnboardingModelChooser
+      {...chooserProps(chooserView())}
+      width={100}
+      error={null}
+      operation={{
+        _tag: "Activating",
+        providerModelId: ProviderModelIdSchema.make("configuration_installed"),
+        displayName: "Installed Model",
+        phase: "Loading",
+        failure: null,
+        onRetry: vi.fn(),
+        onChooseAnother: vi.fn(),
+      }}
       onContinue={onContinue}
       onSkip={onSkip}
     />,
@@ -191,7 +224,8 @@ test("does not accept another selection while command submission is pending", as
     await act(view.renderOnce)
     await act(async () => press("down"))
     await act(async () => press("enter"))
-    expect(onChoose).not.toHaveBeenCalled()
+    expect(onLoad).not.toHaveBeenCalled()
+    expect(onDownload).not.toHaveBeenCalled()
     expect(onContinue).not.toHaveBeenCalled()
   } finally {
     await act(async () => view.renderer.destroy())
@@ -317,7 +351,6 @@ test("keeps the chooser unchanged until authoritative download state arrives", a
           onCancel: vi.fn(),
           onRetry: vi.fn(),
         } : null}
-        onChoose={onChoose}
         onContinue={onContinue}
         onSkip={onSkip}
       />
@@ -331,9 +364,10 @@ test("keeps the chooser unchanged until authoritative download state arrives", a
     await act(view.renderOnce)
     await act(async () => press("down"))
     await act(async () => press("enter"))
-    expect(onChoose).toHaveBeenCalledWith({
+    expect(onDownload).toHaveBeenCalledWith({
       targetId: candidate.targetId,
       providerModelId: candidate.providerModelId,
+      displayName: candidate.displayName,
       reasoningEffort: "none",
     })
     await act(view.renderOnce)
@@ -378,7 +412,6 @@ test("keeps the chosen row highlighted and locks navigation while download detai
         onCancel: vi.fn(),
         onRetry: vi.fn(),
       }}
-      onChoose={onChoose}
       onContinue={onContinue}
       onSkip={onSkip}
     />,
@@ -401,7 +434,8 @@ test("keeps the chosen row highlighted and locks navigation while download detai
     await act(async () => press("up"))
     await act(view.renderOnce)
     expect(view.captureCharFrame()).toMatch(/› Remote Model\s+Balanced/)
-    expect(onChoose).not.toHaveBeenCalled()
+    expect(onLoad).not.toHaveBeenCalled()
+    expect(onDownload).not.toHaveBeenCalled()
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -423,7 +457,6 @@ test("renders the authoritative loading lifecycle", async () => {
         onRetry: vi.fn(),
         onChooseAnother: vi.fn(),
       }}
-      onChoose={onChoose}
       onContinue={onContinue}
       onSkip={onSkip}
     />,
@@ -451,7 +484,6 @@ test("keeps four rows per section and scrolls only the installed-model window", 
       width={100}
       error={null}
       operation={null}
-      onChoose={onChoose}
       onContinue={onContinue}
       onSkip={onSkip}
     />,
@@ -543,7 +575,6 @@ test("excludes unrelated failed downloads and unusable installed models", async 
       width={100}
       error={null}
       operation={null}
-      onChoose={onChoose}
       onContinue={onContinue}
       onSkip={onSkip}
     />,
@@ -559,9 +590,10 @@ test("excludes unrelated failed downloads and unusable installed models", async 
       await act(async () => press("down"))
     }
     await act(async () => press("enter"))
-    expect(onChoose).toHaveBeenCalledWith({
+    expect(onDownload).toHaveBeenCalledWith({
       targetId: ModelOfferingTargetIdSchema.make("target_remote_4"),
       providerModelId: ProviderModelIdSchema.make("configuration_remote_4"),
+      displayName: "Remote 4",
       reasoningEffort: "none",
     })
   } finally {
@@ -576,7 +608,6 @@ test("stacks the informational pane without clipping actions on narrower termina
       width={70}
       error={null}
       operation={null}
-      onChoose={onChoose}
       onContinue={onContinue}
       onSkip={onSkip}
     />,

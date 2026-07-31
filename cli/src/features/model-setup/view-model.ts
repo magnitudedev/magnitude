@@ -1,33 +1,23 @@
 import { Option } from "effect"
-import {
-  deriveSelectedLocalModelCandidate,
-} from "@magnitudedev/client-common"
+import type { OnboardingModelWorkflowIntent } from "@magnitudedev/client-common"
 import type {
   LocalModelCatalogCandidate,
   LocalModelsState,
   ModelSlotsState,
-  ProviderModelCatalogState,
   ProviderModelId,
+  ReasoningEffort,
 } from "@magnitudedev/sdk"
-import {
-  buildLocalInferenceSelections,
-} from "../local-inference/view-model"
 
 export type OnboardingModelSetupView =
   | { readonly _tag: "Inactive" }
   | { readonly _tag: "Choosing" }
-  | {
-      readonly _tag: "Downloading"
-      readonly candidate: LocalModelCatalogCandidate
-    }
-  | {
-      readonly _tag: "DownloadFailed"
-      readonly candidate: LocalModelCatalogCandidate
-    }
+  | { readonly _tag: "Downloading"; readonly candidate: LocalModelCatalogCandidate }
+  | { readonly _tag: "DownloadFailed"; readonly candidate: LocalModelCatalogCandidate }
   | {
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly displayName: string
+      readonly reasoningEffort: ReasoningEffort
       readonly phase: "Loading" | "Ready" | "Failed"
       readonly failure: string | null
     }
@@ -47,58 +37,52 @@ export const deriveModelSetupActive = ({
 
 export const deriveOnboardingModelSetupView = ({
   active,
-  submittedProviderModelId,
+  intent,
   models,
-  catalog,
   slots,
 }: {
   readonly active: boolean
-  readonly submittedProviderModelId: ProviderModelId | null
+  readonly intent: OnboardingModelWorkflowIntent
   readonly models: LocalModelsState
-  readonly catalog: ProviderModelCatalogState
   readonly slots: ModelSlotsState
 }): OnboardingModelSetupView => {
   if (!active) return { _tag: "Inactive" }
+  if (intent._tag === "Idle") return { _tag: "Choosing" }
 
-  const submittedCandidate = submittedProviderModelId === null
-    || models.recommendations._tag !== "Ready"
-    ? null
-    : models.recommendations.catalog.find(({ providerModelId }) =>
-        providerModelId === submittedProviderModelId) ?? null
-  if (submittedCandidate?.download._tag === "Failed") {
-    return { _tag: "DownloadFailed", candidate: submittedCandidate }
-  }
-  if (submittedCandidate?.download._tag === "Downloading") {
-    return { _tag: "Downloading", candidate: submittedCandidate }
+  const operation = intent._tag === "Cancelling" ? intent.operation : intent
+  if (operation._tag === "Downloading") {
+    const candidate = models.recommendations._tag === "Ready"
+      ? models.recommendations.catalog.find(({ providerModelId }) =>
+          providerModelId === operation.choice.providerModelId)
+      : undefined
+    if (candidate === undefined) return { _tag: "Choosing" }
+    return candidate.download._tag === "Failed"
+      ? { _tag: "DownloadFailed", candidate }
+      : { _tag: "Downloading", candidate }
   }
 
   const primary = slots.slots.primary
-  if (submittedProviderModelId === null
-    || primary._tag !== "ConfiguredLocal"
-    || primary.selection.providerModelId !== submittedProviderModelId) {
-    return { _tag: "Choosing" }
-  }
-  const candidate = deriveSelectedLocalModelCandidate(models, slots)
-  const selection = buildLocalInferenceSelections(models, catalog, slots).find((item) =>
-    Option.exists(item.providerModelId, (providerModelId) =>
-      providerModelId === primary.selection.providerModelId))
-  const lifecycle = Option.getOrNull(Option.map(
-    primary.instance,
-    ({ lifecycle }) => lifecycle,
-  ))
-  if (lifecycle === null
-    || lifecycle._tag === "Stopping"
-    || lifecycle._tag === "Stopped") {
-    return { _tag: "Choosing" }
+  const lifecycle = primary._tag === "ConfiguredLocal"
+    && primary.selection.providerModelId === operation.choice.providerModelId
+    ? Option.getOrNull(Option.map(primary.instance, ({ lifecycle }) => lifecycle))
+    : null
+  if (lifecycle?._tag === "Ready" || lifecycle?._tag === "Failed") {
+    return {
+      _tag: "Activating",
+      providerModelId: operation.choice.providerModelId,
+      displayName: operation.choice.displayName,
+      reasoningEffort: operation.choice.reasoningEffort,
+      phase: lifecycle._tag,
+      failure: lifecycle._tag === "Failed" ? lifecycle.failure.message : null,
+    }
   }
   return {
     _tag: "Activating",
-    providerModelId: primary.selection.providerModelId,
-    displayName: candidate?.displayName
-      ?? selection?.model.displayName
-      ?? primary.descriptor.displayName,
-    phase: lifecycle._tag,
-    failure: lifecycle._tag === "Failed" ? lifecycle.failure.message : null,
+    providerModelId: operation.choice.providerModelId,
+    displayName: operation.choice.displayName,
+    reasoningEffort: operation.choice.reasoningEffort,
+    phase: "Loading",
+    failure: null,
   }
 }
 

@@ -6,6 +6,7 @@ mod catalog;
 mod download;
 mod download_service;
 pub mod gguf;
+mod hugging_face;
 mod identity;
 mod inventory;
 mod manifest;
