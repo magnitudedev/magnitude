@@ -169,18 +169,25 @@ fn header_sources(lock: &Lock) -> anyhow::Result<BTreeMap<String, HeaderSource>>
                 path: component.component.path.clone(),
                 bytes: component.source_header_size_bytes,
             };
-            if let Some(previous) =
-                sources.insert(component.source_header_digest.clone(), source.clone())
-                && (previous.repository != source.repository
-                    || previous.commit != source.commit
-                    || previous.path != source.path
-                    || previous.bytes != source.bytes)
-            {
-                anyhow::bail!("catalog reuses a planner digest for different sources");
-            }
+            insert_header_source(&mut sources, component.source_header_digest.clone(), source)?;
         }
     }
     Ok(sources)
+}
+
+fn insert_header_source(
+    sources: &mut BTreeMap<String, HeaderSource>,
+    digest: String,
+    source: HeaderSource,
+) -> anyhow::Result<()> {
+    if let Some(previous) = sources.get(&digest) {
+        if previous.bytes != source.bytes {
+            anyhow::bail!("catalog reuses a planner digest with different header sizes");
+        }
+        return Ok(());
+    }
+    sources.insert(digest, source);
+    Ok(())
 }
 
 fn prepare_planner_stubs(
@@ -421,4 +428,40 @@ fn monotonic_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(path: &str, bytes: u64) -> HeaderSource {
+        HeaderSource {
+            repository: "owner/repository".to_owned(),
+            commit: "a".repeat(40),
+            path: PathBuf::from(path),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn identical_header_content_may_be_reused_at_multiple_source_paths() {
+        let mut sources = BTreeMap::new();
+        insert_header_source(&mut sources, "b".repeat(64), source("q4/model.gguf", 42)).unwrap();
+        insert_header_source(&mut sources, "b".repeat(64), source("q8/model.gguf", 42)).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources.values().next().unwrap().path,
+            Path::new("q4/model.gguf")
+        );
+    }
+
+    #[test]
+    fn one_header_digest_cannot_declare_conflicting_sizes() {
+        let mut sources = BTreeMap::new();
+        insert_header_source(&mut sources, "b".repeat(64), source("q4/model.gguf", 42)).unwrap();
+        assert!(
+            insert_header_source(&mut sources, "b".repeat(64), source("q8/model.gguf", 43))
+                .is_err()
+        );
+    }
 }

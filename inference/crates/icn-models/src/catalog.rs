@@ -1014,7 +1014,7 @@ mod tests {
             formats("nemotron-3-super-120b-a12b"),
             ["UD-Q4_K_XL", "MXFP4_MOE"]
         );
-        assert_eq!(formats("deepseek-v4-flash"), ["UD-Q3_K_M"]);
+        assert_eq!(formats("deepseek-v4-flash"), ["UD-Q4_K_XL", "UD-Q8_K_XL"]);
         assert_eq!(formats("glm-5.2"), ["BF16"]);
     }
 

@@ -1,8 +1,8 @@
 {
-  "sourceDigest": "de93c941505b255f037e1927d9a751b88606fa5cead1bc3f0de1bb054935d4ce",
+  "sourceDigest": "045aed2d0b1ec70a192c21a550c6c6862fb9f485f0a073891bd25169ebc9457f",
   "templateIdentity": "icn-native-model-template:0.1.0:c434543fbf094ccf89ead7e0584f74ebfd374a1b:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9",
   "plannerIdentity": "icn-native-model-template:0.1.0:c434543fbf094ccf89ead7e0584f74ebfd374a1b:1f66c3ce1c26c95db3fadb734086c7d9fba23bb9:gguf-planner-v2:llama-native-decode-workload-v2:llama-native-ggml-decode-calibration-v2",
-  "plannerBundleDigest": "ee7beb4266941f1e56811066e2a310ddc41cb1028da1d5ada976debd49e4112a",
+  "plannerBundleDigest": "b7fac10cc7990906b9fd9d1ad3a64fad7e16324ad02248d18205da020396c38c",
   "plannerArtifacts": [
     {
       "targetId": "target_5e2192c9cd74e5ee4361bd793d3e3fb85bb6eb1d98c19564aba5c9007f8430f2",
@@ -2694,10 +2694,10 @@
       ]
     },
     {
-      "targetId": "target_d4d8f2cd49368a5e0ac3f772d337f4bf6f48f14e2c7588112e6c05f9da36d025",
-      "modelId": "mdl_d22036866d1190f26d58915e3c620f6285d12c75179be46d1a89efba89fa2075",
-      "contentId": "content_de40d96078ec008a1c9b710ce0789282fb70e1abe46394fb19d945d4e2c33508",
-      "name": "Deepseek-V4-Flash",
+      "targetId": "target_2e541b4c05c4e8754860ff34f5444de625f5acd42e026a2fc30dc555c2a6c84f",
+      "modelId": "mdl_972ff61670b4883417adc9f53cd9f452a69d8f979ca1dbe71781e89ce4f12fa1",
+      "contentId": "content_6d5d5a92ab0e60e1182e544a93630c06d98367257fcab364a3537c70a2f1610d",
+      "name": "Deepseek-V4-Flash-0731",
       "supportedParameters": [
         "tools",
         "reasoning_effort"
@@ -2705,8 +2705,8 @@
       "properties": {
         "type": "inspected",
         "architecture": "deepseek4",
-        "quantization": "Q3_K - Medium",
-        "quantization_name": "3-bit",
+        "quantization": "MXFP4 MoE",
+        "quantization_name": "4-bit",
         "parameter_count": null,
         "active_parameter_count": null,
         "training_context_length": 1048576,
@@ -2715,7 +2715,7 @@
           "text"
         ],
         "base_models": [
-          "DeepSeek V4 Flash"
+          "DeepSeek V4 Flash 0731"
         ],
         "tools": {
           "type": "supported",
@@ -2731,9 +2731,10 @@
             "type": "effort",
             "levels": [
               "none",
+              "high",
               "max"
             ],
-            "default": "none"
+            "default": "high"
           },
           "visibility": "hidden",
           "delimiters": {
@@ -2743,82 +2744,244 @@
           },
           "evidence": {
             "type": "bounded_template_probe",
-            "fingerprint": "sha256:d05566ebe26667ec54f4ef7a3dbc114ce2e00aefc40e0c62286374eee0e22080"
+            "fingerprint": "sha256:e643c31fcec17f342f72296e02c46d35846bf4c70f6a0271f23bad73fd4eb645"
           }
         },
-        "evidence_fingerprint": "sha256:2338b7f11bd9f7d0e2fb8ceb887cbd1f6e8dfc2e32a637f7bf5af4a9e5e8188f+sha256:d05566ebe26667ec54f4ef7a3dbc114ce2e00aefc40e0c62286374eee0e22080"
+        "evidence_fingerprint": "sha256:2480e63dace483eba5911f48a92f81a5423662be6002d96e94539b4a7a39bb5b+sha256:e643c31fcec17f342f72296e02c46d35846bf4c70f6a0271f23bad73fd4eb645"
       },
       "source": {
         "type": "hugging_face",
-        "repository": "unsloth/DeepSeek-V4-Flash-GGUF",
-        "requested_revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
-        "commit": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0"
+        "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+        "requested_revision": "ce2d0d94e35d96e9412afee41b9b32b21529bf1b",
+        "commit": "ce2d0d94e35d96e9412afee41b9b32b21529bf1b"
       },
-      "primaryGguf": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf",
+      "primaryGguf": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf",
       "components": [
         {
           "component": {
-            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf",
+            "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf",
             "role": "shard",
-            "size_bytes": 5256864,
+            "size_bytes": 5257408,
             "content": {
               "type": "sha256",
-              "value": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396"
+              "value": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa"
             },
             "shard_index": 1
           },
-          "sourceHeaderDigest": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
-          "sourceHeaderSizeBytes": 5256864,
-          "plannerStubDigest": "ec98697cec2c60e1de6b8c54f027f299cf52dfac374887d63307e5d084a1707a",
-          "plannerStubSizeBytes": 1038208
+          "sourceHeaderDigest": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+          "sourceHeaderSizeBytes": 5257408,
+          "plannerStubDigest": "9d56dbfd9ac87c361f9a2849a73d1c05f702e016a99e84ebe31702630199d378",
+          "plannerStubSizeBytes": 1038048
         },
         {
           "component": {
-            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00002-of-00004.gguf",
+            "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00002-of-00005.gguf",
             "role": "shard",
-            "size_bytes": 49222528448,
+            "size_bytes": 48935523072,
             "content": {
               "type": "sha256",
-              "value": "18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034"
+              "value": "d5b61668950f4743aacd677675d7fcf7507dbe1db6d304e8ff97ed1f00827bee"
             },
             "shard_index": 2
           },
-          "sourceHeaderDigest": "44fa1c970a02656d467a7918b2bf45a90b1b2a2ad28beaf349989b47a25b33be",
-          "sourceHeaderSizeBytes": 32384,
-          "plannerStubDigest": "44fa1c970a02656d467a7918b2bf45a90b1b2a2ad28beaf349989b47a25b33be",
-          "plannerStubSizeBytes": 32384
+          "sourceHeaderDigest": "3c6aaedc0391eb0c7c4d08b543d8da3679b74ea86f6d87aad82fb52ab596a212",
+          "sourceHeaderSizeBytes": 26560,
+          "plannerStubDigest": "3c6aaedc0391eb0c7c4d08b543d8da3679b74ea86f6d87aad82fb52ab596a212",
+          "plannerStubSizeBytes": 26560
         },
         {
           "component": {
-            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00003-of-00004.gguf",
+            "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00003-of-00005.gguf",
             "role": "shard",
-            "size_bytes": 49189072672,
+            "size_bytes": 48980787136,
             "content": {
               "type": "sha256",
-              "value": "9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc"
+              "value": "9705db7e589f360685ca7bd48100b270d78d228d4f5aa980508f3b2778af5494"
             },
             "shard_index": 3
           },
-          "sourceHeaderDigest": "9f2b871af97cdeaff7cd5def1cdb0173290fcffc8bf00a569eca80275402fc00",
-          "sourceHeaderSizeBytes": 32544,
-          "plannerStubDigest": "9f2b871af97cdeaff7cd5def1cdb0173290fcffc8bf00a569eca80275402fc00",
-          "plannerStubSizeBytes": 32544
+          "sourceHeaderDigest": "6b1502c91e728906cd297f91e47204e4ce3284ac9c8eafcce605926fc543675f",
+          "sourceHeaderSizeBytes": 28096,
+          "plannerStubDigest": "6b1502c91e728906cd297f91e47204e4ce3284ac9c8eafcce605926fc543675f",
+          "plannerStubSizeBytes": 28096
         },
         {
           "component": {
-            "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00004-of-00004.gguf",
+            "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00004-of-00005.gguf",
             "role": "shard",
-            "size_bytes": 30903139232,
+            "size_bytes": 49999168416,
             "content": {
               "type": "sha256",
-              "value": "2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea"
+              "value": "7f13a68e3ca64208454c4ba32cc2757c0cbe78e3e5576c3142bf7007ca97da42"
             },
             "shard_index": 4
           },
-          "sourceHeaderDigest": "23f344cddb983f4291a48e0d58a2091f9fe541dec0c884d5a99dcb1ba6c0eb43",
-          "sourceHeaderSizeBytes": 21152,
-          "plannerStubDigest": "23f344cddb983f4291a48e0d58a2091f9fe541dec0c884d5a99dcb1ba6c0eb43",
-          "plannerStubSizeBytes": 21152
+          "sourceHeaderDigest": "75bcb3f965f342ea1c6e61f1455df8957070e33cf5fbd224ff7b1a58c8430983",
+          "sourceHeaderSizeBytes": 26816,
+          "plannerStubDigest": "75bcb3f965f342ea1c6e61f1455df8957070e33cf5fbd224ff7b1a58c8430983",
+          "plannerStubSizeBytes": 26816
+        },
+        {
+          "component": {
+            "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00005-of-00005.gguf",
+            "role": "shard",
+            "size_bytes": 7174505088,
+            "content": {
+              "type": "sha256",
+              "value": "ed0d93164d3784968d6ce40d6d201ba98337f16e7db1b31fe495b2b0f334cc09"
+            },
+            "shard_index": 5
+          },
+          "sourceHeaderDigest": "77988d2ed849f5738ada23a0a4ef9d2e3ad364248ddeda7b7ee6cd44378c70d0",
+          "sourceHeaderSizeBytes": 4704,
+          "plannerStubDigest": "77988d2ed849f5738ada23a0a4ef9d2e3ad364248ddeda7b7ee6cd44378c70d0",
+          "plannerStubSizeBytes": 4704
+        }
+      ]
+    },
+    {
+      "targetId": "target_1653b27d4675d415c99e6fbe11cda767a4c3e29457012aa706b37cb9b9e87d02",
+      "modelId": "mdl_1ca424ca133d753563521a0892a33aa1d90a7dfb8a2377824cd0d5ca4ca01309",
+      "contentId": "content_029d75ff1ce57d2578c816780802237af534c91c30a5ad7b252007f9f4f98086",
+      "name": "Deepseek-V4-Flash-0731",
+      "supportedParameters": [
+        "tools",
+        "reasoning_effort"
+      ],
+      "properties": {
+        "type": "inspected",
+        "architecture": "deepseek4",
+        "quantization": "MXFP4 MoE",
+        "quantization_name": "4-bit",
+        "parameter_count": null,
+        "active_parameter_count": null,
+        "training_context_length": 1048576,
+        "tokenizer": "gpt2",
+        "modalities": [
+          "text"
+        ],
+        "base_models": [
+          "DeepSeek V4 Flash 0731"
+        ],
+        "tools": {
+          "type": "supported",
+          "parallel": true
+        },
+        "structured_output": {
+          "type": "supported",
+          "parallel": null
+        },
+        "reasoning": {
+          "type": "supported",
+          "control": {
+            "type": "effort",
+            "levels": [
+              "none",
+              "high",
+              "max"
+            ],
+            "default": "high"
+          },
+          "visibility": "hidden",
+          "delimiters": {
+            "type": "known",
+            "start": "<think>",
+            "end": "</think>"
+          },
+          "evidence": {
+            "type": "bounded_template_probe",
+            "fingerprint": "sha256:e643c31fcec17f342f72296e02c46d35846bf4c70f6a0271f23bad73fd4eb645"
+          }
+        },
+        "evidence_fingerprint": "sha256:2480e63dace483eba5911f48a92f81a5423662be6002d96e94539b4a7a39bb5b+sha256:e643c31fcec17f342f72296e02c46d35846bf4c70f6a0271f23bad73fd4eb645"
+      },
+      "source": {
+        "type": "hugging_face",
+        "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+        "requested_revision": "ce2d0d94e35d96e9412afee41b9b32b21529bf1b",
+        "commit": "ce2d0d94e35d96e9412afee41b9b32b21529bf1b"
+      },
+      "primaryGguf": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+      "components": [
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+            "role": "shard",
+            "size_bytes": 5257408,
+            "content": {
+              "type": "sha256",
+              "value": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa"
+            },
+            "shard_index": 1
+          },
+          "sourceHeaderDigest": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+          "sourceHeaderSizeBytes": 5257408,
+          "plannerStubDigest": "9d56dbfd9ac87c361f9a2849a73d1c05f702e016a99e84ebe31702630199d378",
+          "plannerStubSizeBytes": 1038048
+        },
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00002-of-00005.gguf",
+            "role": "shard",
+            "size_bytes": 49215492960,
+            "content": {
+              "type": "sha256",
+              "value": "3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610"
+            },
+            "shard_index": 2
+          },
+          "sourceHeaderDigest": "2ef78ef1a3160b7d19ae975cbb3d0d8017a7559443bd80a89a81e50dfc69fa13",
+          "sourceHeaderSizeBytes": 24608,
+          "plannerStubDigest": "2ef78ef1a3160b7d19ae975cbb3d0d8017a7559443bd80a89a81e50dfc69fa13",
+          "plannerStubSizeBytes": 24608
+        },
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf",
+            "role": "shard",
+            "size_bytes": 49700372160,
+            "content": {
+              "type": "sha256",
+              "value": "7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce"
+            },
+            "shard_index": 3
+          },
+          "sourceHeaderDigest": "d42ade5a28200068e1b61e501dacec11648a33f61c8a1b1632a9e1870be31772",
+          "sourceHeaderSizeBytes": 27840,
+          "plannerStubDigest": "d42ade5a28200068e1b61e501dacec11648a33f61c8a1b1632a9e1870be31772",
+          "plannerStubSizeBytes": 27840
+        },
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00004-of-00005.gguf",
+            "role": "shard",
+            "size_bytes": 49466495968,
+            "content": {
+              "type": "sha256",
+              "value": "6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3"
+            },
+            "shard_index": 4
+          },
+          "sourceHeaderDigest": "5a006259cc7607775757381700de7b8a42d217eb454308791bad00128cf08d1c",
+          "sourceHeaderSizeBytes": 26592,
+          "plannerStubDigest": "5a006259cc7607775757381700de7b8a42d217eb454308791bad00128cf08d1c",
+          "plannerStubSizeBytes": 26592
+        },
+        {
+          "component": {
+            "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00005-of-00005.gguf",
+            "role": "shard",
+            "size_bytes": 13481997024,
+            "content": {
+              "type": "sha256",
+              "value": "ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea"
+            },
+            "shard_index": 5
+          },
+          "sourceHeaderDigest": "b0fc28190d6dbc4983e5c1ba7506d4ac10cfcaa60bbc319903491d68dcfd2b93",
+          "sourceHeaderSizeBytes": 7136,
+          "plannerStubDigest": "b0fc28190d6dbc4983e5c1ba7506d4ac10cfcaa60bbc319903491d68dcfd2b93",
+          "plannerStubSizeBytes": 7136
         }
       ]
     },
@@ -5860,78 +6023,91 @@
         ]
       },
       {
-        "id": "deepseek-v4-flash:UD-Q3_K_M",
+        "id": "deepseek-v4-flash:UD-Q4_K_XL",
         "checkpointId": "deepseek-v4-flash",
-        "targetId": "target_d4d8f2cd49368a5e0ac3f772d337f4bf6f48f14e2c7588112e6c05f9da36d025",
+        "targetId": "target_2e541b4c05c4e8754860ff34f5444de625f5acd42e026a2fc30dc555c2a6c84f",
         "target": {
           "_tag": "Package",
           "package": {
-            "id": "package_1b4785d96c19203870e1158cfec083d0d51eda6ba09b4039638aed7583c0c8a9",
+            "id": "package_ca0fc11e3e8b7d3b38ea6c6613857b79ab743971b153b35c29b7a8f814074d4a",
             "source": {
               "_tag": "HuggingFace",
-              "repository": "unsloth/DeepSeek-V4-Flash-GGUF",
-              "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0"
+              "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+              "revision": "ce2d0d94e35d96e9412afee41b9b32b21529bf1b"
             },
             "files": [
               {
-                "id": "file_951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
-                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf",
+                "id": "file_d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+                "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf",
                 "role": "weights",
-                "sizeBytes": 5256864,
-                "sha256": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396"
+                "sizeBytes": 5257408,
+                "sha256": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa"
               },
               {
-                "id": "file_18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034",
-                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00002-of-00004.gguf",
+                "id": "file_d5b61668950f4743aacd677675d7fcf7507dbe1db6d304e8ff97ed1f00827bee",
+                "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00002-of-00005.gguf",
                 "role": "weights",
-                "sizeBytes": 49222528448,
-                "sha256": "18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034"
+                "sizeBytes": 48935523072,
+                "sha256": "d5b61668950f4743aacd677675d7fcf7507dbe1db6d304e8ff97ed1f00827bee"
               },
               {
-                "id": "file_9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc",
-                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00003-of-00004.gguf",
+                "id": "file_9705db7e589f360685ca7bd48100b270d78d228d4f5aa980508f3b2778af5494",
+                "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00003-of-00005.gguf",
                 "role": "weights",
-                "sizeBytes": 49189072672,
-                "sha256": "9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc"
+                "sizeBytes": 48980787136,
+                "sha256": "9705db7e589f360685ca7bd48100b270d78d228d4f5aa980508f3b2778af5494"
               },
               {
-                "id": "file_2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea",
-                "path": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00004-of-00004.gguf",
+                "id": "file_7f13a68e3ca64208454c4ba32cc2757c0cbe78e3e5576c3142bf7007ca97da42",
+                "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00004-of-00005.gguf",
                 "role": "weights",
-                "sizeBytes": 30903139232,
-                "sha256": "2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea"
+                "sizeBytes": 49999168416,
+                "sha256": "7f13a68e3ca64208454c4ba32cc2757c0cbe78e3e5576c3142bf7007ca97da42"
+              },
+              {
+                "id": "file_ed0d93164d3784968d6ce40d6d201ba98337f16e7db1b31fe495b2b0f334cc09",
+                "path": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00005-of-00005.gguf",
+                "role": "weights",
+                "sizeBytes": 7174505088,
+                "sha256": "ed0d93164d3784968d6ce40d6d201ba98337f16e7db1b31fe495b2b0f334cc09"
               }
             ],
             "relationships": [
               {
                 "_tag": "Shard",
-                "fileId": "file_18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034",
-                "index": 2,
-                "count": 4
-              },
-              {
-                "_tag": "Shard",
-                "fileId": "file_2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea",
+                "fileId": "file_7f13a68e3ca64208454c4ba32cc2757c0cbe78e3e5576c3142bf7007ca97da42",
                 "index": 4,
-                "count": 4
+                "count": 5
               },
               {
                 "_tag": "Shard",
-                "fileId": "file_951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
-                "index": 1,
-                "count": 4
-              },
-              {
-                "_tag": "Shard",
-                "fileId": "file_9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc",
+                "fileId": "file_9705db7e589f360685ca7bd48100b270d78d228d4f5aa980508f3b2778af5494",
                 "index": 3,
-                "count": 4
+                "count": 5
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+                "index": 1,
+                "count": 5
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_d5b61668950f4743aacd677675d7fcf7507dbe1db6d304e8ff97ed1f00827bee",
+                "index": 2,
+                "count": 5
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_ed0d93164d3784968d6ce40d6d201ba98337f16e7db1b31fe495b2b0f334cc09",
+                "index": 5,
+                "count": 5
               }
             ],
             "properties": {
               "format": "gguf",
-              "quantization": "Q3_K - Medium",
-              "quantizationName": "3-bit",
+              "quantization": "MXFP4 MoE",
+              "quantizationName": "4-bit",
               "architecture": "deepseek4",
               "maximumContextLength": 1048576
             }
@@ -5956,14 +6132,140 @@
             "supported": true,
             "efforts": [
               "none",
+              "high",
               "max"
             ],
-            "defaultEffort": "none"
+            "defaultEffort": "high"
           }
         },
         "qualityScore": 61.8,
         "qualityScoreProvenance": "measured_terminal_bench_2.1",
         "fidelityRank": 40,
+        "quantizationAware": false,
+        "qualityEvidence": [
+          "Quantization fidelity is curated independently from hardware fit.",
+          "https://arxiv.org/abs/2606.19558"
+        ]
+      },
+      {
+        "id": "deepseek-v4-flash:UD-Q8_K_XL",
+        "checkpointId": "deepseek-v4-flash",
+        "targetId": "target_1653b27d4675d415c99e6fbe11cda767a4c3e29457012aa706b37cb9b9e87d02",
+        "target": {
+          "_tag": "Package",
+          "package": {
+            "id": "package_cca2100eca9e32d0ab55b4bcd8b921ed6deff56fd73e51ce4e6eb6806910ca00",
+            "source": {
+              "_tag": "HuggingFace",
+              "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+              "revision": "ce2d0d94e35d96e9412afee41b9b32b21529bf1b"
+            },
+            "files": [
+              {
+                "id": "file_d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+                "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+                "role": "weights",
+                "sizeBytes": 5257408,
+                "sha256": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa"
+              },
+              {
+                "id": "file_3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610",
+                "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00002-of-00005.gguf",
+                "role": "weights",
+                "sizeBytes": 49215492960,
+                "sha256": "3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610"
+              },
+              {
+                "id": "file_7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce",
+                "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf",
+                "role": "weights",
+                "sizeBytes": 49700372160,
+                "sha256": "7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce"
+              },
+              {
+                "id": "file_6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3",
+                "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00004-of-00005.gguf",
+                "role": "weights",
+                "sizeBytes": 49466495968,
+                "sha256": "6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3"
+              },
+              {
+                "id": "file_ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea",
+                "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00005-of-00005.gguf",
+                "role": "weights",
+                "sizeBytes": 13481997024,
+                "sha256": "ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea"
+              }
+            ],
+            "relationships": [
+              {
+                "_tag": "Shard",
+                "fileId": "file_3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610",
+                "index": 2,
+                "count": 5
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3",
+                "index": 4,
+                "count": 5
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce",
+                "index": 3,
+                "count": 5
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+                "index": 1,
+                "count": 5
+              },
+              {
+                "_tag": "Shard",
+                "fileId": "file_ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea",
+                "index": 5,
+                "count": 5
+              }
+            ],
+            "properties": {
+              "format": "gguf",
+              "quantization": "MXFP4 MoE",
+              "quantizationName": "4-bit",
+              "architecture": "deepseek4",
+              "maximumContextLength": 1048576
+            }
+          }
+        },
+        "eligibleServingProfiles": [
+          {
+            "contextLength": 100000
+          },
+          {
+            "contextLength": 200000
+          }
+        ],
+        "displayName": "DeepSeek V4 Flash 284B-A13B",
+        "description": "Frontier MoE model with a very large weight footprint and low active compute.",
+        "license": "mit",
+        "capabilities": {
+          "vision": false,
+          "tools": true,
+          "structuredOutput": true,
+          "reasoning": {
+            "supported": true,
+            "efforts": [
+              "none",
+              "high",
+              "max"
+            ],
+            "defaultEffort": "high"
+          }
+        },
+        "qualityScore": 61.8,
+        "qualityScoreProvenance": "measured_terminal_bench_2.1",
+        "fidelityRank": 80,
         "quantizationAware": false,
         "qualityEvidence": [
           "Quantization fidelity is curated independently from hardware fit.",
