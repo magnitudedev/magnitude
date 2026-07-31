@@ -75,7 +75,8 @@ const devTimestamp = (build: string): string | null =>
  * Published versions use SemVer precedence. Development identities use the
  * generated `+dev.<commit>.<timestamp>` suffix. Equal-precedence build
  * identities are naturally ordered, so numeric segments such as timestamps
- * compare numerically. A published release outranks a build of the same base.
+ * compare numerically. A development identity outranks a published release of
+ * the same base so local development always replaces that release's daemon.
  * Arbitrary non-SemVer strings use the same deterministic natural ordering.
  */
 export const compareReleaseVersions = (
@@ -107,10 +108,14 @@ export const compareReleaseVersions = (
     if (compared !== 0) return compared
   }
 
+  const leftDevTimestamp = left.build === null ? null : devTimestamp(left.build)
+  const rightDevTimestamp = right.build === null ? null : devTimestamp(right.build)
+  if (leftDevTimestamp !== null || rightDevTimestamp !== null) {
+    if (leftDevTimestamp === null) return -1
+    if (rightDevTimestamp === null) return 1
+  }
   if (left.build === null) return 1
   if (right.build === null) return -1
-  const leftDevTimestamp = devTimestamp(left.build)
-  const rightDevTimestamp = devTimestamp(right.build)
   if (leftDevTimestamp !== null && rightDevTimestamp !== null) {
     const compared = compareIdentifiers(leftDevTimestamp, rightDevTimestamp)
     if (compared !== 0) return compared

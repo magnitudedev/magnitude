@@ -536,7 +536,7 @@ describe("local daemon spawner rendezvous", () => {
     );
   });
 
-  it("starts the successor without directing the incompatible owner to shut down", async () => {
+  it("starts a same-base development successor without directing the published owner to shut down", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "magnitude-spawner-upgrade-"));
     const registryDirectory = join(dataDir, "acn");
     const registryPath = join(registryDirectory, "registry.json");
@@ -551,7 +551,9 @@ describe("local daemon spawner rendezvous", () => {
       stdout: "ignore",
       stderr: "ignore",
     });
-    let health = { version: "1.0.0", id: "old-owner", pid: old.pid };
+    const publishedVersion = "1.0.0-alpha.1";
+    const developmentVersion = "1.0.0-alpha.1+dev.commit.1";
+    let health = { version: publishedVersion, id: "old-owner", pid: old.pid };
     let shutdownRequests = 0;
     server = Bun.serve({
       port: 0,
@@ -563,7 +565,9 @@ describe("local daemon spawner rendezvous", () => {
         return Response.json({
           service: "magnitude-acn",
           ...health,
-          ...(health.version === "1.0.0" ? {} : { state: { _tag: "Ready" } }),
+          ...(health.version === publishedVersion
+            ? {}
+            : { state: { _tag: "Ready" } }),
         });
       },
     });
@@ -586,7 +590,7 @@ describe("local daemon spawner rendezvous", () => {
       } catch {
         oldWasGoneAtSpawn = true;
       }
-      health = { version: "2.0.0", id: "new-owner", pid: 9876 };
+      health = { version: developmentVersion, id: "new-owner", pid: 9876 };
       void writeFile(
         registryPath,
         JSON.stringify({
@@ -603,7 +607,7 @@ describe("local daemon spawner rendezvous", () => {
 
     const url = await makeLocalDaemonSpawner({
       dataDir,
-      version: "2.0.0",
+      version: developmentVersion,
       publicationTimeoutMs: 2000,
       probeTimeoutMs: 200,
     }).pipe(

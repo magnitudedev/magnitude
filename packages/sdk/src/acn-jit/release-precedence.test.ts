@@ -42,9 +42,10 @@ describe("compareReleaseVersions", () => {
     ).toBe(1)
   })
 
-  it("orders a published release above a dev build of the same base", () => {
-    expect(compareReleaseVersions("0.0.1-alpha.22", "0.0.1-alpha.22+dev.2c5b178.1")).toBe(1)
-    expect(compareReleaseVersions("0.0.1-alpha.22+dev.2c5b178.1", "0.0.1-alpha.22")).toBe(-1)
+  it("orders a dev build above a published release of the same base", () => {
+    expect(compareReleaseVersions("0.0.1-alpha.22", "0.0.1-alpha.22+dev.2c5b178.1")).toBe(-1)
+    expect(compareReleaseVersions("0.0.1-alpha.22+dev.2c5b178.1", "0.0.1-alpha.22")).toBe(1)
+    expect(compareReleaseVersions("0.0.1-alpha.23", "0.0.1-alpha.22+dev.2c5b178.1")).toBe(1)
   })
 
   it("deterministically orders malformed and non-Magnitude identities", () => {
