@@ -195,7 +195,7 @@ const resolveCandidate = (
         lifecycleError(
           "resolve",
           "download-failed",
-          "unable to prepare the release ICN installation",
+          `unable to prepare the release ICN installation (${cause.stage}: ${cause.message})`,
           cause
         )
       )
