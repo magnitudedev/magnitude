@@ -194,7 +194,7 @@
     },
     "packages/cli": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.1-alpha.24",
+      "version": "0.0.1-alpha.26",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
