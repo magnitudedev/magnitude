@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.27
+
+### Patch Changes
+
+- [`497c151`](https://github.com/magnitudedev/magnitude/commit/497c151272dc7ae5bb6892ed746b74a3bed3900b) Thanks [@anerli](https://github.com/anerli)! - fix: remove native openssl implicit dep
+
 ## 0.0.1-alpha.26
 
 ### Patch Changes
