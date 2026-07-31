@@ -102,16 +102,16 @@ type CallOptionsWithToolIds = BaseCallOptions & {
 
 /**
  * Determine the tool-choice mode from a tool choice value.
- * An unspecified choice has the provider-neutral default "auto" behavior.
  * Returns None for "none", grammar, named-function, allowed-tools —
  * those preserve caller intent and don't need grammar wrapping.
  */
 function toolChoiceMode(toolChoice: Option.Option<BaseCallOptions["toolChoice"]>): Option.Option<ToolChoiceMode> {
-  if (Option.isNone(toolChoice)) return Option.some("auto")
-  const tc = toolChoice.value
-  if (tc === "auto") return Option.some("auto")
-  if (tc === "required") return Option.some("required")
-  return Option.none()
+  return Option.gen(function* () {
+    const tc = yield* toolChoice
+    if (tc === "auto") return "auto"
+    if (tc === "required") return "required"
+    return yield* Option.none()
+  })
 }
 
 interface GrammarToolChoice {
