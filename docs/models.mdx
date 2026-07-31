@@ -32,3 +32,13 @@ Recommendations are a short list selected for your machine. The catalog contains
 Open `/settings`, then select **catalog** to compare model details including recommendation, memory, coding intelligence, quantization quality, speed, context, and license information. You can download another model at any time or select one that is already installed.
 
 Magnitude-managed models are stored in `~/.magnitude/models`. Magnitude also checks the Hugging Face Hub cache for compatible GGUF models, respecting `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, and `XDG_CACHE_HOME` before falling back to `~/.cache/huggingface/hub`.
+
+### Download a model outside the catalog
+
+You can use a compatible GGUF model that is not included in Magnitude's catalog by downloading it with the Hugging Face CLI. Let `hf download` place the files in the canonical Hugging Face Hub cache instead of downloading them to an arbitrary directory. Use an include pattern that selects the model and quantization you want:
+
+```bash
+hf download <owner>/<repository> --include "<model-and-quantization>*.gguf"
+```
+
+Hugging Face downloads every matching file, including all shards in the selected set. Magnitude scans the Hugging Face cache locations described above and adds compatible, complete GGUF packages to the Models menu. Restart Magnitude after the download finishes to refresh its model inventory.
