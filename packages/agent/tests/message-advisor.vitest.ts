@@ -276,7 +276,7 @@ function runAdvisor(
       getWindowState: () => Effect.succeed(state),
     }),
     Layer.succeed(AgentStateReaderTag, {
-      getAgentState: () => Effect.succeed({ agents: new Map(), agentByForkId: new Map(), rootWork: { phase: 'idle', accumulatedWorkMs: 0, workingStartedAt: null, lastChainMs: 0, activity: null, activeChildCount: 0, _currentTurnId: null, _currentChainId: null, _thinkingCharCount: null, _activeToolKey: null, _generation: null } }),
+      getAgentState: () => Effect.succeed({ agents: new Map(), agentByForkId: new Map(), rootWork: { phase: 'idle', accumulatedWorkMs: 0, workingStartedAt: null, lastChainMs: 0, activeChildCount: 0, _currentTurnId: null, _currentChainId: null, _thinkingCharCount: null, _activeToolKey: null, _generation: null } }),
       getAgent: () => Effect.sync(() => undefined),
     }),
     makeResolver(model),

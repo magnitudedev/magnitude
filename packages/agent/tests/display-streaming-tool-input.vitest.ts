@@ -19,7 +19,11 @@ import type { ProviderToolCallId, ToolCallId } from '@magnitudedev/ai'
 import type { AppEvent } from '../src/events'
 import { TurnProjection } from '../src/projections/turn'
 import { AgentRoutingProjection } from '../src/projections/agent-routing'
-import { AgentLifecycleProjection, type AgentLifecycleState } from '../src/projections/agent-lifecycle'
+import {
+  AgentLifecycleProjection,
+  rootWorkActivity,
+  type AgentLifecycleState,
+} from '../src/projections/agent-lifecycle'
 import { GoalProjection } from '../src/projections/goal'
 import { DisplayTimelineProjection } from '../src/display'
 import { HarnessStateProjection } from '../src/projections/harness-state'
@@ -237,7 +241,7 @@ describe('Display projection — tool lifecycle events', () => {
       } as AppEvent,
     ])
 
-    expect(active.rootWork.activity?.message).toBe('Asking advisor')
+    expect(rootWorkActivity(active.rootWork)?.message).toBe('Asking advisor')
     expect(listMessages(active.display.messages).some(m => m.type === 'tool' && m.toolKey === 'messageAdvisor')).toBe(false)
 
     const completed = await makeDisplayAndRootWork([
@@ -255,6 +259,6 @@ describe('Display projection — tool lifecycle events', () => {
       } as AppEvent,
     ])
 
-    expect(completed.rootWork.activity).toBeNull()
+    expect(rootWorkActivity(completed.rootWork)).toBeNull()
   })
 })

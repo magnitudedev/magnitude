@@ -34,6 +34,10 @@ applies_to:
   - packages/agent/src/process/detached-process-registry-live.ts
   - packages/agent/src/process/detached-process-registry.ts
   - packages/agent/src/projections/compaction.ts
+  - packages/agent/src/projections/agent-lifecycle.ts
+  - packages/agent/src/display-view/semantic.ts
+  - packages/client-common/src/utils/actor-work.ts
+  - packages/client-common/src/utils/model-request-progress.ts
   - packages/agent/tests/session-work-status.test.ts
   - cli/src/**
   - desktop/src/**
@@ -266,6 +270,26 @@ Display snapshots expose that authoritative state, and clients only add the curr
 while that interval is open. Transient request progress controls loading and prefill copy but never
 owns, reconstructs, or adjusts the work timer. This keeps live and replayed completed timing
 identical even when a chain crosses several model requests.
+
+Completed root turns attribute the selected model display name independently from optional native
+decode telemetry. Work summaries therefore identify both local and cloud models. A summary includes
+decode tokens per second only when every contributing request in the chain supplied a valid native
+measurement; clients never estimate missing cloud throughput.
+
+Clients distinguish an active root chain from an open productive interval. Authoritative model
+loading and request progress takes precedence when present. When a root is waiting for a provider
+that exposes no granular request progress and no worker keeps the productive interval open, clients
+show a generic model-wait state rather than presenting the paused accumulated duration as a running
+Working timer. Providers do not receive synthetic progress for presentation purposes.
+
+Thinking activity follows the semantic response lifecycle. Thinking start opens the activity,
+thinking chunks refine its copy, and thinking end closes it immediately unless another
+independently active derived activity takes precedence. Assistant-message start and streamed answer
+text also close stale or interleaved thinking activity, so the live rail never claims the model is
+thinking while it is actively emitting its answer. The lifecycle projection stores only the
+authoritative response and tool lifecycle fields; display activity is derived from those fields at
+the display-view boundary rather than retained as a second synchronized copy. Clients never infer
+or retain thinking state from rendered text.
 
 Closing the final subscription removes the display registration. There is no separate close RPC.
 

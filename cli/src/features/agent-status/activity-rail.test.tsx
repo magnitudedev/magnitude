@@ -142,7 +142,7 @@ describe('activity rail', () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_400)
     const html = renderToStaticMarkup(
       <ActivityRail
-        work={work()}
+        work={work({ phase: 'waiting_for_model', activeSince: null })}
         width={100}
         modelLoadActivity={null}
         modelRequestActivity={request()}
@@ -157,7 +157,7 @@ describe('activity rail', () => {
     vi.spyOn(Date, 'now').mockReturnValue(2_000)
     expect(text(
       <ActivityRail
-        work={work()}
+        work={work({ phase: 'waiting_for_model', activeSince: null })}
         width={100}
         modelLoadActivity={null}
         modelRequestActivity={request({
@@ -216,7 +216,7 @@ describe('activity rail', () => {
     vi.restoreAllMocks()
   })
 
-  it('keeps the timer paused during a model-only wait', () => {
+  it('shows a generic model wait instead of a frozen Working timer', () => {
     vi.spyOn(Date, 'now').mockReturnValue(10_000)
     expect(text(
       <ActivityRail
@@ -229,7 +229,24 @@ describe('activity rail', () => {
         modelLoadActivity={null}
         modelRequestActivity={null}
       />,
-    )).toBe('● Working... 0:03')
+    )).toBe('⠋ Waiting for model · 0:03 worked')
+    vi.restoreAllMocks()
+  })
+
+  it('shows a generic model wait without a zero duration before generation starts', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    expect(text(
+      <ActivityRail
+        work={work({
+          phase: 'waiting_for_model',
+          activeSince: null,
+          accumulatedMs: 0,
+        })}
+        width={100}
+        modelLoadActivity={null}
+        modelRequestActivity={null}
+      />,
+    )).toBe('⠋ Waiting for model')
     vi.restoreAllMocks()
   })
 

@@ -77,6 +77,7 @@ const turnOutcome = (
   toolCallsCount = 0,
   forkId: string | null = null,
   generationPerformance: GenerationPerformance | null = null,
+  modelDisplayName = 'Qwen3 Coder',
 ): AppEvent => ({
   type: 'turn_outcome',
   timestamp,
@@ -101,6 +102,7 @@ const turnOutcome = (
   cost: null,
   providerId: null,
   modelId: null,
+  modelDisplayName,
   generationPerformance: generationPerformance
     ? { ...generationPerformance, modelDisplayName: 'Qwen3 Coder' }
     : null,
@@ -155,7 +157,10 @@ describe('persistent root work summaries', () => {
       chainId: 'chain-1',
       durationMs: 2_500,
       phase: 'worked',
-      performance: Option.none(),
+      performance: Option.some({
+        modelDisplayName: 'Qwen3 Coder',
+        decodeTokensPerSecond: Option.none(),
+      }),
       timestamp: ts(6_000),
     }])
   })
@@ -185,7 +190,7 @@ describe('persistent root work summaries', () => {
     if (summary?.type !== 'work_summary') return
     expect(Option.getOrThrow(summary.performance)).toEqual({
       modelDisplayName: 'Qwen3 Coder',
-      decodeTokensPerSecond: 40_000 / 1_500,
+      decodeTokensPerSecond: Option.some(40_000 / 1_500),
     })
   })
 
@@ -206,7 +211,47 @@ describe('persistent root work summaries', () => {
     if (summary?.type !== 'work_summary') return
     expect(Option.getOrThrow(summary.performance)).toEqual({
       modelDisplayName: 'Qwen3 Coder',
-      decodeTokensPerSecond: 24.5,
+      decodeTokensPerSecond: Option.some(24.5),
+    })
+  })
+
+  it('preserves the cloud model name without inventing decode throughput', async () => {
+    const messages = await runDisplay([
+      turnStarted('turn-1', 'chain-1', ts(1_000)),
+      generationStarted('turn-1', 'chain-1', ts(1_500)),
+      turnOutcome('turn-1', 'chain-1', ts(3_000), 0, null, null, 'DeepSeek V4 Flash'),
+    ])
+
+    const summary = messages.find((message) => message.type === 'work_summary')
+    expect(summary?.type).toBe('work_summary')
+    if (summary?.type !== 'work_summary') return
+    expect(Option.getOrThrow(summary.performance)).toEqual({
+      modelDisplayName: 'DeepSeek V4 Flash',
+      decodeTokensPerSecond: Option.none(),
+    })
+  })
+
+  it('omits chain throughput when any contributing request lacks a measurement', async () => {
+    const messages = await runDisplay([
+      turnStarted('turn-1', 'chain-1', ts(1_000)),
+      generationStarted('turn-1', 'chain-1', ts(1_500)),
+      turnOutcome('turn-1', 'chain-1', ts(3_000), 1, null, {
+        generatedTokens: 10,
+        decodeDurationMs: 500,
+        decodeTokensPerSecond: 20,
+        timeToFirstTokenMs: 80,
+      }),
+      turnStarted('turn-2', 'chain-1', ts(4_000)),
+      generationStarted('turn-2', 'chain-1', ts(5_000)),
+      turnOutcome('turn-2', 'chain-1', ts(6_000), 0, null, null),
+    ])
+
+    const summary = messages.find((message) => message.type === 'work_summary')
+    expect(summary?.type).toBe('work_summary')
+    if (summary?.type !== 'work_summary') return
+    expect(Option.getOrThrow(summary.performance)).toEqual({
+      modelDisplayName: 'Qwen3 Coder',
+      decodeTokensPerSecond: Option.none(),
     })
   })
 

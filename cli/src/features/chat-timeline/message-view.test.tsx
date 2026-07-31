@@ -40,17 +40,40 @@ describe('work summary message', () => {
     expect(html).toContain('Worked for 1:05')
   })
 
+  it('avoids showing zero seconds for sub-second work', () => {
+    const html = renderToStaticMarkup(
+      <MessageView message={summary(999)} isStreaming={false} />,
+    )
+
+    expect(html).toContain('Worked for &lt;1 second')
+    expect(html).not.toContain('Worked for 0 seconds')
+  })
+
   it('renders native model throughput with the standard separator', () => {
     const message: DisplayMessage = {
       ...summary(6_000),
       performance: Option.some({
         modelDisplayName: 'Qwen3 Coder',
-        decodeTokensPerSecond: 20.46,
+        decodeTokensPerSecond: Option.some(20.46),
       }),
     }
     const html = renderToStaticMarkup(<MessageView message={message} isStreaming={false} />)
 
     expect(html).toContain('Qwen3 Coder worked for 6 seconds · 20.5 tok/s')
     expect(html).not.toContain('ttft')
+  })
+
+  it('renders the cloud model name without unavailable throughput', () => {
+    const message: DisplayMessage = {
+      ...summary(1_000),
+      performance: Option.some({
+        modelDisplayName: 'DeepSeek V4 Flash',
+        decodeTokensPerSecond: Option.none(),
+      }),
+    }
+    const html = renderToStaticMarkup(<MessageView message={message} isStreaming={false} />)
+
+    expect(html).toContain('DeepSeek V4 Flash worked for 1 second')
+    expect(html).not.toContain('tok/s')
   })
 })

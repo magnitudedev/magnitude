@@ -55,7 +55,6 @@ const idleAgentStatus: AgentLifecycleState = {
     accumulatedWorkMs: 0,
     workingStartedAt: null,
     lastChainMs: 0,
-    activity: null,
     activeChildCount: 0,
     _currentTurnId: null,
     _currentChainId: null,

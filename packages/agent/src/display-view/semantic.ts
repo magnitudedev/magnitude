@@ -10,7 +10,7 @@ import {
   type TaskDisplayRow,
 } from '@magnitudedev/acn-protocol'
 import { DEFAULT_CHAT_NAME } from '../constants'
-import type { AgentLifecycleState, AgentInfo } from '../projections/agent-lifecycle'
+import { rootWorkActivity, type AgentLifecycleState, type AgentInfo } from '../projections/agent-lifecycle'
 import type { TaskAssignmentRow, TaskAssignmentState, WorkerActivity } from '../projections/task-assignment'
 
 function titleCase(value: string): string {
@@ -37,7 +37,7 @@ const materializeRootWork = (
   lastWorkMs: rootWork.lastChainMs,
   accumulatedMs: rootWork.accumulatedWorkMs,
   resumeCount: 0,
-  activity: rootWork.activity,
+  activity: rootWorkActivity(rootWork),
   activeChildCount: rootWork.activeChildCount,
 })
 

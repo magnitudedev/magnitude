@@ -49,6 +49,7 @@ export * from './utils/current-local-model'
 export * from './utils/model-memory'
 export * from './utils/hardware-memory'
 export * from './utils/actor-work'
+export * from './utils/model-request-progress'
 export * from './attachments/images'
 
 // Commands
