@@ -124,6 +124,18 @@ fn cuda() -> CudaEligibility {
     classify_cuda(result)
 }
 
+fn classify_vulkan_instance_error(error: vk::Result) -> VulkanEligibility {
+    if error == vk::Result::ERROR_INCOMPATIBLE_DRIVER {
+        VulkanEligibility::Absent {
+            diagnostic: "Vulkan driver is unavailable".to_owned(),
+        }
+    } else {
+        VulkanEligibility::Failed {
+            diagnostic: bounded(error),
+        }
+    }
+}
+
 fn vulkan() -> VulkanEligibility {
     let entry = match unsafe { Entry::load() } {
         Ok(entry) => entry,
@@ -143,11 +155,7 @@ fn vulkan() -> VulkanEligibility {
     let create = vk::InstanceCreateInfo::default().application_info(&application);
     let instance = match unsafe { entry.create_instance(&create, None) } {
         Ok(instance) => instance,
-        Err(error) => {
-            return VulkanEligibility::Failed {
-                diagnostic: bounded(error),
-            };
-        }
+        Err(error) => return classify_vulkan_instance_error(error),
     };
     let devices = unsafe { instance.enumerate_physical_devices() };
     let usable = devices.as_ref().is_ok_and(|devices| {
@@ -223,5 +231,23 @@ mod tests {
                 diagnostic: "CUDA probe failed (init=35, version=0, count=35)".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn missing_vulkan_driver_is_absent() {
+        assert_eq!(
+            classify_vulkan_instance_error(vk::Result::ERROR_INCOMPATIBLE_DRIVER),
+            VulkanEligibility::Absent {
+                diagnostic: "Vulkan driver is unavailable".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn other_vulkan_instance_errors_still_fail() {
+        assert!(matches!(
+            classify_vulkan_instance_error(vk::Result::ERROR_INITIALIZATION_FAILED),
+            VulkanEligibility::Failed { .. }
+        ));
     }
 }
