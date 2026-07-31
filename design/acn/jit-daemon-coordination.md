@@ -91,6 +91,8 @@ and cannot retain active ownership.
 | Same version | Reuse |
 | Older | Reuse the newer ACN |
 | Newer | Start the expected ACN, which becomes canonical and causes self-retirement |
+| Development build vs published release of the same base | Start development, which becomes canonical and causes the published ACN to self-retire |
+| Published release vs development build of the same base | Reuse development |
 | Same SemVer precedence with different build identities | Naturally order the build identities |
 | Arbitrary non-SemVer identities | Naturally order the complete identities |
 
@@ -98,8 +100,10 @@ Release comparison is applied only after the observed health contract decodes an
 registered identity. Any health-incompatible incumbent is replaced by the expected ACN. Magnitude
 development identities have the form
 `<version>+dev.<commit>.<timestamp>` and are naturally ordered, including numeric timestamp ordering.
-A published release outranks a development build with the same SemVer base. Every distinct identity
-has a deterministic order, so version comparison cannot produce an unorderable conflict.
+A development build outranks a published release with the same SemVer base, ensuring local
+development replaces installed code rather than silently reusing it. A release with a newer SemVer
+base still outranks an older development build. Every distinct identity has a deterministic order,
+so version comparison cannot produce an unorderable conflict.
 
 The client never asks an incumbent to shut down and never signals it as part of upgrade. The
 incumbent's ownership watchdog is responsible for invoking its own shutdown semantics. This avoids
