@@ -92,6 +92,16 @@ const nextRoot = (root: ModelMenuRoot, direction: -1 | 1): ModelMenuRoot => {
   return ROOTS[(index + direction + ROOTS.length) % ROOTS.length]!
 }
 
+export const resolveRootNavigationDirection = (
+  key: Pick<KeyEvent, "name" | "ctrl" | "meta" | "option" | "shift">,
+): -1 | 1 | null => {
+  if (key.ctrl || key.meta || key.option) return null
+  if (key.name === "left") return -1
+  if (key.name === "right") return 1
+  if (key.name === "tab") return key.shift ? -1 : 1
+  return null
+}
+
 const formatContextWindow = (tokens: number): string =>
   tokens >= 1_000_000
     ? `${(tokens / 1_000_000).toFixed(1)}M`
@@ -124,17 +134,17 @@ export function ModelMenusContainer({
   const menu = useAtomValue(modelMenuStateAtom)
   const setMenu = useAtomSet(modelMenuStateAtom)
   const theme = useTheme()
-  const [rootSwitchingEnabled, setRootSwitchingEnabled] = useState(true)
+  const [atRootLevel, setAtRootLevel] = useState(true)
   const [hoveredRoot, setHoveredRoot] = useState<ModelMenuRoot | null>(null)
   const [catalogDetailId, setCatalogDetailId] = useState<string | null>(null)
   const openRoot = useCallback((root: ModelMenuRoot) => {
     setCatalogDetailId(null)
-    setRootSwitchingEnabled(true)
+    setAtRootLevel(true)
     setMenu({ open: true, root })
   }, [setMenu])
   const openCatalogDetail = useCallback((candidateId: string) => {
     setCatalogDetailId(candidateId)
-    setRootSwitchingEnabled(false)
+    setAtRootLevel(false)
     setMenu({ open: true, root: "catalog" })
   }, [setMenu])
   const close = useCallback(() => {
@@ -143,24 +153,17 @@ export function ModelMenusContainer({
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (!menu.open || key.defaultPrevented) return
-    if (rootSwitchingEnabled
-      && (key.name === "left" || key.name === "right")
-      && !key.ctrl && !key.meta && !key.option) {
+    const rootNavigationDirection = resolveRootNavigationDirection(key)
+    if (rootNavigationDirection !== null) {
       key.preventDefault()
-      openRoot(nextRoot(menu.root, key.name === "left" ? -1 : 1))
+      openRoot(nextRoot(menu.root, rootNavigationDirection))
       return
     }
-    if (rootSwitchingEnabled
-      && key.name === "tab" && !key.ctrl && !key.meta && !key.option) {
-      key.preventDefault()
-      openRoot(nextRoot(menu.root, key.shift ? -1 : 1))
-      return
-    }
-    if (rootSwitchingEnabled && key.name === "escape") {
+    if (atRootLevel && key.name === "escape") {
       key.preventDefault()
       close()
     }
-  }, [close, menu.open, menu.root, openRoot, rootSwitchingEnabled]))
+  }, [atRootLevel, close, menu.open, menu.root, openRoot]))
 
   if (!menu.open) return null
 
@@ -177,10 +180,10 @@ export function ModelMenusContainer({
       }}
     >
       <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", backgroundColor: theme.menuBg }}>
-        {menu.root === "models" && <ModelsMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} setRootSwitchingEnabled={setRootSwitchingEnabled} />}
-        {menu.root === "catalog" && <CatalogMenu initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setRootSwitchingEnabled} />}
+        {menu.root === "models" && <ModelsMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} setRootSwitchingEnabled={setAtRootLevel} />}
+        {menu.root === "catalog" && <CatalogMenu initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setAtRootLevel} />}
         {menu.root === "hardware" && <HardwareMenu />}
-        {menu.root === "cloud" && <CloudMenu setRootSwitchingEnabled={setRootSwitchingEnabled} />}
+        {menu.root === "cloud" && <CloudMenu setRootSwitchingEnabled={setAtRootLevel} />}
       </box>
       <box
         style={{
@@ -248,7 +251,7 @@ export function ModelMenusContainer({
         )}
         <box style={{ flexGrow: 1 }} />
         <text style={{ fg: theme.muted }}>
-          {rootSwitchingEnabled ? "←/→ switch menus" : "Esc back"}
+          {atRootLevel ? "←/→ switch menus" : "←/→ switch menus · Esc back"}
         </text>
       </box>
     </box>
