@@ -206,17 +206,20 @@ There are no placeholder candidate lifecycles and no fallback source of target s
 
 `DownloadModel` is one idempotent target-acquisition operation: it admits missing package attempts
 and waits for their exact authoritative terminal outcomes. It performs no installed-inventory
-refresh. Clients do not precompute whether a download is required. Observed inventory and attempt
-snapshots never gate admission; ACN sends the command directly to ICN, whose package operation is
-idempotent. Every exact attempt snapshot returned by admission or command polling is immediately
+refresh. Observed inventory and attempt snapshots never gate download admission; ACN sends the
+command directly to ICN, whose package operation is idempotent. A client surface that presents
+installed packages separately from catalog recommendations preserves that action boundary: an
+installed selection loads, while a catalog recommendation downloads and then loads. Every exact
+attempt snapshot returned by admission or command polling is immediately
 merged into the download observer so presentation does not wait for a periodic polling interval;
 this local publication is not external confirmation and cannot determine command completion.
 Reconciliation therefore cannot delay either the start or completion of a download.
 Local assignment records the exact provider offering without using cached installed presence as
 command authorization. ICN load admission validates the current package files and remains the final
-load-time authority. A frontend flow that composes download, slot
-assignment, loading, completion, and cancellation represents the command and its lifecycle as one
-composite Effect Atom; React does not coordinate those mutation results or copy mirror state.
+load-time authority. A frontend flow that composes optional download, slot assignment, loading,
+completion, and cancellation represents the command and its lifecycle as one composite Effect
+Atom. That atom owns explicit downloading and loading intent so React does not infer an admitted
+operation from delayed mirror state, coordinate mutation results, or copy server state.
 
 Installed packages appear even when catalog resolution or assessment is unavailable. Catalog-only
 packages appear as not installed. Download progress does not require inventory-wide reconciliation.

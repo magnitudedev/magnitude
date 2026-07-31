@@ -63,7 +63,9 @@ device.
 The device evidence supplied by one native allocation report. It is deliberately distinct from
 device identity because different native APIs expose different amounts of evidence:
 
-- an exact locator supplies backend, optional physical identity, and native index;
+- an exact locator supplies a non-empty backend, optional physical identity, and native index;
+- an observed locator preserves whatever evidence a native allocation report supplied, treating
+  blank backend or physical-identity strings as absent rather than contradictory identity; and
 - an index locator supplies only the process-global native index.
 
 A locator cannot select a memory domain. It can only be matched against an identity already owned
@@ -146,6 +148,7 @@ domain allocations into model-instance state.
 3. Native reports describe allocations; they never create memory domains.
 4. Backend aliases have one canonicalization authority.
 5. The native registry index is unique within a topology.
-6. Unknown or inconsistent location evidence fails closed.
+6. Missing location evidence may be resolved from the native index; inconsistent non-empty
+   evidence fails closed.
 7. Category totals are derived from `MemoryBreakdown`, not maintained independently.
 8. Planning, admission, and resident accounting use the same abstractions and resolution rules.

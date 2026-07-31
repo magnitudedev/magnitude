@@ -35,7 +35,6 @@ import {
   useAcnLifecycle,
 } from "@magnitudedev/client-common";
 import {
-  PRIMARY_SLOT_ID,
   ReasoningEffortSchema,
   type LocalModelsState,
   type ModelSlotsState,
@@ -322,7 +321,8 @@ function CliAppContent(
   const completeModelSetup = useCallback(() => {
     void props.updateOnboarding(true);
   }, [props.updateOnboarding]);
-  const selectOnboardingModel = onboardingSetup.select;
+  const loadOnboardingModel = onboardingSetup.load;
+  const downloadOnboardingModel = onboardingSetup.downloadThenLoad;
   const cancelOnboardingModelSetup = onboardingSetup.cancel;
   const chatColumn = useLocalWidth();
   const chatColumnWidth = chatColumn.width ?? 80;
@@ -366,7 +366,6 @@ function CliAppContent(
     catalog: ProviderModelCatalogState,
     slots: ModelSlotsState
   ) => {
-    const submitting = Result.isWaiting(onboardingSetup.workflowResult);
     if (models.recommendations._tag === "Loading") {
       return setupPreparation(models.recommendations.progress, null);
     }
@@ -376,7 +375,6 @@ function CliAppContent(
         models.recommendations.failure.message
       );
     }
-    const recommendations = models.recommendations;
     if (catalog._tag === "Loading") {
       return setupPreparation(models.recommendations.progress, null);
     }
@@ -388,10 +386,8 @@ function CliAppContent(
     }
     const setupView = deriveOnboardingModelSetupView({
       active: true,
-      submittedProviderModelId:
-        onboardingSetup.submittedChoice?.providerModelId ?? null,
+      intent: onboardingSetup.intent,
       models,
-      catalog,
       slots,
     });
     const surface = (() => {
@@ -406,8 +402,7 @@ function CliAppContent(
               catalog={catalog}
               slots={slots}
               width={chatColumnWidth}
-              error={null}
-              submitting={submitting}
+              error={downloadMutationError}
               operation={{
                 _tag: "Downloading",
                 candidate: setupView.candidate,
@@ -415,16 +410,18 @@ function CliAppContent(
                 cancelError: cancelDownloadError,
                 onCancel: cancelOnboardingModelSetup,
                 onRetry: () =>
-                  selectOnboardingModel({
+                  downloadOnboardingModel({
                     targetId: setupView.candidate.targetId,
                     providerModelId: setupView.candidate.providerModelId,
+                    displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(
                       setupView.candidate.capabilities.reasoning.defaultEffort,
                       () => ReasoningEffortSchema.make("none")
                     ),
                   }),
               }}
-              onChoose={selectOnboardingModel}
+              onLoad={loadOnboardingModel}
+              onDownload={downloadOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -438,22 +435,23 @@ function CliAppContent(
               slots={slots}
               width={chatColumnWidth}
               error={null}
-              submitting={submitting}
               operation={{
                 _tag: "DownloadFailed",
                 candidate: setupView.candidate,
                 onChooseAnother: cancelOnboardingModelSetup,
                 onRetry: () =>
-                  selectOnboardingModel({
+                  downloadOnboardingModel({
                     targetId: setupView.candidate.targetId,
                     providerModelId: setupView.candidate.providerModelId,
+                    displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(
                       setupView.candidate.capabilities.reasoning.defaultEffort,
                       () => ReasoningEffortSchema.make("none")
                     ),
                   }),
               }}
-              onChoose={selectOnboardingModel}
+              onLoad={loadOnboardingModel}
+              onDownload={downloadOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -469,36 +467,23 @@ function CliAppContent(
               error={
                 setupView.phase === "Ready"
                   ? completionMutationError
-                  : loadMutationError
+                  : assignmentMutationError ?? loadMutationError
               }
-              submitting={submitting}
               operation={{
                 _tag: "Activating",
                 providerModelId: setupView.providerModelId,
                 displayName: setupView.displayName,
                 phase: setupView.phase,
                 failure: setupView.failure,
-                onRetry: () => {
-                  const candidate = recommendations.catalog.find(
-                    ({ providerModelId }) =>
-                      providerModelId === setupView.providerModelId
-                  );
-                  if (candidate) {
-                    selectOnboardingModel({
-                      targetId: candidate.targetId,
-                      providerModelId: candidate.providerModelId,
-                      reasoningEffort: Option.getOrElse(
-                        candidate.capabilities.reasoning.defaultEffort,
-                        () => ReasoningEffortSchema.make("none")
-                      ),
-                    });
-                  } else {
-                    void onboardingSetup.slotActions.load(PRIMARY_SLOT_ID);
-                  }
-                },
+                onRetry: () => loadOnboardingModel({
+                  providerModelId: setupView.providerModelId,
+                  displayName: setupView.displayName,
+                  reasoningEffort: setupView.reasoningEffort,
+                }),
                 onChooseAnother: cancelOnboardingModelSetup,
               }}
-              onChoose={selectOnboardingModel}
+              onLoad={loadOnboardingModel}
+              onDownload={downloadOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -516,9 +501,9 @@ function CliAppContent(
                 assignmentMutationError ??
                 loadMutationError
               }
-              submitting={submitting}
               operation={null}
-              onChoose={selectOnboardingModel}
+              onLoad={loadOnboardingModel}
+              onDownload={downloadOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />

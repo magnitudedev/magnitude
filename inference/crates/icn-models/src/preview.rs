@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{ModelBlobKind, ModelCacheWorkspace, ModelIndexKind};
+use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ModelManager, build_model, now};
 
@@ -630,12 +631,15 @@ impl HubModel {
     fn into_snapshot(
         self,
         requested_repository: String,
+        requested_revision: &str,
     ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
         if self.siblings.len() > MAX_HUB_SIBLINGS {
             return Err(InventoryError::Integrity(
                 "Hugging Face metadata contains too many files".to_owned(),
             ));
         }
+        require_requested_revision(requested_revision, self.sha.as_deref())
+            .map_err(InventoryError::Integrity)?;
         let commit = self.sha.and_then(immutable_commit).ok_or_else(|| {
             InventoryError::Integrity(
                 "Hugging Face repository did not resolve to an immutable commit".to_owned(),
@@ -753,7 +757,10 @@ async fn refresh_hub_repository_snapshot(
             })?;
             (cached.snapshot, cached.etag)
         }
-        HubModelFetch::Modified { model, etag } => (model.into_snapshot(request.repository)?, etag),
+        HubModelFetch::Modified { model, etag } => (
+            model.into_snapshot(request.repository, request.revision.as_str())?,
+            etag,
+        ),
     };
     models.cache.write_index(
         ModelIndexKind::HuggingFaceRepositorySnapshot,
@@ -774,7 +781,8 @@ async fn fetch_hub_model(
     revision: &str,
     etag: Option<&str>,
 ) -> Result<HubModelFetch, InventoryError> {
-    let url = hub_metadata_url(endpoint, repository, revision)?;
+    let url =
+        revision_metadata_url(endpoint, repository, revision).map_err(InventoryError::Internal)?;
     let token = hub_token();
     let response = send_hub_request(|| {
         let mut request = http.get(url.clone()).query(&[("blobs", "true")]);
@@ -1170,26 +1178,6 @@ impl ModelManager {
             _workspace: workspace,
         })
     }
-}
-
-fn hub_metadata_url(
-    endpoint: &str,
-    repository: &str,
-    revision: &str,
-) -> Result<reqwest::Url, InventoryError> {
-    let mut url = reqwest::Url::parse(endpoint)
-        .map_err(|error| InventoryError::Internal(error.to_string()))?;
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?;
-        segments.pop_if_empty().push("api").push("models");
-        for segment in repository.split('/') {
-            segments.push(segment);
-        }
-        segments.push("revision").push(revision);
-    }
-    Ok(url)
 }
 
 fn validate_source(source: &ModelPreviewSource) -> Result<(), InventoryError> {
@@ -1828,7 +1816,7 @@ mod tests {
                 },
             ],
         }
-        .into_snapshot("owner/model-gguf".to_owned())
+        .into_snapshot("owner/model-gguf".to_owned(), &"b".repeat(40))
         .unwrap();
 
         assert_eq!(snapshot.commit, "b".repeat(40));
@@ -2031,17 +2019,6 @@ mod tests {
                 ..valid
             })
             .is_err()
-        );
-    }
-
-    #[test]
-    fn metadata_lookup_addresses_the_immutable_revision() {
-        let revision = "a".repeat(40);
-        let url =
-            hub_metadata_url("https://huggingface.co/", "owner/repository", &revision).unwrap();
-        assert_eq!(
-            url.as_str(),
-            format!("https://huggingface.co/api/models/owner/repository/revision/{revision}")
         );
     }
 

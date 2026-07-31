@@ -17,10 +17,16 @@ import { useAgentClient } from "../state/agent-client-context"
 import { useMirroredStateAtom } from "./use-mirrored-state"
 import { useModelSlotActions } from "./use-local-inference-state"
 
-export interface OnboardingModelChoice {
-  readonly targetId: ModelOfferingTargetId
+interface OnboardingModelChoice {
   readonly providerModelId: ProviderModelId
+  readonly displayName: string
   readonly reasoningEffort: ReasoningEffort
+}
+
+export type OnboardingLoadModelChoice = OnboardingModelChoice
+
+export interface OnboardingDownloadModelChoice extends OnboardingModelChoice {
+  readonly targetId: ModelOfferingTargetId
 }
 
 export class OnboardingModelCommandFailed extends Schema.TaggedError<
@@ -30,14 +36,19 @@ export class OnboardingModelCommandFailed extends Schema.TaggedError<
   message: Schema.String,
 }) {}
 
-type OnboardingModelWorkflowCommand =
-  | { readonly _tag: "Select"; readonly choice: OnboardingModelChoice }
-  | { readonly _tag: "Cancel" }
+type ActiveOnboardingModelIntent =
+  | { readonly _tag: "Loading"; readonly choice: OnboardingLoadModelChoice }
+  | { readonly _tag: "Downloading"; readonly choice: OnboardingDownloadModelChoice }
 
-type OnboardingModelWorkflowIntent =
+export type OnboardingModelWorkflowIntent =
   | { readonly _tag: "Idle" }
-  | { readonly _tag: "Selecting"; readonly choice: OnboardingModelChoice }
-  | { readonly _tag: "Cancelling"; readonly choice: OnboardingModelChoice }
+  | ActiveOnboardingModelIntent
+  | { readonly _tag: "Cancelling"; readonly operation: ActiveOnboardingModelIntent }
+
+type OnboardingModelWorkflowCommand =
+  | { readonly _tag: "Load"; readonly choice: OnboardingLoadModelChoice }
+  | { readonly _tag: "DownloadThenLoad"; readonly choice: OnboardingDownloadModelChoice }
+  | { readonly _tag: "Cancel" }
 
 export const useOnboardingModelSetup = () => {
   const client = useAgentClient()
@@ -64,13 +75,17 @@ export const useOnboardingModelSetup = () => {
       if (command._tag === "Cancel") {
         const intent = get(intentAtom)
         if (intent._tag === "Idle") return Effect.void
-        const choice = intent.choice
-        get.set(intentAtom, { _tag: "Cancelling", choice })
-        const shouldCancelDownload = Option.exists(
-          Result.value(get(modelsAtom)),
-          ({ state }) => state.models.some(({ targetId, download }) =>
-            targetId === choice.targetId && download._tag === "Downloading"),
-        )
+        const operation = intent._tag === "Cancelling" ? intent.operation : intent
+        const choice = operation.choice
+        get.set(intentAtom, { _tag: "Cancelling", operation })
+        const cancelTargetId = operation._tag === "Downloading"
+          && Option.exists(
+            Result.value(get(modelsAtom)),
+            ({ state }) => state.models.some(({ targetId, download }) =>
+              targetId === operation.choice.targetId && download._tag === "Downloading"),
+          )
+          ? operation.choice.targetId
+          : null
         const shouldClearSlot = Option.exists(
           Result.value(get(slotsAtom)),
           ({ state }) => {
@@ -81,9 +96,9 @@ export const useOnboardingModelSetup = () => {
           },
         )
         return Effect.gen(function* () {
-          if (shouldCancelDownload) {
+          if (cancelTargetId !== null) {
             yield* get.setResult(mutations.cancel, {
-              payload: { targetId: choice.targetId },
+              payload: { targetId: cancelTargetId },
               reactivityKeys: [LocalModelsMirror.id],
             }).pipe(
               Effect.mapError((error) => new OnboardingModelCommandFailed({
@@ -104,26 +119,12 @@ export const useOnboardingModelSetup = () => {
             )
           }
         }).pipe(
-          Effect.ensuring(Effect.sync(() =>
-            get.set(intentAtom, { _tag: "Idle" }))),
+          Effect.ensuring(Effect.sync(() => get.set(intentAtom, { _tag: "Idle" }))),
         )
       }
 
       const choice = command.choice
-      get.set(intentAtom, { _tag: "Selecting", choice })
-      return Effect.gen(function* () {
-        yield* get.setResult(mutations.download, {
-          payload: { targetId: choice.targetId },
-          reactivityKeys: [
-            LocalModelsMirror.id,
-            ProviderModelCatalogMirror.id,
-          ],
-        }).pipe(
-          Effect.mapError((error) => new OnboardingModelCommandFailed({
-            command: "download",
-            message: error.message,
-          })),
-        )
+      const activate = Effect.gen(function* () {
         yield* get.setResult(mutations.assign, {
           payload: {
             slotId: PRIMARY_SLOT_ID,
@@ -161,30 +162,53 @@ export const useOnboardingModelSetup = () => {
         )
         return load
       })
+
+      if (command._tag === "Load") {
+        get.set(intentAtom, { _tag: "Loading", choice })
+        return activate
+      }
+
+      const downloadChoice = command.choice
+      get.set(intentAtom, { _tag: "Downloading", choice: downloadChoice })
+      return Effect.gen(function* () {
+        yield* get.setResult(mutations.download, {
+          payload: { targetId: downloadChoice.targetId },
+          reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
+        }).pipe(
+          Effect.mapError((error) => new OnboardingModelCommandFailed({
+            command: "download",
+            message: error.message,
+          })),
+        )
+        get.set(intentAtom, { _tag: "Loading", choice })
+        return yield* activate
+      })
     }),
     [intentAtom, modelsAtom, mutations, slotsAtom],
   )
   const runWorkflow = useAtomSet(workflowAtom)
   const setupAtom = useMemo(
-    () => Atom.make((get) => {
-      const intent = get(intentAtom)
-      return {
-        hardware: Result.map(get(hardwareAtom), ({ state }) => state),
-        models: Result.map(get(modelsAtom), ({ state }) => state),
-        catalog: Result.map(get(catalogAtom), ({ state }) => state),
-        slots: Result.map(get(slotsAtom), ({ state }) => state),
-        workflowResult: get(workflowAtom),
-        submittedChoice: intent._tag === "Idle" ? null : intent.choice,
-        cancelling: intent._tag === "Cancelling",
-      }
-    }),
+    () => Atom.make((get) => ({
+      hardware: Result.map(get(hardwareAtom), ({ state }) => state),
+      models: Result.map(get(modelsAtom), ({ state }) => state),
+      catalog: Result.map(get(catalogAtom), ({ state }) => state),
+      slots: Result.map(get(slotsAtom), ({ state }) => state),
+      workflowResult: get(workflowAtom),
+      intent: get(intentAtom),
+      cancelling: get(intentAtom)._tag === "Cancelling",
+    })),
     [catalogAtom, hardwareAtom, intentAtom, modelsAtom, slotsAtom, workflowAtom],
   )
   const setup = useAtomValue(setupAtom)
 
-  const select = useCallback((choice: OnboardingModelChoice) => {
+  const load = useCallback((choice: OnboardingLoadModelChoice) => {
     if (Result.isWaiting(setup.workflowResult)) return
-    runWorkflow({ _tag: "Select", choice })
+    runWorkflow({ _tag: "Load", choice })
+  }, [runWorkflow, setup.workflowResult])
+
+  const downloadThenLoad = useCallback((choice: OnboardingDownloadModelChoice) => {
+    if (Result.isWaiting(setup.workflowResult)) return
+    runWorkflow({ _tag: "DownloadThenLoad", choice })
   }, [runWorkflow, setup.workflowResult])
 
   const cancel = useCallback(() => {
@@ -194,7 +218,8 @@ export const useOnboardingModelSetup = () => {
   return {
     ...setup,
     slotActions,
-    select,
+    load,
+    downloadThenLoad,
     cancel,
   }
 }

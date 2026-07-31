@@ -1226,7 +1226,7 @@ fn model_instance_allocation(
                 physical_id,
                 native_index,
                 ..
-            } => MemoryLocation::NativeDevice(NativeDeviceLocator::exact(
+            } => MemoryLocation::NativeDevice(NativeDeviceLocator::observed(
                 backend,
                 physical_id.clone(),
                 *native_index,

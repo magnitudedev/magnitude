@@ -6,7 +6,8 @@ import { Option } from "effect"
 import {
   truncateToDisplayWidth,
   type LocalInferenceHardwareResult,
-  type OnboardingModelChoice,
+  type OnboardingDownloadModelChoice,
+  type OnboardingLoadModelChoice,
 } from "@magnitudedev/client-common"
 import type {
   LocalModelCatalogCandidate,
@@ -241,9 +242,9 @@ export function OnboardingModelChooser({
   slots,
   width,
   error,
-  submitting,
   operation,
-  onChoose,
+  onLoad,
+  onDownload,
   onContinue,
   onSkip,
 }: {
@@ -253,9 +254,9 @@ export function OnboardingModelChooser({
   readonly slots: ModelSlotsState
   readonly width: number
   readonly error: string | null
-  readonly submitting: boolean
   readonly operation: OnboardingModelChooserOperation | null
-  readonly onChoose: (choice: OnboardingModelChoice) => void
+  readonly onLoad: (choice: OnboardingLoadModelChoice) => void
+  readonly onDownload: (choice: OnboardingDownloadModelChoice) => void
   readonly onContinue: () => void
   readonly onSkip: () => void
 }): ReactNode {
@@ -277,7 +278,7 @@ export function OnboardingModelChooser({
     Option.isSome(activeSelectionId) ? activeSelectionId : selectedId,
   )
   const selected = selections[selectedIndex]
-  const locked = submitting || operation !== null
+  const locked = operation !== null
   const local = selections.filter(({ kind }) => kind === "running" || kind === "stored")
   const downloads = selections.filter(({ kind }) => kind === "recommendation")
   const selectedLocalIndex = Math.min(selectedIndex, Math.max(0, local.length - 1))
@@ -303,18 +304,30 @@ export function OnboardingModelChooser({
       onContinue()
       return
     }
-    const value = onboardingSelection(selection)
-    if (value) {
-      onChoose({
-        targetId: selection.model.targetId,
-        providerModelId: value,
+    if (selection.kind === "stored" && Option.isSome(selection.providerModelId)) {
+      onLoad({
+        providerModelId: selection.providerModelId.value,
+        displayName: selection.model.displayName,
+        reasoningEffort: Option.getOrElse(
+          selection.reasoningEffort,
+          () => ReasoningEffortSchema.make("none"),
+        ),
+      })
+      return
+    }
+    if (selection.kind === "recommendation" && Option.isSome(selection.recommendation)) {
+      const candidate = selection.recommendation.value.candidate
+      onDownload({
+        targetId: candidate.targetId,
+        providerModelId: candidate.providerModelId,
+        displayName: candidate.displayName,
         reasoningEffort: Option.getOrElse(
           selection.reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
         ),
       })
     }
-  }, [onChoose, onContinue])
+  }, [onContinue, onDownload, onLoad])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) {

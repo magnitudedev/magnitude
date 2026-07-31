@@ -745,7 +745,7 @@ impl NativeDeviceIdentity {
         native_index: usize,
     ) -> Self {
         Self {
-            backend: canonical_backend(backend.as_ref()),
+            backend: canonical_backend(backend.as_ref().trim()),
             physical_id: physical_id.map(Into::into),
             native_index,
         }
@@ -782,9 +782,40 @@ impl NativeDeviceLocator {
         physical_id: Option<impl Into<String>>,
         native_index: usize,
     ) -> Self {
+        let backend = backend.as_ref().trim();
+        assert!(
+            !backend.is_empty(),
+            "an exact native device locator requires a backend"
+        );
+        let physical_id = physical_id.map(Into::into);
+        assert!(
+            physical_id
+                .as_ref()
+                .is_none_or(|value: &String| !value.trim().is_empty()),
+            "an exact native device locator cannot contain a blank physical identity"
+        );
         Self {
-            backend: Some(canonical_backend(backend.as_ref())),
-            physical_id: physical_id.map(Into::into),
+            backend: Some(canonical_backend(backend)),
+            physical_id,
+            native_index,
+        }
+    }
+
+    /// Constructs a locator from a native allocation observation, where blank
+    /// strings mean that the native API did not report that identity field.
+    #[must_use]
+    pub fn observed(
+        backend: impl AsRef<str>,
+        physical_id: Option<impl Into<String>>,
+        native_index: usize,
+    ) -> Self {
+        let backend = backend.as_ref().trim();
+        let physical_id = physical_id
+            .map(Into::into)
+            .filter(|value: &String| !value.trim().is_empty());
+        Self {
+            backend: (!backend.is_empty()).then(|| canonical_backend(backend)),
+            physical_id,
             native_index,
         }
     }
@@ -1069,7 +1100,14 @@ impl MemoryTopology {
                 return None;
             }
             for device in &domain.devices {
-                if device.id.as_str().is_empty() || !native_indices.insert(device.native_index) {
+                if device.id.as_str().is_empty()
+                    || device.backend.trim().is_empty()
+                    || device
+                        .physical_id
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    || !native_indices.insert(device.native_index)
+                {
                     return None;
                 }
                 if device
@@ -1790,6 +1828,22 @@ mod tests {
             .expect("Metal aliases the inventory MTL backend");
         assert_eq!(metal.memory_domain, &MemoryDomainId::system());
         assert_eq!(metal.device.expect("device binding").name, "MTL0");
+
+        let backend_unreported = topology
+            .resolve(&MemoryLocation::NativeDevice(
+                NativeDeviceLocator::observed("", None::<String>, 0),
+            ))
+            .expect("native index resolves when backend evidence is absent");
+        assert_eq!(backend_unreported.memory_domain, &MemoryDomainId::system());
+
+        assert!(
+            topology
+                .resolve(&MemoryLocation::NativeDevice(
+                    NativeDeviceLocator::observed("CUDA", None::<String>, 0,)
+                ))
+                .is_none(),
+            "contradictory non-empty backend evidence must fail closed",
+        );
 
         assert!(
             topology
