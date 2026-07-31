@@ -1,6 +1,6 @@
 //! Persistent llama.cpp executor for ICN.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::num::{NonZeroI32, NonZeroU32};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,9 +18,10 @@ use icn_contracts::{
     CompletionBackend, ExecutionConfig, ExecutionConfigReport, ExecutionIntent, FinishReason,
     FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
     HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceEvent,
-    InferenceProgress, InferenceStreamEvent, ModelModalities, ModelProperties, PreparedChatInfo,
-    ProjectorConfig, ReasoningControl, ResponseFormat, SplitMode, TemplateCapabilities, ToolCall,
-    ToolChoice,
+    InferenceProgress, InferenceStreamEvent, MemoryAccountant, MemoryBreakdown, MemoryCharge,
+    MemoryChargeOwner, MemoryLocation, MemoryTopology, ModelModalities, ModelProperties,
+    NativeDeviceLocator, PreparedChatInfo, ProjectorConfig, ReasoningControl, ResponseFormat,
+    SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -104,12 +105,17 @@ impl NativeBackend {
         model_id: impl Into<String>,
         config: ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
+        hardware: HardwareSnapshot,
     ) -> Result<PreparedModelLoad, ModelLoadError> {
+        let topology = MemoryTopology::from_snapshot(&hardware).ok_or_else(|| {
+            ModelLoadError::Planning("load request contains an invalid memory topology".to_owned())
+        })?;
         PreparedModelLoad::prepare(
             Arc::clone(&self.backend),
             model_id.into(),
             config,
             mtp_selection,
+            topology,
         )
     }
 }
@@ -184,20 +190,19 @@ pub struct ModelInstanceObservation {
 #[derive(Clone)]
 struct ResidentAllocation {
     location: LlamaMemoryLocation,
-    model_bytes: u64,
-    context_bytes: u64,
-    compute_bytes: u64,
-    auxiliary_bytes: u64,
+    memory: MemoryBreakdown,
 }
 
 impl From<LlamaMemoryBreakdown> for ResidentAllocation {
     fn from(value: LlamaMemoryBreakdown) -> Self {
         Self {
             location: value.location,
-            model_bytes: value.model_bytes,
-            context_bytes: value.context_bytes,
-            compute_bytes: value.compute_bytes,
-            auxiliary_bytes: 0,
+            memory: MemoryBreakdown::new(
+                value.model_bytes,
+                value.context_bytes,
+                value.compute_bytes,
+                0,
+            ),
         }
     }
 }
@@ -362,6 +367,7 @@ impl PreparedModelLoad {
         model_id: String,
         config: ExecutionIntent,
         mtp_selection: MtpCandidateSelection,
+        topology: MemoryTopology,
     ) -> Result<Self, ModelLoadError> {
         validate_model_config(&config).map_err(ModelLoadError::from)?;
         tracing::Span::current().record("model.id", model_id.as_str());
@@ -373,7 +379,8 @@ impl PreparedModelLoad {
         let executor = thread::Builder::new()
             .name(format!("icn-llama-{model_id}"))
             .spawn(move || {
-                let result = prepare_native_plan(backend.as_ref(), config, mtp_selection);
+                let result =
+                    prepare_native_plan(backend.as_ref(), &topology, config, mtp_selection);
                 match result {
                     Ok((planned, acceleration, phases)) => {
                         let timing_plan_identity = timing_plan_identity(&planned.assessed.plan);
@@ -658,6 +665,7 @@ impl Drop for LlamaCompletionBackend {
 
 fn prepare_native_plan(
     backend: &LlamaBackend,
+    topology: &MemoryTopology,
     mut requested: ExecutionIntent,
     mtp_selection: MtpCandidateSelection,
 ) -> Result<(icn_hardware::BackendLoadPlan, String, Vec<ModelLoadPhase>), ModelLoadError> {
@@ -667,12 +675,8 @@ fn prepare_native_plan(
     };
     requested.mtp = icn_mtp::select_mtp_with_backend(backend, &requested, candidates)
         .map_err(|error| ModelLoadError::MtpSelection(error.to_string()))?;
-    let planned = icn_hardware::plan_load_with_backend(
-        backend,
-        &requested,
-        icn_hardware::CapacityPolicy::default(),
-    )
-    .map_err(|error| ModelLoadError::Planning(error.to_string()))?;
+    let planned = icn_hardware::plan_load_with_backend(backend, topology, &requested)
+        .map_err(|error| ModelLoadError::Planning(error.to_string()))?;
     let acceleration = match &planned.assessed.assessment {
         HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
         assessment => {
@@ -777,10 +781,7 @@ fn executor_main(
                         native_index,
                     }
                 }),
-            model_bytes: 0,
-            context_bytes: 0,
-            compute_bytes: 0,
-            auxiliary_bytes: estimate.bytes,
+            memory: MemoryBreakdown::new(0, 0, 0, estimate.bytes),
         })
         .collect::<Vec<_>>();
     #[cfg(not(feature = "mtmd"))]
@@ -1197,7 +1198,7 @@ fn capture_resident_allocations(
             .collect::<Vec<_>>();
         if !draft_has_separate_model {
             for allocation in &mut draft {
-                allocation.model_bytes = 0;
+                allocation.memory = allocation.memory.without_model();
             }
         }
         allocations.extend(draft);
@@ -1211,53 +1212,53 @@ fn model_instance_allocation(
     allocations: &[ResidentAllocation],
     config: &ExecutionIntent,
 ) -> Result<ModelInstanceAllocation, ModelInstanceObservationError> {
-    let mut domains = BTreeMap::<icn_contracts::MemoryDomainId, ModelInstanceMemoryDomain>::new();
+    let topology = MemoryTopology::from_snapshot(snapshot).ok_or_else(|| {
+        ModelInstanceObservationError::MemoryDomainUnresolved {
+            location: "hardware snapshot contains an invalid memory topology".to_owned(),
+        }
+    })?;
+    let mut accountant = MemoryAccountant::new(&topology);
     for allocation in allocations {
         let location = match &allocation.location {
-            LlamaMemoryLocation::Host => icn_hardware::NativeMemoryLocation::Host,
+            LlamaMemoryLocation::Host => MemoryLocation::Host,
             LlamaMemoryLocation::Device {
                 backend,
                 physical_id,
                 native_index,
                 ..
-            } => icn_hardware::NativeMemoryLocation::Device {
-                backend: backend.clone(),
-                physical_id: physical_id.clone(),
-                native_index: *native_index,
-            },
+            } => MemoryLocation::NativeDevice(NativeDeviceLocator::exact(
+                backend,
+                physical_id.clone(),
+                *native_index,
+            )),
         };
-        let domain_id =
-            icn_hardware::resolve_memory_domain(snapshot, &location).ok_or_else(|| {
-                ModelInstanceObservationError::MemoryDomainUnresolved {
-                    location: format!("{location:?}"),
-                }
-            })?;
-        let domain =
-            domains
-                .entry(domain_id.clone())
-                .or_insert_with(|| ModelInstanceMemoryDomain {
-                    memory_domain_id: domain_id.clone(),
-                    model_bytes: 0,
-                    context_bytes: 0,
-                    compute_bytes: 0,
-                    auxiliary_bytes: 0,
-                });
-        domain.model_bytes = domain.model_bytes.saturating_add(allocation.model_bytes);
-        domain.context_bytes = domain
-            .context_bytes
-            .saturating_add(allocation.context_bytes);
-        domain.compute_bytes = domain
-            .compute_bytes
-            .saturating_add(allocation.compute_bytes);
-        domain.auxiliary_bytes = domain
-            .auxiliary_bytes
-            .saturating_add(allocation.auxiliary_bytes);
+        let charge = MemoryCharge::new(
+            MemoryChargeOwner::ResidentRuntime,
+            location,
+            allocation.memory,
+        );
+        accountant.record(charge).map_err(|error| {
+            ModelInstanceObservationError::MemoryDomainUnresolved {
+                location: format!("{:?}", error.location),
+            }
+        })?;
     }
     Ok(ModelInstanceAllocation {
         context_window_tokens: config.context_size,
         parallel_sequences: config.max_sequences,
         physical_context_tokens: config.physical_context_size,
-        memory_domains: domains.into_values().collect(),
+        memory_domains: accountant
+            .finish()
+            .domains
+            .into_iter()
+            .map(|domain| ModelInstanceMemoryDomain {
+                memory_domain_id: domain.id,
+                model_bytes: domain.memory.model_bytes,
+                context_bytes: domain.memory.context_bytes,
+                compute_bytes: domain.memory.compute_bytes,
+                auxiliary_bytes: domain.memory.auxiliary_bytes,
+            })
+            .collect(),
     })
 }
 
@@ -4315,10 +4316,7 @@ mod tests {
         let evidence = vec![
             ResidentAllocation {
                 location: LlamaMemoryLocation::Host,
-                model_bytes: 3,
-                context_bytes: 2,
-                compute_bytes: 1,
-                auxiliary_bytes: 0,
+                memory: MemoryBreakdown::new(3, 2, 1, 0),
             },
             ResidentAllocation {
                 location: LlamaMemoryLocation::Device {
@@ -4326,10 +4324,7 @@ mod tests {
                     physical_id: Some("metal-0".to_owned()),
                     native_index: 1,
                 },
-                model_bytes: 5,
-                context_bytes: 4,
-                compute_bytes: 3,
-                auxiliary_bytes: 2,
+                memory: MemoryBreakdown::new(5, 4, 3, 2),
             },
         ];
 

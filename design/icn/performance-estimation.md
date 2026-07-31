@@ -98,6 +98,9 @@ workload invalid rather than double-counting it.
 Host/device placement is part of the workload: every tensor and every layer's KV traffic uses the
 calibration for its actual native device. A configuration that fits through partial offload or
 expert buffer overrides must not inherit the estimate for a fully accelerated configuration.
+The estimator resolves each native workload location through the same inventory-owned memory
+topology used by fitting and resident allocation; it has no independent host, integrated-device,
+or unified-memory classification.
 Phase 1 does not directly calibrate the small activation transfers at backend boundaries; a
 placement spanning multiple physical memory domains therefore receives a conservative efficiency
 penalty and low confidence. Multiple native execution-device identities do not alone establish

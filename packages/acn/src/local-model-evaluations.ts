@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, ParseResult } from "effect"
+import { Context, Effect, Inspectable, Layer, Option, ParseResult } from "effect"
 import {
   FitsOfferingAssessmentSchema,
   LocalInferenceMemoryDomainIdSchema,
@@ -55,10 +55,37 @@ export type LocalModelAssessmentResult =
     }
   | { readonly _tag: "InvalidTarget"; readonly message: string }
 
+export const formatLocalModelEvaluationFailure = (error: unknown): string => {
+  try {
+    const serialized = JSON.stringify(
+      error,
+      (_key, value: unknown) =>
+        value instanceof Error
+          ? {
+              ...value,
+              name: value.name,
+              message: value.message,
+              stack: value.stack,
+              cause: value.cause,
+            }
+          : value,
+      2,
+    )
+    if (serialized !== undefined && serialized !== "{}") return serialized
+  } catch {
+    // Fall through to Effect's cycle-safe unknown-value formatter.
+  }
+  const structured = Inspectable.toStringUnknown(error)
+  if (structured !== "{}") return structured
+  return error instanceof Error
+    ? error.stack ?? error.message
+    : structured
+}
+
 const failure = (operation: string, error: unknown) =>
   new LocalModelMutationFailed({
     code: operation,
-    message: error instanceof Error ? error.message : String(error),
+    message: formatLocalModelEvaluationFailure(error),
     retryable: true,
   })
 

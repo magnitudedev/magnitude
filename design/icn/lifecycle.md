@@ -348,6 +348,11 @@ private process lifetime. All three worker kinds receive native-runtime authorit
 immutable worker-launch capability. An inference-worker handshake proves that its native runtime
 has already initialized.
 
+The persistent process also supplies an isolated planner with the exact hardware snapshot for its
+assessment environment and supplies an inference worker with the exact snapshot used for load
+selection. A worker validates and consumes that snapshot's memory topology; it does not rediscover
+memory sharing or reinterpret native allocation locations independently.
+
 Inference-worker lifetime is subordinate to ICN even on abrupt failure. Unix children disable
 core dumps and run a dedicated parent-liveness watchdog; Linux additionally requests
 `PR_SET_PDEATHSIG`. Windows workers are assigned to a kill-on-close Job Object. The retained child

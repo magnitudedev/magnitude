@@ -38,6 +38,14 @@ physical identity exists. Device names are presentation only and never domain id
 Device-specific working-set constraints use a separate canonical native-device identity derived
 from normalized backend, physical identity when available, and native ordinal.
 
+One validated memory-topology value owns the binding from every registered native device view to
+its physical memory domain. CPU, integrated-GPU, and host-accelerator views are system-memory
+bindings; Apple Silicon accelerator views are also system-memory bindings; only genuinely
+dedicated devices create dedicated domains. Target, speculative, projector, performance, and
+resident-runtime evidence describe only host or exact native-device allocation locations. They
+never classify a memory domain. The shared topology resolver performs that classification for all
+of them, and an unregistered location fails closed with its native identity preserved.
+
 Hardware presentation keeps system-product identity, accelerator chip identity, native backend,
 and native device ordinal distinct. Product identity comes from operating-system firmware data;
 chip identity comes from the native backend's device description. Generic backend ordinals such as
@@ -64,6 +72,11 @@ evidence is requested. ICN applies the system-only safety floor defined by
 [system memory management](../inference/system-memory-management.md); caller policy may increase
 that floor. Dedicated device domains retain the product reserve rather than inheriting the larger
 system reserve.
+
+ICN applies that reserve policy when it captures the assessment hardware environment. The
+resulting snapshot owns the stable capacities and fingerprint consumed by planning, accounting,
+cache validation, and workers. Accounting cannot accept a second reserve policy or recompute
+capacity from native fit reports.
 
 Each profile produces one complete result:
 
@@ -108,6 +121,12 @@ Required memory includes every allocation needed by the exact planned target and
 - compute buffers;
 - projector or other auxiliary components; and
 - target and draft allocations for speculative decoding.
+
+Each native source is normalized into one charge per owner and allocation location. The charge
+carries the complete model, context, compute, and auxiliary memory breakdown. One accountant
+resolves each location through the captured topology, aggregates each complete breakdown per
+existing domain and device-local limit, and compares only with the stable capacities in that
+topology. Fit reports are allocation evidence, never topology evidence.
 
 Product assessment proves the minimum serving guarantee: one sequence with one complete configured
 context. It never persists or promises a parallel count.
@@ -156,6 +175,12 @@ availability rule in [system memory management](../inference/system-memory-manag
 cached assessment is advisory and cannot authorize a different target, profile, reserve policy,
 native-engine build, or topology.
 
+The persistent service sends the exact policy-selected hardware snapshot used for planning and
+admission to each isolated planner and inference worker. Workers construct the validated topology
+from that supplied snapshot; they do not rediscover or infer memory sharing. A native report that
+cannot be resolved against the supplied topology is a topology-change failure, not an invitation
+to guess a domain.
+
 After the exact one-sequence baseline fits, loading evaluates native sequence capacities from one
 through four. Candidate `P` provisions physical context `configured context × P`, preserves the
 baseline target, acceleration, and per-sequence model context, and is selected only when its full
@@ -197,6 +222,9 @@ currently fits.
 - Loading may select one through four native sequences without changing serving configuration
   identity or per-request context.
 - Unified physical memory is never double-counted.
+- Target, speculative, projector, performance, and resident allocations use one topology resolver.
+- Fit reports and component roles never create or select memory domains.
+- Planner and inference workers account against the exact supplied hardware snapshot.
 - Discovery, fitting, cached assessment, and residency use the same physical-domain identities.
 - Loading reassesses the exact configuration it realizes.
 - Deleting assessment caches changes only latency and recomputation.

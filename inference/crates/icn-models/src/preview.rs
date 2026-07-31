@@ -1740,6 +1740,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::test_support::system_memory_topology;
     use icn_contracts::{
         CapabilityEvidence, EffectiveTemplateInputs, HardwareAssessment, LocalDeclaration,
         ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters, ReasoningVisibility,
@@ -2287,17 +2288,7 @@ mod tests {
             },
             recommendation: icn_contracts::HardwareRecommendation::Recommended,
         };
-        let topology =
-            icn_contracts::MemoryTopology::from_domains(&[icn_contracts::HardwareMemoryDomain {
-                id: icn_contracts::MemoryDomainId::system(),
-                kind: icn_contracts::HardwareMemoryDomainKind::System,
-                total_capacity_bytes: 20,
-                stable_capacity_bytes: 20,
-                current_free_bytes: Some(20),
-                shares_system_memory: true,
-                devices: Vec::new(),
-            }])
-            .unwrap();
+        let topology = system_memory_topology(20);
         let content_id = icn_contracts::ContentId("artifact".to_owned());
         manager
             .cache

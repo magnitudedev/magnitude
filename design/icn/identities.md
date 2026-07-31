@@ -19,11 +19,26 @@ applies_to:
 | `ProviderModelId` | One offering inside a provider namespace. Slots address `(ProviderId, ProviderModelId)`. |
 | `SlotId` | One ACN product role assignment. |
 | `CatalogCandidateId` | Presentation-row identity only; never a domain-operation identity. |
+| `MemoryDomainId` | One physical memory pool in a captured hardware topology. |
+| `HardwareDeviceId` | One stable native device view and its device-local constraints. |
 
 There is no generic `ModelId`.
 
 For the local provider, `ProviderModelId` is the `ModelServingConfigurationId` value within the
 `ProviderId = "local"` namespace.
+
+## Hardware topology identity
+
+A native device view has one canonical identity formed from its normalized backend, optional
+physical-device identity, and process-global native registry index. Backend spelling aliases are
+normalized by that identity abstraction, not independently by discovery, fitting, or runtime
+accounting.
+
+Native allocation reports carry a locator rather than claiming a stable device identity. A locator
+contains the identity evidence available from that native API: either the registry index alone or
+the index plus backend and optional physical identity. Only the captured hardware topology may
+match a locator to a canonical device identity and its physical memory domain. Contradictory or
+unknown evidence fails closed.
 
 ## Layer boundaries
 

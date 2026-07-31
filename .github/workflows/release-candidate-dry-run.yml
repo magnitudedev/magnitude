@@ -1,0 +1,69 @@
+name: Linux release candidate dry run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-candidate-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.3.14"
+  RUST_VERSION: "1.91.1"
+  NPM_VERSION: "11.6.2"
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install Linux build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
+      - run: npm install --global "npm@${NPM_VERSION}"
+      - run: bun install --frozen-lockfile
+      - name: Test Linux CPU MTP memory-domain accounting
+        run: >-
+          cargo test
+          --manifest-path inference/Cargo.toml
+          -p icn-hardware
+          mtp_
+      - run: bun run icn:catalog:hydrate
+      - name: Build the Linux x64 CPU release host
+        run: >-
+          bun run packages/release/scripts/build/host.ts
+          linux-x64-gnu
+          inference/target/catalog-inputs
+          release/linux-x64-gnu
+      - id: npm-candidate
+        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
+      - id: version
+        run: echo "version=$(jq -r '.version' packages/cli/package.json)" >> "$GITHUB_OUTPUT"
+      - name: Assemble the Linux x64 candidate
+        run: >-
+          bun run packages/release/scripts/assemble.ts
+          release/linux-x64-gnu
+          release-candidate
+          --host linux-x64-gnu
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ github.sha }}
+      - run: bun run packages/version/scripts/generate-version.ts
+      - name: Accept the production candidate path
+        run: >-
+          bun run scripts/accept-release-candidate.ts
+          release-candidate
+          "${{ steps.npm-candidate.outputs.tarball }}"
