@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.26
+
+### Patch Changes
+
+- [`262f85d`](https://github.com/magnitudedev/magnitude/commit/262f85d7a4b220732819ac861603bf862e1c1d43) Thanks [@anerli](https://github.com/anerli)! - fix inference workers missing native libs
+
 ## 0.0.1-alpha.25
 
 ### Patch Changes
