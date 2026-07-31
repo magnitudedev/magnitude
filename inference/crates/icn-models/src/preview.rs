@@ -638,13 +638,13 @@ impl HubModel {
                 "Hugging Face metadata contains too many files".to_owned(),
             ));
         }
-        require_requested_revision(requested_revision, self.sha.as_deref())
-            .map_err(InventoryError::Integrity)?;
         let commit = self.sha.and_then(immutable_commit).ok_or_else(|| {
             InventoryError::Integrity(
                 "Hugging Face repository did not resolve to an immutable commit".to_owned(),
             )
         })?;
+        validate_snapshot_revision(requested_revision, &commit)
+            .map_err(InventoryError::Integrity)?;
         let mut gguf_files = self
             .siblings
             .iter()
@@ -851,6 +851,13 @@ fn immutable_commit(value: String) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
     .then_some(value)
+}
+
+fn validate_snapshot_revision(requested: &str, commit: &str) -> Result<(), String> {
+    if immutable_commit(requested.to_owned()).is_some() {
+        require_requested_revision(requested, Some(commit))?;
+    }
+    Ok(())
 }
 
 fn hub_gated(value: Option<&serde_json::Value>) -> bool {
@@ -1776,6 +1783,14 @@ mod tests {
         assert!(valid_hub_revision("feature/catalog-v2"));
         assert!(!valid_hub_revision("../main"));
         assert!(!valid_hub_revision("main?blobs=true"));
+    }
+
+    #[test]
+    fn hub_snapshot_pins_symbolic_revisions_and_preserves_immutable_requests() {
+        let commit = "a".repeat(40);
+        assert!(validate_snapshot_revision("main", &commit).is_ok());
+        assert!(validate_snapshot_revision(&commit, &commit).is_ok());
+        assert!(validate_snapshot_revision(&"b".repeat(40), &commit).is_err());
     }
 
     #[test]
