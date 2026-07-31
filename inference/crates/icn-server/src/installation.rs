@@ -5,6 +5,7 @@ use icn_contracts::bootstrap_protocol::{IcnInstallationBackend, IcnInstallationD
 
 const MAX_DECLARATION_BYTES: u64 = 64 * 1024;
 
+#[derive(Clone, Debug)]
 pub(crate) struct Installation {
     root: PathBuf,
     declaration: IcnInstallationDeclaration,
@@ -68,6 +69,10 @@ impl Installation {
 
     pub(crate) fn backend_directory(&self) -> PathBuf {
         self.root.join("backends")
+    }
+
+    pub(crate) fn declaration_path(&self) -> PathBuf {
+        self.root.join("installation.json")
     }
 
     fn validate_layout(&self) -> anyhow::Result<()> {

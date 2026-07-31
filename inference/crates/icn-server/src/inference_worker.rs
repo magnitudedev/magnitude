@@ -13,6 +13,8 @@ use icn_engine::{ModelLoadObserver, ModelLoadPhase, MtpCandidateSelection, Nativ
 use icn_hardware::CapacityPolicy;
 use serde::{Deserialize, Serialize};
 
+use crate::worker_process::{NativeWorkerLauncher, NativeWorkerRole};
+
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 48 * 1024 * 1024;
 // At most one maximum-sized request may wait behind the frame currently being written.
@@ -454,11 +456,10 @@ impl InferenceWorker {
     pub(crate) fn spawn(
         generation: u64,
         expected_build: String,
+        worker_launcher: &NativeWorkerLauncher,
     ) -> anyhow::Result<(Self, tokio::sync::mpsc::Receiver<LoadEvent>)> {
-        let executable = std::env::current_exe()?;
-        let mut command = Command::new(executable);
+        let mut command = worker_launcher.command(NativeWorkerRole::Inference)?;
         command
-            .arg("inference-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -831,7 +832,7 @@ impl ModelLoadObserver for IpcLoadObserver {
     }
 }
 
-pub(crate) fn run_worker(build: String) -> anyhow::Result<()> {
+pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result<()> {
     start_parent_watchdog();
     let generation = Arc::new(AtomicU64::new(0));
     let (responses, response_receiver) = mpsc::sync_channel(RESPONSE_QUEUE_CAPACITY);
@@ -882,7 +883,6 @@ pub(crate) fn run_worker(build: String) -> anyhow::Result<()> {
     let load_span = tracing::info_span!("icn.worker.load", model.id = %model_id);
     crate::telemetry::set_parent_from_carrier(&load_span, &trace);
     let _load_entered = load_span.enter();
-    let native = NativeBackend::initialize()?;
     let prepared = match native.prepare_load(model_id.clone(), plan, mtp_selection) {
         Ok(prepared) => prepared,
         Err(error) => {
