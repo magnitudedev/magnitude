@@ -91,7 +91,10 @@ export type StatusIndicatorMessage = Schema.Schema.Type<typeof StatusIndicatorMe
 
 export const WorkSummaryPerformance = Schema.Struct({
   modelDisplayName: Schema.String,
-  decodeTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+  decodeTokensPerSecond: Schema.optionalWith(
+    Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+    { as: 'Option', exact: true },
+  ),
 })
 export type WorkSummaryPerformance = Schema.Schema.Type<typeof WorkSummaryPerformance>
 

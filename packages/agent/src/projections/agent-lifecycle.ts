@@ -38,6 +38,7 @@ const RootGenerationAggregateSchema = Schema.Struct({
   generatedTokens: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
   decodeDurationMs: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   requestCount: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  measuredRequestCount: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
   singleRequestDecodeTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
 })
 type RootGenerationAggregate = typeof RootGenerationAggregateSchema.Type
@@ -47,7 +48,6 @@ const RootWorkStateSchema = Schema.Struct({
   accumulatedWorkMs: Schema.Number,
   workingStartedAt: Schema.NullOr(Schema.Number),
   lastChainMs: Schema.Number,
-  activity: Schema.NullOr(DisplayActivity),
   activeChildCount: Schema.Number,
   _currentTurnId: Schema.NullOr(Schema.String),
   _currentChainId: Schema.optionalWith(Schema.NullOr(Schema.String), {
@@ -148,7 +148,7 @@ function thinkingMessage(charCount: number): string {
   return 'Thinking'
 }
 
-function computeActivity(work: RootWorkState): DisplayActivity | null {
+export function rootWorkActivity(work: AgentLifecycleState['rootWork']): DisplayActivity | null {
   if (work._activeToolKey) {
     const toolKey = work._activeToolKey
     const statusTool = STATUS_TOOL_ACTIVITIES[toolKey]
@@ -161,10 +161,6 @@ function computeActivity(work: RootWorkState): DisplayActivity | null {
     return { kind: 'thinking', message: thinkingMessage(work._thinkingCharCount) }
   }
   return null
-}
-
-function resolveActivity(work: RootWorkState): RootWorkState {
-  return { ...work, activity: computeActivity(work) }
 }
 
 export function isRootWorkActive(state: RootWorkState): boolean {
@@ -185,7 +181,7 @@ function accumulatedRootWorkMs(state: RootWorkState, timestamp: number): number 
 
 function startRootTurn(state: RootWorkState, timestamp: number, chainId: string): RootWorkState {
   const isNewChain = !isRootWorkActive(state) || state._currentChainId !== chainId
-  return resolveActivity({
+  return {
     ...state,
     phase: 'waiting_for_model',
     accumulatedWorkMs: isNewChain ? 0 : state.accumulatedWorkMs,
@@ -194,7 +190,7 @@ function startRootTurn(state: RootWorkState, timestamp: number, chainId: string)
       : state.workingStartedAt,
     _thinkingCharCount: null,
     _generation: isNewChain ? null : state._generation,
-  })
+  }
 }
 
 function recordRootGeneration(
@@ -202,36 +198,41 @@ function recordRootGeneration(
   event: Extract<AppEvent, { type: 'turn_outcome' }>,
 ): RootWorkState {
   const measurement = event.generationPerformance
-  if (measurement == null) return state
+  const modelDisplayName = event.modelDisplayName ?? measurement?.modelDisplayName ?? null
+  if (modelDisplayName === null) return state
   const current = state._generation
   const next: RootGenerationAggregate = current === null
     ? {
-        modelDisplayName: measurement.modelDisplayName,
-        generatedTokens: measurement.generatedTokens,
-        decodeDurationMs: measurement.decodeDurationMs,
+        modelDisplayName,
+        generatedTokens: measurement?.generatedTokens ?? 0,
+        decodeDurationMs: measurement?.decodeDurationMs ?? 0,
         requestCount: 1,
-        singleRequestDecodeTokensPerSecond: measurement.decodeTokensPerSecond,
+        measuredRequestCount: measurement === null || measurement === undefined ? 0 : 1,
+        singleRequestDecodeTokensPerSecond: measurement?.decodeTokensPerSecond ?? 0,
       }
     : {
         ...current,
-        generatedTokens: current.generatedTokens + measurement.generatedTokens,
-        decodeDurationMs: current.decodeDurationMs + measurement.decodeDurationMs,
+        generatedTokens: current.generatedTokens + (measurement?.generatedTokens ?? 0),
+        decodeDurationMs: current.decodeDurationMs + (measurement?.decodeDurationMs ?? 0),
         requestCount: current.requestCount + 1,
+        measuredRequestCount: current.measuredRequestCount
+          + (measurement === null || measurement === undefined ? 0 : 1),
       }
   return { ...state, _generation: next }
 }
 
 function summarizeGeneration(aggregate: RootGenerationAggregate | null): WorkSummaryPerformance | null {
-  if (
-    aggregate === null
-    || aggregate.generatedTokens <= 0
-    || aggregate.decodeDurationMs <= 0
-  ) return null
+  if (aggregate === null) return null
+  const hasCompleteDecodeMeasurement = aggregate.measuredRequestCount === aggregate.requestCount
+    && aggregate.generatedTokens > 0
+    && aggregate.decodeDurationMs > 0
   return {
     modelDisplayName: aggregate.modelDisplayName,
-    decodeTokensPerSecond: aggregate.requestCount === 1
-      ? aggregate.singleRequestDecodeTokensPerSecond
-      : aggregate.generatedTokens * 1_000 / aggregate.decodeDurationMs,
+    decodeTokensPerSecond: hasCompleteDecodeMeasurement
+      ? Option.some(aggregate.requestCount === 1
+        ? aggregate.singleRequestDecodeTokensPerSecond
+        : aggregate.generatedTokens * 1_000 / aggregate.decodeDurationMs)
+      : Option.none(),
   }
 }
 
@@ -256,7 +257,6 @@ function pauseRootForModel(state: RootWorkState, timestamp: number): RootWorkSta
     workingStartedAt: workersRemainActive
       ? (state.workingStartedAt ?? timestamp)
       : null,
-    activity: null,
     _thinkingCharCount: null,
     _activeToolKey: null,
   }
@@ -285,7 +285,6 @@ function stopRootWork(
       accumulatedWorkMs: 0,
       workingStartedAt: null,
       lastChainMs: chainMs,
-      activity: null,
       _currentTurnId: null,
       _currentChainId: null,
       _thinkingCharCount: null,
@@ -421,7 +420,6 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
       accumulatedWorkMs: 0,
       workingStartedAt: null,
       lastChainMs: 0,
-      activity: null,
       activeChildCount: 0,
       _currentTurnId: null,
       _currentChainId: null,
@@ -773,7 +771,13 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
     thinking_start: ({ event, state }) => {
       if (event.forkId !== null) return state
       if (state.rootWork._currentTurnId !== event.turnId) return state
-      return { ...state, rootWork: startRootGeneration(state.rootWork, event.timestamp) }
+      return {
+        ...state,
+        rootWork: {
+          ...startRootGeneration(state.rootWork, event.timestamp),
+          _thinkingCharCount: 0,
+        },
+      }
     },
 
     message_start: ({ event, state }) => {
@@ -788,11 +792,30 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
       }
     },
 
+    message_chunk: ({ event, state }) => {
+      if (event.forkId !== null) return state
+      if (state.rootWork._currentTurnId !== event.turnId) return state
+      if (state.rootWork._thinkingCharCount === null) return state
+      return {
+        ...state,
+        rootWork: { ...state.rootWork, _thinkingCharCount: null },
+      }
+    },
+
     thinking_chunk: ({ event, state }) => {
       if (event.forkId !== null) return state
       if (state.rootWork._currentTurnId !== event.turnId) return state
       const nextCount = (state.rootWork._thinkingCharCount ?? 0) + event.text.length
-      return { ...state, rootWork: resolveActivity({ ...state.rootWork, _thinkingCharCount: nextCount }) }
+      return { ...state, rootWork: { ...state.rootWork, _thinkingCharCount: nextCount } }
+    },
+
+    thinking_end: ({ event, state }) => {
+      if (event.forkId !== null) return state
+      if (state.rootWork._currentTurnId !== event.turnId) return state
+      return {
+        ...state,
+        rootWork: { ...state.rootWork, _thinkingCharCount: null },
+      }
     },
 
     tool_event: ({ event, state }) => {
@@ -806,11 +829,11 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
           const activeToolKey = statusTool || toolKey === 'spawnWorker' ? toolKey : null
           return {
             ...state,
-            rootWork: resolveActivity({
+            rootWork: {
               ...startRootGeneration(state.rootWork, event.timestamp),
               _activeToolKey: activeToolKey,
               _thinkingCharCount: null,
-            }),
+            },
           }
         }
         case 'ToolExecutionEnded':
@@ -818,7 +841,7 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
           if (state.rootWork._activeToolKey !== event.toolKey) return state
           return {
             ...state,
-            rootWork: resolveActivity({ ...state.rootWork, _activeToolKey: null }),
+            rootWork: { ...state.rootWork, _activeToolKey: null },
           }
         }
         default:

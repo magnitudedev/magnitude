@@ -49,6 +49,7 @@ const StatusIndicatorRow = ({ message }: { message: Extract<DisplayMessage, { ty
 }
 
 function formatWorkDuration(durationMs: number): string {
+  if (durationMs < 1_000) return '<1 second'
   const totalSeconds = Math.floor(durationMs / 1000)
   if (totalSeconds < 60) return `${totalSeconds} second${totalSeconds === 1 ? '' : 's'}`
   const minutes = Math.floor(totalSeconds / 60)
@@ -63,7 +64,10 @@ const WorkSummaryRow = ({ message }: { message: Extract<DisplayMessage, { type: 
     onNone: () => `Worked for ${formatWorkDuration(message.durationMs)}`,
     onSome: (performance) =>
       `${performance.modelDisplayName} worked for ${formatWorkDuration(message.durationMs)}`
-      + ` · ${performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
+      + Option.match(performance.decodeTokensPerSecond, {
+        onNone: () => '',
+        onSome: (tokensPerSecond) => ` · ${tokensPerSecond.toFixed(1)} tok/s`,
+      }),
   })
   return (
     <box style={{ height: 1, flexShrink: 0, marginBottom: 1 }}>

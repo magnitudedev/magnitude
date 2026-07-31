@@ -379,6 +379,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           cost:             executeResult.usage?.cost ?? null,
           providerId: agentModel.providerId,
           modelId:    agentModel.modelId,
+          modelDisplayName: agentModel.modelDisplayName,
           generationPerformance: executeResult.generationPerformance === null
             ? null
             : { ...executeResult.generationPerformance, modelDisplayName: agentModel.modelDisplayName },

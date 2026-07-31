@@ -18,7 +18,11 @@ import {
 import type { AppEvent } from '../src/events'
 import { TurnProjection } from '../src/projections/turn'
 import { AgentRoutingProjection } from '../src/projections/agent-routing'
-import { AgentLifecycleProjection, type AgentLifecycleState } from '../src/projections/agent-lifecycle'
+import {
+  AgentLifecycleProjection,
+  rootWorkActivity,
+  type AgentLifecycleState,
+} from '../src/projections/agent-lifecycle'
 import { GoalProjection } from '../src/projections/goal'
 import { HarnessStateProjection } from '../src/projections/harness-state'
 import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
@@ -210,5 +214,119 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
     // lastChainMs should be chain 2 duration (50ms), not accumulated (150ms).
     expect(rootWork(state).phase).toBe('worked')
     expect(rootWork(state).lastChainMs).toBe(50)
+  })
+})
+
+describe('AgentLifecycleProjection rootWork — thinking lifecycle', () => {
+  it('opens thinking on start and closes it on end without stopping the work clock', async () => {
+    const state = await runWithEvents([
+      rootTurnStarted('root-turn-1', ts(1)),
+      { type: 'thinking_start', timestamp: ts(2), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+      { type: 'thinking_chunk', timestamp: ts(3), forkId: null, turnId: 'root-turn-1', text: 'Considering options' } as AppEvent,
+      { type: 'thinking_end', timestamp: ts(4), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+    ])
+
+    expect(rootWork(state)).toMatchObject({
+      phase: 'working',
+      workingStartedAt: ts(2),
+      _thinkingCharCount: null,
+    })
+    expect(rootWorkActivity(rootWork(state))).toBeNull()
+  })
+
+  it('represents an open empty thinking segment from thinking_start', async () => {
+    const state = await runWithEvents([
+      rootTurnStarted('root-turn-1', ts(1)),
+      { type: 'thinking_start', timestamp: ts(2), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+    ])
+
+    expect(rootWork(state)).toMatchObject({
+      phase: 'working',
+      _thinkingCharCount: 0,
+    })
+    expect(rootWorkActivity(rootWork(state))).toEqual({ kind: 'thinking', message: 'Thinking' })
+  })
+
+  it('clears thinking when answer text starts even if thinking-end is missing', async () => {
+    const state = await runWithEvents([
+      rootTurnStarted('root-turn-1', ts(1)),
+      { type: 'thinking_start', timestamp: ts(2), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+      { type: 'thinking_chunk', timestamp: ts(3), forkId: null, turnId: 'root-turn-1', text: 'Considering options' } as AppEvent,
+      {
+        type: 'message_start',
+        timestamp: ts(4),
+        forkId: null,
+        turnId: 'root-turn-1',
+        id: 'message-1',
+        destination: { kind: 'user' },
+      } as AppEvent,
+    ])
+
+    expect(rootWork(state)).toMatchObject({
+      phase: 'working',
+      _thinkingCharCount: null,
+    })
+    expect(rootWorkActivity(rootWork(state))).toBeNull()
+  })
+
+  it('clears thinking for the cloud thought-end then message-start ordering', async () => {
+    const state = await runWithEvents([
+      rootTurnStarted('root-turn-1', ts(1)),
+      { type: 'thinking_start', timestamp: ts(2), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+      { type: 'thinking_chunk', timestamp: ts(3), forkId: null, turnId: 'root-turn-1', text: 'Cloud thought' } as AppEvent,
+      { type: 'thinking_end', timestamp: ts(4), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+      {
+        type: 'message_start',
+        timestamp: ts(4),
+        forkId: null,
+        turnId: 'root-turn-1',
+        id: 'message-1',
+        destination: { kind: 'user' },
+      } as AppEvent,
+      { type: 'message_chunk', timestamp: ts(5), forkId: null, turnId: 'root-turn-1', id: 'message-1', text: 'Answer' } as AppEvent,
+    ])
+
+    expect(rootWork(state)).toMatchObject({
+      phase: 'working',
+      workingStartedAt: ts(2),
+      _thinkingCharCount: null,
+    })
+    expect(rootWorkActivity(rootWork(state))).toBeNull()
+  })
+
+  it('clears thinking when answer text resumes after an interleaved thinking segment', async () => {
+    const state = await runWithEvents([
+      rootTurnStarted('root-turn-1', ts(1)),
+      {
+        type: 'message_start',
+        timestamp: ts(2),
+        forkId: null,
+        turnId: 'root-turn-1',
+        id: 'message-1',
+        destination: { kind: 'user' },
+      } as AppEvent,
+      { type: 'thinking_start', timestamp: ts(3), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+      { type: 'thinking_chunk', timestamp: ts(4), forkId: null, turnId: 'root-turn-1', text: 'Interleaved thought' } as AppEvent,
+      { type: 'message_chunk', timestamp: ts(5), forkId: null, turnId: 'root-turn-1', id: 'message-1', text: 'Answer' } as AppEvent,
+    ])
+
+    expect(rootWork(state)).toMatchObject({
+      phase: 'working',
+      _thinkingCharCount: null,
+    })
+    expect(rootWorkActivity(rootWork(state))).toBeNull()
+  })
+
+  it('ignores thinking-end events that do not belong to the current root turn', async () => {
+    const state = await runWithEvents([
+      rootTurnStarted('root-turn-1', ts(1)),
+      { type: 'thinking_start', timestamp: ts(2), forkId: null, turnId: 'root-turn-1' } as AppEvent,
+      { type: 'thinking_chunk', timestamp: ts(3), forkId: null, turnId: 'root-turn-1', text: 'Still thinking' } as AppEvent,
+      { type: 'thinking_end', timestamp: ts(4), forkId: null, turnId: 'stale-turn' } as AppEvent,
+      { type: 'thinking_end', timestamp: ts(5), forkId: 'worker-a', turnId: 'root-turn-1' } as AppEvent,
+    ])
+
+    expect(rootWork(state)._thinkingCharCount).toBe('Still thinking'.length)
+    expect(rootWorkActivity(rootWork(state))).toEqual({ kind: 'thinking', message: 'Thinking' })
   })
 })

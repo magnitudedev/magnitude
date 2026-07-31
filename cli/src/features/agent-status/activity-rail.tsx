@@ -11,13 +11,13 @@ import { useTheme } from '../../hooks/use-theme'
 import {
   slate,
   displayActorWorkElapsedMs,
-  isDisplayActorWorkActive,
+  displayActorWorkLiveState,
+  modelRequestProgressSegments,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { red } from '../../utils/theme'
 import { spinnerFrameForTick } from '../../hooks/use-spinner-frame'
 import { useAnimationTick } from '../../hooks/use-animation-tick'
-import { modelRequestProgressSegments } from '../chat-timeline/model-request-progress'
 import { Button } from '../../components/button'
 
 const WORKING_PULSE_COLORS = [
@@ -69,7 +69,8 @@ export const ActivityRail = memo(function ActivityRail({
 }: ActivityRailProps) {
   const theme = useTheme()
 
-  const active = work !== null && isDisplayActorWorkActive(work)
+  const liveState = work === null ? 'inactive' : displayActorWorkLiveState(work)
+  const active = liveState !== 'inactive'
   const activity = work?.activity ?? null
   const hasSpinner = activity?.kind === 'tool' && Option.getOrNull(activity.decorator) === 'spinner'
   const hasActivity = activity !== null
@@ -155,6 +156,22 @@ export const ActivityRail = memo(function ActivityRail({
           {progress.trailing && width >= 72 && (
             <span style={{ fg: theme.muted }}>{` · ${progress.trailing}`}</span>
           )}
+        </text>
+      </box>
+    )
+  }
+
+  if (liveState === 'waiting_for_model' && work !== null) {
+    const worked = work.accumulatedMs > 0
+      ? ` · ${formatElapsed(Math.floor(work.accumulatedMs / 1000))} worked`
+      : ''
+    return (
+      <box style={{ height: 1, flexShrink: 0 }}>
+        <text>
+          <span style={{ fg: theme.primary }}>{loadingSpinner}</span>
+          {' '}
+          <span style={{ fg: theme.foreground }}>Waiting for model</span>
+          {worked && <span style={{ fg: theme.muted }}>{worked}</span>}
         </text>
       </box>
     )

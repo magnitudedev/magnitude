@@ -1,5 +1,7 @@
 import type { DisplayActorWork } from '@magnitudedev/sdk'
 
+export type DisplayActorWorkLiveState = 'inactive' | 'waiting_for_model' | 'working'
+
 export function isDisplayActorWorkActive(work: DisplayActorWork): boolean {
   return work.phase === 'waiting_for_model'
     || work.phase === 'working'
@@ -14,4 +16,11 @@ export function displayActorWorkElapsedMs(work: DisplayActorWork, now: number): 
   return isDisplayActorWorkClockRunning(work) && work.activeSince !== null
     ? work.accumulatedMs + Math.max(0, now - work.activeSince)
     : work.accumulatedMs
+}
+
+export function displayActorWorkLiveState(work: DisplayActorWork): DisplayActorWorkLiveState {
+  if (!isDisplayActorWorkActive(work)) return 'inactive'
+  return work.phase === 'waiting_for_model' && !isDisplayActorWorkClockRunning(work)
+    ? 'waiting_for_model'
+    : 'working'
 }

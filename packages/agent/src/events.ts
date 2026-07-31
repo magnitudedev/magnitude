@@ -194,6 +194,8 @@ export interface TurnOutcomeEvent {
   readonly providerId: string | null
   /** Model ID used for this turn. Null when unavailable. */
   readonly modelId: string | null
+  /** Selected model display name, independently available from optional performance telemetry. */
+  readonly modelDisplayName?: string | null
   /** Native generation performance attributed by the agent. Absent on older events and when unavailable. */
   readonly generationPerformance?: AttributedGenerationPerformance | null
 }

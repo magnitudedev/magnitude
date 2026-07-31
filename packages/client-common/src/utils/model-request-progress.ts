@@ -13,28 +13,12 @@ export interface ModelRequestProgressCopy {
 export function modelRequestProgressCopy(
   activity: DisplayModelRequestActivity,
 ): ModelRequestProgressCopy {
-  if (activity.phase === 'queued') {
-    return { primary: 'Waiting for the local model', secondary: null }
-  }
-  if (activity.phase === 'preparing') {
-    return { primary: 'Loading conversation into the model', secondary: null }
-  }
-
-  const completedTokens = activity.completedTokens ?? 0
-  const totalTokens = activity.totalTokens ?? 0
-  const cachedTokens = Math.min(activity.cachedTokens ?? 0, totalTokens)
-  if (cachedTokens > 0) {
-    const newCompleted = Math.max(0, completedTokens - cachedTokens)
-    const newTotal = Math.max(0, totalTokens - cachedTokens)
-    return {
-      primary: `Prefilling · ${formatTokenCount(newCompleted)} / ${formatTokenCount(newTotal)} input tokens`,
-      secondary: `Using ${formatTokenCount(cachedTokens)} cached tokens`,
-    }
-  }
-
+  const segments = modelRequestProgressSegments(activity)
   return {
-    primary: `Prefilling · ${formatTokenCount(completedTokens)} / ${formatTokenCount(totalTokens)} input tokens`,
-    secondary: null,
+    primary: segments.detail === null
+      ? segments.label
+      : `${segments.label} · ${segments.detail}`,
+    secondary: segments.trailing,
   }
 }
 
