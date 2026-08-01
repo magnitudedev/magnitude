@@ -74,7 +74,7 @@ describe('ephemeral events', () => {
 
           yield* bus.publish({ type: 'normal_event', data: 'hello' })
 
-          const pending = yield* sink.readPending()
+          const pending = (yield* sink.claimPending()).events
           expect(pending).toHaveLength(1)
           expect(pending[0].type).toBe('normal_event')
         }),
@@ -91,7 +91,7 @@ describe('ephemeral events', () => {
 
           yield* bus.publish({ type: 'ephemeral_event', ephemeral: true, data: 'transient' })
 
-          const pending = yield* sink.readPending()
+          const pending = (yield* sink.claimPending()).events
           expect(pending).toHaveLength(0)
         }),
       ).pipe(Effect.provide(makeTestLayers())),
@@ -135,7 +135,7 @@ describe('ephemeral events', () => {
           yield* bus.publish({ type: 'ephemeral_event', ephemeral: true, data: 'skip2' })
           yield* bus.publish({ type: 'normal_event', data: 'third' })
 
-          const pending = yield* sink.readPending()
+          const pending = (yield* sink.claimPending()).events
           expect(pending).toHaveLength(3)
           expect(pending.map((e) => (e as { data: string }).data)).toEqual([
             'first',
@@ -157,7 +157,7 @@ describe('ephemeral events', () => {
 
           yield* bus.publish({ type: 'normal_event', data: 'historical', timestamp: historicalTimestamp })
 
-          const pending = yield* sink.readPending()
+          const pending = (yield* sink.claimPending()).events
           expect(pending).toHaveLength(1)
           expect(pending[0].timestamp).toBe(historicalTimestamp)
         }),
@@ -176,7 +176,7 @@ describe('ephemeral events', () => {
           yield* bus.publish({ type: 'normal_event', data: 'no-ts' })
 
           const after = Date.now()
-          const pending = yield* sink.readPending()
+          const pending = (yield* sink.claimPending()).events
           expect(pending).toHaveLength(1)
           expect(typeof pending[0].timestamp).toBe('number')
           expect(pending[0].timestamp).toBeGreaterThanOrEqual(before)

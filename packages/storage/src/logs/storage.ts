@@ -22,7 +22,7 @@ export function makeLogStorage(): Effect.Effect<
       appendSession: (sessionId, entries) =>
         Effect.gen(function* () {
           yield* io.ensureDir(g.sessionDir(sessionId))
-          yield* io.appendJsonLines(g.sessionLogFile(sessionId), entries)
+          yield* io.appendDiagnosticJsonLines(g.sessionLogFile(sessionId), entries)
         }),
 
       clearSession: (sessionId) =>

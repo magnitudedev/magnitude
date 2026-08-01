@@ -16,7 +16,7 @@ import {
   HydrationContext,
   ProjectionSnapshotServiceTag,
 } from '@magnitudedev/event-core'
-import type { EventCursor, Timestamped } from '@magnitudedev/event-core'
+import type { EventCursor } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
 
 import type { AppEvent } from '../events'
@@ -48,11 +48,6 @@ export const LifecycleCoordinator = {
       const turnTerminatedPubSub = yield* TurnProjection.signals.turnTerminated.tag
       const timerStarted = yield* Ref.make(false)
 
-      const requeueAndFail = <E>(pending: Timestamped<AppEvent>[], error: E) =>
-        eventSink.prependEvents(pending).pipe(
-          Effect.andThen(Effect.fail(error))
-        )
-
       const saveProjectionSnapshot = (
         cursor: EventCursor,
         sessionId: string,
@@ -71,23 +66,29 @@ export const LifecycleCoordinator = {
 
       const flushPendingEvents = (reason: LifecycleFlushReason) =>
         eventBus.checkpoint(Effect.gen(function* () {
-          const pending = yield* eventSink.drainPending()
-          if (pending.length === 0) return
+          const persisted = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const claim = yield* eventSink.claimPending()
+              if (claim.events.length === 0) return null
 
-          const metadata = yield* persistence.getSessionMetadata().pipe(
-            Effect.catchAll((error) => requeueAndFail(pending, error))
+              const metadata = yield* persistence.getSessionMetadata()
+
+              const cursor = yield* Effect.uninterruptible(
+                persistence.persistNewEvents(claim.events).pipe(
+                  Effect.flatMap(cursor =>
+                    cursor === null
+                      ? new MissingEventCursor({ eventCount: claim.events.length })
+                      : claim.acknowledge.pipe(Effect.as(cursor))
+                  )
+                )
+              )
+
+              return { cursor, sessionId: metadata.sessionId }
+            })
           )
+          if (persisted === null) return
 
-          const cursor = yield* persistence.persistNewEvents(pending).pipe(
-            Effect.catchAll((error) => requeueAndFail(pending, error))
-          )
-
-          if (cursor === null) {
-            yield* eventSink.prependEvents(pending)
-            return yield* new MissingEventCursor({ eventCount: pending.length })
-          }
-
-          yield* saveProjectionSnapshot(cursor, metadata.sessionId, reason)
+          yield* saveProjectionSnapshot(persisted.cursor, persisted.sessionId, reason)
         }))
 
       const flushPendingEventsOrLog = (reason: LifecycleFlushReason) =>

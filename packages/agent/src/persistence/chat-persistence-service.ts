@@ -36,7 +36,7 @@ export interface SessionMetadata {
 export interface ChatPersistenceService {
   readonly loadEvents: () => Effect.Effect<Timestamped<AppEvent>[], PersistenceError>
   readonly loadEventsAfterCursor: (cursor: EventCursor) => Effect.Effect<Timestamped<AppEvent>[] | null, PersistenceError>
-  readonly persistNewEvents: (events: Timestamped<AppEvent>[]) => Effect.Effect<EventCursor | null, PersistenceError>
+  readonly persistNewEvents: (events: ReadonlyArray<Timestamped<AppEvent>>) => Effect.Effect<EventCursor | null, PersistenceError>
   readonly loadProjectionSnapshot: () => Effect.Effect<unknown | null, PersistenceError>
   readonly saveProjectionSnapshot: <A>(snapshot: A) => Effect.Effect<void, PersistenceError>
   readonly getSessionMetadata: () => Effect.Effect<SessionMetadata, PersistenceError>

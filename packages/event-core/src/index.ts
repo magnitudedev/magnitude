@@ -13,7 +13,12 @@
 // Core types
 export * from './types'
 export { HydrationContext } from './core/hydration-context'
-export { EventSinkTag, makeEventSinkLayer, type EventSinkService } from './core/event-sink'
+export {
+  EventSinkTag,
+  makeEventSinkLayer,
+  type EventSinkService,
+  type PendingEventClaim,
+} from './core/event-sink'
 export { InterruptCoordinator, InterruptCoordinatorLive, type InterruptBaseline, type InterruptCoordinator as InterruptCoordinatorService } from './core/interrupt-coordinator'
 export { ProjectionBusTag, makeProjectionBusLayer, type ProjectionBusService } from './core/projection-bus'
 export { AmbientServiceTag, makeAmbientServiceLayer, type AmbientService } from './core/ambient-service'

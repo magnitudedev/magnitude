@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
@@ -206,12 +206,16 @@ describe("session storage", () => {
     expect(index?.sessionIds).toEqual(["mqa00001", "mqa00000"]);
   });
 
-  test("appendEvents appends events", async () => {
+  test("event appends preserve order", async () => {
     await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage;
-        yield* storage.sessions.appendEvents(sessionId, [{ type: "a" }]);
-        yield* storage.sessions.appendEvents(sessionId, [{ type: "b" }]);
+        yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "a", timestamp: 100 },
+        ]);
+        yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "b", timestamp: 200 },
+        ]);
       }),
       tmpDir
     );
@@ -223,7 +227,50 @@ describe("session storage", () => {
       }),
       tmpDir
     );
-    expect(result).toEqual([{ type: "a" }, { type: "b" }]);
+    expect(result).toEqual([
+      { type: "a", timestamp: 100 },
+      { type: "b", timestamp: 200 },
+    ]);
+  });
+
+  test("appendEventsWithCursor advances the cached committed record count", async () => {
+    const cursors = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        const first = yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "a", timestamp: 100 },
+          { type: "b", timestamp: 200 },
+        ]);
+        const second = yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "c", timestamp: 300 },
+        ]);
+        return { first, second };
+      }),
+      tmpDir
+    );
+
+    expect(cursors).toEqual({
+      first: { index: 1, timestamp: 200 },
+      second: { index: 2, timestamp: 300 },
+    });
+  });
+
+  test("deleting a session invalidates its cached event count", async () => {
+    const cursor = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "old", timestamp: 100 },
+        ]);
+        yield* storage.sessions.deleteSession(sessionId);
+        return yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "new", timestamp: 200 },
+        ]);
+      }),
+      tmpDir
+    );
+
+    expect(cursor).toEqual({ index: 0, timestamp: 200 });
   });
 
   test("recovers a torn final event without hiding interior corruption", async () => {
@@ -242,6 +289,22 @@ describe("session storage", () => {
       tmpDir
     );
     expect(recovered).toEqual([{ type: "complete" }]);
+    expect(
+      await readFile(paths.sessionEventsFile(sessionId), "utf-8")
+    ).toBe('{"type":"complete"}\n');
+
+    await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "after-repair", timestamp: 200 },
+        ]);
+      }),
+      tmpDir
+    );
+    expect(
+      await readFile(paths.sessionEventsFile(sessionId), "utf-8")
+    ).toBe('{"type":"complete"}\n{"type":"after-repair","timestamp":200}\n');
 
     await writeFile(
       paths.sessionEventsFile(sessionId),
@@ -259,6 +322,80 @@ describe("session storage", () => {
       )
     );
     expect(exit._tag).toBe("Failure");
+    expect(
+      await readFile(paths.sessionEventsFile(sessionId), "utf-8")
+    ).toBe('{"type":"complete"}\nnot-json\n{"type":"later"}\n');
+  });
+
+  test("preserves a valid final event that is missing only its newline", async () => {
+    await mkdir(paths.sessionDir(sessionId), { recursive: true });
+    await writeFile(
+      paths.sessionEventsFile(sessionId),
+      '{"type":"first"}\n{"type":"complete-tail"}',
+      "utf-8"
+    );
+
+    const recovered = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        return yield* storage.sessions.readEvents<{ type: string }>(sessionId);
+      }),
+      tmpDir
+    );
+
+    expect(recovered).toEqual([
+      { type: "first" },
+      { type: "complete-tail" },
+    ]);
+    expect(
+      await readFile(paths.sessionEventsFile(sessionId), "utf-8")
+    ).toBe('{"type":"first"}\n{"type":"complete-tail"}\n');
+  });
+
+  test("repairs a torn tail before appending without a preceding read", async () => {
+    await mkdir(paths.sessionDir(sessionId), { recursive: true });
+    await writeFile(
+      paths.sessionEventsFile(sessionId),
+      '{"type":"first"}\n{"type":',
+      "utf-8"
+    );
+
+    const cursor = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        return yield* storage.sessions.appendEventsWithCursor(sessionId, [
+          { type: "after-repair", timestamp: 200 },
+        ]);
+      }),
+      tmpDir
+    );
+
+    expect(cursor).toEqual({ index: 1, timestamp: 200 });
+    expect(
+      await readFile(paths.sessionEventsFile(sessionId), "utf-8")
+    ).toBe('{"type":"first"}\n{"type":"after-repair","timestamp":200}\n');
+  });
+
+  test("repairs a torn UTF-8 tail at a byte boundary", async () => {
+    await mkdir(paths.sessionDir(sessionId), { recursive: true });
+    await writeFile(
+      paths.sessionEventsFile(sessionId),
+      '{"type":"complete","text":"héllo"}\n{"type":"torn","text":"世',
+      "utf-8"
+    );
+
+    const recovered = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        return yield* storage.sessions.readEvents<{ type: string; text: string }>(sessionId);
+      }),
+      tmpDir
+    );
+
+    expect(recovered).toEqual([{ type: "complete", text: "héllo" }]);
+    expect(
+      await readFile(paths.sessionEventsFile(sessionId), "utf-8")
+    ).toBe('{"type":"complete","text":"héllo"}\n');
   });
 
   test("projection snapshots are read back as raw json", async () => {
