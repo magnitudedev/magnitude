@@ -21,6 +21,7 @@ import {
 } from "@magnitudedev/release"
 import { IcnPreparationReporter } from "./preparation.js"
 import { installationLoaderEnvironment } from "./installation-environment.js"
+import { selectCudaArtifact } from "./cuda-compatibility.js"
 import { Data, Effect, Option, Schema } from "effect"
 type SelectedBackend = {
   readonly backend: "cpu" | "metal" | "cuda" | "vulkan"
@@ -192,33 +193,6 @@ const readIdentity = (
     return value
   })
 
-const compatibleCuda = (
-  manifest: ReleaseManifest,
-  driverApi: number,
-  architectures: readonly string[]
-): Option.Option<ReleaseArtifact> =>
-  Option.fromNullable(
-    manifest.artifacts.find((artifact) => {
-      if (
-        artifact.kind !== "icn-backend" ||
-        Option.getOrUndefined(artifact.host) !== currentHost() ||
-        Option.getOrUndefined(artifact.backend) !== "cuda" ||
-        Option.isNone(artifact.compatibility) ||
-        artifact.compatibility.value.kind !== "cuda"
-      )
-        return false
-      const compatibility = artifact.compatibility.value
-      return (
-        driverApi >= compatibility.minimumDriverApi &&
-        architectures.some(
-          (architecture) =>
-            Number.parseInt(architecture, 10) >=
-            compatibility.minimumArchitecture
-        )
-      )
-    })
-  )
-
 const vulkanVersionAtLeast = (encoded: number, required: string): boolean => {
   const [requiredMajor = 0, requiredMinor = 0] = required.split(".").map(Number)
   const major = (encoded >>> 22) & 0x7f
@@ -292,8 +266,9 @@ const selectBackend = (
       return yield* installationError("probe", report.cuda.diagnostic)
     }
     if (report.cuda.state === "usable") {
-      const pack = compatibleCuda(
+      const pack = selectCudaArtifact(
         manifest,
+        currentHost(),
         report.cuda.driverApi,
         report.cuda.architectures
       )

@@ -509,42 +509,36 @@ pub struct GenerationSpeedPoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum GenerationPerformanceAssessment {
-    Estimated {
-        method: String,
-        confidence: GenerationPerformanceConfidence,
-        workload: String,
-        always_active_weight_bytes: u64,
-        routed_expert_weight_bytes: u64,
-        expert_count: u32,
-        expert_used_count: u32,
-        cross_memory_domain_placement: bool,
-        points: Vec<GenerationSpeedPoint>,
-    },
-    Unavailable {
-        method: String,
-        code: String,
-        message: String,
-    },
-}
-
-impl GenerationPerformanceAssessment {
-    #[must_use]
-    pub fn not_requested() -> Self {
-        Self::Unavailable {
-            method: "not_requested".to_owned(),
-            code: "not_requested".to_owned(),
-            message: "generation performance was not requested".to_owned(),
-        }
-    }
+#[serde(deny_unknown_fields)]
+pub struct GenerationPerformanceAssessment {
+    pub confidence: GenerationPerformanceConfidence,
+    pub workload: String,
+    pub always_active_weight_bytes: u64,
+    pub routed_expert_weight_bytes: u64,
+    pub expert_count: u32,
+    pub expert_used_count: u32,
+    pub cross_memory_domain_placement: bool,
+    pub points: Vec<GenerationSpeedPoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelExecutionAssessment {
-    pub hardware: HardwareAssessment,
-    pub performance: GenerationPerformanceAssessment,
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelExecutionAssessment {
+    Executable {
+        hardware: HardwareAssessment,
+        performance: GenerationPerformanceAssessment,
+    },
+    NotExecutable {
+        hardware: HardwareAssessment,
+    },
+}
+
+impl ModelExecutionAssessment {
+    pub fn hardware(&self) -> &HardwareAssessment {
+        match self {
+            Self::Executable { hardware, .. } | Self::NotExecutable { hardware } => hardware,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1355,8 +1349,7 @@ pub struct ModelPreviewAssessment {
     pub profile_id: String,
     pub artifact_fingerprint: String,
     pub hardware_topology: String,
-    pub assessment: HardwareAssessment,
-    pub performance: GenerationPerformanceAssessment,
+    pub execution: ModelExecutionAssessment,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1638,13 +1631,15 @@ pub trait HardwareProvider: Send + Sync + 'static {
     fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>>;
 }
 
-/// Canonical profile-aware model assessment used by inventory and remote preview.
+/// Canonical profile-aware model assessment used by inventory and remote preview. Execution cache
+/// identity is asynchronous because implementations must establish every process-local input,
+/// including concrete calibration, before a persisted performance result can be read.
 pub trait ModelHardwareAssessor: HardwareProvider {
-    fn cache_key(
-        &self,
-        profile: Option<&ModelPreviewProfile>,
-        snapshot: &HardwareSnapshot,
-    ) -> Result<String, InventoryError>;
+    fn execution_cache_key<'a>(
+        &'a self,
+        profile: Option<&'a ModelPreviewProfile>,
+        snapshot: &'a HardwareSnapshot,
+    ) -> BoxFuture<'a, Result<String, InventoryError>>;
     fn assess_profile(
         &self,
         model: ResolvedModel,
@@ -1669,19 +1664,7 @@ pub trait ModelHardwareAssessor: HardwareProvider {
         &self,
         model: ResolvedModel,
         profiles: Vec<ModelPreviewProfile>,
-    ) -> BoxFuture<'_, Result<Vec<ModelExecutionAssessment>, InventoryError>> {
-        Box::pin(async move {
-            Ok(self
-                .assess_profiles(model, profiles)
-                .await?
-                .into_iter()
-                .map(|hardware| ModelExecutionAssessment {
-                    hardware,
-                    performance: GenerationPerformanceAssessment::not_requested(),
-                })
-                .collect())
-        })
-    }
+    ) -> BoxFuture<'_, Result<Vec<ModelExecutionAssessment>, InventoryError>>;
 }
 
 pub trait ModelPreviewer: Send + Sync + 'static {
@@ -1950,9 +1933,8 @@ mod tests {
     }
 
     #[test]
-    fn generation_performance_contract_round_trips_tagged_evidence() {
-        let assessment = GenerationPerformanceAssessment::Estimated {
-            method: "native".to_owned(),
+    fn generation_performance_contract_round_trips_exact_data() {
+        let assessment = GenerationPerformanceAssessment {
             confidence: GenerationPerformanceConfidence::Low,
             workload: "baseline_single_sequence_decode".to_owned(),
             always_active_weight_bytes: 10,
@@ -1969,24 +1951,11 @@ mod tests {
             }],
         };
         let encoded = serde_json::to_value(&assessment).expect("serialize performance evidence");
-        assert_eq!(encoded["status"], "estimated");
         assert_eq!(encoded["confidence"], "low");
         assert_eq!(
             serde_json::from_value::<GenerationPerformanceAssessment>(encoded)
                 .expect("deserialize performance evidence"),
             assessment
-        );
-    }
-
-    #[test]
-    fn default_profile_assessor_marks_performance_as_not_requested() {
-        assert_eq!(
-            GenerationPerformanceAssessment::not_requested(),
-            GenerationPerformanceAssessment::Unavailable {
-                method: "not_requested".to_owned(),
-                code: "not_requested".to_owned(),
-                message: "generation performance was not requested".to_owned(),
-            }
         );
     }
 

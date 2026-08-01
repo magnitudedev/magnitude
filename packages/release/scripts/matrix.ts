@@ -15,9 +15,7 @@ const matrices = {
       host: pack.host,
       backend: pack.backend,
       runner: pack.runner,
-      toolkit: pack.compatibility.kind === "cuda"
-        ? pack.compatibility.toolkit
-        : "",
+      toolkit: "cuda" in pack ? pack.cuda.toolkitVersion : "",
     })),
   },
 }

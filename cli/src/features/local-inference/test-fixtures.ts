@@ -106,7 +106,7 @@ export const makeCatalogCandidate = (
   intelligenceProvenance: "Test evidence",
   fidelityRank: 75,
   qualityEvidence: ["Test quantization evidence"],
-  estimatedTokensPerSecond: Option.none(),
+  estimatedTokensPerSecond: 24,
   capabilities: {
     vision: false,
     tools: true,
@@ -135,6 +135,7 @@ export const makeView = (options: {
   readonly hardware?: LocalInferenceHardware
   readonly models?: readonly LocalModel[]
   readonly recommendations?: readonly LocalModelRecommendation[]
+  readonly catalogCandidates?: readonly LocalModelCatalogCandidate[]
   readonly allocation?: ModelInstanceAllocation
   readonly ready?: boolean
 } = {}): {
@@ -156,7 +157,7 @@ export const makeView = (options: {
       recommendations: {
         _tag: "Ready",
         entries: options.recommendations ?? [],
-        catalog: [],
+        catalog: options.catalogCandidates ?? [],
         progress: [],
       },
     },

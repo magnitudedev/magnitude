@@ -224,11 +224,11 @@ A policy suggestion selecting one model serving configuration for a product inte
 Recommendation changes never change package, configuration, provider-offering, or slot-selection
 identity.
 
-ACN persists the last complete recommendation portfolio as disposable derived state. It may reuse
-that portfolio only when the complete catalog-target/profile input, native hardware topology and
-build, enabled backends, and recommendation-policy identity are unchanged. Missing, malformed,
-unreadable, mismatched, or older-than-seven-days portfolio data is a cache miss. It never
-suppresses recomputation after one of those inputs changes.
+ACN retains a recommendation portfolio for the current process while its catalog,
+hardware, native build, enabled backends, and recommendation-policy identity are unchanged. It does
+not persist portfolios across daemon restarts. ICN's finer-grained assessment cache supplies the
+expensive reusable work without allowing a stale or operationally incomplete empty portfolio to be
+published as current truth. Failed calculations are not cached as recommendation results.
 
 Recommendation calculation publishes an ordered, cumulative four-stage lifecycle for hardware,
 downloaded-model discovery, model evaluation for the current machine, and recommendation
@@ -256,10 +256,11 @@ service, or startup reconciler. Confirmed cancellation uses the ordinary target-
 cancellation or slot-clear mutation. Interruption or restart never reconstructs command intent from
 onboarding, download, slot, or instance snapshots.
 
-The complete compatible recommendable-candidate projection is published beside the small labeled
-portfolio. Labeled portfolio members retain their intent and order. Remaining compatible
-candidates are ordered by one internal balanced recommendation score. That score is ranking
-metadata, not user-facing model metadata, and clients do not display it.
+The compatible recommendable-candidate projection is published beside the small labeled portfolio.
+Candidate records contain assessment facts; recommendation membership and intent exist only in the
+portfolio. Onboarding presents installed models and selected portfolio entries, not every
+compatible candidate. Complete execution assessments always contain measured performance.
+Operational failure remains a failed refresh and is never published as an empty ready result.
 
 ### Provider offering
 

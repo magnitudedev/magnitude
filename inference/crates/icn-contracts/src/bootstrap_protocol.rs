@@ -122,6 +122,36 @@ pub enum IcnStartupRecordType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IcnStartupProgressRecord {
+    #[serde(rename = "type")]
+    pub record_type: IcnStartupProgressRecordType,
+    pub backend: IcnStartupBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum IcnStartupProgressRecordType {
+    PreparingBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum IcnStartupBackend {
+    Cuda {
+        #[serde(rename = "hardwareLabel")]
+        hardware_label: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IcnInstallationDeclaration {
     #[cfg_attr(feature = "openapi", schema(minimum = 1, maximum = 1))]
     pub schema_version: u32,
@@ -189,6 +219,17 @@ mod tests {
         assert_eq!(startup["type"], "icn_ready");
         assert_eq!(startup["protocolVersion"], 1);
         assert_eq!(startup["instanceId"], "instance");
+
+        let progress = serde_json::to_value(IcnStartupProgressRecord {
+            record_type: IcnStartupProgressRecordType::PreparingBackend,
+            backend: IcnStartupBackend::Cuda {
+                hardware_label: "NVIDIA GPU".to_owned(),
+            },
+        })
+        .expect("serialize progress");
+        assert_eq!(progress["type"], "preparing_backend");
+        assert_eq!(progress["backend"]["type"], "cuda");
+        assert_eq!(progress["backend"]["hardwareLabel"], "NVIDIA GPU");
 
         let installation = serde_json::to_value(IcnInstallationDeclaration {
             schema_version: 1,

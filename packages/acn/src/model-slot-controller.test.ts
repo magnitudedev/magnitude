@@ -136,7 +136,7 @@ const recommendationEntry = {
     intelligenceProvenance: "Unavailable",
     fidelityRank: 0,
     qualityEvidence: [],
-    estimatedTokensPerSecond: Option.none(),
+    estimatedTokensPerSecond: 24,
     capabilities,
     sources: [{
       source: modelPackage.source,
@@ -263,7 +263,12 @@ const makeHarness = (options: {
     Layer.succeed(LocalModelRecommendations, LocalModelRecommendations.of({
       snapshot: Effect.succeed({
         revision: 0,
-        state: { _tag: "Ready", recommendations: [], catalog: [], progress: [] },
+        state: {
+          _tag: "Ready",
+          recommendations: [],
+          catalog: [],
+          progress: [],
+        },
       }),
       changes: Stream.empty,
       refresh: Effect.void,

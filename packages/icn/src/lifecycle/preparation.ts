@@ -17,6 +17,13 @@ export type IcnPreparationEvent =
       readonly event: ArtifactInstallationEvent
     }
   | { readonly _tag: "Starting" }
+  | {
+      readonly _tag: "PreparingBackend"
+      readonly backend: {
+        readonly _tag: "Cuda"
+        readonly hardwareLabel: string
+      }
+    }
 
 export interface IcnPreparationReporter {
   readonly report: (event: IcnPreparationEvent) => Effect.Effect<void>

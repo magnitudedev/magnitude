@@ -135,6 +135,11 @@ replaced by the exact selected CPU/CUDA/Vulkan plan before accelerator acquisiti
 the surface with the causal safe error and Retry/Quit actions. Ctrl-C remains available throughout.
 Individual commands and screens do not own startup hooks, retry loops, or copies of lifecycle state.
 
+When a selected local backend requires startup preparation, ICN reports that operation before its
+readiness record and ACN mirrors it as a structured starting phase. CUDA preparation includes its
+detected hardware label and renders as `Preparing CUDA backend for <hardware>`. This remains under
+`Starting Magnitude`; it is not an installation phase and carries no fabricated percentage.
+
 ## Recovery and compatibility
 
 Transport loss invalidates the failed endpoint and may start ACN. A subscription receiving

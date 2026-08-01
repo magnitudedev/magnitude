@@ -299,7 +299,7 @@ const addLocalInferenceServices = <A, E, R>(
     withOfferings
   )
   const withRecommendations = Layer.provideMerge(
-    makeLocalModelRecommendationsLive(dataDir),
+    makeLocalModelRecommendationsLive(),
     withOfferingProjection
   )
   const withAutoSetup = Layer.provideMerge(

@@ -6,6 +6,7 @@ import * as HttpClientError from "@effect/platform/HttpClientError";
 import * as Path from "@effect/platform/Path";
 import {
   IcnBinaryIdentity,
+  IcnStartupProgressRecord,
   IcnStartupRecord,
 } from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
@@ -519,6 +520,28 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       Stream.runForEach((line) =>
         Effect.gen(function* () {
           yield* appendBounded(output, `${line}\n`, config.outputLimitBytes);
+          if (line.startsWith("MAGNITUDE_ICN_PROGRESS ")) {
+            const record = yield* Schema.decodeUnknown(
+              Schema.parseJson(IcnStartupProgressRecord)
+            )(line.slice("MAGNITUDE_ICN_PROGRESS ".length)).pipe(
+              Effect.mapError((cause) =>
+                lifecycleError(
+                  "startup-record",
+                  "invalid-startup-record",
+                  "invalid ICN startup progress record",
+                  cause
+                )
+              )
+            );
+            yield* reporter.report({
+              _tag: "PreparingBackend",
+              backend: {
+                _tag: "Cuda",
+                hardwareLabel: record.backend.hardwareLabel,
+              },
+            });
+            return;
+          }
           if (!line.startsWith("MAGNITUDE_ICN_READY ")) return;
           const record = yield* Schema.decodeUnknown(
             Schema.parseJson(IcnStartupRecord)

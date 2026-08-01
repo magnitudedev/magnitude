@@ -1183,8 +1183,7 @@
         "type": "object",
         "required": [
           "requests",
-          "capacityPolicy",
-          "includePerformance"
+          "capacityPolicy"
         ],
         "properties": {
           "requests": {
@@ -1195,9 +1194,6 @@
           },
           "capacityPolicy": {
             "$ref": "#/components/schemas/CapacityPolicy"
-          },
-          "includePerformance": {
-            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -3177,6 +3173,50 @@
         },
         "additionalProperties": false
       },
+      "IcnStartupBackend": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "hardwareLabel",
+              "type"
+            ],
+            "properties": {
+              "hardwareLabel": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "cuda"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "IcnStartupProgressRecord": {
+        "type": "object",
+        "required": [
+          "type",
+          "backend"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/IcnStartupProgressRecordType"
+          },
+          "backend": {
+            "$ref": "#/components/schemas/IcnStartupBackend"
+          }
+        },
+        "additionalProperties": false
+      },
+      "IcnStartupProgressRecordType": {
+        "type": "string",
+        "enum": [
+          "preparing_backend"
+        ]
+      },
       "IcnStartupRecord": {
         "type": "object",
         "required": [
@@ -4449,6 +4489,7 @@
               "configurationId",
               "assessmentId",
               "memory",
+              "performance",
               "_tag"
             ],
             "properties": {
@@ -4468,24 +4509,7 @@
                 }
               },
               "performance": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/PerformanceEvidence"
-                  }
-                ]
-              },
-              "performanceUnavailable": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/PerformanceUnavailable"
-                  }
-                ]
+                "$ref": "#/components/schemas/PerformanceEvidence"
               },
               "_tag": {
                 "type": "string",
@@ -4584,8 +4608,7 @@
           "lowerTokensPerSecond",
           "estimatedTokensPerSecond",
           "upperTokensPerSecond",
-          "confidence",
-          "method"
+          "confidence"
         ],
         "properties": {
           "contextTokens": {
@@ -4607,29 +4630,6 @@
           },
           "confidence": {
             "$ref": "#/components/schemas/PerformanceConfidence"
-          },
-          "method": {
-            "type": "string"
-          }
-        },
-        "additionalProperties": false
-      },
-      "PerformanceUnavailable": {
-        "type": "object",
-        "required": [
-          "method",
-          "code",
-          "message"
-        ],
-        "properties": {
-          "method": {
-            "type": "string"
-          },
-          "code": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
           }
         },
         "additionalProperties": false

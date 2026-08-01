@@ -170,7 +170,7 @@ impl ModelCache {
             ModelIndexKind::ExecutionAssessment,
             &hardware_assessment_evidence(content_id, execution_evidence),
         )
-        .filter(|assessment| topology.validates_hardware_assessment(&assessment.hardware))
+        .filter(|assessment| topology.validates_hardware_assessment(assessment.hardware()))
     }
 
     pub fn write_execution_assessment(
@@ -179,7 +179,7 @@ impl ModelCache {
         execution_evidence: &str,
         assessment: &ModelExecutionAssessment,
     ) {
-        if is_terminal_assessment(&assessment.hardware) {
+        if is_terminal_assessment(assessment.hardware()) {
             self.write_index(
                 ModelIndexKind::ExecutionAssessment,
                 &hardware_assessment_evidence(content_id, execution_evidence),

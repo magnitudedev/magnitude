@@ -318,10 +318,9 @@ describe("local inference selection view model", () => {
       models,
       recommendations: intents.map(recommendation),
     }))
-    expect(selections.map(({ recommendation: value }) => Option.match(value, {
-      onNone: () => "none",
-      onSome: ({ intent }) => intent,
-    }))).toEqual([
+    expect(selections.map(({ recommendation }) => recommendation._tag === "Recommended"
+      ? recommendation.value.intent
+      : "none")).toEqual([
       "balanced",
       "best_quality",
       "fastest",

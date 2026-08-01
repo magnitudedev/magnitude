@@ -421,6 +421,9 @@ const reportHealthState = (
     });
   }
   if (state._tag !== "Starting") return Effect.void;
+  if (typeof state.activity !== "string") {
+    return emitObservation({ _tag: "Starting", phase: state.activity });
+  }
   switch (state.activity) {
     case "WaitingForOwnership":
       return emitObservation({ _tag: "Starting", phase: "WaitingForOwner" });

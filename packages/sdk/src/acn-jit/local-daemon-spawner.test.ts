@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { makeLocalDaemonSpawner } from "./local-daemon-spawner";
 import { SpawnProcess, type SpawnedProcess } from "./local-daemon-spawner";
 import { runDaemonSpawn, type DaemonSpawner } from "./daemon-spawner";
+import type { AcnStartingPhase } from "./lifecycle";
 
 const spawn = (
   spawner: DaemonSpawner,
@@ -270,7 +271,7 @@ describe("local daemon spawner rendezvous", () => {
     const pid = 7655;
     let ready = false;
     let spawnCalls = 0;
-    const reports: string[] = [];
+    const reports: AcnStartingPhase[] = [];
     server = Bun.serve({
       port: 0,
       fetch: () =>

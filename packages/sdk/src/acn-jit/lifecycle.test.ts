@@ -139,4 +139,33 @@ describe("ACN installation lifecycle", () => {
       })
     );
   });
+
+  it("replaces installation progress with exact backend preparation", async () => {
+    await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* makeAcnLifecycle();
+        yield* lifecycle.report({
+          _tag: "Installing",
+          phase: "StartingMagnitude",
+          plan,
+          progress: Option.none(),
+        });
+        yield* lifecycle.report({
+          _tag: "Starting",
+          phase: {
+            _tag: "PreparingBackend",
+            backend: { _tag: "Cuda", hardwareLabel: "NVIDIA GPU" },
+          },
+        });
+
+        expect(yield* lifecycle.get).toEqual({
+          _tag: "Starting",
+          phase: {
+            _tag: "PreparingBackend",
+            backend: { _tag: "Cuda", hardwareLabel: "NVIDIA GPU" },
+          },
+        });
+      }),
+    );
+  });
 });

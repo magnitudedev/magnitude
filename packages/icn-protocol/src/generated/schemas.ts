@@ -134,7 +134,6 @@ export type AssessModelResultEncoded = S.Schema.Encoded<typeof AssessModelResult
 
 export const AssessModelsRequest = S.Struct({
   capacityPolicy: S.suspend((): S.Schema<CapacityPolicy, CapacityPolicyEncoded> => CapacityPolicy),
-  includePerformance: S.Boolean,
   requests: S.Array(S.suspend((): S.Schema<AssessModelRequest, AssessModelRequestEncoded> => AssessModelRequest)),
 })
 export type AssessModelsRequest = S.Schema.Type<typeof AssessModelsRequest>
@@ -964,6 +963,29 @@ export const IcnInstallationDeclaration = S.Struct({
 export type IcnInstallationDeclaration = S.Schema.Type<typeof IcnInstallationDeclaration>
 export type IcnInstallationDeclarationEncoded = S.Schema.Encoded<typeof IcnInstallationDeclaration>
 
+export const IcnStartupBackend = S.extend(
+  S.Struct({
+    hardwareLabel: S.String,
+    type: S.Literal("cuda"),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type IcnStartupBackend = S.Schema.Type<typeof IcnStartupBackend>
+export type IcnStartupBackendEncoded = S.Schema.Encoded<typeof IcnStartupBackend>
+
+export const IcnStartupProgressRecord = S.Struct({
+  backend: S.suspend((): S.Schema<IcnStartupBackend, IcnStartupBackendEncoded> => IcnStartupBackend),
+  type: S.suspend(
+    (): S.Schema<IcnStartupProgressRecordType, IcnStartupProgressRecordTypeEncoded> => IcnStartupProgressRecordType,
+  ),
+})
+export type IcnStartupProgressRecord = S.Schema.Type<typeof IcnStartupProgressRecord>
+export type IcnStartupProgressRecordEncoded = S.Schema.Encoded<typeof IcnStartupProgressRecord>
+
+export const IcnStartupProgressRecordType = S.Literal("preparing_backend")
+export type IcnStartupProgressRecordType = S.Schema.Type<typeof IcnStartupProgressRecordType>
+export type IcnStartupProgressRecordTypeEncoded = S.Schema.Encoded<typeof IcnStartupProgressRecordType>
+
 export const IcnStartupRecord = S.Struct({
   apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
   instanceId: S.String.pipe(S.minLength(1)),
@@ -1512,20 +1534,7 @@ export const OfferingAssessment = S.Union(
         (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
       ),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      performance: S.optionalWith(
-        S.Union(
-          S.Null,
-          S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
-        ),
-        { exact: true, as: "Option" },
-      ),
-      performanceUnavailable: S.optionalWith(
-        S.Union(
-          S.Null,
-          S.suspend((): S.Schema<PerformanceUnavailable, PerformanceUnavailableEncoded> => PerformanceUnavailable),
-        ),
-        { exact: true, as: "Option" },
-      ),
+      performance: S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1570,19 +1579,10 @@ export const PerformanceEvidence = S.Struct({
   contextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   estimatedTokensPerSecond: S.Number,
   lowerTokensPerSecond: S.Number,
-  method: S.String,
   upperTokensPerSecond: S.Number,
 })
 export type PerformanceEvidence = S.Schema.Type<typeof PerformanceEvidence>
 export type PerformanceEvidenceEncoded = S.Schema.Encoded<typeof PerformanceEvidence>
-
-export const PerformanceUnavailable = S.Struct({
-  code: S.String,
-  message: S.String,
-  method: S.String,
-})
-export type PerformanceUnavailable = S.Schema.Type<typeof PerformanceUnavailable>
-export type PerformanceUnavailableEncoded = S.Schema.Encoded<typeof PerformanceUnavailable>
 
 export const PreviewModelLoadRequest = S.Struct({
   configuration: S.suspend(
