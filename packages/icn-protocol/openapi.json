@@ -1880,6 +1880,7 @@
             "required": [
               "driverApi",
               "architectures",
+              "driverLibrary",
               "state"
             ],
             "properties": {
@@ -1894,6 +1895,10 @@
                   "type": "string"
                 },
                 "minItems": 1
+              },
+              "driverLibrary": {
+                "type": "string",
+                "minLength": 1
               },
               "state": {
                 "type": "string",

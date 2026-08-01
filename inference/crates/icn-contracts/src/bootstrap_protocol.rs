@@ -26,6 +26,9 @@ pub enum CudaEligibility {
         driver_api: i32,
         #[cfg_attr(feature = "openapi", schema(min_items = 1))]
         architectures: Vec<String>,
+        #[serde(rename = "driverLibrary")]
+        #[cfg_attr(feature = "openapi", schema(min_length = 1))]
+        driver_library: String,
     },
     Absent {
         diagnostic: String,

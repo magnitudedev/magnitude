@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto"
-import { delimiter } from "node:path"
 import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
@@ -21,6 +20,7 @@ import {
   type ReleaseManifest,
 } from "@magnitudedev/release"
 import { IcnPreparationReporter } from "./preparation.js"
+import { installationLoaderEnvironment } from "./installation-environment.js"
 import { Data, Effect, Option, Schema } from "effect"
 type SelectedBackend = {
   readonly backend: "cpu" | "metal" | "cuda" | "vulkan"
@@ -47,19 +47,6 @@ const installationError = (
 
 const executableName = () =>
   process.platform === "win32" ? "magnitude-icn.exe" : "magnitude-icn"
-
-const loaderEnvironment = (
-  runtime: string
-): Readonly<Record<string, string>> => {
-  const key =
-    process.platform === "win32"
-      ? "PATH"
-      : process.platform === "darwin"
-      ? "DYLD_LIBRARY_PATH"
-      : "LD_LIBRARY_PATH"
-  const inherited = process.env[key]
-  return { [key]: inherited ? `${runtime}${delimiter}${inherited}` : runtime }
-}
 
 const run = (
   command: readonly [string, ...string[]],
@@ -185,7 +172,7 @@ const readIdentity = (
     const path = yield* Path.Path
     const value = yield* run(
       [path.join(base, "bin", executableName()), "version", "--json"],
-      loaderEnvironment(path.join(base, "runtime"))
+      installationLoaderEnvironment(path.join(base, "runtime"))
     ).pipe(
       Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(IcnBinaryIdentity))),
       Effect.mapError(() =>
@@ -273,7 +260,7 @@ const selectBackend = (
         "backend-eligibility",
         "--json",
       ],
-      loaderEnvironment(path.join(base, "runtime"))
+      installationLoaderEnvironment(path.join(base, "runtime"))
     ).pipe(
       Effect.flatMap(
         Schema.decodeUnknown(Schema.parseJson(BackendEligibilityReport))
@@ -359,7 +346,7 @@ const inspectComposition = (
     const path = yield* Path.Path
     const binaryPath = path.join(root, "bin", executableName())
     const declarationPath = path.join(root, "installation.json")
-    const environment = loaderEnvironment(path.join(root, "runtime"))
+    const environment = installationLoaderEnvironment(path.join(root, "runtime"))
     const declaration = yield* fs.readFileString(declarationPath).pipe(
       Effect.flatMap(
         Schema.decodeUnknown(Schema.parseJson(IcnInstallationDeclaration))
@@ -545,7 +532,7 @@ const publishComposition = (
           return {
             binaryPath: path.join(root, "bin", executableName()),
             declarationPath: path.join(root, "installation.json"),
-            environment: loaderEnvironment(path.join(root, "runtime")),
+            environment: installationLoaderEnvironment(path.join(root, "runtime")),
           }
         }),
       (staging) =>

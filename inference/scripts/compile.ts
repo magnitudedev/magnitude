@@ -78,6 +78,24 @@ const rustTarget = (target: string): string => {
   return value
 }
 
+const nativeRuntimeLinkageEnvironment = (
+  target: string,
+): Readonly<Record<string, string>> => {
+  const { platform } = getTargetInfo(target)
+  if (platform === "linux") {
+    return {
+      CMAKE_BUILD_RPATH_USE_ORIGIN: "ON",
+      CMAKE_INSTALL_RPATH: "$ORIGIN;$ORIGIN/../runtime",
+    }
+  }
+  if (platform === "darwin") {
+    return {
+      CMAKE_INSTALL_RPATH: "@loader_path;@loader_path/../runtime",
+    }
+  }
+  return {}
+}
+
 const filesIn = async (directory: string): Promise<readonly string[]> => {
   try {
     const entries = await readdir(directory, { withFileTypes: true })
@@ -202,6 +220,7 @@ export const buildIcnBinary = async ({
     env: {
       ...process.env,
       ...buildEnvironment,
+      ...nativeRuntimeLinkageEnvironment(target),
       CARGO_TARGET_DIR: targetDirectory,
     },
   })

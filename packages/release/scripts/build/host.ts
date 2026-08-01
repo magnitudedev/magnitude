@@ -27,7 +27,12 @@ import {
 } from "../../src/targets"
 import { buildAcnBinary } from "./acn"
 import { buildCliBinary } from "./cli"
-import { buildArchive, type ArchiveSource, run } from "./common"
+import {
+  buildArchive,
+  type ArchiveSource,
+  run,
+  verifyOwnedLoaderPaths,
+} from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
@@ -187,17 +192,19 @@ const smokeHostArchives = async (
       nativeBuild: Option.getOrThrow(icnArtifact.nativeBuild),
       backendModuleAbi: Option.getOrThrow(icnArtifact.backendModuleAbi),
     })}\n`)
-    const loader = host.id.startsWith("windows-")
-      ? "PATH"
-      : host.id.startsWith("darwin-")
-        ? "DYLD_LIBRARY_PATH"
-        : "LD_LIBRARY_PATH"
-    const environment = {
-      ...process.env,
-      [loader]: [resolve(icnRoot, "runtime"), process.env[loader]]
-        .filter(Boolean)
-        .join(delimiter),
-    }
+    const environment = host.id.startsWith("windows-")
+      ? {
+        ...process.env,
+        PATH: [resolve(icnRoot, "runtime"), process.env.PATH]
+          .filter(Boolean)
+          .join(delimiter),
+      }
+      : {
+        ...process.env,
+        ...(host.id.startsWith("darwin-")
+          ? { DYLD_LIBRARY_PATH: "" }
+          : { LD_LIBRARY_PATH: "" }),
+      }
     const icnBinary = resolve(icnRoot, `bin/magnitude-icn${extension}`)
     await smokeIcnServer(icnBinary, declaration, icnRoot, environment)
   } finally {
@@ -248,6 +255,12 @@ export const buildHostArtifacts = async (
   if (cpuModules.length === 0) {
     throw new Error(`${host.id} ICN base emitted no CPU module`)
   }
+  await verifyOwnedLoaderPaths({
+    host: host.id,
+    executable: icn.binary,
+    modules: cpuModules,
+    runtime: icn.runtimeLibraries,
+  })
 
   if (host.id.startsWith("darwin-")) {
     for (const file of [icn.binary, ...icn.runtimeLibraries, ...cpuModules]) {

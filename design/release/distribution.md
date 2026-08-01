@@ -43,11 +43,14 @@ Metal, CUDA, and Vulkan are separate backend packs. Each pack contains one backe
 and only its required redistributable runtime libraries. The supported hosts and packs are fixed
 product configuration, not a plugin system.
 
-CUDA backend packs currently contain PTX only for compute capabilities 8.0, 9.0, and 12.0. These
-tiers preserve the Ampere-and-newer compatibility baseline and the dedicated Hopper and Blackwell
-compile-time paths while keeping release build time bounded. Additional compatibility tiers or
-native cubins may be restored when measured startup latency or runtime performance justifies their
-build cost.
+CUDA compatibility and backend-pack selection are governed by
+[CUDA compatibility](../inference/cuda-compatibility.md). Linux x64 and ARM64 each publish one
+compatibility pack containing one ordinary `compute_80` PTX image and one modern pack containing
+the current Ampere, Hopper, and Blackwell paths. The ordinary compatibility image may execute on
+newer GPUs when its PTX ISA and target rules are satisfied; separate Ada and Hopper targets are not
+required merely for coverage. Host architecture does not select a CUDA toolkit generation. The
+four host/tier packs build independently and concurrently; additional PTX targets and native cubins
+require measured startup-latency or runtime-performance justification.
 
 One manifest records every native archive's release identity, filename, size, SHA-256, native-build
 identity, backend ABI, and compatibility facts used at runtime. Production acquisition trusts the
@@ -65,9 +68,16 @@ authenticated ICN endpoint. Binary identity, backend eligibility, installation, 
 records are validated with Effect Schemas generated from the canonical Rust bootstrap protocol;
 generated drift fails release checks.
 
+Before archiving, Linux and macOS jobs verify that the ICN executable, runtime libraries, and backend
+modules contain only the installation-relative loader paths required by their final `bin/`,
+`runtime/`, and `backends/` locations. Their extracted-archive smoke test runs without injected
+library search paths and with inherited Unix library paths cleared.
+
 CUDA and Vulkan jobs prove that the configured module and redistributable files were produced and
-that their native-build and backend ABI identities match their host base. Jobs without matching GPU
-hardware do not claim device execution.
+that their native-build and backend ABI identities match their host base. CUDA release assembly
+also inspects the final fatbinary and verifies its exact device images and compatibility facts;
+requested compiler targets are not publication truth. Jobs without matching GPU hardware do not
+claim device execution.
 
 Pull requests build and validate the complete release artifact graph from the exact proposed commit
 using the same reusable build workflow as production. They stop before creating or modifying a

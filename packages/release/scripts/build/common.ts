@@ -15,6 +15,7 @@ import {
   ReleaseArtifactSchema,
   type ReleaseArtifact,
 } from "../../src/contracts"
+import type { HostId } from "../../src/targets"
 
 export interface ArchiveSource {
   readonly path: string
@@ -66,6 +67,72 @@ export const run = async (
     )
   }
   return stdout
+}
+
+export interface OwnedLoaderPathInputs {
+  readonly host: HostId
+  readonly executable?: string
+  readonly modules: readonly string[]
+  readonly runtime: readonly string[]
+}
+
+export const verifyOwnedLoaderPaths = async ({
+  host,
+  executable,
+  modules,
+  runtime,
+}: OwnedLoaderPathInputs): Promise<void> => {
+  if (host.startsWith("windows-")) return
+
+  const inspect = async (file: string): Promise<readonly string[]> => {
+    if (host.startsWith("linux-")) {
+      const dynamic = await run(["readelf", "-d", file])
+      return [...dynamic.matchAll(
+        /\((?:RUNPATH|RPATH)\).*\[([^\]]+)\]/g,
+      )].flatMap((match) => match[1]!.split(":"))
+    }
+    const commands = await run(["otool", "-l", file])
+    return [...commands.matchAll(
+      /LC_RPATH[\s\S]*?\n\s*path ([^ ]+) \(offset/g,
+    )].map((match) => match[1]!)
+  }
+
+  const expectedExecutable = host.startsWith("linux-")
+    ? ["$ORIGIN/../runtime"]
+    : ["@loader_path/../runtime"]
+  const expectedLibrary = host.startsWith("linux-")
+    ? ["$ORIGIN", "$ORIGIN/../runtime"]
+    : ["@loader_path", "@loader_path/../runtime"]
+  const verify = async (
+    file: string,
+    allowed: readonly string[],
+    exact: boolean,
+  ): Promise<void> => {
+    const actual = await inspect(file)
+    if (
+      actual.some((path) => !allowed.includes(path)) ||
+      (exact && (
+        actual.length !== allowed.length ||
+        allowed.some((path) => !actual.includes(path))
+      ))
+    ) {
+      throw new Error(
+        `${basename(file)} has loader paths ${JSON.stringify(actual)}; allowed ${JSON.stringify(allowed)}`,
+      )
+    }
+  }
+
+  if (executable !== undefined) {
+    await verify(executable, expectedExecutable, true)
+  }
+  await Promise.all(
+    modules.map((module) => verify(module, expectedLibrary, true)),
+  )
+  // Vendor runtime libraries may need no rpath. If present, it may only
+  // address this installation's runtime directory.
+  await Promise.all(
+    runtime.map((library) => verify(library, expectedLibrary, false)),
+  )
 }
 
 export const buildArchive = async (

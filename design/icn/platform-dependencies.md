@@ -52,6 +52,13 @@ application-local DLL resolution). Final integrity measurement and signing happe
 and path rewriting. Vendor drivers that cannot be redistributed remain explicit capability
 dependencies rather than becoming artifact dependencies.
 
+ICN executables resolve owned libraries from the sibling `runtime/` directory; backend and runtime
+libraries resolve from their own directory and sibling `runtime/`. Linux uses `$ORIGIN`, macOS uses
+`@loader_path`, and Windows adds the installation's `runtime/` to the child process `PATH`. Linux and
+macOS release execution must not require `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`. Release builds
+inspect these embedded paths before archiving, and launchers clear inherited Unix library paths so
+ambient toolkit or package-manager libraries cannot override the installation closure.
+
 ## Release validation
 
 The extracted final installation is tested independently of its build host on the minimum supported
