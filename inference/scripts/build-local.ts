@@ -85,7 +85,7 @@ export const buildLocalIcn = async (): Promise<{
   readonly installationPath: string;
 }> => {
   const backend = await selectBackend();
-  await run(["bun", "run", "icn:catalog:hydrate"]);
+  await run(["bun", "run", "icn:catalog:build-bundle"]);
   const build = await buildIcnBinary({
     target: getDefaultBunTarget(),
     profile: `development-${backend}`,
@@ -133,10 +133,6 @@ export const buildLocalIcn = async (): Promise<{
     for (const source of modules) {
       await copyFile(source, resolve(staging, "backends", basename(source)));
     }
-    await copyFile(
-      resolve(target, "catalog-inputs/release-catalog.lock.json"),
-      resolve(staging, "catalog/release-catalog.lock.json")
-    );
     await copyFile(
       resolve(target, "catalog-inputs/model-planner-inputs.bundle"),
       resolve(staging, "catalog/model-planner-inputs.bundle")

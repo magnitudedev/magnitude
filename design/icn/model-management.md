@@ -68,10 +68,12 @@ part of catalog or configuration identity.
 Catalog membership means only that Magnitude may assess and recommend the target. It does not mean
 the target fits, is recommended, is installed, is offered, or is resident.
 
-Catalog publication is an explicit release-development operation. It resolves the human source
-catalog through production ICN code, pins immutable Hugging Face commits and exact files, and emits
-a deterministic manifest with both the exact source GGUF-header ranges and the identities of their
-compact planner stubs. A stub is standard GGUF: it retains all model metadata and tensor
+Catalog publication is an explicit release-development operation owned by the dedicated catalog
+build tool, not the ICN server. The human source catalog owns repository identity and a separate
+minimal lock maps every catalog ID to one immutable Hugging Face commit. Lock advancement is
+explicit. Deterministic generation resolves only those commits through shared ICN model and native
+planning libraries and emits a self-describing bundle of compact planner inputs. A stub is
+standard GGUF: it retains all model metadata and tensor
 descriptors and supplies a compressible placeholder vocabulary of the original cardinality so
 retained graph metadata is loaded through llama.cpp's ordinary vocabulary path. Auxiliary split
 components receive no primary overrides. A stub contains no tensor payload and is not a runnable
@@ -80,14 +82,9 @@ table.
 
 Generation fails if any source entry produces a diagnostic or if the native planner gives a
 different hardware assessment for a source-header sparse model and its compact-stub sparse model
-at any curated serving profile. An explicit hydration command retrieves and verifies the source
-ranges from pinned immutable revisions, reruns the same deterministic compactor, verifies every
-stub identity, and materializes the compressed stub bundle. Release builds package the lock file
-and bundle as ICN catalog sidecars; local development constructs the same installation layout.
-The bundle is not committed to source control, and release validation rejects a partial catalog.
-Normal ICN startup validates the installed sidecars against the source declarations, native
-template and planner identities, bundle digest, and exact catalog coverage. It performs no remote
-catalog refresh.
+at any curated serving profile. Release builds package only the resulting planner-input bundle;
+the bundle is not committed to source control. Catalog declarations and the ID-to-commit lock are
+compiled into ICN. Startup validates the bundle and exact catalog coverage without a remote refresh.
 
 At runtime, a release-catalog target is assessed from its installed hardware-independent properties
 and planner inputs, combined with current machine topology and local calibration. ICN materializes

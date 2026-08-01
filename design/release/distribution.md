@@ -37,7 +37,7 @@ and x64. Windows release artifacts are intentionally disabled until the Windows 
 release builds are reliable.
 
 CLI and ACN archives contain one executable under `bin/`. ICN bases contain the executable, common
-runtime libraries, CPU modules, the release catalog lock, and the model-planner-input bundle.
+runtime libraries, CPU modules, and the model-planner-input bundle.
 
 Metal, CUDA, and Vulkan are separate backend packs. Each pack contains one backend module family
 and only its required redistributable runtime libraries. The supported hosts and packs are fixed
@@ -59,8 +59,8 @@ downloaded bytes match that manifest; they do not provide an independent publish
 
 ## Build and validation
 
-Catalog hydration is an explicit operation performed once per release. Every host receives the
-same lock and planner bundle. Ordinary Cargo builds perform no model-data network access.
+Planner-input generation is an explicit operation performed once per release. Every host receives
+the same bundle. Ordinary Cargo builds perform no model-data network access.
 
 Each host job builds and extracts its final CLI, ACN, and ICN-base archives. It verifies exact
 versions, embedded ripgrep, native installation loading, server readiness, health, and an

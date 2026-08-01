@@ -40,12 +40,11 @@ Every file-backed format must be classified before its persistence behavior is d
 | Durable configuration | user preferences with defined defaults | Preserve valid values; default damaged values | Only if recovery is catastrophic |
 | Irreplaceable record | session events, user content, credentials | Format-specific durability and repair protocol | Yes; this document's defaulting rules do not apply |
 
-Release artifacts are a separate class from files in a user data directory. The release-bound
-recommendable-model manifest is generated from reviewed source declarations and checked in. Its
-pinned native-planner inputs are retrieved and integrity-checked by an explicit hydration command,
-then the manifest and bundle are packaged as immutable ICN release sidecars. Local development
-constructs the same installation layout. They are not user caches: corruption or evidence mismatch
-is an installation defect, and deleting
+Release artifacts are a separate class from files in a user data directory. Reviewed catalog
+declarations and their minimal ID-to-commit lock generate one self-describing planner-input bundle,
+which is packaged as an immutable ICN release artifact. Local development constructs the same
+installation layout. It is not a user cache: corruption or evidence mismatch is an installation
+defect, and deleting
 `.magnitude/cache` must never cause catalog metadata or model headers to be reconstructed from the
 network during setup.
 

@@ -59,10 +59,6 @@ impl Installation {
         })
     }
 
-    pub(crate) fn catalog_lock(&self) -> PathBuf {
-        self.root.join("catalog/release-catalog.lock.json")
-    }
-
     pub(crate) fn planner_bundle(&self) -> PathBuf {
         self.root.join("catalog/model-planner-inputs.bundle")
     }
@@ -78,7 +74,6 @@ impl Installation {
     fn validate_layout(&self) -> anyhow::Result<()> {
         for (label, path) in [
             ("executable", self.executable()),
-            ("catalog lock", self.catalog_lock()),
             ("model planner inputs", self.planner_bundle()),
         ] {
             let metadata = fs::symlink_metadata(path)?;

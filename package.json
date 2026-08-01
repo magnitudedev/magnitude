@@ -18,7 +18,7 @@
     "acn:kill-all": "bun run packages/acn/src/binary.ts kill-all",
     "acn:dash": "bun run --cwd packages/acn-dashboard dashboard",
     "build": "bun run packages/version/scripts/generate-version.ts && turbo build",
-    "build:release": "bun run icn:catalog:hydrate && bun run packages/release/scripts/build/host.ts",
+    "build:release": "bun run icn:catalog:build-bundle && bun run packages/release/scripts/build/host.ts",
     "test:release-bootstrap": "bun run packages/release/scripts/test-bootstrap.ts",
     "typecheck": "bun run packages/version/scripts/generate-version.ts && turbo typecheck",
     "test": "bun run packages/version/scripts/generate-version.ts && bun test",
@@ -70,9 +70,8 @@
     "icn:serve": "bun run inference/scripts/build-local.ts --serve",
     "icn:doctor": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- doctor",
     "icn:version": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- version --json",
-    "icn:catalog:update": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- catalog generate --output inference/catalog/generated/release-catalog.lock.json --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
-    "icn:catalog:hydrate": "cargo run --manifest-path inference/Cargo.toml -p icn-models --bin hydrate-release-catalog -- --lock inference/catalog/generated/release-catalog.lock.json --source inference/catalog/models.json --output inference/target/catalog-inputs --cache inference/target/catalog-cache",
-    "icn:catalog:check": "cargo run --manifest-path inference/Cargo.toml -p icn-models --bin hydrate-release-catalog -- --lock inference/catalog/generated/release-catalog.lock.json --source inference/catalog/models.json --output inference/target/catalog-inputs --cache inference/target/catalog-cache --offline"
+    "icn:catalog:update": "cargo run --manifest-path inference/Cargo.toml -p icn-catalog -- update-lock --output inference/catalog/models.lock.json --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
+    "icn:catalog:build-bundle": "cargo run --manifest-path inference/Cargo.toml -p icn-catalog -- build-bundle --output inference/target/catalog-inputs/model-planner-inputs.bundle --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",

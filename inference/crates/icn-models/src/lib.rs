@@ -20,17 +20,16 @@ mod validation;
 
 pub use cache::{ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind};
 pub use catalog::{
-    GeneratedReleaseCatalog, ReleaseCatalog, ReleaseCatalogManifest, ReleaseRecommendableCatalog,
-    ResolvingRecommendableCatalog, catalog_source_digest, catalog_source_digest_from,
-    encode_release_planner_bundle, encode_release_planner_bundle_with_progress,
-    load_release_catalog, release_catalog_manifest,
+    GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,
+    ResolvingRecommendableCatalog, advance_model_catalog_lock, load_release_catalog,
+    model_catalog_lock,
 };
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ModelManager};
 pub use package_service::{canonical_package_id, offering_target_id};
 pub use planner_stub::{
-    PLANNER_STUB_FORMAT_IDENTITY, PlannerStubComponent, PlannerStubContext, PlannerStubError,
-    compact_planner_stub, planner_stub_context,
+    PlannerStubComponent, PlannerStubContext, PlannerStubError, compact_planner_stub,
+    planner_stub_context,
 };
-pub use preview::{ModelPreviewService, PreparedPreview};
+pub use preview::{ModelPreviewService, PreparedPreview, refresh_hugging_face_repository};
 pub use validation::validate_download_request;

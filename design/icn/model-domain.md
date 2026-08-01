@@ -193,23 +193,18 @@ catalog, which contains configured provider offerings available for slot selecti
 
 The catalog shipped to users is release-bound data, not a runtime cache. Human-reviewed source
 declarations name the curated checkpoints, formats, profiles, and recommendation evidence. An
-explicit developer generation command resolves those declarations through ICN's production
-Hugging Face resolver, GGUF parser, package builder, template assessor, and native planner. It pins
-immutable commits and exact files, synchronously revalidates mutable upstream refs, and writes a
-deterministic manifest containing exact source GGUF-header ranges and compact planner-stub
-identities. The compact form is standard GGUF: it preserves model metadata and tensor descriptors,
+explicit developer command advances a minimal ID-to-commit lock. Generation resolves only those
+pinned commits through ICN's production Hugging Face resolver, GGUF parser, package builder,
+template assessor, and native planner, then writes one self-describing planner-input bundle. The
+compact form is standard GGUF: it preserves model metadata and tensor descriptors,
 omits lexical tokenizer payloads, and supplies a compressible placeholder vocabulary of the
 original cardinality so ordinary native vocabulary loading preserves graph-relevant state.
 Generation proves that source and compact sparse models produce identical native hardware
-assessments for every curated profile. Hydration
-retrieves and verifies the source ranges from pinned immutable revisions, reproduces and verifies
-the compact stubs, and materializes the deterministic compressed bundle. Release builds package
-the lock file and bundle as ICN catalog sidecars, and local development constructs the same
-installation layout. The bundle is not committed to source control.
+assessments for every curated profile. Release builds package the derived bundle, and local
+development constructs the same installation layout. The bundle is not committed to source control.
 
-ICN validates the installed catalog sidecars' canonical source digest, template-assessor and native-planner
-identities, exact catalog-to-planner coverage, bundle digest, unique model identities, and absence
-of generation diagnostics. Missing, stale, partial, or malformed release data is an installation defect
+ICN validates the installed bundle's structure, entry integrity, and exact catalog coverage.
+Missing, partial, or malformed release data is an installation defect
 and prevents ICN readiness; it is never treated as a user cache miss. User setup performs no remote
 catalog reconstruction or model-header fetch. It combines the release inputs with current hardware
 topology and local calibration to calculate fit and speed. Installed targets continue to use their

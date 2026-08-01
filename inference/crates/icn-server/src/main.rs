@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::Stdio;
@@ -29,18 +28,19 @@ use icn_contracts::models::{
     RemoveInstalledModelPackageResponse, ServingProfile as DomainServingProfile,
 };
 use icn_contracts::{
-    CacheType, CompletionBackend, ComponentRole, ExecutionConfig, ExecutionIntent, FlashAttention,
-    GenerationPerformanceAssessment, GpuLayers, HardwareAssessment, HardwareProvider,
-    HardwareSnapshot, InventoryError, InventoryHardwareAssessor, ModelExecutionAssessment,
-    ModelHardwareAssessor, ModelPreviewProfile, ProjectorConfig, ResolvedModel, SplitMode,
-    TemplateAssessment, TemplateAssessor,
+    CompletionBackend, ComponentRole, ExecutionIntent, GenerationPerformanceAssessment,
+    HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
+    InventoryHardwareAssessor, ModelExecutionAssessment, ModelHardwareAssessor,
+    ModelPreviewProfile, ResolvedModel, TemplateAssessment, TemplateAssessor,
 };
-use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
+use icn_engine::{
+    ModelLoadObserver, ModelPlanDefaults, MtpCandidateSelection, NativeBackend, execution_intent,
+    model_plan_defaults,
+};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedModelDownloads, ModelCache, ModelManager, ModelPreviewService,
-    ReleaseCatalog, ReleaseRecommendableCatalog, ResolvingRecommendableCatalog,
-    canonical_package_id, load_release_catalog, offering_target_id, release_catalog_manifest,
+    InventoryConfig, ManagedModelDownloads, ModelCache, ModelManager, ReleaseCatalog,
+    ReleaseRecommendableCatalog, canonical_package_id, load_release_catalog, offering_target_id,
 };
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -111,12 +111,6 @@ enum Command {
         #[arg(long)]
         installation: Option<PathBuf>,
     },
-    /// Maintains the release-bound curated model catalog.
-    #[command(hide = true)]
-    Catalog {
-        #[command(subcommand)]
-        command: CatalogCommand,
-    },
     Doctor,
     /// Probe supported accelerator APIs without loading an accelerator module.
     BackendEligibility {
@@ -147,41 +141,6 @@ enum Command {
         #[command(flatten)]
         runtime: NativeWorkerArgs,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum CatalogCommand {
-    /// Resolve the curated source catalog with the production model parser.
-    Generate {
-        #[arg(long)]
-        output: PathBuf,
-        #[arg(long)]
-        model_store: PathBuf,
-        #[arg(long)]
-        cache_root: PathBuf,
-        #[arg(long = "hf-cache")]
-        hf_caches: Vec<PathBuf>,
-    },
-    /// Validate prepared release catalog sidecars.
-    Check {
-        #[arg(long)]
-        installation: PathBuf,
-    },
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct ModelPlanDefaults {
-    context_size: u32,
-    physical_context_size: u32,
-    batch_size: u32,
-    ubatch_size: u32,
-    max_sequences: u32,
-    prefill_quantum: u32,
-    execution: ExecutionConfig,
-    projector_use_gpu: bool,
-    projector_warmup: bool,
-    image_min_tokens: Option<NonZeroU32>,
-    image_max_tokens: Option<NonZeroU32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -713,66 +672,6 @@ fn credit_replaced_instance_memory(
     sample
 }
 
-fn model_plan_defaults() -> ModelPlanDefaults {
-    ModelPlanDefaults {
-        // Managed product models always overwrite context from their persisted serving
-        // configuration. This conservative value is only the discovery/migration fallback for
-        // unmanaged local artifacts that predate serving configurations.
-        context_size: 4096,
-        physical_context_size: 4096,
-        batch_size: 512,
-        ubatch_size: 512,
-        max_sequences: 1,
-        prefill_quantum: 512,
-        execution: ExecutionConfig {
-            gpu_layers: GpuLayers::Auto,
-            use_mmap: true,
-            use_mlock: false,
-            split_mode: SplitMode::Layer,
-            tensor_split: None,
-            cache_type_k: CacheType::F16,
-            cache_type_v: CacheType::F16,
-            offload_kqv: true,
-            operation_offload: true,
-            swa_full: false,
-            kv_unified: false,
-            threads: None,
-            threads_batch: None,
-            flash_attention: FlashAttention::Auto,
-        },
-        projector_use_gpu: true,
-        projector_warmup: true,
-        image_min_tokens: None,
-        image_max_tokens: None,
-    }
-}
-
-fn execution_intent(
-    model_path: PathBuf,
-    projector_path: Option<PathBuf>,
-    defaults: &ModelPlanDefaults,
-) -> anyhow::Result<ExecutionIntent> {
-    Ok(ExecutionIntent {
-        model_path,
-        context_size: defaults.context_size,
-        physical_context_size: defaults.physical_context_size,
-        batch_size: defaults.batch_size,
-        ubatch_size: defaults.ubatch_size,
-        max_sequences: defaults.max_sequences,
-        prefill_quantum: defaults.prefill_quantum,
-        execution: defaults.execution.clone(),
-        projector: projector_path.map(|path| {
-            let mut projector = ProjectorConfig::new(path);
-            projector.use_gpu = defaults.projector_use_gpu;
-            projector.warmup = defaults.projector_warmup;
-            projector.image_min_tokens = defaults.image_min_tokens;
-            projector.image_max_tokens = defaults.image_max_tokens;
-            projector
-        }),
-        mtp: icn_contracts::MtpConfig::default(),
-    })
-}
-
 #[derive(Clone)]
 struct NativeHardwareAssessor {
     defaults: ModelPlanDefaults,
@@ -860,30 +759,9 @@ struct NativeTemplateAssessor {
     worker_launcher: NativeWorkerLauncher,
 }
 
-fn native_template_identity() -> &'static str {
-    concat!(
-        "icn-native-model-template:",
-        env!("CARGO_PKG_VERSION"),
-        ":",
-        env!("ICN_BINDINGS_REVISION"),
-        ":",
-        env!("ICN_NATIVE_BACKEND_REVISION")
-    )
-}
-
-fn native_planner_identity() -> String {
-    format!(
-        "{}:{}:{}:{}",
-        native_template_identity(),
-        icn_models::PLANNER_STUB_FORMAT_IDENTITY,
-        llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
-        llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
-    )
-}
-
 impl TemplateAssessor for NativeTemplateAssessor {
     fn cache_identity(&self) -> &str {
-        native_template_identity()
+        icn_reasoning::TEMPLATE_INSPECTION_CACHE_IDENTITY
     }
 
     fn assess(
@@ -2059,7 +1937,7 @@ fn assess_planning_request_with_backend(
     let mut plans = defaults
         .into_iter()
         .map(|defaults| execution_intent(primary.clone(), projector.clone(), &defaults))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     let calibration = match operation {
         PlanningOperation::Capacity => {
             let base = icn_hardware::assess_profiles_with_backend(backend, &topology, &plans)?;
@@ -2822,11 +2700,7 @@ impl NativeModelInstanceController {
         let defaults = self.profile_defaults(&ModelExecutionProfile {
             context_length: configuration.profile.context_length,
         })?;
-        let plan = execution_intent(primary, projector, &defaults).map_err(|error| {
-            InventoryError::Internal(format!(
-                "failed to resolve model execution intent: {error:#}"
-            ))
-        })?;
+        let plan = execution_intent(primary, projector, &defaults);
         Ok((
             model,
             plan,
@@ -4161,118 +4035,6 @@ impl ModelInstanceController for NativeModelInstanceController {
     }
 }
 
-async fn generate_release_catalog(
-    output: PathBuf,
-    model_store: PathBuf,
-    cache_root: PathBuf,
-    hf_caches: Vec<PathBuf>,
-) -> anyhow::Result<()> {
-    let mut config = InventoryConfig::with_roots(model_store, cache_root)
-        .context("invalid catalog generation inventory configuration")?;
-    config.hf_cache_dirs.extend(hf_caches);
-    let runtime_authority = NativeRuntimeAuthority::development();
-    let native_backend = initialize_native_runtime(&runtime_authority)
-        .context("failed to initialize the native backend for catalog generation")?;
-    let worker_launcher = NativeWorkerLauncher::new(runtime_authority);
-    let inventory = Arc::new(
-        ModelManager::open_with_template_assessor(
-            config,
-            Some(Arc::new(NativeTemplateAssessor {
-                worker_launcher: worker_launcher.clone(),
-            })),
-        )
-        .await
-        .context("failed to initialize catalog generation inventory")?,
-    );
-    let (assessor, _) = native_assessor_services(
-        &inventory,
-        native_backend,
-        model_plan_defaults(),
-        worker_launcher,
-    );
-    inventory
-        .set_hardware_assessor(assessor.clone())
-        .context("failed to configure catalog generation hardware assessment")?;
-    let repositories = Arc::new(ModelPreviewService::new(
-        inventory.clone(),
-        assessor.clone(),
-    ));
-    let resolver = ResolvingRecommendableCatalog::new(inventory, repositories);
-    let generated = resolver
-        .resolve_release_catalog()
-        .await
-        .context("failed to resolve the curated model catalog")?;
-    verify_compact_planner_parity(&generated, assessor.as_ref())
-        .await
-        .context("compact planner inputs changed native planning results")?;
-    let planner_bundle = generated
-        .encode_planner_bundle()
-        .context("failed to encode release planner inputs")?;
-    let manifest = release_catalog_manifest(
-        &generated,
-        native_template_identity(),
-        native_planner_identity(),
-        &planner_bundle,
-    )
-    .context("refusing to publish an incomplete release catalog")?;
-    let encoded =
-        serde_json::to_vec_pretty(&manifest).context("failed to encode the release catalog")?;
-    let parent = output
-        .parent()
-        .context("catalog output must have a parent directory")?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .context("failed to create the catalog output directory")?;
-    let temporary = output.with_extension("json.tmp");
-    tokio::fs::write(&temporary, [&encoded[..], b"\n"].concat())
-        .await
-        .context("failed to write the generated catalog")?;
-    tokio::fs::rename(&temporary, &output)
-        .await
-        .context("failed to publish the generated catalog")?;
-    println!("generated {}", output.display());
-    Ok(())
-}
-
-async fn verify_compact_planner_parity(
-    generated: &icn_models::GeneratedReleaseCatalog,
-    assessor: &NativeHardwareAssessor,
-) -> anyhow::Result<()> {
-    for model in &generated.catalog.models {
-        let profiles = model
-            .eligible_serving_profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| ModelPreviewProfile {
-                id: format!("release-{index}"),
-                context_length: profile.context_length,
-                parallel_sequences: 1,
-            })
-            .collect::<Vec<_>>();
-        let source = generated
-            .resolve_source_planner_target(&model.target_id)
-            .with_context(|| format!("failed to materialize source input for {}", model.id.0))?;
-        let compact = generated
-            .resolve_compact_planner_target(&model.target_id)
-            .with_context(|| format!("failed to materialize compact input for {}", model.id.0))?;
-        let source_assessments = assessor
-            .assess_resolved_profiles(source.target_model.clone(), profiles.clone())
-            .await
-            .with_context(|| format!("failed to plan source input for {}", model.id.0))?;
-        let compact_assessments = assessor
-            .assess_resolved_profiles(compact.target_model.clone(), profiles)
-            .await
-            .with_context(|| format!("failed to plan compact input for {}", model.id.0))?;
-        if compact_assessments != source_assessments {
-            anyhow::bail!(
-                "native planning parity failed for catalog target {}",
-                model.id.0
-            );
-        }
-    }
-    Ok(())
-}
-
 fn open_installation_catalog(
     installation: &installation::Installation,
 ) -> anyhow::Result<ReleaseCatalog> {
@@ -4282,13 +4044,8 @@ fn open_installation_catalog(
     if installation.backend_module_abi() != build_identity::backend_module_abi() {
         anyhow::bail!("ICN installation backend module ABI does not match its executable");
     }
-    load_release_catalog(
-        &installation.catalog_lock(),
-        &installation.planner_bundle(),
-        native_template_identity(),
-        &native_planner_identity(),
-    )
-    .context("failed to load release catalog sidecars")
+    load_release_catalog(&installation.planner_bundle())
+        .context("failed to load the release planner bundle")
 }
 
 fn load_installation_backends(installation: &installation::Installation) -> anyhow::Result<()> {
@@ -4572,23 +4329,6 @@ async fn main() -> anyhow::Result<()> {
             serve_result?;
             tracing::info!("ICN server stopped");
         }
-        Command::Catalog { command } => match command {
-            CatalogCommand::Generate {
-                output,
-                model_store,
-                cache_root,
-                hf_caches,
-            } => generate_release_catalog(output, model_store, cache_root, hf_caches).await?,
-            CatalogCommand::Check { installation } => {
-                let installation = installation::Installation::load(&installation)
-                    .context("invalid ICN installation")?;
-                let catalog = open_installation_catalog(&installation)?;
-                println!(
-                    "validated {} release catalog models",
-                    catalog.catalog().models.len()
-                );
-            }
-        },
         Command::Doctor => println!("ICN inference engine and native backend loaded successfully"),
         Command::BackendEligibility { json } => {
             let report = backend_eligibility::probe();
@@ -4866,17 +4606,6 @@ mod tests {
         assert_eq!(evidence.confidence, PerformanceConfidence::Moderate);
     }
 
-    #[test]
-    fn native_template_cache_identity_tracks_both_native_pins() {
-        let assessor = NativeTemplateAssessor {
-            worker_launcher: NativeWorkerLauncher::development(),
-        };
-        let identity = assessor.cache_identity();
-
-        assert!(identity.contains(build_identity::BINDINGS_REVISION));
-        assert!(identity.contains(build_identity::NATIVE_BACKEND_REVISION));
-    }
-
     fn parity_test_defaults() -> ModelPlanDefaults {
         ModelPlanDefaults {
             context_size: 128,
@@ -4885,9 +4614,9 @@ mod tests {
             ubatch_size: 64,
             max_sequences: 1,
             prefill_quantum: 128,
-            execution: ExecutionConfig {
+            execution: icn_contracts::ExecutionConfig {
                 kv_unified: false,
-                ..ExecutionConfig::default()
+                ..icn_contracts::ExecutionConfig::default()
             },
             projector_use_gpu: true,
             projector_warmup: true,
