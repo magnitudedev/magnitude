@@ -43,8 +43,9 @@ Each CUDA pack declares only facts needed for current PTX-only artifacts:
 - the reviewed minimum driver API capable of JIT-compiling each image's PTX ISA.
 
 Release assembly obtains these facts from the finished backend module with NVIDIA tooling and
-rejects a mismatch with the configured target set. Build flags are expectations, not artifact
-truth. An unknown PTX version has no implicit driver floor and fails publication.
+publishes the inspected result as artifact truth. The configured architecture list is solely a
+compiler input and is not duplicated as a second compatibility declaration. An unknown PTX version
+has no implicit driver floor and fails publication.
 
 Cubins and additional target relations are not part of this contract until Magnitude actually
 ships them.
@@ -123,7 +124,8 @@ successful empty recommendation result.
 ## Conformance
 
 - WSL resolves its driver projection without symlinks or toolkit compatibility libraries.
-- The final module's inspected PTX images exactly match its release declaration.
+- The final module contains inspectable PTX images whose compatibility metadata is derived from the
+  module itself.
 - CUDA 11.8 PTX 7.8 and CUDA 12.9 PTX 8.8 use their reviewed driver-JIT floors.
 - Ordinary `compute_80` remains applicable to newer physical architectures.
 - Architecture-specific targets never use the ordinary numeric-forward rule.
