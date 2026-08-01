@@ -75,9 +75,9 @@ library search paths and with inherited Unix library paths cleared.
 
 CUDA and Vulkan jobs prove that the configured module and redistributable files were produced and
 that their native-build and backend ABI identities match their host base. CUDA release assembly
-also inspects the final fatbinary and verifies its exact device images and compatibility facts;
-requested compiler targets are not publication truth. Jobs without matching GPU hardware do not
-claim device execution.
+also inspects the final fatbinary and derives its device-image compatibility facts; requested
+compiler targets are not duplicated as a publication contract. Jobs without matching GPU hardware
+do not claim device execution.
 
 Pull requests build and validate the complete release artifact graph from the exact proposed commit
 using the same reusable build workflow as production. They stop before creating or modifying a

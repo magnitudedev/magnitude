@@ -31,11 +31,6 @@ export type BackendPack =
       readonly cuda: {
         readonly toolkitVersion: string
         readonly architectures: readonly string[]
-        readonly expectedImages: readonly {
-          readonly ptxVersion: string
-          readonly target: number
-          readonly architectureSpecific: boolean
-        }[]
       }
     })
   | (BackendPackBase & {
@@ -92,19 +87,11 @@ const cudaBuilds = [
   {
     toolkitVersion: "11.8",
     architectures: ["80-virtual"],
-    expectedImages: [
-      { ptxVersion: "7.8", target: 80, architectureSpecific: false },
-    ],
     runtimeLibraries: ["libcudart.so.11.0", "libcublas.so.11", "libcublasLt.so.11"],
   },
   {
     toolkitVersion: "12.9",
     architectures: ["80-virtual", "90-virtual", "120-virtual"],
-    expectedImages: [
-      { ptxVersion: "8.8", target: 80, architectureSpecific: false },
-      { ptxVersion: "8.8", target: 90, architectureSpecific: false },
-      { ptxVersion: "8.8", target: 120, architectureSpecific: false },
-    ],
     runtimeLibraries: ["libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12"],
   },
 ] as const

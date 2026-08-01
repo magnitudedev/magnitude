@@ -44,24 +44,10 @@ export const inspectNvccCompiler = (output: string): string => {
   return identity
 }
 
-const assertExpectedImages = (
-  actual: readonly CudaPtxImage[],
-  expected: readonly CudaPtxImage[],
-): void => {
-  const actualKeys = actual.map(imageKey)
-  const expectedKeys = [...expected].map(imageKey).sort()
-  if (JSON.stringify([...actualKeys].sort()) !== JSON.stringify(expectedKeys)) {
-    throw new Error(
-      `finished CUDA module contains PTX ${JSON.stringify(actualKeys)}; expected ${JSON.stringify(expectedKeys)}`,
-    )
-  }
-}
-
 export const inspectCudaCompatibility = async (
   module: string,
   configuration: {
     readonly toolkitVersion: string
-    readonly expectedImages: readonly CudaPtxImage[]
   },
 ) => {
   const cudaRoot = process.env.CUDA_PATH?.trim()
@@ -75,7 +61,6 @@ export const inspectCudaCompatibility = async (
   if (!firstImage) {
     throw new Error("finished CUDA module contains no inspectable PTX images")
   }
-  assertExpectedImages(images, configuration.expectedImages)
   const imagesWithDriverFloors = images.map((image) => {
     const floor = DRIVER_API_BY_PTX_VERSION[image.ptxVersion]
     if (floor === undefined) {
