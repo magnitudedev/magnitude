@@ -29,6 +29,30 @@ vi.mock("../../hooks/use-theme", () => ({
 
 const { AcnBootstrapScreen } = await import("./acn-bootstrap")
 
+test.each([
+  ["Discovering", "Looking for Magnitude"],
+  ["WaitingForOwner", "Waiting for previous Magnitude process"],
+  ["LaunchingAcn", "Starting Magnitude"],
+  ["ResolvingLocalInference", "Preparing local inference"],
+  ["LaunchingLocalInference", "Starting local inference"],
+] as const)("renders the %s startup phase", async (phase, label) => {
+  const view = await testRender(
+    <AcnBootstrapScreen
+      state={{ _tag: "Starting", phase }}
+      onRetry={() => undefined}
+      onQuit={() => undefined}
+    />,
+    { width: 91, height: 13 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain(label)
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
 const keyEvent = (name: string, ctrl = false) =>
   new KeyEvent({
     name,

@@ -4,6 +4,7 @@ import { Option } from "effect";
 import type {
   AcnInstallationPhase,
   AcnLifecycleState,
+  AcnStartingPhase,
 } from "@magnitudedev/sdk";
 import { ProgressBar } from "../../components/progress-bar";
 import { useTheme } from "../../hooks/use-theme";
@@ -12,6 +13,14 @@ const PHASE_LABELS: Readonly<Record<AcnInstallationPhase, string>> = {
   DownloadingDaemon: "Downloading daemon",
   DownloadingInferenceEngine: "Downloading inference engine",
   StartingMagnitude: "Starting Magnitude",
+};
+
+const STARTING_PHASE_LABELS: Readonly<Record<AcnStartingPhase, string>> = {
+  Discovering: "Looking for Magnitude",
+  WaitingForOwner: "Waiting for previous Magnitude process",
+  LaunchingAcn: "Starting Magnitude",
+  ResolvingLocalInference: "Preparing local inference",
+  LaunchingLocalInference: "Starting local inference",
 };
 
 const INSTALLATION_PANEL_WIDTH = 64;
@@ -176,7 +185,9 @@ export function AcnBootstrapScreen({
           >
             Starting Magnitude
           </text>
-          <text style={{ fg: theme.muted }}>Starting local inference</text>
+          <text style={{ fg: theme.muted }}>
+            {STARTING_PHASE_LABELS[state.phase]}
+          </text>
         </box>
       )}
     </box>

@@ -122,6 +122,10 @@ predecessor is never considered stale because of elapsed time.
 The CLI calls `AcnStartup.prepare` before creating its renderer. A ready owner enters the ordinary
 TUI without a bootstrap frame. Otherwise prepare starts the shared ensure attempt and waits only
 for its first non-Checking lifecycle state, making the root bootstrap surface the first frame.
+The bootstrap subtitle follows the authoritative startup phase: discovery looks for Magnitude,
+ownership handoff waits for the previous Magnitude process, ACN launch starts Magnitude, and local
+inference resolution and launch prepare and start local inference respectively. Clients do not
+infer these phases from elapsed time or process observations.
 
 `Starting Magnitude` covers cached process startup. `Installing Magnitude` has one bar and only
 three subtitles: `Downloading daemon`, `Downloading inference engine`, and `Starting Magnitude`.
