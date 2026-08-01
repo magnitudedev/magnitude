@@ -65,6 +65,70 @@ pub struct NativeBackend {
     backend: Arc<LlamaBackend>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ModelPlanDefaults {
+    pub context_size: u32,
+    pub physical_context_size: u32,
+    pub batch_size: u32,
+    pub ubatch_size: u32,
+    pub max_sequences: u32,
+    pub prefill_quantum: u32,
+    pub execution: ExecutionConfig,
+    pub projector_use_gpu: bool,
+    pub projector_warmup: bool,
+    pub image_min_tokens: Option<NonZeroU32>,
+    pub image_max_tokens: Option<NonZeroU32>,
+}
+
+#[must_use]
+pub fn model_plan_defaults() -> ModelPlanDefaults {
+    ModelPlanDefaults {
+        // Managed product models overwrite context from their serving configuration. This
+        // conservative value remains the discovery fallback for unmanaged local artifacts.
+        context_size: 4096,
+        physical_context_size: 4096,
+        batch_size: 512,
+        ubatch_size: 512,
+        max_sequences: 1,
+        prefill_quantum: 512,
+        execution: ExecutionConfig {
+            kv_unified: false,
+            ..ExecutionConfig::default()
+        },
+        projector_use_gpu: true,
+        projector_warmup: true,
+        image_min_tokens: None,
+        image_max_tokens: None,
+    }
+}
+
+#[must_use]
+pub fn execution_intent(
+    model_path: PathBuf,
+    projector_path: Option<PathBuf>,
+    defaults: &ModelPlanDefaults,
+) -> ExecutionIntent {
+    ExecutionIntent {
+        model_path,
+        context_size: defaults.context_size,
+        physical_context_size: defaults.physical_context_size,
+        batch_size: defaults.batch_size,
+        ubatch_size: defaults.ubatch_size,
+        max_sequences: defaults.max_sequences,
+        prefill_quantum: defaults.prefill_quantum,
+        execution: defaults.execution.clone(),
+        projector: projector_path.map(|path| {
+            let mut projector = ProjectorConfig::new(path);
+            projector.use_gpu = defaults.projector_use_gpu;
+            projector.warmup = defaults.projector_warmup;
+            projector.image_min_tokens = defaults.image_min_tokens;
+            projector.image_max_tokens = defaults.image_max_tokens;
+            projector
+        }),
+        mtp: icn_contracts::MtpConfig::default(),
+    }
+}
+
 impl NativeBackend {
     /// Initialize the process-global native backend.
     ///

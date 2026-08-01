@@ -41,7 +41,7 @@ jobs:
           --manifest-path inference/Cargo.toml
           -p icn-hardware
           mtp_
-      - run: bun run icn:catalog:hydrate
+      - run: bun run icn:catalog:build-bundle
       - name: Build the Linux x64 CPU release host
         run: >-
           bun run packages/release/scripts/build/host.ts

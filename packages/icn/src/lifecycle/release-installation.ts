@@ -96,9 +96,6 @@ const validateArtifactDirectory = (
       const files = yield* Effect.all([
         isNonEmptyFile(path.join(directory, "bin", executableName())),
         isNonEmptyFile(
-          path.join(directory, "catalog", "release-catalog.lock.json")
-        ),
-        isNonEmptyFile(
           path.join(directory, "catalog", "model-planner-inputs.bundle")
         ),
       ])
@@ -345,9 +342,6 @@ const inspectComposition = (
     }
     const requiredFiles = yield* Effect.all([
       isNonEmptyFile(binaryPath),
-      isNonEmptyFile(
-        path.join(root, "catalog", "release-catalog.lock.json")
-      ),
       isNonEmptyFile(
         path.join(root, "catalog", "model-planner-inputs.bundle")
       ),

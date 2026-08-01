@@ -429,8 +429,6 @@ pub struct EffectiveTemplateInputs {
 
 /// Native chat-template assessment injected into model discovery.
 pub trait TemplateAssessor: Send + Sync + 'static {
-    /// Stable identity for every implementation and native-policy input that can change an
-    /// assessment. This is cache evidence, not a persisted schema version.
     fn cache_identity(&self) -> &str;
 
     fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String>;

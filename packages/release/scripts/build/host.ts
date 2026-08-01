@@ -353,11 +353,6 @@ export const buildHostArtifacts = async (
         mode: 0o755,
       },
       {
-        path: "catalog/release-catalog.lock.json",
-        source: resolve(catalogRoot, "release-catalog.lock.json"),
-        mode: 0o644,
-      },
-      {
         path: "catalog/model-planner-inputs.bundle",
         source: resolve(catalogRoot, "model-planner-inputs.bundle"),
         mode: 0o644,

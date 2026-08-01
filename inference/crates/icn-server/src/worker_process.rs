@@ -185,10 +185,6 @@ mod tests {
                 b"executable".as_slice(),
             ),
             (
-                root.path().join("catalog/release-catalog.lock.json"),
-                b"catalog".as_slice(),
-            ),
-            (
                 root.path().join("catalog/model-planner-inputs.bundle"),
                 b"planner".as_slice(),
             ),

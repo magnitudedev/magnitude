@@ -72,7 +72,6 @@ const validateLayout = (
   if (artifact.kind === "icn-base") {
     for (const required of [
       `bin/magnitude-icn${extension}`,
-      "catalog/release-catalog.lock.json",
       "catalog/model-planner-inputs.bundle",
     ]) {
       if (!paths.has(required)) {

@@ -83,12 +83,11 @@ The native ICN process owns hardware discovery, model acquisition and inventory,
 inspection, model fitting, the pinned inference runtime, active-model state, and inference request
 execution. `@magnitudedev/icn` acquires a release-manifest base plus an optional concrete accelerator
 pack; ICN is not downloaded from a model repository or selected from a user-installed runtime.
-The installation carries the release-bound catalog lock and hardware-independent planner-input
-bundle as integrity-checked sidecars. Native startup validates their source, template, planner,
-integrity, and exact-coverage identities before becoming ready. Ordinary startup and setup
+The installation carries one hardware-independent planner-input bundle. Native startup validates
+its integrity and exact catalog coverage before becoming ready. Ordinary startup and setup
 therefore do not contact a catalog service, fetch model headers, or depend on a user cache.
-Development hydration and release CI obtain the sidecars explicitly from immutable catalog
-revisions; ordinary TypeScript and Cargo builds perform no catalog network access.
+Development generation and release CI build it explicitly from immutable catalog revisions;
+ordinary TypeScript and Cargo builds perform no catalog network access.
 
 ACN owns the parent scope and application policy. It supplies ICN's storage roots and supported
 binary identity and translates private ICN observations into product-owned inventory, hardware,
@@ -210,9 +209,9 @@ identity, so installing a driver can change the next composition without manual 
 
 An installation is immutable and identified by the release manifest, base, optional pack, concrete
 backend, native build, and backend-module ABI. Its fixed layout contains executable,
-runtime, backend modules, catalog sidecars, and a minimal declaration. Native validation proves the
+runtime, backend modules, the planner-input bundle, and a minimal declaration. Native validation proves the
 running executable belongs to that installation, the selected backend directory contains only the
-declared accelerator family, required devices register, and catalog sidecars are complete.
+declared accelerator family, required devices register, and planner inputs are complete.
 
 `bun dev` prepares the same fixed layout at
 `inference/target/development/installation.json` before starting the client. `MAGNITUDE_ICN_PATH`

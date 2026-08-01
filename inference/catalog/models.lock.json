@@ -1,0 +1,16 @@
+{
+  "deepseek-v4-flash": "ce2d0d94e35d96e9412afee41b9b32b21529bf1b",
+  "gemma-4-12b-it-qat": "980b060c40a8539ac159e0501a3e0f66a6365af3",
+  "gemma-4-26b-a4b-it-qat": "7b92b5b28818151e8669af2e45e88d6086f490dd",
+  "gemma-4-31b-it-qat": "43cc1aeb31adf47ec06a854507ce552cd9862e6f",
+  "gemma-4-e2b-it-qat": "66a399f68ddd113b06dff02fca9523e55465d11d",
+  "glm-5.2": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+  "laguna-s-2.1": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+  "nemotron-3-super-120b-a12b": "036038fb30334a2d56a146c6f0d4871ab5edccbb",
+  "nemotron-3-ultra-550b-a55b": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6",
+  "qwen3.5-122b-a10b": "907becb33103ab66b23da06a2dc74a5fca0583bd",
+  "qwen3.5-4b": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+  "qwen3.5-9b": "9716a636ee4bddc3fed678220b7a33dd2a4160ae",
+  "qwen3.6-27b": "5cb35eb3dcbf52dbce5f87dbc64df6aaffadcace",
+  "qwen3.6-35b-a3b": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d"
+}

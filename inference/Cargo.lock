@@ -1413,6 +1413,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "icn-catalog"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "icn-contracts",
+ "icn-engine",
+ "icn-models",
+ "icn-reasoning",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "icn-contracts"
 version = "0.1.0"
 dependencies = [

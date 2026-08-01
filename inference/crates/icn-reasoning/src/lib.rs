@@ -27,6 +27,9 @@ const EFFORT_DEFINITIONS: &[(&str, &[&str])] = &[
     ("max", &["max"]),
 ];
 
+/// Version of the complete template-inspection semantics stored in model inspection caches.
+pub const TEMPLATE_INSPECTION_CACHE_IDENTITY: &str = "template-inspection-v1";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateInspection {
     pub template_fingerprint: String,

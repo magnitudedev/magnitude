@@ -14,8 +14,6 @@ const MAX_STRING_BYTES: u64 = 128 * 1024 * 1024;
 const TOKENIZER_MODEL: &str = "tokenizer.ggml.model";
 const TOKENIZER_TOKENS: &str = "tokenizer.ggml.tokens";
 
-pub const PLANNER_STUB_FORMAT_IDENTITY: &str = "gguf-planner-v2";
-
 const REMOVED_METADATA: &[&str] = &[
     TOKENIZER_MODEL,
     TOKENIZER_TOKENS,

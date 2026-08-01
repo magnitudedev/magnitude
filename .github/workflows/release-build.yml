@@ -53,7 +53,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - run: bun install --frozen-lockfile
-      - run: bun run icn:catalog:hydrate
+      - run: bun run icn:catalog:build-bundle
       - uses: actions/upload-artifact@v4
         with:
           name: catalog-inputs

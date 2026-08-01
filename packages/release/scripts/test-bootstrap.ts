@@ -112,8 +112,8 @@ const buildCandidate = Effect.gen(function* () {
     (pack) => pack.host === host && pack.backend === "metal",
   )
 
-  yield* Console.log("Hydrating the release catalog")
-  yield* command("bun", "run", "icn:catalog:hydrate")
+  yield* Console.log("Building model planner inputs")
+  yield* command("bun", "run", "icn:catalog:build-bundle")
 
   yield* Console.log(`Building ${host} CLI, ACN, and ICN release artifacts`)
   yield* fromPromise(

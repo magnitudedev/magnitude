@@ -83,24 +83,8 @@ impl ModelPreviewService {
         &self,
         request: HuggingFaceRepositoryRequest,
     ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
-        validate_repository_request(&request)?;
         let cache_key = repository_cache_key(self.models.client.endpoint(), &request);
-        let cached = self
-            .models
-            .cache
-            .read_index::<CachedHuggingFaceRepositorySnapshot>(
-                ModelIndexKind::HuggingFaceRepositorySnapshot,
-                &cache_key,
-            );
-        let snapshot = refresh_hub_repository_snapshot(
-            &self.models,
-            &self.http,
-            self.models.client.endpoint(),
-            request,
-            cache_key.clone(),
-            cached,
-        )
-        .await?;
+        let snapshot = refresh_hugging_face_repository(&self.models, request).await?;
         let mut memory_cache = self.hub_repository_snapshots.lock().await;
         memory_cache.insert(cache_key, (Instant::now(), snapshot.clone()));
         trim_discovery_cache(&mut memory_cache);
@@ -288,6 +272,29 @@ impl ModelPreviewService {
             })
             .collect()
     }
+}
+
+pub async fn refresh_hugging_face_repository(
+    models: &Arc<ModelManager>,
+    request: HuggingFaceRepositoryRequest,
+) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+    validate_repository_request(&request)?;
+    let cache_key = repository_cache_key(models.client.endpoint(), &request);
+    let cached = models
+        .cache
+        .read_index::<CachedHuggingFaceRepositorySnapshot>(
+            ModelIndexKind::HuggingFaceRepositorySnapshot,
+            &cache_key,
+        );
+    refresh_hub_repository_snapshot(
+        models,
+        &models.http,
+        models.client.endpoint(),
+        request,
+        cache_key,
+        cached,
+    )
+    .await
 }
 
 impl ModelPreviewer for ModelPreviewService {

@@ -7,16 +7,27 @@ use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
-const MAGIC: &[u8; 8] = b"MAGPLAN2";
+const MAGIC: &[u8; 8] = b"MAGPLAN3";
+const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PLANNER_INPUT_BYTES: usize = 128 * 1024 * 1024;
 
 pub fn encode(
+    manifest: &[u8],
     inputs: &BTreeMap<String, Vec<u8>>,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Vec<u8>, String> {
+    if manifest.is_empty() || manifest.len() > MAX_MANIFEST_BYTES {
+        return Err("planner bundle manifest length is outside the supported bound".to_owned());
+    }
     let mut encoded = Vec::new();
     let total = inputs.len();
     encoded.extend_from_slice(MAGIC);
+    encoded.extend_from_slice(
+        &u64::try_from(manifest.len())
+            .map_err(|_| "planner bundle manifest is too large".to_owned())?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(manifest);
     encoded.extend_from_slice(
         &u32::try_from(inputs.len())
             .map_err(|_| "too many planner inputs".to_owned())?
@@ -54,6 +65,7 @@ pub fn encode(
 #[derive(Debug)]
 pub struct PlannerBundle<'a> {
     bytes: &'a [u8],
+    manifest: Range<usize>,
     entries: BTreeMap<String, Entry>,
 }
 
@@ -69,6 +81,14 @@ impl<'a> PlannerBundle<'a> {
             return Err("planner bundle has an invalid header".to_owned());
         }
         let mut cursor = MAGIC.len();
+        let manifest_len = usize::try_from(read_u64(bytes, &mut cursor)?)
+            .map_err(|_| "planner bundle manifest is too large".to_owned())?;
+        if manifest_len == 0 || manifest_len > MAX_MANIFEST_BYTES {
+            return Err("planner bundle manifest length is outside the supported bound".to_owned());
+        }
+        let manifest_start = cursor;
+        read_bytes(bytes, &mut cursor, manifest_len)?;
+        let manifest = manifest_start..cursor;
         let count = read_u32(bytes, &mut cursor)?;
         let mut entries = BTreeMap::new();
         for _ in 0..count {
@@ -101,11 +121,19 @@ impl<'a> PlannerBundle<'a> {
         if cursor != bytes.len() {
             return Err("planner bundle contains trailing bytes".to_owned());
         }
-        Ok(Self { bytes, entries })
+        Ok(Self {
+            bytes,
+            manifest,
+            entries,
+        })
     }
 
-    pub fn contains(&self, digest: &str) -> bool {
-        self.entries.contains_key(digest)
+    pub fn manifest(&self) -> &'a [u8] {
+        &self.bytes[self.manifest.clone()]
+    }
+
+    pub fn digests(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
     }
 
     pub fn input(&self, digest: &str) -> Result<Vec<u8>, String> {
@@ -173,26 +201,44 @@ mod tests {
         let input = b"compact planner input".to_vec();
         let digest = sha256(&input);
         let encoded = encode(
+            b"manifest",
             &BTreeMap::from([(digest.clone(), input.clone())]),
             |_, _| {},
         )
         .unwrap();
         let bundle = PlannerBundle::parse(&encoded).unwrap();
-        assert!(bundle.contains(&digest));
+        assert_eq!(bundle.manifest(), b"manifest");
+        assert!(bundle.digests().any(|candidate| candidate == digest));
         assert_eq!(bundle.input(&digest).unwrap(), input);
     }
 
     #[test]
+    fn corrupted_compressed_input_fails_integrity_validation() {
+        let input = b"compact planner input".to_vec();
+        let digest = sha256(&input);
+        let mut encoded = encode(
+            b"manifest",
+            &BTreeMap::from([(digest.clone(), input)]),
+            |_, _| {},
+        )
+        .unwrap();
+        *encoded.last_mut().unwrap() ^= 1;
+        let bundle = PlannerBundle::parse(&encoded).unwrap();
+        assert!(bundle.input(&digest).is_err());
+    }
+
+    #[test]
     fn old_bundle_format_is_not_accepted() {
-        assert!(PlannerBundle::parse(b"MAGPLAN1\0\0\0\0").is_err());
+        assert!(PlannerBundle::parse(b"MAGPLAN2\0\0\0\0").is_err());
     }
 
     #[test]
     fn invalid_declared_input_size_is_rejected_before_decompression() {
         let input = b"x".to_vec();
         let digest = sha256(&input);
-        let mut encoded = encode(&BTreeMap::from([(digest, input)]), |_, _| {}).unwrap();
-        let size_offset = MAGIC.len() + 4 + 64;
+        let mut encoded =
+            encode(b"manifest", &BTreeMap::from([(digest, input)]), |_, _| {}).unwrap();
+        let size_offset = MAGIC.len() + 8 + b"manifest".len() + 4 + 64;
         encoded[size_offset..size_offset + 8]
             .copy_from_slice(&((MAX_PLANNER_INPUT_BYTES as u64) + 1).to_le_bytes());
         assert!(PlannerBundle::parse(&encoded).is_err());

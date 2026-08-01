@@ -105,7 +105,6 @@ const validateLayout = async (
   if (artifact.kind === "icn-base") {
     for (const requiredPath of [
       `bin/magnitude-icn${extension}`,
-      "catalog/release-catalog.lock.json",
       "catalog/model-planner-inputs.bundle",
     ]) {
       if (!listing.includes(requiredPath)) {
@@ -207,21 +206,15 @@ for (const [id, filename] of expectedArtifacts) {
   archiveById.set(id, archive)
 }
 
-let catalogLock: Buffer | undefined
 let plannerBundleDigest: string | undefined
 for (const host of candidateHosts) {
   const base = byId.get(`icn-base-${host.id}`)!
   const archive = archiveById.get(base.id)!
-  const lock = await archiveEntry(archive, "catalog/release-catalog.lock.json")
   const bundle = await archiveEntry(archive, "catalog/model-planner-inputs.bundle")
   const bundleDigest = createHash("sha256").update(bundle).digest("hex")
-  if (catalogLock && !catalogLock.equals(lock)) {
-    throw new Error(`${base.id} contains a different catalog lock`)
-  }
   if (plannerBundleDigest && plannerBundleDigest !== bundleDigest) {
     throw new Error(`${base.id} contains a different planner bundle`)
   }
-  catalogLock = lock
   plannerBundleDigest = bundleDigest
 }
 for (const pack of candidateBackendPacks) {
