@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.28
+
+### Patch Changes
+
+- [`d3b10cb`](https://github.com/magnitudedev/magnitude/commit/d3b10cb558907fbce6de26a60b257574d0a473fe) Thanks [@anerli](https://github.com/anerli)! - fix cuda resolution issues
+
 ## 0.0.1-alpha.27
 
 ### Patch Changes
