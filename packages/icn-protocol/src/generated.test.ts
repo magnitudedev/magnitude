@@ -13,14 +13,24 @@ describe("generated ICN bootstrap protocol", () => {
     )
     const report = decode(JSON.stringify({
       schemaVersion: 1,
-      cuda: { state: "usable", driverApi: 12_000, architectures: ["90"] },
+      cuda: {
+        state: "usable",
+        driverApi: 12_000,
+        architectures: ["90"],
+        driverLibrary: "/host/libcuda.so.1",
+      },
       vulkan: { state: "absent", diagnostic: "unavailable" },
       metal: { state: "absent", diagnostic: "unavailable" },
     }))
     expect(report.cuda.state).toBe("usable")
     expect(() => decode(JSON.stringify({
       schemaVersion: 1,
-      cuda: { _tag: "usable", driverApi: 12_000, architectures: ["90"] },
+      cuda: {
+        _tag: "usable",
+        driverApi: 12_000,
+        architectures: ["90"],
+        driverLibrary: "/host/libcuda.so.1",
+      },
       vulkan: { _tag: "absent", diagnostic: "unavailable" },
       metal: { _tag: "absent", diagnostic: "unavailable" },
     }))).toThrow()

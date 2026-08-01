@@ -27,6 +27,11 @@ fn main() {
         &env::var("PROFILE").expect("PROFILE must be set"),
     );
     emit("ICN_RUSTC_VERSION", &rustc_version());
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("linux") => println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../runtime"),
+        Ok("macos") => println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../runtime"),
+        _ => {}
+    }
 }
 
 fn table_value(source: &str, wanted_table: &str, wanted_key: &str) -> Option<String> {

@@ -168,12 +168,20 @@ if (import.meta.main) {
   if (process.argv.includes("--serve")) {
     const executable =
       process.platform === "win32" ? "magnitude-icn.exe" : "magnitude-icn";
-    const loader =
-      process.platform === "win32"
-        ? "PATH"
-        : process.platform === "darwin"
-        ? "DYLD_LIBRARY_PATH"
-        : "LD_LIBRARY_PATH";
+    const environment = process.platform === "win32"
+      ? {
+        ...process.env,
+        PATH: [
+          resolve(PROJECT_ROOT, "inference/target/development/runtime"),
+          process.env.PATH,
+        ].filter(Boolean).join(delimiter),
+      }
+      : {
+        ...process.env,
+        ...(process.platform === "darwin"
+          ? { DYLD_LIBRARY_PATH: "" }
+          : { LD_LIBRARY_PATH: "" }),
+      };
     const child = Bun.spawn(
       [
         resolve(PROJECT_ROOT, "inference/target/development/bin", executable),
@@ -184,15 +192,7 @@ if (import.meta.main) {
       ],
       {
         cwd: PROJECT_ROOT,
-        env: {
-          ...process.env,
-          [loader]: [
-            resolve(PROJECT_ROOT, "inference/target/development/runtime"),
-            process.env[loader],
-          ]
-            .filter(Boolean)
-            .join(delimiter),
-        },
+        env: environment,
         stdin: "inherit",
         stdout: "inherit",
         stderr: "inherit",

@@ -49,6 +49,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
 mod backend_eligibility;
 mod build_identity;
+mod cuda_driver;
 mod inference_worker;
 mod installation;
 mod load_progress;
@@ -4324,6 +4325,15 @@ fn load_installation_backends(installation: &installation::Installation) -> anyh
 
 fn initialize_native_runtime(authority: &NativeRuntimeAuthority) -> anyhow::Result<NativeBackend> {
     if let Some(installation) = authority.installation() {
+        if installation.backend() == IcnInstallationBackend::Cuda {
+            let driver = cuda_driver::require()
+                .context("failed to resolve the host CUDA driver provider")?;
+            tracing::info!(
+                cuda.driver.path = %driver.path.display(),
+                cuda.driver.api = driver.driver_api,
+                "resolved host CUDA driver provider"
+            );
+        }
         load_installation_backends(installation).with_context(|| {
             format!(
                 "failed to load native runtime from {}",

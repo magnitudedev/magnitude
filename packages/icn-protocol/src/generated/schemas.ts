@@ -453,6 +453,7 @@ export const CudaEligibility = S.Union(
     S.Struct({
       architectures: S.Array(S.String).pipe(S.minItems(1)),
       driverApi: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+      driverLibrary: S.String.pipe(S.minLength(1)),
       state: S.Literal("usable"),
     }),
     S.Record({ key: S.String, value: JsonValue }),

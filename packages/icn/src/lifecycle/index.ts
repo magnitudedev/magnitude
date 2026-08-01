@@ -9,7 +9,7 @@ import {
   IcnStartupRecord,
 } from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
-import { delimiter, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   Context,
   Cause,
@@ -26,6 +26,7 @@ import {
   Scope,
   Stream,
 } from "effect";
+import { installationLoaderEnvironment } from "./installation-environment.js";
 import {
   makeIcnApiClient,
 } from "@magnitudedev/icn-protocol/client";
@@ -167,11 +168,6 @@ const resolveCandidate = (
     yield* reporter.report({ _tag: "Resolving" });
     if (source._tag === "Installation") {
       const root = dirname(source.path);
-      const key = process.platform === "win32"
-        ? "PATH"
-        : process.platform === "darwin"
-          ? "DYLD_LIBRARY_PATH"
-          : "LD_LIBRARY_PATH";
       return {
         path: join(
           root,
@@ -179,11 +175,7 @@ const resolveCandidate = (
           `magnitude-icn${process.platform === "win32" ? ".exe" : ""}`,
         ),
         installation: source.path,
-        environment: {
-          [key]: process.env[key]
-            ? `${join(root, "runtime")}${delimiter}${process.env[key]}`
-            : join(root, "runtime"),
-        },
+        environment: installationLoaderEnvironment(join(root, "runtime")),
       };
     }
     const installation = yield* resolveReleaseIcnInstallation(

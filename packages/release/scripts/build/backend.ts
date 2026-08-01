@@ -6,7 +6,12 @@ import {
   backendPacks,
   hostById,
 } from "../../src/targets"
-import { buildArchive, run, type ArchiveSource } from "./common"
+import {
+  buildArchive,
+  run,
+  type ArchiveSource,
+  verifyOwnedLoaderPaths,
+} from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
 
 const fixedCudaDirectories = (): readonly string[] => {
@@ -73,6 +78,11 @@ export const buildBackendArtifact = async (
       resolveRuntimeLibrary(name, icn.runtimeLibraries)
     ),
   )
+  await verifyOwnedLoaderPaths({
+    host: host.id,
+    modules,
+    runtime,
+  })
   if (host.id.startsWith("darwin-")) {
     for (const file of [...modules, ...runtime]) {
       await run(["codesign", "--force", "--sign", "-", file])
