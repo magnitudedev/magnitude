@@ -152,11 +152,13 @@ jobs:
             aarch64) repository_arch=sbsa ;;
             *) exit 1 ;;
           esac
+          . /etc/os-release
+          repository_distribution="ubuntu${VERSION_ID//./}"
           toolkit="${{ matrix.toolkit }}"
           package_version="${toolkit/./-}"
           curl --fail --location --silent --show-error \
             --output cuda-keyring.deb \
-            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${repository_arch}/cuda-keyring_1.1-1_all.deb"
+            "https://developer.download.nvidia.com/compute/cuda/repos/${repository_distribution}/${repository_arch}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring.deb
           sudo apt-get update
           sudo apt-get install -y "cuda-toolkit-${package_version}"

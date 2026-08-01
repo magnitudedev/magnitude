@@ -53,6 +53,32 @@ test.each([
   }
 })
 
+test("renders CUDA backend preparation with its hardware label", async () => {
+  const view = await testRender(
+    <AcnBootstrapScreen
+      state={{
+        _tag: "Starting",
+        phase: {
+          _tag: "PreparingBackend",
+          backend: { _tag: "Cuda", hardwareLabel: "NVIDIA GeForce RTX 3060" },
+        },
+      }}
+      onRetry={() => undefined}
+      onQuit={() => undefined}
+    />,
+    { width: 91, height: 13 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain(
+      "Preparing CUDA backend for NVIDIA GeForce RTX 3060",
+    )
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
 const keyEvent = (name: string, ctrl = false) =>
   new KeyEvent({
     name,

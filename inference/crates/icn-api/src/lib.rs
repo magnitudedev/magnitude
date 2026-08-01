@@ -16,7 +16,8 @@ use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use icn_contracts::bootstrap_protocol::{
     BackendEligibilityReport, CudaEligibility, IcnBinaryIdentity, IcnInstallationBackend,
-    IcnInstallationDeclaration, IcnStartupRecord, IcnStartupRecordType, MetalEligibility,
+    IcnInstallationDeclaration, IcnStartupBackend, IcnStartupProgressRecord,
+    IcnStartupProgressRecordType, IcnStartupRecord, IcnStartupRecordType, MetalEligibility,
     VulkanEligibility,
 };
 use icn_contracts::models::{
@@ -2792,6 +2793,9 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         IcnBinaryIdentity,
         IcnStartupRecord,
         IcnStartupRecordType,
+        IcnStartupProgressRecord,
+        IcnStartupProgressRecordType,
+        IcnStartupBackend,
         IcnInstallationDeclaration,
         IcnInstallationBackend
     ))

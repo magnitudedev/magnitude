@@ -13,6 +13,7 @@ import {
   verifyOwnedLoaderPaths,
 } from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
+import { inspectCudaCompatibility } from "./cuda"
 
 const fixedCudaDirectories = (): readonly string[] => {
   const root = process.env.CUDA_PATH?.trim()
@@ -58,11 +59,12 @@ export const buildBackendArtifact = async (
     target: host.bunTarget,
     profile: `backend-${pack.id}`,
     features: pack.cargoFeatures,
-    buildEnvironment: pack.backend === "cuda"
-      ? {
-        CMAKE_CUDA_ARCHITECTURES: pack.cudaArchitectures?.join(";") ?? "",
-      }
-      : {},
+    buildEnvironment:
+      pack.backend === "cuda"
+        ? {
+            CMAKE_CUDA_ARCHITECTURES: pack.cuda.architectures.join(";"),
+          }
+        : {},
   })
   if (!icn.identity.backends.includes(pack.backend)) {
     throw new Error(`${pack.id} build identity does not include ${pack.backend}`)
@@ -73,6 +75,10 @@ export const buildBackendArtifact = async (
   if (modules.length !== 1) {
     throw new Error(`${pack.id} emitted ${modules.length} ${pack.module} modules`)
   }
+  const compatibility =
+    pack.backend === "cuda"
+      ? await inspectCudaCompatibility(modules[0]!, pack.cuda)
+      : pack.compatibility
   const runtime = await Promise.all(
     pack.runtimeLibraries.map((name) =>
       resolveRuntimeLibrary(name, icn.runtimeLibraries)
@@ -111,7 +117,7 @@ export const buildBackendArtifact = async (
       requiredBaseId: Option.some(`icn-base-${pack.host}`),
       nativeBuild: Option.some(icn.identity.native_build),
       backendModuleAbi: Option.some(icn.identity.backend_module_abi),
-      compatibility: Option.some(pack.compatibility),
+      compatibility: Option.some(compatibility),
     },
     sources,
   )

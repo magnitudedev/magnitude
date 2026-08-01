@@ -381,19 +381,13 @@ export const FitsOfferingAssessmentSchema = Schema.TaggedStruct("Fits", {
   configurationId: ModelServingConfigurationIdSchema,
   assessmentId: OfferingAssessmentIdSchema,
   memory: Schema.Array(MemoryAssessmentSchema),
-  performance: Schema.optionalWith(Schema.Struct({
+  performance: Schema.Struct({
     contextTokens: PositiveSafeInteger,
     lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
     estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
     upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
     confidence: Schema.Literal("high", "moderate", "low"),
-    method: NonEmptyString,
-  }), { as: "Option", exact: true }),
-  performanceUnavailable: Schema.optionalWith(Schema.Struct({
-    method: NonEmptyString,
-    code: NonEmptyString,
-    message: NonEmptyString,
-  }), { as: "Option", exact: true }),
+  }),
 })
 export type FitsOfferingAssessment = typeof FitsOfferingAssessmentSchema.Type
 
@@ -476,10 +470,7 @@ export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct({
   intelligenceProvenance: NonEmptyString,
   fidelityRank: NonNegativeSafeInteger,
   qualityEvidence: Schema.Array(NonEmptyString),
-  estimatedTokensPerSecond: Schema.optionalWith(
-    Schema.Number.pipe(Schema.finite(), Schema.positive()),
-    { as: "Option", exact: true },
-  ),
+  estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
   capabilities: ModelCapabilitiesSchema,
   sources: Schema.Array(Schema.Struct({
     source: ModelPackageSourceSchema,

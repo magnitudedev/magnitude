@@ -87,7 +87,7 @@ const chooserView = () => {
         providerModelId: remoteProviderModelId,
         displayName: "Remote Model",
         profile: { contextLength: 200_000 },
-        estimatedTokensPerSecond: Option.some(36.2),
+        estimatedTokensPerSecond: 36.2,
       }),
     })],
   })

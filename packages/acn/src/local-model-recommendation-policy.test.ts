@@ -113,15 +113,13 @@ const candidate = (input: {
         warningReserveBytes: 0,
         remainingBytes: capacityBytes - runtimeBytes,
       }],
-      performance: Option.some({
+      performance: {
         contextTokens: context,
         lowerTokensPerSecond: input.lower ?? expected * 0.85,
         estimatedTokensPerSecond: expected,
         upperTokensPerSecond: input.upper ?? expected * 1.15,
         confidence: input.confidence ?? "high",
-        method: "test-estimator",
-      }),
-      performanceUnavailable: Option.none(),
+      },
     },
     artifactId,
     checkpointId,
@@ -162,18 +160,29 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "balanced")?.configuration.profile.contextLength).toBe(100_000)
   })
 
-  it("excludes missing or sub-floor speed evidence from every intent", () => {
+  it("excludes sub-floor measured speed from every intent", () => {
     const slow = candidate({
       id: "slow",
       score: 90,
       expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1,
     })
-    const missingBase = candidate({ id: "missing", score: 80 })
-    const missing = {
-      ...missingBase,
-      assessment: { ...missingBase.assessment, performance: Option.none() },
-    }
-    expect(selectRecommendationPortfolio([slow, missing])).toEqual([])
+    expect(selectRecommendationPortfolio([slow])).toEqual([])
+  })
+
+  it("keeps fitting candidates below the recommendation speed floor in the compatible catalog", () => {
+    const slow = candidate({
+      id: "slow",
+      score: 80,
+      expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 1,
+    })
+
+    const recommendations = selectRecommendationPortfolio([slow])
+    const catalog = assembleRecommendationCatalogCandidates([slow], recommendations)
+
+    expect(recommendations).toEqual([])
+    expect(catalog).toMatchObject([{
+      candidate: { model: { displayName: "slow" } },
+    }])
   })
 
   it("applies the floor at the same one-decimal precision shown to users", () => {

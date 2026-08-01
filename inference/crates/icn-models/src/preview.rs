@@ -119,7 +119,7 @@ impl ModelPreviewService {
         Ok(snapshot)
     }
 
-    fn cached_preview(
+    async fn cached_preview(
         &self,
         artifact: &CachedArtifact,
         profiles: &[ModelPreviewProfile],
@@ -154,7 +154,10 @@ impl ModelPreviewService {
         };
         let mut assessments = Vec::with_capacity(profiles.len());
         for profile in profiles {
-            let hardware_key = self.assessor.cache_key(Some(profile), snapshot)?;
+            let hardware_key = self
+                .assessor
+                .execution_cache_key(Some(profile), snapshot)
+                .await?;
             let Some(assessment) =
                 self.models
                     .cache
@@ -166,8 +169,7 @@ impl ModelPreviewService {
                 profile_id: profile.id.clone(),
                 artifact_fingerprint: source_fingerprint.clone(),
                 hardware_topology: snapshot.topology_fingerprint.clone(),
-                assessment: assessment.hardware,
-                performance: assessment.performance,
+                execution: assessment,
             });
         }
         Ok(Some(ModelPreview {
@@ -200,18 +202,18 @@ impl ModelPreviewService {
         let topology = icn_contracts::MemoryTopology::from_snapshot(snapshot).ok_or_else(|| {
             InventoryError::Internal("hardware snapshot has an invalid memory topology".to_owned())
         })?;
-        let mut entries = profiles
-            .into_iter()
-            .map(|profile| {
-                let hardware_key = self.assessor.cache_key(Some(&profile), snapshot)?;
-                let assessment = self.models.cache.read_execution_assessment(
-                    content_id,
-                    &hardware_key,
-                    &topology,
-                );
-                Ok((profile, hardware_key, assessment))
-            })
-            .collect::<Result<Vec<_>, InventoryError>>()?;
+        let mut entries = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            let hardware_key = self
+                .assessor
+                .execution_cache_key(Some(&profile), snapshot)
+                .await?;
+            let assessment =
+                self.models
+                    .cache
+                    .read_execution_assessment(content_id, &hardware_key, &topology);
+            entries.push((profile, hardware_key, assessment));
+        }
 
         let mut missing_keys = entries
             .iter()
@@ -281,8 +283,7 @@ impl ModelPreviewService {
                     profile_id: profile.id,
                     artifact_fingerprint: prepared.artifact_fingerprint.clone(),
                     hardware_topology: snapshot.topology_fingerprint.clone(),
-                    assessment: assessment.hardware,
-                    performance: assessment.performance,
+                    execution: assessment,
                 })
             })
             .collect()
@@ -300,8 +301,9 @@ impl ModelPreviewer for ModelPreviewService {
                 .map_err(|error| InventoryError::Internal(error.to_string()))?;
             let snapshot = self.hardware_snapshot().await?;
             if let Some(artifact) = self.models.cached_preview_artifact(&request.source)
-                && let Some(preview) =
-                    self.cached_preview(&artifact, &request.profiles, &snapshot)?
+                && let Some(preview) = self
+                    .cached_preview(&artifact, &request.profiles, &snapshot)
+                    .await?
             {
                 return Ok(preview);
             }
@@ -309,8 +311,9 @@ impl ModelPreviewer for ModelPreviewService {
             let prepared = {
                 let _guard = artifact_gate.lock().await;
                 if let Some(artifact) = self.models.cached_preview_artifact(&request.source)
-                    && let Some(preview) =
-                        self.cached_preview(&artifact, &request.profiles, &snapshot)?
+                    && let Some(preview) = self
+                        .cached_preview(&artifact, &request.profiles, &snapshot)
+                        .await?
                 {
                     return Ok(preview);
                 }
@@ -1955,15 +1958,17 @@ mod tests {
     }
 
     impl ModelHardwareAssessor for CountingProfileAssessor {
-        fn cache_key(
-            &self,
-            profile: Option<&icn_contracts::ModelPreviewProfile>,
-            _snapshot: &icn_contracts::HardwareSnapshot,
-        ) -> Result<String, InventoryError> {
-            Ok(format!(
-                "profile:{}",
-                profile.map_or(0, |profile| profile.context_length)
-            ))
+        fn execution_cache_key<'a>(
+            &'a self,
+            profile: Option<&'a icn_contracts::ModelPreviewProfile>,
+            _snapshot: &'a icn_contracts::HardwareSnapshot,
+        ) -> futures_util::future::BoxFuture<'a, Result<String, InventoryError>> {
+            Box::pin(async move {
+                Ok(format!(
+                    "profile:{}",
+                    profile.map_or(0, |profile| profile.context_length)
+                ))
+            })
         }
 
         fn assess_profile(
@@ -1999,6 +2004,48 @@ mod tests {
                     },
                     recommendation: icn_contracts::HardwareRecommendation::Recommended,
                 })
+            })
+        }
+
+        fn assess_execution_profiles(
+            &self,
+            model: ResolvedModel,
+            profiles: Vec<icn_contracts::ModelPreviewProfile>,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            Result<Vec<icn_contracts::ModelExecutionAssessment>, InventoryError>,
+        > {
+            Box::pin(async move {
+                let contexts = profiles
+                    .iter()
+                    .map(|profile| profile.context_length)
+                    .collect::<Vec<_>>();
+                let hardware = self.assess_profiles(model, profiles).await?;
+                Ok(hardware
+                    .into_iter()
+                    .zip(contexts)
+                    .map(|(hardware, context_tokens)| {
+                        icn_contracts::ModelExecutionAssessment::Executable {
+                            hardware,
+                            performance: icn_contracts::GenerationPerformanceAssessment {
+                                confidence: icn_contracts::GenerationPerformanceConfidence::Low,
+                                workload: "baseline_single_sequence_decode".to_owned(),
+                                always_active_weight_bytes: 1,
+                                routed_expert_weight_bytes: 0,
+                                expert_count: 0,
+                                expert_used_count: 0,
+                                cross_memory_domain_placement: false,
+                                points: vec![icn_contracts::GenerationSpeedPoint {
+                                    context_tokens,
+                                    kv_bytes_read_per_token: 1,
+                                    lower_tokens_per_second: 1.0,
+                                    expected_tokens_per_second: 2.0,
+                                    upper_tokens_per_second: 3.0,
+                                }],
+                            },
+                        }
+                    })
+                    .collect())
             })
         }
     }
@@ -2312,12 +2359,23 @@ mod tests {
                 .is_none()
         );
 
-        let execution = icn_contracts::ModelExecutionAssessment {
+        let execution = icn_contracts::ModelExecutionAssessment::Executable {
             hardware: assessment.clone(),
-            performance: icn_contracts::GenerationPerformanceAssessment::Unavailable {
-                method: "native".to_owned(),
-                code: "calibration_failed".to_owned(),
-                message: "calibration is advisory".to_owned(),
+            performance: icn_contracts::GenerationPerformanceAssessment {
+                confidence: icn_contracts::GenerationPerformanceConfidence::Low,
+                workload: "baseline_single_sequence_decode".to_owned(),
+                always_active_weight_bytes: 1,
+                routed_expert_weight_bytes: 0,
+                expert_count: 0,
+                expert_used_count: 0,
+                cross_memory_domain_placement: false,
+                points: vec![icn_contracts::GenerationSpeedPoint {
+                    context_tokens: 4096,
+                    kv_bytes_read_per_token: 1,
+                    lower_tokens_per_second: 1.0,
+                    expected_tokens_per_second: 2.0,
+                    upper_tokens_per_second: 3.0,
+                }],
             },
         };
         manager
@@ -2404,9 +2462,8 @@ mod tests {
         let first = first.unwrap();
         assert_eq!(first, second.unwrap());
         assert!(matches!(
-            first.assessments[0].performance,
-            icn_contracts::GenerationPerformanceAssessment::Unavailable { ref code, .. }
-                if code == "not_requested"
+            first.assessments[0].execution,
+            icn_contracts::ModelExecutionAssessment::Executable { .. }
         ));
         assert_eq!(assessor.0.load(Ordering::SeqCst), 1);
         fs::remove_dir_all(cache_root.join("blobs")).unwrap();

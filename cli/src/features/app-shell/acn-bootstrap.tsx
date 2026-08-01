@@ -15,13 +15,20 @@ const PHASE_LABELS: Readonly<Record<AcnInstallationPhase, string>> = {
   StartingMagnitude: "Starting Magnitude",
 };
 
-const STARTING_PHASE_LABELS: Readonly<Record<AcnStartingPhase, string>> = {
+const STARTING_PHASE_LABELS: Readonly<Record<Extract<AcnStartingPhase, string>, string>> = {
   Discovering: "Looking for Magnitude",
   WaitingForOwner: "Waiting for previous Magnitude process",
   LaunchingAcn: "Starting Magnitude",
   ResolvingLocalInference: "Preparing local inference",
   LaunchingLocalInference: "Starting local inference",
 };
+
+const startingPhaseLabel = (phase: AcnStartingPhase): string =>
+  typeof phase === "string"
+    ? STARTING_PHASE_LABELS[phase]
+    : phase.backend._tag === "Cuda"
+      ? `Preparing CUDA backend for ${phase.backend.hardwareLabel}`
+      : "Preparing local inference"
 
 const INSTALLATION_PANEL_WIDTH = 64;
 const PROGRESS_BAR_WIDTH = 36;
@@ -186,7 +193,7 @@ export function AcnBootstrapScreen({
             Starting Magnitude
           </text>
           <text style={{ fg: theme.muted }}>
-            {STARTING_PHASE_LABELS[state.phase]}
+            {startingPhaseLabel(state.phase)}
           </text>
         </box>
       )}

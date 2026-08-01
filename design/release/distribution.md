@@ -44,12 +44,12 @@ and only its required redistributable runtime libraries. The supported hosts and
 product configuration, not a plugin system.
 
 CUDA compatibility and backend-pack selection are governed by
-[CUDA compatibility](../inference/cuda-compatibility.md). Linux x64 and ARM64 each publish one
-compatibility pack containing one ordinary `compute_80` PTX image and one modern pack containing
-the current Ampere, Hopper, and Blackwell paths. The ordinary compatibility image may execute on
-newer GPUs when its PTX ISA and target rules are satisfied; separate Ada and Hopper targets are not
-required merely for coverage. Host architecture does not select a CUDA toolkit generation. The
-four host/tier packs build independently and concurrently; additional PTX targets and native cubins
+[CUDA compatibility](../inference/cuda-compatibility.md). Linux x64 and ARM64 each publish CUDA
+11.8 output containing ordinary `compute_80` PTX and CUDA 12.9 output containing the current
+Ampere, Hopper, and Blackwell paths. An ordinary image may execute on newer GPUs when its PTX ISA
+and target rules are satisfied; separate Ada and Hopper targets are not required merely for
+coverage. Host architecture does not select a CUDA toolkit generation. The four host/toolkit packs
+build independently and concurrently; additional PTX targets and native cubins
 require measured startup-latency or runtime-performance justification.
 
 One manifest records every native archive's release identity, filename, size, SHA-256, native-build

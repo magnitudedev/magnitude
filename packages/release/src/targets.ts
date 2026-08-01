@@ -16,30 +16,41 @@ export interface ReleaseHost {
   readonly cargoFeatures: readonly string[]
 }
 
-export interface BackendPack {
+interface BackendPackBase {
   readonly id: string
   readonly host: HostId
-  readonly backend: Exclude<Backend, "cpu">
   readonly runner: string
   readonly cargoFeatures: readonly string[]
   readonly module: string
   readonly runtimeLibraries: readonly string[]
-  readonly cudaArchitectures?: readonly string[]
-  readonly compatibility:
-    | {
-      readonly kind: "metal"
-    }
-    | {
-      readonly kind: "cuda"
-      readonly toolkit: string
-      readonly minimumDriverApi: number
-      readonly minimumArchitecture: number
-    }
-    | {
-      readonly kind: "vulkan"
-      readonly minimumApi: string
-    }
 }
+
+export type BackendPack =
+  | (BackendPackBase & {
+      readonly backend: "cuda"
+      readonly cuda: {
+        readonly toolkitVersion: string
+        readonly architectures: readonly string[]
+        readonly expectedImages: readonly {
+          readonly ptxVersion: string
+          readonly target: number
+          readonly architectureSpecific: boolean
+        }[]
+      }
+    })
+  | (BackendPackBase & {
+      readonly backend: "metal"
+      readonly compatibility: {
+        readonly kind: "metal"
+      }
+    })
+  | (BackendPackBase & {
+      readonly backend: "vulkan"
+      readonly compatibility: {
+        readonly kind: "vulkan"
+        readonly minimumApi: string
+      }
+    })
 
 // This is product configuration, not a serialized registry or extension point.
 export const releaseHosts = [
@@ -77,9 +88,53 @@ export const releaseHosts = [
   },
 ] as const satisfies readonly ReleaseHost[]
 
+const cudaBuilds = [
+  {
+    toolkitVersion: "11.8",
+    architectures: ["80-virtual"],
+    expectedImages: [
+      { ptxVersion: "7.8", target: 80, architectureSpecific: false },
+    ],
+    runtimeLibraries: ["libcudart.so.11.0", "libcublas.so.11", "libcublasLt.so.11"],
+  },
+  {
+    toolkitVersion: "12.9",
+    architectures: ["80-virtual", "90-virtual", "120-virtual"],
+    expectedImages: [
+      { ptxVersion: "8.8", target: 80, architectureSpecific: false },
+      { ptxVersion: "8.8", target: 90, architectureSpecific: false },
+      { ptxVersion: "8.8", target: 120, architectureSpecific: false },
+    ],
+    runtimeLibraries: ["libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12"],
+  },
+] as const
+
+const cudaHosts = [
+  {
+    host: "linux-arm64-gnu",
+    runners: { "11.8": "ubuntu-22.04-arm", "12.9": "ubuntu-24.04-arm" },
+  },
+  {
+    host: "linux-x64-gnu",
+    runners: { "11.8": "ubuntu-22.04", "12.9": "ubuntu-24.04" },
+  },
+] as const
+
+const cudaBackendPacks: readonly BackendPack[] = cudaHosts.flatMap(({ host, runners }) =>
+  cudaBuilds.map((cuda) => ({
+    id: `cuda-${cuda.toolkitVersion}-${host}`,
+    host,
+    backend: "cuda" as const,
+    runner: runners[cuda.toolkitVersion],
+    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
+    module: "libggml-cuda.so",
+    runtimeLibraries: cuda.runtimeLibraries,
+    cuda,
+  })))
+
 // Windows release artifacts are intentionally disabled for now. Runtime support outside the
 // release system remains available to revisit once Windows builds are reliable.
-export const backendPacks = [
+export const backendPacks: readonly BackendPack[] = [
   {
     id: "metal-darwin-arm64",
     host: "darwin-arm64",
@@ -90,42 +145,7 @@ export const backendPacks = [
     runtimeLibraries: [],
     compatibility: { kind: "metal" },
   },
-  {
-    id: "cuda13-linux-arm64-gnu",
-    host: "linux-arm64-gnu",
-    backend: "cuda",
-    runner: "ubuntu-24.04-arm",
-    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
-    module: "libggml-cuda.so",
-    runtimeLibraries: ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"],
-    // PTX-only tiers keep release builds manageable while retaining the CUDA code paths that
-    // matter most today: Ampere+, Hopper, and Blackwell. Additional compatibility tiers or native
-    // cubins can be restored later if measured startup or runtime performance justifies the cost.
-    cudaArchitectures: ["80-virtual", "90-virtual", "120-virtual"],
-    compatibility: {
-      kind: "cuda",
-      toolkit: "13.0",
-      minimumDriverApi: 13000,
-      minimumArchitecture: 80,
-    },
-  },
-  {
-    id: "cuda12-linux-x64-gnu",
-    host: "linux-x64-gnu",
-    backend: "cuda",
-    runner: "ubuntu-latest",
-    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
-    module: "libggml-cuda.so",
-    runtimeLibraries: ["libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12"],
-    // Keep this list aligned with the ARM64 pack above.
-    cudaArchitectures: ["80-virtual", "90-virtual", "120-virtual"],
-    compatibility: {
-      kind: "cuda",
-      toolkit: "12.9",
-      minimumDriverApi: 12000,
-      minimumArchitecture: 80,
-    },
-  },
+  ...cudaBackendPacks,
   {
     id: "vulkan1-linux-arm64-gnu",
     host: "linux-arm64-gnu",
@@ -146,7 +166,7 @@ export const backendPacks = [
     runtimeLibraries: [],
     compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
   },
-] as const satisfies readonly BackendPack[]
+]
 
 export const hostById = (id: HostId): ReleaseHost => {
   const host = releaseHosts.find((candidate) => candidate.id === id)

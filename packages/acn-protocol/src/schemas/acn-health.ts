@@ -33,10 +33,14 @@ export const AcnInstallationPlanSchema = Schema.Struct({
 });
 export type AcnInstallationPlan = typeof AcnInstallationPlanSchema.Type;
 
-export const AcnStartupActivitySchema = Schema.Literal(
-  "WaitingForOwnership",
-  "Resolving",
-  "Starting"
+export const StartupBackendSchema = Schema.Union(
+  Schema.TaggedStruct("Cuda", { hardwareLabel: NonEmptyString }),
+)
+export type StartupBackend = typeof StartupBackendSchema.Type
+
+export const AcnStartupActivitySchema = Schema.Union(
+  Schema.Literal("WaitingForOwnership", "Resolving", "Starting"),
+  Schema.TaggedStruct("PreparingBackend", { backend: StartupBackendSchema }),
 );
 export type AcnStartupActivity = typeof AcnStartupActivitySchema.Type;
 

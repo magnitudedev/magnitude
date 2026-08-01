@@ -7,10 +7,7 @@ import * as NodePath from "node:path"
 
 const CacheScope = Schema.Literal(
   "all",
-  "onboarding",
-  "recommendations",
   "assessments",
-  "calibration",
 )
 
 type CacheScope = typeof CacheScope.Type
@@ -19,16 +16,7 @@ const cacheRoot = NodePath.join(NodeOs.homedir(), ".magnitude", "cache")
 
 const targetsFor = (scope: CacheScope): ReadonlyArray<string> => scope === "all"
   ? [cacheRoot]
-  : scope === "onboarding"
-    ? [
-        NodePath.join(cacheRoot, "local-model-recommendations.json"),
-        NodePath.join(cacheRoot, "indexes", "assessments"),
-      ]
-    : scope === "recommendations"
-      ? [NodePath.join(cacheRoot, "local-model-recommendations.json")]
-      : scope === "assessments"
-        ? [NodePath.join(cacheRoot, "indexes", "assessments")]
-        : [NodePath.join(cacheRoot, "indexes", "calibrations")]
+  : [NodePath.join(cacheRoot, "indexes", "assessments")]
 
 const clearDerivedCache = Effect.gen(function* () {
   const scope = yield* Schema.decodeUnknown(CacheScope)(process.argv[2] ?? "all")

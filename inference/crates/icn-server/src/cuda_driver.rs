@@ -1,17 +1,22 @@
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::ffi::CStr;
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use libloading::Library;
 
+#[cfg(any(target_os = "linux", test))]
 const MAX_CANDIDATES_PER_DIRECTORY: usize = 32;
 #[cfg(target_os = "linux")]
 const MAX_CHILD_PROVIDER_DIRECTORIES: usize = 64;
 
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 const CUDA_ERROR_STUB_LIBRARY: i32 = 34;
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 const CUDA_ERROR_NO_DEVICE: i32 = 100;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const CUDA_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
@@ -28,8 +33,14 @@ type DeviceCount = unsafe extern "C" fn(*mut i32) -> i32;
 type DeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 type DeviceAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type DeviceName = unsafe extern "C" fn(*mut std::ffi::c_char, i32, i32) -> i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows", test)),
+    allow(dead_code)
+)]
 pub(crate) enum CudaDriverFailureKind {
     Absent,
     Failed,
@@ -49,6 +60,7 @@ impl CudaDriverFailure {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
     fn failed(diagnostic: impl std::fmt::Display) -> Self {
         Self {
             kind: CudaDriverFailureKind::Failed,
@@ -64,6 +76,7 @@ pub(crate) struct CudaDriver {
     pub(crate) path: PathBuf,
     pub(crate) driver_api: i32,
     pub(crate) architectures: Vec<String>,
+    pub(crate) hardware_labels: Vec<String>,
 }
 
 static DRIVER: OnceLock<Result<CudaDriver, CudaDriverFailure>> = OnceLock::new();
@@ -85,6 +98,7 @@ struct CudaApi {
     device_count: DeviceCount,
     device_get: DeviceGet,
     device_attribute: DeviceAttribute,
+    device_name: DeviceName,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -113,6 +127,11 @@ impl CudaApi {
                     .map_err(|_| {
                         CudaDriverFailure::failed("CUDA driver is missing cuDeviceGetAttribute")
                     })?,
+                device_name: *library
+                    .get::<DeviceName>(b"cuDeviceGetName\0")
+                    .map_err(|_| {
+                        CudaDriverFailure::failed("CUDA driver is missing cuDeviceGetName")
+                    })?,
             })
         }
     }
@@ -136,8 +155,13 @@ impl CudaApi {
     fn device_attribute(self, value: &mut i32, attribute: i32, device: i32) -> i32 {
         unsafe { (self.device_attribute)(value, attribute, device) }
     }
+
+    fn device_name(self, buffer: &mut [std::ffi::c_char], device: i32) -> i32 {
+        unsafe { (self.device_name)(buffer.as_mut_ptr(), buffer.len() as i32, device) }
+    }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn cuda_init_failure(code: i32) -> Option<CudaDriverFailure> {
     match code {
         0 => None,
@@ -151,6 +175,7 @@ fn cuda_init_failure(code: i32) -> Option<CudaDriverFailure> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn is_driver_filename(name: &str) -> bool {
     let Some(version) = name.strip_prefix("libcuda.so.") else {
         return false;
@@ -160,6 +185,7 @@ fn is_driver_filename(name: &str) -> bool {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn add_driver_files(directory: &Path, candidates: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -234,30 +260,8 @@ fn linux_fallback_candidates() -> Vec<PathBuf> {
         "/run/opengl-driver/lib",
         "/usr/local/nvidia/lib",
         "/usr/local/nvidia/lib64",
-        "/usr/local/cuda/compat",
     ] {
         add_driver_files(Path::new(directory), &mut candidates);
-    }
-
-    if let Ok(entries) = std::fs::read_dir("/usr/local") {
-        let mut compat = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("cuda-"))
-            })
-            .map(|path| path.join("compat"))
-            .collect::<Vec<_>>();
-        compat.sort_by(|left, right| right.cmp(left));
-        for directory in compat {
-            add_driver_files(&directory, &mut candidates);
-        }
-    }
-
-    if !wsl {
-        add_wsl(&mut candidates);
     }
 
     let mut seen = HashSet::new();
@@ -339,7 +343,7 @@ fn windows_candidate() -> Result<PathBuf, CudaDriverFailure> {
 fn inspect(
     library: &Library,
     candidate: &Path,
-) -> Result<(PathBuf, i32, Vec<String>), CudaDriverFailure> {
+) -> Result<(PathBuf, i32, Vec<String>, Vec<String>), CudaDriverFailure> {
     let api = CudaApi::load(library)?;
     if let Some(failure) = cuda_init_failure(api.initialize()) {
         return Err(failure);
@@ -359,6 +363,7 @@ fn inspect(
     }
 
     let mut architectures = Vec::new();
+    let mut hardware_labels = Vec::new();
     for ordinal in 0..device_count {
         let mut device = 0;
         let mut major = 0;
@@ -369,6 +374,16 @@ fn inspect(
             && major > 0
         {
             architectures.push(format!("{major}{minor}"));
+            let mut name = [0 as std::ffi::c_char; 256];
+            if api.device_name(&mut name, device) == 0 {
+                let label = unsafe { CStr::from_ptr(name.as_ptr()) }
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned();
+                if !label.is_empty() {
+                    hardware_labels.push(label);
+                }
+            }
         }
     }
     if architectures.is_empty() {
@@ -376,7 +391,12 @@ fn inspect(
             "CUDA devices did not report a compute architecture",
         ));
     }
-    Ok((loaded_path(api.init, candidate), driver_api, architectures))
+    Ok((
+        loaded_path(api.init, candidate),
+        driver_api,
+        architectures,
+        hardware_labels,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -395,7 +415,7 @@ fn load() -> Result<CudaDriver, CudaDriverFailure> {
             }
         };
         match inspect(&library, &candidate) {
-            Ok((path, driver_api, architectures)) => {
+            Ok((path, driver_api, architectures, hardware_labels)) => {
                 let library = promote_global(&path).map_err(|error| {
                     CudaDriverFailure::failed(format!("unable to expose CUDA driver: {error}"))
                 })?;
@@ -404,6 +424,7 @@ fn load() -> Result<CudaDriver, CudaDriverFailure> {
                     path,
                     driver_api,
                     architectures,
+                    hardware_labels,
                 });
             }
             Err(failure) => last_failure = Some(failure),
@@ -424,12 +445,13 @@ fn load() -> Result<CudaDriver, CudaDriverFailure> {
     let library = open_candidate(&candidate).map_err(|error| {
         CudaDriverFailure::absent(format!("CUDA driver library is unavailable ({error})"))
     })?;
-    let (path, driver_api, architectures) = inspect(&library, &candidate)?;
+    let (path, driver_api, architectures, hardware_labels) = inspect(&library, &candidate)?;
     Ok(CudaDriver {
         _library: library,
         path,
         driver_api,
         architectures,
+        hardware_labels,
     })
 }
 

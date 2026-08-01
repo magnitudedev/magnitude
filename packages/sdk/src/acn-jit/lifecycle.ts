@@ -9,12 +9,19 @@ import {
 import { Clock, Effect, Option, Schema, Stream, SubscriptionRef } from "effect";
 import type { DaemonError } from "./errors";
 
-export const AcnStartingPhaseSchema = Schema.Literal(
-  "Discovering",
-  "WaitingForOwner",
-  "LaunchingAcn",
-  "ResolvingLocalInference",
-  "LaunchingLocalInference"
+export const AcnStartingPhaseSchema = Schema.Union(
+  Schema.Literal(
+    "Discovering",
+    "WaitingForOwner",
+    "LaunchingAcn",
+    "ResolvingLocalInference",
+    "LaunchingLocalInference",
+  ),
+  Schema.TaggedStruct("PreparingBackend", {
+    backend: Schema.Union(
+      Schema.TaggedStruct("Cuda", { hardwareLabel: Schema.NonEmptyString }),
+    ),
+  }),
 );
 export type AcnStartingPhase = typeof AcnStartingPhaseSchema.Type;
 
@@ -270,7 +277,7 @@ export const makeAcnLifecycle = (): Effect.Effect<AcnLifecycleController> =>
       Effect.gen(function* () {
         const current = yield* SubscriptionRef.get(internal);
         if (observation._tag === "Starting") {
-          if (current._tag === "Installing") return;
+          if (current._tag === "Installing" && typeof observation.phase === "string") return;
           yield* SubscriptionRef.set(internal, {
             _tag: "Visible",
             state: observation,

@@ -34,7 +34,6 @@ use sha2::{Digest, Sha256};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 pub const GENERATION_PERFORMANCE_CONTEXTS: [u32; 4] = [8_192, 32_768, 100_000, 200_000];
-pub const GENERATION_PERFORMANCE_METHOD: &str = "icn-hardware-calibrated-decode-v5";
 /// Canonical identity for physical system memory in topology and plan assessments.
 use icn_contracts::MemoryDomainId;
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -58,8 +57,7 @@ pub fn system_memory_thresholds(total_bytes: u64) -> SystemMemoryThresholds {
         abort_reserve_bytes: (total_bytes / 20).max(GIB),
     }
 }
-// Versioned ICN policy for work not represented by the synthetic matrix-operation calibration.
-// Changing any of these constants requires a new GENERATION_PERFORMANCE_METHOD identity.
+// ICN policy for work not represented by the synthetic matrix-operation calibration.
 const GENERATION_PERFORMANCE_WORKLOAD: &str = "baseline_single_sequence_decode";
 const DENSE_DECODE_EFFICIENCY: f64 = 0.82;
 const ROUTED_DECODE_EFFICIENCY: f64 = 0.75;
@@ -714,6 +712,8 @@ pub enum AssessmentError {
     IncompatibleArtifact { code: String, message: String },
     #[error("artifact is invalid: {code}: {message}")]
     InvalidArtifact { code: String, message: String },
+    #[error("generation performance assessment failed: {code}: {message}")]
+    PerformanceEstimate { code: &'static str, message: String },
 }
 
 /// Assess execution intent using the same native planning implementation used by loading.
@@ -1001,59 +1001,30 @@ pub fn assess_with_backend(
 }
 
 fn generation_performance(
-    hardware: &HardwareAssessment,
     decode_workload: &FitDecodeWorkloadAssessment,
     devices: &[FitDeviceEstimate],
     topology: &MemoryTopology,
-    calibration: Option<&FitCalibration>,
+    calibration: &FitCalibration,
     configured_context_tokens: u32,
-) -> GenerationPerformanceAssessment {
-    if !matches!(hardware, HardwareAssessment::Fits { .. }) {
-        return unavailable_generation_performance(
-            "configuration_does_not_fit",
-            "generation performance is unavailable for a configuration that does not fit",
-        );
-    }
-    let Some(calibration) = calibration else {
-        return GenerationPerformanceAssessment::not_requested();
-    };
+) -> Result<GenerationPerformanceAssessment, PerformanceEstimateFailure> {
     let workload = match decode_workload {
         FitDecodeWorkloadAssessment::Available { workload } => workload,
         FitDecodeWorkloadAssessment::Unavailable { reason } => {
-            return unavailable_generation_performance(
+            return Err(PerformanceEstimateFailure::new(
                 "native_workload_unavailable",
                 reason.clone(),
-            );
+            ));
         }
     };
     let cross_memory_domain_placement =
-        match workload_crosses_memory_domains(workload, devices, topology) {
-            Ok(value) => value,
-            Err(failure) => {
-                return unavailable_generation_performance(failure.code, failure.message);
-            }
-        };
-    match estimate_generation_performance(
+        workload_crosses_memory_domains(workload, devices, topology)?;
+    estimate_generation_performance(
         workload,
         calibration,
         configured_context_tokens,
         &GENERATION_PERFORMANCE_CONTEXTS,
         cross_memory_domain_placement,
-    ) {
-        Ok(estimate) => estimate,
-        Err(failure) => unavailable_generation_performance(failure.code, failure.message),
-    }
-}
-
-fn unavailable_generation_performance(
-    code: &str,
-    message: impl Into<String>,
-) -> GenerationPerformanceAssessment {
-    GenerationPerformanceAssessment::Unavailable {
-        method: GENERATION_PERFORMANCE_METHOD.to_owned(),
-        code: code.to_owned(),
-        message: message.into(),
-    }
+    )
 }
 
 #[derive(Debug)]
@@ -1757,8 +1728,7 @@ fn estimate_generation_performance(
         });
     }
 
-    Ok(GenerationPerformanceAssessment::Estimated {
-        method: GENERATION_PERFORMANCE_METHOD.to_owned(),
+    Ok(GenerationPerformanceAssessment {
         confidence,
         workload: GENERATION_PERFORMANCE_WORKLOAD.to_owned(),
         always_active_weight_bytes,
@@ -1792,7 +1762,23 @@ pub fn assess_execution_profiles_with_backend(
     requested: &[ExecutionIntent],
     calibration: &FitCalibration,
 ) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
-    assess_profiles_impl(backend, topology, requested, Some(calibration))
+    assess_profiles_impl(backend, topology, requested, Some(calibration))?
+        .into_iter()
+        .map(|assessment| match assessment.performance {
+            Some(performance) => Ok(ModelExecutionAssessment::Executable {
+                hardware: assessment.hardware,
+                performance,
+            }),
+            None => Ok(ModelExecutionAssessment::NotExecutable {
+                hardware: assessment.hardware,
+            }),
+        })
+        .collect()
+}
+
+struct ProfileAssessment {
+    hardware: HardwareAssessment,
+    performance: Option<GenerationPerformanceAssessment>,
 }
 
 fn assess_profiles_impl(
@@ -1800,7 +1786,7 @@ fn assess_profiles_impl(
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
     calibration: Option<&FitCalibration>,
-) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
+) -> Result<Vec<ProfileAssessment>, AssessmentError> {
     if requested.is_empty() {
         return Ok(Vec::new());
     }
@@ -1858,15 +1844,22 @@ fn assess_profiles_impl(
                 let plan = assessed_intent(intent, &report, Measurement::Initial);
                 let hardware =
                     fits_assessment(&plan, &preferred, HardwareRecommendation::Recommended);
-                return Ok(ModelExecutionAssessment {
-                    performance: generation_performance(
-                        &hardware,
-                        &report.decode_workload,
-                        &report.devices,
-                        topology,
-                        calibration,
-                        report.fitted.resolved_context_tokens,
-                    ),
+                return Ok(ProfileAssessment {
+                    performance: calibration
+                        .map(|calibration| {
+                            generation_performance(
+                                &report.decode_workload,
+                                &report.devices,
+                                topology,
+                                calibration,
+                                report.fitted.resolved_context_tokens,
+                            )
+                        })
+                        .transpose()
+                        .map_err(|failure| AssessmentError::PerformanceEstimate {
+                            code: failure.code,
+                            message: failure.message,
+                        })?,
                     hardware,
                 });
             }
@@ -1887,15 +1880,8 @@ fn assess_profiles_impl(
                     limiting_resource: preferred.limiting_resource,
                     alternative: None,
                 };
-                return Ok(ModelExecutionAssessment {
-                    performance: generation_performance(
-                        &hardware,
-                        &report.decode_workload,
-                        &report.devices,
-                        topology,
-                        calibration,
-                        report.fitted.resolved_context_tokens,
-                    ),
+                return Ok(ProfileAssessment {
+                    performance: None,
                     hardware,
                 });
             }
@@ -1904,15 +1890,26 @@ fn assess_profiles_impl(
                 Some(_) => assess_intent_with_decode_workload(backend, topology, intent)?,
                 None => assess_with_backend(backend, topology, intent)?,
             };
-            let performance = generation_performance(
-                &assessed.assessment,
-                &assessed.text_report.decode_workload,
-                &assessed.text_report.devices,
-                topology,
-                calibration,
-                assessed.text_report.fitted.resolved_context_tokens,
-            );
-            Ok(ModelExecutionAssessment {
+            let performance = if matches!(assessed.assessment, HardwareAssessment::Fits { .. }) {
+                calibration
+                    .map(|calibration| {
+                        generation_performance(
+                            &assessed.text_report.decode_workload,
+                            &assessed.text_report.devices,
+                            topology,
+                            calibration,
+                            assessed.text_report.fitted.resolved_context_tokens,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|failure| AssessmentError::PerformanceEstimate {
+                        code: failure.code,
+                        message: failure.message,
+                    })?
+            } else {
+                None
+            };
+            Ok(ProfileAssessment {
                 performance,
                 hardware: assessed.assessment,
             })
@@ -4168,17 +4165,14 @@ mod tests {
         bool,
         Vec<GenerationSpeedPoint>,
     ) {
-        let GenerationPerformanceAssessment::Estimated {
+        let GenerationPerformanceAssessment {
             confidence,
             always_active_weight_bytes,
             routed_expert_weight_bytes,
             cross_memory_domain_placement,
             points,
             ..
-        } = assessment
-        else {
-            panic!("expected generation estimate")
-        };
+        } = assessment;
         (
             confidence,
             always_active_weight_bytes,
@@ -4856,56 +4850,5 @@ mod tests {
         let error = estimate_generation_performance(&dense, &calibration, 2, &[2], false)
             .expect_err("KV byte overflow must fail");
         assert_eq!(error.code, "workload_overflow");
-    }
-
-    #[test]
-    fn non_fitting_configuration_never_exposes_a_speed_estimate() {
-        let topology = test_topology(Vec::new(), 1, CapacityPolicy::default(), "linux", "x86_64");
-        let hardware = HardwareAssessment::DoesNotFit {
-            profile: HardwareProfile {
-                context_length: 200_000,
-                acceleration: "cpu".to_owned(),
-                device: "system".to_owned(),
-            },
-            memory: HardwareDeficit {
-                required_bytes: 2,
-                usable_capacity_bytes: 1,
-                deficit_bytes: 1,
-                domains: Vec::new(),
-                device_constraints: Vec::new(),
-            },
-            limiting_resource: "system".to_owned(),
-            alternative: None,
-        };
-        let performance = generation_performance(
-            &hardware,
-            &FitDecodeWorkloadAssessment::Available {
-                workload: workload(
-                    vec![tensor(
-                        "output.weight",
-                        FitTensorWorkloadKind::AlwaysActive,
-                        1,
-                        1,
-                        1,
-                        "CPU",
-                        "CPU",
-                    )],
-                    vec![kv_layer(0, 1, 0, false, "CPU", "CPU")],
-                    0,
-                    0,
-                ),
-            },
-            &[],
-            &topology,
-            Some(&calibration(vec![calibration_metric(
-                "CPU", "CPU", 1, false, 1_000.0,
-            )])),
-            8_192,
-        );
-        assert!(matches!(
-            performance,
-            GenerationPerformanceAssessment::Unavailable { ref code, .. }
-                if code == "configuration_does_not_fit"
-        ));
     }
 }

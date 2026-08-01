@@ -109,11 +109,7 @@ const fitAssessment = (
     configurationId: ModelServingConfigurationIdSchema.make(assessment.configurationId),
     assessmentId: OfferingAssessmentIdSchema.make(assessment.assessmentId),
     memory: assessment.memory.map(memoryAssessmentFromIcn),
-    performance: Option.flatMap(assessment.performance, Option.fromNullable),
-    performanceUnavailable: Option.flatMap(
-      assessment.performanceUnavailable,
-      Option.fromNullable,
-    ),
+    performance: assessment.performance,
   })
 })
 
@@ -198,7 +194,6 @@ export const LocalModelEvaluationsLive: Layer.Layer<
               profiles: profiles.map(servingProfileToIcn),
             })),
             capacityPolicy: { requiredReserveBytesPerMemoryDomain: REQUIRED_RESERVE_BYTES },
-            includePerformance: true,
           },
         })
         nativeResults.push(...response.results)

@@ -427,7 +427,6 @@ pub struct AssessModelRequest {
 pub struct AssessModelsRequest {
     pub requests: Vec<AssessModelRequest>,
     pub capacity_policy: CapacityPolicy,
-    pub include_performance: bool,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -460,16 +459,6 @@ pub struct PerformanceEvidence {
     pub estimated_tokens_per_second: f64,
     pub upper_tokens_per_second: f64,
     pub confidence: PerformanceConfidence,
-    pub method: String,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PerformanceUnavailable {
-    pub method: String,
-    pub code: String,
-    pub message: String,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -482,10 +471,7 @@ pub enum OfferingAssessment {
         configuration_id: ModelServingConfigurationId,
         assessment_id: OfferingAssessmentId,
         memory: Vec<MemoryAssessment>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        performance: Option<PerformanceEvidence>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        performance_unavailable: Option<PerformanceUnavailable>,
+        performance: PerformanceEvidence,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {

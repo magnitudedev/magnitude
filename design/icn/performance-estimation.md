@@ -80,7 +80,7 @@ efficiency constants, uncertainty bounds, or confidence labels.
 `icn-hardware` charges always-active operations and row lookups by their native operation bytes.
 Routed expert pools are charged by applying selected experts divided by total experts with checked,
 round-up integer arithmetic; router tensors and shared experts remain always active. Missing or
-inconsistent expert metadata makes performance unavailable rather than falling back to an
+inconsistent expert metadata fails execution assessment rather than falling back to an
 active-parameter ratio over the complete model.
 
 KV traffic is calculated from the native per-layer K/V row bytes. Full-attention layers scale with
@@ -124,17 +124,16 @@ dispersion with robust median-absolute-deviation and interquartile statistics. S
 two consecutive stable checks or at versioned sample and measurement budgets. A metric that reaches
 its budget without convergence remains usable evidence but is explicitly marked unstable.
 
-Calibration is performed at most once for one native-build, enabled-backend, topology, and
-calibration-policy identity while valid evidence is available. Successful calibration is stored in
-the shared disposable derived cache so daemon restarts and isolated planner workers reuse it.
-Evidence includes the native build, enabled backends, normalized topology, platform, architecture,
-operating-system and kernel versions, and native calibration method. A missing, malformed,
-mismatched, or older-than-policy entry is a cache miss. Transient calibration failures are never
-persisted. Calibration failure is non-fatal: memory fitting continues and performance is reported
-as unavailable. Calibration has explicit sample, measurement, and temporary-allocation bounds and
-releases all native resources before returning. Recommendation and assessment caches can be cleared
-without deleting compatible machine calibration; deleting all derived cache remains safe and causes
-the calibration to be measured again.
+For a CUDA installation, an isolated worker performs calibration during ICN startup. Its untimed
+warmup launches trigger PTX JIT and prove synchronized backend execution before the timed samples.
+The successful measurement is retained for the ICN process and reused by all assessment workers.
+Other backends measure lazily on the first performance request and likewise reuse the process result.
+Magnitude does not persist calibration across ICN restarts; the NVIDIA driver may independently
+reuse its native-code cache. CUDA startup preparation requires a successful CUDA metric, so its
+calibration failure is a backend startup failure. A later estimator-specific failure, or lazy
+calibration failure on another backend, fails execution assessment without changing the separate
+memory-fit result. Calibration has explicit sample, measurement, and temporary-allocation bounds
+and releases all native resources before returning.
 
 ## Estimate and confidence
 
@@ -142,16 +141,17 @@ In `icn-hardware`, time for each native operation class is derived from its cali
 tensor-read rate and dispatch overhead. Routed and dense matrix operations use different calibration
 evidence. K and V traffic is charged independently for every layer, with sliding-window limits and
 the layer's actual native device. The reciprocal of total predicted seconds per token is the raw
-generation rate. Estimator v5 applies ICN-owned upper efficiency factors of `0.82` for ordinary
+generation rate. ICN applies upper efficiency factors of `0.82` for ordinary
 dense decode and `0.75` for routed decode. Recurrent, sparse-attention, and compressed-attention
 workloads cap that factor at `0.72`, `0.68`, and `0.65` respectively to cover state-update,
 selection, gather, compression, and elementwise work outside calibrated matrix and memory traffic.
-Cross-memory-domain placement applies a further `0.88` factor. These are versioned estimator policy:
-any change requires a new ICN estimator method identity and cache evidence.
+Cross-memory-domain placement applies a further `0.88` factor. Changes are invalidated by the
+native build and the concrete workload, calibration, hardware, placement, and policy inputs in
+cache evidence.
 
 Every available result contains finite, positive lower, expected, and upper rates with
 `lower <= expected <= upper`. Bounds incorporate calibration dispersion and workload coverage.
-Estimator v5 starts with at least 12% uncertainty, weights observed calibration spread by `1.5`,
+The estimator starts with at least 12% uncertainty, weights observed calibration spread by `1.5`,
 and widens routed and cross-memory-domain estimates further. Confidence is high, moderate, or low
 and is lowered by missing exact operation calibration, routed-expert uncertainty,
 cross-memory-domain placement, or architecture work represented by a conservative related
@@ -159,22 +159,23 @@ calibration. Unified CPU/accelerator device ownership is not itself a reason to 
 An adaptive calibration metric that did not converge within its native budget also lowers
 confidence.
 When exact routed or quant calibration is absent but the same fitted device has valid related
-calibration, ICN returns a bounded hardware-specific estimate with lower confidence rather than
-suppressing the model. Structurally malformed workloads still return a typed unavailable result;
-zero, NaN, infinity, and an unqualified point estimate are invalid.
+calibration, ICN returns a bounded hardware-specific estimate with lower confidence. Structurally
+malformed workloads fail execution assessment; zero, NaN, infinity, and an unqualified point
+estimate are invalid.
 
-The evidence identity includes the ICN estimator method, native workload schema, native calibration
-schema, artifact content, execution policy, native build, enabled backends, topology, capacity
-policy, effective placement, and requested context points. Evidence identities are cache inputs,
-not cache schema versions.
+The cache identity includes the native workload schema and a digest of the concrete calibration
+method and metrics, plus artifact content, execution policy, native build, enabled backends,
+topology, capacity policy, effective placement, and requested context points. Calibration wall
+time is excluded because it does not affect estimation. A process establishes calibration before
+reading an execution cache, so a restart cannot reuse token rates produced by different
+measurements. These identities are cache inputs, not cache schema versions.
 
 ## Failure and lifecycle semantics
 
-Performance is independent of fit success. A calibration, workload, arithmetic, or decoding failure
-cannot change `Fits`, `DoesNotFit`, incompatibility, or native fit diagnostics. A profile without a
-runnable placement has no generation estimate. Operational failures needed to produce a memory fit
-remain ordinary operation failures; estimator-specific failures become typed unavailable evidence
-and retain their method, code, and message through the public assessment response.
+Capacity assessment and execution assessment are distinct operations. Capacity assessment contains
+only compatibility and memory fit. Complete execution assessment adds mandatory measured
+performance. Calibration, workload, arithmetic, or decoding failure fails execution assessment; it
+cannot change capacity facts into incompatibility or a successful empty result.
 
 Preview caches the composite profile assessment through the model-management cache. A complete
 batch cache hit is checked from the target identity before remote sparse-header materialization, so
@@ -183,14 +184,13 @@ is captured once per assessment or fit request and shared across every target/pr
 Product assessment and fitting estimate one full per-request context at parallelism one.
 Load-time expansion to additional full context partitions is a memory-allocation decision and does
 not change this single-user throughput evidence.
-Cache reads and writes retain the no-fail behavior of disposable caches. Persisted calibration is
-recomputable evidence, not a durable authority. Loading always replans, and installed-model runtime
-timing remains authoritative for observed performance.
+Cache reads and writes retain the no-fail behavior of disposable assessment caches. Loading always
+replans, and installed-model runtime timing remains authoritative for observed performance.
 
 ## Acceptance criteria
 
 - Preview never downloads or reads model tensor payloads to estimate performance.
-- Native memory-fit outcomes and byte accounting are unchanged when performance is unavailable.
+- Native memory-fit outcomes and byte accounting are unchanged when execution assessment fails.
 - The bindings expose workload and calibration facts but contain no throughput formula, confidence
   assignment, context policy, or recommendation semantics.
 - Dense, routed-expert, shared-expert, sliding-window, recurrent, compressed-attention,
@@ -207,8 +207,8 @@ timing remains authoritative for observed performance.
 - Calibration is bounded, reusable across profiles and artifacts, and never runs concurrently for
   the same evidence identity. Stable inputs use robust central estimates; measurements that do not
   converge retain explicit unstable evidence and lower downstream confidence.
-- Malformed native values and incomplete MoE metadata produce typed unavailable results. Missing
-  exact operation calibration uses a conservative same-device fallback and lowers confidence.
+- Malformed native values and incomplete MoE metadata fail execution assessment. Missing exact
+  operation calibration uses a conservative same-device fallback and lowers confidence.
 - Remote sparse and complete local forms of the same artifact produce identical model workloads.
 - Recommendation policy consumes only a complete estimate point matching the exact selected product
   context. Clients present the selected evidence but never reinterpret workload or throughput.

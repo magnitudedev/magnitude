@@ -13,13 +13,20 @@ const Host = Schema.Literal(
 )
 const BackendSchema = Schema.Literal("cpu", "metal", "cuda", "vulkan")
 
+const CudaPtxImage = Schema.Struct({
+  ptxVersion: Schema.String.pipe(Schema.pattern(/^\d+\.\d+$/)),
+  target: PositiveInt,
+  architectureSpecific: Schema.Boolean,
+  minimumDriverApi: PositiveInt,
+})
+
 const Compatibility = Schema.Union(
   Schema.Struct({ kind: Schema.Literal("metal") }),
   Schema.Struct({
     kind: Schema.Literal("cuda"),
-    toolkit: NonEmpty,
-    minimumDriverApi: PositiveInt,
-    minimumArchitecture: PositiveInt,
+    toolkitVersion: NonEmpty,
+    compiler: NonEmpty,
+    images: Schema.NonEmptyArray(CudaPtxImage),
   }),
   Schema.Struct({
     kind: Schema.Literal("vulkan"),

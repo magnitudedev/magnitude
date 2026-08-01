@@ -16,14 +16,25 @@ import {
 
 const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 
-export type LocalInferenceSelection = {
-  readonly kind: "running" | "stored" | "recommendation"
+type LocalInferenceSelectionBase = {
   readonly id: string
   readonly model: LocalModel
-  readonly recommendation: Option.Option<LocalModelRecommendation>
   readonly providerModelId: Option.Option<ProviderModelId>
   readonly reasoningEffort: Option.Option<ReasoningEffort>
 }
+
+export type LocalInferenceSelection = LocalInferenceSelectionBase & (
+  | {
+      readonly kind: "running" | "stored"
+      readonly recommendation: { readonly _tag: "None" }
+    }
+  | {
+      readonly kind: "recommendation"
+      readonly recommendation:
+        | { readonly _tag: "None" }
+        | { readonly _tag: "Recommended"; readonly value: LocalModelRecommendation }
+    }
+)
 
 const selectionKindOrder: Record<LocalInferenceSelection["kind"], number> = {
   running: 0,
@@ -43,13 +54,11 @@ const compareSelections = (
   right: LocalInferenceSelection,
 ): number => selectionKindOrder[left.kind] - selectionKindOrder[right.kind]
   || (left.kind === "recommendation" && right.kind === "recommendation"
-    ? Option.match(left.recommendation, {
-        onNone: () => 4,
-        onSome: ({ intent }) => recommendationIntentOrder[intent],
-      }) - Option.match(right.recommendation, {
-        onNone: () => 4,
-        onSome: ({ intent }) => recommendationIntentOrder[intent],
-      })
+    ? (left.recommendation._tag === "Recommended"
+      ? recommendationIntentOrder[left.recommendation.value.intent]
+      : 4) - (right.recommendation._tag === "Recommended"
+      ? recommendationIntentOrder[right.recommendation.value.intent]
+      : 4)
     : 0)
   || left.model.displayName.localeCompare(right.model.displayName)
 
@@ -86,7 +95,7 @@ export const buildLocalInferenceSelections = (
         id: `model:${model.targetId}`,
         kind: Option.exists(providerModelId, (id) => running.has(id)) ? "running" : "stored",
         model,
-        recommendation: Option.none(),
+        recommendation: { _tag: "None" },
         providerModelId,
         reasoningEffort: Option.flatMap(
           providerModel,
@@ -103,7 +112,7 @@ export const buildLocalInferenceSelections = (
           id: `recommendation:${recommendation.id}`,
           kind: "recommendation",
           model,
-          recommendation: Option.some(recommendation),
+          recommendation: { _tag: "Recommended", value: recommendation },
           providerModelId: Option.some(recommendation.candidate.providerModelId),
           reasoningEffort: recommendation.candidate.capabilities.reasoning.defaultEffort,
         }]
@@ -118,11 +127,12 @@ export const buildLocalInferenceSelections = (
       id: `download:${model.targetId}`,
       kind: "recommendation",
       model,
-      recommendation: Option.none(),
+      recommendation: { _tag: "None" },
       providerModelId: Option.fromNullable(model.providerModelIds[0]),
       reasoningEffort: Option.none(),
     }))
-  return [...stored, ...recommendations, ...transientDownloads].sort(compareSelections)
+  return [...stored, ...recommendations, ...transientDownloads]
+    .sort(compareSelections)
 }
 
 export const selectedInferenceIndex = (
@@ -340,10 +350,9 @@ export const selectionTitle = ({ model }: LocalInferenceSelection): string => mo
 
 export const selectionMetadata = ({ model, recommendation }: LocalInferenceSelection): string =>
   `${model.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
-    Option.match(recommendation, {
-      onNone: () => model.maximumContextLength,
-      onSome: ({ candidate }) => candidate.profile.contextLength,
-    }),
+    recommendation._tag === "Recommended"
+      ? recommendation.value.candidate.profile.contextLength
+      : model.maximumContextLength,
   )} ctx`
 
 export const selectionCapacityWarning = ({ model }: LocalInferenceSelection): string | null =>

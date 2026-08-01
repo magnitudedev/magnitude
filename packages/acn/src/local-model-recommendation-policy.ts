@@ -7,8 +7,6 @@ import {
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 
-export const RECOMMENDATION_POLICY_VERSION =
-  "local-model-multicriteria-v10-human-readable-fidelity"
 export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 10
 
 const MAX_RECOMMENDATIONS = 4
@@ -39,14 +37,12 @@ export interface RecommendationCatalogCandidate {
   readonly recommendation: Recommendation | undefined
 }
 
-const generationFor = (candidate: RecommendationCandidate) =>
-  Option.getOrUndefined(candidate.assessment.performance)
+const generationFor = (candidate: RecommendationCandidate) => candidate.assessment.performance
 
 export const conservativeGenerationSpeed = (
   candidate: RecommendationCandidate,
 ): number => {
   const generation = generationFor(candidate)
-  if (!generation) return 0
   if (generation.confidence === "high") return generation.estimatedTokensPerSecond
   if (generation.confidence === "moderate") {
     return (generation.lowerTokensPerSecond + generation.estimatedTokensPerSecond) / 2
@@ -73,8 +69,7 @@ const stableCompare = (
 
 const usable = (candidate: RecommendationCandidate): boolean => {
   const generation = generationFor(candidate)
-  return generation !== undefined
-    && generation.contextTokens === candidate.profile.contextLength
+  return generation.contextTokens === candidate.profile.contextLength
     && meetsUsabilityFloor(generation.estimatedTokensPerSecond)
     && (candidate.profile.contextLength === 100_000
       || candidate.profile.contextLength === 200_000)
@@ -95,8 +90,11 @@ const collapseLargestContext = (
     const current = byArtifact.get(candidate.artifactId)
     if (
       !current
-      || candidate.profile.contextLength > current.profile.contextLength
-      || (candidate.profile.contextLength === current.profile.contextLength
+      || Number(usable(candidate)) > Number(usable(current))
+      || (usable(candidate) === usable(current)
+        && candidate.profile.contextLength > current.profile.contextLength)
+      || (usable(candidate) === usable(current)
+        && candidate.profile.contextLength === current.profile.contextLength
         && stableCompare(candidate, current) < 0)
     ) {
       byArtifact.set(candidate.artifactId, candidate)
@@ -145,7 +143,6 @@ const speedUtility = (tokensPerSecond: number): number => clamp(
 
 export const balancedUtility = (candidate: RecommendationCandidate): number => {
   const generation = generationFor(candidate)
-  if (!generation) return Number.NEGATIVE_INFINITY
   const capability = (capabilityScore(candidate) ?? 50) / 100
   const memory = clamp(1 - candidate.estimatedLoadedBytes
     / Math.max(1, candidate.stableCapacityBudgetBytes))
@@ -168,8 +165,13 @@ const compareBalanced = (
 export const rankCatalogCandidates = (
   input: readonly RecommendationCandidate[],
 ): readonly RecommendationCandidate[] =>
-  [...collapseLargestContext(preferScoredCandidates(input.filter(usable)))]
-    .sort(compareBalanced)
+  [...collapseLargestContext(input)]
+    .sort((left, right) =>
+      Number(usable(right)) - Number(usable(left))
+        || (usable(left) && usable(right) ? compareBalanced(left, right) : 0)
+        || (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
+        || right.fidelityRank - left.fidelityRank
+        || stableCompare(left, right))
 
 export const assembleRecommendationCatalogCandidates = (
   input: readonly RecommendationCandidate[],
@@ -180,7 +182,10 @@ export const assembleRecommendationCatalogCandidates = (
   )
   const selected = recommendations.flatMap((recommendation) => {
     const candidate = candidatesByConfiguration.get(recommendation.configuration.id)
-    return candidate ? [{ candidate, recommendation }] : []
+    return candidate ? [{
+      candidate,
+      recommendation,
+    }] : []
   })
   const selectedArtifactIds = new Set(
     selected.map(({ candidate }) => candidate.artifactId),
@@ -189,7 +194,10 @@ export const assembleRecommendationCatalogCandidates = (
     ...selected,
     ...rankCatalogCandidates(input)
       .filter((candidate) => !selectedArtifactIds.has(candidate.artifactId))
-      .map((candidate) => ({ candidate, recommendation: undefined })),
+      .map((candidate) => ({
+        candidate,
+        recommendation: undefined,
+      })),
   ]
 }
 
@@ -200,8 +208,8 @@ const compareBestQuality = (
   || Number(measuredCapability(right)) - Number(measuredCapability(left))
   || right.fidelityRank - left.fidelityRank
   || right.profile.contextLength - left.profile.contextLength
-  || (generationFor(right)?.estimatedTokensPerSecond ?? 0)
-    - (generationFor(left)?.estimatedTokensPerSecond ?? 0)
+  || generationFor(right).estimatedTokensPerSecond
+    - generationFor(left).estimatedTokensPerSecond
   || stableCompare(left, right)
 
 const sameConfiguration = (
@@ -243,7 +251,7 @@ const shorterContextTradeoff = (
   : ""
 
 const describeBalanced = (candidate: RecommendationCandidate): string => {
-  const generation = generationFor(candidate)!
+  const generation = generationFor(candidate)
   return `Best overall mix of coding ability, speed, and memory use. Runs at about ${generation.estimatedTokensPerSecond.toFixed(1)} tokens/sec with ${Math.round(candidate.profile.contextLength / 1_000)}K context and ${qualitySummary(candidate)}.`
 }
 
@@ -251,7 +259,7 @@ const describeBestQuality = (
   candidate: RecommendationCandidate,
   balanced: RecommendationCandidate,
 ): string => {
-  const generation = generationFor(candidate)!
+  const generation = generationFor(candidate)
   const capabilityGain = (capabilityScore(candidate) ?? 0)
     - (capabilityScore(balanced) ?? 0)
   const reason = capabilityGain >= 5
@@ -265,7 +273,7 @@ const describeBestQuality = (
     ? ` It uses about ${memoryChange}% more memory than Balanced.`
     : ""
   const speed = generation.estimatedTokensPerSecond
-  const balancedSpeed = generationFor(balanced)!.estimatedTokensPerSecond
+  const balancedSpeed = generationFor(balanced).estimatedTokensPerSecond
   const speedTradeoff = speed < balancedSpeed * 0.95
     ? ` It is about ${percentDifference(speed, balancedSpeed)}% slower than Balanced.`
     : " It runs at nearly the same speed as Balanced."
@@ -276,8 +284,8 @@ const describeFastest = (
   candidate: RecommendationCandidate,
   balanced: RecommendationCandidate,
 ): string => {
-  const generation = generationFor(candidate)!
-  const balancedSpeed = generationFor(balanced)!.estimatedTokensPerSecond
+  const generation = generationFor(candidate)
+  const balancedSpeed = generationFor(balanced).estimatedTokensPerSecond
   const speedGain = generation.estimatedTokensPerSecond >= balancedSpeed * 1.05
     ? `About ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% faster than Balanced, at roughly ${generation.estimatedTokensPerSecond.toFixed(1)} tokens/sec.`
     : `Prioritizes responsiveness at roughly ${generation.estimatedTokensPerSecond.toFixed(1)} tokens/sec.`
@@ -292,7 +300,7 @@ const describeLightweight = (
   candidate: RecommendationCandidate,
   balanced: RecommendationCandidate,
 ): string => {
-  const generation = generationFor(candidate)!
+  const generation = generationFor(candidate)
   const loadedMemoryReduction = Math.max(0, Math.round(
     (1 - candidate.estimatedLoadedBytes / balanced.estimatedLoadedBytes) * 100,
   ))
@@ -302,7 +310,7 @@ const describeLightweight = (
   const reduction = loadedMemoryReduction >= downloadReduction
     ? `${loadedMemoryReduction}% less memory while loaded`
     : `${downloadReduction}% less disk space`
-  const balancedSpeed = generationFor(balanced)!.estimatedTokensPerSecond
+  const balancedSpeed = generationFor(balanced).estimatedTokensPerSecond
   const speedTradeoff = generation.estimatedTokensPerSecond < balancedSpeed * 0.95
     ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% slower than Balanced.`
     : generation.estimatedTokensPerSecond > balancedSpeed * 1.05

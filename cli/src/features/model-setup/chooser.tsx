@@ -52,29 +52,21 @@ const intentLabel = (intent: "balanced" | "best_quality" | "fastest" | "lightwei
 const actionLabel = (selection: LocalInferenceSelection): string => {
   if (selection.kind === "running") return "Loaded"
   if (selection.kind === "recommendation") {
-    return Option.match(selection.recommendation, {
-      onNone: () => "Download",
-      onSome: ({ intent }) => intentLabel(intent),
-    })
+    return selection.recommendation._tag === "Recommended"
+      ? intentLabel(selection.recommendation.value.intent)
+      : "Download"
   }
   return Option.isSome(selection.providerModelId) ? "Load" : "Unavailable"
 }
 
 const onboardingSelection = (
   selection: LocalInferenceSelection,
-): ProviderModelId | null => {
-  if (Option.isSome(selection.recommendation)) {
-    return selection.recommendation.value.candidate.providerModelId
-  }
-  return Option.getOrNull(selection.providerModelId)
-}
+): ProviderModelId | null => Option.getOrNull(selection.providerModelId)
 
 const matchesOnboardingSelection = (
   selection: LocalInferenceSelection,
   submitted: ProviderModelId,
 ): boolean => Option.contains(selection.providerModelId, submitted)
-  || Option.exists(selection.recommendation, ({ candidate }) =>
-    candidate.providerModelId === submitted)
 
 const ModelRow = ({
   selection,
@@ -264,7 +256,7 @@ export function OnboardingModelChooser({
   const selections = useMemo(() =>
     buildLocalInferenceSelections(models, catalog, slots).filter((selection) =>
       selection.kind === "recommendation"
-        ? Option.isSome(selection.recommendation)
+        ? selection.recommendation._tag === "Recommended"
         : Option.isSome(selection.providerModelId)), [catalog, models, slots])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const activeSelectionId = operation === null
@@ -315,7 +307,10 @@ export function OnboardingModelChooser({
       })
       return
     }
-    if (selection.kind === "recommendation" && Option.isSome(selection.recommendation)) {
+    if (
+      selection.kind === "recommendation"
+      && selection.recommendation._tag === "Recommended"
+    ) {
       const candidate = selection.recommendation.value.candidate
       onDownload({
         targetId: candidate.targetId,
@@ -413,13 +408,14 @@ export function OnboardingModelChooser({
     </box>
   )
 
-  const recommendationIntent = selected && Option.isSome(selected.recommendation)
+  const recommendationIntent = selected?.recommendation._tag === "Recommended"
     ? intentLabel(selected.recommendation.value.intent)
     : null
   const titleNameWidth = Math.max(
     1,
     detailWidth - (recommendationIntent ? recommendationIntent.length + 3 : 0),
   )
+  const emptySelectionMessage = "No compatible models found."
   const regularDetails = selected ? (
     <>
       <DetailRow width={detailWidth}>
@@ -438,9 +434,9 @@ export function OnboardingModelChooser({
         </text>
       </DetailRow>
       <DetailRow width={detailWidth}>
-        {Option.isSome(selected.recommendation) && Option.isSome(selected.recommendation.value.candidate.estimatedTokensPerSecond) && (
+        {selected.recommendation._tag === "Recommended" && (
           <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
-            {`~${Math.round(selected.recommendation.value.candidate.estimatedTokensPerSecond.value)} tok/s at ${formatContext(selected.recommendation.value.candidate.profile.contextLength)} ctx`}
+            {`~${Math.round(selected.recommendation.value.candidate.estimatedTokensPerSecond)} tok/s at ${formatContext(selected.recommendation.value.candidate.profile.contextLength)} ctx`}
           </text>
         )}
       </DetailRow>
@@ -455,7 +451,7 @@ export function OnboardingModelChooser({
         overflow: "hidden",
       }}>
         <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="word">
-          {Option.isSome(selected.recommendation)
+          {selected.recommendation._tag === "Recommended"
             ? selected.recommendation.value.explanation
             : selected.kind === "running"
               ? "Loaded in memory and ready to use."
@@ -471,7 +467,7 @@ export function OnboardingModelChooser({
       </DetailRow>
     </>
   ) : (
-    <text style={{ fg: theme.muted }}>No compatible models found.</text>
+    <text style={{ fg: theme.muted }}>{emptySelectionMessage}</text>
   )
   const detailsContent = operation?._tag === "Downloading" ? (
     <OnboardingModelDownloadDetails

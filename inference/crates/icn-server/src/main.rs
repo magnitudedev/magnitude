@@ -13,7 +13,8 @@ use icn_api::{
     AppState, FakeBackend, ModelInstanceController, ModelInstanceLease, ServerIdentity, app,
 };
 use icn_contracts::bootstrap_protocol::{
-    IcnInstallationBackend, IcnStartupRecord, IcnStartupRecordType,
+    IcnInstallationBackend, IcnStartupBackend, IcnStartupProgressRecord,
+    IcnStartupProgressRecordType, IcnStartupRecord, IcnStartupRecordType,
 };
 use icn_contracts::models::{
     AssessModelResult, AssessModelsRequest, AssessModelsResponse, AssessmentEnvironmentId,
@@ -24,9 +25,8 @@ use icn_contracts::models::{
     ModelLoadStage, ModelOfferingTarget as DomainModelOfferingTarget, ModelPackageId,
     ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
     ModelServingConfigurationId, ModelStoppingAllocation, ModelTargetInput, OfferingAssessment,
-    OfferingAssessmentId, PerformanceConfidence, PerformanceEvidence, PerformanceUnavailable,
-    PreviewModelLoadRequest, RemoveInstalledModelPackageResponse,
-    ServingProfile as DomainServingProfile,
+    OfferingAssessmentId, PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
+    RemoveInstalledModelPackageResponse, ServingProfile as DomainServingProfile,
 };
 use icn_contracts::{
     CacheType, CompletionBackend, ComponentRole, ExecutionConfig, ExecutionIntent, FlashAttention,
@@ -38,10 +38,9 @@ use icn_contracts::{
 use icn_engine::{ModelLoadObserver, MtpCandidateSelection, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedModelDownloads, ModelCache, ModelIndexKind, ModelManager,
-    ModelPreviewService, ReleaseCatalog, ReleaseRecommendableCatalog,
-    ResolvingRecommendableCatalog, canonical_package_id, load_release_catalog, offering_target_id,
-    release_catalog_manifest,
+    InventoryConfig, ManagedModelDownloads, ModelCache, ModelManager, ModelPreviewService,
+    ReleaseCatalog, ReleaseRecommendableCatalog, ResolvingRecommendableCatalog,
+    canonical_package_id, load_release_catalog, offering_target_id, release_catalog_manifest,
 };
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -127,6 +126,11 @@ enum Command {
     Version {
         #[arg(long)]
         json: bool,
+    },
+    #[command(hide = true)]
+    PrepareBackendWorker {
+        #[command(flatten)]
+        runtime: NativeWorkerArgs,
     },
     #[command(hide = true)]
     PlanWorker {
@@ -785,9 +789,7 @@ struct NativeHardwareAssessor {
 
 #[derive(Default)]
 struct CalibrationCache {
-    topology_fingerprint: Option<String>,
-    evidence: Option<String>,
-    result: Option<Result<llama_cpp_2::model::params::fit::FitCalibration, String>>,
+    value: Option<llama_cpp_2::model::params::fit::FitCalibration>,
 }
 
 type NativeAssessorServices = (
@@ -816,35 +818,7 @@ fn native_assessor_services(
     (assessor, native_executor)
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct PersistedCalibration {
-    captured_at: u64,
-    calibration: llama_cpp_2::model::params::fit::FitCalibration,
-}
-
 const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
-const CALIBRATION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
-
-fn unix_time_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn calibration_evidence(snapshot: &HardwareSnapshot) -> Result<String, InventoryError> {
-    serde_json::to_string(&(
-        llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
-        &snapshot.native_build,
-        &snapshot.enabled_backends,
-        &snapshot.topology_fingerprint,
-        &snapshot.platform,
-        &snapshot.architecture,
-        sysinfo::System::long_os_version(),
-        sysinfo::System::kernel_long_version(),
-    ))
-    .map_err(|error| InventoryError::Internal(error.to_string()))
-}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PlanningWorkerRequest {
@@ -853,15 +827,27 @@ struct PlanningWorkerRequest {
     projector: Option<PathBuf>,
     mtp: Vec<PathBuf>,
     defaults: Vec<ModelPlanDefaults>,
-    estimate_performance: bool,
-    calibration: Option<llama_cpp_2::model::params::fit::FitCalibration>,
-    calibration_unavailable: Option<String>,
+    operation: PlanningOperation,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct PlanningWorkerResponse {
-    assessments: Vec<ModelExecutionAssessment>,
-    calibration: Option<Result<llama_cpp_2::model::params::fit::FitCalibration, String>>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PlanningOperation {
+    Capacity,
+    Execution {
+        calibration: llama_cpp_2::model::params::fit::FitCalibration,
+    },
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PlanningWorkerResponse {
+    Capacity {
+        assessments: Vec<HardwareAssessment>,
+    },
+    Execution {
+        assessments: Vec<ModelExecutionAssessment>,
+    },
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -923,6 +909,68 @@ const LOW_MEMORY_FAILURE_CODE: &str = "low_memory";
 const TEMPLATE_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl NativeHardwareAssessor {
+    async fn fit_calibration(
+        &self,
+    ) -> Result<llama_cpp_2::model::params::fit::FitCalibration, InventoryError> {
+        // Hold the lock through measurement so concurrent first-use assessments share one
+        // concrete process calibration and therefore one execution-cache identity.
+        let mut state = self.calibration.lock().await;
+        if let Some(calibration) = &state.value {
+            return Ok(calibration.clone());
+        }
+        let launcher = self.worker_launcher.clone();
+        let calibration =
+            spawn_blocking_traced(move || run_isolated_backend_preparation(&launcher))
+                .await
+                .map_err(|error| InventoryError::Internal(error.to_string()))?
+                .map_err(|error| {
+                    InventoryError::Internal(format!("backend calibration failed: {error:#}"))
+                })?;
+        let stable_metrics = calibration
+            .metrics
+            .iter()
+            .filter(|metric| metric.stable)
+            .count();
+        let total_samples = calibration
+            .metrics
+            .iter()
+            .map(|metric| u64::from(metric.sample_count))
+            .sum::<u64>();
+        tracing::info!(
+            method = calibration.method,
+            elapsed_microseconds = calibration.elapsed_microseconds,
+            metrics = calibration.metrics.len(),
+            stable_metrics,
+            total_samples,
+            "hardware calibration completed"
+        );
+        state.value = Some(calibration.clone());
+        Ok(calibration)
+    }
+
+    fn calibration_identity(
+        calibration: &llama_cpp_2::model::params::fit::FitCalibration,
+    ) -> Result<String, InventoryError> {
+        let bytes = serde_json::to_vec(&(&calibration.method, &calibration.metrics))
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        Ok(format!("calibration_{:x}", Sha256::digest(bytes)))
+    }
+
+    async fn prepare_cuda_backend(&self) -> Result<(), InventoryError> {
+        HardwareProvider::snapshot(self).await?;
+        let calibration = self.fit_calibration().await?;
+        if !calibration
+            .metrics
+            .iter()
+            .any(|metric| metric.backend.eq_ignore_ascii_case("CUDA"))
+        {
+            return Err(InventoryError::Internal(
+                "backend preparation executed no CUDA calibration operation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn assessment_work_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.assessment_work_gates.lock().await;
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -964,12 +1012,9 @@ impl NativeHardwareAssessor {
         resolved: ResolvedModel,
         profiles: Vec<ModelPreviewProfile>,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
-        Ok(self
-            .assess_resolved_plans(resolved, profiles, false)
-            .await?
-            .into_iter()
-            .map(|assessment| assessment.hardware)
-            .collect())
+        let hardware = HardwareProvider::snapshot(self).await?;
+        self.assess_resolved_capacity_plans_with_hardware(resolved, profiles, hardware)
+            .await
     }
 
     async fn assess_resolved_execution_profiles(
@@ -977,17 +1022,8 @@ impl NativeHardwareAssessor {
         resolved: ResolvedModel,
         profiles: Vec<ModelPreviewProfile>,
     ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
-        self.assess_resolved_plans(resolved, profiles, true).await
-    }
-
-    async fn assess_resolved_plans(
-        &self,
-        resolved: ResolvedModel,
-        profiles: Vec<ModelPreviewProfile>,
-        estimate_performance: bool,
-    ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
         let hardware = HardwareProvider::snapshot(self).await?;
-        self.assess_resolved_plans_with_hardware(resolved, profiles, estimate_performance, hardware)
+        self.assess_resolved_execution_plans_with_hardware(resolved, profiles, hardware)
             .await
     }
 
@@ -997,10 +1033,10 @@ impl NativeHardwareAssessor {
         profiles: Vec<ModelPreviewProfile>,
         snapshot: &HardwareSnapshot,
         configuration_id: &ModelServingConfigurationId,
-    ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
+    ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         let Some(cache) = self.cache.clone() else {
             return self
-                .assess_resolved_plans_with_hardware(resolved, profiles, false, snapshot.clone())
+                .assess_resolved_capacity_plans_with_hardware(resolved, profiles, snapshot.clone())
                 .await;
         };
         let topology = icn_contracts::MemoryTopology::from_snapshot(snapshot).ok_or_else(|| {
@@ -1010,10 +1046,11 @@ impl NativeHardwareAssessor {
         let mut entries = profiles
             .into_iter()
             .map(|profile| {
-                let planner_evidence = self.assessment_cache_key(Some(&profile), snapshot)?;
+                let planner_evidence =
+                    self.capacity_assessment_cache_key(Some(&profile), snapshot)?;
                 let evidence = serde_json::to_string(&(&configuration_id.0, planner_evidence))
                     .map_err(|error| InventoryError::Internal(error.to_string()))?;
-                let assessment = cache.read_execution_assessment(&content_id, &evidence, &topology);
+                let assessment = cache.read_hardware_assessment(&content_id, &evidence, &topology);
                 Ok((profile, evidence, assessment))
             })
             .collect::<Result<Vec<_>, InventoryError>>()?;
@@ -1037,7 +1074,7 @@ impl NativeHardwareAssessor {
                 .await;
             for (_, evidence, assessment) in &mut entries {
                 if assessment.is_none() {
-                    *assessment = cache.read_execution_assessment(&content_id, evidence, &topology);
+                    *assessment = cache.read_hardware_assessment(&content_id, evidence, &topology);
                 }
             }
             let missing = entries
@@ -1059,13 +1096,12 @@ impl NativeHardwareAssessor {
                 let planned = tokio::spawn(async move {
                     let _cache_guard = cache_guard;
                     let measured = assessor
-                        .assess_resolved_plans_with_hardware(
+                        .assess_resolved_capacity_plans_with_hardware(
                             resolved,
                             missing
                                 .iter()
                                 .map(|(_, profile, _)| profile.clone())
                                 .collect(),
-                            false,
                             task_hardware,
                         )
                         .await?;
@@ -1080,7 +1116,7 @@ impl NativeHardwareAssessor {
                             .into_iter()
                             .zip(measured)
                             .map(|((index, _, evidence), assessment)| {
-                                task_cache.write_execution_assessment(
+                                task_cache.write_hardware_assessment(
                                     &task_content_id,
                                     &evidence,
                                     &assessment,
@@ -1111,13 +1147,13 @@ impl NativeHardwareAssessor {
             .collect()
     }
 
-    async fn assess_resolved_plans_with_hardware(
+    async fn run_resolved_plans_with_hardware(
         &self,
         resolved: ResolvedModel,
         profiles: Vec<ModelPreviewProfile>,
         estimate_performance: bool,
         hardware: HardwareSnapshot,
-    ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
+    ) -> Result<PlanningWorkerResponse, InventoryError> {
         let id = resolved.model.id.clone();
         let primary = resolved
             .components
@@ -1150,24 +1186,10 @@ impl NativeHardwareAssessor {
                 .map(|profile| self.effective_defaults(Some(profile)))
                 .collect()
         };
-        // Hardware-only planning never calibrates. For execution assessment, only the first
-        // request holds the calibration lock across native planning. Once a model-free result is
-        // cached, concurrent model inspections proceed independently through the bounded pool.
-        let mut calibration_guard = if estimate_performance {
-            Some(self.calibration.lock().await)
+        let calibration = if estimate_performance {
+            Some(self.fit_calibration().await?)
         } else {
             None
-        };
-        let calibration_result = calibration_guard
-            .as_ref()
-            .and_then(|guard| guard.result.as_ref().cloned());
-        if calibration_result.is_some() {
-            calibration_guard.take();
-        }
-        let (calibration, calibration_unavailable) = match calibration_result {
-            Some(Ok(calibration)) => (Some(calibration), None),
-            Some(Err(error)) => (None, Some(error)),
-            None => (None, None),
         };
         let request = PlanningWorkerRequest {
             hardware,
@@ -1175,9 +1197,13 @@ impl NativeHardwareAssessor {
             projector,
             mtp,
             defaults,
-            estimate_performance,
-            calibration,
-            calibration_unavailable,
+            operation: if estimate_performance {
+                PlanningOperation::Execution {
+                    calibration: calibration.expect("execution planning established calibration"),
+                }
+            } else {
+                PlanningOperation::Capacity
+            },
         };
         let permit = Arc::clone(&self.planning_slots)
             .acquire_owned()
@@ -1204,51 +1230,66 @@ impl NativeHardwareAssessor {
                 )));
             }
         };
-        if let Some(mut guard) = calibration_guard
-            && guard.result.is_none()
-            && let Some(calibration) = response.calibration.clone()
-        {
-            if let Ok(value) = &calibration
-                && let Some(evidence) = guard.evidence.as_deref()
-                && let Some(cache) = &self.cache
-            {
-                let stable_metrics = value.metrics.iter().filter(|metric| metric.stable).count();
-                let total_samples = value
-                    .metrics
-                    .iter()
-                    .map(|metric| u64::from(metric.sample_count))
-                    .sum::<u64>();
-                tracing::info!(
-                    method = value.method,
-                    elapsed_microseconds = value.elapsed_microseconds,
-                    metrics = value.metrics.len(),
-                    stable_metrics,
-                    total_samples,
-                    "hardware calibration completed"
-                );
-                cache.write_index(
-                    ModelIndexKind::Calibration,
-                    evidence,
-                    &PersistedCalibration {
-                        captured_at: unix_time_seconds(),
-                        calibration: value.clone(),
-                    },
-                );
-            }
-            guard.result = Some(calibration);
-        }
-        Ok(response.assessments)
+        Ok(response)
     }
 
-    fn assessment_cache_key(
+    async fn assess_resolved_capacity_plans_with_hardware(
+        &self,
+        resolved: ResolvedModel,
+        profiles: Vec<ModelPreviewProfile>,
+        hardware: HardwareSnapshot,
+    ) -> Result<Vec<HardwareAssessment>, InventoryError> {
+        match self
+            .run_resolved_plans_with_hardware(resolved, profiles, false, hardware)
+            .await?
+        {
+            PlanningWorkerResponse::Capacity { assessments } => Ok(assessments),
+            PlanningWorkerResponse::Execution { .. } => Err(InventoryError::Internal(
+                "capacity planner returned execution assessments".to_owned(),
+            )),
+        }
+    }
+
+    async fn assess_resolved_execution_plans_with_hardware(
+        &self,
+        resolved: ResolvedModel,
+        profiles: Vec<ModelPreviewProfile>,
+        hardware: HardwareSnapshot,
+    ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
+        match self
+            .run_resolved_plans_with_hardware(resolved, profiles, true, hardware)
+            .await?
+        {
+            PlanningWorkerResponse::Execution { assessments, .. } => Ok(assessments),
+            PlanningWorkerResponse::Capacity { .. } => Err(InventoryError::Internal(
+                "execution planner returned capacity assessments".to_owned(),
+            )),
+        }
+    }
+
+    fn capacity_assessment_cache_key(
         &self,
         profile: Option<&ModelPreviewProfile>,
         snapshot: &HardwareSnapshot,
     ) -> Result<String, InventoryError> {
         serde_json::to_string(&(
-            icn_hardware::GENERATION_PERFORMANCE_METHOD,
+            &snapshot.native_build,
+            &snapshot.enabled_backends,
+            &snapshot.topology_fingerprint,
+            self.effective_defaults(profile),
+        ))
+        .map_err(|error| InventoryError::Internal(error.to_string()))
+    }
+
+    async fn execution_assessment_cache_key(
+        &self,
+        profile: Option<&ModelPreviewProfile>,
+        snapshot: &HardwareSnapshot,
+    ) -> Result<String, InventoryError> {
+        let calibration = self.fit_calibration().await?;
+        serde_json::to_string(&(
             llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
-            llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
+            Self::calibration_identity(&calibration)?,
             &snapshot.native_build,
             &snapshot.enabled_backends,
             &snapshot.topology_fingerprint,
@@ -1258,14 +1299,14 @@ impl NativeHardwareAssessor {
     }
 
     #[cfg(test)]
-    fn assessment_cache_key_with_policy(
+    fn capacity_assessment_cache_key_with_policy(
         &self,
         profile: Option<&ModelPreviewProfile>,
         snapshot: &HardwareSnapshot,
         capacity_policy: CapacityPolicy,
     ) -> Result<String, InventoryError> {
         let snapshot = icn_hardware::with_capacity_policy(snapshot.clone(), capacity_policy);
-        self.assessment_cache_key(profile, &snapshot)
+        self.capacity_assessment_cache_key(profile, &snapshot)
     }
 }
 
@@ -1341,47 +1382,41 @@ impl NativeModelEvaluator {
         target
     }
 
-    fn assessment_evidence(
+    async fn assessment_evidence(
         &self,
         target_id: &icn_contracts::models::ModelOfferingTargetId,
         profiles: &[DomainServingProfile],
         reserve_bytes: u64,
-        include_performance: bool,
         environment: &AssessmentEnvironment,
     ) -> Result<Vec<String>, InventoryError> {
+        let calibration = self.assessor.fit_calibration().await?;
+        let calibration_identity = NativeHardwareAssessor::calibration_identity(&calibration)?;
         profiles
             .iter()
             .map(|profile| {
                 serde_json::to_string(&(
-                    icn_hardware::GENERATION_PERFORMANCE_METHOD,
                     llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
-                    llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD,
+                    &calibration_identity,
                     &environment.id.0,
                     &target_id.0,
                     profile.context_length,
                     reserve_bytes,
-                    include_performance,
                 ))
                 .map_err(|error| InventoryError::Internal(error.to_string()))
             })
             .collect()
     }
 
-    fn cached_profiles(
+    async fn cached_profiles(
         &self,
         target_id: &icn_contracts::models::ModelOfferingTargetId,
         profiles: &[DomainServingProfile],
         reserve_bytes: u64,
-        include_performance: bool,
         environment: &AssessmentEnvironment,
     ) -> Result<Option<Vec<OfferingAssessment>>, InventoryError> {
-        let evidence = self.assessment_evidence(
-            target_id,
-            profiles,
-            reserve_bytes,
-            include_performance,
-            environment,
-        )?;
+        let evidence = self
+            .assessment_evidence(target_id, profiles, reserve_bytes, environment)
+            .await?;
         let results = evidence
             .iter()
             .map(|key| {
@@ -1397,19 +1432,14 @@ impl NativeModelEvaluator {
         resolved: &icn_contracts::models::ResolvedModelTarget,
         profiles: &[DomainServingProfile],
         reserve_bytes: u64,
-        include_performance: bool,
         environment: &AssessmentEnvironment,
     ) -> Result<Vec<OfferingAssessment>, InventoryError> {
         let hardware = &environment.snapshot;
         let thresholds = icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes);
         let system_reserve_bytes = reserve_bytes.max(thresholds.assess_reserve_bytes);
-        let evidence = self.assessment_evidence(
-            &resolved.target_id,
-            profiles,
-            reserve_bytes,
-            include_performance,
-            environment,
-        )?;
+        let evidence = self
+            .assessment_evidence(&resolved.target_id, profiles, reserve_bytes, environment)
+            .await?;
         let mut results = evidence
             .iter()
             .map(|key| {
@@ -1438,10 +1468,9 @@ impl NativeModelEvaluator {
             .collect::<Vec<_>>();
         let assessed = self
             .assessor
-            .assess_resolved_plans_with_hardware(
+            .assess_resolved_execution_plans_with_hardware(
                 Self::resolved_for_planning(resolved),
                 native_profiles,
-                include_performance,
                 environment.snapshot.clone(),
             )
             .await?;
@@ -1453,7 +1482,7 @@ impl NativeModelEvaluator {
                 system_reserve_bytes,
                 thresholds.warning_reserve_bytes,
                 assessment,
-            );
+            )?;
             self.models
                 .write_offering_assessment(&evidence[index], &assessment);
             results[index] = Some(assessment);
@@ -1462,6 +1491,30 @@ impl NativeModelEvaluator {
             .into_iter()
             .map(|assessment| assessment.expect("missing assessment was populated"))
             .collect())
+    }
+
+    async fn assess_capacity_profiles(
+        &self,
+        resolved: &icn_contracts::models::ResolvedModelTarget,
+        profiles: &[DomainServingProfile],
+        environment: &AssessmentEnvironment,
+    ) -> Result<Vec<HardwareAssessment>, InventoryError> {
+        let native_profiles = profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| ModelPreviewProfile {
+                id: format!("capacity-{index}"),
+                context_length: profile.context_length,
+                parallel_sequences: 1,
+            })
+            .collect();
+        self.assessor
+            .assess_resolved_capacity_plans_with_hardware(
+                Self::resolved_for_planning(resolved),
+                native_profiles,
+                environment.snapshot.clone(),
+            )
+            .await
     }
 
     async fn fit_one(
@@ -1502,74 +1555,81 @@ impl NativeModelEvaluator {
         let mut lower = request.minimum_context_length;
         let mut upper = maximum_context;
         let upper_assessment = self
-            .assess_profiles(
+            .assess_capacity_profiles(
                 resolved,
                 &[DomainServingProfile {
                     context_length: upper,
                 }],
-                reserve,
-                false,
                 environment,
             )
             .await?
             .pop()
             .expect("one requested profile produces one assessment");
         let mut best_context =
-            matches!(upper_assessment, OfferingAssessment::Fits { .. }).then_some(upper);
+            matches!(upper_assessment, HardwareAssessment::Fits { .. }).then_some(upper);
         if best_context.is_none() {
             let minimum = self
-                .assess_profiles(
+                .assess_capacity_profiles(
                     resolved,
                     &[DomainServingProfile {
                         context_length: lower,
                     }],
-                    reserve,
-                    false,
                     environment,
                 )
                 .await?
                 .pop()
                 .expect("one requested profile produces one assessment");
-            if !matches!(minimum, OfferingAssessment::Fits { .. }) {
+            if !matches!(minimum, HardwareAssessment::Fits { .. }) {
                 return Ok(match minimum {
-                    OfferingAssessment::DoesNotFit {
+                    HardwareAssessment::DoesNotFit {
                         limiting_resource,
-                        deficit_bytes,
+                        memory,
                         ..
                     } => FitModelResult::DoesNotFit {
                         request_id: icn_contracts::models::ModelAssessmentRequestId(String::new()),
                         target_id: resolved.target_id.clone(),
                         limiting_resource,
-                        deficit_bytes,
+                        deficit_bytes: memory.deficit_bytes,
                     },
-                    OfferingAssessment::Incompatible { failure, .. } => {
+                    HardwareAssessment::InvalidArtifact { code, message }
+                    | HardwareAssessment::IncompatibleArtifact { code, message } => {
                         FitModelResult::InvalidTarget {
                             request_id: icn_contracts::models::ModelAssessmentRequestId(
                                 String::new(),
                             ),
-                            failure,
+                            failure: DomainModelFailure {
+                                code,
+                                message,
+                                retryable: false,
+                            },
                         }
                     }
-                    OfferingAssessment::Fits { .. } => unreachable!(),
+                    HardwareAssessment::NotAssessed { reason } => FitModelResult::InvalidTarget {
+                        request_id: icn_contracts::models::ModelAssessmentRequestId(String::new()),
+                        failure: DomainModelFailure {
+                            code: "not_assessed".to_owned(),
+                            message: reason,
+                            retryable: true,
+                        },
+                    },
+                    HardwareAssessment::Fits { .. } => unreachable!(),
                 });
             }
             best_context = Some(lower);
             while lower + 1 < upper {
                 let middle = lower + (upper - lower) / 2;
                 let assessment = self
-                    .assess_profiles(
+                    .assess_capacity_profiles(
                         resolved,
                         &[DomainServingProfile {
                             context_length: middle,
                         }],
-                        reserve,
-                        false,
                         environment,
                     )
                     .await?
                     .pop()
                     .expect("one requested profile produces one assessment");
-                if matches!(assessment, OfferingAssessment::Fits { .. }) {
+                if matches!(assessment, HardwareAssessment::Fits { .. }) {
                     lower = middle;
                     best_context = Some(middle);
                 } else {
@@ -1584,7 +1644,6 @@ impl NativeModelEvaluator {
                 resolved,
                 std::slice::from_ref(&profile),
                 reserve,
-                true,
                 environment,
             )
             .await?
@@ -1621,7 +1680,7 @@ fn offering_assessment(
     system_reserve_bytes: u64,
     warning_reserve_bytes: u64,
     assessment: ModelExecutionAssessment,
-) -> OfferingAssessment {
+) -> Result<OfferingAssessment, InventoryError> {
     let context_tokens = profile.context_length;
     let configuration_id = serving_configuration_id(target_id, &profile);
     let mut digest = Sha256::new();
@@ -1630,11 +1689,24 @@ fn offering_assessment(
     digest.update(reserve_bytes.to_le_bytes());
     digest.update(system_reserve_bytes.to_le_bytes());
     let assessment_id = OfferingAssessmentId(format!("assessment_{:x}", digest.finalize()));
-    match assessment.hardware {
+    let (hardware, performance) = match assessment {
+        ModelExecutionAssessment::Executable {
+            hardware,
+            performance,
+        } => (hardware, Some(performance)),
+        ModelExecutionAssessment::NotExecutable { hardware } => (hardware, None),
+    };
+    match hardware {
         HardwareAssessment::Fits { memory, .. } => {
-            let (performance, performance_unavailable) =
-                performance_result(assessment.performance, context_tokens);
-            OfferingAssessment::Fits {
+            let performance = performance_result(
+                performance.ok_or_else(|| {
+                    InventoryError::Internal(
+                        "executable hardware assessment omitted measured performance".to_owned(),
+                    )
+                })?,
+                context_tokens,
+            )?;
+            Ok(OfferingAssessment::Fits {
                 profile,
                 configuration_id,
                 assessment_id,
@@ -1664,14 +1736,13 @@ fn offering_assessment(
                     })
                     .collect(),
                 performance,
-                performance_unavailable,
-            }
+            })
         }
         HardwareAssessment::DoesNotFit {
             memory,
             limiting_resource,
             ..
-        } => OfferingAssessment::DoesNotFit {
+        } => Ok(OfferingAssessment::DoesNotFit {
             profile,
             configuration_id,
             assessment_id,
@@ -1700,18 +1771,9 @@ fn offering_assessment(
                 .collect(),
             limiting_resource,
             deficit_bytes: memory.deficit_bytes.max(1),
-        },
-        HardwareAssessment::InvalidArtifact { code, message } => OfferingAssessment::Incompatible {
-            profile,
-            configuration_id,
-            failure: DomainModelFailure {
-                code,
-                message,
-                retryable: false,
-            },
-        },
-        HardwareAssessment::IncompatibleArtifact { code, message } => {
-            OfferingAssessment::Incompatible {
+        }),
+        HardwareAssessment::InvalidArtifact { code, message } => {
+            Ok(OfferingAssessment::Incompatible {
                 profile,
                 configuration_id,
                 failure: DomainModelFailure {
@@ -1719,9 +1781,20 @@ fn offering_assessment(
                     message,
                     retryable: false,
                 },
-            }
+            })
         }
-        HardwareAssessment::NotAssessed { reason } => OfferingAssessment::Incompatible {
+        HardwareAssessment::IncompatibleArtifact { code, message } => {
+            Ok(OfferingAssessment::Incompatible {
+                profile,
+                configuration_id,
+                failure: DomainModelFailure {
+                    code,
+                    message,
+                    retryable: false,
+                },
+            })
+        }
+        HardwareAssessment::NotAssessed { reason } => Ok(OfferingAssessment::Incompatible {
             profile,
             configuration_id,
             failure: DomainModelFailure {
@@ -1729,69 +1802,37 @@ fn offering_assessment(
                 message: reason,
                 retryable: true,
             },
-        },
+        }),
     }
 }
 
 fn performance_result(
     assessment: GenerationPerformanceAssessment,
     context_tokens: u32,
-) -> (Option<PerformanceEvidence>, Option<PerformanceUnavailable>) {
-    match assessment {
-        GenerationPerformanceAssessment::Estimated {
-            method,
-            confidence,
-            points,
-            ..
-        } => {
-            let evidence = points
-                .into_iter()
-                .find(|point| point.context_tokens == context_tokens)
-                .map(|point| PerformanceEvidence {
-                    context_tokens: point.context_tokens,
-                    lower_tokens_per_second: point.lower_tokens_per_second,
-                    estimated_tokens_per_second: point.expected_tokens_per_second,
-                    upper_tokens_per_second: point.upper_tokens_per_second,
-                    confidence: match confidence {
-                        icn_contracts::GenerationPerformanceConfidence::High => {
-                            PerformanceConfidence::High
-                        }
-                        icn_contracts::GenerationPerformanceConfidence::Moderate => {
-                            PerformanceConfidence::Moderate
-                        }
-                        icn_contracts::GenerationPerformanceConfidence::Low => {
-                            PerformanceConfidence::Low
-                        }
-                    },
-                    method: method.clone(),
-                });
-            match evidence {
-                Some(evidence) => (Some(evidence), None),
-                None => (
-                    None,
-                    Some(PerformanceUnavailable {
-                        method,
-                        code: "requested_context_unavailable".to_owned(),
-                        message: format!(
-                            "generation performance has no point for requested context {context_tokens}"
-                        ),
-                    }),
-                ),
-            }
-        }
-        GenerationPerformanceAssessment::Unavailable {
-            method,
-            code,
-            message,
-        } => (
-            None,
-            Some(PerformanceUnavailable {
-                method,
-                code,
-                message,
-            }),
-        ),
-    }
+) -> Result<PerformanceEvidence, InventoryError> {
+    let confidence = assessment.confidence;
+    assessment
+        .points
+        .into_iter()
+        .find(|point| point.context_tokens == context_tokens)
+        .map(|point| PerformanceEvidence {
+            context_tokens: point.context_tokens,
+            lower_tokens_per_second: point.lower_tokens_per_second,
+            estimated_tokens_per_second: point.expected_tokens_per_second,
+            upper_tokens_per_second: point.upper_tokens_per_second,
+            confidence: match confidence {
+                icn_contracts::GenerationPerformanceConfidence::High => PerformanceConfidence::High,
+                icn_contracts::GenerationPerformanceConfidence::Moderate => {
+                    PerformanceConfidence::Moderate
+                }
+                icn_contracts::GenerationPerformanceConfidence::Low => PerformanceConfidence::Low,
+            },
+        })
+        .ok_or_else(|| {
+            InventoryError::Internal(format!(
+                "performance estimator produced no point for requested context {context_tokens}"
+            ))
+        })
 }
 
 fn package_operand_id(operand: &ModelPackageOperand) -> Result<&ModelPackageId, String> {
@@ -1843,7 +1884,6 @@ impl ModelEvaluator for NativeModelEvaluator {
                 .capacity_policy
                 .required_reserve_bytes_per_memory_domain;
             let environment = self.environment(reserve_bytes).await?;
-            let include_performance = request.include_performance;
             let release_catalog = Arc::clone(&self.release_catalog);
             let evaluated = futures_util::stream::iter(request.requests.into_iter().enumerate())
                 .map(|(index, item)| {
@@ -1867,13 +1907,14 @@ impl ModelEvaluator for NativeModelEvaluator {
                                 ));
                             }
                         };
-                        let cached = self.cached_profiles(
-                            &target_id,
-                            &item.profiles,
-                            reserve_bytes,
-                            include_performance,
-                            &environment,
-                        )?;
+                        let cached = self
+                            .cached_profiles(
+                                &target_id,
+                                &item.profiles,
+                                reserve_bytes,
+                                &environment,
+                            )
+                            .await?;
                         let result = if let Some(profiles) = cached {
                             AssessModelResult::Assessed {
                                 request_id,
@@ -1911,7 +1952,6 @@ impl ModelEvaluator for NativeModelEvaluator {
                                             &resolved,
                                             &item.profiles,
                                             reserve_bytes,
-                                            include_performance,
                                             &environment,
                                         )
                                         .await?,
@@ -2001,120 +2041,95 @@ fn planner_concurrency() -> usize {
     std::thread::available_parallelism().map_or(1, |cores| cores.get().clamp(1, 16))
 }
 
-fn unavailable_performance(
-    code: &str,
-    message: impl Into<String>,
-) -> GenerationPerformanceAssessment {
-    GenerationPerformanceAssessment::Unavailable {
-        method: icn_hardware::GENERATION_PERFORMANCE_METHOD.to_owned(),
-        code: code.to_owned(),
-        message: message.into(),
-    }
-}
-
 fn assess_planning_request_with_backend(
     request: PlanningWorkerRequest,
     native_backend: &NativeBackend,
 ) -> anyhow::Result<PlanningWorkerResponse> {
+    let PlanningWorkerRequest {
+        hardware,
+        primary,
+        projector,
+        mtp,
+        defaults,
+        operation,
+    } = request;
     let backend = native_backend.as_llama_backend();
-    let topology = icn_contracts::MemoryTopology::from_snapshot(&request.hardware)
+    let topology = icn_contracts::MemoryTopology::from_snapshot(&hardware)
         .context("planning request contains an invalid memory topology")?;
-    let mut plans = request
-        .defaults
+    let mut plans = defaults
         .into_iter()
-        .map(|defaults| {
-            execution_intent(
-                request.primary.clone(),
-                request.projector.clone(),
-                &defaults,
-            )
-        })
+        .map(|defaults| execution_intent(primary.clone(), projector.clone(), &defaults))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let calibration = if request.estimate_performance {
-        Some(
-            match (request.calibration, request.calibration_unavailable) {
-                (Some(calibration), _) => Ok(calibration),
-                (None, Some(error)) => Err(error),
-                (None, None) => llama_cpp_2::model::params::fit::FitCalibration::measure(backend)
-                    .map_err(|error| error.to_string()),
-            },
-        )
-    } else {
-        None
-    };
-    let assess_without_performance = |code: &str, message: String| {
-        icn_hardware::assess_profiles_with_backend(backend, &topology, &plans).map(|assessments| {
-            assessments
-                .into_iter()
-                .map(|hardware| ModelExecutionAssessment {
-                    hardware,
-                    performance: unavailable_performance(code, message.clone()),
+    let calibration = match operation {
+        PlanningOperation::Capacity => {
+            let base = icn_hardware::assess_profiles_with_backend(backend, &topology, &plans)?;
+            let assessments = plans
+                .iter_mut()
+                .zip(base)
+                .map(|(plan, base)| {
+                    if !matches!(base, HardwareAssessment::Fits { .. }) {
+                        return Ok(base);
+                    }
+                    plan.mtp = icn_mtp::select_mtp_with_backend(
+                        backend,
+                        plan,
+                        icn_mtp::CandidatePolicy::Automatic(&mtp),
+                    )
+                    .context("failed to select a native MTP configuration")?;
+                    if matches!(plan.mtp, icn_contracts::MtpConfig::Disabled { .. }) {
+                        return Ok(base);
+                    }
+                    Ok(icn_hardware::assess_with_backend(backend, &topology, plan)?.assessment)
                 })
-                .collect()
-        })
-    };
-    let base = match calibration.as_ref() {
-        Some(Ok(calibration)) => icn_hardware::assess_execution_profiles_with_backend(
-            backend,
-            &topology,
-            &plans,
-            calibration,
-        )
-        .or_else(|error| {
-            assess_without_performance("performance_estimation_failed", error.to_string())
-        }),
-        Some(Err(calibration_error)) => {
-            assess_without_performance("calibration_failed", calibration_error.clone())
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            return Ok(PlanningWorkerResponse::Capacity { assessments });
         }
-        None => icn_hardware::assess_profiles_with_backend(backend, &topology, &plans).map(
-            |assessments| {
-                assessments
-                    .into_iter()
-                    .map(|hardware| ModelExecutionAssessment {
-                        hardware,
-                        performance: GenerationPerformanceAssessment::not_requested(),
-                    })
-                    .collect()
-            },
-        ),
-    }?;
+        PlanningOperation::Execution { calibration } => calibration,
+    };
+    let base = icn_hardware::assess_execution_profiles_with_backend(
+        backend,
+        &topology,
+        &plans,
+        &calibration,
+    )?;
     let assessments = plans
         .iter_mut()
         .zip(base)
         .map(|(plan, base)| {
-            if !matches!(base.hardware, HardwareAssessment::Fits { .. }) {
+            let ModelExecutionAssessment::Executable {
+                hardware: base_hardware,
+                performance,
+            } = base
+            else {
                 return Ok(base);
-            }
+            };
+            debug_assert!(matches!(base_hardware, HardwareAssessment::Fits { .. }));
             plan.mtp = icn_mtp::select_mtp_with_backend(
                 backend,
                 plan,
-                icn_mtp::CandidatePolicy::Automatic(&request.mtp),
+                icn_mtp::CandidatePolicy::Automatic(&mtp),
             )
             .context("failed to select a native MTP configuration")?;
             if matches!(plan.mtp, icn_contracts::MtpConfig::Disabled { .. }) {
-                return Ok(base);
+                return Ok(ModelExecutionAssessment::Executable {
+                    hardware: base_hardware,
+                    performance,
+                });
             }
             let hardware = icn_hardware::assess_with_backend(backend, &topology, plan)?.assessment;
-            let performance = if matches!(hardware, HardwareAssessment::Fits { .. }) {
+            if matches!(hardware, HardwareAssessment::Fits { .. }) {
                 // Phase 1 intentionally estimates baseline target-model decode. MTP changes fit
                 // memory but is not credited with an unmeasured speculative-decoding speedup.
-                base.performance
+                Ok(ModelExecutionAssessment::Executable {
+                    hardware,
+                    performance,
+                })
             } else {
-                unavailable_performance(
-                    "configuration_does_not_fit",
-                    "generation performance is unavailable for a configuration that does not fit",
-                )
-            };
-            Ok(ModelExecutionAssessment {
-                hardware,
-                performance,
-            })
+                Ok(ModelExecutionAssessment::NotExecutable { hardware })
+            }
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(PlanningWorkerResponse {
-        assessments,
-        calibration,
-    })
+    Ok(PlanningWorkerResponse::Execution { assessments })
 }
 
 #[cfg(test)]
@@ -2140,64 +2155,13 @@ fn run_isolated_planning(
     request: PlanningWorkerRequest,
     worker_launcher: &NativeWorkerLauncher,
 ) -> anyhow::Result<PlanningWorkerResponse> {
-    use std::io::Write as _;
-
-    let mut child = worker_launcher.command(NativeWorkerRole::Planner)?;
-    child
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = child
-        .spawn()
-        .context("failed to start isolated native planner")?;
-    serde_json::to_writer(
-        child
-            .stdin
-            .as_mut()
-            .context("isolated native planner stdin was unavailable")?,
-        &request,
+    run_isolated_json_worker(
+        worker_launcher,
+        NativeWorkerRole::Planner,
+        Some(&request),
+        PLANNING_WORKER_TIMEOUT,
+        "native planner",
     )
-    .context("failed to encode isolated native planner request")?;
-    child
-        .stdin
-        .take()
-        .context("isolated native planner stdin was unavailable")?
-        .flush()
-        .context("failed to flush isolated native planner request")?;
-    let deadline = std::time::Instant::now() + PLANNING_WORKER_TIMEOUT;
-    loop {
-        if child
-            .try_wait()
-            .context("failed to observe isolated native planner")?
-            .is_some()
-        {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("isolated native planner exceeded its time bound");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let output = child
-        .wait_with_output()
-        .context("failed to await isolated native planner")?;
-    if output.stdout.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
-        || output.stderr.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
-    {
-        anyhow::bail!("isolated native planner exceeded its output bound");
-    }
-    if !output.status.success() {
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "isolated native planner exited with {}: {}",
-            output.status,
-            diagnostic.trim().chars().take(4_096).collect::<String>()
-        );
-    }
-    serde_json::from_slice(&output.stdout)
-        .context("isolated native planner returned an invalid assessment")
 }
 
 fn run_planning_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> {
@@ -2207,6 +2171,39 @@ fn run_planning_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> 
     let assessment = assess_planning_request_with_backend(request, &native_backend)?;
     serde_json::to_writer(std::io::stdout().lock(), &assessment)
         .context("failed to encode native planner result")?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_isolated_backend_preparation(
+    _worker_launcher: &NativeWorkerLauncher,
+) -> anyhow::Result<llama_cpp_2::model::params::fit::FitCalibration> {
+    llama_cpp_2::model::params::fit::FitCalibration::measure(
+        test_native_backend().as_llama_backend(),
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(not(test))]
+fn run_isolated_backend_preparation(
+    worker_launcher: &NativeWorkerLauncher,
+) -> anyhow::Result<llama_cpp_2::model::params::fit::FitCalibration> {
+    run_isolated_json_worker::<(), _>(
+        worker_launcher,
+        NativeWorkerRole::BackendPreparation,
+        None,
+        PLANNING_WORKER_TIMEOUT,
+        "backend preparation",
+    )
+}
+
+fn run_backend_preparation_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> {
+    let native_backend = initialize_native_runtime(&authority)?;
+    let calibration = llama_cpp_2::model::params::fit::FitCalibration::measure(
+        native_backend.as_llama_backend(),
+    )?;
+    serde_json::to_writer(std::io::stdout().lock(), &calibration)
+        .context("failed to encode backend preparation result")?;
     Ok(())
 }
 
@@ -2241,35 +2238,56 @@ fn run_isolated_template_inspection(
     request: TemplateWorkerRequest,
     worker_launcher: &NativeWorkerLauncher,
 ) -> anyhow::Result<TemplateAssessment> {
+    run_isolated_json_worker(
+        worker_launcher,
+        NativeWorkerRole::Template,
+        Some(&request),
+        TEMPLATE_WORKER_TIMEOUT,
+        "native template inspection",
+    )
+}
+
+#[cfg(not(test))]
+fn run_isolated_json_worker<Request, Response>(
+    worker_launcher: &NativeWorkerLauncher,
+    role: NativeWorkerRole,
+    request: Option<&Request>,
+    timeout: std::time::Duration,
+    operation: &str,
+) -> anyhow::Result<Response>
+where
+    Request: serde::Serialize,
+    Response: serde::de::DeserializeOwned,
+{
     use std::io::Write as _;
 
-    let mut child = worker_launcher.command(NativeWorkerRole::Template)?;
-    child
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut child = worker_launcher.command(role)?;
+    if request.is_some() {
+        child.stdin(Stdio::piped());
+    }
+    child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child
         .spawn()
-        .context("failed to start isolated native template worker")?;
-    serde_json::to_writer(
-        child
+        .with_context(|| format!("failed to start isolated {operation}"))?;
+    if let Some(request) = request {
+        let stdin = child
             .stdin
             .as_mut()
-            .context("template worker stdin was unavailable")?,
-        &request,
-    )
-    .context("failed to encode template worker request")?;
-    child
-        .stdin
-        .take()
-        .context("template worker stdin was unavailable")?
-        .flush()
-        .context("failed to flush template worker request")?;
-    let deadline = std::time::Instant::now() + TEMPLATE_WORKER_TIMEOUT;
+            .with_context(|| format!("isolated {operation} stdin was unavailable"))?;
+        serde_json::to_writer(stdin, request)
+            .with_context(|| format!("failed to encode isolated {operation} request"))?;
+        child
+            .stdin
+            .take()
+            .with_context(|| format!("isolated {operation} stdin was unavailable"))?
+            .flush()
+            .with_context(|| format!("failed to flush isolated {operation} request"))?;
+    }
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         if child
             .try_wait()
-            .context("failed to observe isolated native template worker")?
+            .with_context(|| format!("failed to observe isolated {operation}"))?
             .is_some()
         {
             break;
@@ -2277,21 +2295,21 @@ fn run_isolated_template_inspection(
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("isolated native template worker exceeded its time bound");
+            anyhow::bail!("isolated {operation} exceeded its time bound");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let output = child
         .wait_with_output()
-        .context("failed to await isolated native template worker")?;
+        .with_context(|| format!("failed to await isolated {operation}"))?;
     if output.stdout.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
         || output.stderr.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
     {
-        anyhow::bail!("isolated native template worker exceeded its output bound");
+        anyhow::bail!("isolated {operation} exceeded its output bound");
     }
     if !output.status.success() {
         anyhow::bail!(
-            "template worker exited with {}: {}",
+            "isolated {operation} exited with {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
                 .trim()
@@ -2300,7 +2318,8 @@ fn run_isolated_template_inspection(
                 .collect::<String>()
         );
     }
-    serde_json::from_slice(&output.stdout).context("template worker returned an invalid assessment")
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("isolated {operation} returned invalid JSON"))
 }
 
 fn run_template_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> {
@@ -2315,7 +2334,7 @@ fn run_template_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> 
 
 impl InventoryHardwareAssessor for NativeHardwareAssessor {
     fn cache_key(&self, snapshot: &HardwareSnapshot) -> Result<String, InventoryError> {
-        ModelHardwareAssessor::cache_key(self, None, snapshot)
+        self.capacity_assessment_cache_key(None, snapshot)
     }
 
     fn assess(
@@ -2345,12 +2364,12 @@ impl InventoryHardwareAssessor for NativeHardwareAssessor {
 }
 
 impl ModelHardwareAssessor for NativeHardwareAssessor {
-    fn cache_key(
-        &self,
-        profile: Option<&ModelPreviewProfile>,
-        snapshot: &HardwareSnapshot,
-    ) -> Result<String, InventoryError> {
-        self.assessment_cache_key(profile, snapshot)
+    fn execution_cache_key<'a>(
+        &'a self,
+        profile: Option<&'a ModelPreviewProfile>,
+        snapshot: &'a HardwareSnapshot,
+    ) -> BoxFuture<'a, Result<String, InventoryError>> {
+        Box::pin(self.execution_assessment_cache_key(profile, snapshot))
     }
 
     fn assess_profile(
@@ -2416,26 +2435,6 @@ impl HardwareProvider for NativeHardwareAssessor {
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
-            let mut calibration = self.calibration.lock().await;
-            let evidence = calibration_evidence(&snapshot)?;
-            if calibration.evidence.as_deref() != Some(evidence.as_str()) {
-                calibration.topology_fingerprint = Some(snapshot.topology_fingerprint.clone());
-                calibration.evidence = Some(evidence.clone());
-                calibration.result = self
-                    .cache
-                    .as_ref()
-                    .and_then(|cache| {
-                        cache.read_index::<PersistedCalibration>(
-                            ModelIndexKind::Calibration,
-                            &evidence,
-                        )
-                    })
-                    .filter(|cached| {
-                        unix_time_seconds().saturating_sub(cached.captured_at)
-                            <= CALIBRATION_MAX_AGE_SECONDS
-                    })
-                    .map(|cached| Ok(cached.calibration));
-            }
             Ok(snapshot)
         })
     }
@@ -2897,7 +2896,7 @@ impl NativeModelInstanceController {
         let mut candidates = Vec::new();
         for (index, assessment) in assessments.into_iter().enumerate() {
             let parallel_sequences = u32::try_from(index + 1).expect("four candidates fit u32");
-            match assessment.hardware {
+            match assessment {
                 HardwareAssessment::Fits { memory, .. } => {
                     let required = memory
                         .domains
@@ -4419,6 +4418,31 @@ async fn main() -> anyhow::Result<()> {
                 .map(NativeRuntimeAuthority::installed)
                 .unwrap_or_else(NativeRuntimeAuthority::development);
             let worker_launcher = NativeWorkerLauncher::new(runtime_authority.clone());
+            let prepare_cuda = installation
+                .as_ref()
+                .is_some_and(|installation| installation.backend() == IcnInstallationBackend::Cuda);
+            if prepare_cuda {
+                let driver = cuda_driver::require()
+                    .context("failed to resolve CUDA for backend preparation")?;
+                let progress = IcnStartupProgressRecord {
+                    record_type: IcnStartupProgressRecordType::PreparingBackend,
+                    backend: IcnStartupBackend::Cuda {
+                        hardware_label: driver
+                            .hardware_labels
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "NVIDIA GPU".to_owned()),
+                    },
+                };
+                println!(
+                    "MAGNITUDE_ICN_PROGRESS {}",
+                    serde_json::to_string(&progress)?
+                );
+                use std::io::Write as _;
+                std::io::stdout()
+                    .flush()
+                    .context("failed to publish CUDA backend preparation progress")?;
+            }
             let inventory_root = match model_store {
                 Some(root) => root,
                 None => InventoryConfig::default_root()
@@ -4451,6 +4475,12 @@ async fn main() -> anyhow::Result<()> {
                 plan_defaults.clone(),
                 worker_launcher.clone(),
             );
+            if prepare_cuda {
+                inventory_hardware_assessor
+                    .prepare_cuda_backend()
+                    .await
+                    .context("CUDA backend preparation failed")?;
+            }
             inventory
                 .set_hardware_assessor(inventory_hardware_assessor.clone())
                 .context("failed to configure inventory hardware assessment")?;
@@ -4574,6 +4604,9 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
+        }
+        Command::PrepareBackendWorker { runtime } => {
+            run_backend_preparation_worker(runtime.authority()?)?
         }
         Command::PlanWorker { runtime } => run_planning_worker(runtime.authority()?)?,
         Command::TemplateWorker { runtime } => run_template_worker(runtime.authority()?)?,
@@ -4796,9 +4829,8 @@ mod tests {
 
     #[test]
     fn performance_evidence_preserves_the_exact_requested_context_and_bounds() {
-        let (evidence, unavailable) = performance_result(
-            GenerationPerformanceAssessment::Estimated {
-                method: "native".to_owned(),
+        let evidence = performance_result(
+            GenerationPerformanceAssessment {
                 confidence: icn_contracts::GenerationPerformanceConfidence::Moderate,
                 workload: "baseline_single_sequence_decode".to_owned(),
                 always_active_weight_bytes: 10,
@@ -4824,38 +4856,14 @@ mod tests {
                 ],
             },
             100_000,
-        );
-        let evidence = evidence.expect("matching performance evidence");
+        )
+        .expect("matching performance evidence");
 
-        assert!(unavailable.is_none());
         assert_eq!(evidence.context_tokens, 100_000);
         assert_eq!(evidence.lower_tokens_per_second, 20.0);
         assert_eq!(evidence.estimated_tokens_per_second, 24.0);
         assert_eq!(evidence.upper_tokens_per_second, 28.0);
         assert_eq!(evidence.confidence, PerformanceConfidence::Moderate);
-        assert_eq!(evidence.method, "native");
-    }
-
-    #[test]
-    fn performance_result_preserves_typed_unavailable_evidence() {
-        let (evidence, unavailable) = performance_result(
-            GenerationPerformanceAssessment::Unavailable {
-                method: "native_decode_v3".to_owned(),
-                code: "calibration_coverage_missing".to_owned(),
-                message: "no routed calibration covers backend CUDA device GPU0".to_owned(),
-            },
-            100_000,
-        );
-
-        assert!(evidence.is_none());
-        assert_eq!(
-            unavailable,
-            Some(PerformanceUnavailable {
-                method: "native_decode_v3".to_owned(),
-                code: "calibration_coverage_missing".to_owned(),
-                message: "no routed calibration covers backend CUDA device GPU0".to_owned(),
-            })
-        );
     }
 
     #[test]
@@ -5050,7 +5058,7 @@ mod tests {
     }
 
     #[test]
-    fn available_and_preview_cache_keys_share_resolved_profile_identity() {
+    fn capacity_cache_keys_share_resolved_profile_identity() {
         let assessor = NativeHardwareAssessor {
             defaults: parity_test_defaults(),
             cache: None,
@@ -5097,15 +5105,19 @@ mod tests {
             parallel_sequences: 1,
         };
         assert_eq!(
-            assessor.assessment_cache_key(None, &snapshot).unwrap(),
             assessor
-                .assessment_cache_key(Some(&equivalent_preview), &snapshot)
+                .capacity_assessment_cache_key(None, &snapshot)
+                .unwrap(),
+            assessor
+                .capacity_assessment_cache_key(Some(&equivalent_preview), &snapshot)
                 .unwrap()
         );
         assert_ne!(
-            assessor.assessment_cache_key(None, &snapshot).unwrap(),
             assessor
-                .assessment_cache_key(
+                .capacity_assessment_cache_key(None, &snapshot)
+                .unwrap(),
+            assessor
+                .capacity_assessment_cache_key(
                     Some(&ModelPreviewProfile {
                         context_length: 4096,
                         ..equivalent_preview.clone()
@@ -5121,22 +5133,22 @@ mod tests {
             .current_available_bytes = 0;
         assert_eq!(
             assessor
-                .assessment_cache_key(Some(&equivalent_preview), &snapshot)
+                .capacity_assessment_cache_key(Some(&equivalent_preview), &snapshot)
                 .unwrap(),
             assessor
-                .assessment_cache_key(Some(&equivalent_preview), &availability_only_change)
+                .capacity_assessment_cache_key(Some(&equivalent_preview), &availability_only_change)
                 .unwrap()
         );
         assert_ne!(
             assessor
-                .assessment_cache_key_with_policy(
+                .capacity_assessment_cache_key_with_policy(
                     Some(&equivalent_preview),
                     &snapshot,
                     CapacityPolicy::default(),
                 )
                 .unwrap(),
             assessor
-                .assessment_cache_key_with_policy(
+                .capacity_assessment_cache_key_with_policy(
                     Some(&equivalent_preview),
                     &snapshot,
                     CapacityPolicy {
@@ -5145,6 +5157,41 @@ mod tests {
                     },
                 )
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn execution_cache_identity_tracks_concrete_calibration_metrics() {
+        let calibration = |bytes_per_second, elapsed_microseconds| {
+            llama_cpp_2::model::params::fit::FitCalibration {
+                method: llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD.to_owned(),
+                metrics: vec![llama_cpp_2::model::params::fit::FitCalibrationMetric {
+                    backend_type: 2,
+                    backend: "CUDA".to_owned(),
+                    device_id: Some("GPU0".to_owned()),
+                    tensor_type: 1,
+                    routed: false,
+                    bytes_per_second,
+                    launch_microseconds: 10.0,
+                    relative_spread: 0.05,
+                    sample_count: 5,
+                    measured_microseconds: 50_000,
+                    stable: true,
+                }],
+                elapsed_microseconds,
+            }
+        };
+        let original = calibration(1_000.0, 60_000);
+        let changed_measurement = calibration(2_000.0, 60_000);
+        let changed_wall_time = calibration(1_000.0, 70_000);
+
+        assert_ne!(
+            NativeHardwareAssessor::calibration_identity(&original).unwrap(),
+            NativeHardwareAssessor::calibration_identity(&changed_measurement).unwrap()
+        );
+        assert_eq!(
+            NativeHardwareAssessor::calibration_identity(&original).unwrap(),
+            NativeHardwareAssessor::calibration_identity(&changed_wall_time).unwrap()
         );
     }
 

@@ -967,7 +967,7 @@ const CatalogMenu = memo(function CatalogMenu({
             {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · intelligence {Math.round(detail.intelligenceScore)}/100 · {qualityLabel(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
-            {Option.match(detail.estimatedTokensPerSecond, { onNone: () => "Speed unavailable", onSome: (speed) => `Approximately ${speed.toFixed(1)} tokens/sec` })}
+            Approximately {detail.estimatedTokensPerSecond.toFixed(1)} tokens/sec
           </text>
           <text style={{ fg: failed ? theme.error : downloading || downloaded ? theme.primary : theme.muted }}>
             {catalogStatus(detail)}
@@ -1059,7 +1059,7 @@ const CatalogMenu = memo(function CatalogMenu({
               <text style={{ fg: theme.muted, width: 12 }}>{formatBytes(requiredMemoryBytes(candidate.memory))}</text>
               <text style={{ fg: theme.muted, width: 14 }}>{Math.round(candidate.intelligenceScore)}/100</text>
               <text style={{ fg: theme.muted, width: 14 }}>{qualityLabel(candidate)}</text>
-              <text style={{ fg: theme.muted, width: 12 }}>{Option.match(candidate.estimatedTokensPerSecond, { onNone: () => "—", onSome: (speed) => `~${speed.toFixed(0)} t/s` })}</text>
+              <text style={{ fg: theme.muted, width: 12 }}>~{candidate.estimatedTokensPerSecond.toFixed(0)} t/s</text>
               <text
                 style={{
                   fg: pendingDelete

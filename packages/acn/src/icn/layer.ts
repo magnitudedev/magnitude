@@ -101,7 +101,7 @@ const makeProcess = (dataDir: string) =>
         huggingFaceCaches: resolveHuggingFaceCacheRoots(),
       }),
       host: "127.0.0.1",
-      startupTimeout: Duration.seconds(30),
+      startupTimeout: Duration.seconds(150),
       gracefulShutdownTimeout: Duration.millis(500),
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
@@ -196,6 +196,11 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                   Option.none()
                 );
               }
+              case "PreparingBackend":
+                return yield* startup.starting({
+                  _tag: "PreparingBackend",
+                  backend: event.backend,
+                }, Option.none());
             }
           }),
       };
