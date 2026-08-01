@@ -230,15 +230,23 @@ Pending events buffer for persistence:
 ```typescript
 interface EventSinkService {
   append: (event: BaseEvent) => Effect.Effect<void>
-  readPending: () => Effect.Effect<BaseEvent[]>
-  drainPending: () => Effect.Effect<BaseEvent[]>
-  prependEvents: (events: BaseEvent[]) => Effect.Effect<void>
+  claimPending: () => Effect.Effect<PendingEventClaim, never, Scope.Scope>
+}
+
+interface PendingEventClaim {
+  events: ReadonlyArray<BaseEvent>
+  acknowledge: Effect.Effect<void>
 }
 ```
 
 Used for:
 - Accumulating new events since last persistence
-- Providing batches to persistence workers
+- Granting one persistence worker exclusive ownership of a stable pending prefix
+- Removing only the exact claimed prefix after the persistence commit succeeds
+
+The claim's scope owns the exclusive flush permit. Closing it without acknowledgement leaves every
+claimed event pending. Events appended while a claim is open remain after that claim is
+acknowledged.
 
 ### HydrationContext
 

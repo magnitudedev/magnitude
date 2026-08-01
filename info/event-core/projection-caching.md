@@ -40,10 +40,10 @@ event sink, and before later events update projections.
 
 Inside that boundary, the flush does this:
 
-1. Drain pending non-ephemeral events from the event sink.
+1. Acquire a scoped, exclusive claim on the pending non-ephemeral event prefix without removing it.
 2. If there are no pending events, stop.
 3. Read session metadata for the session id.
-4. Append the pending events to the event log.
+4. Append the claimed events and acknowledge that exact claim as one uninterruptible commit.
 5. Use the returned append cursor as the snapshot cursor.
 6. Capture every registered projection's encoded snapshot at that cursor.
 7. Atomically write the projection snapshot envelope.
@@ -78,8 +78,10 @@ physical-entry reuse, and residency invariants.
 ## Failure Semantics
 
 If metadata loading or event append fails before events become durable, the
-drained events are put back at the front of the pending sink. A later lifecycle
-flush can retry them without losing ordering.
+events remain pending. A later lifecycle flush can retry them without losing
+ordering. Closing an unacknowledged claim does not mutate the queue, and scope
+interruption cannot land between event-log commit and acknowledgement of the
+claim.
 
 If event append succeeds but snapshot capture or snapshot write fails, the
 events are not requeued. Requeueing already-appended events would duplicate the
@@ -113,6 +115,13 @@ restore is committed and the agent falls back to event replay.
 
 After a successful restore, the agent replays only the event suffix after the
 snapshot cursor.
+
+Event-log reads repair only the unterminated physical tail before validating a
+snapshot cursor. A complete JSON value missing its final newline is preserved
+and terminated. An incomplete final JSON fragment is truncated to the preceding
+newline. Invalid newline-terminated records remain fatal. Tail repair does not
+renumber retained events, so a cursor remains valid exactly when its indexed
+timestamp still matches.
 
 ## Unknown Projection Keys
 

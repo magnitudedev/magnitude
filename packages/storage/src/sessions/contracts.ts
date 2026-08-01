@@ -83,11 +83,6 @@ export interface SessionStorageShape {
     cursor: StoredEventCursor
   ) => Effect.Effect<T[] | null, PlatformError | JsonLinesError>
 
-  readonly appendEvents: <T>(
-    sessionId: string,
-    events: readonly T[]
-  ) => Effect.Effect<void, PlatformError | JsonLinesError>
-
   readonly appendEventsWithCursor: <T extends { readonly timestamp: number }>(
     sessionId: string,
     events: readonly T[]
@@ -124,11 +119,6 @@ export interface SessionStorageShape {
   readonly readEventsFromPath: <T>(
     eventsPath: string
   ) => Effect.Effect<T[], PlatformError | JsonLinesError>
-
-  readonly appendLogs: <T>(
-    sessionId: string,
-    entries: readonly T[]
-  ) => Effect.Effect<void, PlatformError | JsonLinesError>
 
   readonly clearLog: (
     sessionId: string

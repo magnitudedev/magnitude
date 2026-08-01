@@ -51,7 +51,7 @@ export class AcnChatPersistence implements ChatPersistenceService {
     return next
   }
 
-  persistNewEvents(events: Timestamped<AppEvent>[]): Effect.Effect<EventCursor | null, PersistenceError> {
+  persistNewEvents(events: ReadonlyArray<Timestamped<AppEvent>>): Effect.Effect<EventCursor | null, PersistenceError> {
     return Effect.gen(this, function* () {
       const cursor = yield* this.storage.sessions.appendEventsWithCursor(this.sessionId, events).pipe(
         Effect.mapError((e) => new PersistenceError({ reason: "SaveFailed", message: String(e) })),

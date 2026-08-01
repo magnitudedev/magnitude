@@ -247,16 +247,16 @@ export function makeSessionStorage(): Effect.Effect<
         ),
 
       readEvents: <T>(sessionId: string) =>
-        io.readJsonLines<T>(g.sessionEventsFile(sessionId)),
+        io.recoverableJsonLines<T>(g.sessionEventsFile(sessionId)).readAndRepair,
 
       readEventsAfterCursor: <T extends { readonly timestamp: number }>(
         sessionId: string,
         cursor: StoredEventCursor
       ) =>
         Effect.gen(function* () {
-          const events = yield* io.readJsonLines<T>(
-            g.sessionEventsFile(sessionId)
-          );
+          const events = yield* io
+            .recoverableJsonLines<T>(g.sessionEventsFile(sessionId))
+            .readAndRepair;
           const cursorEvent = events[cursor.index];
           if (!cursorEvent || cursorEvent.timestamp !== cursor.timestamp) {
             return null;
@@ -264,35 +264,22 @@ export function makeSessionStorage(): Effect.Effect<
           return events.slice(cursor.index + 1);
         }),
 
-      appendEvents: <T>(sessionId: string, events: readonly T[]) =>
-        io.withPathLock(
-          g.sessionEventsFile(sessionId),
-          Effect.gen(function* () {
-            yield* io.ensureDir(g.sessionDir(sessionId));
-            yield* io.appendJsonLines(g.sessionEventsFile(sessionId), events);
-          })
-        ),
-
       appendEventsWithCursor: <T extends { readonly timestamp: number }>(
         sessionId: string,
         events: readonly T[]
       ) =>
-        io.withPathLock(
-          g.sessionEventsFile(sessionId),
-          Effect.gen(function* () {
-            if (events.length === 0) return null;
-            yield* io.ensureDir(g.sessionDir(sessionId));
-            const existing = yield* io.readJsonLines<T>(
-              g.sessionEventsFile(sessionId)
-            );
-            yield* io.appendJsonLines(g.sessionEventsFile(sessionId), events);
-            const lastEvent = events[events.length - 1];
-            return {
-              index: existing.length + events.length - 1,
-              timestamp: lastEvent.timestamp,
-            };
-          })
-        ),
+        Effect.gen(function* () {
+          if (events.length === 0) return null;
+          yield* io.ensureDir(g.sessionDir(sessionId));
+          const appended = yield* io
+            .recoverableJsonLines<T>(g.sessionEventsFile(sessionId))
+            .append(events);
+          const lastEvent = events[events.length - 1];
+          return {
+            index: appended.previousRecordCount + appended.appendedRecordCount - 1,
+            timestamp: lastEvent.timestamp,
+          };
+        }),
 
       readProjectionSnapshot: (sessionId: string) =>
         Effect.gen(function* () {
@@ -361,13 +348,7 @@ export function makeSessionStorage(): Effect.Effect<
         ),
 
       readEventsFromPath: <T>(eventsPath: string) =>
-        io.readJsonLines<T>(eventsPath),
-
-      appendLogs: <T>(sessionId: string, entries: readonly T[]) =>
-        Effect.gen(function* () {
-          yield* io.ensureDir(g.sessionDir(sessionId));
-          yield* io.appendJsonLines(g.sessionLogFile(sessionId), entries);
-        }),
+        io.recoverableJsonLines<T>(eventsPath).readAndRepair,
 
       clearLog: (sessionId) =>
         io.removeFileIfExists(g.sessionLogFile(sessionId)),

@@ -1,4 +1,3 @@
-import { readFile } from 'fs/promises'
 import type { AppEvent } from '../events'
 
 const DEFAULT_TRANSCRIPT_CHAR_BUDGET = 35_000
@@ -44,15 +43,6 @@ function truncateTranscript(lines: string[], maxChars: number): string {
     start++
   }
   return lines.slice(start).join(sep)
-}
-
-export async function readEventsJsonl(eventsPath: string): Promise<AppEvent[]> {
-  const raw = await readFile(eventsPath, 'utf8')
-  return raw
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as AppEvent)
 }
 
 export function buildExtractionTranscript(

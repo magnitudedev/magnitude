@@ -31,6 +31,18 @@ export class JsonLinesParseError extends Schema.TaggedError<JsonLinesParseError>
 export type JsonError = JsonParseError | SchemaDecodeError | SchemaEncodeError;
 export type JsonLinesError = JsonLinesParseError | PlatformError;
 
+export interface JsonLinesAppendResult {
+  readonly previousRecordCount: number;
+  readonly appendedRecordCount: number;
+}
+
+export interface RecoverableJsonLinesFile<T> {
+  readonly readAndRepair: Effect.Effect<T[], JsonLinesError>;
+  readonly append: (
+    entries: ReadonlyArray<T>
+  ) => Effect.Effect<JsonLinesAppendResult, JsonLinesError>;
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -102,10 +114,10 @@ export interface StorageIo {
     filePath: string,
     value: unknown
   ) => Effect.Effect<void, JsonParseError | PlatformError>;
-  readonly readJsonLines: <T>(
+  readonly recoverableJsonLines: <T>(
     filePath: string
-  ) => Effect.Effect<T[], JsonLinesError>;
-  readonly appendJsonLines: <T>(
+  ) => RecoverableJsonLinesFile<T>;
+  readonly appendDiagnosticJsonLines: <T>(
     filePath: string,
     entries: ReadonlyArray<T>
   ) => Effect.Effect<void, JsonLinesError>;
@@ -128,6 +140,9 @@ export function makeStorageIo(): Effect.Effect<
     const path = yield* Path.Path;
     const pathLocks = yield* SynchronizedRef.make(
       new Map<string, Effect.Semaphore>()
+    );
+    const jsonLinesMetadata = yield* SynchronizedRef.make(
+      new Map<string, { readonly byteLength: number; readonly recordCount: number }>()
     );
 
     const withPathLock = <A, E, R>(
@@ -155,6 +170,158 @@ export function makeStorageIo(): Effect.Effect<
     const ensureParentDir = (
       filePath: string
     ): Effect.Effect<void, PlatformError> => ensureDir(path.dirname(filePath));
+
+    const readFileBytes = (filePath: string) =>
+      fs.readFile(filePath).pipe(
+        Effect.catchTag("SystemError", (e: SystemError) =>
+          e.reason === "NotFound"
+            ? Effect.succeed(new Uint8Array())
+            : Effect.fail(e)
+        )
+      );
+
+    const decodeUtf8 = (
+      filePath: string,
+      line: number,
+      bytes: Uint8Array
+    ): Effect.Effect<string, JsonLinesParseError> =>
+      Effect.try({
+        try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+        catch: (error) =>
+          new JsonLinesParseError({
+            path: filePath,
+            line,
+            message: `Invalid UTF-8: ${String(error)}`,
+          }),
+      });
+
+    const decodeJsonLine = <T>(
+      filePath: string,
+      line: number,
+      bytes: Uint8Array
+    ): Effect.Effect<
+      { readonly _tag: "blank" } | { readonly _tag: "value"; readonly value: T },
+      JsonLinesParseError
+    > =>
+      Effect.gen(function* () {
+        const text = yield* decodeUtf8(filePath, line, bytes);
+        if (text.trim() === "") return { _tag: "blank" as const };
+        return yield* Schema.decodeUnknown(Schema.parseJson())(text).pipe(
+          Effect.map((value) => ({ _tag: "value" as const, value: value as T })),
+          Effect.mapError(
+            (error) =>
+              new JsonLinesParseError({
+                path: filePath,
+                line,
+                message: String(error),
+              })
+          )
+        );
+      });
+
+    const setJsonLinesMetadata = (
+      filePath: string,
+      byteLength: number,
+      recordCount: number
+    ) =>
+      SynchronizedRef.update(jsonLinesMetadata, (current) => {
+        const next = new Map(current);
+        next.set(filePath, { byteLength, recordCount });
+        return next;
+      });
+
+    const removeJsonLinesMetadata = (targetPath: string, directory: boolean) =>
+      SynchronizedRef.update(jsonLinesMetadata, (current) => {
+        const normalized = path.resolve(targetPath);
+        const prefix = normalized.endsWith(path.sep)
+          ? normalized
+          : `${normalized}${path.sep}`;
+        const next = new Map(current);
+        for (const filePath of current.keys()) {
+          if (filePath === normalized || (directory && filePath.startsWith(prefix))) {
+            next.delete(filePath);
+          }
+        }
+        return next;
+      });
+
+    const readAndRepairJsonLinesUnlocked = <T>(filePath: string) =>
+      Effect.gen(function* () {
+        const raw = yield* readFileBytes(filePath);
+        const result: T[] = [];
+        let recordStart = 0;
+        let line = 1;
+
+        for (let offset = 0; offset < raw.byteLength; offset += 1) {
+          if (raw[offset] !== 0x0a) continue;
+          const decoded = yield* decodeJsonLine<T>(
+            filePath,
+            line,
+            raw.subarray(recordStart, offset)
+          );
+          if (decoded._tag === "value") result.push(decoded.value);
+          recordStart = offset + 1;
+          line += 1;
+        }
+
+        let repairedByteLength = raw.byteLength;
+        if (recordStart < raw.byteLength) {
+          const tail = raw.subarray(recordStart);
+          const decoded = yield* Effect.either(
+            decodeJsonLine<T>(filePath, line, tail)
+          );
+          if (decoded._tag === "Right" && decoded.right._tag === "value") {
+            yield* fs.writeFileString(filePath, "\n", { flag: "a" }).pipe(
+              Effect.uninterruptible
+            );
+            repairedByteLength += 1;
+            result.push(decoded.right.value);
+            yield* Effect.logWarning(
+              "[storage] Repaired JSONL record missing final newline"
+            ).pipe(
+              Effect.annotateLogs({
+                filePath,
+                originalByteLength: raw.byteLength,
+                repairedByteLength,
+                tail: "valid-json",
+              })
+            );
+          } else {
+            yield* fs.truncate(filePath, recordStart).pipe(
+              Effect.uninterruptible
+            );
+            repairedByteLength = recordStart;
+            yield* Effect.logWarning(
+              "[storage] Discarded incomplete final JSONL record"
+            ).pipe(
+              Effect.annotateLogs({
+                filePath,
+                originalByteLength: raw.byteLength,
+                repairedByteLength,
+                discardedByteCount: raw.byteLength - repairedByteLength,
+                tail: decoded._tag === "Right" ? "whitespace" : "invalid-json",
+              })
+            );
+          }
+        }
+
+        yield* setJsonLinesMetadata(filePath, repairedByteLength, result.length);
+        return result;
+      });
+
+    const encodeJsonLines = <T>(filePath: string, entries: ReadonlyArray<T>) =>
+      Effect.forEach(entries, (entry, index) =>
+        Schema.encodeUnknown(Schema.parseJson())(entry).pipe(
+          Effect.mapError(
+            (error) =>
+              new JsonLinesParseError({
+                path: filePath,
+                line: index + 1,
+                message: String(error),
+              })
+          )
+        )
+      );
 
     const writeJsonAtomic = (
       filePath: string,
@@ -210,9 +377,14 @@ export function makeStorageIo(): Effect.Effect<
             e.reason === "NotFound" ? Effect.succeed(null) : Effect.fail(e)
           )
         ),
-      removeFileIfExists: (filePath) => fs.remove(filePath, { force: true }),
+      removeFileIfExists: (filePath) =>
+        fs.remove(filePath, { force: true }).pipe(
+          Effect.zipRight(removeJsonLinesMetadata(filePath, false))
+        ),
       removeDirectoryIfExists: (dirPath) =>
-        fs.remove(dirPath, { recursive: true, force: true }),
+        fs.remove(dirPath, { recursive: true, force: true }).pipe(
+          Effect.zipRight(removeJsonLinesMetadata(dirPath, true))
+        ),
       readTextFile: (filePath) => fs.readFileString(filePath),
       writeTextFile: (filePath, content, options) =>
         Effect.gen(function* () {
@@ -284,73 +456,85 @@ export function makeStorageIo(): Effect.Effect<
       writeSecureJsonFile: (filePath, value) =>
         writeJsonAtomic(filePath, value, { mode: 0o600 }),
 
-      readJsonLines: <T>(filePath: string) =>
-        Effect.gen(function* () {
-          const raw = yield* fs
-            .readFileString(filePath)
-            .pipe(
-              Effect.catchTag("SystemError", (e: SystemError) =>
-                e.reason === "NotFound" ? Effect.succeed("") : Effect.fail(e)
-              )
-            );
-          const result: T[] = [];
-          const lines = raw.split("\n");
-          const hasTerminatedTail = raw.endsWith("\n");
-          for (let i = 0; i < lines.length; i += 1) {
-            const line = lines[i];
-            if (line.trim() === "") continue;
-            const decoded = yield* Effect.either(
-              Schema.decodeUnknown(Schema.parseJson())(line).pipe(
-                Effect.map((value) => value as T),
-                Effect.mapError(
-                  (e) =>
-                    new JsonLinesParseError({
-                      path: filePath,
-                      line: i,
-                      message: String(e),
-                    })
-                )
-              )
-            );
-            if (decoded._tag === "Right") {
-              result.push(decoded.right);
-              continue;
-            }
-            const isTornFinalAppend =
-              i === lines.length - 1 && !hasTerminatedTail;
-            if (isTornFinalAppend) {
-              yield* Effect.logWarning(
-                "[storage] Ignoring torn final JSONL append"
-              ).pipe(
-                Effect.annotateLogs({
-                  filePath,
-                  line: i,
-                  error: decoded.left.message,
+      recoverableJsonLines: <T>(filePath: string): RecoverableJsonLinesFile<T> => {
+        const normalized = path.resolve(filePath);
+        return {
+          readAndRepair: withPathLock(
+            normalized,
+            readAndRepairJsonLinesUnlocked<T>(normalized)
+          ),
+          append: (entries) =>
+            Effect.gen(function* () {
+              const encoded = yield* encodeJsonLines(normalized, entries);
+              return yield* withPathLock(
+                normalized,
+                Effect.gen(function* () {
+                  let metadata = (
+                    yield* SynchronizedRef.get(jsonLinesMetadata)
+                  ).get(normalized);
+                  const currentByteLength = yield* fs.stat(normalized).pipe(
+                    Effect.map((info) => Number(info.size)),
+                    Effect.catchTag("SystemError", (e: SystemError) =>
+                      e.reason === "NotFound"
+                        ? Effect.succeed(0)
+                        : Effect.fail(e)
+                    )
+                  );
+                  if (!metadata || metadata.byteLength !== currentByteLength) {
+                    const records =
+                      yield* readAndRepairJsonLinesUnlocked<T>(normalized);
+                    metadata = (
+                      yield* SynchronizedRef.get(jsonLinesMetadata)
+                    ).get(normalized) ?? {
+                      byteLength: 0,
+                      recordCount: records.length,
+                    };
+                  }
+
+                  if (encoded.length === 0) {
+                    return {
+                      previousRecordCount: metadata.recordCount,
+                      appendedRecordCount: 0,
+                    } satisfies JsonLinesAppendResult;
+                  }
+
+                  yield* ensureParentDir(normalized);
+                  const content = encoded.join("\n") + "\n";
+                  const appendedByteLength =
+                    new TextEncoder().encode(content).byteLength;
+                  yield* Effect.uninterruptible(
+                    fs
+                      .writeFileString(normalized, content, { flag: "a" })
+                      .pipe(
+                        Effect.tapError(() =>
+                          fs.truncate(normalized, metadata.byteLength).pipe(
+                            Effect.orDie
+                          )
+                        ),
+                        Effect.zipRight(
+                          setJsonLinesMetadata(
+                            normalized,
+                            metadata.byteLength + appendedByteLength,
+                            metadata.recordCount + encoded.length
+                          )
+                        )
+                      )
+                  );
+                  return {
+                    previousRecordCount: metadata.recordCount,
+                    appendedRecordCount: encoded.length,
+                  } satisfies JsonLinesAppendResult;
                 })
               );
-              break;
-            }
-            return yield* decoded.left;
-          }
-          return result;
-        }),
+            }),
+        };
+      },
 
-      appendJsonLines: <T>(filePath: string, entries: ReadonlyArray<T>) =>
+      appendDiagnosticJsonLines: <T>(filePath: string, entries: ReadonlyArray<T>) =>
         Effect.gen(function* () {
           if (entries.length === 0) return;
           yield* ensureParentDir(filePath);
-          const encoded = yield* Effect.forEach(entries, (entry, index) =>
-            Schema.encodeUnknown(Schema.parseJson())(entry).pipe(
-              Effect.mapError(
-                (error) =>
-                  new JsonLinesParseError({
-                    path: filePath,
-                    line: index,
-                    message: String(error),
-                  })
-              )
-            )
-          );
+          const encoded = yield* encodeJsonLines(filePath, entries);
           yield* fs.writeFileString(filePath, encoded.join("\n") + "\n", {
             flag: "a",
           });

@@ -58,7 +58,7 @@ const makeStorageLayer = (root: string) => {
 const makePersistence = (metadataCalls: string[]): ChatPersistenceService => ({
   loadEvents: () => Effect.succeed([]),
   loadEventsAfterCursor: () => Effect.succeed([]),
-  persistNewEvents: (_events: Timestamped<AppEvent>[]) =>
+  persistNewEvents: (_events: ReadonlyArray<Timestamped<AppEvent>>) =>
     Effect.succeed({ index: 0, timestamp: 1 } satisfies EventCursor),
   loadProjectionSnapshot: () => Effect.succeed(null),
   saveProjectionSnapshot: () => Effect.void,

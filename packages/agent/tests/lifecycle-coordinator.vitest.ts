@@ -79,21 +79,27 @@ describe('LifecycleCoordinator', () => {
         subscribe: () => Effect.succeed(Stream.fromPubSub(eventPubSub)),
       }
 
-      const eventSink: Pick<EventSinkService<AppEvent>, 'append' | 'readPending' | 'drainPending' | 'prependEvents'> = {
+      const eventSink: EventSinkService<AppEvent> = {
         append: (event) => Effect.sync(() => {
           pending.push(event)
         }),
-        readPending: () => Effect.sync(() => [...pending]),
-        drainPending: () => Effect.sync(() => {
-          calls.push('drain')
-          const drained = pending
-          pending = []
-          return drained
-        }),
-        prependEvents: (events) => Effect.sync(() => {
-          calls.push(`requeue:${events.length}`)
-          pending = [...events, ...pending]
-        }),
+        claimPending: () =>
+          Effect.acquireRelease(Effect.void, () => Effect.void).pipe(
+            Effect.map(() => {
+              const events = [...pending]
+              return {
+                events,
+                acknowledge: Effect.sync(() => {
+                  const matches = events.every((event, index) => pending[index] === event)
+                  if (!matches) throw new Error('Claim no longer matches pending prefix')
+                  calls.push(`ack:${events.map(event =>
+                    event.type === 'user_message' ? event.messageId : event.type
+                  ).join(',')}`)
+                  pending = pending.slice(events.length)
+                }),
+              }
+            })
+          ),
       }
 
       const persistence: ChatPersistenceService = {
@@ -131,7 +137,7 @@ describe('LifecycleCoordinator', () => {
       const deps = Layer.mergeAll(
         HydrationContext.Default,
         Layer.succeed(EventBusCoreTag<AppEvent>(), eventBus as EventBusCoreService<AppEvent>),
-        Layer.succeed(EventSinkTag<AppEvent>(), eventSink as EventSinkService<AppEvent>),
+        Layer.succeed(EventSinkTag<AppEvent>(), eventSink),
         Layer.succeed(ChatPersistence, persistence),
         Layer.succeed(ProjectionSnapshotServiceTag, engine as never),
         Layer.succeed(TurnProjection.signals.turnTerminated.tag, turnTerminatedPubSub),
@@ -156,12 +162,13 @@ describe('LifecycleCoordinator', () => {
 
     expect(calls.slice(0, 7)).toEqual([
       'checkpoint:start',
-      'drain',
       'metadata',
       'persist:1',
+      'ack:msg-1',
       'snapshot:session-1:0',
       'save:0',
       'checkpoint:end',
     ])
+    expect(pending).toEqual([])
   })
 })
