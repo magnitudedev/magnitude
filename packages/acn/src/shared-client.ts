@@ -1,8 +1,10 @@
-import { Context, Effect, Layer, Ref, Schema } from "effect"
+import { Context, Effect, Layer, Ref, Schema, Stream, SubscriptionRef } from "effect"
+import type { ToolAvailabilityState } from "@magnitudedev/agent"
 import {
   ProviderClient,
   createProviderClient,
   type ProviderClientShape,
+  type WebSearchSource,
 } from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
@@ -86,6 +88,9 @@ export const makeDelegatingProviderClient = (
       Effect.flatMap((client) => client.requestAttribution(providerId, providerModelId, key).requestStarted),
     ),
   }),
+  webSearchSource: Ref.get(ref).pipe(
+    Effect.flatMap((client) => client.webSearchSource),
+  ),
   webSearch: (query, schema) => Ref.get(ref).pipe(
     Effect.flatMap((client) => client.webSearch(query, schema)),
   ),
@@ -96,6 +101,8 @@ export const makeDelegatingProviderClient = (
 export interface ProviderClientRegistryApi {
   readonly shared: ProviderClientShape
   readonly session: (sessionId: string) => Effect.Effect<ProviderClientShape>
+  readonly toolAvailability: Effect.Effect<ToolAvailabilityState>
+  readonly toolAvailabilityChanges: Stream.Stream<ToolAvailabilityState>
   readonly refreshAll: Effect.Effect<void>
   readonly remove: (sessionId: string) => Effect.Effect<void>
 }
@@ -153,6 +160,12 @@ export const ProviderClientRegistryLive: Layer.Layer<
 
     const sharedEntry = yield* makeEntry(null)
     yield* Ref.set(entries, new Map([["shared", sharedEntry]]))
+    const initialSource = yield* sharedEntry.client.webSearchSource
+    const toolAvailability = yield* SubscriptionRef.make<ToolAvailabilityState>(
+      toolAvailabilityFromSource(initialSource),
+    )
+    const publishToolAvailability = (next: ToolAvailabilityState) =>
+      SubscriptionRef.set(toolAvailability, next)
 
     return ProviderClientRegistry.of({
       shared: sharedEntry.client,
@@ -165,11 +178,35 @@ export const ProviderClientRegistryLive: Layer.Layer<
         yield* Ref.set(entries, new Map(current).set(key, entry))
         return entry.client
       })),
+      toolAvailability: SubscriptionRef.get(toolAvailability),
+      toolAvailabilityChanges: toolAvailability.changes,
       refreshAll: lock.withPermits(1)(Effect.gen(function* () {
         const current = yield* Ref.get(entries)
-        yield* Effect.forEach(current.values(), (entry) => makeConcrete(entry.sessionId).pipe(
-          Effect.flatMap((replacement) => Ref.set(entry.ref, replacement)),
-        ), { concurrency: 4, discard: true })
+        const replacements = yield* Effect.forEach(
+          current.values(),
+          (entry) => makeConcrete(entry.sessionId).pipe(
+            Effect.map((client) => ({ entry, client })),
+          ),
+          { concurrency: 4 },
+        )
+        const nextSource = replacements.length > 0
+          ? yield* replacements[0]!.client.webSearchSource
+          : "unavailable" as const
+        const previous = yield* SubscriptionRef.get(toolAvailability)
+        const next = nextToolAvailability(previous, nextSource)
+        const sourceChanged = next !== previous
+
+        if (sourceChanged && nextSource === "unavailable") {
+          yield* publishToolAvailability(next)
+        }
+        yield* Effect.forEach(
+          replacements,
+          ({ entry, client }) => Ref.set(entry.ref, client),
+          { discard: true },
+        )
+        if (sourceChanged && nextSource !== "unavailable") {
+          yield* publishToolAvailability(next)
+        }
       })),
       remove: (sessionId) => lock.withPermits(1)(Ref.update(entries, (current) => {
         const next = new Map(current)
@@ -182,3 +219,30 @@ export const ProviderClientRegistryLive: Layer.Layer<
 
 export const SharedProviderClientLive: Layer.Layer<ProviderClient, never, ProviderClientRegistry> =
   Layer.effect(ProviderClient, Effect.map(ProviderClientRegistry, (registry) => registry.shared))
+
+export function toolAvailabilityFromSource(
+  source: WebSearchSource,
+): ToolAvailabilityState {
+  return {
+    webSearch: source === "unavailable"
+      ? { _tag: "Unavailable" }
+      : { _tag: "Available", source },
+  }
+}
+
+export function availabilitySource(
+  state: ToolAvailabilityState,
+): WebSearchSource {
+  return state.webSearch._tag === "Available"
+    ? state.webSearch.source
+    : "unavailable"
+}
+
+export function nextToolAvailability(
+  current: ToolAvailabilityState,
+  source: WebSearchSource,
+): ToolAvailabilityState {
+  return availabilitySource(current) === source
+    ? current
+    : toolAvailabilityFromSource(source)
+}

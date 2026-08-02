@@ -19,7 +19,7 @@
  * Generic over E - the application's event union type.
  */
 
-import { Effect, Context, Layer, Ref, Cause, PubSub, Stream } from 'effect'
+import { Effect, Context, FiberRef, Layer, Ref, Cause, PubSub, Scope, Stream } from 'effect'
 import { type BaseEvent, type Timestamped } from './event-bus-core'
 import { FrameworkErrorReporter, FrameworkError, type FrameworkErrorReporterService } from './framework-error'
 import {
@@ -34,6 +34,54 @@ import type { AddressedError } from '../addressed/errors'
 
 const MAX_SIGNAL_FLUSH_ITERATIONS = 100
 type ProjectionHandlerError = unknown
+
+interface ProjectionBusInternal {
+  readonly processAmbientChangeTransaction: (
+    ambientName: string,
+    value: unknown,
+    commit: Effect.Effect<void>,
+  ) => Effect.Effect<void>
+  readonly read: <A, Err, R>(effect: Effect.Effect<A, Err, R>) => Effect.Effect<A, Err, R>
+  readonly isInsideTransaction: Effect.Effect<boolean>
+}
+
+const projectionBusInternals = new WeakMap<object, ProjectionBusInternal>()
+
+const getProjectionBusInternal = <E extends BaseEvent>(
+  bus: ProjectionBusService<E>,
+): Effect.Effect<ProjectionBusInternal> => Effect.suspend(() => {
+  const internal = projectionBusInternals.get(bus)
+  return internal
+    ? Effect.succeed(internal)
+    : Effect.dieMessage('ProjectionBus was not created by makeProjectionBusLayer')
+})
+
+export const processAmbientChangeTransaction = <E extends BaseEvent>(
+  bus: ProjectionBusService<E>,
+  ambientName: string,
+  value: unknown,
+  commit: Effect.Effect<void>,
+): Effect.Effect<void> =>
+  getProjectionBusInternal(bus).pipe(
+    Effect.flatMap((internal) => internal.processAmbientChangeTransaction(
+      ambientName,
+      value,
+      commit,
+    )),
+  )
+
+export const withProjectionBusReadLock = <E extends BaseEvent, A, Err, R>(
+  bus: ProjectionBusService<E>,
+  effect: Effect.Effect<A, Err, R>,
+): Effect.Effect<A, Err, R> => getProjectionBusInternal(bus).pipe(
+  Effect.flatMap((internal) => internal.read(effect)),
+)
+
+export const isInsideProjectionBusTransaction = <E extends BaseEvent>(
+  bus: ProjectionBusService<E>,
+): Effect.Effect<boolean> => getProjectionBusInternal(bus).pipe(
+  Effect.flatMap((internal) => internal.isInsideTransaction),
+)
 
 /**
  * Minimal structural shape that forked projection states must satisfy.
@@ -160,7 +208,9 @@ export interface ProjectionBusService<E extends BaseEvent> {
    * materializations: they rerun when tracked projection state or addressed
    * entries change, without becoming projections and without app events.
    */
-  registerRuntimeObserver: (observerName: string) => Effect.Effect<Stream.Stream<void>>
+  registerRuntimeObserver: (
+    observerName: string
+  ) => Effect.Effect<Stream.Stream<void>, never, Scope.Scope>
 
   /**
    * Atomically replace all dependencies and pins for one runtime observer.
@@ -319,6 +369,16 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
 
   return Layer.scoped(Tag, Effect.gen(function* () {
     const reporter = yield* FrameworkErrorReporter
+    const processingLock = yield* Effect.makeSemaphore(1)
+    const insideProcessing = yield* FiberRef.make(false, { fork: () => false })
+    const withProcessingLock = <A, Err, R>(effect: Effect.Effect<A, Err, R>) =>
+      FiberRef.get(insideProcessing).pipe(
+        Effect.flatMap((inside) => inside
+          ? effect
+          : processingLock.withPermits(1)(
+              effect.pipe(Effect.locally(insideProcessing, true)),
+            )),
+      )
     // Event handlers in registration order (will be sorted by dependencies)
     type EventHandlerItem = {
       name: string
@@ -658,7 +718,43 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
 
     let currentEventTimestamp: number = Date.now()
 
-    return {
+    const processAmbientChange = (
+      ambientName: string,
+      value: unknown,
+      commit: Effect.Effect<void>,
+    ) => withProcessingLock(Effect.gen(function* () {
+      yield* commit
+      const graph = yield* Ref.get(dependencyGraphRef)
+      const ambientHandlers = yield* Ref.get(ambientHandlersRef)
+      const handlers = ambientHandlers.get(ambientName) ?? []
+      if (handlers.length === 0) return
+
+      const handlerNames = handlers.map(h => h.name)
+      const sortedNames = topologicalSort(handlerNames, graph)
+      const nameToHandler = new Map(handlers.map(h => [h.name, h]))
+
+      for (const name of sortedNames) {
+        const handlerItem = nameToHandler.get(name)
+        if (handlerItem) {
+          yield* handlerItem.handler(value).pipe(
+            Effect.catchAllCause((cause) =>
+              reporter.report(FrameworkError.ProjectionSignalHandlerError({
+                projectionName: name,
+                signalName: `ambient:${ambientName}`,
+                cause
+              }))
+            )
+          )
+          recordObserverRun(name)
+          recordRuntimeProjectionChange(name)
+        }
+      }
+
+      yield* flushSignalQueue
+      yield* publishRuntimeObserverChanges
+    }))
+
+    const service: ProjectionBusService<E> = {
       register: (
         handler: (event: E) => Effect.Effect<void, ProjectionHandlerError>,
         eventTypes: readonly E['type'][],
@@ -834,12 +930,13 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
             yield* PubSub.shutdown(existing.pubsub)
           }
           const pubsub = yield* PubSub.unbounded<void>()
+          const changes = yield* PubSub.subscribe(pubsub)
           runtimeObservers.set(observerName, {
             projectionNames: new Set(),
             addressedReads: new Map(),
             pubsub
           })
-          return Stream.fromPubSub(pubsub)
+          return Stream.fromQueue(changes)
         }),
 
       updateRuntimeObserverDependencies: (observerName, projectionNames, addressedReads) =>
@@ -952,7 +1049,7 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
         }
       }),
 
-      processEvent: (event: Timestamped<E>) => Effect.gen(function* () {
+      processEvent: (event: Timestamped<E>) => withProcessingLock(Effect.gen(function* () {
         currentEventTimestamp = event.timestamp
         const handlers = yield* Ref.get(eventHandlersRef)
         const graph = yield* Ref.get(dependencyGraphRef)
@@ -987,38 +1084,16 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
         // Phase 2: Flush signals iteratively
         yield* flushSignalQueue
         yield* publishRuntimeObserverChanges
-      }),
+      })),
 
-      processAmbientChange: (ambientName: string, value: unknown) => Effect.gen(function* () {
-        const graph = yield* Ref.get(dependencyGraphRef)
-        const ambientHandlers = yield* Ref.get(ambientHandlersRef)
-        const handlers = ambientHandlers.get(ambientName) ?? []
-        if (handlers.length === 0) return
-
-        const handlerNames = handlers.map(h => h.name)
-        const sortedNames = topologicalSort(handlerNames, graph)
-        const nameToHandler = new Map(handlers.map(h => [h.name, h]))
-
-        for (const name of sortedNames) {
-          const handlerItem = nameToHandler.get(name)
-          if (handlerItem) {
-            yield* handlerItem.handler(value).pipe(
-              Effect.catchAllCause((cause) =>
-                reporter.report(FrameworkError.ProjectionSignalHandlerError({
-                  projectionName: name,
-                  signalName: `ambient:${ambientName}`,
-                  cause
-                }))
-              )
-            )
-            recordObserverRun(name)
-            recordRuntimeProjectionChange(name)
-          }
-        }
-
-        yield* flushSignalQueue
-        yield* publishRuntimeObserverChanges
-      })
+      processAmbientChange: (ambientName, value) =>
+        processAmbientChange(ambientName, value, Effect.void),
     }
+    projectionBusInternals.set(service, {
+      processAmbientChangeTransaction: processAmbientChange,
+      read: withProcessingLock,
+      isInsideTransaction: FiberRef.get(insideProcessing),
+    })
+    return service
   }))
 }

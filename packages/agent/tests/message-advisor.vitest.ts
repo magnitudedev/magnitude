@@ -406,7 +406,22 @@ describe('messageAdvisor toolkit registration', () => {
 
     expect(leaderToolkit.entries.messageAdvisor).toBeDefined()
     expect(isToolKey('messageAdvisor')).toBe(true)
-    expect(selectAgentToolKeys({ roleId: 'leader', configState: config, solo: false, vcsAvailable: false })).not.toContain('messageAdvisor')
-    expect(selectAgentToolKeys({ roleId: 'engineer', configState: config, solo: false, vcsAvailable: false })).not.toContain('messageAdvisor')
+    const toolAvailability = {
+      webSearch: { _tag: 'Available', source: 'magnitude' },
+    } as const
+    expect(selectAgentToolKeys({
+      roleId: 'leader',
+      configState: config,
+      toolAvailability,
+      solo: false,
+      vcsAvailable: false,
+    })).not.toContain('messageAdvisor')
+    expect(selectAgentToolKeys({
+      roleId: 'engineer',
+      configState: config,
+      toolAvailability,
+      solo: false,
+      vcsAvailable: false,
+    })).not.toContain('messageAdvisor')
   })
 })

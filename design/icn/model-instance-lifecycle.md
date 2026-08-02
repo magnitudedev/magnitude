@@ -138,8 +138,9 @@ Hardware view requests it; ICN repeats authoritative planning and admission duri
 
 `ModelSlotController` reduces stored selections, provider/catalog evidence, installed packages,
 and `ModelInstancesSnapshot`. One atomic aggregate commit publishes both the new `ModelSlotsState`
-and the corresponding agent model configuration. Each projection has its own semantic revision
-and filtered stream, so a change relevant to only one does not create a false change in the other.
+and the corresponding agent model configuration. The public slot mirror has its protocol revision;
+the process-local agent configuration is filtered by semantic equality. A change relevant to only
+one does not create a false change in the other.
 Clients read `ModelSlotsMirror` for canonical state; the Hardware view independently queries the
 advisory plan only while it needs unloaded-model presentation.
 
@@ -186,8 +187,8 @@ request. Prefill remains distinct from productive generation work.
 - A new local assignment is committed only when its exact retained configuration is installed and
   valid for the slot.
 - Slot transitions use `defineFSM` directly, and slot actions never authorize commands.
-- Slot and agent configuration advance from one aggregate commit and independent semantic
-  revisions.
+- Slot and agent configuration advance from one aggregate commit and publish independently on
+  semantic changes.
 - Clients obtain current identity, lifecycle, actual allocation, and actions from one slot snapshot.
 - Advisory load plans exist only as responses to explicit unloaded-model Hardware queries.
 - Hardware can alter memory presentation but cannot create or erase model lifecycle.

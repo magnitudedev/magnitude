@@ -80,7 +80,7 @@ export interface ModelSlotControllerApi {
   readonly snapshot: Effect.Effect<MirroredSnapshot<ModelSlotsState>>
   readonly changes: Stream.Stream<MirroredSnapshot<ModelSlotsState>>
   readonly agentModelConfiguration: Effect.Effect<ConfigState>
-  readonly agentModelConfigurations: Stream.Stream<ConfigState>
+  readonly agentModelConfigurationChanges: Stream.Stream<ConfigState>
   readonly acquireLocalModel: (
     slotId: SlotId,
     providerModelId: ProviderModelId,
@@ -251,7 +251,6 @@ export const ModelSlotControllerLive: Layer.Layer<
       catalogContents(initialCatalog).models,
       emptyState.slots,
       initialConfiguration.contextLimits,
-      0,
     ),
     loadTargets: {
       primary: Option.none(),
@@ -262,7 +261,6 @@ export const ModelSlotControllerLive: Layer.Layer<
       secondary: Option.none(),
     },
   })
-
   const commit = (
     state: ModelSlotsState,
     catalogModels: readonly ProviderModelCatalogEntry[],
@@ -278,7 +276,6 @@ export const ModelSlotControllerLive: Layer.Layer<
       catalogModels,
       state.slots,
       contextLimits,
-      previous.agentConfiguration.revision,
     )
     const agentConfigurationChanged = !sameConfigStateValue(
       previous.agentConfiguration,
@@ -305,13 +302,10 @@ export const ModelSlotControllerLive: Layer.Layer<
     const revision = stateChanged
       ? previous.snapshot.revision + 1
       : previous.snapshot.revision
-    const agentRevision = agentConfigurationChanged
-      ? previous.agentConfiguration.revision + 1
-      : previous.agentConfiguration.revision
     const next: ControllerAggregate = {
       snapshot: stateChanged ? { revision, state } : previous.snapshot,
       agentConfiguration: agentConfigurationChanged
-        ? { ...candidateAgentConfiguration, revision: agentRevision }
+        ? candidateAgentConfiguration
         : previous.agentConfiguration,
       loadTargets: loadTargetsChanged ? loadTargets : previous.loadTargets,
       instanceBindings: instanceBindingsChanged
@@ -1012,9 +1006,9 @@ export const ModelSlotControllerLive: Layer.Layer<
     agentModelConfiguration: SubscriptionRef.get(aggregate).pipe(
       Effect.map(({ agentConfiguration }) => agentConfiguration),
     ),
-    agentModelConfigurations: aggregate.changes.pipe(
+    agentModelConfigurationChanges: aggregate.changes.pipe(
       Stream.map(({ agentConfiguration }) => agentConfiguration),
-      Stream.changesWith((left, right) => left.revision === right.revision),
+      Stream.changesWith(sameConfigStateValue),
     ),
     acquireLocalModel,
     ensureLocalModelReady: (slotId, providerModelId) =>

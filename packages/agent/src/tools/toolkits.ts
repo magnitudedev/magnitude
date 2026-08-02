@@ -9,6 +9,7 @@
 import { defineToolkit, mergeToolkits, type Toolkit, type ToolkitEntry, type ToolkitKeys } from '@magnitudedev/harness'
 import type { RoleId } from '../agents/role-validation'
 import type { ConfigState } from '../ambient/config-ambient'
+import type { ToolAvailabilityState } from '../ambient/tool-availability-ambient'
 import { ROLE_TO_SLOT } from '@magnitudedev/roles'
 import { vcsToolkit } from '@magnitudedev/vcs'
 import type { ToolKeyErased } from './types'
@@ -153,6 +154,7 @@ export function isToolKey(value: string): value is ToolKey {
 export interface AgentToolSelectionInput {
   readonly roleId: RoleId
   readonly configState: ConfigState
+  readonly toolAvailability: ToolAvailabilityState
   readonly solo: boolean
   readonly vcsAvailable: boolean
 }
@@ -172,8 +174,12 @@ function baseToolKeys(roleId: RoleId): readonly ToolKey[] {
 
 /** Sole policy for selecting ordered tool keys for an agent fork. */
 export function selectAgentToolKeys(input: AgentToolSelectionInput): readonly ToolKey[] {
-  const { roleId, configState, solo, vcsAvailable } = input
+  const { roleId, configState, toolAvailability, solo, vcsAvailable } = input
   let keys = [...baseToolKeys(roleId)]
+
+  if (toolAvailability.webSearch._tag === 'Unavailable') {
+    keys = keys.filter(key => key !== 'webSearch')
+  }
 
   if (roleId === 'leader') {
     keys = keys.filter(key => key !== 'messageAdvisor')

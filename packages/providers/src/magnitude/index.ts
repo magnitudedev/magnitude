@@ -1,4 +1,5 @@
-export { createMagnitudeProvider, fetchUsage, PROVIDER_ID, type MagnitudeProviderInstance, type MagnitudeClientConfig, type FetchUsageOptions, WebSearchError, MagnitudeClientError } from "./provider"
+export { createMagnitudeProvider, fetchUsage, PROVIDER_ID, type MagnitudeProviderInstance, type MagnitudeClientConfig, type FetchUsageOptions, MagnitudeClientError } from "./provider"
+export type { WebSearchError } from "../web-search-error"
 export { createMagnitudeCatalog, toMagnitudeModelInfo, type MagnitudeAuthentication } from "./catalog"
 export { createMagnitudeCompatibleSpec, type MagnitudeCallOptions, type MagnitudeModelSpec, type MagnitudeCompatibleSpecConfig } from "./models"
 export { classifyMagnitudeRejectedResponse, tryParseErrorBody, type ParsedMagnitudeApiError } from "./errors"

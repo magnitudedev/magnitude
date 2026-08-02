@@ -53,9 +53,26 @@ export {
   type MagnitudeProviderInstance,
   type MagnitudeClientConfig,
   type FetchUsageOptions,
-  WebSearchError,
   MagnitudeClientError,
 } from "./magnitude/provider"
+export {
+  createExaWebSearch,
+  type ExaWebSearchConfig,
+  type ExaWebSearchInstance,
+} from "./exa/web-search"
+export {
+  WebSearchProviderSchema,
+  WebSearchNotConfigured,
+  WebSearchRequestEncodingFailed,
+  WebSearchRequestFailed,
+  WebSearchTimedOut,
+  WebSearchRejected,
+  WebSearchResponseReadFailed,
+  WebSearchInvalidResponse,
+  formatWebSearchError,
+  type WebSearchProvider,
+  type WebSearchError,
+} from "./web-search-error"
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export { createMagnitudeCatalog, toMagnitudeModelInfo, type MagnitudeAuthentication } from "./magnitude/catalog"
 export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./magnitude/contract"

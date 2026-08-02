@@ -696,7 +696,14 @@ describe("ModelSlotController load admission", () => {
       const harness = yield* makeHarness()
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        const before = yield* controller.agentModelConfiguration
+        const change = yield* controller.agentModelConfigurationChanges.pipe(
+          Stream.drop(1),
+          Stream.runHead,
+          Effect.fork,
+        )
+        while ((yield* Fiber.status(change))._tag !== "Suspended") {
+          yield* Effect.yieldNow()
+        }
 
         yield* SubscriptionRef.update(harness.catalogSnapshot, (current) => ({
           revision: current.revision + 1,
@@ -710,14 +717,11 @@ describe("ModelSlotController load admission", () => {
           }),
         }))
 
-        const changed = yield* controller.agentModelConfigurations.pipe(
-          Stream.filter((configuration) => configuration.revision > before.revision),
-          Stream.runHead,
-          Effect.flatMap(Option.match({
-            onNone: () => Effect.die("Agent configuration stream ended before catalog update"),
-            onSome: Effect.succeed,
-          })),
-        )
+        yield* Fiber.join(change).pipe(Effect.flatMap(Option.match({
+          onNone: () => Effect.die("Agent configuration stream ended before catalog update"),
+          onSome: () => Effect.void,
+        })))
+        const changed = yield* controller.agentModelConfiguration
         const primary = changed.bySlot.primary
         expect(primary._tag).toBe("Ready")
         if (primary._tag === "Ready") {

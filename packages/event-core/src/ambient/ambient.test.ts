@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Effect, Schema } from 'effect'
+import { Cause, Deferred, Effect, Exit, Fiber, Option, Schema, Stream } from 'effect'
 import * as EventEngine from '../event-engine'
 import * as Ambient from './index'
 import * as Projection from '../projection'
 import * as Signal from '../signal'
 import { AmbientServiceTag } from '../core/ambient-service'
+import { ProjectionBusTag } from '../core/projection-bus'
 
 type TestEvent =
   | { type: 'set'; value: number }
@@ -118,6 +119,307 @@ describe('Ambient primitive', () => {
       )
 
       expect(await client.state.reactive.get()).toEqual({ seen: [2] })
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('processes an ambient update started by another ambient handler', async () => {
+    const SourceAmbient = Ambient.define<number>({ name: 'NestedSource', initial: 0 })
+    const TargetAmbient = Ambient.define<number>({ name: 'NestedTarget', initial: 0 })
+
+    const TestAgent = EventEngine.make<TestEvent>()({
+      name: 'TestAgent',
+      schemaVersion: 'test',
+      projections: [],
+      workers: [],
+    })
+
+    const client = await TestAgent.createClient()
+
+    try {
+      const target = await client.runEffect(Effect.gen(function* () {
+        const ambients = yield* AmbientServiceTag
+        const bus = yield* ProjectionBusTag<TestEvent>()
+        yield* ambients.register(SourceAmbient)
+        yield* ambients.register(TargetAmbient)
+        yield* bus.registerAmbientHandler(
+          SourceAmbient.name,
+          (value) => ambients.update(TargetAmbient, (value as number) + 1),
+          'NestedAmbientHandler',
+        )
+        yield* ambients.update(SourceAmbient, 4)
+        return ambients.getValue(TargetAmbient)
+      }))
+
+      expect(target).toBe(5)
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('processes an ambient update started by an event handler', async () => {
+    const TargetAmbient = Ambient.define<number>({ name: 'EventNestedTarget', initial: 0 })
+    const TestAgent = EventEngine.make<TestEvent>()({
+      name: 'TestAgent',
+      schemaVersion: 'test',
+      projections: [],
+      workers: [],
+    })
+    const client = await TestAgent.createClient()
+
+    try {
+      const target = await client.runEffect(Effect.gen(function* () {
+        const ambients = yield* AmbientServiceTag
+        const bus = yield* ProjectionBusTag<TestEvent>()
+        yield* ambients.register(TargetAmbient)
+        yield* bus.register(
+          () => ambients.update(TargetAmbient, 7),
+          ['set'],
+          'EventAmbientHandler',
+        )
+        yield* bus.processEvent({ type: 'set', value: 1, timestamp: Date.now() })
+        return ambients.getValue(TargetAmbient)
+      }))
+
+      expect(target).toBe(7)
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('defects when reading an unregistered ambient', async () => {
+    const UnregisteredAmbient = Ambient.define<number>({ name: 'UnregisteredRead', initial: 0 })
+    const TestAgent = EventEngine.make<TestEvent>()({
+      name: 'TestAgent',
+      schemaVersion: 'test',
+      projections: [],
+      workers: [],
+    })
+    const client = await TestAgent.createClient()
+
+    try {
+      const exit = await client.runEffect(Effect.exit(Effect.gen(function* () {
+        const ambients = yield* AmbientServiceTag
+        return ambients.getValue(UnregisteredAmbient)
+      })))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.pretty(exit.cause)).toContain('UnregisteredAmbientDefect')
+      }
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('does not expose a projection read while an ambient transaction is in flight', async () => {
+    const NumberAmbient = Ambient.define<number>({ name: 'TransactionalNumber', initial: 1 })
+    const handlerStarted = await Effect.runPromise(Deferred.make<void>())
+    const releaseHandler = await Effect.runPromise(Deferred.make<void>())
+
+    const ReactiveProjection = Projection.define<TestEvent>()({
+      name: 'TransactionalReactive',
+      state: LatestStateSchema,
+      initial: { latest: null },
+      ambients: [NumberAmbient],
+      ambientHandlers: (on) => [
+        on(NumberAmbient, ({ value }) => Effect.gen(function* () {
+          yield* Deferred.succeed(handlerStarted, undefined)
+          yield* Deferred.await(releaseHandler)
+          return { latest: value }
+        }))
+      ]
+    })
+
+    const TestAgent = EventEngine.make<TestEvent>()({
+      name: 'TestAgent',
+      schemaVersion: 'test',
+      projections: [ReactiveProjection],
+      workers: []
+    })
+
+    const client = await TestAgent.createClient()
+
+    try {
+      const result = await client.runEffect(Effect.gen(function* () {
+        const ambients = yield* AmbientServiceTag
+        const projection = yield* ReactiveProjection.Tag
+        const update = yield* Effect.fork(ambients.update(NumberAmbient, 2))
+        yield* Deferred.await(handlerStarted)
+
+        const read = yield* Effect.fork(projection.get)
+        yield* Effect.yieldNow()
+        const whileUpdating = yield* Fiber.poll(read)
+
+        yield* Deferred.succeed(releaseHandler, undefined)
+        yield* Fiber.join(update)
+        const after = yield* Fiber.join(read)
+        return { whileUpdating, after }
+      }))
+
+      expect(Option.isNone(result.whileUpdating)).toBe(true)
+      expect(result.after).toEqual({ latest: 2 })
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('does not expose a runtime consumer snapshot while an ambient transaction is in flight', async () => {
+    const NumberAmbient = Ambient.define<number>({ name: 'ConsumerTransactionalNumber', initial: 1 })
+    const handlerStarted = await Effect.runPromise(Deferred.make<void>())
+    const releaseHandler = await Effect.runPromise(Deferred.make<void>())
+
+    const ReactiveProjection = Projection.define<TestEvent>()({
+      name: 'ConsumerTransactionalReactive',
+      state: LatestStateSchema,
+      initial: { latest: null },
+      ambients: [NumberAmbient],
+      ambientHandlers: (on) => [
+        on(NumberAmbient, ({ value }) => Effect.gen(function* () {
+          yield* Deferred.succeed(handlerStarted, undefined)
+          yield* Deferred.await(releaseHandler)
+          return { latest: value }
+        }))
+      ]
+    })
+
+    const TestAgent = EventEngine.make<TestEvent>()({
+      name: 'TestAgent',
+      schemaVersion: 'test',
+      projections: [ReactiveProjection],
+      workers: []
+    })
+
+    const client = await TestAgent.createClient()
+
+    try {
+      const result = await client.runEffect(Effect.scoped(Effect.gen(function* () {
+        const ambients = yield* AmbientServiceTag
+        const consumer = yield* Projection.consumer.acquire('ambient-transaction-test')
+        const update = yield* Effect.fork(ambients.update(NumberAmbient, 2))
+        yield* Deferred.await(handlerStarted)
+
+        const read = yield* Effect.fork(
+          Projection.consumer.provide(consumer)(
+            Projection.consumer.read(ReactiveProjection)
+          )
+        )
+        yield* Effect.yieldNow()
+        const whileUpdating = yield* Fiber.poll(read)
+
+        yield* Deferred.succeed(releaseHandler, undefined)
+        yield* Fiber.join(update)
+        const after = yield* Fiber.join(read)
+        return { whileUpdating, after }
+      })))
+
+      expect(Option.isNone(result.whileUpdating)).toBe(true)
+      expect(result.after.state).toEqual({ latest: 2 })
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('does not miss an ambient invalidation before the consumer change stream starts', async () => {
+    const NumberAmbient = Ambient.define<number>({ name: 'ConsumerSubscriptionNumber', initial: 1 })
+
+    const ReactiveProjection = Projection.define<TestEvent>()({
+      name: 'ConsumerSubscriptionReactive',
+      state: LatestStateSchema,
+      initial: { latest: null },
+      ambients: [NumberAmbient],
+      ambientHandlers: (on) => [
+        on(NumberAmbient, ({ value }) => ({ latest: value }))
+      ]
+    })
+
+    const TestAgent = EventEngine.make<TestEvent>()({
+      name: 'TestAgent',
+      schemaVersion: 'test',
+      projections: [ReactiveProjection],
+      workers: []
+    })
+
+    const client = await TestAgent.createClient()
+
+    try {
+      const snapshots = await client.runEffect(Effect.scoped(Effect.gen(function* () {
+        const ambients = yield* AmbientServiceTag
+        const consumer = yield* Projection.consumer.acquire('ambient-subscription-test')
+        const firstDelivered = yield* Deferred.make<void>()
+        const releaseFirst = yield* Deferred.make<void>()
+        let delivered = 0
+
+        const snapshots = yield* Projection.consumer.stream(consumer)(
+          Projection.consumer.read(ReactiveProjection)
+        ).pipe(
+          Stream.tap(() => Effect.gen(function* () {
+            delivered += 1
+            if (delivered !== 1) return
+            yield* Deferred.succeed(firstDelivered, undefined)
+            yield* Deferred.await(releaseFirst)
+          })),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.fork,
+        )
+
+        yield* Deferred.await(firstDelivered)
+        yield* ambients.update(NumberAmbient, 2)
+        yield* Deferred.succeed(releaseFirst, undefined)
+
+        return yield* Fiber.join(snapshots)
+      })))
+
+      expect(Array.from(snapshots, ({ state }) => state)).toEqual([
+        { latest: null },
+        { latest: 2 },
+      ])
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('finishes an admitted ambient transaction when its caller is interrupted', async () => {
+    const NumberAmbient = Ambient.define<number>({ name: 'InterruptedCallerNumber', initial: 1 })
+    const handlerStarted = await Effect.runPromise(Deferred.make<void>())
+    const releaseHandler = await Effect.runPromise(Deferred.make<void>())
+
+    const ReactiveProjection = Projection.define<TestEvent>()({
+      name: 'InterruptedCallerReactive',
+      state: LatestStateSchema,
+      initial: { latest: null },
+      ambients: [NumberAmbient],
+      ambientHandlers: (on) => [
+        on(NumberAmbient, ({ value }) => Effect.gen(function* () {
+          yield* Deferred.succeed(handlerStarted, undefined)
+          yield* Deferred.await(releaseHandler)
+          return { latest: value }
+        }))
+      ]
+    })
+
+    const TestAgent = EventEngine.make<TestEvent>()({
+      name: 'TestAgent',
+      schemaVersion: 'test',
+      projections: [ReactiveProjection],
+      workers: []
+    })
+
+    const client = await TestAgent.createClient()
+
+    try {
+      const after = await client.runEffect(Effect.gen(function* () {
+        const ambients = yield* AmbientServiceTag
+        const projection = yield* ReactiveProjection.Tag
+        const caller = yield* Effect.fork(ambients.update(NumberAmbient, 2))
+        yield* Deferred.await(handlerStarted)
+        yield* Fiber.interrupt(caller)
+        yield* Deferred.succeed(releaseHandler, undefined)
+        return yield* projection.get
+      }))
+
+      expect(after).toEqual({ latest: 2 })
     } finally {
       await client.dispose()
     }
