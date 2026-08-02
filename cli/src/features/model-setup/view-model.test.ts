@@ -52,7 +52,8 @@ describe("deriveOnboardingModelSetupView", () => {
     const state = makeView({ ready: false })
     const view = deriveOnboardingModelSetupView({
       active: true,
-      intent: { _tag: "Idle" },
+      submission: null,
+      submitting: false,
       ...state,
     })
     expect(view._tag).toBe("Choosing")
@@ -63,7 +64,8 @@ describe("deriveOnboardingModelSetupView", () => {
     const state = makeView({ ready: false })
     const view = deriveOnboardingModelSetupView({
       active: true,
-      intent: { _tag: "Loading", choice },
+      submission: { _tag: "Load", choice },
+      submitting: true,
       ...state,
     })
     expect(view).toMatchObject({
@@ -103,7 +105,8 @@ describe("deriveOnboardingModelSetupView", () => {
     })
     const view = deriveOnboardingModelSetupView({
       active: true,
-      intent: { _tag: "Loading", choice },
+      submission: { _tag: "Load", choice },
+      submitting: true,
       ...base,
       slots: { ...base.slots, slots: { ...base.slots.slots, primary } },
     })
@@ -112,7 +115,7 @@ describe("deriveOnboardingModelSetupView", () => {
 
   it("shows download immediately, before progress mirrors propagate", () => {
     const candidate = makeCatalogCandidate()
-    const base = makeView({ models: [makeModel()] })
+    const base = makeView({ models: [makeModel()], ready: false })
     const state = {
       ...base,
       models: {
@@ -125,10 +128,11 @@ describe("deriveOnboardingModelSetupView", () => {
     }
     const view = deriveOnboardingModelSetupView({
       active: true,
-      intent: {
-        _tag: "Downloading",
+      submission: {
+        _tag: "DownloadThenLoad",
         choice: { ...choice, targetId: TEST_TARGET_ID },
       },
+      submitting: true,
       ...state,
     })
     expect(view).toMatchObject({ _tag: "Downloading", candidate: { displayName: "Qwen Test" } })
@@ -147,10 +151,11 @@ describe("deriveOnboardingModelSetupView", () => {
     const base = makeView({ models: [makeModel({ download: candidate.download })] })
     const view = deriveOnboardingModelSetupView({
       active: true,
-      intent: {
-        _tag: "Downloading",
+      submission: {
+        _tag: "DownloadThenLoad",
         choice: { ...choice, targetId: TEST_TARGET_ID },
       },
+      submitting: false,
       ...base,
       models: {
         ...base.models,
@@ -165,4 +170,79 @@ describe("deriveOnboardingModelSetupView", () => {
     expect(view._tag).toBe("DownloadFailed")
     expect(onboardingModelSetupPlaceholder(view)).toBe("Couldn’t download Qwen Test")
   })
+
+  it("returns to choosing when an externally stopped load has settled", () => {
+    const base = makeView({ ready: false })
+    const primary = new ModelSlotConfiguredLocal({
+      slotId: PRIMARY_SLOT_ID,
+      selection: {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: TEST_MODEL_ID,
+        reasoningEffort: TEST_REASONING_EFFORT,
+      },
+      descriptor: {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: TEST_MODEL_ID,
+        displayName: "Qwen Test",
+      },
+      availability: { _tag: "Available" },
+      instance: Option.some({
+        id: ModelInstanceIdSchema.make("stopped-instance"),
+        configurationId: TEST_CONFIGURATION_ID,
+        lifecycle: { _tag: "Stopped", reason: "user_stop" },
+      }),
+      actions: ["Load"],
+    })
+    for (const submitting of [true, false]) {
+      const view = deriveOnboardingModelSetupView({
+        active: true,
+        submission: { _tag: "Load", choice },
+        submitting,
+        ...base,
+        slots: { ...base.slots, slots: { ...base.slots.slots, primary } },
+      })
+
+      expect(view._tag).toBe("Choosing")
+      expect(onboardingModelSetupPlaceholder(view)).toBe("Select a model to start coding…")
+    }
+  })
+
+  it("renders the authoritative stopping lifecycle while cancellation settles", () => {
+    const base = makeView({ ready: false })
+    const primary = new ModelSlotConfiguredLocal({
+      slotId: PRIMARY_SLOT_ID,
+      selection: {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: TEST_MODEL_ID,
+        reasoningEffort: TEST_REASONING_EFFORT,
+      },
+      descriptor: {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: TEST_MODEL_ID,
+        displayName: "Qwen Test",
+      },
+      availability: { _tag: "Available" },
+      instance: Option.some({
+        id: ModelInstanceIdSchema.make("stopping-instance"),
+        configurationId: TEST_CONFIGURATION_ID,
+        lifecycle: {
+          _tag: "Stopping",
+          reason: "user_stop",
+          allocation: { _tag: "Planned", allocation: Option.none() },
+        },
+      }),
+      actions: [],
+    })
+    const view = deriveOnboardingModelSetupView({
+      active: true,
+      submission: { _tag: "Load", choice },
+      submitting: true,
+      ...base,
+      slots: { ...base.slots, slots: { ...base.slots.slots, primary } },
+    })
+
+    expect(view).toMatchObject({ _tag: "Activating", phase: "Stopping" })
+    expect(onboardingModelSetupPlaceholder(view)).toBe("Stopping Qwen Test…")
+  })
+
 })

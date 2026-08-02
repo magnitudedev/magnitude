@@ -477,6 +477,37 @@ test("renders the authoritative loading lifecycle", async () => {
   }
 })
 
+test("renders the authoritative stopping lifecycle", async () => {
+  const view = await testRender(
+    <OnboardingModelChooser
+      {...chooserProps(chooserView())}
+      width={100}
+      error={null}
+      operation={{
+        _tag: "Activating",
+        providerModelId: ProviderModelIdSchema.make("configuration_remote"),
+        displayName: "Remote Model",
+        phase: "Stopping",
+        failure: null,
+        onRetry: vi.fn(),
+        onChooseAnother: vi.fn(),
+      }}
+      onContinue={onContinue}
+      onSkip={onSkip}
+    />,
+    { width: 100, height: 34 },
+  )
+  try {
+    await act(view.renderOnce)
+    const frame = view.captureCharFrame()
+    expect(frame).toContain("Stopping Remote Model")
+    expect(frame).toContain("Stopping model…")
+    expect(frame).not.toContain("Loading model weights…")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
 test("keeps four rows per section and scrolls only the installed-model window", async () => {
   const view = await testRender(
     <OnboardingModelChooser

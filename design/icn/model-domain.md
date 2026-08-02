@@ -245,9 +245,12 @@ after every exact admitted attempt reports successful publication. Generic slot 
 the selected serving configuration and stores the primary selection without using installed
 presentation as command authorization. Generic slot load lets ICN validate current package presence
 and returns only after the exact selected instance is Ready; the client then marks onboarding
-complete. The submitted choice is the only onboarding-specific transient state and exists only in
-the client that received the explicit action. ACN has no onboarding model command, activation
-service, or startup reconciler. Confirmed cancellation uses the ordinary target-download
+complete. The submitted command and choice are the only onboarding-specific transient state and
+exist only in the client that received the explicit action. They bridge command admission but do
+not represent download or instance lifecycle; presentation derives those facts from authoritative
+mirrors. Confirmed onboarding cancellation clears the submission, an externally stopped load is
+terminal presentation, and successful completion closes setup. ACN has no onboarding model command,
+activation service, or startup reconciler. Confirmed cancellation uses the ordinary target-download
 cancellation or slot-clear mutation. Interruption or restart never reconstructs command intent from
 onboarding, download, slot, or instance snapshots.
 

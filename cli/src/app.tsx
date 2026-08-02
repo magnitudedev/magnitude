@@ -33,6 +33,7 @@ import {
   isModelSlotConfigured,
   deriveLocalModelLoadActivity,
   useAcnLifecycle,
+  type OnboardingModelCommandFailed,
 } from "@magnitudedev/client-common";
 import {
   ReasoningEffortSchema,
@@ -300,10 +301,11 @@ function CliAppContent(
     onFailure: () => null,
     onSuccess: ({ value }) => deriveLocalModelLoadActivity(value, rootSlotId),
   });
-  const workflowError = (
+  const workflowError = <A,>(
+    result: Result.Result<A, OnboardingModelCommandFailed>,
     command: "download" | "assign" | "load" | "complete" | "cancel" | "clear"
   ): string | null =>
-    Result.matchWithError(onboardingSetup.workflowResult, {
+    Result.matchWithError(result, {
       onInitial: () => null,
       onError: (failure) =>
         failure.command === command ? failure.message : null,
@@ -313,11 +315,12 @@ function CliAppContent(
           : "The local model setup command failed unexpectedly.",
       onSuccess: () => null,
     });
-  const downloadMutationError = workflowError("download");
-  const loadMutationError = workflowError("load");
-  const assignmentMutationError = workflowError("assign");
-  const completionMutationError = workflowError("complete");
-  const cancelDownloadError = workflowError("cancel") ?? workflowError("clear");
+  const downloadMutationError = workflowError(onboardingSetup.workflowResult, "download");
+  const loadMutationError = workflowError(onboardingSetup.workflowResult, "load");
+  const assignmentMutationError = workflowError(onboardingSetup.workflowResult, "assign");
+  const completionMutationError = workflowError(onboardingSetup.workflowResult, "complete");
+  const cancelDownloadError = workflowError(onboardingSetup.cancelResult, "cancel")
+    ?? workflowError(onboardingSetup.cancelResult, "clear");
   const completeModelSetup = useCallback(() => {
     void props.updateOnboarding(true);
   }, [props.updateOnboarding]);
@@ -386,7 +389,8 @@ function CliAppContent(
     }
     const setupView = deriveOnboardingModelSetupView({
       active: true,
-      intent: onboardingSetup.intent,
+      submission: onboardingSetup.submission,
+      submitting: Result.isWaiting(onboardingSetup.workflowResult),
       models,
       slots,
     });

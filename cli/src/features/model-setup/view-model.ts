@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import type { OnboardingModelWorkflowIntent } from "@magnitudedev/client-common"
+import type { OnboardingModelSubmission } from "@magnitudedev/client-common"
 import type {
   LocalModelCatalogCandidate,
   LocalModelsState,
@@ -18,9 +18,24 @@ export type OnboardingModelSetupView =
       readonly providerModelId: ProviderModelId
       readonly displayName: string
       readonly reasoningEffort: ReasoningEffort
-      readonly phase: "Loading" | "Ready" | "Failed"
+      readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
       readonly failure: string | null
     }
+
+type ActivatingView = Extract<OnboardingModelSetupView, { readonly _tag: "Activating" }>
+
+const activatingView = (
+  choice: OnboardingModelSubmission["choice"],
+  phase: ActivatingView["phase"],
+  failure: string | null = null,
+): ActivatingView => ({
+  _tag: "Activating",
+  providerModelId: choice.providerModelId,
+  displayName: choice.displayName,
+  reasoningEffort: choice.reasoningEffort,
+  phase,
+  failure,
+})
 
 export const deriveModelSetupActive = ({
   forceSetup,
@@ -37,53 +52,53 @@ export const deriveModelSetupActive = ({
 
 export const deriveOnboardingModelSetupView = ({
   active,
-  intent,
+  submission,
+  submitting,
   models,
   slots,
 }: {
   readonly active: boolean
-  readonly intent: OnboardingModelWorkflowIntent
+  readonly submission: OnboardingModelSubmission | null
+  readonly submitting: boolean
   readonly models: LocalModelsState
   readonly slots: ModelSlotsState
 }): OnboardingModelSetupView => {
   if (!active) return { _tag: "Inactive" }
-  if (intent._tag === "Idle") return { _tag: "Choosing" }
+  if (submission === null) return { _tag: "Choosing" }
 
-  const operation = intent._tag === "Cancelling" ? intent.operation : intent
-  if (operation._tag === "Downloading") {
-    const candidate = models.recommendations._tag === "Ready"
-      ? models.recommendations.catalog.find(({ providerModelId }) =>
-          providerModelId === operation.choice.providerModelId)
-      : undefined
-    if (candidate === undefined) return { _tag: "Choosing" }
-    return candidate.download._tag === "Failed"
-      ? { _tag: "DownloadFailed", candidate }
-      : { _tag: "Downloading", candidate }
+  const choice = submission.choice
+  const candidate = submission._tag === "DownloadThenLoad"
+    && models.recommendations._tag === "Ready"
+    ? models.recommendations.catalog.find(({ targetId }) =>
+        targetId === submission.choice.targetId)
+    : undefined
+  if (candidate?.download._tag === "Failed") {
+    return { _tag: "DownloadFailed", candidate }
+  }
+  if (candidate?.download._tag === "Downloading") {
+    return { _tag: "Downloading", candidate }
   }
 
   const primary = slots.slots.primary
   const lifecycle = primary._tag === "ConfiguredLocal"
-    && primary.selection.providerModelId === operation.choice.providerModelId
+    && primary.selection.providerModelId === choice.providerModelId
     ? Option.getOrNull(Option.map(primary.instance, ({ lifecycle }) => lifecycle))
     : null
-  if (lifecycle?._tag === "Ready" || lifecycle?._tag === "Failed") {
-    return {
-      _tag: "Activating",
-      providerModelId: operation.choice.providerModelId,
-      displayName: operation.choice.displayName,
-      reasoningEffort: operation.choice.reasoningEffort,
-      phase: lifecycle._tag,
-      failure: lifecycle._tag === "Failed" ? lifecycle.failure.message : null,
-    }
+  if (lifecycle?._tag === "Loading"
+    || lifecycle?._tag === "Stopping"
+    || lifecycle?._tag === "Ready") {
+    return activatingView(choice, lifecycle._tag)
   }
-  return {
-    _tag: "Activating",
-    providerModelId: operation.choice.providerModelId,
-    displayName: operation.choice.displayName,
-    reasoningEffort: operation.choice.reasoningEffort,
-    phase: "Loading",
-    failure: null,
+  if (lifecycle?._tag === "Failed") {
+    return activatingView(choice, "Failed", lifecycle.failure.message)
   }
+  if (lifecycle?._tag === "Stopped") return { _tag: "Choosing" }
+
+  if (!submitting) return { _tag: "Choosing" }
+  if (submission._tag === "DownloadThenLoad" && candidate !== undefined) {
+    return { _tag: "Downloading", candidate }
+  }
+  return activatingView(choice, "Loading")
 }
 
 export const onboardingModelSetupPlaceholder = (view: OnboardingModelSetupView): string | null => {
@@ -95,8 +110,10 @@ export const onboardingModelSetupPlaceholder = (view: OnboardingModelSetupView):
     case "Activating":
       return view.phase === "Loading"
         ? `Loading ${view.displayName}…`
-        : view.phase === "Ready"
-          ? `Finishing setup for ${view.displayName}…`
-          : `Couldn’t load ${view.displayName}`
+        : view.phase === "Stopping"
+          ? `Stopping ${view.displayName}…`
+          : view.phase === "Ready"
+            ? `Finishing setup for ${view.displayName}…`
+            : `Couldn’t load ${view.displayName}`
   }
 }
