@@ -26,8 +26,14 @@ A syntactically invalid fragment after the final LF is an incomplete append. Rea
 former by adding LF and discard the latter by truncating to the preceding LF.
 
 Only an unterminated tail is automatically repairable. Every LF-terminated record is committed
-history. Invalid UTF-8, invalid JSON, or domain-schema failure in a committed record is a visible
-persistence failure and is never skipped or deleted automatically.
+history. Invalid UTF-8 or invalid JSON in a committed record—including an empty or whitespace-only
+record—is a visible persistence failure and is never skipped or deleted automatically.
+
+The generic JSONL layer validates UTF-8 and JSON syntax. Its type parameter describes the caller's
+expected value but is not runtime validation. Magnitude does not currently define a runtime schema
+for the complete `AppEvent` union, so event-variant shape validation is outside this recovery
+boundary. A syntactically valid committed JSON value is never deleted as tail damage merely because
+a downstream domain consumer cannot use its shape.
 
 Repair decisions use byte offsets in the UTF-8 file. Event content is not included in recovery
 diagnostics.

@@ -199,15 +199,13 @@ export function makeStorageIo(): Effect.Effect<
       filePath: string,
       line: number,
       bytes: Uint8Array
-    ): Effect.Effect<
-      { readonly _tag: "blank" } | { readonly _tag: "value"; readonly value: T },
-      JsonLinesParseError
-    > =>
+    ): Effect.Effect<T, JsonLinesParseError> =>
       Effect.gen(function* () {
         const text = yield* decodeUtf8(filePath, line, bytes);
-        if (text.trim() === "") return { _tag: "blank" as const };
         return yield* Schema.decodeUnknown(Schema.parseJson())(text).pipe(
-          Effect.map((value) => ({ _tag: "value" as const, value: value as T })),
+          // JSON parsing is the runtime boundary owned by this generic layer.
+          // Domain owners are responsible for any narrower record schema.
+          Effect.map((value) => value as T),
           Effect.mapError(
             (error) =>
               new JsonLinesParseError({
@@ -259,7 +257,7 @@ export function makeStorageIo(): Effect.Effect<
             line,
             raw.subarray(recordStart, offset)
           );
-          if (decoded._tag === "value") result.push(decoded.value);
+          result.push(decoded);
           recordStart = offset + 1;
           line += 1;
         }
@@ -270,12 +268,12 @@ export function makeStorageIo(): Effect.Effect<
           const decoded = yield* Effect.either(
             decodeJsonLine<T>(filePath, line, tail)
           );
-          if (decoded._tag === "Right" && decoded.right._tag === "value") {
+          if (decoded._tag === "Right") {
             yield* fs.writeFileString(filePath, "\n", { flag: "a" }).pipe(
               Effect.uninterruptible
             );
             repairedByteLength += 1;
-            result.push(decoded.right.value);
+            result.push(decoded.right);
             yield* Effect.logWarning(
               "[storage] Repaired JSONL record missing final newline"
             ).pipe(
@@ -299,7 +297,7 @@ export function makeStorageIo(): Effect.Effect<
                 originalByteLength: raw.byteLength,
                 repairedByteLength,
                 discardedByteCount: raw.byteLength - repairedByteLength,
-                tail: decoded._tag === "Right" ? "whitespace" : "invalid-json",
+                tail: "invalid-json",
               })
             );
           }
