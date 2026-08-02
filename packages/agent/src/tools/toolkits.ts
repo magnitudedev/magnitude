@@ -122,14 +122,24 @@ const criticBase = mergeToolkits(
   mergeToolkits(skillToolkit, compactToolkit),
 )
 
-/** fs + shell + web + task + advisor + goal + skill + compact. */
+/** fs + shell + web + advisor + goal + skill + compact. */
 export const leaderToolkit = mergeToolkits(
   workerBase,
-  mergeToolkits(taskToolkit, mergeToolkits(advisorConsultToolkit, goalToolkit)),
+  // TEMPORARILY DISABLED: task and subagent tools are not exposed to the leader.
+  // Re-add taskToolkit here when tasks and subagents are enabled again.
+  // mergeToolkits(taskToolkit, mergeToolkits(advisorConsultToolkit, goalToolkit)),
+  mergeToolkits(advisorConsultToolkit, goalToolkit),
 )
 
-/** Complete executable tool universe understood by this agent runtime. */
-export const toolUniverseToolkit = mergeToolkits(leaderToolkit, vcsToolkit)
+/**
+ * Complete executable tool universe understood by this agent runtime.
+ * Task tools remain here so historical events can still be replayed while
+ * they are temporarily absent from the leader's effective toolkit.
+ */
+export const toolUniverseToolkit = mergeToolkits(
+  mergeToolkits(leaderToolkit, taskToolkit),
+  vcsToolkit,
+)
 
 // =============================================================================
 // Role → Toolkit mapping

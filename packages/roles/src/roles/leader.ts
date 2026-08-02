@@ -8,7 +8,7 @@ import { join } from 'node:path'
 export function createLeaderRole(): RoleDefinition {
   return {
     id: 'leader',
-    description: 'Coordinates tasks and workers',
+    description: 'Works directly with the user to complete coding work',
     prompt: definePrompt<'SKILLS_SECTION' | 'THINKING_LIMIT' | 'CHECKPOINT_SECTION'>(leaderPromptRaw),
     defaultRecipient: 'user',
     agentKind: 'lead',
