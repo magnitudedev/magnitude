@@ -161,9 +161,18 @@ jobs:
             "https://developer.download.nvidia.com/compute/cuda/repos/${repository_distribution}/${repository_arch}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring.deb
           sudo apt-get update
-          sudo apt-get install -y "cuda-toolkit-${package_version}"
-          echo "CUDA_PATH=/usr/local/cuda-${toolkit}" >> "$GITHUB_ENV"
-          echo "/usr/local/cuda-${toolkit}/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y --no-install-recommends \
+            "cuda-compiler-${package_version}" \
+            "libcublas-dev-${package_version}"
+          cuda_path="/usr/local/cuda-${toolkit}"
+          test -x "${cuda_path}/bin/nvcc"
+          test -x "${cuda_path}/bin/cuobjdump"
+          test -f "${cuda_path}/include/cublas_v2.h"
+          echo "CUDA_PATH=${cuda_path}" >> "$GITHUB_ENV"
+          echo "${cuda_path}/bin" >> "$GITHUB_PATH"
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          rm -f cuda-keyring.deb
       - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         if: runner.os == 'Windows' && matrix.backend == 'cuda'
         with:
