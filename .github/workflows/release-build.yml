@@ -24,6 +24,7 @@ jobs:
     outputs:
       hosts: ${{ steps.matrix.outputs.hosts }}
       backends: ${{ steps.matrix.outputs.backends }}
+      cuda11_backends: ${{ steps.matrix.outputs.cuda11_backends }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -179,7 +180,77 @@ jobs:
           cuda: "${{ matrix.toolkit }}.0"
           method: network
       - run: bun install --frozen-lockfile
-      - run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+      - name: Build backend with resource diagnostics
+        shell: bash
+        run: |
+          bash scripts/release-build-diagnostics.sh run -- \
+            bun run packages/release/scripts/build/backend.ts \
+            "${{ matrix.id }}" \
+            "release/${{ matrix.id }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ matrix.id }}
+          path: release/${{ matrix.id }}/
+          if-no-files-found: error
+
+  cuda-11-8-backend:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.cuda11_backends) }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: nvidia/cuda:11.8.0-base-ubuntu22.04@sha256:f895871972c1c91eb6a896eee68468f40289395a1e58c492e1be7929d0f8703b
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install checkout prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          submodules: recursive
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install CUDA 11.8 build environment
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            cuda-compiler-11-8 \
+            libcublas-dev-11-8 \
+            libclang-dev \
+            procps
+          if [[ "$(uname -m)" == "aarch64" ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          fi
+          cuda_path=/usr/local/cuda-11.8
+          test -x "${cuda_path}/bin/nvcc"
+          test -x "${cuda_path}/bin/cuobjdump"
+          test -f "${cuda_path}/include/cublas_v2.h"
+          echo "CUDA_PATH=${cuda_path}" >> "$GITHUB_ENV"
+          echo "${cuda_path}/bin" >> "$GITHUB_PATH"
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+      - run: bun install --frozen-lockfile
+      - name: Build CUDA 11.8 backend with resource diagnostics
+        run: |
+          bash scripts/release-build-diagnostics.sh run -- \
+            bun run packages/release/scripts/build/backend.ts \
+            "${{ matrix.id }}" \
+            "release/${{ matrix.id }}"
       - uses: actions/upload-artifact@v4
         with:
           name: backend-${{ matrix.id }}
@@ -187,7 +258,7 @@ jobs:
           if-no-files-found: error
 
   candidate:
-    needs: [matrix, host, backend]
+    needs: [matrix, host, backend, cuda-11-8-backend]
     if: inputs.validate_candidate
     runs-on: ubuntu-latest
     steps:
