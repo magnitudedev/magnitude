@@ -1,10 +1,5 @@
 import { Effect } from 'effect'
 
-export interface AmbientValue<T> {
-  readonly value: T
-  readonly version: number
-}
-
 export interface AmbientDef<T, R = never> {
   readonly name: string
   readonly initial: T | Effect.Effect<T, never, R>

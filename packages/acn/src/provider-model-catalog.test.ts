@@ -88,6 +88,7 @@ describe("provider model catalog", () => {
         resolveModel: () => Effect.die("not used"),
         discoverModelProperties: () => Effect.succeed(ModelDiscoveryOperationIdSchema.make("not-used")),
         requestAttribution: (_providerId, _providerModelId, key) => ({ key, requestStarted: Effect.void }),
+        webSearchSource: Effect.succeed("unavailable"),
         webSearch: () => Effect.die("not used"),
         usage: () => Effect.die("not used"),
         runtimeConfig: { disableTraits: false },

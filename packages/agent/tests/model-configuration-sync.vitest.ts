@@ -7,10 +7,13 @@ import {
 import { Effect, Ref } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { ConfigAmbient, type ConfigState } from '../src/ambient/config-ambient'
-import { makeModelConfigurationSynchronizer } from '../src/coding-agent'
+import type { ToolAvailabilityState } from '../src/ambient/tool-availability-ambient'
+import {
+  makeModelConfigurationSynchronizer,
+  makeToolAvailabilitySynchronizer,
+} from '../src/coding-agent'
 
-const config = (revision: number, providerModelId: string): ConfigState => ({
-  revision,
+const config = (providerModelId: string): ConfigState => ({
   catalogLoaded: true,
   bySlot: {
     primary: {
@@ -34,17 +37,19 @@ const config = (revision: number, providerModelId: string): ConfigState => ({
 })
 
 describe('resident session model configuration', () => {
-  it('synchronizes a preloaded session before use and rejects delayed older revisions', async () => {
+  it('re-reads the authoritative snapshot and skips semantic duplicates', async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
-      const authoritative = yield* Ref.make(config(2, 'selected-model'))
-      let resident = config(1, 'stale-preload-model')
-      const applied: number[] = []
+      const authoritative = yield* Ref.make(config('selected-model'))
+      let resident = config('stale-preload-model')
+      const applied: string[] = []
       const ambient = {
         register: () => Effect.void,
         getValue: () => resident,
         update: (_definition, state: ConfigState) => Effect.sync(() => {
           resident = state
-          applied.push(state.revision)
+          if (state.bySlot.primary._tag === 'Ready') {
+            applied.push(state.bySlot.primary.config.providerModelId)
+          }
         }),
       } as AmbientService
       const synchronizer = yield* makeModelConfigurationSynchronizer(
@@ -53,8 +58,8 @@ describe('resident session model configuration', () => {
       )
 
       yield* synchronizer.sync
-      yield* synchronizer.apply(config(1, 'late-stream-model'))
-      yield* Ref.set(authoritative, config(3, 'newer-model'))
+      yield* synchronizer.sync
+      yield* Ref.set(authoritative, config('newer-model'))
       yield* synchronizer.sync
 
       return { resident, applied }
@@ -63,6 +68,47 @@ describe('resident session model configuration', () => {
     expect(result.resident.bySlot.primary._tag).toBe('Ready')
     if (result.resident.bySlot.primary._tag !== 'Ready') return
     expect(result.resident.bySlot.primary.config.providerModelId).toBe('newer-model')
-    expect(result.applied).toEqual([2, 3])
+    expect(result.applied).toEqual(['selected-model', 'newer-model'])
+  })
+})
+
+describe('resident session tool availability', () => {
+  it('re-reads the authoritative snapshot and skips semantic duplicates', async () => {
+    const state = (
+      source: 'magnitude' | 'exa' | 'unavailable',
+    ): ToolAvailabilityState => ({
+      webSearch: source === 'unavailable'
+        ? { _tag: 'Unavailable' }
+        : { _tag: 'Available', source },
+    })
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const authoritative = yield* Ref.make(state('exa'))
+      let resident = state('unavailable')
+      const applied: string[] = []
+      const ambient = {
+        register: () => Effect.void,
+        getValue: () => resident,
+        update: (_definition, next: ToolAvailabilityState) => Effect.sync(() => {
+          resident = next
+          applied.push(next.webSearch._tag === 'Available'
+            ? next.webSearch.source
+            : 'unavailable')
+        }),
+      } as AmbientService
+      const synchronizer = yield* makeToolAvailabilitySynchronizer(
+        ambient,
+        Ref.get(authoritative),
+      )
+
+      yield* synchronizer.sync
+      yield* synchronizer.sync
+      yield* Ref.set(authoritative, state('magnitude'))
+      yield* synchronizer.sync
+
+      return { resident, applied }
+    }))
+
+    expect(result.resident).toEqual(state('magnitude'))
+    expect(result.applied).toEqual(['exa', 'magnitude'])
   })
 })

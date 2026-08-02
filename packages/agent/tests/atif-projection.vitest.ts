@@ -93,8 +93,11 @@ const mockConfigState = buildConfigStateFromSlots(mockModels, mockSlots, {
   softCapRatio: 0.9,
   softCapMaxTokens: 200_000,
 })
+const toolAvailability = {
+  webSearch: { _tag: 'Available', source: 'magnitude' },
+} as const
 const leaderToolKeys = selectAgentToolKeys({
-  roleId: 'leader', configState: mockConfigState, solo: false, vcsAvailable: false,
+  roleId: 'leader', configState: mockConfigState, toolAvailability, solo: false, vcsAvailable: false,
 })
 const serializationTools = {
   universe: toolUniverseToolkit,

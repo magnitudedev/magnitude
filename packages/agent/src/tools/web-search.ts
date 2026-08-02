@@ -7,7 +7,7 @@
 import { Effect, Option, Schema } from 'effect'
 import { JsonRecordSchema, JsonValueSchema, type JsonValue } from '@magnitudedev/utils/schema'
 import { defineHarnessTool } from '@magnitudedev/harness'
-import { ProviderClient } from '@magnitudedev/sdk'
+import { ProviderClient, formatWebSearchError } from '@magnitudedev/sdk'
 import { ToolErrorSchema } from './errors'
 
 const WebSearchErrorSchema = ToolErrorSchema('WebSearchError', {})
@@ -37,7 +37,7 @@ export const webSearchTool = defineHarnessTool({
       const result = yield* search.pipe(
         Effect.mapError((err) => ({
           _tag: 'WebSearchError' as const,
-          message: err.message,
+          message: formatWebSearchError(err),
         }))
       )
       return {

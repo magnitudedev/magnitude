@@ -1,21 +1,33 @@
-import { AmbientServiceTag, Projection, type AmbientService, type WorkerReadFn } from '@magnitudedev/event-core'
+import { Projection, type WorkerReadFn } from '@magnitudedev/event-core'
 import { Effect, Schema } from 'effect'
 import type { Toolkit } from '@magnitudedev/harness'
 import type { AppEvent } from '../events'
-import { ConfigAmbient, type ConfigState } from '../ambient/config-ambient'
+import {
+  ConfigAmbient,
+  ConfigStateSchema,
+  sameConfigStateValue,
+  type ConfigState,
+} from '../ambient/config-ambient'
 import { SessionOptionsAmbient, type SessionOptions } from '../ambient/session-ambient'
 import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
+import {
+  ToolAvailabilityAmbient,
+  type ToolAvailabilityState,
+} from '../ambient/tool-availability-ambient'
 import { AgentLifecycleProjection } from './agent-lifecycle'
 import { getForkInfo } from '../agents/registry'
 import { selectAgentToolKeys } from '../tools/toolkits'
 
 export const AgentToolkitStateSchema = Schema.Struct({
-  configRevision: Schema.Number,
+  config: Schema.NullOr(ConfigStateSchema),
   toolKeys: Schema.Array(Schema.String),
 })
 export type AgentToolkitState = typeof AgentToolkitStateSchema.Type
 
-const initial: AgentToolkitState = { configRevision: -1, toolKeys: [] }
+const initial: AgentToolkitState = {
+  config: null,
+  toolKeys: [],
+}
 
 function sameKeys(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((key, index) => key === b[index])
@@ -24,19 +36,21 @@ function sameKeys(a: readonly string[], b: readonly string[]): boolean {
 function select(
   roleId: Parameters<typeof selectAgentToolKeys>[0]['roleId'],
   config: ConfigState,
+  toolAvailability: ToolAvailabilityState,
   options: SessionOptions,
   universe: Toolkit,
 ): AgentToolkitState {
   const toolKeys = selectAgentToolKeys({
     roleId,
     configState: config,
+    toolAvailability,
     solo: options.solo,
     vcsAvailable: options.vcsAvailable,
   })
   const missing = toolKeys.filter(key => !(key in universe.entries))
   if (missing.length > 0) throw new Error(`Tool universe is missing selected keys: ${missing.join(', ')}`)
   return {
-    configRevision: config.revision,
+    config,
     toolKeys,
   }
 }
@@ -45,6 +59,7 @@ function recomputeAll(args: {
   readonly state: { readonly forks: ReadonlyMap<string | null, AgentToolkitState> }
   readonly agentState: Parameters<typeof getForkInfo>[0]
   readonly config: ConfigState
+  readonly toolAvailability: ToolAvailabilityState
   readonly options: SessionOptions
   readonly universe: Toolkit
 }) {
@@ -52,9 +67,20 @@ function recomputeAll(args: {
   for (const forkId of forks.keys()) {
     const info = getForkInfo(args.agentState, forkId)
     if (!info) continue
-    const next = select(info.roleId, args.config, args.options, args.universe)
+    const next = select(
+      info.roleId,
+      args.config,
+      args.toolAvailability,
+      args.options,
+      args.universe,
+    )
     const current = forks.get(forkId)
-    if (!current || current.configRevision !== next.configRevision || !sameKeys(current.toolKeys, next.toolKeys)) {
+    if (
+      !current
+      || current.config === null
+      || !sameConfigStateValue(current.config, args.config)
+      || !sameKeys(current.toolKeys, next.toolKeys)
+    ) {
       forks.set(forkId, next)
     }
   }
@@ -66,18 +92,25 @@ export const AgentToolkitProjection = Projection.defineForked<AppEvent>()({
   forkState: AgentToolkitStateSchema,
   initialFork: initial,
   reads: [AgentLifecycleProjection] as const,
-  ambients: [ConfigAmbient, SessionOptionsAmbient, ToolUniverseAmbient] as const,
+  ambients: [
+    ConfigAmbient,
+    ToolAvailabilityAmbient,
+    SessionOptionsAmbient,
+    ToolUniverseAmbient,
+  ] as const,
 
   eventHandlers: {
     session_initialized: ({ fork, ambient }) => select(
       'leader',
       ambient.get(ConfigAmbient),
+      ambient.get(ToolAvailabilityAmbient),
       ambient.get(SessionOptionsAmbient),
       ambient.get(ToolUniverseAmbient),
     ),
     agent_created: ({ event, ambient }) => select(
       event.role,
       ambient.get(ConfigAmbient),
+      ambient.get(ToolAvailabilityAmbient),
       ambient.get(SessionOptionsAmbient),
       ambient.get(ToolUniverseAmbient),
     ),
@@ -89,6 +122,15 @@ export const AgentToolkitProjection = Projection.defineForked<AppEvent>()({
       state,
       agentState: read(AgentLifecycleProjection),
       config: value,
+      toolAvailability: ambient.get(ToolAvailabilityAmbient),
+      options: ambient.get(SessionOptionsAmbient),
+      universe: ambient.get(ToolUniverseAmbient),
+    })),
+    on(ToolAvailabilityAmbient, ({ value, state, read, ambient }) => recomputeAll({
+      state,
+      agentState: read(AgentLifecycleProjection),
+      config: ambient.get(ConfigAmbient),
+      toolAvailability: value,
       options: ambient.get(SessionOptionsAmbient),
       universe: ambient.get(ToolUniverseAmbient),
     })),
@@ -96,26 +138,20 @@ export const AgentToolkitProjection = Projection.defineForked<AppEvent>()({
       state,
       agentState: read(AgentLifecycleProjection),
       config: ambient.get(ConfigAmbient),
+      toolAvailability: ambient.get(ToolAvailabilityAmbient),
       options: value,
       universe: ambient.get(ToolUniverseAmbient),
     })),
   ] as const),
 })
 
-/**
- * Read the fork projection and its source ambient at one matching revision.
- * Ambient changes are projected asynchronously, so a turn waits for that
- * projection boundary instead of combining values from different revisions.
- */
 export function readCoherentAgentToolkit(
   read: WorkerReadFn<AppEvent>,
   forkId: string | null,
-): Effect.Effect<{ readonly config: ConfigState; readonly toolkit: AgentToolkitState }, never, AmbientService> {
+): Effect.Effect<{ readonly config: ConfigState; readonly toolkit: AgentToolkitState }> {
   return Effect.suspend(() => Effect.gen(function* () {
-    const ambientService = yield* AmbientServiceTag
-    const config = ambientService.getValue(ConfigAmbient)
     const toolkit = yield* read(AgentToolkitProjection, forkId)
-    if (toolkit.configRevision === config.revision) return { config, toolkit }
+    if (toolkit.config !== null) return { config: toolkit.config, toolkit }
     yield* Effect.yieldNow()
     return yield* readCoherentAgentToolkit(read, forkId)
   }))

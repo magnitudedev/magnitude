@@ -86,11 +86,13 @@ Draft preload and claim phases are outcome-total: cancellation removes or restor
 Claiming linearizes creation; initial message or goal publication and draft promotion or rollback
 then complete before client interruption can take effect.
 
-Preloaded and resident sessions consume one ACN-owned, revisioned model configuration. A slot
-mutation publishes its new configuration before it succeeds. Before a session accepts an external
-event, it synchronizes to the latest published revision; delayed subscription delivery or an older
-queued revision cannot replace a newer configuration. Selecting a model therefore makes an
-already-preloaded draft immediately usable without restarting the client or daemon.
+Preloaded and resident sessions consume one ACN-owned authoritative model configuration. A slot
+mutation publishes its new configuration before it succeeds. The configuration stream emits its
+current observation on subscription and later semantic changes. Before a session accepts an
+external event, it reads the current authoritative value under its synchronization lock and updates
+its ambient only when the semantic configuration differs. A delayed observation therefore cannot
+replace newer state, and the initial observation closes the startup subscription gap. Selecting a
+model makes an already-preloaded draft immediately usable without restarting the client or daemon.
 
 ## User bash command history
 

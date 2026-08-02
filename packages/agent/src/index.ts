@@ -202,6 +202,12 @@ export { PermissionRejection } from './execution/permission-rejection'
 
 // Tools
 export { isToolKey, type ToolKey } from './tools/toolkits'
+export {
+  ToolAvailabilityStateSchema,
+  WebSearchAvailabilitySchema,
+  type ToolAvailabilityState,
+  type WebSearchAvailability,
+} from './ambient/tool-availability-ambient'
 export type { ToolHandle } from './tools/tool-handle'
 export type { ToolState } from './models'
 export type {

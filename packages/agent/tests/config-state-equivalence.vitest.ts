@@ -13,7 +13,6 @@ import {
 const configState = (
   overrides: Partial<SlotConfig> = {},
 ): ConfigState => ({
-  revision: 1,
   catalogLoaded: true,
   bySlot: {
     primary: {
@@ -38,10 +37,10 @@ const configState = (
 })
 
 describe('agent configuration value equivalence', () => {
-  it('ignores revision but detects catalog-derived configuration changes', () => {
+  it('detects catalog-derived configuration changes', () => {
     const current = configState()
 
-    expect(sameConfigStateValue(current, { ...current, revision: 2 })).toBe(true)
+    expect(sameConfigStateValue(current, configState())).toBe(true)
     expect(sameConfigStateValue(current, configState({
       profile: { contextWindow: 65_536, maxOutputTokens: 8_192 },
     }))).toBe(false)

@@ -1,6 +1,10 @@
 import { Context, Effect, Layer, Ref, Scope, Stream } from 'effect'
 import type { Schema } from 'effect'
-import { ProjectionBusTag, type ProjectionBusService } from '../core/projection-bus'
+import {
+  ProjectionBusTag,
+  withProjectionBusReadLock,
+  type ProjectionBusService,
+} from '../core/projection-bus'
 import type { AddressedError } from '../addressed/errors'
 import {
   makeReadTracker,
@@ -107,15 +111,17 @@ export const provide = (consumer: RuntimeConsumer) =>
         addressedReads: makeReadTracker()
       }
 
-      const value = yield* effect.pipe(
-        Effect.provideService(TrackingScope, tracking)
-      )
-      yield* bus.updateRuntimeObserverDependencies(
-        tracking.observerName,
-        tracking.projectionNames,
-        tracking.addressedReads
-      )
-      return value
+      return yield* withProjectionBusReadLock(bus, Effect.gen(function* () {
+        const value = yield* effect.pipe(
+          Effect.provideService(TrackingScope, tracking)
+        )
+        yield* bus.updateRuntimeObserverDependencies(
+          tracking.observerName,
+          tracking.projectionNames,
+          tracking.addressedReads
+        )
+        return value
+      }))
     })
 
 export const stream = (consumer: RuntimeConsumer) =>

@@ -9,7 +9,7 @@
  */
 
 import { Context, Data, Effect, Layer, Option, Stream } from 'effect'
-import { EventEngine, Introspection, Surface } from '@magnitudedev/event-core'
+import { Ambient, EventEngine, Introspection, Surface } from '@magnitudedev/event-core'
 import { AmbientServiceTag, HydrationContext, WorkerBusTag, type AmbientService } from '@magnitudedev/event-core'
 import type { FrameworkError } from '@magnitudedev/event-core'
 import type { AppEvent, SessionContext } from './events'
@@ -110,7 +110,17 @@ import { initTraceSession } from '@magnitudedev/tracing'
 import { MAGNITUDE_VERSION } from '@magnitudedev/version'
 
 import { publishSessionOptions, SessionOptionsAmbient } from './ambient/session-ambient'
-import { ConfigAmbient, getSlotConfig, type ConfigState } from './ambient/config-ambient'
+import {
+  ConfigAmbient,
+  getSlotConfig,
+  sameConfigStateValue,
+  type ConfigState,
+} from './ambient/config-ambient'
+import {
+  ToolAvailabilityAmbient,
+  sameToolAvailabilityState,
+  type ToolAvailabilityState,
+} from './ambient/tool-availability-ambient'
 import { loadSkills, skillLoadDiagnosticLogFields, type Skill, type SkillLoadDiagnostic } from '@magnitudedev/skills'
 import { publishSkills } from './ambient/skills-ambient'
 import { publishAtifConfig, DEFAULT_ATIF_CONFIG } from './ambient/atif-ambient'
@@ -234,8 +244,12 @@ export interface CreateClientOptions {
 
   /** Reads the latest coherent snapshot from ACN's authoritative model state. */
   modelConfiguration: Effect.Effect<ConfigState>
-  /** Publishes later authoritative model-state revisions to resident sessions. */
-  modelConfigurations: Stream.Stream<ConfigState>
+  /** Observes the current and later states of ACN's authoritative model configuration. */
+  modelConfigurationChanges: Stream.Stream<ConfigState>
+  /** Reads current provider-backed tool availability from ACN. */
+  toolAvailability: Effect.Effect<ToolAvailabilityState>
+  /** Observes current and later provider-backed tool availability. */
+  toolAvailabilityChanges: Stream.Stream<ToolAvailabilityState>
   /** ACN-owned authoritative persistence/publication for a runtime-invalidated bound effort. */
   applyReasoningEffortFallback?: (
     input: import('./model/model-resolver').ReasoningEffortFallbackInput,
@@ -286,23 +300,43 @@ export interface CreateClientOptions {
   systemPromptOverride?: string
 }
 
+const makeAmbientSynchronizer = <State>(
+  ambientService: AmbientService,
+  ambient: Ambient.AmbientDef<State>,
+  currentState: Effect.Effect<State>,
+  equivalent: (left: State, right: State) => boolean,
+) => Effect.gen(function* () {
+  const lock = yield* Effect.makeSemaphore(1)
+  const sync = lock.withPermits(1)(
+    currentState.pipe(Effect.flatMap((state) => Effect.suspend(() => {
+      const current = ambientService.getValue(ambient)
+      return equivalent(current, state)
+        ? Effect.void
+        : ambientService.update(ambient, state)
+    }))),
+  )
+  return { sync } as const
+})
+
 export const makeModelConfigurationSynchronizer = (
   ambientService: AmbientService,
   modelConfiguration: Effect.Effect<ConfigState>,
-) => Effect.gen(function* () {
-  const lock = yield* Effect.makeSemaphore(1)
-  const apply = (state: ConfigState): Effect.Effect<void> =>
-    lock.withPermits(1)(Effect.suspend(() => {
-      const current = ambientService.getValue(ConfigAmbient)
-      return state.revision <= current.revision
-        ? Effect.void
-        : ambientService.update(ConfigAmbient, state)
-    }))
-  return {
-    apply,
-    sync: modelConfiguration.pipe(Effect.flatMap(apply)),
-  } as const
-})
+) => makeAmbientSynchronizer(
+  ambientService,
+  ConfigAmbient,
+  modelConfiguration,
+  sameConfigStateValue,
+)
+
+export const makeToolAvailabilitySynchronizer = (
+  ambientService: AmbientService,
+  toolAvailability: Effect.Effect<ToolAvailabilityState>,
+) => makeAmbientSynchronizer(
+  ambientService,
+  ToolAvailabilityAmbient,
+  toolAvailability,
+  sameToolAvailabilityState,
+)
 
 export class CodingAgentStartupError extends Data.TaggedError('CodingAgentStartupError')<{
   readonly reason: string
@@ -380,8 +414,15 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         ambientService,
         options.modelConfiguration,
       )
+      const toolAvailability = yield* makeToolAvailabilitySynchronizer(
+        ambientService,
+        options.toolAvailability,
+      )
 
-      yield* Stream.runForEach(options.modelConfigurations, modelConfiguration.apply).pipe(
+      yield* Stream.runForEach(options.modelConfigurationChanges, () => modelConfiguration.sync).pipe(
+        Effect.forkScoped,
+      )
+      yield* Stream.runForEach(options.toolAvailabilityChanges, () => toolAvailability.sync).pipe(
         Effect.forkScoped,
       )
 
@@ -460,6 +501,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           }
 
           yield* modelConfiguration.sync
+          yield* toolAvailability.sync
           yield* engine.send({
             type: 'session_initialized',
             forkId: null,
@@ -511,6 +553,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         }
 
         yield* modelConfiguration.sync
+        yield* toolAvailability.sync
         const skills = yield* Effect.tryPromise(() => loadRuntimeSkills(process.cwd())).pipe(
           Effect.catchTag('UnknownException', (error) =>
             Effect.sync(() => logger.error({
@@ -650,7 +693,10 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         events: engine.events,
         errors: engine.errors,
         initialize,
-        send: (event) => modelConfiguration.sync.pipe(
+        send: (event) => Effect.all([
+          modelConfiguration.sync,
+          toolAvailability.sync,
+        ], { concurrency: 2, discard: true }).pipe(
           Effect.zipRight(engine.send(event)),
         ),
         interrupt: () => engine.interrupt(),

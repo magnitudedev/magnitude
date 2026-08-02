@@ -4,6 +4,7 @@ import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import {
   Auth,
   JsonValueSchema,
+  payloadSample,
   type AuthApplicator,
   type BoundModel,
   type Provider,
@@ -27,11 +28,18 @@ import type { CloudUsageResponse } from "./usage"
 import type { UsagePeriod } from "./usage"
 import { createMagnitudeCompatibleSpec, wrapAsBaseModel, type MagnitudeCallOptions } from "./models"
 import { CLIENT_PLATFORM, CLIENT_SHELL, HEADER_PLATFORM, HEADER_SHELL, HEADER_SESSION_ID, HEADER_USE_DEDICATED } from "./client-headers"
+import {
+  WebSearchInvalidResponse,
+  WebSearchNotConfigured,
+  WebSearchRejected,
+  WebSearchRequestEncodingFailed,
+  WebSearchRequestFailed,
+  WebSearchResponseReadFailed,
+  WebSearchTimedOut,
+  type WebSearchError,
+} from "../web-search-error"
 
-export class WebSearchError extends Data.TaggedError("WebSearchError")<{
-  readonly message: string
-  readonly cause?: unknown
-}> {}
+export type { WebSearchError } from "../web-search-error"
 
 export class MagnitudeClientError extends Data.TaggedError("MagnitudeClientError")<{
   readonly message: string
@@ -44,7 +52,7 @@ const WebSearchResultSchema = Schema.Struct({
     title: Schema.String,
     url: Schema.String,
   })),
-  data: Schema.optional(JsonValueSchema),
+  data: Schema.optionalWith(JsonValueSchema, { as: "Option", exact: true }),
 })
 
 export const PROVIDER_ID = ProviderIdSchema.make("magnitude")
@@ -143,7 +151,7 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
   const webSearch: WebSearchExtension<WebSearchResult, WebSearchError, HttpClient.HttpClient>["webSearch"] = (query, schema?) =>
     Effect.gen(function* () {
       if (requestAuthentication._tag === "NotConfigured") {
-        return yield* new WebSearchError({ message: "Magnitude authentication is not configured" })
+        return yield* new WebSearchNotConfigured()
       }
 
       const http = yield* HttpClient.HttpClient
@@ -158,40 +166,67 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
 
       const body = schema ? { query, schema } : { query }
 
-      const request = HttpClientRequest.post(`${endpoint}/web-search`).pipe(
+      const request = yield* HttpClientRequest.post(`${endpoint}/web-search`).pipe(
         HttpClientRequest.setHeaders(headerRecord),
         HttpClientRequest.bodyJson(body),
+        Effect.mapError((error) => new WebSearchRequestEncodingFailed({
+          provider: "magnitude",
+          reason: error instanceof Error ? error.message || error.name : String(error),
+        })),
       )
 
-      const response = yield* Effect.flatMap(
-        request,
-        (req) => http.execute(req)
-      ).pipe(
-        Effect.mapError((cause) => new WebSearchError({ message: "Request failed", cause })),
+      return yield* Effect.gen(function* () {
+        const response = yield* http.execute(request).pipe(
+          Effect.mapError((error) => new WebSearchRequestFailed({
+            provider: "magnitude",
+            reason: error instanceof Error ? error.message || error.name : String(error),
+          })),
+        )
+
+        if (response.status < 200 || response.status >= 300) {
+          const text = yield* response.text.pipe(
+            Effect.mapError((error) => new WebSearchResponseReadFailed({
+              provider: "magnitude",
+              reason: error instanceof Error ? error.message || error.name : String(error),
+            })),
+          )
+          return yield* new WebSearchRejected({
+            provider: "magnitude",
+            status: response.status,
+            message: text.slice(0, 500),
+            body: payloadSample(text),
+          })
+        }
+
+        const text = yield* response.text.pipe(
+          Effect.mapError((error) => new WebSearchResponseReadFailed({
+            provider: "magnitude",
+            reason: error instanceof Error ? error.message || error.name : String(error),
+          })),
+        )
+
+        const parsed = yield* Schema.decodeUnknown(Schema.parseJson(WebSearchResultSchema))(text).pipe(
+          Effect.mapError((error) => new WebSearchInvalidResponse({
+            provider: "magnitude",
+            body: payloadSample(text),
+            issue: error instanceof Error ? error.message || error.name : String(error),
+          })),
+        )
+
+        return {
+          text: parsed.text,
+          sources: parsed.sources,
+          ...(Option.isSome(parsed.data) ? { data: parsed.data.value } : {}),
+        } satisfies WebSearchResult
+      }).pipe(
         Effect.timeoutFail({
-          onTimeout: () => new WebSearchError({ message: "Request timed out after 10 seconds" }),
+          onTimeout: () => new WebSearchTimedOut({
+            provider: "magnitude",
+            timeoutMs: 10_000,
+          }),
           duration: Duration.seconds(10),
         }),
       )
-
-      if (response.status < 200 || response.status >= 300) {
-        const text = yield* response.text.pipe(Effect.orElseSucceed(() => ""))
-        return yield* new WebSearchError({ message: `HTTP ${response.status}: ${text}` })
-      }
-
-      const text = yield* response.text.pipe(
-        Effect.mapError((cause) => new WebSearchError({ message: "Failed to read response", cause })),
-      )
-
-      const parsed = yield* Schema.decodeUnknown(Schema.parseJson(WebSearchResultSchema))(text).pipe(
-        Effect.mapError((cause) => new WebSearchError({ message: `Failed to parse response: ${text.slice(0, 200)}`, cause })),
-      )
-
-      return {
-        text: parsed.text,
-        sources: parsed.sources,
-        data: parsed.data,
-      } satisfies WebSearchResult
     })
 
   const usage: UsageExtension<CloudUsageResponse, MagnitudeClientError, HttpClient.HttpClient>["usage"] = (query?) =>

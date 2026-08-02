@@ -1,4 +1,4 @@
-import { Context } from "effect"
+import { Context, Schema } from "effect"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import { Effect } from "effect"
 import { ModelCatalogError } from "@magnitudedev/ai"
@@ -21,7 +21,10 @@ import type { ModelCatalog } from "@magnitudedev/ai"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
   createMagnitudeProvider,
+  createExaWebSearch,
   makeProviderRegistry,
+  WebSearchNotConfigured,
+  WebSearchProviderSchema,
   type DiscoverableProviderInstance,
   type MagnitudeProviderInstance,
   type MagnitudeClientConfig,
@@ -81,6 +84,8 @@ export type { ProviderCatalogOutcome } from "@magnitudedev/providers"
 
 export interface ProviderClientConfig extends MagnitudeClientConfig {
   readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
+  readonly exaApiKey?: string
+  readonly exaEndpoint?: string
 }
 
 export type {
@@ -92,6 +97,7 @@ export type {
 } from "@magnitudedev/providers"
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
+export { formatWebSearchError } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/acn-protocol"
 
 // =============================================================================
@@ -119,6 +125,12 @@ export interface ProviderRuntimeConfig {
   readonly preferProvider?: string
   readonly disableTraits: boolean
 }
+
+export const WebSearchSourceSchema = Schema.Union(
+  WebSearchProviderSchema,
+  Schema.Literal("unavailable"),
+)
+export type WebSearchSource = typeof WebSearchSourceSchema.Type
 
 // =============================================================================
 // Provider Client Shape
@@ -150,6 +162,7 @@ export interface ProviderClientShape {
     providerModelId: ProviderModelId,
     key: string,
   ) => RequestAttribution
+  readonly webSearchSource: Effect.Effect<WebSearchSource>
   readonly webSearch: (
     query: string,
     schema?: Record<string, unknown>,
@@ -176,7 +189,22 @@ export class ProviderClient extends Context.Tag("ProviderClient")<
 
 export function createProviderClient(config?: ProviderClientConfig): ProviderClientShape {
   const magnitudeInstance: MagnitudeProviderInstance = createMagnitudeProvider(config)
+  const exaInstance = createExaWebSearch({
+    ...(config?.exaApiKey === undefined ? {} : { apiKey: config.exaApiKey }),
+    ...(config?.exaEndpoint === undefined ? {} : { endpoint: config.exaEndpoint }),
+  })
   const sessionId = config?.sessionId ?? null
+  const webSearchSource: WebSearchSource =
+    magnitudeInstance.authentication._tag === "Configured"
+      ? "magnitude"
+      : exaInstance.configured
+        ? "exa"
+        : "unavailable"
+  const webSearch = webSearchSource === "magnitude"
+    ? magnitudeInstance.provider.webSearch
+    : webSearchSource === "exa"
+      ? exaInstance.webSearch
+      : () => Effect.fail(new WebSearchNotConfigured())
 
   const registry = makeProviderRegistry({
     magnitude: magnitudeInstance,
@@ -192,7 +220,8 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
       registry.resolveModel(providerId, providerModelId, options),
     discoverModelProperties: registry.discoverModelProperties,
     requestAttribution: (_providerId, _providerModelId, key) => ({ key, requestStarted: Effect.void }),
-    webSearch: magnitudeInstance.provider.webSearch,
+    webSearchSource: Effect.succeed(webSearchSource),
+    webSearch,
     usage: magnitudeInstance.provider.usage,
     runtimeConfig: {
       preferProvider: process.env.MAGNITUDE_PREFER_PROVIDER || undefined,

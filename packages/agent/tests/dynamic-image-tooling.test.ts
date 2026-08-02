@@ -13,6 +13,10 @@ import type { AppEvent } from '../src/events'
 import { AgentLifecycleProjection } from '../src/projections/agent-lifecycle'
 import { AgentToolkitProjection } from '../src/projections/agent-toolkit'
 import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
+import {
+  ToolAvailabilityAmbient,
+  type ToolAvailabilityState,
+} from '../src/ambient/tool-availability-ambient'
 
 const ToolkitProjectionAgent = EventEngine.make<AppEvent>()({
   name: 'DynamicImageToolkitProjectionAgent',
@@ -35,7 +39,6 @@ function slot(slotId: 'primary' | 'secondary', vision: boolean): SlotConfig {
 
 function config(primary: boolean, secondary: boolean): ConfigState {
   return {
-    revision: 1,
     catalogLoaded: true,
     bySlot: {
       primary: { _tag: 'Ready', config: slot('primary', primary) },
@@ -44,8 +47,18 @@ function config(primary: boolean, secondary: boolean): ConfigState {
   }
 }
 
+const toolAvailability: ToolAvailabilityState = {
+  webSearch: { _tag: 'Available', source: 'magnitude' },
+}
+
 function imageTools(state: ConfigState, role: 'leader' | 'advisor' = 'leader'): string[] {
-  const keys = selectAgentToolKeys({ roleId: role, configState: state, solo: false, vcsAvailable: false })
+  const keys = selectAgentToolKeys({
+    roleId: role,
+    configState: state,
+    toolAvailability,
+    solo: false,
+    vcsAvailable: false,
+  })
   return keys.filter(key => key === 'fileView' || key === 'queryImage')
 }
 
@@ -65,7 +78,6 @@ describe('dynamic image tooling', () => {
   it('treats an unavailable opposite slot as non-vision', () => {
     const state: ConfigState = {
       ...config(false, true),
-      revision: 2,
       bySlot: {
         primary: { _tag: 'Ready', config: slot('primary', false) },
         secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'provider_unavailable' },
@@ -78,17 +90,30 @@ describe('dynamic image tooling', () => {
     const keys = selectAgentToolKeys({
       roleId: 'engineer',
       configState: config(true, false),
+      toolAvailability,
       solo: false,
       vcsAvailable: false,
     })
     expect(keys.filter(key => key === 'fileView' || key === 'queryImage')).toEqual(['fileView'])
   })
 
-  it('does not churn materialized tools when only the config revision changes', () => {
+  it('does not churn materialized tools when an irrelevant slot capability changes', () => {
     const firstConfig = config(true, false)
-    const secondConfig = { ...config(true, true), revision: 2 }
-    const firstKeys = selectAgentToolKeys({ roleId: 'leader', configState: firstConfig, solo: false, vcsAvailable: false })
-    const secondKeys = selectAgentToolKeys({ roleId: 'leader', configState: secondConfig, solo: false, vcsAvailable: false })
+    const secondConfig = config(true, true)
+    const firstKeys = selectAgentToolKeys({
+      roleId: 'leader',
+      configState: firstConfig,
+      toolAvailability,
+      solo: false,
+      vcsAvailable: false,
+    })
+    const secondKeys = selectAgentToolKeys({
+      roleId: 'leader',
+      configState: secondConfig,
+      toolAvailability,
+      solo: false,
+      vcsAvailable: false,
+    })
 
     expect(secondKeys).toEqual(firstKeys)
     expect(materializeAgentToolkit(toolUniverseToolkit, secondKeys))
@@ -101,6 +126,7 @@ describe('dynamic image tooling', () => {
       await client.runEffect(Effect.gen(function* () {
         const ambient = yield* AmbientServiceTag
         yield* ambient.update(ConfigAmbient, config(false, true))
+        yield* ambient.update(ToolAvailabilityAmbient, toolAvailability)
       }))
       await client.send({
         type: 'session_initialized',
@@ -124,22 +150,97 @@ describe('dynamic image tooling', () => {
         const projection = yield* AgentToolkitProjection.Tag
         return yield* projection.getFork(null)
       }))
-      expect(before.configRevision).toBe(1)
+      expect(before.config).toEqual(config(false, true))
       expect(before.toolKeys).not.toContain('queryImage')
       expect(before.toolKeys).not.toContain('fileView')
 
       await client.runEffect(Effect.gen(function* () {
         const ambient = yield* AmbientServiceTag
-        yield* ambient.update(ConfigAmbient, { ...config(true, true), revision: 2 })
+        yield* ambient.update(ConfigAmbient, config(true, true))
       }))
 
       const after = await client.runEffect(Effect.gen(function* () {
         const projection = yield* AgentToolkitProjection.Tag
         return yield* projection.getFork(null)
       }))
-      expect(after.configRevision).toBe(2)
+      expect(after.config).toEqual(config(true, true))
       expect(after.toolKeys).toContain('fileView')
       expect(after.toolKeys).not.toContain('queryImage')
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('removes only web search when provider-backed search is unavailable', () => {
+    const unavailable: ToolAvailabilityState = {
+      webSearch: { _tag: 'Unavailable' },
+    }
+    const availableKeys = selectAgentToolKeys({
+      roleId: 'leader',
+      configState: config(false, false),
+      toolAvailability,
+      solo: false,
+      vcsAvailable: false,
+    })
+    const unavailableKeys = selectAgentToolKeys({
+      roleId: 'leader',
+      configState: config(false, false),
+      toolAvailability: unavailable,
+      solo: false,
+      vcsAvailable: false,
+    })
+
+    expect(toolUniverseToolkit.entries.webSearch).toBeDefined()
+    expect(availableKeys).toContain('webSearch')
+    expect(unavailableKeys).not.toContain('webSearch')
+    expect(unavailableKeys).toContain('webFetch')
+  })
+
+  it('reacts to tool availability changes at the fork projection boundary', async () => {
+    const client = await ToolkitProjectionAgent.createClient(ToolUniverseSourceLive)
+    try {
+      await client.runEffect(Effect.gen(function* () {
+        const ambient = yield* AmbientServiceTag
+        yield* ambient.update(ConfigAmbient, config(false, false))
+        yield* ambient.update(ToolAvailabilityAmbient, toolAvailability)
+      }))
+      await client.send({
+        type: 'session_initialized',
+        forkId: null,
+        context: {
+          cwd: '/workspace',
+          scratchpadPath: '/scratchpad',
+          platform: 'linux',
+          shell: 'zsh',
+          timezone: 'UTC',
+          username: 'test',
+          fullName: null,
+          git: null,
+          folderStructure: '',
+          agentsFile: null,
+          skills: null,
+        },
+      })
+
+      const before = await client.runEffect(Effect.gen(function* () {
+        const projection = yield* AgentToolkitProjection.Tag
+        return yield* projection.getFork(null)
+      }))
+      expect(before.toolKeys).toContain('webSearch')
+
+      await client.runEffect(Effect.gen(function* () {
+        const ambient = yield* AmbientServiceTag
+        yield* ambient.update(ToolAvailabilityAmbient, {
+          webSearch: { _tag: 'Unavailable' },
+        })
+      }))
+
+      const after = await client.runEffect(Effect.gen(function* () {
+        const projection = yield* AgentToolkitProjection.Tag
+        return yield* projection.getFork(null)
+      }))
+      expect(after.toolKeys).not.toContain('webSearch')
+      expect(after.toolKeys).toContain('webFetch')
     } finally {
       await client.dispose()
     }

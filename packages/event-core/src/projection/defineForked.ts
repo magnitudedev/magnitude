@@ -16,7 +16,7 @@
 import { Effect, SubscriptionRef, Context, Layer, PubSub, Schema } from 'effect'
 import type { ParseResult } from 'effect'
 import type { EnforceJsonSafe } from '@magnitudedev/utils/schema'
-import { ProjectionBusTag, type ProjectionBusService, type AddressedStateInfo } from '../core/projection-bus'
+import { withProjectionBusReadLock, ProjectionBusTag, type ProjectionBusService, type AddressedStateInfo } from '../core/projection-bus'
 import { AmbientServiceTag } from '../core/ambient-service'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
 import type { AddressedEntryStore } from '../addressed/entry-store'
@@ -779,28 +779,37 @@ export function defineForked<TEvent extends ForkableEvent>() {
 
         // Return instance with fork-aware accessors
         const instance: ForkedProjectionInstance<TForkStateSchema, TAddressed> = {
-          getFork: (forkId) => Effect.gen(function* () {
-            const state = yield* SubscriptionRef.get(stateRef)
-            return state.forks.get(forkId) ?? config.initialFork
-          }),
-          getAllForks: () => Effect.gen(function* () {
-            const state = yield* SubscriptionRef.get(stateRef)
-            return state.forks
-          }),
+          getFork: (forkId) => withProjectionBusReadLock(
+            bus,
+            Effect.gen(function* () {
+              const state = yield* SubscriptionRef.get(stateRef)
+              return state.forks.get(forkId) ?? config.initialFork
+            }),
+          ),
+          getAllForks: () => withProjectionBusReadLock(
+            bus,
+            Effect.gen(function* () {
+              const state = yield* SubscriptionRef.get(stateRef)
+              return state.forks
+            }),
+          ),
           addressed: {
             ...addressedRuntime.consumers,
             forFork: (forkId: string | null) => addressedRuntime.consumersFor(['forks', forkId ?? 'root'])
           } as ProjectionForkedAddressedConsumers<TAddressed>,
           state: stateRef,
-          snapshot: mutationLock.withPermits(1)(Effect.gen(function* () {
-            yield* addressedRuntime.flushDirty
-            const state = yield* SubscriptionRef.get(stateRef)
-            const entries: Array<readonly [string | null, Schema.Schema.Encoded<TForkStateSchema>]> = []
-            for (const [forkId, fork] of state.forks) {
-              entries.push([forkId, yield* Schema.encode(config.forkState)(fork)])
-            }
-            return entries
-          })),
+          snapshot: withProjectionBusReadLock(
+            bus,
+            mutationLock.withPermits(1)(Effect.gen(function* () {
+              yield* addressedRuntime.flushDirty
+              const state = yield* SubscriptionRef.get(stateRef)
+              const entries: Array<readonly [string | null, Schema.Schema.Encoded<TForkStateSchema>]> = []
+              for (const [forkId, fork] of state.forks) {
+                entries.push([forkId, yield* Schema.encode(config.forkState)(fork)])
+              }
+              return entries
+            })),
+          ),
           prepareRestore,
           restore: (snapshot) => Effect.gen(function* () {
             const plan = yield* prepareRestore(snapshot)

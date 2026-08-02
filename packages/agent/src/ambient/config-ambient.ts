@@ -49,7 +49,6 @@ export type ReadyAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Ready' }>
 export type UnavailableAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unavailable' }>
 
 export const ConfigStateSchema = Schema.Struct({
-  revision: Schema.Number,
   bySlot: Schema.Struct({
     primary: AgentSlotStateSchema,
     secondary: AgentSlotStateSchema,
@@ -61,7 +60,7 @@ export type ConfigState = typeof ConfigStateSchema.Type
 const configStateEquivalent = Schema.equivalence(ConfigStateSchema)
 
 export const sameConfigStateValue = (left: ConfigState, right: ConfigState): boolean =>
-  configStateEquivalent(left, { ...right, revision: left.revision })
+  configStateEquivalent(left, right)
 
 export function getSlotConfig(state: ConfigState, slotId: SlotId): SlotConfig {
   const slot = state.bySlot[slotId]
@@ -95,7 +94,6 @@ export const ConfigAmbient = Ambient.define<ConfigState, never>({
       primary: { _tag: 'Unavailable', slotId: 'primary', reason: 'not_loaded' },
       secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'not_loaded' },
     },
-    revision: 0,
     catalogLoaded: false,
   }),
 })
@@ -104,7 +102,6 @@ export function buildConfigStateFromSlots(
   catalogModels: readonly ProviderModelCatalogEntry[],
   slots: ModelSlotsState['slots'],
   policy: ResolvedContextLimitPolicy,
-  revision = 0,
 ): ConfigState {
   const buildSlot = (slotId: SlotId): AgentSlotState => {
     const slot = slots[slotId]
@@ -139,7 +136,6 @@ export function buildConfigStateFromSlots(
     }
   }
   return {
-    revision,
     bySlot: {
       primary: buildSlot('primary'),
       secondary: buildSlot('secondary'),

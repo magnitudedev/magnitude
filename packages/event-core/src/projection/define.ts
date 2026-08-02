@@ -10,7 +10,7 @@
 import { Effect, SubscriptionRef, Context, Layer, PubSub, Schema } from 'effect'
 import type { ParseResult } from 'effect'
 import type { EnforceJsonSafe } from '@magnitudedev/utils/schema'
-import { ProjectionBusTag, type ProjectionBusService, type AddressedStateInfo } from '../core/projection-bus'
+import { withProjectionBusReadLock, ProjectionBusTag, type ProjectionBusService, type AddressedStateInfo } from '../core/projection-bus'
 import { AmbientServiceTag } from '../core/ambient-service'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
 import { type AmbientDef, type AmbientValueOf } from '../ambient/define'
@@ -685,13 +685,16 @@ export function define<TEvent extends BaseEvent>() {
 
         return {
           state: stateRef,
-          get: SubscriptionRef.get(stateRef),
+          get: withProjectionBusReadLock(bus, SubscriptionRef.get(stateRef)),
           addressed: addressedRuntime.consumers,
-          snapshot: mutationLock.withPermits(1)(Effect.gen(function* () {
-            yield* addressedRuntime.flushDirty
-            const state = yield* SubscriptionRef.get(stateRef)
-            return yield* Schema.encode(config.state)(state)
-          })),
+          snapshot: withProjectionBusReadLock(
+            bus,
+            mutationLock.withPermits(1)(Effect.gen(function* () {
+              yield* addressedRuntime.flushDirty
+              const state = yield* SubscriptionRef.get(stateRef)
+              return yield* Schema.encode(config.state)(state)
+            })),
+          ),
           prepareRestore,
           restore: (snapshot) => Effect.gen(function* () {
             const plan = yield* prepareRestore(snapshot)
