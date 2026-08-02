@@ -13,7 +13,7 @@ use icn_contracts::models::{
 };
 use icn_contracts::{
     ComponentRelationship, ComponentRole, DownloadComponent, DownloadModelRequest, DownloadStage,
-    HuggingFaceDownloadSource, InventoryError, ModelDownloadEvent, ModelInventory,
+    HuggingFaceDownloadSource, InventoryError, ModelDownloadEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -366,7 +366,10 @@ impl ModelDownloads for ManagedModelDownloads {
                 return Ok(StartModelDownloadResponse { attempt });
             }
             let legacy = legacy_request(&request.package)?;
-            let stream = self.manager.download(legacy).await?;
+            let stream = self
+                .manager
+                .start_package_download(legacy, request.package.clone())
+                .await?;
             let id = random_attempt_id()?;
             let attempt = DownloadAttempt::Pending {
                 id: id.clone(),
@@ -452,7 +455,7 @@ impl ModelDownloads for ManagedModelDownloads {
                 return Ok(record.attempt);
             }
             self.manager
-                .cancel_download(&legacy_request(&record.package)?)
+                .cancel_package_download(&legacy_request(&record.package)?, &record.package)
                 .await?;
             let attempt = DownloadAttempt::Cancelled {
                 id: id.clone(),

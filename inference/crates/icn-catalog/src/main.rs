@@ -81,13 +81,56 @@ async fn update_lock(
     cache_root: PathBuf,
     hf_caches: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
-    let mut config = InventoryConfig::with_roots(model_store, cache_root)
-        .context("invalid model catalog lock inventory configuration")?;
-    config.hf_cache_dirs.extend(hf_caches);
-    let models = Arc::new(ModelManager::open(config).await?);
-    let encoded = serde_json::to_vec_pretty(&advance_model_catalog_lock(models).await?)?;
+    let models = open_catalog_models(model_store, cache_root, hf_caches).await?;
+    eprintln!("Resolving current catalog revisions...");
+    let lock = advance_model_catalog_lock(Arc::clone(&models)).await?;
+    eprintln!("Validating candidate catalog lock...");
+    let generated = ResolvingRecommendableCatalog::new(models)
+        .resolve_release_catalog_with_lock(lock.clone(), report_progress)
+        .await
+        .context("failed to validate candidate model catalog lock")?;
+    ensure_catalog_resolved(&generated)?;
+    let encoded = serde_json::to_vec_pretty(&lock)?;
     publish(&output, &[encoded.as_slice(), b"\n"].concat(), "json.tmp").await?;
     println!("updated {}", output.display());
+    Ok(())
+}
+
+async fn open_catalog_models(
+    model_store: PathBuf,
+    cache_root: PathBuf,
+    hf_caches: Vec<PathBuf>,
+) -> anyhow::Result<Arc<ModelManager>> {
+    icn_engine::disable_native_diagnostics();
+    let backend = NativeBackend::initialize().context("failed to initialize native backend")?;
+    let mut config = InventoryConfig::with_roots(model_store, cache_root)
+        .context("invalid catalog-build inventory configuration")?;
+    config.hf_cache_dirs.extend(hf_caches);
+    Ok(Arc::new(
+        ModelManager::open_with_template_assessor(
+            config,
+            Some(Arc::new(NativeTemplateAssessor::new(backend))),
+        )
+        .await?,
+    ))
+}
+
+fn ensure_catalog_resolved(generated: &icn_models::GeneratedReleaseCatalog) -> anyhow::Result<()> {
+    for diagnostic in &generated.catalog.diagnostics {
+        let entry = diagnostic
+            .entry_id
+            .as_ref()
+            .map_or("unknown", |entry| entry.0.as_str());
+        eprintln!(
+            "Catalog resolution failed for {entry}: {}",
+            diagnostic.failure.message
+        );
+    }
+    anyhow::ensure!(
+        generated.catalog.diagnostics.is_empty(),
+        "catalog resolution failed for {} entries",
+        generated.catalog.diagnostics.len()
+    );
     Ok(())
 }
 
@@ -101,23 +144,13 @@ async fn build_bundle(
         eprintln!("Model catalog bundle is already current.");
         return Ok(());
     }
-    icn_engine::disable_native_diagnostics();
-    let backend = NativeBackend::initialize().context("failed to initialize native backend")?;
-    let mut config = InventoryConfig::with_roots(model_store, cache_root)
-        .context("invalid catalog-build inventory configuration")?;
-    config.hf_cache_dirs.extend(hf_caches);
-    let models = Arc::new(
-        ModelManager::open_with_template_assessor(
-            config,
-            Some(Arc::new(NativeTemplateAssessor::new(backend.clone()))),
-        )
-        .await?,
-    );
+    let models = open_catalog_models(model_store, cache_root, hf_caches).await?;
     eprintln!("Resolving pinned catalog models...");
     let generated = ResolvingRecommendableCatalog::new(models)
         .resolve_release_catalog(report_progress)
         .await
         .context("failed to resolve curated model catalog")?;
+    ensure_catalog_resolved(&generated)?;
     eprintln!("Encoding planner input bundle...");
     let bytes = generated.encode_planner_bundle(|completed, total| {
         report_progress("Encoded planner inputs", completed, total);

@@ -23,6 +23,7 @@ sha2.workspace = true
 sha2-state = { package = "sha2", version = "0.11.0" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
+tracing.workspace = true
 tempfile = "3.24.0"
 
 [target.'cfg(unix)'.dependencies]
