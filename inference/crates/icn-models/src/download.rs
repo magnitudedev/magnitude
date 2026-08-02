@@ -9,12 +9,11 @@ use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use getrandom::fill;
 use hf_hub::HFError;
-use icn_contracts::models::{ModelPackage, ModelPackageSource};
+use icn_contracts::models::ModelPackage;
 use icn_contracts::{
-    ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress,
-    DownloadModelRequest, DownloadStage, HardwareAssessment, HuggingFaceDownloadSource, Integrity,
-    InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
-    ModelDownloadEvent, ModelLocation, ModelSource,
+    ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress, DownloadStage,
+    HardwareAssessment, Integrity, InventoryError, InventoryModel, InventoryProperties,
+    ModelAvailability, ModelComponent, ModelDownloadEvent, ModelLocation, ModelSource,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,7 +26,7 @@ use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, model_id};
 use crate::inventory::{ModelManager, build_model, hf_repo_dir, now};
 use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationComponent, OperationManifest};
-use crate::validation::validate_download_request;
+use crate::validation::ValidatedDownloadPackage;
 
 const MAX_ATTEMPTS: usize = 5;
 const INTEGRITY_CHECKPOINT_INTERVAL: u64 = 256 * 1024 * 1024;
@@ -61,14 +60,6 @@ impl DownloadOperation {
     }
 }
 
-#[derive(Debug)]
-struct RemoteComponent {
-    request: icn_contracts::DownloadComponent,
-    size: u64,
-    content: ContentIdentity,
-    content_key: String,
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct HubApiModel {
     sha: Option<String>,
@@ -80,8 +71,6 @@ struct HubApiModel {
 struct HubApiSibling {
     rfilename: String,
     size: Option<u64>,
-    #[serde(rename = "blobId")]
-    blob_id: Option<String>,
     lfs: Option<HubApiLfs>,
 }
 
@@ -94,18 +83,7 @@ struct HubApiLfs {
 #[derive(Debug)]
 struct ResolvedRemoteMetadata {
     size: u64,
-    content: ContentIdentity,
     sha256: Option<String>,
-}
-
-struct ResolvedDownloadRevision {
-    commit: String,
-    components: Vec<RemoteComponent>,
-}
-
-#[derive(Clone, Debug)]
-struct EquivalentRevisionFallback {
-    package: ModelPackage,
 }
 
 struct DownloadComponentPaths {
@@ -166,7 +144,7 @@ impl DownloadIntegrityRecord {
 }
 
 impl DownloadIntegrity {
-    fn empty(component: &RemoteComponent) -> Self {
+    fn empty(component: &ModelComponent) -> Self {
         Self {
             digest: matches!(&component.content, ContentIdentity::Sha256 { .. })
                 .then(StatefulSha256::new),
@@ -176,11 +154,11 @@ impl DownloadIntegrity {
     }
 
     fn restore(
-        component: &RemoteComponent,
+        component: &ModelComponent,
         record: DownloadIntegrityRecord,
     ) -> Result<Self, DownloadError> {
         record
-            .restore(&component.content, component.size)
+            .restore(&component.content, component.size_bytes)
             .ok_or_else(|| invalid_checkpoint(component))
     }
 
@@ -203,10 +181,10 @@ impl DownloadIntegrity {
         Ok(())
     }
 
-    fn record(&self, component: &RemoteComponent) -> DownloadIntegrityRecord {
+    fn record(&self, component: &ModelComponent) -> DownloadIntegrityRecord {
         DownloadIntegrityRecord {
             content: component.content.clone(),
-            expected_size: component.size,
+            expected_size: component.size_bytes,
             completed_bytes: self.bytes,
             sha256_state: self
                 .digest
@@ -223,11 +201,11 @@ impl DownloadIntegrity {
         self.checkpointed_bytes = self.bytes;
     }
 
-    fn verify(&self, component: &RemoteComponent) -> Result<(), DownloadError> {
-        if self.bytes != component.size {
+    fn verify(&self, component: &ModelComponent) -> Result<(), DownloadError> {
+        if self.bytes != component.size_bytes {
             return Err(DownloadError {
                 code: "size_mismatch",
-                message: format!("unexpected size for {}", component.request.path.display()),
+                message: format!("unexpected size for {}", component.path.display()),
                 retryable: true,
                 resumable: true,
             });
@@ -246,7 +224,7 @@ impl DownloadIntegrity {
         if &actual != expected {
             return Err(DownloadError {
                 code: "integrity_failed",
-                message: format!("SHA-256 mismatch for {}", component.request.path.display()),
+                message: format!("SHA-256 mismatch for {}", component.path.display()),
                 retryable: false,
                 resumable: false,
             });
@@ -265,44 +243,23 @@ struct DownloadError {
 }
 
 impl ModelManager {
-    pub(crate) async fn start_download(
-        &self,
-        request: DownloadModelRequest,
-    ) -> Result<DownloadEventStream, InventoryError> {
-        self.start_download_with_fallback(request, None).await
-    }
-
     pub(crate) async fn start_package_download(
         &self,
-        request: DownloadModelRequest,
         package: ModelPackage,
     ) -> Result<DownloadEventStream, InventoryError> {
-        validate_package_download_request(&request, &package)?;
-        self.start_download_with_fallback(request, Some(EquivalentRevisionFallback { package }))
-            .await
-    }
-
-    async fn start_download_with_fallback(
-        &self,
-        request: DownloadModelRequest,
-        fallback: Option<EquivalentRevisionFallback>,
-    ) -> Result<DownloadEventStream, InventoryError> {
-        validate_download_request(&request)?;
-        let key = request_key(&request, fallback.as_ref());
+        let key = package_download_key(&package);
+        let package = ValidatedDownloadPackage::new(package)?;
         let mut operations = self.operations.lock().await;
         if let Some(operation) = operations.get(&key) {
             return Ok(operation.subscribe());
         }
 
         let operation_id = random_id("download")?;
-        let HuggingFaceDownloadSource::HuggingFace {
-            repository,
-            revision,
-        } = &request.source;
+        let (repository, revision) = package.repository_revision();
         let initial = ModelDownloadEvent::Resolving {
             operation_id: operation_id.clone(),
-            repository: repository.clone(),
-            revision: revision.clone(),
+            repository: repository.to_owned(),
+            revision: revision.to_owned(),
         };
         let (sender, _receiver) = watch::channel(initial);
         let operation = Arc::new(DownloadOperation {
@@ -316,7 +273,7 @@ impl ModelManager {
         let manager = self.clone();
         tokio::spawn(async move {
             manager
-                .run_download(key, operation_id, request, fallback, operation)
+                .run_download(key, operation_id, package, operation)
                 .await;
         });
         Ok(stream)
@@ -324,25 +281,10 @@ impl ModelManager {
 
     pub(crate) async fn cancel_package_download(
         &self,
-        request: &DownloadModelRequest,
         package: &ModelPackage,
     ) -> Result<(), InventoryError> {
-        validate_package_download_request(request, package)?;
-        self.cancel_download_with_fallback(
-            request,
-            Some(&EquivalentRevisionFallback {
-                package: package.clone(),
-            }),
-        )
-        .await
-    }
-
-    async fn cancel_download_with_fallback(
-        &self,
-        request: &DownloadModelRequest,
-        fallback: Option<&EquivalentRevisionFallback>,
-    ) -> Result<(), InventoryError> {
-        let key = request_key(request, fallback);
+        ValidatedDownloadPackage::new(package.clone())?;
+        let key = package_download_key(package);
         let operation = self
             .operations
             .lock()
@@ -358,12 +300,11 @@ impl ModelManager {
         &self,
         operation_key: String,
         operation_id: String,
-        request: DownloadModelRequest,
-        fallback: Option<EquivalentRevisionFallback>,
+        package: ValidatedDownloadPackage,
         operation: Arc<DownloadOperation>,
     ) {
         let result = self
-            .run_download_inner(&operation_id, &request, fallback.as_ref(), &operation)
+            .run_download_inner(&operation_id, package, &operation)
             .await;
         if let Err(failure) = result {
             let model_id = current_model_id(&operation.sender.borrow());
@@ -405,15 +346,11 @@ impl ModelManager {
     async fn run_download_inner(
         &self,
         operation_id: &str,
-        request: &DownloadModelRequest,
-        fallback: Option<&EquivalentRevisionFallback>,
+        package: ValidatedDownloadPackage,
         operation: &DownloadOperation,
     ) -> Result<(), DownloadError> {
         operation.ensure_active()?;
-        let HuggingFaceDownloadSource::HuggingFace {
-            repository,
-            revision,
-        } = &request.source;
+        let (repository, revision) = package.repository_revision();
         let (owner, name) = repository.split_once('/').ok_or_else(|| DownloadError {
             code: "invalid_request",
             message: "repository must be owner/name".to_owned(),
@@ -422,54 +359,47 @@ impl ModelManager {
         })?;
         let repo = self.client.model(owner.to_owned(), name.to_owned());
 
-        let pinned =
-            resolve_download_revision(&self.client, &repo, repository, revision, request, None)
-                .await;
+        let pinned = resolve_download_revision(
+            &self.client,
+            &repo,
+            repository,
+            revision,
+            package.components(),
+            None,
+        )
+        .await;
         let resolved = match pinned {
             Ok(resolved) => resolved,
-            Err(error) if fallback.is_some() && missing_upstream_content(&error) => {
-                let fallback = fallback.expect("checked package fallback");
+            Err(error) if missing_upstream_content(&error) => {
                 let resolved = resolve_download_revision(
                     &self.client,
                     &repo,
                     repository,
                     "main",
-                    request,
-                    Some((&fallback.package, revision)),
+                    package.components(),
+                    Some(revision),
                 )
                 .await?;
                 tracing::info!(
                     repository,
                     pinned_revision = revision,
-                    resolved_revision = resolved.commit,
+                    resolved_revision = resolved,
                     "using content-equivalent current revision for model acquisition"
                 );
                 resolved
             }
             Err(error) => return Err(error),
         };
-        let commit = resolved.commit;
-        let remote = resolved.components;
-        let components = remote
-            .iter()
-            .map(|component| ModelComponent {
-                path: component.request.path.clone(),
-                role: component.request.role.clone(),
-                size_bytes: component.size,
-                content: component.content.clone(),
-                shard_index: component.request.shard_index,
-                relationship: request.relationships.iter().find_map(|relationship| {
-                    relationship_component(relationship)
-                        .is_some_and(|path| path == component.request.path)
-                        .then(|| relationship.clone())
-                }),
-            })
-            .collect::<Vec<_>>();
+        let commit = resolved;
+        let (repository, revision, components) = package.into_parts();
         let content_id = content_id(&components);
-        let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
+        let repo_root = self.config.root.join("hub").join(hf_repo_dir(&repository));
         let snapshot = repo_root.join("snapshots").join(&commit);
         let model_id = model_id("magnitude-cache", &snapshot, &content_id);
-        let total_bytes: u64 = remote.iter().map(|component| component.size).sum();
+        let total_bytes: u64 = components
+            .iter()
+            .map(|component| component.size_bytes)
+            .sum();
         let existing = self.models.read().ok().and_then(|models| {
             models
                 .get(&model_id)
@@ -484,7 +414,7 @@ impl ModelManager {
             return Ok(());
         }
 
-        let completed_bytes = resumable_bytes(&repo_root, &remote).await;
+        let completed_bytes = resumable_bytes(&repo_root, &components).await;
         let missing_bytes = total_bytes.saturating_sub(completed_bytes);
         let available_bytes =
             fs2::available_space(&self.config.root).map_err(|error| DownloadError {
@@ -563,7 +493,7 @@ impl ModelManager {
             })?
             .insert(model_id.clone(), planned);
 
-        if let Some(first) = remote.first() {
+        if let Some(first) = components.first() {
             operation.sender.send_replace(ModelDownloadEvent::Progress {
                 operation_id: operation_id.to_owned(),
                 model_id: model_id.clone(),
@@ -571,9 +501,9 @@ impl ModelManager {
                 completed_bytes,
                 total_bytes,
                 file: DownloadFileProgress {
-                    path: first.request.path.clone(),
+                    path: first.path.clone(),
                     completed_bytes: component_partial_len(&repo_root, first).await,
-                    total_bytes: first.size,
+                    total_bytes: first.size_bytes,
                 },
                 bytes_per_second: None,
                 resumed_from_bytes: completed_bytes,
@@ -611,20 +541,16 @@ impl ModelManager {
             repository: repository.clone(),
             requested_revision: revision.clone(),
             commit: commit.clone(),
-            components: remote
+            components: components
                 .iter()
                 .map(|component| OperationComponent {
-                    path: component.request.path.clone(),
-                    role: component.request.role.clone(),
+                    path: component.path.clone(),
+                    role: component.role.clone(),
                     content: component.content.clone(),
-                    shard_index: component.request.shard_index,
-                    relationship: request.relationships.iter().find_map(|relationship| {
-                        relationship_component(relationship)
-                            .is_some_and(|path| path == component.request.path)
-                            .then(|| relationship.clone())
-                    }),
-                    expected_size: component.size,
-                    content_key: component.content_key.clone(),
+                    shard_index: component.shard_index,
+                    relationship: component.relationship.clone(),
+                    expected_size: component.size_bytes,
+                    content_key: blob_key(&component.content),
                     completed_bytes: 0,
                 })
                 .collect(),
@@ -636,11 +562,11 @@ impl ModelManager {
         persist_operation_manifest(&self.config.root, &operation_manifest).await?;
 
         let started = Instant::now();
-        let mut resumed_by_component = Vec::with_capacity(remote.len());
-        for component in &remote {
+        let mut resumed_by_component = Vec::with_capacity(components.len());
+        for component in &components {
             resumed_by_component.push(component_partial_len(&repo_root, component).await);
         }
-        for (index, component) in remote.iter().enumerate() {
+        for (index, component) in components.iter().enumerate() {
             operation.ensure_active()?;
             let resumed_from = resumed_by_component[index];
             let mut last_progress_emit = Instant::now()
@@ -653,22 +579,25 @@ impl ModelManager {
                 component,
                 |file_completed, stage| {
                     let timestamp = Instant::now();
-                    if file_completed != component.size
+                    if file_completed != component.size_bytes
                         && timestamp.duration_since(last_progress_emit) < Duration::from_millis(100)
                     {
                         return;
                     }
                     last_progress_emit = timestamp;
-                    let previous_files = remote[..index].iter().map(|item| item.size).sum::<u64>();
+                    let previous_files = components[..index]
+                        .iter()
+                        .map(|item| item.size_bytes)
+                        .sum::<u64>();
                     let future_resumed = resumed_by_component[index + 1..].iter().sum::<u64>();
                     let completed = previous_files
                         .saturating_add(file_completed)
                         .saturating_add(future_resumed);
                     let elapsed = started.elapsed().as_secs_f64();
-                    let previous_transferred = remote[..index]
+                    let previous_transferred = components[..index]
                         .iter()
                         .zip(&resumed_by_component[..index])
-                        .map(|(item, resumed)| item.size.saturating_sub(*resumed))
+                        .map(|(item, resumed)| item.size_bytes.saturating_sub(*resumed))
                         .sum::<u64>();
                     let transferred = previous_transferred
                         .saturating_add(file_completed.saturating_sub(resumed_from));
@@ -681,9 +610,9 @@ impl ModelManager {
                         completed_bytes: completed,
                         total_bytes,
                         file: DownloadFileProgress {
-                            path: component.request.path.clone(),
+                            path: component.path.clone(),
                             completed_bytes: file_completed,
-                            total_bytes: component.size,
+                            total_bytes: component.size_bytes,
                         },
                         bytes_per_second: rate,
                         resumed_from_bytes: resumed_from,
@@ -697,7 +626,7 @@ impl ModelManager {
                             stage,
                             completed_bytes: completed,
                             total_bytes,
-                            current_component: Some(component.request.path.clone()),
+                            current_component: Some(component.path.clone()),
                             started_at,
                             updated_at,
                         };
@@ -707,7 +636,7 @@ impl ModelManager {
                 &operation.cancelled,
             )
             .await?;
-            operation_manifest.components[index].completed_bytes = component.size;
+            operation_manifest.components[index].completed_bytes = component.size_bytes;
             operation_manifest.updated_at = now();
             persist_operation_manifest(&self.config.root, &operation_manifest).await?;
             publish_snapshot_link(&repo_root, &snapshot, component).await?;
@@ -716,7 +645,7 @@ impl ModelManager {
         operation_manifest.stage = "verifying".to_owned();
         operation_manifest.updated_at = now();
         persist_operation_manifest(&self.config.root, &operation_manifest).await?;
-        if let Some(last) = remote.last() {
+        if let Some(last) = components.last() {
             operation.sender.send_replace(ModelDownloadEvent::Progress {
                 operation_id: operation_id.to_owned(),
                 model_id: model_id.clone(),
@@ -724,9 +653,9 @@ impl ModelManager {
                 completed_bytes: total_bytes,
                 total_bytes,
                 file: DownloadFileProgress {
-                    path: last.request.path.clone(),
-                    completed_bytes: last.size,
-                    total_bytes: last.size,
+                    path: last.path.clone(),
+                    completed_bytes: last.size_bytes,
+                    total_bytes: last.size_bytes,
                 },
                 bytes_per_second: None,
                 resumed_from_bytes: 0,
@@ -737,8 +666,8 @@ impl ModelManager {
             version: MANIFEST_VERSION,
             model_id: model_id.clone(),
             content_id,
-            repository: repository.clone(),
-            requested_revision: revision.clone(),
+            repository: repository.to_owned(),
+            requested_revision: revision.to_owned(),
             commit,
             components,
             created_at: started_at,
@@ -815,7 +744,7 @@ async fn download_component_with_retry(
     repo: &hf_hub::HFRepository<hf_hub::RepoTypeModel>,
     root: &Path,
     commit: &str,
-    component: &RemoteComponent,
+    component: &ModelComponent,
     mut progress: impl FnMut(u64, DownloadStage),
     cancelled: &AtomicBool,
 ) -> Result<(), DownloadError> {
@@ -823,9 +752,9 @@ async fn download_component_with_retry(
         .join("hub")
         .join(hf_repo_dir(&repo.repo_path()))
         .join("blobs");
-    let paths = DownloadComponentPaths::new(&blobs, &component.content_key);
+    let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
     if recover_completed_blob(&paths, component).await? {
-        progress(component.size, DownloadStage::Verifying);
+        progress(component.size_bytes, DownloadStage::Verifying);
         return Ok(());
     }
     let mut integrity = recover_partial(&paths, component).await?;
@@ -860,7 +789,7 @@ async fn download_component_with_retry(
 async fn download_component_once(
     repo: &hf_hub::HFRepository<hf_hub::RepoTypeModel>,
     commit: &str,
-    component: &RemoteComponent,
+    component: &ModelComponent,
     paths: &DownloadComponentPaths,
     integrity: &mut DownloadIntegrity,
     progress: &mut impl FnMut(u64, DownloadStage),
@@ -885,14 +814,14 @@ async fn download_component_once(
             code: "size_mismatch",
             message: format!(
                 "partial download is shorter than verified progress for {}",
-                component.request.path.display()
+                component.path.display()
             ),
             retryable: true,
             resumable: false,
         });
     }
-    if offset == component.size {
-        progress(component.size, DownloadStage::Verifying);
+    if offset == component.size_bytes {
+        progress(component.size_bytes, DownloadStage::Verifying);
         if let Err(error) = integrity.verify(component) {
             quarantine_component_files(paths).await?;
             return Err(error);
@@ -903,9 +832,9 @@ async fn download_component_once(
 
     let (_reported_length, mut stream) = repo
         .download_file_stream()
-        .filename(component.request.path.to_string_lossy().into_owned())
+        .filename(component.path.to_string_lossy().into_owned())
         .revision(commit.to_owned())
-        .range(offset..component.size)
+        .range(offset..component.size_bytes)
         .send()
         .await
         .map_err(map_hf_error)?;
@@ -934,13 +863,13 @@ async fn download_component_once(
         })?;
         if offset
             .checked_add(chunk_len)
-            .is_none_or(|next| next > component.size)
+            .is_none_or(|next| next > component.size_bytes)
         {
             return Err(DownloadError {
                 code: "size_mismatch",
                 message: format!(
                     "download exceeded expected size for {}",
-                    component.request.path.display()
+                    component.path.display()
                 ),
                 retryable: true,
                 resumable: true,
@@ -954,14 +883,14 @@ async fn download_component_once(
             persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
         }
     }
-    if offset != component.size {
+    if offset != component.size_bytes {
         persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
         return Err(DownloadError {
             code: "size_mismatch",
             message: format!(
                 "download ended at {offset} bytes; expected {} for {}",
-                component.size,
-                component.request.path.display()
+                component.size_bytes,
+                component.path.display()
             ),
             retryable: true,
             resumable: true,
@@ -969,7 +898,7 @@ async fn download_component_once(
     }
     persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
     drop(file);
-    progress(component.size, DownloadStage::Verifying);
+    progress(component.size_bytes, DownloadStage::Verifying);
     if let Err(error) = integrity.verify(component) {
         quarantine_component_files(paths).await?;
         return Err(error);
@@ -980,7 +909,7 @@ async fn download_component_once(
 
 async fn recover_partial(
     paths: &DownloadComponentPaths,
-    component: &RemoteComponent,
+    component: &ModelComponent,
 ) -> Result<DownloadIntegrity, DownloadError> {
     let partial_len = regular_file_len(&paths.partial).await;
     let record = read_integrity_record(&paths.checkpoint).await;
@@ -1012,7 +941,7 @@ async fn recover_partial(
 
 async fn recover_completed_blob(
     paths: &DownloadComponentPaths,
-    component: &RemoteComponent,
+    component: &ModelComponent,
 ) -> Result<bool, DownloadError> {
     let Some(blob_len) = regular_file_len(&paths.blob).await else {
         return Ok(false);
@@ -1020,9 +949,9 @@ async fn recover_completed_blob(
     let checkpoint = read_integrity_record(&paths.checkpoint)
         .await
         .and_then(|record| DownloadIntegrity::restore(component, record).ok());
-    if blob_len == component.size
+    if blob_len == component.size_bytes
         && let Some(integrity) = checkpoint
-        && integrity.bytes == component.size
+        && integrity.bytes == component.size_bytes
         && integrity.verify(component).is_ok()
     {
         return Ok(true);
@@ -1034,7 +963,7 @@ async fn recover_completed_blob(
 
 async fn persist_integrity_checkpoint(
     paths: &DownloadComponentPaths,
-    component: &RemoteComponent,
+    component: &ModelComponent,
     integrity: &mut DownloadIntegrity,
     file: Option<&mut tokio::fs::File>,
 ) -> Result<(), DownloadError> {
@@ -1095,12 +1024,12 @@ async fn quarantine_component_files(paths: &DownloadComponentPaths) -> Result<()
     Ok(())
 }
 
-fn invalid_checkpoint(component: &RemoteComponent) -> DownloadError {
+fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
     DownloadError {
         code: "invalid_checkpoint",
         message: format!(
             "download integrity checkpoint does not match {}",
-            component.request.path.display()
+            component.path.display()
         ),
         retryable: true,
         resumable: false,
@@ -1119,15 +1048,15 @@ fn cancelled_error() -> DownloadError {
 async fn publish_snapshot_link(
     repo_root: &Path,
     snapshot: &Path,
-    component: &RemoteComponent,
+    component: &ModelComponent,
 ) -> Result<(), DownloadError> {
-    let destination = snapshot.join(&component.request.path);
+    let destination = snapshot.join(&component.path);
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(download_io)?;
     }
-    let blob = repo_root.join("blobs").join(&component.content_key);
+    let blob = repo_root.join("blobs").join(blob_key(&component.content));
     let destination_clone = destination.clone();
     tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
         if destination_clone.exists() {
@@ -1268,7 +1197,7 @@ fn operation_manifest_path(root: &Path, model_id: &icn_contracts::ModelId) -> Pa
     root.join("operations").join(format!("{}.json", model_id.0))
 }
 
-async fn resumable_bytes(repo_root: &Path, components: &[RemoteComponent]) -> u64 {
+async fn resumable_bytes(repo_root: &Path, components: &[ModelComponent]) -> u64 {
     let mut total = 0_u64;
     for component in components {
         total = total.saturating_add(component_partial_len(repo_root, component).await);
@@ -1276,9 +1205,10 @@ async fn resumable_bytes(repo_root: &Path, components: &[RemoteComponent]) -> u6
     total
 }
 
-async fn component_partial_len(repo_root: &Path, component: &RemoteComponent) -> u64 {
-    let paths = DownloadComponentPaths::new(&repo_root.join("blobs"), &component.content_key);
-    recoverable_download_bytes(&paths, &component.content, component.size).await
+async fn component_partial_len(repo_root: &Path, component: &ModelComponent) -> u64 {
+    let paths =
+        DownloadComponentPaths::new(&repo_root.join("blobs"), &blob_key(&component.content));
+    recoverable_download_bytes(&paths, &component.content, component.size_bytes).await
 }
 
 async fn recoverable_download_bytes(
@@ -1362,19 +1292,9 @@ fn open_partial(path: &Path) -> Result<File, DownloadError> {
     options.open(path).map_err(download_io)
 }
 
-fn request_key(
-    request: &DownloadModelRequest,
-    fallback: Option<&EquivalentRevisionFallback>,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(serde_json::to_vec(request).expect("validated download requests serialize"));
-    if let Some(fallback) = fallback {
-        digest.update(b"\0equivalent-main\0");
-        digest.update(
-            serde_json::to_vec(&fallback.package.files).expect("validated package files serialize"),
-        );
-    }
-    format!("{:x}", digest.finalize())
+fn package_download_key(package: &ModelPackage) -> String {
+    let bytes = serde_json::to_vec(package).expect("validated model packages serialize");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub(crate) fn blob_key(content: &ContentIdentity) -> String {
@@ -1408,60 +1328,6 @@ fn inventory_download_error(error: InventoryError) -> DownloadError {
     }
 }
 
-fn validate_package_download_request(
-    request: &DownloadModelRequest,
-    package: &ModelPackage,
-) -> Result<(), InventoryError> {
-    let (
-        HuggingFaceDownloadSource::HuggingFace {
-            repository,
-            revision,
-        },
-        ModelPackageSource::HuggingFace {
-            repository: package_repository,
-            revision: package_revision,
-        },
-    ) = (&request.source, &package.source)
-    else {
-        return Err(InventoryError::InvalidRequest(
-            "package download requires an exact Hugging Face source".to_owned(),
-        ));
-    };
-    if repository != package_repository || revision != package_revision {
-        return Err(InventoryError::InvalidRequest(
-            "download source does not match the package source".to_owned(),
-        ));
-    }
-    if request.components.len() != package.files.len() {
-        return Err(InventoryError::InvalidRequest(
-            "download components do not exactly cover the package files".to_owned(),
-        ));
-    }
-    for component in &request.components {
-        let file = package
-            .files
-            .iter()
-            .find(|file| file.path == component.path)
-            .ok_or_else(|| {
-                InventoryError::InvalidRequest(format!(
-                    "download component {} is absent from the package",
-                    component.path.display()
-                ))
-            })?;
-        if component
-            .expected_sha256
-            .as_deref()
-            .is_none_or(|digest| !digest.eq_ignore_ascii_case(&file.sha256))
-        {
-            return Err(InventoryError::InvalidRequest(format!(
-                "download component {} does not use the package SHA-256",
-                component.path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn missing_upstream_content(error: &DownloadError) -> bool {
     matches!(
         error.code,
@@ -1474,13 +1340,13 @@ async fn resolve_download_revision(
     repo: &hf_hub::HFRepository<hf_hub::RepoTypeModel>,
     repository: &str,
     revision: &str,
-    request: &DownloadModelRequest,
-    equivalent: Option<(&ModelPackage, &str)>,
-) -> Result<ResolvedDownloadRevision, DownloadError> {
+    components: &[ModelComponent],
+    equivalent_to_revision: Option<&str>,
+) -> Result<String, DownloadError> {
     let api = match hub_api_metadata(client, repository, revision).await {
         Ok(api) => api,
-        Err(error) if equivalent.is_some() && missing_upstream_content(&error) => {
-            let (_, pinned) = equivalent.expect("checked equivalent package");
+        Err(error) if equivalent_to_revision.is_some() && missing_upstream_content(&error) => {
+            let pinned = equivalent_to_revision.expect("checked equivalent package");
             return Err(package_unavailable(
                 repository,
                 pinned,
@@ -1515,12 +1381,11 @@ async fn resolve_download_revision(
         })?;
     }
 
-    let mut components = Vec::with_capacity(request.components.len());
-    for component in &request.components {
+    for component in components {
         let metadata = match resolve_remote_metadata(repo, &api, &commit, &component.path).await {
             Ok(metadata) => metadata,
-            Err(error) if equivalent.is_some() && missing_upstream_content(&error) => {
-                let (_, pinned) = equivalent.expect("checked equivalent package");
+            Err(error) if equivalent_to_revision.is_some() && missing_upstream_content(&error) => {
+                let pinned = equivalent_to_revision.expect("checked equivalent package");
                 return Err(package_unavailable(
                     repository,
                     pinned,
@@ -1542,33 +1407,11 @@ async fn resolve_download_revision(
                 resumable: false,
             });
         }
-        if let Some((package, pinned)) = equivalent {
-            validate_equivalent_file(
-                repository,
-                pinned,
-                &commit,
-                package,
-                &api,
-                &component.path,
-                &metadata,
-            )?;
+        if let Some(pinned) = equivalent_to_revision {
+            validate_equivalent_file(repository, pinned, &commit, component, &metadata)?;
         }
-        let content = if let Some(expected) = component.expected_sha256.as_ref() {
-            ContentIdentity::Sha256 {
-                value: expected.to_ascii_lowercase(),
-            }
-        } else {
-            metadata.content
-        };
-        let content_key = blob_key(&content);
-        components.push(RemoteComponent {
-            request: component.clone(),
-            size: metadata.size,
-            content,
-            content_key,
-        });
     }
-    Ok(ResolvedDownloadRevision { commit, components })
+    Ok(commit)
 }
 
 fn is_immutable_commit(value: &str) -> bool {
@@ -1582,38 +1425,31 @@ fn validate_equivalent_file(
     repository: &str,
     pinned: &str,
     observed: &str,
-    package: &ModelPackage,
-    api: &HubApiModel,
-    path: &Path,
+    expected: &ModelComponent,
     metadata: &ResolvedRemoteMetadata,
 ) -> Result<(), DownloadError> {
-    let expected = package
-        .files
-        .iter()
-        .find(|file| file.path == path)
-        .expect("package download request was validated");
     if metadata.size != expected.size_bytes {
         return Err(package_unavailable(
             repository,
             pinned,
             Some(observed),
-            Some(path),
+            Some(&expected.path),
             "current main reports a different file size",
         ));
     }
-    let metadata_sha256 = api
-        .siblings
-        .iter()
-        .find(|sibling| sibling.rfilename == path.to_string_lossy())
-        .and_then(|sibling| sibling.lfs.as_ref())
-        .map(|lfs| lfs.sha256.as_str())
-        .or(metadata.sha256.as_deref());
-    if metadata_sha256.is_none_or(|digest| !digest.eq_ignore_ascii_case(&expected.sha256)) {
+    if metadata
+        .sha256
+        .as_deref()
+        .is_none_or(|digest| match &expected.content {
+            ContentIdentity::Sha256 { value } => !digest.eq_ignore_ascii_case(value),
+            _ => true,
+        })
+    {
         return Err(package_unavailable(
             repository,
             pinned,
             Some(observed),
-            Some(path),
+            Some(&expected.path),
             "current main reports different file content",
         ));
     }
@@ -1712,19 +1548,16 @@ async fn resolve_remote_metadata(
             }
             let sha256 = (metadata.etag.len() == 64
                 && metadata.etag.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .then(|| metadata.etag.to_ascii_lowercase());
-            let content = if let Some(value) = metadata.xet_hash {
-                ContentIdentity::Xet { value }
-            } else if let Some(value) = sha256.clone() {
-                ContentIdentity::Sha256 { value }
-            } else {
-                ContentIdentity::GitOid {
-                    value: metadata.etag,
-                }
-            };
+            .then(|| metadata.etag.to_ascii_lowercase())
+            .or_else(|| {
+                api.siblings
+                    .iter()
+                    .find(|sibling| sibling.rfilename == filename)
+                    .and_then(|sibling| sibling.lfs.as_ref())
+                    .map(|lfs| lfs.sha256.to_ascii_lowercase())
+            });
             Ok(ResolvedRemoteMetadata {
                 size: metadata.file_size,
-                content,
                 sha256,
             })
         }
@@ -1741,30 +1574,11 @@ async fn resolve_remote_metadata(
                     retryable: false,
                     resumable: false,
                 })?;
-            let (size, content, sha256) = match sibling.lfs.as_ref() {
-                Some(lfs) => (
-                    lfs.size,
-                    ContentIdentity::Sha256 {
-                        value: lfs.sha256.to_ascii_lowercase(),
-                    },
-                    Some(lfs.sha256.to_ascii_lowercase()),
-                ),
-                None => (
-                    sibling.size.unwrap_or(0),
-                    sibling
-                        .blob_id
-                        .as_ref()
-                        .map_or(ContentIdentity::Unknown, |value| ContentIdentity::GitOid {
-                            value: value.clone(),
-                        }),
-                    None,
-                ),
+            let (size, sha256) = match sibling.lfs.as_ref() {
+                Some(lfs) => (lfs.size, Some(lfs.sha256.to_ascii_lowercase())),
+                None => (sibling.size.unwrap_or(0), None),
             };
-            Ok(ResolvedRemoteMetadata {
-                size,
-                content,
-                sha256,
-            })
+            Ok(ResolvedRemoteMetadata { size, sha256 })
         }
         Err(error) => Err(map_hf_error(error)),
     }
@@ -1811,15 +1625,6 @@ fn download_io(error: impl std::fmt::Display) -> DownloadError {
         retryable: true,
         resumable: true,
     }
-}
-
-fn relationship_component(relationship: &icn_contracts::ComponentRelationship) -> Option<&Path> {
-    match relationship {
-        icn_contracts::ComponentRelationship::ProjectorFor { projector, .. } => Some(projector),
-        icn_contracts::ComponentRelationship::DraftFor { draft, .. } => Some(draft),
-        icn_contracts::ComponentRelationship::MtpFor { mtp, .. } => Some(mtp),
-    }
-    .map(PathBuf::as_path)
 }
 
 fn watch_stream(receiver: watch::Receiver<ModelDownloadEvent>) -> DownloadEventStream {
@@ -1892,22 +1697,20 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
 mod tests {
     use super::*;
     use icn_contracts::models::{
-        ModelFile, ModelFileId, ModelFileRole, ModelPackageId, ModelPackageProperties,
+        ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole, ModelPackageId,
+        ModelPackageProperties, ModelPackageSource,
     };
-    use icn_contracts::{ComponentRole, DownloadComponent};
+    use icn_contracts::{ComponentRelationship, ComponentRole};
 
-    fn remote_component(contents: &[u8]) -> RemoteComponent {
+    fn model_component(contents: &[u8]) -> ModelComponent {
         let digest = format!("{:x}", Sha256::digest(contents));
-        RemoteComponent {
-            request: DownloadComponent {
-                path: PathBuf::from("model.gguf"),
-                role: ComponentRole::Weights,
-                shard_index: None,
-                expected_sha256: Some(digest.clone()),
-            },
-            size: contents.len() as u64,
+        ModelComponent {
+            path: PathBuf::from("model.gguf"),
+            role: ComponentRole::Weights,
+            size_bytes: contents.len() as u64,
             content: ContentIdentity::Sha256 { value: digest },
-            content_key: "test".to_owned(),
+            shard_index: None,
+            relationship: None,
         }
     }
 
@@ -1937,52 +1740,10 @@ mod tests {
         }
     }
 
-    fn exact_request(package: &ModelPackage) -> DownloadModelRequest {
-        let ModelPackageSource::HuggingFace {
-            repository,
-            revision,
-        } = &package.source
-        else {
-            panic!("test package source")
-        };
-        DownloadModelRequest {
-            source: HuggingFaceDownloadSource::HuggingFace {
-                repository: repository.clone(),
-                revision: revision.clone(),
-            },
-            components: package
-                .files
-                .iter()
-                .map(|file| DownloadComponent {
-                    path: file.path.clone(),
-                    role: ComponentRole::Weights,
-                    shard_index: None,
-                    expected_sha256: Some(file.sha256.clone()),
-                })
-                .collect(),
-            relationships: Vec::new(),
-        }
-    }
-
-    fn hub_file(path: &str, size: u64, sha256: &str) -> HubApiModel {
-        HubApiModel {
-            sha: Some("b".repeat(40)),
-            siblings: vec![HubApiSibling {
-                rfilename: path.to_owned(),
-                size: Some(size),
-                blob_id: None,
-                lfs: Some(HubApiLfs {
-                    sha256: sha256.to_owned(),
-                    size,
-                }),
-            }],
-        }
-    }
-
     #[test]
     fn streamed_integrity_matches_the_complete_source_digest() {
         let contents = b"streamed model contents";
-        let component = remote_component(contents);
+        let component = model_component(contents);
         let mut integrity = DownloadIntegrity::empty(&component);
 
         integrity.update(&contents[..8]).expect("first chunk");
@@ -1995,9 +1756,9 @@ mod tests {
     async fn resumed_integrity_restores_the_existing_prefix_without_reading_it() {
         let contents = b"resumed model contents";
         let split = 9;
-        let component = remote_component(contents);
+        let component = model_component(contents);
         let directory = tempfile::tempdir().expect("temporary directory");
-        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        let paths = DownloadComponentPaths::new(directory.path(), &blob_key(&component.content));
         tokio::fs::write(&paths.partial, &contents[..split])
             .await
             .expect("partial contents");
@@ -2023,9 +1784,9 @@ mod tests {
     async fn resume_truncates_bytes_beyond_the_durable_checkpoint() {
         let contents = b"checkpoint plus uncommitted tail";
         let split = 10;
-        let component = remote_component(contents);
+        let component = model_component(contents);
         let directory = tempfile::tempdir().expect("temporary directory");
-        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        let paths = DownloadComponentPaths::new(directory.path(), &blob_key(&component.content));
         tokio::fs::write(&paths.partial, contents)
             .await
             .expect("partial contents");
@@ -2054,9 +1815,9 @@ mod tests {
     #[tokio::test]
     async fn completed_blob_uses_the_final_checkpoint_without_rehashing() {
         let contents = b"completed model contents";
-        let component = remote_component(contents);
+        let component = model_component(contents);
         let directory = tempfile::tempdir().expect("temporary directory");
-        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        let paths = DownloadComponentPaths::new(directory.path(), &blob_key(&component.content));
         tokio::fs::write(&paths.blob, contents)
             .await
             .expect("completed blob");
@@ -2077,9 +1838,9 @@ mod tests {
     #[tokio::test]
     async fn partial_without_a_valid_checkpoint_restarts_cleanly() {
         let contents = b"untrusted partial model contents";
-        let component = remote_component(contents);
+        let component = model_component(contents);
         let directory = tempfile::tempdir().expect("temporary directory");
-        let paths = DownloadComponentPaths::new(directory.path(), &component.content_key);
+        let paths = DownloadComponentPaths::new(directory.path(), &blob_key(&component.content));
         tokio::fs::write(&paths.partial, contents)
             .await
             .expect("partial contents");
@@ -2099,7 +1860,7 @@ mod tests {
     #[test]
     fn streamed_integrity_rejects_mismatched_content() {
         let expected = b"expected model contents";
-        let component = remote_component(expected);
+        let component = model_component(expected);
         let mut different = expected.to_vec();
         different[0] ^= 1;
         let mut integrity = DownloadIntegrity::empty(&component);
@@ -2113,53 +1874,34 @@ mod tests {
     }
 
     #[test]
-    fn package_download_request_requires_exact_package_files() {
-        let package = exact_package("model.gguf", b"model contents");
-        let mut request = exact_request(&package);
-        validate_package_download_request(&request, &package).expect("exact request");
-
-        request.components[0].expected_sha256 = Some("0".repeat(64));
-        assert!(validate_package_download_request(&request, &package).is_err());
-    }
-
-    #[test]
     fn equivalent_revision_requires_matching_path_size_and_sha256() {
-        let package = exact_package("model.gguf", b"model contents");
-        let expected = &package.files[0];
-        let api = hub_file("model.gguf", expected.size_bytes, &expected.sha256);
+        let expected = model_component(b"model contents");
+        let ContentIdentity::Sha256 { value: sha256 } = &expected.content else {
+            unreachable!("test component uses SHA-256")
+        };
         let metadata = ResolvedRemoteMetadata {
             size: expected.size_bytes,
-            content: ContentIdentity::Xet {
-                value: "xet-object".to_owned(),
-            },
-            sha256: None,
+            sha256: Some(sha256.clone()),
         };
         validate_equivalent_file(
             "owner/repository",
             &"a".repeat(40),
             &"b".repeat(40),
-            &package,
-            &api,
-            Path::new("model.gguf"),
+            &expected,
             &metadata,
         )
         .expect("equivalent file");
 
         let different_size = ResolvedRemoteMetadata {
             size: expected.size_bytes + 1,
-            content: ContentIdentity::Xet {
-                value: "xet-object".to_owned(),
-            },
-            sha256: Some(expected.sha256.clone()),
+            sha256: Some(sha256.clone()),
         };
         assert_eq!(
             validate_equivalent_file(
                 "owner/repository",
                 &"a".repeat(40),
                 &"b".repeat(40),
-                &package,
-                &api,
-                Path::new("model.gguf"),
+                &expected,
                 &different_size,
             )
             .expect_err("changed size")
@@ -2167,18 +1909,53 @@ mod tests {
             "package_unavailable"
         );
 
-        let changed = hub_file("model.gguf", expected.size_bytes, &"0".repeat(64));
+        let changed = ResolvedRemoteMetadata {
+            size: expected.size_bytes,
+            sha256: Some("0".repeat(64)),
+        };
         let failure = validate_equivalent_file(
             "owner/repository",
             &"a".repeat(40),
             &"b".repeat(40),
-            &package,
+            &expected,
             &changed,
-            Path::new("model.gguf"),
-            &metadata,
         )
         .expect_err("changed file");
         assert_eq!(failure.code, "package_unavailable");
+    }
+
+    #[test]
+    fn package_components_preserve_roles_and_relationships() {
+        let mut package = exact_package("model.gguf", b"model contents");
+        let projector_sha = format!("{:x}", Sha256::digest(b"projector contents"));
+        let projector_id = ModelFileId(format!("file_{projector_sha}"));
+        package.files.push(ModelFile {
+            id: projector_id.clone(),
+            path: PathBuf::from("projector.gguf"),
+            role: ModelFileRole::Projector,
+            size_bytes: 18,
+            sha256: projector_sha,
+        });
+        package
+            .relationships
+            .push(ModelFileRelationship::ProjectorFor {
+                projector_file_id: projector_id,
+                weights_file_id: package.files[0].id.clone(),
+            });
+
+        let package = ValidatedDownloadPackage::new(package).expect("valid package");
+        let components = package.components();
+        let projector = &components[1];
+
+        assert_eq!(projector.role, ComponentRole::Projector);
+        assert_eq!(projector.shard_index, None);
+        assert_eq!(
+            projector.relationship,
+            Some(ComponentRelationship::ProjectorFor {
+                projector: PathBuf::from("projector.gguf"),
+                model: PathBuf::from("model.gguf"),
+            })
+        );
     }
 
     #[test]

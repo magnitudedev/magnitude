@@ -32,4 +32,3 @@ pub use planner_stub::{
     planner_stub_context,
 };
 pub use preview::{ModelPreviewService, PreparedPreview, refresh_hugging_face_repository};
-pub use validation::validate_download_request;
