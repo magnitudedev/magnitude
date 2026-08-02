@@ -99,11 +99,11 @@ const cudaBuilds = [
 const cudaHosts = [
   {
     host: "linux-arm64-gnu",
-    runners: { "11.8": "ubuntu-24.04-arm", "12.9": "ubuntu-24.04-arm" },
+    runners: { "11.8": "ubuntu-22.04-arm", "12.9": "ubuntu-24.04-arm" },
   },
   {
     host: "linux-x64-gnu",
-    runners: { "11.8": "ubuntu-24.04", "12.9": "ubuntu-24.04" },
+    runners: { "11.8": "ubuntu-22.04", "12.9": "ubuntu-24.04" },
   },
 ] as const
 
