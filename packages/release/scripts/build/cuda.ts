@@ -15,24 +15,77 @@ const DRIVER_API_BY_PTX_VERSION: Readonly<Record<string, number>> = {
 const imageKey = (image: CudaPtxImage): string =>
   `${image.ptxVersion}:${image.target}${image.architectureSpecific ? "a" : ""}`
 
-export const inspectPtxImages = (dump: string): readonly CudaPtxImage[] => {
+const sortedImages = (
+  images: ReadonlyMap<string, CudaPtxImage>,
+): readonly CudaPtxImage[] =>
+  [...images.values()].sort((left, right) =>
+    left.target - right.target
+      || Number(left.architectureSpecific) - Number(right.architectureSpecific)
+      || left.ptxVersion.localeCompare(right.ptxVersion))
+
+const ptxImageInspector = () => {
   const images = new Map<string, CudaPtxImage>()
-  const modules = dump.split(/(?=\.version\s+\d+\.\d+)/g)
-  for (const module of modules) {
-    const version = module.match(/\.version\s+(\d+\.\d+)/)?.[1]
-    const target = module.match(/\.target\s+sm_(\d+)(a)?\b/)
-    if (!version || !target) continue
+  let version: string | undefined
+  const accept = (line: string): void => {
+    const nextVersion = line.match(/\.version\s+(\d+\.\d+)/)?.[1]
+    if (nextVersion) {
+      version = nextVersion
+      return
+    }
+    const target = line.match(/\.target\s+sm_(\d+)(a)?\b/)
+    if (!version || !target) return
     const image = {
       ptxVersion: version,
       target: Number(target[1]),
       architectureSpecific: target[2] === "a",
     }
     images.set(imageKey(image), image)
+    version = undefined
   }
-  return [...images.values()].sort((left, right) =>
-    left.target - right.target
-      || Number(left.architectureSpecific) - Number(right.architectureSpecific)
-      || left.ptxVersion.localeCompare(right.ptxVersion))
+  return { accept, images: () => sortedImages(images) }
+}
+
+export const inspectPtxImages = (dump: string): readonly CudaPtxImage[] => {
+  const inspector = ptxImageInspector()
+  for (const line of dump.split("\n")) inspector.accept(line)
+  return inspector.images()
+}
+
+const inspectPtxImagesFromModule = async (
+  cuobjdump: string,
+  module: string,
+): Promise<readonly CudaPtxImage[]> => {
+  const child = Bun.spawn([cuobjdump, "--dump-ptx", module], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const inspector = ptxImageInspector()
+  const readOutput = async (): Promise<void> => {
+    const reader = child.stdout.getReader()
+    const decoder = new TextDecoder()
+    let pending = ""
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const lines = `${pending}${decoder.decode(value, { stream: true })}`.split("\n")
+      pending = lines.pop() ?? ""
+      for (const line of lines) inspector.accept(line)
+    }
+    pending += decoder.decode()
+    if (pending.length > 0) inspector.accept(pending)
+  }
+  const [code, , stderr] = await Promise.all([
+    child.exited,
+    readOutput(),
+    new Response(child.stderr).text(),
+  ])
+  if (code !== 0) {
+    throw new Error(
+      `${cuobjdump} failed with exit ${code}: ${stderr.trim().slice(0, 4_000)}`,
+    )
+  }
+  return inspector.images()
 }
 
 export const inspectNvccCompiler = (output: string): string => {
@@ -52,11 +105,10 @@ export const inspectCudaCompatibility = async (
 ) => {
   const cudaRoot = process.env.CUDA_PATH?.trim()
   if (!cudaRoot) throw new Error("CUDA_PATH is required to inspect a CUDA pack")
-  const [dump, compilerOutput] = await Promise.all([
-    run([resolve(cudaRoot, "bin", "cuobjdump"), "--dump-ptx", module]),
+  const [images, compilerOutput] = await Promise.all([
+    inspectPtxImagesFromModule(resolve(cudaRoot, "bin", "cuobjdump"), module),
     run([resolve(cudaRoot, "bin", "nvcc"), "--version"]),
   ])
-  const images = inspectPtxImages(dump)
   const [firstImage] = images
   if (!firstImage) {
     throw new Error("finished CUDA module contains no inspectable PTX images")
