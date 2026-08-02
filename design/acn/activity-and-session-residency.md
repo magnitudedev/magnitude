@@ -189,12 +189,14 @@ master-detail chooser groups compact rows into models on the computer and models
 download; arrow keys move one selection across both groups, the right pane is informational until
 selection, and Enter or a row click performs the row's `Load` or `Download` action.
 
-After selection, the composite onboarding workflow immediately records whether it admitted a load
-or a download-then-load action, so the right pane cannot remain as a locked chooser while server
-mirrors propagate. It then advances through download and loading without a screen transition.
-Transfer state, quantization, byte progress, rate, remaining time, and exact instance lifecycle
-remain authoritative mirror facts; the workflow intent supplies only the admitted action and its
-selected identity. Detailed residency progress remains in the activity rail. A stored-model action
+After selection, the composite onboarding workflow immediately records the submitted load or
+download-then-load command and its selected identity, so the right pane can represent command
+admission while server mirrors propagate. It never records a parallel download or model-instance
+lifecycle. Transfer state, quantization, byte progress, rate, remaining time, and exact instance
+lifecycle remain authoritative mirror facts. A terminal stopped/cancelled result deactivates the
+submitted presentation, while successful completion closes setup; in particular, an externally
+stopped load returns to the chooser rather than retaining loading presentation. Detailed residency
+progress remains in the activity rail. A stored-model action
 composes primary-slot assignment and slot load; a catalog action first composes the ordinary target
 download. The client
 marks onboarding complete only after the exact selected instance is Ready. Cancel uses the ordinary

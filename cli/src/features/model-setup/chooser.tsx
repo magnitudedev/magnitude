@@ -221,7 +221,7 @@ export type OnboardingModelChooserOperation =
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly displayName: string
-      readonly phase: "Loading" | "Ready" | "Failed"
+      readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
       readonly failure: string | null
       readonly onRetry: () => void
       readonly onChooseAnother: () => void
@@ -530,9 +530,11 @@ export function OnboardingModelChooser({
       : operation?._tag === "Activating"
         ? operation.phase === "Failed"
           ? "Model loading failed"
-          : operation.phase === "Loading"
-            ? "Loading model into memory…"
-            : "Finishing setup…"
+          : operation.phase === "Stopping"
+            ? "Stopping model…"
+            : operation.phase === "Loading"
+              ? "Loading model into memory…"
+              : "Finishing setup…"
     : "↑/↓ choose · Enter select · Esc skip for now"
 
   return (
@@ -621,7 +623,7 @@ function OnboardingModelLoadingDetails({
   readonly displayName: string
   readonly width: number
   readonly height: number
-  readonly phase: "Loading" | "Ready" | "Failed"
+  readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
   readonly failed: string | null
   readonly onRetry: () => void
   readonly onChooseAnother: () => void
@@ -644,9 +646,11 @@ function OnboardingModelLoadingDetails({
           {truncateToDisplayWidth(
             failed
               ? `Couldn’t load ${displayName}`
-              : phase === "Loading"
-                ? `Loading ${displayName} into memory`
-                : `Finishing setup for ${displayName}`,
+              : phase === "Stopping"
+                ? `Stopping ${displayName}`
+                : phase === "Loading"
+                  ? `Loading ${displayName} into memory`
+                  : `Finishing setup for ${displayName}`,
             width,
           )}
         </text>
@@ -672,7 +676,11 @@ function OnboardingModelLoadingDetails({
             {spinner}
           </text>
           <text style={{ fg: theme.muted, width: Math.max(1, width - 2) }} wrapMode="none">
-            {phase === "Loading" ? "Loading model weights…" : "Finishing setup…"}
+            {phase === "Loading"
+              ? "Loading model weights…"
+              : phase === "Stopping"
+                ? "Stopping model…"
+                : "Finishing setup…"}
           </text>
         </box>
       )}

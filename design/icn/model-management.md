@@ -215,8 +215,11 @@ Local assignment records the exact provider offering without using cached instal
 command authorization. ICN load admission validates the current package files and remains the final
 load-time authority. A frontend flow that composes optional download, slot assignment, loading,
 completion, and cancellation represents the command and its lifecycle as one composite Effect
-Atom. That atom owns explicit downloading and loading intent so React does not infer an admitted
-operation from delayed mirror state, coordinate mutation results, or copy server state.
+Atom. That atom retains only the submitted command and selected identity needed to bridge admission.
+Download and model-instance lifecycle remain authoritative mirror state. Confirmed onboarding
+cancellation clears submitted context, terminal external stop deactivates it for presentation,
+successful completion closes setup, and React neither infers admission from delayed mirrors nor
+copies server lifecycle into writable client state.
 
 Installed packages appear even when catalog resolution or assessment is unavailable. Catalog-only
 packages appear as not installed. Download progress does not require inventory-wide reconciliation.
