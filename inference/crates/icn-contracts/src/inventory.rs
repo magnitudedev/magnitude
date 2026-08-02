@@ -1479,33 +1479,6 @@ pub enum ModelOperation {
     Delete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DownloadModelRequest {
-    pub source: HuggingFaceDownloadSource,
-    pub components: Vec<DownloadComponent>,
-    #[serde(default)]
-    pub relationships: Vec<ComponentRelationship>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HuggingFaceDownloadSource {
-    HuggingFace {
-        repository: String,
-        revision: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DownloadComponent {
-    pub path: PathBuf,
-    pub role: ComponentRole,
-    pub shard_index: Option<u32>,
-    pub expected_sha256: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelDownloadEvent {
@@ -1589,10 +1562,6 @@ pub type DownloadEventStream = BoxStream<'static, ModelDownloadEvent>;
 pub trait ModelInventory: Send + Sync + 'static {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>>;
     fn get(&self, id: &ModelId) -> BoxFuture<'_, Result<InventoryModel, InventoryError>>;
-    fn download(
-        &self,
-        request: DownloadModelRequest,
-    ) -> BoxFuture<'_, Result<DownloadEventStream, InventoryError>>;
     fn plan_delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletePlan, InventoryError>>;
     fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
     fn resolve_ready(&self, id: &ModelId) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>>;

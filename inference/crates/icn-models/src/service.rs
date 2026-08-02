@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use futures_util::future::BoxFuture;
 use icn_contracts::{
-    DeletePlan, DeletedModel, DownloadEventStream, DownloadModelRequest, InventoryError,
-    InventoryModel, ModelAvailability, ModelId, ModelInventory, ModelLocation, ModelSource,
-    ResolvedComponent, ResolvedModel, ServingProfile,
+    DeletePlan, DeletedModel, InventoryError, InventoryModel, ModelAvailability, ModelId,
+    ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel, ServingProfile,
 };
 
 use crate::download::blob_key;
@@ -47,13 +46,6 @@ impl ModelInventory for ModelManager {
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
             Ok(model)
         })
-    }
-
-    fn download(
-        &self,
-        request: DownloadModelRequest,
-    ) -> BoxFuture<'_, Result<DownloadEventStream, InventoryError>> {
-        Box::pin(async move { self.start_download(request).await })
     }
 
     fn plan_delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletePlan, InventoryError>> {

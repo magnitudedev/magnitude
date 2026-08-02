@@ -8,13 +8,9 @@ use futures_util::future::BoxFuture;
 use getrandom::fill;
 use icn_contracts::models::{
     DownloadAttempt, DownloadAttemptId, ModelDownloads, ModelDownloadsResponse, ModelFailure,
-    ModelFileRelationship, ModelFileRole, ModelPackage, ModelPackageSource,
-    StartModelDownloadRequest, StartModelDownloadResponse,
+    ModelPackage, StartModelDownloadRequest, StartModelDownloadResponse,
 };
-use icn_contracts::{
-    ComponentRelationship, ComponentRole, DownloadComponent, DownloadModelRequest, DownloadStage,
-    HuggingFaceDownloadSource, InventoryError, ModelDownloadEvent,
-};
+use icn_contracts::{DownloadStage, InventoryError, ModelDownloadEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::inventory::ModelManager;
@@ -221,88 +217,6 @@ fn random_attempt_id() -> Result<DownloadAttemptId, InventoryError> {
     )))
 }
 
-fn legacy_request(package: &ModelPackage) -> Result<DownloadModelRequest, InventoryError> {
-    let ModelPackageSource::HuggingFace {
-        repository,
-        revision,
-    } = &package.source
-    else {
-        return Err(InventoryError::Unsupported(
-            "only exact Hugging Face packages can be downloaded".to_owned(),
-        ));
-    };
-    let shard_indices = package
-        .relationships
-        .iter()
-        .filter_map(|relationship| match relationship {
-            ModelFileRelationship::Shard { file_id, index, .. } => Some((file_id.clone(), *index)),
-            _ => None,
-        })
-        .collect::<BTreeMap<_, _>>();
-    let path_by_id = package
-        .files
-        .iter()
-        .map(|file| (file.id.clone(), file.path.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let components = package
-        .files
-        .iter()
-        .map(|file| DownloadComponent {
-            path: file.path.clone(),
-            role: match file.role {
-                ModelFileRole::Weights if shard_indices.contains_key(&file.id) => {
-                    ComponentRole::Shard
-                }
-                ModelFileRole::Weights => ComponentRole::Weights,
-                ModelFileRole::Projector => ComponentRole::Projector,
-                ModelFileRole::Draft => ComponentRole::Draft,
-                ModelFileRole::Mtp => ComponentRole::Mtp,
-                ModelFileRole::Auxiliary => ComponentRole::Auxiliary,
-            },
-            shard_index: shard_indices.get(&file.id).copied(),
-            expected_sha256: Some(file.sha256.clone()),
-        })
-        .collect();
-    let relationships = package
-        .relationships
-        .iter()
-        .filter_map(|relationship| match relationship {
-            ModelFileRelationship::Shard { .. } => None,
-            ModelFileRelationship::ProjectorFor {
-                projector_file_id,
-                weights_file_id,
-            } => Some(ComponentRelationship::ProjectorFor {
-                projector: path_by_id.get(projector_file_id)?.clone(),
-                model: path_by_id.get(weights_file_id)?.clone(),
-            }),
-            ModelFileRelationship::MtpFor {
-                mtp_file_id,
-                weights_file_id,
-            } => Some(ComponentRelationship::MtpFor {
-                mtp: path_by_id.get(mtp_file_id)?.clone(),
-                model: path_by_id.get(weights_file_id)?.clone(),
-            }),
-            ModelFileRelationship::DraftFor {
-                draft_file_id,
-                weights_file_id,
-                method,
-            } => Some(ComponentRelationship::DraftFor {
-                draft: path_by_id.get(draft_file_id)?.clone(),
-                model: path_by_id.get(weights_file_id)?.clone(),
-                method: method.clone(),
-            }),
-        })
-        .collect();
-    Ok(DownloadModelRequest {
-        source: HuggingFaceDownloadSource::HuggingFace {
-            repository: repository.clone(),
-            revision: revision.clone(),
-        },
-        components,
-        relationships,
-    })
-}
-
 fn load_records(path: &Path) -> BTreeMap<DownloadAttemptId, AttemptRecord> {
     let mut records = fs::read(path)
         .ok()
@@ -365,10 +279,9 @@ impl ModelDownloads for ManagedModelDownloads {
             {
                 return Ok(StartModelDownloadResponse { attempt });
             }
-            let legacy = legacy_request(&request.package)?;
             let stream = self
                 .manager
-                .start_package_download(legacy, request.package.clone())
+                .start_package_download(request.package.clone())
                 .await?;
             let id = random_attempt_id()?;
             let attempt = DownloadAttempt::Pending {
@@ -455,7 +368,7 @@ impl ModelDownloads for ManagedModelDownloads {
                 return Ok(record.attempt);
             }
             self.manager
-                .cancel_package_download(&legacy_request(&record.package)?, &record.package)
+                .cancel_package_download(&record.package)
                 .await?;
             let attempt = DownloadAttempt::Cancelled {
                 id: id.clone(),
