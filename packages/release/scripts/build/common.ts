@@ -1,16 +1,16 @@
 import { createHash } from "node:crypto"
+import { createReadStream, createWriteStream } from "node:fs"
 import {
-  chmod,
-  copyFile,
   mkdir,
-  mkdtemp,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { basename, dirname, resolve } from "node:path"
+import { basename, dirname } from "node:path"
+import { pipeline } from "node:stream/promises"
+import { createGzip } from "node:zlib"
 import { Schema } from "effect"
+import { pack } from "tar-stream"
 import {
   ReleaseArtifactSchema,
   type ReleaseArtifact,
@@ -145,30 +145,35 @@ export const buildArchive = async (
   if (paths.length === 0 || new Set(paths).size !== paths.length) {
     throw new Error(`${draft.id} contains duplicate or no archive files`)
   }
-  const staging = await mkdtemp(resolve(tmpdir(), "magnitude-release-"))
+  const orderedSources = sources
+    .map((source, index) => ({ source, path: paths[index]! }))
+    .sort((left, right) => left.path.localeCompare(right.path))
+  await mkdir(dirname(archive), { recursive: true, mode: 0o700 })
+  const tar = pack()
+  const writeArchive = pipeline(
+    tar,
+    createGzip(),
+    createWriteStream(archive, { mode: 0o600 }),
+  )
   try {
-    await Promise.all(sources.map(async (source) => {
-      const destination = resolve(staging, source.path)
-      await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
-      await copyFile(source.source, destination)
-      await chmod(destination, source.mode)
-    }))
-    await mkdir(dirname(archive), { recursive: true, mode: 0o700 })
-    await run([
-      "tar",
-      "-czf",
-      archive,
-      "-C",
-      staging,
-      ...paths.slice().sort(),
-    ], {
-      env: {
-        ...process.env,
-        // Prevent macOS tar from adding AppleDouble `._*` metadata entries,
-        // which would violate the release archive's exact file layout.
-        COPYFILE_DISABLE: "1",
-      },
-    })
+    for (const { source, path } of orderedSources) {
+      const sourceInfo = await stat(source.source)
+      if (!sourceInfo.isFile()) {
+        throw new Error(`${draft.id} archive source ${source.source} is not a file`)
+      }
+      const entry = tar.entry({
+        name: path,
+        type: "file",
+        size: sourceInfo.size,
+        mode: source.mode,
+        mtime: new Date(0),
+        uid: 0,
+        gid: 0,
+      })
+      await pipeline(createReadStream(source.source), entry)
+    }
+    tar.finalize()
+    await writeArchive
     const info = await stat(archive)
     const artifact = Schema.validateSync(ReleaseArtifactSchema)({
       ...draft,
@@ -182,7 +187,10 @@ export const buildArchive = async (
       { flag: "wx", mode: 0o600 },
     )
     return artifact
-  } finally {
-    await rm(staging, { recursive: true, force: true })
+  } catch (cause) {
+    tar.destroy(cause instanceof Error ? cause : new Error(String(cause)))
+    await writeArchive.catch(() => undefined)
+    await rm(archive, { force: true })
+    throw cause
   }
 }
