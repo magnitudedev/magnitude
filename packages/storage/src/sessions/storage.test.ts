@@ -327,6 +327,44 @@ describe("session storage", () => {
     ).toBe('{"type":"complete"}\nnot-json\n{"type":"later"}\n');
   });
 
+  test.each(["\n", "  \t\n"])(
+    "rejects a committed blank JSONL record without changing the file: %j",
+    async (blankRecord) => {
+      const contents = `{"type":"complete"}\n${blankRecord}{"type":"later"}\n`;
+      await mkdir(paths.sessionDir(sessionId), { recursive: true });
+      await writeFile(paths.sessionEventsFile(sessionId), contents, "utf-8");
+
+      const exit = await Effect.runPromise(
+        Effect.exit(
+          Effect.gen(function* () {
+            const storage = yield* MagnitudeStorage;
+            return yield* storage.sessions.readEvents<{ type: string }>(sessionId);
+          }).pipe(Effect.provide(testLayer(tmpDir)))
+        )
+      );
+
+      expect(exit._tag).toBe("Failure");
+      expect(await readFile(paths.sessionEventsFile(sessionId), "utf-8")).toBe(contents);
+    }
+  );
+
+  test("preserves syntactically valid JSON at the generic storage boundary", async () => {
+    const contents = '{"unexpected":true}\n';
+    await mkdir(paths.sessionDir(sessionId), { recursive: true });
+    await writeFile(paths.sessionEventsFile(sessionId), contents, "utf-8");
+
+    const records = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        return yield* storage.sessions.readEvents<{ readonly unexpected: boolean }>(sessionId);
+      }),
+      tmpDir
+    );
+
+    expect(records).toEqual([{ unexpected: true }]);
+    expect(await readFile(paths.sessionEventsFile(sessionId), "utf-8")).toBe(contents);
+  });
+
   test("preserves a valid final event that is missing only its newline", async () => {
     await mkdir(paths.sessionDir(sessionId), { recursive: true });
     await writeFile(
