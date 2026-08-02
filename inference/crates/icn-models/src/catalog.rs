@@ -145,6 +145,7 @@ pub async fn advance_model_catalog_lock(
         .map(|declaration| {
             let models = Arc::clone(&models);
             async move {
+                let entry_id = declaration.id;
                 let snapshot = refresh_hugging_face_repository(
                     &models,
                     HuggingFaceRepositoryRequest {
@@ -152,8 +153,13 @@ pub async fn advance_model_catalog_lock(
                         revision: "main".to_owned(),
                     },
                 )
-                .await?;
-                Ok::<_, InventoryError>((declaration.id, snapshot.commit))
+                .await
+                .map_err(|error| {
+                    InventoryError::Upstream(format!(
+                        "failed to resolve catalog entry {entry_id}: {error}"
+                    ))
+                })?;
+                Ok::<_, InventoryError>((entry_id, snapshot.commit))
             }
         })
         .buffer_unordered(12)
@@ -169,6 +175,14 @@ fn model_catalog_lock_from(
     let lock: BTreeMap<String, String> = serde_json::from_slice(bytes).map_err(|error| {
         InventoryError::Integrity(format!("invalid model catalog lock: {error}"))
     })?;
+    validate_model_catalog_lock(&lock, source)?;
+    Ok(lock)
+}
+
+fn validate_model_catalog_lock(
+    lock: &BTreeMap<String, String>,
+    source: &CatalogSource,
+) -> Result<(), InventoryError> {
     let expected = source
         .models
         .iter()
@@ -189,7 +203,7 @@ fn model_catalog_lock_from(
             "model catalog lock contains a non-commit revision".to_owned(),
         ));
     }
-    Ok(lock)
+    Ok(())
 }
 
 pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog, InventoryError> {
@@ -998,157 +1012,180 @@ impl ResolvingRecommendableCatalog {
         Box::pin(async move {
             let source = catalog_source()?;
             let lock = model_catalog_lock()?;
-            let repositories = source
-                .models
-                .iter()
-                .map(|declaration| {
-                    Ok::<_, InventoryError>((
-                        declaration.repository.clone(),
-                        lock.get(&declaration.id).cloned().ok_or_else(|| {
-                            InventoryError::Integrity(format!(
-                                "model catalog lock is missing {}",
-                                declaration.id
-                            ))
-                        })?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let repository_total = repositories.len();
-            let mut repository_completed = 0;
-            let snapshots = stream::iter(repositories)
-                .map(|(repository, revision)| async move {
-                    let result = refresh_hugging_face_repository(
-                        &self.models,
-                        HuggingFaceRepositoryRequest {
-                            repository: repository.clone(),
-                            revision,
-                        },
-                    )
-                    .await;
-                    (repository, result)
-                })
-                .buffer_unordered(12)
-                .inspect(|_| {
-                    repository_completed += 1;
-                    progress(
-                        "Resolved catalog repositories",
-                        repository_completed,
-                        repository_total,
-                    );
-                })
-                .collect::<Vec<_>>()
-                .await;
-            let mut resolved_snapshots = BTreeMap::new();
-            let mut snapshot_failures = BTreeMap::new();
-            for (repository, result) in snapshots {
-                match result {
-                    Ok(snapshot) => {
-                        resolved_snapshots.insert(repository, snapshot);
-                    }
-                    Err(error) => {
-                        snapshot_failures.insert(repository, error.to_string());
-                    }
-                }
-            }
-            let resolved_snapshots = &resolved_snapshots;
-            let snapshot_failures = &snapshot_failures;
-            let model_total = source.models.len();
-            let mut model_completed = 0;
-            let resolved = stream::iter(source.models.into_iter().enumerate())
-                .map(|(declaration_index, declaration)| async move {
-                    let mut formats = Vec::with_capacity(declaration.formats.len());
-                    for (format_index, format) in declaration.formats.iter().enumerate() {
-                        let result = match resolved_snapshots.get(&declaration.repository) {
-                            Some(snapshot) => {
-                                self.resolve_model(&declaration, format, snapshot).await
-                            }
-                            None => Err(InventoryError::Io(
-                                snapshot_failures
-                                    .get(&declaration.repository)
-                                    .cloned()
-                                    .unwrap_or_else(|| {
-                                        format!(
-                                            "repository {} was not resolved",
-                                            declaration.repository
-                                        )
-                                    }),
-                            )),
-                        };
-                        formats.push((
-                            declaration_index,
-                            format_index,
-                            declaration.clone(),
-                            format.clone(),
-                            result,
-                        ));
-                    }
-                    formats
-                })
-                .buffer_unordered(6)
-                .inspect(|_| {
-                    model_completed += 1;
-                    progress("Prepared catalog models", model_completed, model_total);
-                })
-                .flat_map(stream::iter)
-                .collect::<Vec<_>>()
-                .await;
-            let mut resolved = resolved;
-            resolved.sort_by_key(|(declaration_index, format_index, ..)| {
-                (*declaration_index, *format_index)
-            });
-            let mut models = Vec::new();
-            let mut planner_inputs = BTreeMap::new();
-            let mut source_headers = BTreeMap::new();
-            let mut planner_stubs = BTreeMap::new();
-            let mut diagnostics = Vec::new();
-            for (_, _, declaration, format, result) in resolved {
-                match result {
-                    Ok((model, planner, model_headers, model_stubs)) => {
-                        planner_inputs.insert(model.target_id.clone(), planner);
-                        models.push(model);
-                        for (digest, header) in model_headers {
-                            if let Some(previous) =
-                                source_headers.insert(digest.clone(), header.clone())
-                                && previous != header
-                            {
-                                return Err(InventoryError::Integrity(format!(
-                                    "planner source header digest collision {digest}"
-                                )));
-                            }
-                        }
-                        for (digest, stub) in model_stubs {
-                            if let Some(previous) =
-                                planner_stubs.insert(digest.clone(), stub.clone())
-                                && previous != stub
-                            {
-                                return Err(InventoryError::Integrity(format!(
-                                    "planner stub digest collision {digest}"
-                                )));
-                            }
-                        }
-                    }
-                    Err(error) => diagnostics.push(CatalogDiagnostic {
-                        entry_id: Some(RecommendableModelId(format!(
-                            "{}:{format}",
+            self.resolve_release_catalog_from_lock(source, lock, progress)
+                .await
+        })
+    }
+
+    pub fn resolve_release_catalog_with_lock<F>(
+        &self,
+        lock: BTreeMap<String, String>,
+        progress: F,
+    ) -> BoxFuture<'_, Result<GeneratedReleaseCatalog, InventoryError>>
+    where
+        F: Fn(&str, usize, usize) + Send + Sync + 'static,
+    {
+        Box::pin(async move {
+            let source = catalog_source()?;
+            validate_model_catalog_lock(&lock, &source)?;
+            self.resolve_release_catalog_from_lock(source, lock, progress)
+                .await
+        })
+    }
+
+    async fn resolve_release_catalog_from_lock<F>(
+        &self,
+        source: CatalogSource,
+        lock: BTreeMap<String, String>,
+        progress: F,
+    ) -> Result<GeneratedReleaseCatalog, InventoryError>
+    where
+        F: Fn(&str, usize, usize) + Send + Sync + 'static,
+    {
+        let repositories = source
+            .models
+            .iter()
+            .map(|declaration| {
+                Ok::<_, InventoryError>((
+                    declaration.repository.clone(),
+                    lock.get(&declaration.id).cloned().ok_or_else(|| {
+                        InventoryError::Integrity(format!(
+                            "model catalog lock is missing {}",
                             declaration.id
-                        ))),
-                        failure: ModelFailure {
-                            code: "catalog_resolution_failed".to_owned(),
-                            message: error.to_string(),
-                            retryable: true,
-                        },
-                    }),
+                        ))
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let repository_total = repositories.len();
+        let mut repository_completed = 0;
+        let snapshots = stream::iter(repositories)
+            .map(|(repository, revision)| async move {
+                let result = refresh_hugging_face_repository(
+                    &self.models,
+                    HuggingFaceRepositoryRequest {
+                        repository: repository.clone(),
+                        revision,
+                    },
+                )
+                .await;
+                (repository, result)
+            })
+            .buffer_unordered(12)
+            .inspect(|_| {
+                repository_completed += 1;
+                progress(
+                    "Resolved catalog repositories",
+                    repository_completed,
+                    repository_total,
+                );
+            })
+            .collect::<Vec<_>>()
+            .await;
+        let mut resolved_snapshots = BTreeMap::new();
+        let mut snapshot_failures = BTreeMap::new();
+        for (repository, result) in snapshots {
+            match result {
+                Ok(snapshot) => {
+                    resolved_snapshots.insert(repository, snapshot);
+                }
+                Err(error) => {
+                    snapshot_failures.insert(repository, error.to_string());
                 }
             }
-            Ok(GeneratedReleaseCatalog {
-                catalog: RecommendableModelCatalog {
-                    models,
-                    diagnostics,
-                },
-                planner_inputs,
-                source_headers,
-                planner_stubs,
+        }
+        let resolved_snapshots = &resolved_snapshots;
+        let snapshot_failures = &snapshot_failures;
+        let model_total = source.models.len();
+        let mut model_completed = 0;
+        let resolved = stream::iter(source.models.into_iter().enumerate())
+            .map(|(declaration_index, declaration)| async move {
+                let mut formats = Vec::with_capacity(declaration.formats.len());
+                for (format_index, format) in declaration.formats.iter().enumerate() {
+                    let result = match resolved_snapshots.get(&declaration.repository) {
+                        Some(snapshot) => self.resolve_model(&declaration, format, snapshot).await,
+                        None => Err(InventoryError::Io(
+                            snapshot_failures
+                                .get(&declaration.repository)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "repository {} was not resolved",
+                                        declaration.repository
+                                    )
+                                }),
+                        )),
+                    };
+                    formats.push((
+                        declaration_index,
+                        format_index,
+                        declaration.clone(),
+                        format.clone(),
+                        result,
+                    ));
+                }
+                formats
             })
+            .buffer_unordered(6)
+            .inspect(|_| {
+                model_completed += 1;
+                progress("Prepared catalog models", model_completed, model_total);
+            })
+            .flat_map(stream::iter)
+            .collect::<Vec<_>>()
+            .await;
+        let mut resolved = resolved;
+        resolved.sort_by_key(|(declaration_index, format_index, ..)| {
+            (*declaration_index, *format_index)
+        });
+        let mut models = Vec::new();
+        let mut planner_inputs = BTreeMap::new();
+        let mut source_headers = BTreeMap::new();
+        let mut planner_stubs = BTreeMap::new();
+        let mut diagnostics = Vec::new();
+        for (_, _, declaration, format, result) in resolved {
+            match result {
+                Ok((model, planner, model_headers, model_stubs)) => {
+                    planner_inputs.insert(model.target_id.clone(), planner);
+                    models.push(model);
+                    for (digest, header) in model_headers {
+                        if let Some(previous) =
+                            source_headers.insert(digest.clone(), header.clone())
+                            && previous != header
+                        {
+                            return Err(InventoryError::Integrity(format!(
+                                "planner source header digest collision {digest}"
+                            )));
+                        }
+                    }
+                    for (digest, stub) in model_stubs {
+                        if let Some(previous) = planner_stubs.insert(digest.clone(), stub.clone())
+                            && previous != stub
+                        {
+                            return Err(InventoryError::Integrity(format!(
+                                "planner stub digest collision {digest}"
+                            )));
+                        }
+                    }
+                }
+                Err(error) => diagnostics.push(CatalogDiagnostic {
+                    entry_id: Some(RecommendableModelId(format!("{}:{format}", declaration.id))),
+                    failure: ModelFailure {
+                        code: "catalog_resolution_failed".to_owned(),
+                        message: error.to_string(),
+                        retryable: true,
+                    },
+                }),
+            }
+        }
+        Ok(GeneratedReleaseCatalog {
+            catalog: RecommendableModelCatalog {
+                models,
+                diagnostics,
+            },
+            planner_inputs,
+            source_headers,
+            planner_stubs,
         })
     }
 }

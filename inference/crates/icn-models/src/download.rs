@@ -9,6 +9,7 @@ use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use getrandom::fill;
 use hf_hub::HFError;
+use icn_contracts::models::{ModelPackage, ModelPackageSource};
 use icn_contracts::{
     ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress,
     DownloadModelRequest, DownloadStage, HardwareAssessment, HuggingFaceDownloadSource, Integrity,
@@ -94,6 +95,17 @@ struct HubApiLfs {
 struct ResolvedRemoteMetadata {
     size: u64,
     content: ContentIdentity,
+    sha256: Option<String>,
+}
+
+struct ResolvedDownloadRevision {
+    commit: String,
+    components: Vec<RemoteComponent>,
+}
+
+#[derive(Clone, Debug)]
+struct EquivalentRevisionFallback {
+    package: ModelPackage,
 }
 
 struct DownloadComponentPaths {
@@ -257,8 +269,26 @@ impl ModelManager {
         &self,
         request: DownloadModelRequest,
     ) -> Result<DownloadEventStream, InventoryError> {
+        self.start_download_with_fallback(request, None).await
+    }
+
+    pub(crate) async fn start_package_download(
+        &self,
+        request: DownloadModelRequest,
+        package: ModelPackage,
+    ) -> Result<DownloadEventStream, InventoryError> {
+        validate_package_download_request(&request, &package)?;
+        self.start_download_with_fallback(request, Some(EquivalentRevisionFallback { package }))
+            .await
+    }
+
+    async fn start_download_with_fallback(
+        &self,
+        request: DownloadModelRequest,
+        fallback: Option<EquivalentRevisionFallback>,
+    ) -> Result<DownloadEventStream, InventoryError> {
         validate_download_request(&request)?;
-        let key = request_key(&request);
+        let key = request_key(&request, fallback.as_ref());
         let mut operations = self.operations.lock().await;
         if let Some(operation) = operations.get(&key) {
             return Ok(operation.subscribe());
@@ -286,17 +316,33 @@ impl ModelManager {
         let manager = self.clone();
         tokio::spawn(async move {
             manager
-                .run_download(key, operation_id, request, operation)
+                .run_download(key, operation_id, request, fallback, operation)
                 .await;
         });
         Ok(stream)
     }
 
-    pub(crate) async fn cancel_download(
+    pub(crate) async fn cancel_package_download(
         &self,
         request: &DownloadModelRequest,
+        package: &ModelPackage,
     ) -> Result<(), InventoryError> {
-        let key = request_key(request);
+        validate_package_download_request(request, package)?;
+        self.cancel_download_with_fallback(
+            request,
+            Some(&EquivalentRevisionFallback {
+                package: package.clone(),
+            }),
+        )
+        .await
+    }
+
+    async fn cancel_download_with_fallback(
+        &self,
+        request: &DownloadModelRequest,
+        fallback: Option<&EquivalentRevisionFallback>,
+    ) -> Result<(), InventoryError> {
+        let key = request_key(request, fallback);
         let operation = self
             .operations
             .lock()
@@ -313,10 +359,11 @@ impl ModelManager {
         operation_key: String,
         operation_id: String,
         request: DownloadModelRequest,
+        fallback: Option<EquivalentRevisionFallback>,
         operation: Arc<DownloadOperation>,
     ) {
         let result = self
-            .run_download_inner(&operation_id, &request, &operation)
+            .run_download_inner(&operation_id, &request, fallback.as_ref(), &operation)
             .await;
         if let Err(failure) = result {
             let model_id = current_model_id(&operation.sender.borrow());
@@ -359,6 +406,7 @@ impl ModelManager {
         &self,
         operation_id: &str,
         request: &DownloadModelRequest,
+        fallback: Option<&EquivalentRevisionFallback>,
         operation: &DownloadOperation,
     ) -> Result<(), DownloadError> {
         operation.ensure_active()?;
@@ -374,51 +422,34 @@ impl ModelManager {
         })?;
         let repo = self.client.model(owner.to_owned(), name.to_owned());
 
-        let api_metadata = hub_api_metadata(&self.client, repository, revision).await?;
-        require_requested_revision(revision, api_metadata.sha.as_deref()).map_err(|message| {
-            DownloadError {
-                code: "revision_changed",
-                message,
-                retryable: false,
-                resumable: false,
+        let pinned =
+            resolve_download_revision(&self.client, &repo, repository, revision, request, None)
+                .await;
+        let resolved = match pinned {
+            Ok(resolved) => resolved,
+            Err(error) if fallback.is_some() && missing_upstream_content(&error) => {
+                let fallback = fallback.expect("checked package fallback");
+                let resolved = resolve_download_revision(
+                    &self.client,
+                    &repo,
+                    repository,
+                    "main",
+                    request,
+                    Some((&fallback.package, revision)),
+                )
+                .await?;
+                tracing::info!(
+                    repository,
+                    pinned_revision = revision,
+                    resolved_revision = resolved.commit,
+                    "using content-equivalent current revision for model acquisition"
+                );
+                resolved
             }
-        })?;
-        let commit = api_metadata.sha.clone().ok_or_else(|| DownloadError {
-            code: "missing_metadata",
-            message: "Hugging Face repository response did not include a commit".to_owned(),
-            retryable: true,
-            resumable: false,
-        })?;
-        let mut remote = Vec::with_capacity(request.components.len());
-        for component in &request.components {
-            let metadata =
-                resolve_remote_metadata(&repo, &api_metadata, &commit, &component.path).await?;
-            if metadata.size == 0 {
-                return Err(DownloadError {
-                    code: "missing_metadata",
-                    message: format!(
-                        "Hugging Face did not report a non-zero size for {}",
-                        component.path.display()
-                    ),
-                    retryable: false,
-                    resumable: false,
-                });
-            }
-            let content = if let Some(expected) = component.expected_sha256.as_ref() {
-                ContentIdentity::Sha256 {
-                    value: expected.to_ascii_lowercase(),
-                }
-            } else {
-                metadata.content
-            };
-            let content_key = blob_key(&content);
-            remote.push(RemoteComponent {
-                request: component.clone(),
-                size: metadata.size,
-                content,
-                content_key,
-            });
-        }
+            Err(error) => return Err(error),
+        };
+        let commit = resolved.commit;
+        let remote = resolved.components;
         let components = remote
             .iter()
             .map(|component| ModelComponent {
@@ -1331,9 +1362,19 @@ fn open_partial(path: &Path) -> Result<File, DownloadError> {
     options.open(path).map_err(download_io)
 }
 
-fn request_key(request: &DownloadModelRequest) -> String {
-    let bytes = serde_json::to_vec(request).expect("validated download requests serialize");
-    format!("{:x}", Sha256::digest(bytes))
+fn request_key(
+    request: &DownloadModelRequest,
+    fallback: Option<&EquivalentRevisionFallback>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(serde_json::to_vec(request).expect("validated download requests serialize"));
+    if let Some(fallback) = fallback {
+        digest.update(b"\0equivalent-main\0");
+        digest.update(
+            serde_json::to_vec(&fallback.package.files).expect("validated package files serialize"),
+        );
+    }
+    format!("{:x}", digest.finalize())
 }
 
 pub(crate) fn blob_key(content: &ContentIdentity) -> String {
@@ -1364,6 +1405,247 @@ fn inventory_download_error(error: InventoryError) -> DownloadError {
         message: error.to_string(),
         retryable: false,
         resumable: true,
+    }
+}
+
+fn validate_package_download_request(
+    request: &DownloadModelRequest,
+    package: &ModelPackage,
+) -> Result<(), InventoryError> {
+    let (
+        HuggingFaceDownloadSource::HuggingFace {
+            repository,
+            revision,
+        },
+        ModelPackageSource::HuggingFace {
+            repository: package_repository,
+            revision: package_revision,
+        },
+    ) = (&request.source, &package.source)
+    else {
+        return Err(InventoryError::InvalidRequest(
+            "package download requires an exact Hugging Face source".to_owned(),
+        ));
+    };
+    if repository != package_repository || revision != package_revision {
+        return Err(InventoryError::InvalidRequest(
+            "download source does not match the package source".to_owned(),
+        ));
+    }
+    if request.components.len() != package.files.len() {
+        return Err(InventoryError::InvalidRequest(
+            "download components do not exactly cover the package files".to_owned(),
+        ));
+    }
+    for component in &request.components {
+        let file = package
+            .files
+            .iter()
+            .find(|file| file.path == component.path)
+            .ok_or_else(|| {
+                InventoryError::InvalidRequest(format!(
+                    "download component {} is absent from the package",
+                    component.path.display()
+                ))
+            })?;
+        if component
+            .expected_sha256
+            .as_deref()
+            .is_none_or(|digest| !digest.eq_ignore_ascii_case(&file.sha256))
+        {
+            return Err(InventoryError::InvalidRequest(format!(
+                "download component {} does not use the package SHA-256",
+                component.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn missing_upstream_content(error: &DownloadError) -> bool {
+    matches!(
+        error.code,
+        "repository_not_found" | "revision_not_found" | "file_not_found"
+    )
+}
+
+async fn resolve_download_revision(
+    client: &hf_hub::HFClient,
+    repo: &hf_hub::HFRepository<hf_hub::RepoTypeModel>,
+    repository: &str,
+    revision: &str,
+    request: &DownloadModelRequest,
+    equivalent: Option<(&ModelPackage, &str)>,
+) -> Result<ResolvedDownloadRevision, DownloadError> {
+    let api = match hub_api_metadata(client, repository, revision).await {
+        Ok(api) => api,
+        Err(error) if equivalent.is_some() && missing_upstream_content(&error) => {
+            let (_, pinned) = equivalent.expect("checked equivalent package");
+            return Err(package_unavailable(
+                repository,
+                pinned,
+                None,
+                None,
+                "current main is unavailable",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let commit = api.sha.clone().ok_or_else(|| DownloadError {
+        code: "missing_metadata",
+        message: "Hugging Face repository response did not include a commit".to_owned(),
+        retryable: true,
+        resumable: false,
+    })?;
+    if revision == "main" {
+        if !is_immutable_commit(&commit) {
+            return Err(DownloadError {
+                code: "missing_metadata",
+                message: "Hugging Face main did not resolve to an immutable commit".to_owned(),
+                retryable: true,
+                resumable: false,
+            });
+        }
+    } else {
+        require_requested_revision(revision, Some(&commit)).map_err(|message| DownloadError {
+            code: "revision_changed",
+            message,
+            retryable: false,
+            resumable: false,
+        })?;
+    }
+
+    let mut components = Vec::with_capacity(request.components.len());
+    for component in &request.components {
+        let metadata = match resolve_remote_metadata(repo, &api, &commit, &component.path).await {
+            Ok(metadata) => metadata,
+            Err(error) if equivalent.is_some() && missing_upstream_content(&error) => {
+                let (_, pinned) = equivalent.expect("checked equivalent package");
+                return Err(package_unavailable(
+                    repository,
+                    pinned,
+                    Some(&commit),
+                    Some(&component.path),
+                    "required file is absent from current main",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.size == 0 {
+            return Err(DownloadError {
+                code: "missing_metadata",
+                message: format!(
+                    "Hugging Face did not report a non-zero size for {}",
+                    component.path.display()
+                ),
+                retryable: false,
+                resumable: false,
+            });
+        }
+        if let Some((package, pinned)) = equivalent {
+            validate_equivalent_file(
+                repository,
+                pinned,
+                &commit,
+                package,
+                &api,
+                &component.path,
+                &metadata,
+            )?;
+        }
+        let content = if let Some(expected) = component.expected_sha256.as_ref() {
+            ContentIdentity::Sha256 {
+                value: expected.to_ascii_lowercase(),
+            }
+        } else {
+            metadata.content
+        };
+        let content_key = blob_key(&content);
+        components.push(RemoteComponent {
+            request: component.clone(),
+            size: metadata.size,
+            content,
+            content_key,
+        });
+    }
+    Ok(ResolvedDownloadRevision { commit, components })
+}
+
+fn is_immutable_commit(value: &str) -> bool {
+    (40..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_equivalent_file(
+    repository: &str,
+    pinned: &str,
+    observed: &str,
+    package: &ModelPackage,
+    api: &HubApiModel,
+    path: &Path,
+    metadata: &ResolvedRemoteMetadata,
+) -> Result<(), DownloadError> {
+    let expected = package
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .expect("package download request was validated");
+    if metadata.size != expected.size_bytes {
+        return Err(package_unavailable(
+            repository,
+            pinned,
+            Some(observed),
+            Some(path),
+            "current main reports a different file size",
+        ));
+    }
+    let metadata_sha256 = api
+        .siblings
+        .iter()
+        .find(|sibling| sibling.rfilename == path.to_string_lossy())
+        .and_then(|sibling| sibling.lfs.as_ref())
+        .map(|lfs| lfs.sha256.as_str())
+        .or(metadata.sha256.as_deref());
+    if metadata_sha256.is_none_or(|digest| !digest.eq_ignore_ascii_case(&expected.sha256)) {
+        return Err(package_unavailable(
+            repository,
+            pinned,
+            Some(observed),
+            Some(path),
+            "current main reports different file content",
+        ));
+    }
+    Ok(())
+}
+
+fn package_unavailable(
+    repository: &str,
+    pinned: &str,
+    observed: Option<&str>,
+    path: Option<&Path>,
+    reason: &'static str,
+) -> DownloadError {
+    tracing::warn!(
+        repository,
+        pinned_revision = pinned,
+        observed_revision = observed.unwrap_or("unresolved"),
+        path = %path.map_or_else(|| "unknown".to_owned(), |path| path.display().to_string()),
+        reason,
+        "pinned model package is unavailable and current main is not equivalent"
+    );
+    DownloadError {
+        code: "package_unavailable",
+        message: match path {
+            Some(path) => format!(
+                "the publisher no longer provides the catalog package at {}: {reason}",
+                path.display()
+            ),
+            None => format!("the publisher no longer provides the catalog package: {reason}"),
+        },
+        retryable: true,
+        resumable: false,
     }
 }
 
@@ -1428,14 +1710,13 @@ async fn resolve_remote_metadata(
                     resumable: false,
                 });
             }
+            let sha256 = (metadata.etag.len() == 64
+                && metadata.etag.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| metadata.etag.to_ascii_lowercase());
             let content = if let Some(value) = metadata.xet_hash {
                 ContentIdentity::Xet { value }
-            } else if metadata.etag.len() == 64
-                && metadata.etag.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                ContentIdentity::Sha256 {
-                    value: metadata.etag.to_ascii_lowercase(),
-                }
+            } else if let Some(value) = sha256.clone() {
+                ContentIdentity::Sha256 { value }
             } else {
                 ContentIdentity::GitOid {
                     value: metadata.etag,
@@ -1444,6 +1725,7 @@ async fn resolve_remote_metadata(
             Ok(ResolvedRemoteMetadata {
                 size: metadata.file_size,
                 content,
+                sha256,
             })
         }
         // hf-hub 1.0 follows the HEAD redirect before reading resolver headers. The repository
@@ -1459,12 +1741,13 @@ async fn resolve_remote_metadata(
                     retryable: false,
                     resumable: false,
                 })?;
-            let (size, content) = match sibling.lfs.as_ref() {
+            let (size, content, sha256) = match sibling.lfs.as_ref() {
                 Some(lfs) => (
                     lfs.size,
                     ContentIdentity::Sha256 {
                         value: lfs.sha256.to_ascii_lowercase(),
                     },
+                    Some(lfs.sha256.to_ascii_lowercase()),
                 ),
                 None => (
                     sibling.size.unwrap_or(0),
@@ -1474,9 +1757,14 @@ async fn resolve_remote_metadata(
                         .map_or(ContentIdentity::Unknown, |value| ContentIdentity::GitOid {
                             value: value.clone(),
                         }),
+                    None,
                 ),
             };
-            Ok(ResolvedRemoteMetadata { size, content })
+            Ok(ResolvedRemoteMetadata {
+                size,
+                content,
+                sha256,
+            })
         }
         Err(error) => Err(map_hf_error(error)),
     }
@@ -1603,6 +1891,9 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icn_contracts::models::{
+        ModelFile, ModelFileId, ModelFileRole, ModelPackageId, ModelPackageProperties,
+    };
     use icn_contracts::{ComponentRole, DownloadComponent};
 
     fn remote_component(contents: &[u8]) -> RemoteComponent {
@@ -1617,6 +1908,74 @@ mod tests {
             size: contents.len() as u64,
             content: ContentIdentity::Sha256 { value: digest },
             content_key: "test".to_owned(),
+        }
+    }
+
+    fn exact_package(path: &str, contents: &[u8]) -> ModelPackage {
+        let sha256 = format!("{:x}", Sha256::digest(contents));
+        ModelPackage {
+            id: ModelPackageId("package_test".to_owned()),
+            source: ModelPackageSource::HuggingFace {
+                repository: "owner/repository".to_owned(),
+                revision: "a".repeat(40),
+            },
+            files: vec![ModelFile {
+                id: ModelFileId(format!("file_{sha256}")),
+                path: PathBuf::from(path),
+                role: ModelFileRole::Weights,
+                size_bytes: contents.len() as u64,
+                sha256,
+            }],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "test".to_owned(),
+                quantization_name: "test".to_owned(),
+                architecture: "test".to_owned(),
+                maximum_context_length: 1,
+            },
+        }
+    }
+
+    fn exact_request(package: &ModelPackage) -> DownloadModelRequest {
+        let ModelPackageSource::HuggingFace {
+            repository,
+            revision,
+        } = &package.source
+        else {
+            panic!("test package source")
+        };
+        DownloadModelRequest {
+            source: HuggingFaceDownloadSource::HuggingFace {
+                repository: repository.clone(),
+                revision: revision.clone(),
+            },
+            components: package
+                .files
+                .iter()
+                .map(|file| DownloadComponent {
+                    path: file.path.clone(),
+                    role: ComponentRole::Weights,
+                    shard_index: None,
+                    expected_sha256: Some(file.sha256.clone()),
+                })
+                .collect(),
+            relationships: Vec::new(),
+        }
+    }
+
+    fn hub_file(path: &str, size: u64, sha256: &str) -> HubApiModel {
+        HubApiModel {
+            sha: Some("b".repeat(40)),
+            siblings: vec![HubApiSibling {
+                rfilename: path.to_owned(),
+                size: Some(size),
+                blob_id: None,
+                lfs: Some(HubApiLfs {
+                    sha256: sha256.to_owned(),
+                    size,
+                }),
+            }],
         }
     }
 
@@ -1751,5 +2110,88 @@ mod tests {
         assert_eq!(error.code, "integrity_failed");
         assert!(!error.retryable);
         assert!(!error.resumable);
+    }
+
+    #[test]
+    fn package_download_request_requires_exact_package_files() {
+        let package = exact_package("model.gguf", b"model contents");
+        let mut request = exact_request(&package);
+        validate_package_download_request(&request, &package).expect("exact request");
+
+        request.components[0].expected_sha256 = Some("0".repeat(64));
+        assert!(validate_package_download_request(&request, &package).is_err());
+    }
+
+    #[test]
+    fn equivalent_revision_requires_matching_path_size_and_sha256() {
+        let package = exact_package("model.gguf", b"model contents");
+        let expected = &package.files[0];
+        let api = hub_file("model.gguf", expected.size_bytes, &expected.sha256);
+        let metadata = ResolvedRemoteMetadata {
+            size: expected.size_bytes,
+            content: ContentIdentity::Xet {
+                value: "xet-object".to_owned(),
+            },
+            sha256: None,
+        };
+        validate_equivalent_file(
+            "owner/repository",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &package,
+            &api,
+            Path::new("model.gguf"),
+            &metadata,
+        )
+        .expect("equivalent file");
+
+        let different_size = ResolvedRemoteMetadata {
+            size: expected.size_bytes + 1,
+            content: ContentIdentity::Xet {
+                value: "xet-object".to_owned(),
+            },
+            sha256: Some(expected.sha256.clone()),
+        };
+        assert_eq!(
+            validate_equivalent_file(
+                "owner/repository",
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &package,
+                &api,
+                Path::new("model.gguf"),
+                &different_size,
+            )
+            .expect_err("changed size")
+            .code,
+            "package_unavailable"
+        );
+
+        let changed = hub_file("model.gguf", expected.size_bytes, &"0".repeat(64));
+        let failure = validate_equivalent_file(
+            "owner/repository",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &package,
+            &changed,
+            Path::new("model.gguf"),
+            &metadata,
+        )
+        .expect_err("changed file");
+        assert_eq!(failure.code, "package_unavailable");
+    }
+
+    #[test]
+    fn fallback_is_limited_to_definitive_missing_content() {
+        let failure = |code| DownloadError {
+            code,
+            message: String::new(),
+            retryable: false,
+            resumable: false,
+        };
+        assert!(missing_upstream_content(&failure("revision_not_found")));
+        assert!(missing_upstream_content(&failure("file_not_found")));
+        assert!(!missing_upstream_content(&failure("rate_limited")));
+        assert!(!missing_upstream_content(&failure("transport_failed")));
     }
 }
