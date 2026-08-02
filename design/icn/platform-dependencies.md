@@ -42,6 +42,10 @@ feature flags. Optional integrations are enabled from explicit product configura
 a dependency happens to be installed on the runner. Builds target the oldest platform version the
 artifact claims to support.
 
+When the hosted runner OS is newer than a target's supported build userspace, a digest-pinned build
+container owns that userspace boundary. The host kernel and runner lifecycle are build
+infrastructure, not part of the released artifact's platform baseline.
+
 Release assembly uses declared contents and validates the recursive dependency closure of the final
 base-plus-backend installation. Mach-O load commands and deployment targets, ELF interpreters,
 needed libraries and symbol-version floors, and PE imports are checked as applicable. Every edge

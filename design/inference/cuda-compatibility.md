@@ -59,9 +59,17 @@ Linux x64 and ARM64 build the same two compiler configurations independently:
 | CUDA 11.8 | ordinary `80` |
 | CUDA 12.9 | ordinary `80`, ordinary `90`, ordinary `120` |
 
-These four host/toolkit jobs run concurrently. CUDA 11.8 jobs use Ubuntu 22.04, which CUDA
-11.8 supports on x64 and SBSA ARM64; CUDA 12.9 jobs use Ubuntu 24.04. Host CPU architecture never
-selects a CUDA toolkit generation.
+These four host/toolkit jobs run concurrently. All use Ubuntu 24.04 GitHub hosts. CUDA 11.8 builds
+inside a digest-pinned NVIDIA Ubuntu 22.04 container, preserving the x64 and SBSA userspace that
+CUDA 11.8 supports without coupling the build to GitHub's Ubuntu 22 hosted-runner lifecycle. CUDA
+12.9 builds directly on Ubuntu 24.04. Both install only the CUDA compiler closure and cuBLAS
+development files required by the current backend. Host CPU architecture never selects a CUDA
+toolkit generation.
+
+Backend builds emit bounded periodic disk, inode, memory, cgroup, and highest-RSS process snapshots
+while Cargo runs. Cargo stderr is mirrored live while its JSON stdout remains captured for artifact
+discovery. A lost runner must therefore retain recent resource evidence rather than presenting an
+entirely silent build interval.
 
 Additional PTX targets and native cubins require measured startup or inference benefit because
 they increase build time and artifact size.

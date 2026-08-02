@@ -16,6 +16,7 @@ const run = async (
   options: {
     readonly cwd?: string
     readonly env?: Readonly<Record<string, string | undefined>>
+    readonly mirrorStderr?: boolean
   } = {},
 ): Promise<string> => {
   const child = Bun.spawn([...command], {
@@ -25,10 +26,23 @@ const run = async (
     stdout: "pipe",
     stderr: "pipe",
   })
+  const readStderr = async (): Promise<string> => {
+    const reader = child.stderr.getReader()
+    const decoder = new TextDecoder()
+    const output: string[] = []
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (options.mirrorStderr) process.stderr.write(value)
+      output.push(decoder.decode(value, { stream: true }))
+    }
+    output.push(decoder.decode())
+    return output.join("")
+  }
   const [code, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
+    readStderr(),
   ])
   if (code !== 0) {
     const diagnostics = [stderr, stdout]
@@ -217,6 +231,7 @@ export const buildIcnBinary = async ({
     "json-render-diagnostics",
   ], {
     cwd: PROJECT_ROOT,
+    mirrorStderr: true,
     env: {
       ...process.env,
       ...buildEnvironment,
