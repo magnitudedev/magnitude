@@ -27,7 +27,7 @@ export const finishGoalTool = defineHarnessTool({
     description: 'Mark the active goal complete. Use this only after verifying the full active goal against current evidence. Do not use it for partial progress, summaries, or plausible completion; provide concise evidence that proves the goal is complete.',
     inputSchema: Schema.Struct({
       evidence: Schema.String.annotations({
-        description: 'Concise evidence that the full active goal is complete, such as verified requirements, tests run, files changed, worker results reviewed, or final answer delivered.',
+        description: 'Concise evidence that the full active goal is complete, such as verified requirements, tests run, files changed, or final answer delivered.',
       }),
     }),
     outputSchema: Schema.Struct({
