@@ -1,26 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import type { DisplayModelRequestActivity } from '@magnitudedev/sdk'
+import type { DisplayRootStatus } from '@magnitudedev/sdk'
 import {
   formatTokenCount,
-  modelRequestProgressCopy,
-  modelRequestProgressSegments,
-} from './model-request-progress'
+  rootDetailSegments,
+} from './root-detail'
+
+type DisplayRootDetail = Extract<DisplayRootStatus, { readonly _tag: 'Working' }>['detail']
 
 const prefill = (
-  overrides: Partial<DisplayModelRequestActivity> = {},
-): DisplayModelRequestActivity => ({
-  requestId: 'request-1',
-  turnId: 'turn-1',
-  forkId: null,
-  startedAt: 0,
-  phase: 'prefill',
+  overrides: Partial<Extract<DisplayRootDetail, { readonly _tag: 'Prefill' }>> = {},
+): Extract<DisplayRootDetail, { readonly _tag: 'Prefill' }> => ({
+  _tag: 'Prefill',
   completedTokens: 0,
   totalTokens: 0,
   cachedTokens: 0,
   ...overrides,
 })
 
-describe('model request progress copy', () => {
+describe('root detail copy', () => {
   it('formats token counts compactly', () => {
     expect(formatTokenCount(820)).toBe('820')
     expect(formatTokenCount(1_100)).toBe('1.1k')
@@ -28,35 +25,37 @@ describe('model request progress copy', () => {
   })
 
   it('describes a cold prefill using total progress', () => {
-    expect(modelRequestProgressCopy(prefill({
+    expect(rootDetailSegments(prefill({
       completedTokens: 9_400,
       totalTokens: 14_300,
     }))).toEqual({
-      primary: 'Prefilling · 9.4k / 14.3k input tokens',
-      secondary: null,
+      keyword: 'Prefill',
+      detail: '9.4k / 14.3k tokens',
+      trailing: null,
     })
   })
 
   it('separates cached tokens from the input tokens being prefilled', () => {
-    expect(modelRequestProgressCopy(prefill({
+    expect(rootDetailSegments(prefill({
       completedTokens: 14_020,
       totalTokens: 14_300,
       cachedTokens: 13_200,
     }))).toEqual({
-      primary: 'Prefilling · 820 / 1.1k input tokens',
-      secondary: 'Using 13.2k cached tokens',
+      keyword: 'Prefill',
+      detail: '820 / 1.1k tokens',
+      trailing: '13.2k cached',
     })
   })
 
   it('structures cached progress for a single activity rail line', () => {
-    expect(modelRequestProgressSegments(prefill({
+    expect(rootDetailSegments(prefill({
       completedTokens: 14_020,
       totalTokens: 14_300,
       cachedTokens: 13_200,
     }))).toEqual({
-      label: 'Prefilling',
-      detail: '820 / 1.1k input tokens',
-      trailing: 'Using 13.2k cached tokens',
+      keyword: 'Prefill',
+      detail: '820 / 1.1k tokens',
+      trailing: '13.2k cached',
     })
   })
 })

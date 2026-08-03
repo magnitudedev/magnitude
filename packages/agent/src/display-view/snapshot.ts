@@ -146,10 +146,10 @@ export const buildDisplayViewSnapshot = (
         taskWorker.state,
         windowState.state,
         compaction.state,
+        modelRequestActivity.state.requests,
       ),
       agents: materializeDisplayAgents(agentStatus.state),
       tasks: materializeDisplayTasks(taskWorker.state),
-      modelRequests: Object.fromEntries(modelRequestActivity.state.requests),
     }
 
     return { shape: acceptedShape, state }

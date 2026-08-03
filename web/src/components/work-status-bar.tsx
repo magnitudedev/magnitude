@@ -1,22 +1,21 @@
 import { useState, useSyncExternalStore, type ReactNode } from "react"
-import { Option } from "effect"
-import { ChevronDown, ChevronUp, Circle, Loader2 } from "lucide-react"
+import { ChevronDown, ChevronUp, Circle } from "lucide-react"
 import {
   formatElapsedMs,
   getTickSnapshot,
-  displayActorWorkElapsedMs,
-  displayActorWorkLiveState,
-  isDisplayActorWorkClockRunning,
-  modelRequestProgressSegments,
+  displayRootStatusElapsedMs,
+  displayWorkerStatusElapsedMs,
+  isDisplayWorkerStatusClockRunning,
+  rootDetailSegments,
   subscribeNoop,
   subscribeTick,
-  type ModelRequestProgressSegments,
+  useStabilizedRootDetail,
   type SlotProfile,
   type SlotProfiles,
 } from "@magnitudedev/client-common"
 import type {
   DisplayActor,
-  DisplayModelRequestActivity,
+  DisplayRootStatus,
   DisplayTasks,
   TaskAssignee,
   TaskDisplayRow,
@@ -28,7 +27,6 @@ export interface WorkStatusBarProps {
   rootActor: DisplayActor | null
   actors: Record<string, DisplayActor>
   tasks: DisplayTasks | null
-  modelRequestActivity: DisplayModelRequestActivity | null
   slotProfiles?: SlotProfiles | null
   onWorkerClick?: (forkId: string) => void
 }
@@ -61,12 +59,12 @@ function getInteractiveForkId(assignee: TaskAssignee, actors: Record<string, Dis
 }
 
 function actorTimer(actor: DisplayActor | undefined): number | null {
-  if (!actor) return null
-  const { work } = actor
-  if (isDisplayActorWorkClockRunning(work)) {
-    return displayActorWorkElapsedMs(work, Date.now())
+  if (actor?.kind !== "worker") return null
+  const { status } = actor
+  if (isDisplayWorkerStatusClockRunning(status)) {
+    return displayWorkerStatusElapsedMs(status, Date.now())
   }
-  if (work.lastWorkMs > 0) return work.lastWorkMs
+  if (status.lastWorkMs > 0) return status.lastWorkMs
   return null
 }
 
@@ -92,64 +90,54 @@ function assigneeStatus(
   if (assignee.kind === "user") return "user"
   if (assignee.kind === "actor") {
     if (assignee.taskState === "killing") return "killing"
-    return actors[assignee.actorKey]?.work.phase === "working" ? "working" : "idle"
+    const actor = actors[assignee.actorKey]
+    return actor?.kind === "worker" && actor.status.phase === "working" ? "working" : "idle"
   }
   return assignee.variant
 }
 
 function StatusSummary({
   status,
-  elapsed,
-  completedDuration,
-  hasRecentWork,
-  activity,
-  modelRequestProgress,
 }: {
-  status: "idle" | "waiting_for_model" | "working" | "worked"
-  elapsed: number
-  completedDuration: number | null
-  hasRecentWork: boolean
-  activity: DisplayActor["work"]["activity"] | null
-  modelRequestProgress: ModelRequestProgressSegments | null
+  status: DisplayRootStatus
 }): ReactNode {
-  const active = modelRequestProgress !== null || status === "waiting_for_model" || status === "working"
-  const label = modelRequestProgress !== null
-    ? [modelRequestProgress.label, modelRequestProgress.detail, modelRequestProgress.trailing]
-        .filter((part): part is string => part !== null)
-        .join(" · ")
-    : status === "waiting_for_model"
-    ? elapsed > 0
-      ? `Waiting for model · ${formatElapsedMs(elapsed)} worked`
-      : "Waiting for model"
-    : status === "working"
-      ? `Working... ${formatElapsedMs(elapsed)}`
-      : status === "worked" && hasRecentWork
-        ? `Worked ${formatElapsedMs(completedDuration ?? 0)}`
-        : "Idle"
+  const active = status._tag === "Working"
+  const stabilizedDetail = useStabilizedRootDetail(status)
+  const detail = stabilizedDetail === null ? null : rootDetailSegments(stabilizedDetail)
+  const terminalLabel = status._tag === "Worked"
+    ? `Worked ${formatElapsedMs(status.lastProductiveMs)}`
+    : status._tag === "Interrupted"
+      ? `Worked ${formatElapsedMs(status.lastProductiveMs)}`
+      : "Idle"
   return (
     <>
-      {modelRequestProgress !== null || status === "waiting_for_model" ? (
-        <Loader2 size={13} className="animate-spin" style={{ color: "var(--accent-primary)", flexShrink: 0 }} />
-      ) : (
-        <Circle
-          size={9}
-          fill="currentColor"
-          className={active ? "animate-pulse-dot" : undefined}
-          style={{ color: active ? "var(--accent-primary)" : "var(--fg-tertiary)", flexShrink: 0 }}
-        />
-      )}
+      <Circle
+        size={9}
+        fill="currentColor"
+        className={active ? "animate-pulse-dot" : undefined}
+        style={{ color: active ? "var(--accent-primary)" : "var(--fg-tertiary)", flexShrink: 0 }}
+      />
       <span style={{ flexShrink: 0, color: active ? "var(--fg-primary)" : "var(--fg-secondary)" }}>
-        {label}
+        {status._tag === "Working" ? "Working" : terminalLabel}
       </span>
-      {modelRequestProgress === null && activity && (
-        <span style={{ display: "flex", alignItems: "center", gap: 5, minWidth: 0, overflow: "hidden" }}>
-          {activity.kind === "tool" && Option.getOrNull(activity.decorator) === "spinner" && (
-            <Loader2 size={14} className="animate-spin" style={{ color: "var(--fg-secondary)", flexShrink: 0 }} />
-          )}
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {activity.message}
-          </span>
+      {status._tag === "Working" && (
+        <span style={{ color: "var(--fg-secondary)", flexShrink: 0 }}>
+          {` · ${formatElapsedMs(displayRootStatusElapsedMs(status, Date.now()))}`}
         </span>
+      )}
+      {detail?.keyword != null && (
+        <>
+          <span style={{ color: "var(--fg-secondary)" }}> · </span>
+          <span className="animate-pulse-dot" style={{ color: "var(--fg-secondary)" }}>
+            {detail.keyword}
+          </span>
+        </>
+      )}
+      {detail?.detail != null && (
+        <span style={{ color: "var(--fg-secondary)" }}>{` · ${detail.detail}`}</span>
+      )}
+      {detail?.trailing != null && (
+        <span style={{ color: "var(--fg-secondary)" }}>{` · ${detail.trailing}`}</span>
       )}
     </>
   )
@@ -251,41 +239,26 @@ export function WorkStatusBar({
   rootActor,
   actors,
   tasks,
-  modelRequestActivity,
   slotProfiles,
   onWorkerClick,
 }: WorkStatusBarProps): ReactNode {
   const [expanded, setExpanded] = useState(false)
   const rows = rowsFromTasks(tasks)
 
-  const rootWork = rootActor?.work ?? null
-  const liveState = rootWork === null ? "inactive" : displayActorWorkLiveState(rootWork)
-  const chainActive = liveState !== "inactive"
-  const clockRunning = rootWork !== null && isDisplayActorWorkClockRunning(rootWork)
-  const activity = rootWork?.activity ?? null
-  const modelRequestProgress = modelRequestActivity === null
-    ? null
-    : modelRequestProgressSegments(modelRequestActivity)
-  const anyActorClockRunning = Object.values(actors).some((actor) => isDisplayActorWorkClockRunning(actor.work))
+  const rootStatus = rootActor?.kind === "root" ? rootActor.status : null
+  const chainActive = rootStatus?._tag === "Working"
+  const hasRecentWork = rootStatus?._tag === "Worked" || rootStatus?._tag === "Interrupted"
+    ? rootStatus.lastProductiveMs > 0
+    : false
+  const anyActorClockRunning = Object.values(actors).some((actor) =>
+    actor.kind === "worker" && isDisplayWorkerStatusClockRunning(actor.status))
 
-  const tick = useSyncExternalStore(clockRunning || anyActorClockRunning ? subscribeTick : subscribeNoop, getTickSnapshot)
+  const tick = useSyncExternalStore(chainActive || anyActorClockRunning ? subscribeTick : subscribeNoop, getTickSnapshot)
   void tick
 
-  const elapsed = chainActive && rootWork
-    ? displayActorWorkElapsedMs(rootWork, Date.now())
-    : 0
-  const completedDuration = !chainActive && rootWork && rootWork.lastWorkMs > 0 ? rootWork.lastWorkMs : null
-  const hasRecentWork = completedDuration !== null && completedDuration > 0
   const hasTasks = rows.length > 0
-  const status = liveState === "waiting_for_model"
-    ? "waiting_for_model" as const
-    : chainActive
-      ? "working" as const
-      : hasRecentWork
-        ? "worked" as const
-        : "idle" as const
 
-  if (!chainActive && !hasRecentWork && !hasTasks && !activity && modelRequestProgress === null) return null
+  if (rootStatus === null || !chainActive && !hasRecentWork && !hasTasks) return null
 
   const incompleteCount = tasks?.summary.incompleteCount ?? rows.filter((row) => row.status !== "completed").length
   const taskCountLabel = incompleteCount === 1 ? "1 task" : `${incompleteCount} tasks`
@@ -329,12 +302,7 @@ export function WorkStatusBar({
           }}
         >
           <StatusSummary
-            status={status}
-            elapsed={elapsed}
-            completedDuration={completedDuration}
-            hasRecentWork={hasRecentWork}
-            activity={activity}
-            modelRequestProgress={modelRequestProgress}
+            status={rootStatus}
           />
           <span
             style={{
@@ -364,12 +332,7 @@ export function WorkStatusBar({
           }}
         >
           <StatusSummary
-            status={status}
-            elapsed={elapsed}
-            completedDuration={completedDuration}
-            hasRecentWork={hasRecentWork}
-            activity={activity}
-            modelRequestProgress={modelRequestProgress}
+            status={rootStatus}
           />
         </div>
       )}

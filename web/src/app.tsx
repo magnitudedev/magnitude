@@ -543,7 +543,6 @@ function WorkStatusBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles |
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
   const actors = useDisplayState((state) => state.actors)
   const tasks = useDisplayState((state) => state.tasks)
-  const modelRequestActivity = useDisplayState((state) => state.modelRequests.root ?? null)
   const selectedSessionId = useSelectedSessionId()
   const { pushFork } = useDisplayViewController()
 
@@ -559,7 +558,6 @@ function WorkStatusBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles |
       rootActor={rootActor}
       actors={actors}
       tasks={tasks}
-      modelRequestActivity={modelRequestActivity}
       slotProfiles={slotProfiles}
       onWorkerClick={pushFork}
     />

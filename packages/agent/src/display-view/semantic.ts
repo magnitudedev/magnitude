@@ -3,14 +3,15 @@ import {
   forkIdToKey,
   type DisplayAgent,
   type DisplayActor,
-  type DisplayActorWork,
-  type DisplayActivity,
+  type DisplayRootStatus,
+  type DisplayWorkerStatus,
   type DisplayState,
   type TaskAssignee,
   type TaskDisplayRow,
 } from '@magnitudedev/acn-protocol'
 import { DEFAULT_CHAT_NAME } from '../constants'
-import { rootWorkActivity, type AgentLifecycleState, type AgentInfo } from '../projections/agent-lifecycle'
+import type { AgentLifecycleState, AgentInfo } from '../projections/agent-lifecycle'
+import type { ActiveModelRequests } from '../display/model-request-activity'
 import type { TaskAssignmentRow, TaskAssignmentState, WorkerActivity } from '../projections/task-assignment'
 
 function titleCase(value: string): string {
@@ -19,37 +20,73 @@ function titleCase(value: string): string {
 
 const ROOT_ACTOR_KEY = forkIdToKey(null)
 
-const idleActorWork = (): DisplayActorWork => ({
+const idleActorStatus = (): DisplayWorkerStatus => ({
   phase: 'idle',
   activeSince: null,
   lastWorkMs: 0,
   accumulatedMs: 0,
   resumeCount: 0,
-  activity: null,
-  activeChildCount: 0,
 })
 
-const materializeRootWork = (
+const materializeRootDetail = (
   rootWork: AgentLifecycleState['rootWork'],
-): DisplayActorWork => ({
-  phase: rootWork.phase,
-  activeSince: rootWork.workingStartedAt,
-  lastWorkMs: rootWork.lastChainMs,
-  accumulatedMs: rootWork.accumulatedWorkMs,
-  resumeCount: 0,
-  activity: rootWorkActivity(rootWork),
-  activeChildCount: rootWork.activeChildCount,
-})
+  modelRequests: ActiveModelRequests,
+): Extract<DisplayRootStatus, { readonly _tag: 'Working' }>['detail'] => {
+  if (rootWork._isThinking) return { _tag: 'Thinking' }
+  const request = modelRequests.get(ROOT_ACTOR_KEY)
+  if (
+    request?.phase === 'prefill'
+    && request.turnId === rootWork._currentTurn?.turnId
+  ) {
+    return {
+      _tag: 'Prefill',
+      completedTokens: Math.max(0, Math.floor(request.completedTokens ?? 0)),
+      totalTokens: Math.max(0, Math.floor(request.totalTokens ?? 0)),
+      cachedTokens: Math.max(0, Math.floor(request.cachedTokens ?? 0)),
+    }
+  }
+  if (rootWork._currentTurn !== null && !rootWork._currentTurn.modelActivityStarted) {
+    return {
+      _tag: 'WaitingForModel',
+      turnStartedAt: rootWork._currentTurn.startedAt,
+    }
+  }
+  return { _tag: 'NoDetail' }
+}
+
+const materializeRootStatus = (
+  rootWork: AgentLifecycleState['rootWork'],
+  modelRequests: ActiveModelRequests,
+): DisplayRootStatus => {
+  switch (rootWork.phase) {
+    case 'idle':
+      return { _tag: 'Idle' }
+    case 'active':
+      if (rootWork.chainStartedAt === null) {
+        throw new Error('active root work requires chainStartedAt')
+      }
+      return {
+        _tag: 'Working',
+        chainStartedAt: rootWork.chainStartedAt,
+        detail: materializeRootDetail(rootWork, modelRequests),
+        activeChildCount: rootWork.activeChildCount,
+      }
+    case 'worked':
+      return { _tag: 'Worked', lastProductiveMs: rootWork.lastProductiveMs }
+    case 'interrupted':
+      return { _tag: 'Interrupted', lastProductiveMs: rootWork.lastProductiveMs }
+  }
+}
 
 /**
- * Worker actor work derived from AgentInfo (phase from status + lastIdleReason)
+ * Worker actor status derived from AgentInfo (phase from status + lastIdleReason)
  * and WorkerActivity (timer from TaskAssignmentProjection).
  */
-const deriveWorkerWork = (
+const deriveWorkerStatus = (
   agent: AgentInfo,
   activity: WorkerActivity | undefined,
-): DisplayActorWork => {
-  const phase: DisplayActorWork['phase'] =
+): DisplayWorkerStatus => {
+  const phase: DisplayWorkerStatus['phase'] =
     agent.status === 'working' ? 'working'
     : agent.lastIdleReason === 'interrupt' ? 'interrupted'
     : agent.status === 'idle' ? 'worked'
@@ -65,8 +102,6 @@ const deriveWorkerWork = (
     lastWorkMs: activity?.lastStintMs ?? 0,
     accumulatedMs: activity?.accumulatedMs ?? 0,
     resumeCount: activity?.resumeCount ?? 0,
-    activity: null,
-    activeChildCount: 0,
   }
 }
 
@@ -96,6 +131,7 @@ export const materializeDisplayActors = (
   taskWorker: TaskAssignmentState,
   windowState: { readonly forks: ReadonlyMap<string | null, { readonly tokenEstimate: number }> },
   compactionState: { readonly forks: ReadonlyMap<string | null, { readonly _tag: string }> },
+  modelRequests: ActiveModelRequests,
 ): Record<string, DisplayActor> => {
   const actors: Record<string, DisplayActor> = {
     [ROOT_ACTOR_KEY]: {
@@ -104,7 +140,7 @@ export const materializeDisplayActors = (
       role: 'leader',
       parentActorKey: null,
       taskId: null,
-      work: materializeRootWork(agentStatus.rootWork),
+      status: materializeRootStatus(agentStatus.rootWork, modelRequests),
       context: materializeActorContext(null, windowState, compactionState),
     },
   }
@@ -118,7 +154,7 @@ export const materializeDisplayActors = (
       role: agent.role,
       parentActorKey: forkIdToKey(agent.parentForkId),
       taskId: agent.taskId,
-      work: deriveWorkerWork(agent, activity),
+      status: deriveWorkerStatus(agent, activity),
       context: materializeActorContext(agent.forkId, windowState, compactionState),
     }
   }
@@ -136,7 +172,7 @@ export const materializeDisplayActors = (
       role: row.assignee.role,
       parentActorKey: ROOT_ACTOR_KEY,
       taskId: row.taskId,
-      work: idleActorWork(),
+      status: idleActorStatus(),
       context: materializeActorContext(row.assignee.forkId, windowState, compactionState),
     }
   }

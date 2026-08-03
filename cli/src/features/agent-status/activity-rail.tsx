@@ -1,251 +1,141 @@
 import { memo } from 'react'
 import { Option } from 'effect'
 import { TextAttributes } from '@opentui/core'
-import type {
-  DisplayActorWork,
-  DisplayModelRequestActivity,
-  InterruptedMessage,
-  ModelInstanceId,
-} from '@magnitudedev/sdk'
-import { useTheme } from '../../hooks/use-theme'
+import type { DisplayRootStatus, InterruptedMessage, ModelInstanceId } from '@magnitudedev/sdk'
 import {
+  displayRootStatusElapsedMs,
+  modelReleaseReasonLabel,
+  rootDetailSegments,
   slate,
-  displayActorWorkElapsedMs,
-  displayActorWorkLiveState,
-  modelRequestProgressSegments,
+  useStabilizedRootDetail,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
+import { useTheme } from '../../hooks/use-theme'
 import { red } from '../../utils/theme'
 import { spinnerFrameForTick } from '../../hooks/use-spinner-frame'
 import { useAnimationTick } from '../../hooks/use-animation-tick'
 import { Button } from '../../components/button'
 
-const WORKING_PULSE_COLORS = [
+const ACTIVE_PULSE_COLORS = [
   slate[100], slate[200], slate[300], slate[400], slate[500],
   slate[400], slate[300], slate[200],
 ] as const
 
-// Smooth pulse: 400 → 300 → 400 with computed intermediates
-// slate[400]=#94a3b8  slate[300]=#cbd5e1
-const THINKING_PULSE_COLORS = [
-  slate[400],      // 0%   #94a3b8
-  '#a2b0c3',       // 25%
-  '#b0bccd',       // 50%
-  '#bdc9d7',       // 75%
-  slate[300],      // 100% #cbd5e1 (peak)
-  '#bdc9d7',       // 75%
-  '#b0bccd',       // 50%
-  '#a2b0c3',       // 25%
-] as const
+const LOW_MEMORY_MODEL_STOPPED_MESSAGE =
+  'Model stopped · Low memory - close memory-intensive apps and try again'
 
 interface ActivityRailProps {
-  work: DisplayActorWork | null
+  status: DisplayRootStatus | null
   width: number
   modelLoadActivity: LocalModelLoadActivity | null
   onStopModel: (instanceId: ModelInstanceId) => void
-  modelRequestActivity: DisplayModelRequestActivity | null
   interruptedMessage?: InterruptedMessage | null
-  advisorModelName?: string | null
 }
 
-const REQUEST_VISIBILITY_DELAY_MS = 500
-const LOW_MEMORY_MODEL_STOPPED_MESSAGE =
-  "Model stopped · Low memory - close memory-intensive apps and try again"
-
-function formatElapsed(totalSeconds: number): string {
+function formatElapsed(totalMs: number): string {
+  const totalSeconds = Math.floor(totalMs / 1_000)
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
 }
 
 export const ActivityRail = memo(function ActivityRail({
-  work,
+  status,
   width,
   modelLoadActivity,
   onStopModel,
-  modelRequestActivity,
   interruptedMessage,
-  advisorModelName,
 }: ActivityRailProps) {
   const theme = useTheme()
+  const modelLifecycle = modelLoadActivity === null
+    ? null
+    : Option.getOrThrow(modelLoadActivity.instance).lifecycle
+  const active = status?._tag === 'Working'
+  const stabilizedDetail = useStabilizedRootDetail(status)
+  const modelAnimated = modelLifecycle?._tag === 'Loading' || modelLifecycle?._tag === 'Stopping'
+  const tick = useAnimationTick(modelAnimated || active)
+  const pulseColor = ACTIVE_PULSE_COLORS[Math.floor(tick / 4) % ACTIVE_PULSE_COLORS.length]
 
-  const liveState = work === null ? 'inactive' : displayActorWorkLiveState(work)
-  const active = liveState !== 'inactive'
-  const activity = work?.activity ?? null
-  const hasSpinner = activity?.kind === 'tool' && Option.getOrNull(activity.decorator) === 'spinner'
-  const hasActivity = activity !== null
-  const isAdvisor = activity?.kind === 'advisor'
-  const modelLoadAnimating = modelLoadActivity !== null
-    && Option.exists(
-      modelLoadActivity.instance,
-      ({ lifecycle }) => lifecycle._tag !== "Failed",
-    )
-  const tick = useAnimationTick(
-    modelLoadAnimating
-      || modelRequestActivity !== null
-      || active
-      || isAdvisor,
-  )
-
-  // Derive animation indices from tick (80ms per tick)
-  // Thinking pulse: 250ms → ~3 ticks per step
-  const thinkingPulseIndex = (hasActivity && (active || isAdvisor)) ? Math.floor(tick / 3) % THINKING_PULSE_COLORS.length : 0
-  // Dot pulse: 300ms → ~4 ticks per step
-  const dotPulseIndex = active ? Math.floor(tick / 4) % WORKING_PULSE_COLORS.length : 0
-  // Braille: 80ms → 1 tick per step
-  const activitySpinner = spinnerFrameForTick(hasSpinner && active ? tick : 0)
-  const loadingSpinner = spinnerFrameForTick(tick)
-
-  if (modelLoadActivity !== null) {
+  if (modelLoadActivity !== null && modelLifecycle !== null) {
     const instance = Option.getOrThrow(modelLoadActivity.instance)
-    if (instance.lifecycle._tag === "Failed") {
+    if (
+      modelLifecycle._tag === 'Failed'
+      || modelLifecycle._tag === 'Stopped' && modelLifecycle.reason === 'memory_pressure'
+    ) {
       return (
         <box style={{ height: 1, flexShrink: 0 }}>
-          <text style={{ fg: theme.warning }}>{LOW_MEMORY_MODEL_STOPPED_MESSAGE}</text>
-        </box>
-      )
-    }
-    if (instance.lifecycle._tag === "Stopping") {
-      return (
-        <box style={{ height: 1, flexShrink: 0 }}>
-          <text>
-            <span style={{ fg: theme.muted }}>{loadingSpinner}</span>
-            {' '}
-            <span style={{ fg: theme.muted }}>Stopping model…</span>
+          <text style={{ fg: theme.warning }}>
+            <span style={{ fg: red[400] }}>■</span>
+            {` ${LOW_MEMORY_MODEL_STOPPED_MESSAGE}`}
           </text>
         </box>
       )
     }
-    return (
-      <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
-        <text>
-          <span style={{ fg: theme.primary }}>{loadingSpinner}</span>
-          {' '}
-          <span style={{ fg: theme.foreground }}>Loading model into memory</span>
-          <span style={{ fg: theme.muted }}>{` · ${Math.round(
-            Option.getOrElse(instance.lifecycle._tag === "Loading"
-              ? instance.lifecycle.progress
-              : Option.none(), () => 0) * 100,
-          )}%`}</span>
-        </text>
-        <Button onClick={() => onStopModel(instance.id)}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{'  Stop'}</text>
-        </Button>
-      </box>
-    )
-  }
-
-  if (modelRequestActivity !== null) {
-    if (Date.now() - modelRequestActivity.startedAt < REQUEST_VISIBILITY_DELAY_MS) {
-      return <box style={{ height: 1, flexShrink: 0 }} />
+    if (modelLifecycle._tag === 'Stopping') {
+      return (
+        <box style={{ height: 1, flexShrink: 0 }}>
+          <text>
+            <span style={{ fg: pulseColor }}>■</span>
+            {' '}
+            <span style={{ fg: theme.foreground }}>Stopping model</span>
+            <span style={{ fg: theme.muted }}>{` · ${modelReleaseReasonLabel(modelLifecycle.reason)}`}</span>
+          </text>
+        </box>
+      )
     }
-    const progress = modelRequestProgressSegments(modelRequestActivity)
-    const compactLabel = width < 60
-      && progress.label === 'Loading conversation into the model'
-      ? 'Loading conversation'
-      : progress.label
+    if (modelLifecycle._tag === 'Loading') {
+      const percentage = Math.min(100, Math.max(0, Math.round(
+        Option.getOrElse(modelLifecycle.progress, () => 0) * 100,
+      )))
+      return (
+        <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
+          <text>
+            <span style={{ fg: theme.primary }}>{spinnerFrameForTick(tick)}</span>
+            {' '}
+            <span style={{ fg: theme.foreground }}>Loading model</span>
+            <span style={{ fg: theme.muted }}>{` · ${percentage}%`}</span>
+          </text>
+          <Button onClick={() => onStopModel(instance.id)}>
+            <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{' · Stop'}</text>
+          </Button>
+        </box>
+      )
+    }
+  }
+
+  if (status?._tag === 'Working' && stabilizedDetail !== null) {
+    const detail = rootDetailSegments(stabilizedDetail)
+    const elapsed = formatElapsed(displayRootStatusElapsedMs(status, Date.now()))
     return (
       <box style={{ height: 1, flexShrink: 0 }}>
         <text>
-          <span style={{ fg: theme.primary }}>{loadingSpinner}</span>
+          <span style={{ fg: pulseColor }}>●</span>
           {' '}
-          <span style={{ fg: theme.foreground }}>{compactLabel}</span>
-          {progress.detail && (
-            <span style={{ fg: theme.muted }}>{` · ${progress.detail}`}</span>
+          <span style={{ fg: theme.foreground }}>Working</span>
+          <span style={{ fg: theme.muted }}>{` · ${elapsed}`}</span>
+          {detail.keyword !== null && (
+            <>
+              <span style={{ fg: theme.muted }}>{' · '}</span>
+              <span style={{ fg: pulseColor }}>{detail.keyword}</span>
+            </>
           )}
-          {progress.trailing && width >= 72 && (
-            <span style={{ fg: theme.muted }}>{` · ${progress.trailing}`}</span>
+          {detail.detail !== null && (
+            <span style={{ fg: theme.muted }}>{` · ${detail.detail}`}</span>
+          )}
+          {detail.trailing !== null && width >= 72 && (
+            <span style={{ fg: theme.muted }}>{` · ${detail.trailing}`}</span>
           )}
         </text>
       </box>
     )
   }
 
-  if (liveState === 'waiting_for_model' && work !== null) {
-    const worked = work.accumulatedMs > 0
-      ? ` · ${formatElapsed(Math.floor(work.accumulatedMs / 1000))} worked`
-      : ''
-    return (
-      <box style={{ height: 1, flexShrink: 0 }}>
-        <text>
-          <span style={{ fg: theme.primary }}>{loadingSpinner}</span>
-          {' '}
-          <span style={{ fg: theme.foreground }}>Waiting for model</span>
-          {worked && <span style={{ fg: theme.muted }}>{worked}</span>}
-        </text>
-      </box>
-    )
-  }
-
-  // Active: show running timer
-  if (active && work !== null) {
-    const responseElapsedMs = displayActorWorkElapsedMs(work, Date.now())
-    const responseElapsedSeconds = Math.floor(responseElapsedMs / 1000)
-    return (
-      <box style={{ height: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.muted }}>
-          <span style={{ fg: isAdvisor ? slate[600] : WORKING_PULSE_COLORS[dotPulseIndex] }}>{'●'}</span>
-          {` Working... ${formatElapsed(responseElapsedSeconds)}`}
-          {work.activeChildCount > 0 && (
-            <>
-              {' · '}
-              {`${work.activeChildCount} worker${work.activeChildCount === 1 ? '' : 's'} running`}
-            </>
-          )}
-          {hasSpinner && (
-            <>
-              {' · '}
-              <span style={{ fg: theme.muted }}>{activitySpinner}</span>
-              {' '}
-              {activity!.kind === 'tool' && activity.message}
-            </>
-          )}
-          {isAdvisor && (
-            <>
-              {' · '}
-              <span style={{ fg: THINKING_PULSE_COLORS[thinkingPulseIndex] }}>
-                {activity!.message}{advisorModelName ? ` (${advisorModelName})` : ''}
-              </span>
-            </>
-          )}
-          {hasActivity && !hasSpinner && !isAdvisor && (
-            <>
-              {' · '}
-              <span style={{ fg: THINKING_PULSE_COLORS[thinkingPulseIndex] }}>
-                {activity!.message}
-              </span>
-            </>
-          )}
-        </text>
-      </box>
-    )
-  }
-
-  // Chain inactive but activity present — show activity standalone (takes priority over completed/interrupted)
-  if (!active && hasActivity) {
-    return (
-      <box style={{ height: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.muted }}>
-          <span style={{ fg: isAdvisor ? theme.muted : THINKING_PULSE_COLORS[thinkingPulseIndex] }}>{'●'}</span>
-          {' '}
-          <span style={{ fg: THINKING_PULSE_COLORS[thinkingPulseIndex] }}>
-            {activity!.message}{isAdvisor && advisorModelName ? ` (${advisorModelName})` : ''}
-          </span>
-        </text>
-      </box>
-    )
-  }
-
-  // Interrupted state: show interrupt text in place of the work summary
   if (interruptedMessage) {
-    let interruptText: string
-    if (interruptedMessage.context === 'fork') {
-      interruptText = '■ Agent stopped'
-    } else if (interruptedMessage.allKilled) {
-      interruptText = '■ All agents interrupted. What would you like to do?'
-    } else {
-      interruptText = '■ Lead interrupted. What would you like to do?'
-    }
+    const interruptText = interruptedMessage.context === 'fork'
+      ? '■ Agent stopped'
+      : interruptedMessage.allKilled
+        ? '■ All agents interrupted. What would you like to do?'
+        : '■ Lead interrupted. What would you like to do?'
     return (
       <box style={{ height: 1, flexShrink: 0 }}>
         <text style={{ fg: red[400] }}>{interruptText}</text>

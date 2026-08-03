@@ -10,7 +10,8 @@ import { outcomeWillChainContinue } from '../events'
 import type { AppEvent } from '../events'
 import { ROLE_IDS, type RoleId } from '../agents/role-validation'
 import { Option, Schema } from 'effect'
-import { DisplayActivity, type WorkSummaryPerformance } from '@magnitudedev/acn-protocol'
+import type { WorkSummaryPerformance } from '@magnitudedev/acn-protocol'
+import { ModelRequestActivityAmbient } from '../model/model-request-activity'
 
 export const AgentLifecycleSchema = Schema.Literal('working', 'idle', 'killed')
 export type AgentLifecycleStatus = typeof AgentLifecycleSchema.Type
@@ -43,18 +44,24 @@ const RootGenerationAggregateSchema = Schema.Struct({
 })
 type RootGenerationAggregate = typeof RootGenerationAggregateSchema.Type
 
+const RootCurrentTurnSchema = Schema.Struct({
+  turnId: Schema.String,
+  startedAt: Schema.Number,
+  modelActivityStarted: Schema.Boolean,
+})
+
 const RootWorkStateSchema = Schema.Struct({
-  phase: Schema.Literal('idle', 'waiting_for_model', 'working', 'waiting_for_workers', 'worked', 'interrupted'),
-  accumulatedWorkMs: Schema.Number,
-  workingStartedAt: Schema.NullOr(Schema.Number),
-  lastChainMs: Schema.Number,
+  phase: Schema.Literal('idle', 'active', 'worked', 'interrupted'),
+  accumulatedProductiveMs: Schema.Number,
+  productiveStartedAt: Schema.NullOr(Schema.Number),
+  lastProductiveMs: Schema.Number,
+  chainStartedAt: Schema.NullOr(Schema.Number),
   activeChildCount: Schema.Number,
-  _currentTurnId: Schema.NullOr(Schema.String),
+  _currentTurn: Schema.NullOr(RootCurrentTurnSchema),
   _currentChainId: Schema.optionalWith(Schema.NullOr(Schema.String), {
     default: () => null,
   }),
-  _thinkingCharCount: Schema.NullOr(Schema.Number),
-  _activeToolKey: Schema.NullOr(Schema.String),
+  _isThinking: Schema.Boolean,
   _generation: Schema.optionalWith(Schema.NullOr(RootGenerationAggregateSchema), {
     default: () => null,
   }),
@@ -137,58 +144,37 @@ export interface RootWorkCompletedSignal {
 
 // --- Root work helpers ---
 
-const STATUS_TOOL_ACTIVITIES: Partial<Record<string, DisplayActivity>> = {
-  messageAdvisor: { kind: 'advisor', message: 'Asking advisor' },
-  messageWorker: { kind: 'tool', message: 'Steering worker', decorator: Option.none() },
-}
-
-function thinkingMessage(charCount: number): string {
-  if (charCount >= 2800) return 'Thinking very hard'
-  if (charCount >= 1200) return 'Thinking hard'
-  return 'Thinking'
-}
-
-export function rootWorkActivity(work: AgentLifecycleState['rootWork']): DisplayActivity | null {
-  if (work._activeToolKey) {
-    const toolKey = work._activeToolKey
-    const statusTool = STATUS_TOOL_ACTIVITIES[toolKey]
-    if (statusTool) return statusTool
-    if (toolKey === 'spawnWorker') {
-      return { kind: 'tool', message: 'Starting worker', decorator: Option.some('spinner') }
-    }
-  }
-  if (work._thinkingCharCount !== null) {
-    return { kind: 'thinking', message: thinkingMessage(work._thinkingCharCount) }
-  }
-  return null
-}
-
 export function isRootWorkActive(state: RootWorkState): boolean {
-  return state.phase === 'waiting_for_model'
-    || state.phase === 'working'
-    || state.phase === 'waiting_for_workers'
+  return state.phase === 'active'
 }
 
-function isRootWorkClockRunning(state: RootWorkState): boolean {
-  return isRootWorkActive(state) && state.workingStartedAt !== null
+function isRootProductiveClockRunning(state: RootWorkState): boolean {
+  return isRootWorkActive(state) && state.productiveStartedAt !== null
 }
 
-function accumulatedRootWorkMs(state: RootWorkState, timestamp: number): number {
-  return isRootWorkClockRunning(state) && state.workingStartedAt !== null
-    ? state.accumulatedWorkMs + Math.max(0, timestamp - state.workingStartedAt)
-    : state.accumulatedWorkMs
+function accumulatedRootProductiveMs(state: RootWorkState, timestamp: number): number {
+  return isRootProductiveClockRunning(state) && state.productiveStartedAt !== null
+    ? state.accumulatedProductiveMs + Math.max(0, timestamp - state.productiveStartedAt)
+    : state.accumulatedProductiveMs
 }
 
-function startRootTurn(state: RootWorkState, timestamp: number, chainId: string): RootWorkState {
+function startRootTurn(
+  state: RootWorkState,
+  timestamp: number,
+  chainId: string,
+  turnId: string,
+): RootWorkState {
   const isNewChain = !isRootWorkActive(state) || state._currentChainId !== chainId
   return {
     ...state,
-    phase: 'waiting_for_model',
-    accumulatedWorkMs: isNewChain ? 0 : state.accumulatedWorkMs,
-    workingStartedAt: isNewChain
+    phase: 'active',
+    accumulatedProductiveMs: isNewChain ? 0 : state.accumulatedProductiveMs,
+    productiveStartedAt: isNewChain
       ? (state.activeChildCount > 0 ? timestamp : null)
-      : state.workingStartedAt,
-    _thinkingCharCount: null,
+      : state.productiveStartedAt,
+    chainStartedAt: isNewChain ? timestamp : state.chainStartedAt,
+    _currentTurn: { turnId, startedAt: timestamp, modelActivityStarted: false },
+    _isThinking: false,
     _generation: isNewChain ? null : state._generation,
   }
 }
@@ -240,9 +226,17 @@ function startRootGeneration(state: RootWorkState, timestamp: number): RootWorkS
   if (!isRootWorkActive(state)) return state
   return {
     ...state,
-    phase: 'working',
-    workingStartedAt: state.workingStartedAt ?? timestamp,
+    productiveStartedAt: state.productiveStartedAt ?? timestamp,
   }
+}
+
+function markRootModelActivityStarted(state: RootWorkState): RootWorkState {
+  return state._currentTurn === null || state._currentTurn.modelActivityStarted
+    ? state
+    : {
+        ...state,
+        _currentTurn: { ...state._currentTurn, modelActivityStarted: true },
+      }
 }
 
 function pauseRootForModel(state: RootWorkState, timestamp: number): RootWorkState {
@@ -250,23 +244,21 @@ function pauseRootForModel(state: RootWorkState, timestamp: number): RootWorkSta
   const workersRemainActive = state.activeChildCount > 0
   return {
     ...state,
-    phase: 'waiting_for_model',
-    accumulatedWorkMs: workersRemainActive
-      ? state.accumulatedWorkMs
-      : accumulatedRootWorkMs(state, timestamp),
-    workingStartedAt: workersRemainActive
-      ? (state.workingStartedAt ?? timestamp)
+    accumulatedProductiveMs: workersRemainActive
+      ? state.accumulatedProductiveMs
+      : accumulatedRootProductiveMs(state, timestamp),
+    productiveStartedAt: workersRemainActive
+      ? (state.productiveStartedAt ?? timestamp)
       : null,
-    _thinkingCharCount: null,
-    _activeToolKey: null,
+    _isThinking: false,
   }
 }
 
 function waitForRootWorkers(state: RootWorkState, timestamp: number): RootWorkState {
   if (!isRootWorkActive(state)) return state
-  return isRootWorkClockRunning(state)
-    ? { ...state, phase: 'waiting_for_workers' }
-    : { ...state, phase: 'waiting_for_workers', workingStartedAt: timestamp }
+  return isRootProductiveClockRunning(state)
+    ? { ...state, _isThinking: false }
+    : { ...state, productiveStartedAt: timestamp, _isThinking: false }
 }
 
 function stopRootWork(
@@ -277,18 +269,18 @@ function stopRootWork(
   readonly state: RootWorkState
   readonly completion: RootWorkCompletedSignal | null
 } {
-  const chainMs = accumulatedRootWorkMs(state, timestamp)
+  const productiveMs = accumulatedRootProductiveMs(state, timestamp)
   return {
     state: {
       ...state,
       phase,
-      accumulatedWorkMs: 0,
-      workingStartedAt: null,
-      lastChainMs: chainMs,
-      _currentTurnId: null,
+      accumulatedProductiveMs: 0,
+      productiveStartedAt: null,
+      lastProductiveMs: productiveMs,
+      chainStartedAt: null,
+      _currentTurn: null,
       _currentChainId: null,
-      _thinkingCharCount: null,
-      _activeToolKey: null,
+      _isThinking: false,
       _generation: null,
     },
     completion: !isRootWorkActive(state) || state._currentChainId === null
@@ -296,7 +288,7 @@ function stopRootWork(
       : {
           chainId: state._currentChainId,
           completedAt: timestamp,
-          durationMs: chainMs,
+          durationMs: productiveMs,
           phase,
           performance: summarizeGeneration(state._generation),
         },
@@ -366,18 +358,18 @@ function anyAgentInterrupted(state: AgentLifecycleState): boolean {
 function updateChildCount(state: AgentLifecycleState, timestamp: number): AgentLifecycleState {
   const childCount = countWorkingChildren(state, null)
   const rootWork = state.rootWork
-  const shouldClockFollowWorkers = rootWork.phase === 'waiting_for_model'
-    || rootWork.phase === 'waiting_for_workers'
+  const shouldClockFollowWorkers = isRootWorkActive(rootWork)
+    && rootWork._currentTurn === null
   const nextRootWork = shouldClockFollowWorkers
     ? childCount > 0
       ? {
           ...rootWork,
-          workingStartedAt: rootWork.workingStartedAt ?? timestamp,
+          productiveStartedAt: rootWork.productiveStartedAt ?? timestamp,
         }
       : {
           ...rootWork,
-          accumulatedWorkMs: accumulatedRootWorkMs(rootWork, timestamp),
-          workingStartedAt: null,
+          accumulatedProductiveMs: accumulatedRootProductiveMs(rootWork, timestamp),
+          productiveStartedAt: null,
         }
     : rootWork
   return {
@@ -398,7 +390,7 @@ function maybeDeferCloseRootWork(
   readonly completion: RootWorkCompletedSignal | null
 } {
   if (!isRootWorkActive(state.rootWork)) return { state, completion: null }
-  if (state.rootWork._currentTurnId !== null) return { state, completion: null }
+  if (state.rootWork._currentTurn !== null) return { state, completion: null }
   if (countWorkingChildren(state, null) > 0) return { state, completion: null }
   const phase = anyAgentInterrupted(state) ? 'interrupted' : 'worked'
   const stopped = stopRootWork(state.rootWork, timestamp, phase)
@@ -411,20 +403,21 @@ function maybeDeferCloseRootWork(
 export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
   name: 'AgentLifecycle',
   state: AgentLifecycleStateSchema,
+  ambients: [ModelRequestActivityAmbient] as const,
 
   initial: {
     agents: new Map<string, AgentInfo>(),
     agentByForkId: new Map<string, string>(),
     rootWork: {
       phase: 'idle',
-      accumulatedWorkMs: 0,
-      workingStartedAt: null,
-      lastChainMs: 0,
+      accumulatedProductiveMs: 0,
+      productiveStartedAt: null,
+      lastProductiveMs: 0,
+      chainStartedAt: null,
       activeChildCount: 0,
-      _currentTurnId: null,
+      _currentTurn: null,
       _currentChainId: null,
-      _thinkingCharCount: null,
-      _activeToolKey: null,
+      _isThinking: false,
       _generation: null,
     },
   },
@@ -495,13 +488,13 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
     turn_started: ({ event, state, emit }) => {
       if (event.forkId === null) {
-        // Root turn starting — active response, but the work clock remains
-        // paused until generation begins.
+        // Root turn starting — the live chain clock begins immediately; the
+        // separate productive clock remains paused until generation begins.
         const isNewChain = !isRootWorkActive(state.rootWork)
           || state.rootWork._currentChainId !== event.chainId
         let next: AgentLifecycleState = {
           ...state,
-          rootWork: startRootTurn(state.rootWork, event.timestamp, event.chainId),
+          rootWork: startRootTurn(state.rootWork, event.timestamp, event.chainId, event.turnId),
         }
         // Clear stale lastIdleReason on idle agents when a new chain begins,
         // so deferred close doesn't pick up interrupt reasons from previous chains
@@ -514,14 +507,7 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
           }
           next = { ...next, agents }
         }
-        next = {
-          ...next,
-          rootWork: {
-            ...next.rootWork,
-            _currentTurnId: event.turnId,
-            _currentChainId: event.chainId,
-          },
-        }
+        next = { ...next, rootWork: { ...next.rootWork, _currentChainId: event.chainId } }
         return next
       }
 
@@ -553,18 +539,18 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
     model_generation_started: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (state.rootWork._currentTurnId !== event.turnId) return state
+      if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
       if (state.rootWork._currentChainId !== event.chainId) return state
       return {
         ...state,
-        rootWork: startRootGeneration(state.rootWork, event.timestamp),
+        rootWork: markRootModelActivityStarted(startRootGeneration(state.rootWork, event.timestamp)),
       }
     },
 
     turn_outcome: ({ event, state, emit }) => {
       if (event.forkId === null) {
         // Root turn ending — turn-aware close
-        if (state.rootWork._currentTurnId !== event.turnId) return state
+        if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
         const nextState = {
           ...state,
           rootWork: recordRootGeneration(state.rootWork, event),
@@ -576,7 +562,7 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
             ...nextState,
             rootWork: {
               ...pauseRootForModel(nextState.rootWork, event.timestamp),
-              _currentTurnId: null,
+              _currentTurn: null,
             },
           }
         }
@@ -587,7 +573,7 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
             ...nextState,
             rootWork: {
               ...waitForRootWorkers(nextState.rootWork, event.timestamp),
-              _currentTurnId: null,
+              _currentTurn: null,
             },
           }
         }
@@ -770,84 +756,92 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
 
     thinking_start: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (state.rootWork._currentTurnId !== event.turnId) return state
+      if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
       return {
         ...state,
         rootWork: {
-          ...startRootGeneration(state.rootWork, event.timestamp),
-          _thinkingCharCount: 0,
+          ...markRootModelActivityStarted(startRootGeneration(state.rootWork, event.timestamp)),
+          _isThinking: true,
         },
       }
     },
 
     message_start: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (state.rootWork._currentTurnId !== event.turnId) return state
+      if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
       return {
         ...state,
         rootWork: {
-          ...startRootGeneration(state.rootWork, event.timestamp),
-          _thinkingCharCount: null,
+          ...markRootModelActivityStarted(startRootGeneration(state.rootWork, event.timestamp)),
+          _isThinking: false,
         },
       }
     },
 
     message_chunk: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (state.rootWork._currentTurnId !== event.turnId) return state
-      if (state.rootWork._thinkingCharCount === null) return state
+      if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
       return {
         ...state,
-        rootWork: { ...state.rootWork, _thinkingCharCount: null },
+        rootWork: {
+          ...markRootModelActivityStarted(startRootGeneration(state.rootWork, event.timestamp)),
+          _isThinking: false,
+        },
       }
     },
 
-    thinking_chunk: ({ event, state }) => {
+    message_end: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (state.rootWork._currentTurnId !== event.turnId) return state
-      const nextCount = (state.rootWork._thinkingCharCount ?? 0) + event.text.length
-      return { ...state, rootWork: { ...state.rootWork, _thinkingCharCount: nextCount } }
+      if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
+      return {
+        ...state,
+        rootWork: { ...state.rootWork, _isThinking: false },
+      }
     },
 
     thinking_end: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (state.rootWork._currentTurnId !== event.turnId) return state
+      if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
       return {
         ...state,
-        rootWork: { ...state.rootWork, _thinkingCharCount: null },
+        rootWork: { ...state.rootWork, _isThinking: false },
       }
     },
 
     tool_event: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (state.rootWork._currentTurnId !== event.turnId) return state
+      if (state.rootWork._currentTurn?.turnId !== event.turnId) return state
 
       switch (event.event._tag) {
         case 'ToolInputStarted': {
-          const toolKey = event.toolKey
-          const statusTool = STATUS_TOOL_ACTIVITIES[toolKey]
-          const activeToolKey = statusTool || toolKey === 'spawnWorker' ? toolKey : null
           return {
             ...state,
             rootWork: {
-              ...startRootGeneration(state.rootWork, event.timestamp),
-              _activeToolKey: activeToolKey,
-              _thinkingCharCount: null,
+              ...markRootModelActivityStarted(startRootGeneration(state.rootWork, event.timestamp)),
+              _isThinking: false,
             },
           }
         }
         case 'ToolExecutionEnded':
-        case 'ToolInputRejected': {
-          if (state.rootWork._activeToolKey !== event.toolKey) return state
-          return {
-            ...state,
-            rootWork: { ...state.rootWork, _activeToolKey: null },
-          }
-        }
+        case 'ToolInputRejected':
+          return state
         default:
           return state
       }
     },
   },
+
+  ambientHandlers: (on) => [
+    on(ModelRequestActivityAmbient, ({ value, state }) => {
+      if (value === null || value.turn.forkId !== null) return state
+      if (value.turn.turnId !== state.rootWork._currentTurn?.turnId) return state
+      if (value.turn.chainId !== state.rootWork._currentChainId) return state
+      if (value.progress.phase !== 'prefill' && value.progress.phase !== 'generating') {
+        return state
+      }
+      const rootWork = markRootModelActivityStarted(state.rootWork)
+      return rootWork === state.rootWork ? state : { ...state, rootWork }
+    }),
+  ],
 
 }))

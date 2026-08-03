@@ -189,7 +189,7 @@ function getWorkerPresentation(
     case 'actor': {
       const actor = actors[assignee.actorKey]
       const isKilling = assignee.taskState === 'killing'
-      const isWorking = actor?.work.phase === 'working'
+      const isWorking = actor?.kind === 'worker' && actor.status.phase === 'working'
       const labelBaseColor = isKilling ? red[500] : theme.foreground
       const labelColor = hovered && actor?.kind === 'worker' ? theme.primary : labelBaseColor
 
@@ -258,13 +258,13 @@ function TaskRow({
   const workerLabel = getAssigneeLabel(task.assignee, actors)
   const actor = task.assignee.kind === 'actor' ? actors[task.assignee.actorKey] : null
   const workerTimerState = (() => {
-    if (!actor || task.assignee.kind !== 'actor' || task.assignee.taskState === 'killing') return null
-    const work = actor.work
+    if (actor?.kind !== 'worker' || task.assignee.kind !== 'actor' || task.assignee.taskState === 'killing') return null
+    const status = actor.status
     return {
-      state: work.phase === 'working' ? 'working' as const : 'idle' as const,
-      activeSince: work.phase === 'working' ? work.activeSince : null,
-      accumulatedActiveMs: work.accumulatedMs,
-      resumeCount: work.resumeCount,
+      state: status.phase === 'working' ? 'working' as const : 'idle' as const,
+      activeSince: status.phase === 'working' ? status.activeSince : null,
+      accumulatedActiveMs: status.accumulatedMs,
+      resumeCount: status.resumeCount,
     }
   })()
   const workerTimer = workerTimerState && workerPresentation?.showTimer
@@ -378,11 +378,12 @@ export function TaskList({
   const rootSummaries = useMemo(() => buildRootSummaries(realTasksOnly), [realTasksOnly])
 
   const needsFastTick = useMemo(
-    () => visibleAllTasks.some(task => (
-      task.assignee.kind === 'worker'
-        || (task.assignee.kind === 'actor'
-          && actors[task.assignee.actorKey]?.work.phase === 'working')
-    )),
+    () => visibleAllTasks.some((task) => {
+      if (task.assignee.kind === 'worker') return true
+      if (task.assignee.kind !== 'actor') return false
+      const actor = actors[task.assignee.actorKey]
+      return actor?.kind === 'worker' && actor.status.phase === 'working'
+    }),
     [actors, visibleAllTasks]
   )
 

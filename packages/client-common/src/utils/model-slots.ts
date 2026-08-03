@@ -4,6 +4,7 @@ import {
   ProviderModelCatalogLifecycle,
   type ModelInstanceAllocation,
   type ModelInstanceId,
+  type ModelReleaseReason,
   type ModelSlot,
   type LocalModelCatalogCandidate,
   type LocalModelsState,
@@ -34,6 +35,15 @@ export interface SelectedSlotModel {
 export const formatModelLoadProgress = (percentage: number): string =>
   `Loading model into memory · ${percentage}%`
 
+export function modelReleaseReasonLabel(reason: ModelReleaseReason): string {
+  switch (reason) {
+    case "user_stop": return "User requested"
+    case "idle_timeout": return "Idle timeout"
+    case "replacement": return "Model replacement"
+    case "memory_pressure": return "Low memory"
+  }
+}
+
 export function deriveLocalModelLoadActivity(
   slots: ModelSlotsState,
   slotId: SlotId,
@@ -43,6 +53,7 @@ export function deriveLocalModelLoadActivity(
   const lifecycle = slot.instance.value.lifecycle
   return lifecycle._tag === "Loading"
     || lifecycle._tag === "Stopping"
+    || lifecycle._tag === "Stopped" && lifecycle.reason === "memory_pressure"
     || lifecycle._tag === "Failed" && lifecycle.failure.code === "low_memory"
     ? slot
     : null

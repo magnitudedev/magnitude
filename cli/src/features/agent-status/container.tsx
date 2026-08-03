@@ -8,14 +8,12 @@ import { useMemo, type ReactNode } from 'react'
 import {
   useDisplayState,
   getFork,
-  useSlotProfiles,
   useDisplayViewController,
-  findSlotProfile,
-  isDisplayActorWorkActive,
+  useSlotProfiles,
+  isDisplayRootStatusActive,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
-import { PRIMARY_SLOT_ID, ROLE_TO_SLOT, SECONDARY_SLOT_ID, type ModelInstanceId } from '@magnitudedev/sdk'
-import { Option } from 'effect'
+import { type ModelInstanceId } from '@magnitudedev/sdk'
 import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
 import { ActivityRail } from './activity-rail'
 import { ActivityRailSlot } from './activity-rail-slot'
@@ -36,10 +34,6 @@ export function ActivityRailContainer({
   const theme = useTheme()
   const timeline = useDisplayState((state) => getFork(state, null) ?? null)
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
-  const modelRequestActivity = useDisplayState(
-    (state) => state.modelRequests.root ?? null,
-  )
-  const { profiles } = useSlotProfiles()
 
   const interrupted: InterruptedMessage | null = useMemo(() => {
     // Root interrupt from timeline statusSlot
@@ -53,33 +47,25 @@ export function ActivityRailContainer({
     return null
   }, [timeline])
 
-  // Map advisor role to its slot (primary) for model display
-  const advisorSlot = ROLE_TO_SLOT.advisor
-  const advisorSlotId = advisorSlot === 'primary' ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
-  const advisorProfile = profiles
-    ? Option.getOrNull(findSlotProfile(profiles, advisorSlotId))
-    : null
   const slotWidth = Math.max(0, width - 3)
   const activityWidth = Math.max(0, slotWidth - 3)
 
-  const hasWork = agentActivityEnabled && rootActor !== null
-    && (isDisplayActorWorkActive(rootActor.work) || rootActor.work.activity !== null)
-  const visibleModelRequestActivity = agentActivityEnabled ? modelRequestActivity : null
+  const rootStatus = rootActor?.kind === 'root' ? rootActor.status : null
+  const hasWork = agentActivityEnabled && rootStatus !== null
+    && isDisplayRootStatusActive(rootStatus)
   const visibleInterrupted = agentActivityEnabled ? interrupted : null
-  if (!hasWork && modelLoadActivity === null && visibleModelRequestActivity === null && visibleInterrupted === null) {
+  if (!hasWork && modelLoadActivity === null && visibleInterrupted === null) {
     return null
   }
 
   return (
     <ActivityRailSlot width={slotWidth} color={theme.modeDefault}>
       <ActivityRail
-        work={agentActivityEnabled ? rootActor?.work ?? null : null}
+        status={agentActivityEnabled ? rootStatus : null}
         width={activityWidth}
         modelLoadActivity={modelLoadActivity}
         onStopModel={onStopModel}
-        modelRequestActivity={visibleModelRequestActivity}
         interruptedMessage={visibleInterrupted}
-        advisorModelName={advisorProfile?.modelDisplayName ?? null}
       />
     </ActivityRailSlot>
   )

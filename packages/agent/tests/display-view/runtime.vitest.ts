@@ -185,7 +185,6 @@ describe('display view runtime', () => {
       yield* Queue.take(queue)
       yield* ambient.update(ModelRequestActivityAmbient, {
         turn: { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
-        observedAt: 1_000,
         progress: {
           phase: 'prefill',
           requestId: 'request-1',
@@ -195,17 +194,18 @@ describe('display view runtime', () => {
         },
       })
       let active = yield* Queue.take(queue)
-      while (!active.state.modelRequests.root) {
+      while (active.state.actors.root?.status._tag !== 'Working'
+        || active.state.actors.root.status.detail._tag !== 'Prefill') {
         active = yield* Queue.take(queue)
       }
 
       yield* ambient.update(ModelRequestActivityAmbient, {
         turn: { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
-        observedAt: 2_000,
         progress: { phase: 'generating', requestId: 'request-1' },
       })
       let cleared = yield* Queue.take(queue)
-      while (cleared.state.modelRequests.root) {
+      while (cleared.state.actors.root?.status._tag !== 'Working'
+        || cleared.state.actors.root.status.detail._tag === 'Prefill') {
         cleared = yield* Queue.take(queue)
       }
 
@@ -217,15 +217,18 @@ describe('display view runtime', () => {
       Effect.orDie,
     ))
 
-    expect(snapshots[0].state.modelRequests.root).toMatchObject({
-      requestId: 'request-1',
-      phase: 'prefill',
+    expect(snapshots[0].state.actors.root?.status).toMatchObject({
+      _tag: 'Working',
+      detail: {
+        _tag: 'Prefill',
+        completedTokens: 14_020,
+        totalTokens: 14_300,
+        cachedTokens: 13_200,
+      },
     })
-    expect(snapshots[1].state.modelRequests.root).toBeUndefined()
-    expect(snapshots[1].state.actors.root?.work).toMatchObject({
-      phase: 'waiting_for_model',
-      activeSince: null,
-      accumulatedMs: 0,
+    expect(snapshots[1].state.actors.root?.status).toMatchObject({
+      _tag: 'Working',
+      detail: { _tag: 'NoDetail' },
     })
   })
 

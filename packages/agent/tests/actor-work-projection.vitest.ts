@@ -20,7 +20,6 @@ import { TurnProjection } from '../src/projections/turn'
 import { AgentRoutingProjection } from '../src/projections/agent-routing'
 import {
   AgentLifecycleProjection,
-  rootWorkActivity,
   type AgentLifecycleState,
 } from '../src/projections/agent-lifecycle'
 import { GoalProjection } from '../src/projections/goal'
@@ -138,7 +137,7 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
       { type: 'agent_created', timestamp: ts(3), forkId: 'worker-a', parentForkId: null, agentId: 'agent-worker-a', name: 'Worker A', role: 'engineer', context: 'worker context', mode: 'spawn', taskId: 'task-worker-a', message: 'starting work' } as AppEvent,
     ])
 
-    expect(rootWork(state).phase).toBe('working')
+    expect(rootWork(state).phase).toBe('active')
     expect(rootWork(state).activeChildCount).toBe(1)
   })
 
@@ -150,7 +149,7 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
     ])
 
     expect(rootWork(state).phase).toBe('worked')
-    expect(rootWork(state).lastChainMs).toBe(ts(4) - ts(2))
+    expect(rootWork(state).lastProductiveMs).toBe(ts(4) - ts(2))
   })
 
   it('root work stays working when root turn ends but workers still running (deferred close)', async () => {
@@ -163,7 +162,7 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
     ])
 
     // Root turn ended but worker still running — root remains active and counts worker time.
-    expect(rootWork(state).phase).toBe('waiting_for_workers')
+    expect(rootWork(state).phase).toBe('active')
   })
 
   it('root work closes (worked) when last worker goes idle after root turn already ended', async () => {
@@ -187,7 +186,7 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
     ])
 
     expect(rootWork(state).phase).toBe('interrupted')
-    expect(rootWork(state).lastChainMs).toBe(0)
+    expect(rootWork(state).lastProductiveMs).toBe(0)
   })
 
   it('does not count model wait before generation', async () => {
@@ -197,7 +196,7 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
       rootTurnOutcome('root-turn-1', ts(151)),
     ])
 
-    expect(rootWork(state).lastChainMs).toBe(50)
+    expect(rootWork(state).lastProductiveMs).toBe(50)
   })
 
   it('chain timer resets each chain', async () => {
@@ -211,9 +210,9 @@ describe('AgentLifecycleProjection rootWork — worker lifecycle', () => {
     ])
 
     // Chain 1 excludes 20ms of prefill. Chain 2 has no prefill delay.
-    // lastChainMs should be chain 2 duration (50ms), not accumulated (150ms).
+    // The durable productive summary is for chain 2 (50ms), not accumulated (150ms).
     expect(rootWork(state).phase).toBe('worked')
-    expect(rootWork(state).lastChainMs).toBe(50)
+    expect(rootWork(state).lastProductiveMs).toBe(50)
   })
 })
 
@@ -227,11 +226,10 @@ describe('AgentLifecycleProjection rootWork — thinking lifecycle', () => {
     ])
 
     expect(rootWork(state)).toMatchObject({
-      phase: 'working',
-      workingStartedAt: ts(2),
-      _thinkingCharCount: null,
+      phase: 'active',
+      productiveStartedAt: ts(2),
+      _isThinking: false,
     })
-    expect(rootWorkActivity(rootWork(state))).toBeNull()
   })
 
   it('represents an open empty thinking segment from thinking_start', async () => {
@@ -241,10 +239,9 @@ describe('AgentLifecycleProjection rootWork — thinking lifecycle', () => {
     ])
 
     expect(rootWork(state)).toMatchObject({
-      phase: 'working',
-      _thinkingCharCount: 0,
+      phase: 'active',
+      _isThinking: true,
     })
-    expect(rootWorkActivity(rootWork(state))).toEqual({ kind: 'thinking', message: 'Thinking' })
   })
 
   it('clears thinking when answer text starts even if thinking-end is missing', async () => {
@@ -263,10 +260,9 @@ describe('AgentLifecycleProjection rootWork — thinking lifecycle', () => {
     ])
 
     expect(rootWork(state)).toMatchObject({
-      phase: 'working',
-      _thinkingCharCount: null,
+      phase: 'active',
+      _isThinking: false,
     })
-    expect(rootWorkActivity(rootWork(state))).toBeNull()
   })
 
   it('clears thinking for the cloud thought-end then message-start ordering', async () => {
@@ -287,11 +283,10 @@ describe('AgentLifecycleProjection rootWork — thinking lifecycle', () => {
     ])
 
     expect(rootWork(state)).toMatchObject({
-      phase: 'working',
-      workingStartedAt: ts(2),
-      _thinkingCharCount: null,
+      phase: 'active',
+      productiveStartedAt: ts(2),
+      _isThinking: false,
     })
-    expect(rootWorkActivity(rootWork(state))).toBeNull()
   })
 
   it('clears thinking when answer text resumes after an interleaved thinking segment', async () => {
@@ -311,10 +306,9 @@ describe('AgentLifecycleProjection rootWork — thinking lifecycle', () => {
     ])
 
     expect(rootWork(state)).toMatchObject({
-      phase: 'working',
-      _thinkingCharCount: null,
+      phase: 'active',
+      _isThinking: false,
     })
-    expect(rootWorkActivity(rootWork(state))).toBeNull()
   })
 
   it('ignores thinking-end events that do not belong to the current root turn', async () => {
@@ -326,7 +320,6 @@ describe('AgentLifecycleProjection rootWork — thinking lifecycle', () => {
       { type: 'thinking_end', timestamp: ts(5), forkId: 'worker-a', turnId: 'root-turn-1' } as AppEvent,
     ])
 
-    expect(rootWork(state)._thinkingCharCount).toBe('Still thinking'.length)
-    expect(rootWorkActivity(rootWork(state))).toEqual({ kind: 'thinking', message: 'Thinking' })
+    expect(rootWork(state)._isThinking).toBe(true)
   })
 })

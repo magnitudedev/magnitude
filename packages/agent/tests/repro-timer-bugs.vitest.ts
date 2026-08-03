@@ -123,7 +123,7 @@ async function runWithEvents(events: readonly AppEvent[]): Promise<{
     const compactionForkState = yield* compactionProj.getFork(null)
     const compactionState = { forks: new Map([[null, compactionForkState]]) }
 
-    const displayActors = materializeDisplayActors(agentStatus, taskWorker, windowState, compactionState)
+    const displayActors = materializeDisplayActors(agentStatus, taskWorker, windowState, compactionState, new Map())
     const displayTasks = materializeDisplayTasks(taskWorker)
 
     return { agentStatus, displayActors, displayTasks }
@@ -139,7 +139,7 @@ const rootWork = (state: AgentLifecycleState) => state.rootWork
 // ============================================================================
 
 describe('FIX 1 — Working timer resets per chain', () => {
-  it('starts each new chain with a paused work clock', async () => {
+  it('starts each new chain timer immediately while productive time remains paused', async () => {
     const result = await runWithEvents([
       turnStarted(null, 'turn-1', 'chain-1', ts(1000)),
       generationStarted('turn-1', 'chain-1', ts(2000)),
@@ -148,10 +148,11 @@ describe('FIX 1 — Working timer resets per chain', () => {
     ])
 
     const work = rootWork(result.agentStatus)
-    expect(work.phase).toBe('waiting_for_model')
-    expect(work.accumulatedWorkMs).toBe(0)
-    expect(work.workingStartedAt).toBeNull()
-    expect(work.lastChainMs).toBe(3000)
+    expect(work.phase).toBe('active')
+    expect(work.chainStartedAt).toBe(ts(6000))
+    expect(work.accumulatedProductiveMs).toBe(0)
+    expect(work.productiveStartedAt).toBeNull()
+    expect(work.lastProductiveMs).toBe(3000)
   })
 
   it('completed summary shows last chain duration, not accumulated total', async () => {
@@ -166,10 +167,10 @@ describe('FIX 1 — Working timer resets per chain', () => {
 
     const work = rootWork(result.agentStatus)
     expect(work.phase).toBe('worked')
-    expect(work.lastChainMs).toBe(1000)
+    expect(work.lastProductiveMs).toBe(1000)
   })
 
-  it('display actor lastWorkMs matches lastChainMs', async () => {
+  it('display root status exposes the productive summary', async () => {
     const result = await runWithEvents([
       turnStarted(null, 'turn-1', 'chain-1', ts(1000)),
       generationStarted('turn-1', 'chain-1', ts(2000)),
@@ -180,8 +181,9 @@ describe('FIX 1 — Working timer resets per chain', () => {
     ])
 
     const rootActor = result.displayActors['root']
-    expect(rootActor.work.phase).toBe('worked')
-    expect(rootActor.work.lastWorkMs).toBe(1000)
+    expect(rootActor.kind).toBe('root')
+    if (rootActor.kind !== 'root') return
+    expect(rootActor.status).toEqual({ _tag: 'Worked', lastProductiveMs: 1000 })
   })
 })
 
@@ -225,9 +227,9 @@ describe('FIX 3a — Root work stays working while root is streaming', () => {
     ])
 
     const work = rootWork(result.agentStatus)
-    // Root turn is still active (_currentTurnId !== null) — root stays working
-    expect(work.phase).toBe('working')
-    expect(work._currentTurnId).toBe('root-turn-1')
+    // Root turn is still active — root stays working.
+    expect(work.phase).toBe('active')
+    expect(work._currentTurn?.turnId).toBe('root-turn-1')
   })
 
   it('worker interrupt does NOT stop root work while root turn is still active', async () => {
@@ -240,8 +242,8 @@ describe('FIX 3a — Root work stays working while root is streaming', () => {
     ])
 
     const work = rootWork(result.agentStatus)
-    expect(work.phase).toBe('working')
-    expect(work._currentTurnId).toBe('root-turn-1')
+    expect(work.phase).toBe('active')
+    expect(work._currentTurn?.turnId).toBe('root-turn-1')
   })
 
   it('deferred close: root work closes when last worker goes idle AFTER root turn ended', async () => {
@@ -269,7 +271,9 @@ describe('FIX 3b — Worker interrupt shows in display actors', () => {
 
     const workerActor = result.displayActors['worker-1']
     expect(workerActor).toBeDefined()
-    expect(workerActor.work.phase).toBe('interrupted')
+    expect(workerActor.kind).toBe('worker')
+    if (workerActor.kind !== 'worker') return
+    expect(workerActor.status.phase).toBe('interrupted')
   })
 
   it('idle worker has phase "worked" in display actors', async () => {
@@ -282,7 +286,9 @@ describe('FIX 3b — Worker interrupt shows in display actors', () => {
 
     const workerActor = result.displayActors['worker-1']
     expect(workerActor).toBeDefined()
-    expect(workerActor.work.phase).toBe('worked')
+    expect(workerActor.kind).toBe('worker')
+    if (workerActor.kind !== 'worker') return
+    expect(workerActor.status.phase).toBe('worked')
   })
 })
 
@@ -309,6 +315,8 @@ describe('FIX 3c — Root interrupt', () => {
     expect(rootWork(result.agentStatus).phase).toBe('interrupted')
     // Worker agent goes idle with interrupt reason
     const workerActor = result.displayActors['worker-1']
-    expect(workerActor.work.phase).toBe('interrupted')
+    expect(workerActor.kind).toBe('worker')
+    if (workerActor.kind !== 'worker') return
+    expect(workerActor.status.phase).toBe('interrupted')
   })
 })

@@ -420,26 +420,65 @@ export const ContextUsageDisplay = Schema.Struct({
 })
 export type ContextUsageDisplay = Schema.Schema.Type<typeof ContextUsageDisplay>
 
-export const DisplayActorWork = Schema.Struct({
-  phase: Schema.Literal("idle", "waiting_for_model", "working", "waiting_for_workers", "worked", "interrupted"),
-  activeSince: Schema.Union(Schema.Number, Schema.Null),
-  lastWorkMs: Schema.Number,
-  accumulatedMs: Schema.Number,
-  resumeCount: Schema.Number,
-  activity: Schema.Union(DisplayActivity, Schema.Null),
-  activeChildCount: Schema.Number
-})
-export type DisplayActorWork = Schema.Schema.Type<typeof DisplayActorWork>
+const NonNegativeDisplayNumber = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
+const NonNegativeDisplayInteger = NonNegativeDisplayNumber.pipe(Schema.int())
 
-export const DisplayActor = Schema.Struct({
-  kind: Schema.Literal("root", "worker"),
+export const DisplayRootStatus = Schema.Union(
+  Schema.TaggedStruct("Idle", {}),
+  Schema.TaggedStruct("Working", {
+    chainStartedAt: NonNegativeDisplayNumber,
+    detail: Schema.Union(
+      Schema.TaggedStruct("NoDetail", {}),
+      Schema.TaggedStruct("WaitingForModel", {
+        turnStartedAt: NonNegativeDisplayNumber,
+      }),
+      Schema.TaggedStruct("Prefill", {
+        completedTokens: NonNegativeDisplayInteger,
+        totalTokens: NonNegativeDisplayInteger,
+        cachedTokens: NonNegativeDisplayInteger,
+      }),
+      Schema.TaggedStruct("Thinking", {}),
+    ),
+    activeChildCount: NonNegativeDisplayInteger,
+  }),
+  Schema.TaggedStruct("Worked", {
+    lastProductiveMs: NonNegativeDisplayNumber,
+  }),
+  Schema.TaggedStruct("Interrupted", {
+    lastProductiveMs: NonNegativeDisplayNumber,
+  }),
+)
+export type DisplayRootStatus = Schema.Schema.Type<typeof DisplayRootStatus>
+
+export const DisplayWorkerStatus = Schema.Struct({
+  phase: Schema.Literal("idle", "working", "worked", "interrupted"),
+  activeSince: Schema.Union(Schema.Number, Schema.Null),
+  lastWorkMs: NonNegativeDisplayNumber,
+  accumulatedMs: NonNegativeDisplayNumber,
+  resumeCount: NonNegativeDisplayInteger,
+})
+export type DisplayWorkerStatus = Schema.Schema.Type<typeof DisplayWorkerStatus>
+
+const DisplayActorBase = {
   name: Schema.String,
   role: Schema.String,
   parentActorKey: Schema.Union(Schema.String, Schema.Null),
   taskId: Schema.Union(Schema.String, Schema.Null),
-  work: DisplayActorWork,
-  context: ContextUsageDisplay
-})
+  context: ContextUsageDisplay,
+} as const
+
+export const DisplayActor = Schema.Union(
+  Schema.Struct({
+    ...DisplayActorBase,
+    kind: Schema.Literal("root"),
+    status: DisplayRootStatus,
+  }),
+  Schema.Struct({
+    ...DisplayActorBase,
+    kind: Schema.Literal("worker"),
+    status: DisplayWorkerStatus,
+  }),
+)
 export type DisplayActor = Schema.Schema.Type<typeof DisplayActor>
 
 /**
@@ -859,25 +898,12 @@ export const DisplayTasks = Schema.Struct({
 })
 export type DisplayTasks = Schema.Schema.Type<typeof DisplayTasks>
 
-export const DisplayModelRequestActivity = Schema.Struct({
-  requestId: Schema.Union(Schema.String, Schema.Null),
-  turnId: Schema.String,
-  forkId: Schema.Union(Schema.String, Schema.Null),
-  startedAt: Schema.Number,
-  phase: Schema.Literal("queued", "preparing", "prefill"),
-  completedTokens: Schema.Union(Schema.Number, Schema.Null),
-  totalTokens: Schema.Union(Schema.Number, Schema.Null),
-  cachedTokens: Schema.Union(Schema.Number, Schema.Null)
-})
-export type DisplayModelRequestActivity = Schema.Schema.Type<typeof DisplayModelRequestActivity>
-
 export const DisplayState = Schema.Struct({
   session: DisplaySession,
   timelines: Schema.Record({ key: Schema.String, value: DisplayTimeline }),
   actors: Schema.Record({ key: Schema.String, value: DisplayActor }),
   agents: Schema.Record({ key: Schema.String, value: DisplayAgent }),
   tasks: DisplayTasks,
-  modelRequests: Schema.Record({ key: Schema.String, value: DisplayModelRequestActivity })
 })
 export type DisplayState = Schema.Schema.Type<typeof DisplayState>
 
