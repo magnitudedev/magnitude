@@ -4,6 +4,13 @@ import { StreamDisplayView, WatchFile } from "@magnitudedev/acn-protocol";
 
 export class NoDaemon extends Schema.TaggedError<NoDaemon>()("NoDaemon", {}) {}
 
+export class DaemonDiscoveryFailed extends Schema.TaggedError<DaemonDiscoveryFailed>()(
+  "DaemonDiscoveryFailed",
+  {
+    reason: Schema.String,
+  },
+) {}
+
 export class DaemonSpawnFailed extends Schema.TaggedError<DaemonSpawnFailed>()(
   "DaemonSpawnFailed",
   {
@@ -71,6 +78,7 @@ export class DaemonCrashed extends Schema.TaggedError<DaemonCrashed>()(
  */
 export const DaemonError = Schema.Union(
   NoDaemon,
+  DaemonDiscoveryFailed,
   DaemonSpawnFailed,
   BinaryNotFound,
   BinaryVersionMismatch,

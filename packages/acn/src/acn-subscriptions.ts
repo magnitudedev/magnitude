@@ -5,13 +5,14 @@ import {
   ACN_SUBSCRIPTION_KEEPALIVE_INTERVAL_MS,
   type AcnSubscriptionControl,
 } from "@magnitudedev/acn-protocol"
-import { Context, Effect, Fiber, Layer, Ref, Scope } from "effect"
+import { Context, Effect, Fiber, Layer, Option, Ref, Scope } from "effect"
 
 export interface AcnSubscriptionRegistration {
   readonly clientId: number
   readonly requestId: string
   readonly sessionId?: string
   readonly emit: (control: AcnSubscriptionControl) => Effect.Effect<void>
+  readonly close: Effect.Effect<void>
 }
 
 export interface AcnSubscriptionHandle {
@@ -51,6 +52,17 @@ const emptyState: SubscriptionState = {
 const values = (state: SubscriptionState): ReadonlyArray<ActiveSubscription> =>
   Array.from(state.active.values()).flatMap((requests) => Array.from(requests.values()))
 
+/** Observe an operation for a bounded interval without waiting for its interruption. */
+const runBounded = (effect: Effect.Effect<unknown>): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const fiber = yield* Effect.forkDaemon(effect)
+    yield* Effect.raceFirst(
+      Fiber.await(fiber),
+      Effect.sleep("250 millis"),
+    ).pipe(Effect.asVoid)
+    yield* Fiber.interruptFork(fiber)
+  })
+
 export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
   AcnSubscriptions,
   Effect.gen(function* () {
@@ -72,7 +84,7 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
           if (nextClient.size === 0) active.delete(clientId)
           else active.set(clientId, nextClient)
           yield* Ref.set(state, { ...current, active })
-          yield* Fiber.interrupt(subscription.keepalive)
+          yield* Fiber.interruptFork(subscription.keepalive)
         }),
       )
 
@@ -81,10 +93,7 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
         Effect.gen(function* () {
           const current = yield* Ref.get(state)
           if (current.terminated) {
-            yield* registration.emit(
-              AcnSubscriptionTerminated.make({ reason: "acn-shutdown" }),
-            )
-            return { unregister: Effect.void }
+            return Option.none<AcnSubscriptionHandle>()
           }
 
           const keepalive = yield* Effect.sleep(
@@ -101,10 +110,21 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
           const active = new Map(current.active)
           active.set(registration.clientId, client)
           yield* Ref.set(state, { ...current, active })
-          return {
+          return Option.some({
             unregister: unregister(registration.clientId, registration.requestId),
-          }
+          })
         }),
+      ).pipe(
+        Effect.flatMap(
+          Option.match({
+            onSome: Effect.succeed,
+            onNone: () => runBounded(registration.close.pipe(
+              Effect.ignore,
+            )).pipe(
+              Effect.as({ unregister: Effect.void }),
+            ),
+          }),
+        ),
       )
 
     const suspendSession = (sessionId: string) =>
@@ -117,33 +137,48 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
             (subscription) =>
               subscription.emit(
                 AcnSubscriptionSuspended.make({ reason: "session-offloaded" }),
-              ),
-            { discard: true },
-          ),
+            ),
+            { discard: true, concurrency: "unbounded" },
+          ).pipe(Effect.ignore, runBounded),
         ),
       )
 
-    const terminate = semaphore.withPermits(1)(
+    const detach = semaphore.withPermits(1)(
       Effect.gen(function* () {
         const current = yield* Ref.get(state)
-        if (current.terminated) return
+        if (current.terminated) return []
         const active = values(current)
-        yield* Ref.set(state, { ...current, terminated: true })
-        yield* Effect.forEach(
-          active,
-          (subscription) => Fiber.interrupt(subscription.keepalive),
-          { discard: true },
-        )
-        yield* Effect.forEach(
-          active,
-          (subscription) =>
-            subscription.emit(
-              AcnSubscriptionTerminated.make({ reason: "acn-shutdown" }),
-          ),
-          { discard: true },
-        )
+        yield* Ref.set(state, { terminated: true, active: new Map() })
+        return active
       }),
     )
+
+    const terminate = Effect.gen(function* () {
+      const active = yield* detach
+      if (active.length === 0) return
+      yield* Effect.forEach(
+        active,
+        (subscription) => Fiber.interruptFork(subscription.keepalive),
+        { discard: true, concurrency: "unbounded" },
+      )
+      yield* Effect.forEach(
+        active,
+        (subscription) =>
+          subscription.emit(
+            AcnSubscriptionTerminated.make({ reason: "acn-shutdown" }),
+          ),
+        { discard: true, concurrency: "unbounded" },
+      ).pipe(Effect.ignore, runBounded)
+      const clients = new Map(active.map((subscription) => [
+        subscription.clientId,
+        subscription.close,
+      ]))
+      yield* Effect.forEach(
+        clients.values(),
+        (close) => close,
+        { discard: true, concurrency: "unbounded" },
+      ).pipe(Effect.ignore, runBounded)
+    })
 
     return { register, suspendSession, terminate }
   }),

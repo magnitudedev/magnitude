@@ -3,12 +3,14 @@ import { BunContext } from "@effect/platform-bun"
 import { RpcClient } from "@effect/rpc"
 import { AcnVersionRegistryJson } from "@magnitudedev/acn-protocol"
 import {
-  BunDetachedSpawnProcess,
-  DaemonSpawnerTag,
+  BunDetachedChildProcessSpawner,
+  ChildProcessSpawner,
+  DaemonDiscovery,
+  DaemonLauncher,
   MagnitudeRpcs,
   makeAcnJitRuntime,
-  makeLocalDaemonSpawner,
-  SpawnProcess,
+  makeLocalDaemonDiscovery,
+  makeLocalDaemonLauncher,
 } from "@magnitudedev/sdk"
 import { Effect, Layer, Option, Schema } from "effect"
 import {
@@ -193,17 +195,22 @@ const terminateBootstrap = async (): Promise<void> => {
 }
 
 const probeBootstrap = Effect.gen(function* () {
-  const spawner = yield* makeLocalDaemonSpawner({
+  const options = {
     dataDir,
     version: manifest.version,
-  }).pipe(
-    Effect.provideService(SpawnProcess, BunDetachedSpawnProcess),
+  }
+  const discovery = yield* makeLocalDaemonDiscovery({ dataDir }).pipe(
+    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+  )
+  const launcher = yield* makeLocalDaemonLauncher(options).pipe(
+    Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
     Effect.provide([BunContext.layer, FetchHttpClient.layer]),
   )
   const runtime = yield* makeAcnJitRuntime({
-    spawnCommand: Option.none(),
+    launchCommand: Option.none(),
   }).pipe(
-    Effect.provideService(DaemonSpawnerTag, spawner),
+    Effect.provideService(DaemonDiscovery, discovery),
+    Effect.provideService(DaemonLauncher, launcher),
   )
 
   yield* runtime.startup.prepare

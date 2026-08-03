@@ -10,6 +10,8 @@ import {
 import {
   AcnVersionRegistryOwnershipSchema,
   AcnVersionRegistrySchema,
+  AcnInstanceRecordSchema,
+  type AcnInstanceRecord,
   type AcnRegistration,
   type AcnRegistrationOwnership,
   type AcnVersionRegistry,
@@ -17,13 +19,19 @@ import {
 
 export type { AcnRegistration, AcnVersionRegistry };
 
-export interface RegisteredAcn {
+export interface RegisteredAcnInstance {
   readonly path: string;
-  readonly registration: AcnRegistration;
+  readonly record: AcnInstanceRecord;
 }
 
 export const registrationPath = (dataDir: string): string =>
   NodePath.join(dataDir, "acn", "registry.json");
+
+export const instancesDirectory = (dataDir: string): string =>
+  NodePath.join(dataDir, "acn", "instances");
+
+export const instancePath = (dataDir: string, id: string): string =>
+  NodePath.join(instancesDirectory(dataDir), `${encodeURIComponent(id)}.json`);
 
 export const registrationIsOwnedBy = (
   registration: Option.Option<AcnRegistrationOwnership>,
@@ -79,6 +87,10 @@ export const writeRegistrationAtomic = (
   FileSystem.FileSystem
 > =>
   Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const directory = NodePath.dirname(path);
+    yield* fs.makeDirectory(directory, { recursive: true });
+    yield* fs.chmod(directory, 0o700);
     const registry: AcnVersionRegistry = {
       schemaVersion: 1,
       registration: Option.some(registration),
@@ -89,18 +101,77 @@ export const writeRegistrationAtomic = (
     });
   });
 
-export const listRegisteredAcns = (
-  dataDir: string
+export const writeInstanceAtomic = (
+  dataDir: string,
+  record: AcnInstanceRecord,
 ): Effect.Effect<
-  readonly RegisteredAcn[],
+  string,
+  PlatformError | StructuredFileEncodeFailed,
+  FileSystem.FileSystem
+> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const directory = instancesDirectory(dataDir);
+    yield* fs.makeDirectory(directory, { recursive: true });
+    yield* fs.chmod(directory, 0o700);
+    const path = instancePath(dataDir, record.id);
+    yield* writeStructuredFileAtomic(path, AcnInstanceRecordSchema, record, {
+      mode: 0o600,
+    });
+    return path;
+  });
+
+export const removeExactInstance = (
+  instance: RegisteredAcnInstance,
+): Effect.Effect<void, PlatformError, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const current = yield* readStructuredFile(
+      instance.path,
+      AcnInstanceRecordSchema,
+    );
+    if (
+      current._tag === "Present" &&
+      current.value.id === instance.record.id &&
+      current.value.pid === instance.record.pid &&
+      current.value.processStartIdentity === instance.record.processStartIdentity
+    ) {
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.remove(instance.path, { force: true });
+    }
+  });
+
+export const listAcnInstances = (
+  dataDir: string,
+): Effect.Effect<
+  readonly RegisteredAcnInstance[],
   PlatformError,
   FileSystem.FileSystem
 > =>
   Effect.gen(function* () {
-    const path = registrationPath(dataDir);
-    const registration = yield* readRegistration(path);
-    return Option.match(registration, {
-      onNone: () => [],
-      onSome: (value) => [{ path, registration: value }],
-    });
+    const fs = yield* FileSystem.FileSystem;
+    const directory = instancesDirectory(dataDir);
+    const names = yield* fs.readDirectory(directory).pipe(
+      Effect.catchAll((error) =>
+        error._tag === "SystemError" && error.reason === "NotFound"
+          ? Effect.succeed([])
+          : Effect.fail(error),
+      ),
+    );
+    const records = yield* Effect.forEach(
+      names.filter((name) => name.endsWith(".json")),
+      (name) => {
+        const path = NodePath.join(directory, name);
+        return readStructuredFile(path, AcnInstanceRecordSchema).pipe(
+          Effect.flatMap((result) => {
+            if (result._tag === "Present") {
+              return Effect.succeed(Option.some({ path, record: result.value }));
+            }
+            return fs.remove(path, { force: true }).pipe(
+              Effect.as(Option.none<RegisteredAcnInstance>()),
+            );
+          }),
+        );
+      },
+    );
+    return records.filter(Option.isSome).map(({ value }) => value);
   });

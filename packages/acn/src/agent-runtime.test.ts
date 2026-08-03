@@ -22,7 +22,10 @@ import type {
 } from "@magnitudedev/agent"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
 import { SessionOperationFailed } from "@magnitudedev/acn-protocol"
-import { AcnShutdown, type AcnShutdownApi } from "./acn-shutdown"
+import {
+  AcnServiceLifecycle,
+  type AcnServiceLifecycleApi,
+} from "./service-lifecycle"
 import { AgentFactory, type AgentFactoryApi } from "./agent-factory"
 import {
   AgentRuntime,
@@ -128,7 +131,7 @@ const makeLayer = (input: {
   readonly storedRuntimeOptions?: ReadonlyMap<string, SessionRuntimeOptions>
   readonly retirementAdmissionTimeout?: Duration.DurationInput
   readonly retirementShutdownTimeout?: Duration.DurationInput
-  readonly shutdown?: AcnShutdownApi
+  readonly lifecycle?: AcnServiceLifecycleApi
 }) => {
   const dependencies = Layer.mergeAll(
     Layer.succeed(AgentFactory, input.factory),
@@ -167,7 +170,9 @@ const makeLayer = (input: {
         } satisfies SessionRuntimeOptionsStoreApi
       }),
     ),
-    ...(input.shutdown ? [Layer.succeed(AcnShutdown, input.shutdown)] : []),
+    ...(input.lifecycle
+      ? [Layer.succeed(AcnServiceLifecycle, input.lifecycle)]
+      : []),
   )
   return makeAgentRuntimeLive({
     idleTimeout: "2 seconds",
@@ -354,21 +359,28 @@ describe("AgentRuntime", () => {
     await Effect.runPromise(program)
   })
 
-  it("requests controlled ACN replacement when retirement remains stalled", async () => {
+  it("stops ACN when retirement remains stalled", async () => {
     const program = Effect.gen(function* () {
       const retirementStarted = yield* Deferred.make<void>()
       const shutdownRequest = yield* Ref.make<string | null>(null)
-      const shutdown: AcnShutdownApi = {
-        request: (request) =>
+      const lifecycle: AcnServiceLifecycleApi = {
+        state: Effect.die("unused"),
+        dispatchRpc: Effect.die("unused"),
+        reportStarting: () => Effect.die("unused"),
+        becomeReady: () => Effect.die("unused"),
+        beginStopping: (request) =>
           Ref.set(shutdownRequest, request.detail ?? request.reason).pipe(Effect.as(true)),
-        await: Effect.never,
-        current: Effect.succeed(Option.none()),
+        awaitStopping: Effect.never,
+        acquireActivity: () => Effect.die("unused"),
+        joinActivityIfBusy: () => Effect.die("unused"),
+        withActivity: (_label, effect) => effect,
+        activity: Effect.die("unused"),
       }
       const layer = makeLayer({
         factory: { createSession: () => Effect.succeed(idleSession) },
-        storedSessions: [makeMeta("stalled-replacement")],
+        storedSessions: [makeMeta("stalled-shutdown")],
         retirementShutdownTimeout: "3 seconds",
-        shutdown,
+        lifecycle,
       })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
@@ -380,13 +392,13 @@ describe("AgentRuntime", () => {
               ),
           })
           .pipe(Effect.asVoid)
-        yield* runtime.withSession("stalled-replacement", "initial", () => Effect.void)
+        yield* runtime.withSession("stalled-shutdown", "initial", () => Effect.void)
         yield* TestClock.adjust("2 seconds")
         yield* Deferred.await(retirementStarted)
         yield* TestClock.adjust("3 seconds")
         yield* Effect.yieldNow()
         expect(yield* Ref.get(shutdownRequest)).toContain(
-          "session stalled-replacement generation 1 retirement stalled",
+          "session stalled-shutdown generation 1 retirement stalled",
         )
       }).pipe(Effect.provide(layer))
     })

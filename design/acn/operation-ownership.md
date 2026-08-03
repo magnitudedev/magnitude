@@ -42,8 +42,12 @@ Every owner handles its complete Effect `Exit`. Success, typed failure, defect, 
 all remove ownership and produce a terminal state before releasing the activity claim. A public
 nonterminal state without a live owner is invalid.
 
+Process-lifecycle terminalization is additionally single-flight and independent of the requesting
+fiber. Once stopping is committed, caller interruption cannot strand the stopping state without
+the Effect that performs TERM/KILL and publishes the shared terminal result.
+
 Operation identity and completion may remain internal. Clients obtain current truth from
-authoritative revisioned mirrors, including after reconnect; they do not reconstruct operations
+authoritative queries, including after reconnect; they do not reconstruct operations
 from command responses, progress streams, or client-maintained timers. No global workflow registry
 or client-visible operation ID is implied.
 

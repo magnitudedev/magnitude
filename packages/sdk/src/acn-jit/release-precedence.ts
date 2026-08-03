@@ -122,3 +122,9 @@ export const compareReleaseVersions = (
   }
   return naturalCompare(left.build, right.build)
 }
+
+/** Whether an observed daemon can satisfy a client or launch expecting this version. */
+export const canUseDaemonVersion = (
+  expected: string,
+  observed: string,
+): boolean => compareReleaseVersions(expected, observed) <= 0

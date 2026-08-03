@@ -1,12 +1,10 @@
-import { Context, Duration, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Option } from "effect"
 import { AcnRpcDemand } from "@magnitudedev/acn-protocol"
-import { AcnShutdown } from "./acn-shutdown"
 import {
-  makeResourceUseGate,
-  type ResourceUseGate,
   type ResourceUseGateSnapshot,
   type ResourceRetired,
 } from "./resource-use-gate"
+import { AcnServiceLifecycle } from "./service-lifecycle"
 
 export interface AcnActivityTrackerApi {
   readonly withUse: <A, E, R>(
@@ -14,9 +12,9 @@ export interface AcnActivityTrackerApi {
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | ResourceRetired, R>
   readonly acquire: (label: string) => Effect.Effect<Effect.Effect<void>, ResourceRetired>
-  /** Ends the bootstrap lease; idempotent. The idle allowance starts here. */
-  readonly ready: Effect.Effect<void>
-  readonly gate: ResourceUseGate
+  readonly joinIfBusy: (
+    label: string,
+  ) => Effect.Effect<Option.Option<Effect.Effect<void>>, ResourceRetired>
   readonly current: Effect.Effect<ResourceUseGateSnapshot>
 }
 export type AcnActivityState = ResourceUseGateSnapshot
@@ -27,33 +25,20 @@ export class AcnActivityTracker extends Context.Tag("AcnActivityTracker")<
   AcnActivityTrackerApi
 >() {}
 
-export const AcnActivityTrackerLive = (
-  idleTimeout: Duration.DurationInput = "30 minutes",
-  initiallyReady = true,
-): Layer.Layer<AcnActivityTracker, never, AcnShutdown> =>
-  Layer.scoped(
+export const AcnActivityTrackerLive: Layer.Layer<
+  AcnActivityTracker,
+  never,
+  AcnServiceLifecycle
+> =
+  Layer.effect(
     AcnActivityTracker,
     Effect.gen(function* () {
-      const shutdown = yield* AcnShutdown
-      const gate = yield* makeResourceUseGate({
-        resource: "acn",
-        generation: 1,
-        idleTimeout,
-        retire: () =>
-          shutdown.request({ reason: "idle" }).pipe(
-            Effect.tap(() => Effect.logInfo("ACN demand idle deadline reached; shutting down")),
-            Effect.as(true),
-          ),
-      })
-      const releaseBootstrap = initiallyReady
-        ? Effect.void
-        : yield* gate.acquire("acn-startup").pipe(Effect.orDie)
+      const lifecycle = yield* AcnServiceLifecycle
       return {
-        gate,
-        acquire: gate.acquire,
-        withUse: gate.withUse,
-        ready: releaseBootstrap,
-        current: gate.snapshot,
+        acquire: lifecycle.acquireActivity,
+        joinIfBusy: lifecycle.joinActivityIfBusy,
+        withUse: lifecycle.withActivity,
+        current: lifecycle.activity,
       }
     }),
   )

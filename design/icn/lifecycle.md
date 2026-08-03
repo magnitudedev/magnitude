@@ -37,6 +37,20 @@ factory, observes termination, and performs bounded shutdown. ACN consumes that 
 directly; a second semantic facade is forbidden unless it owns a new invariant rather than merely
 renaming generated operations.
 
+The child supervisor exposes one `defineFSM` lifecycle:
+
+```text
+Starting -> Ready -> Stopping -> Exited
+    |         |          |
+    +---------+----------+------> Exited
+```
+
+The exact exit observer commits `Exited(code, expected)` before releasing exit waiters. Shutdown is
+single-flight and caller interruption cannot abandon it: the winner starts one daemon-owned
+terminalization Effect, while all callers await the same result. It sends TERM, waits for the
+configured deadline, sends KILL, waits for the force deadline, and reports failure if exact exit is
+still unobserved.
+
 ICN is not a separately discovered daemon. Clients never connect to it directly, and ACN does not
 adopt an ICN started by another process. A model is not a public process resource: the one ICN
 service starts without a loaded model and privately creates or destroys a disposable inference
@@ -306,7 +320,7 @@ graceful-shutdown path. Repeated shutdown requests do not send overlapping signa
 Finalization is uninterruptible around signal delivery and child reaping, while both waits remain
 bounded. Cleanup errors are logged and classified; they never leave an unobserved child handle.
 
-Signals and recoverable ownership loss use ACN's common coordinator; they do not call `process.exit`
+Signals and recoverable ownership loss enter ACN's authoritative lifecycle; they do not call `process.exit`
 before cleanup. For abrupt death, ICN watches parent-PID liveness and EOF on a private inherited
 stdin pipe. The EOF wait runs on a detached OS thread, not Tokio's blocking pool. These are crash
 backstops, not child adoption or sharing.

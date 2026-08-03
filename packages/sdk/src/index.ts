@@ -2,27 +2,40 @@ export { connect, makeClientLayer, protocolLayer, protocolLayerWithRecovery, Acn
 export type { AcnClient } from "./protocol"
 
 export {
-  DaemonSpawnerTag,
-  DaemonSpawnEventSchema,
-  runDaemonSpawn,
-} from "./daemon-spawner"
-export type { DaemonSpawner, DaemonSpawnEvent } from "./daemon-spawner"
+  DaemonDiscovery,
+  DaemonStatusSchema,
+  type DaemonStatus,
+} from "./acn-jit/daemon-discovery"
 export {
-  makeLocalDaemonSpawner,
-  SpawnProcess,
-  type SpawnedProcess,
-  type LocalSpawnerOptions,
-} from "./local-spawner"
-export { BunDetachedSpawnProcess } from "./acn-jit/bun-spawn-process"
+  DaemonLauncher,
+  DaemonLaunchEventSchema,
+  runDaemonLaunch,
+  type DaemonLaunchEvent,
+} from "./acn-jit/daemon-launcher"
+export {
+  makeLocalDaemonDiscovery,
+  makeLocalDaemonLauncher,
+  ChildProcessSpawner,
+  type ChildProcess,
+  type LocalDaemonDiscoveryOptions,
+  type LocalDaemonLauncherOptions,
+} from "./acn-jit/local-daemon"
+export { BunDetachedChildProcessSpawner } from "./acn-jit/bun-spawn-process"
 export {
   captureSpawnDiagnostics,
   type SpawnDiagnosticCapture,
 } from "./acn-jit/spawn-diagnostic"
 export {
-  makeRemoteDaemonSpawner,
-  RemoteDaemonSpawnMessageSchema,
-  type RemoteDaemonSpawnMessage,
-} from "./remote-spawner"
+  makeRemoteDaemonDiscovery,
+  makeRemoteDaemonLauncher,
+  RemoteDaemonCurrentResponseSchema,
+  RemoteDaemonErrorResponseSchema,
+  RemoteDaemonLaunchRequestSchema,
+  RemoteDaemonLaunchMessageSchema,
+  type RemoteDaemonCurrentResponse,
+  type RemoteDaemonLaunchRequest,
+  type RemoteDaemonLaunchMessage,
+} from "./acn-jit/remote-daemon"
 export {
   makeAcnJitRuntime,
   type AcnStartup,
@@ -192,6 +205,7 @@ export { resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBi
 export { SDK_VERSION } from "./version"
 export {
   NoDaemon,
+  DaemonDiscoveryFailed,
   DaemonSpawnFailed,
   BinaryNotFound,
   BinaryVersionMismatch,

@@ -1,11 +1,11 @@
 import { Effect, Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { BunDetachedSpawnProcess } from "./bun-spawn-process"
+import { BunDetachedChildProcessSpawner } from "./bun-spawn-process"
 
-describe("BunDetachedSpawnProcess", () => {
+describe("BunDetachedChildProcessSpawner", () => {
   it("drains stdout and stderr into a bounded diagnostic tail", async () => {
     const spawned = await Effect.runPromise(
-      BunDetachedSpawnProcess.spawn([
+      BunDetachedChildProcessSpawner.spawn([
         globalThis.process.execPath,
         "-e",
         [

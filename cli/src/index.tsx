@@ -87,7 +87,7 @@ async function main() {
         "src",
         "binary.ts"
       );
-      const spawnCommand = isDev
+      const launchCommand = isDev
         ? Option.some([
             "bun",
             acnSourcePath,
@@ -102,7 +102,7 @@ async function main() {
       });
       Atom.runtime.addGlobalLayer(effectLoggingLayer);
       const platform = await createTerminalPlatform({
-        spawnCommand,
+        launchCommand,
         publicationTimeoutMs: isDev ? Option.some(30_000) : Option.none(),
         debug: opts.debug === true,
         effectLoggingLayer: Option.some(effectLoggingLayer),

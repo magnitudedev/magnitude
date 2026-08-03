@@ -9,13 +9,15 @@ import {
 } from "effect"
 import { describe, expect, it } from "vitest"
 import { AcnActivityTracker, AcnActivityTrackerLive } from "./activity-tracker"
-import { AcnShutdownLive } from "./acn-shutdown"
+import { AcnServiceLifecycleLive } from "./service-lifecycle"
 import {
   makeServiceOperationCoordinator,
   type ServiceOperationDefinition,
 } from "./service-operation-coordinator"
 
-const layer = AcnActivityTrackerLive("30 minutes").pipe(Layer.provide(AcnShutdownLive))
+const layer = AcnActivityTrackerLive.pipe(
+  Layer.provide(AcnServiceLifecycleLive("30 minutes")),
+)
 
 describe("ServiceOperationCoordinator", () => {
   it("owns one operation while equivalent callers join and conflicting callers observe it", async () => {

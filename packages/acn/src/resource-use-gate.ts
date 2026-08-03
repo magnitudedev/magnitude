@@ -217,7 +217,7 @@ export const makeResourceUseGate = <E = never, R = never>(
                     current,
                   ];
                 }
-                if (!current.accepting && !onlyIfBusy) {
+                if (!current.accepting) {
                   return [{ _tag: "retired" }, current];
                 }
                 if (onlyIfBusy && current.leases.size === 0)

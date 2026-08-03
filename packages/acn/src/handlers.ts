@@ -18,7 +18,7 @@ import { ActiveSessionStatusesService } from "./active-session-statuses";
 import { DisplayViewStreams } from "./display-view-streams";
 import { ACN_VERSION } from "./version";
 import { makeHealthResponse } from "./identity";
-import { AcnStartupState } from "./startup-state";
+import { AcnServiceLifecycle } from "./service-lifecycle";
 import { AcnDisplayViewIntrospector } from "./introspection";
 import { uploadAttachment } from "./attachment-upload";
 import {
@@ -53,7 +53,7 @@ const normalizeBashOutput = (output: string): string =>
 
 export const HandlersLive = MagnitudeRpcs.toLayer(
   Effect.gen(function* () {
-    const startup = yield* AcnStartupState;
+    const lifecycle = yield* AcnServiceLifecycle;
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
     const providerCredentials = yield* ProviderCredentials;
@@ -187,7 +187,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
     return {
       // Connection
-      Health: () => startup.get.pipe(
+      Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
       ),
 

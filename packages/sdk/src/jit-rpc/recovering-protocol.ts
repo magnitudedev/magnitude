@@ -4,7 +4,7 @@ import * as HttpBody from "@effect/platform/HttpBody"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { Array as Arr, Chunk, Deferred, Effect, Either, Layer, Schema, Stream } from "effect"
 import { JsonValueSchema } from "@magnitudedev/utils/schema"
-import type { JitDaemonCoordinator } from "./daemon-resolver"
+import type { AcnEndpoint } from "@magnitudedev/acn-protocol"
 import type { RecoveringStreamProtocol } from "./recovering-stream-protocol"
 import {
   type JitRpcAttemptFailure,
@@ -33,11 +33,16 @@ const SubscriptionTerminated: AttemptOutcome = { _tag: "SubscriptionTerminated" 
 const EndpointRetired: AttemptOutcome = { _tag: "EndpointRetired" }
 
 export interface RecoveringProtocolOptions<InfraError> {
-  readonly coordinator: JitDaemonCoordinator<InfraError>
+  readonly endpoint: Effect.Effect<AcnEndpoint, InfraError>
+  readonly recover: (
+    failedEndpoint: AcnEndpoint,
+  ) => Effect.Effect<AcnEndpoint, InfraError>
   readonly rpcPath: string
   readonly streamProtocol: RecoveringStreamProtocol
   readonly isEndpointRetirementExit?: (exit: ResponseExitEncoded["exit"]) => boolean
   readonly classifyInfraError: (error: InfraError) => RpcClientError.RpcClientError
+  /** Bound for establishing an RPC response with the selected process. */
+  readonly responseStartTimeoutMs?: number
 }
 
 export const makeRecoveringProtocol = <InfraError>(
@@ -91,6 +96,9 @@ export const makeRecoveringProtocol = <InfraError>(
                     body,
                   })
                   .pipe(
+                    Effect.timeout(
+                      `${options.responseStartTimeoutMs ?? 2_000} millis`,
+                    ),
                     Effect.mapError(
                       () =>
                         new TransportRequestFailed({
@@ -225,10 +233,9 @@ export const makeRecoveringProtocol = <InfraError>(
 
             return Effect.gen(function* () {
               while (!done) {
-                const lease = yield* options.coordinator.ensure.pipe(
+                const endpoint = yield* options.endpoint.pipe(
                   Effect.mapError(options.classifyInfraError),
                 )
-                const endpoint = lease.endpoint
                 progressed = false
                 yield* Effect.logDebug("jit-rpc attempt").pipe(
                   Effect.annotateLogs({
@@ -240,15 +247,15 @@ export const makeRecoveringProtocol = <InfraError>(
                 const outcome = yield* Effect.either(attempt(endpoint.url))
                 if (Either.isRight(outcome)) {
                   if (outcome.right._tag === "SubscriptionTerminated") {
-                    yield* options.coordinator.awaitSuccessor(lease).pipe(
+                    yield* options.recover(endpoint).pipe(
                       Effect.mapError(options.classifyInfraError),
                     )
                     continue
                   }
                   if (outcome.right._tag === "EndpointRetired") {
-                    yield* options.coordinator.invalidate(lease, {
-                      awaitDifferentEndpoint: true,
-                    })
+                    yield* options.recover(endpoint).pipe(
+                      Effect.mapError(options.classifyInfraError),
+                    )
                     continue
                   }
                   yield* Effect.logDebug("jit-rpc completed").pipe(
@@ -270,7 +277,6 @@ export const makeRecoveringProtocol = <InfraError>(
                 if (failure._tag === "SubscriptionProtocolViolation") {
                   return yield* toRpcClientError(failure)
                 }
-                yield* options.coordinator.invalidate(lease)
                 if (done) return
 
                 failuresWithoutProgress = progressed ? 1 : failuresWithoutProgress + 1
@@ -288,6 +294,9 @@ export const makeRecoveringProtocol = <InfraError>(
                     }),
                   )
                 }
+                yield* options.recover(endpoint).pipe(
+                  Effect.mapError(options.classifyInfraError),
+                )
               }
             })
           })

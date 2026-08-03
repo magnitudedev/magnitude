@@ -3,7 +3,7 @@
  *
  * Exposes a typed DesktopApi to the renderer via contextBridge.
  * Effect RPC stays inside the preload layer; the renderer receives the same
- * narrow desktop facade for platform actions and daemon lifecycle.
+ * narrow desktop facade for platform actions and daemon boundaries.
  */
 import { contextBridge, ipcRenderer, clipboard as electronClipboard, shell } from "electron"
 import { RpcClient } from "@effect/rpc"
@@ -51,6 +51,21 @@ function makeDesktopRpcRuntime() {
         throw new Error(errorMessage(cause))
       }
     },
+    async runStream<A>(
+      operation: (client: DesktopRpcClient) => Stream.Stream<A, unknown, never>,
+      onValue: (value: A) => void,
+    ): Promise<void> {
+      const client = await clientPromise
+      try {
+        await runtime.runPromise(
+          operation(client).pipe(
+            Stream.runForEach((value) => Effect.sync(() => onValue(value))),
+          ),
+        )
+      } catch (cause) {
+        throw new Error(errorMessage(cause))
+      }
+    },
     onMenuAction(cb: (action: MenuAction) => void): () => void {
       let active = true
       let fiber: Fiber.RuntimeFiber<void, unknown> | null = null
@@ -89,12 +104,17 @@ function makeDesktopApi(): DesktopApi {
     get platform(): DesktopPlatform {
       return process.platform as DesktopPlatform
     },
-    daemon: {
-      async discover(): Promise<string | null> {
-        return desktopRpc.run((client) => client.DaemonDiscover({}))
+    daemonDiscovery: {
+      async current() {
+        return desktopRpc.run((client) => client.DaemonCurrent({}))
       },
-      async spawn(command): Promise<string> {
-        return desktopRpc.run((client) => client.DaemonSpawn({ command }))
+    },
+    daemonLauncher: {
+      async launch(command, onEvent) {
+        await desktopRpc.runStream(
+          (client) => client.DaemonLaunch({ command }),
+          onEvent,
+        )
       },
     },
     onMenuAction(cb: (action: MenuAction) => void): () => void {

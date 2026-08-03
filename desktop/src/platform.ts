@@ -2,19 +2,22 @@
  * Desktop Platform implementation — spec §5.3
  *
  * Wraps the `__magnitudeDesktop` DesktopApi exposed by the preload bridge.
- * `DaemonSpawner` delegates daemon lifecycle to Electron main over IPC.
+ * Daemon discovery and launch delegate independently to Electron main.
  */
 import { Effect, Layer, Option, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   DaemonSpawnFailed,
-  DaemonSpawnerTag,
+  DaemonDiscovery,
+  DaemonLauncher,
   makeAcnJitRuntime,
-  type DaemonSpawnEvent,
-  type DaemonSpawner,
+  type DaemonLaunchEvent,
+  type DaemonDiscovery as DaemonDiscoveryService,
+  type DaemonLauncher as DaemonLauncherService,
 } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
+import type { DaemonStatus } from "@magnitudedev/sdk"
 
 const DEFAULT_SERVER_KEY = "default-server"
 
@@ -60,36 +63,46 @@ let api: DesktopApi
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
-const daemonReady = (url: string): DaemonSpawnEvent => ({
-  _tag: "Ready",
-  url,
-})
-
-function createDesktopDaemonSpawner(desktopApi: DesktopApi): DaemonSpawner {
+function createDesktopDaemonDiscovery(desktopApi: DesktopApi): DaemonDiscoveryService {
   return {
-    discover: () =>
+    current: () =>
       Effect.tryPromise({
         try: async () => {
-          const url = await desktopApi.daemon.discover()
-          return url === null ? Option.none<string>() : Option.some(url)
+          const daemon = await desktopApi.daemonDiscovery.current()
+          return daemon === null ? Option.none<DaemonStatus>() : Option.some(daemon)
         },
         catch: (cause) => new DaemonSpawnFailed({ reason: errorMessage(cause) }),
       }),
-    spawn: (command) =>
-      Stream.fromEffect(
+  }
+}
+
+function createDesktopDaemonLauncher(desktopApi: DesktopApi): DaemonLauncherService {
+  return {
+    launch: (command) =>
+      Stream.asyncPush<DaemonLaunchEvent, DaemonSpawnFailed>((emit) =>
         Effect.tryPromise({
-          try: () => desktopApi.daemon.spawn(command),
+          try: () => desktopApi.daemonLauncher.launch(command, (event) => emit.single(event)),
           catch: (cause) => new DaemonSpawnFailed({ reason: errorMessage(cause) }),
-        }).pipe(Effect.map(daemonReady)),
+        }).pipe(
+          Effect.match({
+            onFailure: emit.fail,
+            onSuccess: () => emit.end(),
+          }),
+          Effect.forkScoped,
+        ),
       ),
   }
 }
 
 export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Platform> {
   api = desktopApi
-  const spawner = createDesktopDaemonSpawner(desktopApi)
+  const discovery = createDesktopDaemonDiscovery(desktopApi)
+  const launcher = createDesktopDaemonLauncher(desktopApi)
   const acn = await Effect.runPromise(
-    makeAcnJitRuntime().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
+    makeAcnJitRuntime().pipe(
+      Effect.provideService(DaemonDiscovery, discovery),
+      Effect.provideService(DaemonLauncher, launcher),
+    ),
   )
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
   return {

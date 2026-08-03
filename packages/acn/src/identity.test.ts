@@ -37,12 +37,15 @@ describe("ACN identity", () => {
         makeHealthResponse(
           "1.2.3",
           {
-            _tag: "Installing",
-            phase: "DownloadingInferenceEngine",
-            plan: {
-              daemonBytes: 30,
-              inferenceEngineBytes: 70,
-              inferenceEngineBytesExact: true,
+            _tag: "Starting",
+            activity: {
+              _tag: "Installing",
+              phase: "DownloadingInferenceEngine",
+              plan: {
+                daemonBytes: 30,
+                inferenceEngineBytes: 70,
+                inferenceEngineBytesExact: true,
+              },
             },
             progress: Option.some({
               completed: 10,
@@ -62,12 +65,15 @@ describe("ACN identity", () => {
       activity: "Resolving",
     });
     expect(withProgress.state).toEqual({
-      _tag: "Installing",
-      phase: "DownloadingInferenceEngine",
-      plan: {
-        daemonBytes: 30,
-        inferenceEngineBytes: 70,
-        inferenceEngineBytesExact: true,
+      _tag: "Starting",
+      activity: {
+        _tag: "Installing",
+        phase: "DownloadingInferenceEngine",
+        plan: {
+          daemonBytes: 30,
+          inferenceEngineBytes: 70,
+          inferenceEngineBytesExact: true,
+        },
       },
       progress: {
         completed: 10,

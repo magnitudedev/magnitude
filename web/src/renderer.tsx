@@ -1,13 +1,9 @@
 /**
  * Browser renderer entry — spec §4.3
  *
- * The dev server (one process, one port) serves the web app AND handles
- * daemon lifecycle. The browser uses relative URLs for everything:
- * - /discover, /spawn → daemon lifecycle (proxied to spawner)
- * - /rpc, /health, /logs → daemon RPC (proxied to daemon)
- *
- * The renderer provides a remote DaemonSpawner backed by the dev server.
- * SDK recovery drives /discover and /spawn through that spawner.
+ * The dev server owns the browser's same-origin boundary: `/current` and
+ * `/launch` manage the daemon, while `/rpc`, `/health`, and `/logs` proxy ACN
+ * traffic. The browser never connects cross-origin to the ACN.
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"

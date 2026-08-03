@@ -1,14 +1,4 @@
-/**
- * Local daemon spawner — shared logic for Bun and Node environments.
- *
- * `makeLocalDaemonSpawner` is an `Effect` that captures `FileSystem`,
- * `HttpClient`, and `CommandExecutor` at construction time, returning a sealed
- * `DaemonSpawner` whose methods require only `never`. This keeps the
- * `DaemonSpawner` interface clean while the layer has the real requirements.
- *
- * The actual process spawning is delegated to the `SpawnProcess` service,
- * whose implementation differs between Bun and Node hosts.
- */
+/** Local daemon discovery and launch for Bun and Node environments. */
 import {
   Array as Arr,
   Context,
@@ -34,6 +24,8 @@ import {
   type AcnHealthResponse,
   type AcnInstallationPlan,
   type AcnRegistration,
+  type AcnOwnerId,
+  type AcnEndpoint,
   type AcnStartupProgress,
 } from "@magnitudedev/acn-protocol";
 import type { ArtifactInstallationEvent } from "@magnitudedev/release";
@@ -46,35 +38,45 @@ import {
 } from "./errors";
 import { resolveBinaryCommand, defaultDataDir } from "../binary";
 import { SDK_VERSION } from "../version";
+import { canUseDaemonVersion } from "./release-precedence";
+import {
+  acnLifecycleObservationFromHealthState,
+  type AcnLifecycleObservation,
+} from "./lifecycle";
+import type { DaemonDiscovery, DaemonStatus } from "./daemon-discovery";
 import type {
-  DaemonSpawner,
-  DaemonSpawnEvent,
-} from "./daemon-spawner";
-import { compareReleaseVersions } from "./release-precedence";
-import type { AcnLifecycleObservation } from "./lifecycle";
+  DaemonLaunchEvent,
+  DaemonLauncher,
+} from "./daemon-launcher";
 
 type EmitStartupObservation = (
   observation: AcnLifecycleObservation
 ) => Effect.Effect<void>;
 
+const endpointOf = (daemon: AcnEndpoint): AcnEndpoint => ({
+  id: daemon.id,
+  version: daemon.version,
+  url: daemon.url,
+});
+
 /**
  * A host-owned detached process with Effect-native supervision operations.
  */
-export interface SpawnedProcess {
+export interface ChildProcess {
   readonly pid: Option.Option<number>;
   readonly exited: Effect.Effect<number>;
   readonly diagnostic: Effect.Effect<Option.Option<string>>;
   readonly kill: (signal: NodeJS.Signals) => Effect.Effect<void>;
 }
 
-export interface SpawnProcess {
+export interface ChildProcessSpawner {
   readonly spawn: (
     command: Arr.NonEmptyReadonlyArray<string>
-  ) => Effect.Effect<SpawnedProcess, DaemonSpawnFailed>;
+  ) => Effect.Effect<ChildProcess, DaemonSpawnFailed>;
 }
 
-export const SpawnProcess = Context.GenericTag<SpawnProcess>(
-  "@magnitudedev/sdk/SpawnProcess"
+export const ChildProcessSpawner = Context.GenericTag<ChildProcessSpawner>(
+  "@magnitudedev/sdk/ChildProcessSpawner"
 );
 
 // ─── Internal types ──────────────────────────────────────────────────────────
@@ -152,20 +154,8 @@ const readSpawnElectionOwner = (
     Effect.catchAll(() => Effect.succeed(Option.none()))
   );
 
-const processIsAlive = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (cause) {
-    return !(
-      cause instanceof Error &&
-      "code" in cause &&
-      cause.code === "ESRCH"
-    );
-  }
-};
-
-const SPAWN_ELECTION_PUBLICATION_GRACE_MS = 250;
+const SPAWN_ELECTION_STALE_MS = 10_000;
+const SPAWN_ELECTION_WAIT_MS = 2_000;
 
 const tryAcquireSpawnElection = (
   path: string,
@@ -219,9 +209,9 @@ const tryAcquireSpawnElection = (
       return Option.some(claim);
     }
 
-    // A crash can leave the claim directory behind. Age-based recovery is
-    // deliberately conservative: a healthy contender normally releases it as
-    // soon as registration becomes observable.
+    // Election is an optimization, not a correctness boundary. Exact ACN
+    // publication and peer removal resolve any duplicate candidate, so an old
+    // claim may be quarantined by age without granting it authority forever.
     const info = yield* fs.stat(path).pipe(
       Effect.map(Option.some),
       Effect.catchAll((cause) =>
@@ -239,10 +229,7 @@ const tryAcquireSpawnElection = (
       );
       if (isStale) {
         const observedOwner = yield* readSpawnElectionOwner(path, fs);
-        if (
-          Option.isSome(observedOwner) &&
-          !processIsAlive(observedOwner.value.pid)
-        ) {
+        if (Option.isSome(observedOwner)) {
           const tombstone = staleSpawnElectionPath(
             path,
             observedOwner.value.token
@@ -320,7 +307,7 @@ const withSpawnElection = <A, E>(
 ): Effect.Effect<A, E | DaemonSpawnFailed, never> => {
   const acquire = tryAcquireSpawnElection(
     path,
-    SPAWN_ELECTION_PUBLICATION_GRACE_MS,
+    SPAWN_ELECTION_STALE_MS,
     fs
   ).pipe(
     Effect.tap((claim) =>
@@ -343,9 +330,17 @@ const withSpawnElection = <A, E>(
     )
   );
   return acquire.pipe(
-    Effect.flatMap((claim) =>
-      effect.pipe(Effect.ensuring(releaseSpawnElection(claim, fs)))
-    )
+    Effect.timeoutOption(`${SPAWN_ELECTION_WAIT_MS} millis`),
+    Effect.flatMap(
+      Option.match({
+        onNone: () =>
+          Effect.logWarning(
+            "ACN spawn election did not converge; continuing with exact ACN reconciliation",
+          ).pipe(Effect.zipRight(effect)),
+        onSome: (claim) =>
+          effect.pipe(Effect.ensuring(releaseSpawnElection(claim, fs))),
+      }),
+    ),
   );
 };
 
@@ -411,34 +406,53 @@ const probeHealth = (
 const reportHealthState = (
   state: AcnHealthResponse["state"],
   emitObservation: EmitStartupObservation
-): Effect.Effect<void> => {
-  if (state._tag === "Installing") {
-    return emitObservation({
-      _tag: "Installing",
-      phase: state.phase,
-      plan: state.plan,
-      progress: state.progress,
+): Effect.Effect<void> =>
+  Option.match(acnLifecycleObservationFromHealthState(state), {
+    onNone: () => Effect.void,
+    onSome: emitObservation,
+  });
+
+/** Reads and identity-validates the canonical registration and health state. */
+const readCurrentDaemon = (
+  options: {
+    readonly dataDir: string;
+    readonly probeTimeoutMs: number;
+    readonly debug: boolean;
+  },
+  deps: {
+    readonly fs: FileSystem;
+    readonly client: HttpClient.HttpClient;
+  }
+): Effect.Effect<Option.Option<DaemonStatus>, RegistrationFileInvalid, never> =>
+  Effect.gen(function* () {
+    const registration = yield* readRegistration(
+      registrationPath(options.dataDir),
+      deps.fs,
+    );
+    if (Option.isNone(registration)) return Option.none();
+    const health = yield* probeHealth(
+      registration.value.url,
+      options.probeTimeoutMs,
+      deps.client,
+    ).pipe(
+      Effect.map(Option.some),
+      Effect.catchAll(() => Effect.succeed(Option.none<AcnHealthResponse>())),
+    );
+    if (
+      Option.isNone(health) ||
+      health.value.version !== registration.value.version ||
+      health.value.id !== registration.value.id ||
+      health.value.pid !== registration.value.pid
+    ) {
+      yield* debugLog(options.debug, "canonical ACN is unreachable or stale");
+      return Option.none();
+    }
+    return Option.some({
+      ...endpointOf(registration.value),
+      pid: registration.value.pid,
+      state: health.value.state,
     });
-  }
-  if (state._tag !== "Starting") return Effect.void;
-  if (typeof state.activity !== "string") {
-    return emitObservation({ _tag: "Starting", phase: state.activity });
-  }
-  switch (state.activity) {
-    case "WaitingForOwnership":
-      return emitObservation({ _tag: "Starting", phase: "WaitingForOwner" });
-    case "Resolving":
-      return emitObservation({
-        _tag: "Starting",
-        phase: "ResolvingLocalInference",
-      });
-    case "Starting":
-      return emitObservation({
-        _tag: "Starting",
-        phase: "LaunchingLocalInference",
-      });
-  }
-};
+  });
 
 const daemonDownloadObservation = (
   plan: AcnInstallationPlan,
@@ -463,18 +477,19 @@ const spawnDaemon = (
     readonly dataDir: string;
     readonly version: string;
     readonly publicationTimeoutMs: number;
+    readonly initialOwnerId: Option.Option<AcnOwnerId>;
     readonly debug: boolean;
     readonly emitObservation: EmitStartupObservation;
   },
   deps: {
     readonly fs: FileSystem;
     readonly client: HttpClient.HttpClient;
-    readonly spawnProcess: SpawnProcess;
+    readonly childProcessSpawner: ChildProcessSpawner;
   }
 ): Effect.Effect<
   {
     readonly ready: Effect.Effect<
-      string,
+      AcnEndpoint,
       DaemonSpawnFailed | DaemonCrashed | RegistrationFileInvalid,
       never
     >;
@@ -483,50 +498,50 @@ const spawnDaemon = (
   never
 > =>
   Effect.gen(function* () {
-    const { fs, client, spawnProcess } = deps;
+    const { fs, client, childProcessSpawner } = deps;
     yield* debugLog(options.debug, "spawning ACN", {
       command: command.join(" "),
       detached: true,
     });
 
-    const proc = yield* spawnProcess.spawn(command);
+    const proc = yield* childProcessSpawner.spawn(command);
 
     yield* debugLog(options.debug, "ACN process spawned", {
       pid: Option.getOrNull(proc.pid),
     });
 
-    const regPath = registrationPath(options.dataDir);
-
     const checkPublishedRegistration: Effect.Effect<
-      {
-        readonly registration: AcnRegistration;
-        readonly health: AcnHealthResponse;
-      },
+      DaemonStatus,
       NoDaemon | RegistrationFileInvalid | DaemonSpawnFailed,
       never
     > = Effect.gen(function* () {
-      const registrationOption = yield* readRegistration(regPath, fs);
-      if (Option.isNone(registrationOption)) return yield* new NoDaemon();
-
-      const registration = registrationOption.value;
-      const health = yield* probeHealth(registration.url, 500, client);
-      if (
-        health.version !== registration.version ||
-        health.id !== registration.id ||
-        health.pid !== registration.pid
-      ) {
+      const observed = yield* readCurrentDaemon(
+        {
+          dataDir: options.dataDir,
+          probeTimeoutMs: 500,
+          debug: options.debug,
+        },
+        { fs, client },
+      );
+      if (Option.isNone(observed)) return yield* new NoDaemon();
+      const status = observed.value;
+      if (Option.contains(options.initialOwnerId, status.id)) {
         return yield* new NoDaemon();
       }
-      if (compareReleaseVersions(options.version, registration.version) > 0) {
+      if (!canUseDaemonVersion(options.version, status.version)) {
         return yield* new NoDaemon();
       }
-      yield* reportHealthState(health.state, options.emitObservation);
-      if (health.state._tag === "Failed") {
+      yield* reportHealthState(status.state, options.emitObservation);
+      if (status.state._tag === "Stopping") {
+        const stopping = status.state;
         return yield* new DaemonSpawnFailed({
-          reason: health.state.message,
+          reason: Option.getOrElse(
+            stopping.safeDetail,
+            () => `ACN is stopping (${stopping.reason})`,
+          ),
         });
       }
-      return { registration, health };
+      return status;
     });
 
     const awaitPublishedRegistration = checkPublishedRegistration.pipe(
@@ -595,12 +610,12 @@ const spawnDaemon = (
     });
     const publicationBelongsToCandidate = Option.exists(
       proc.pid,
-      (pid) => pid === published.registration.pid
+      (pid) => pid === published.pid
     );
 
     const awaitReady = checkPublishedRegistration.pipe(
       Effect.filterOrFail(
-        ({ health }) => health.state._tag === "Ready",
+        ({ state }) => state._tag === "Ready",
         () => new NoDaemon()
       ),
       Effect.retry({
@@ -623,204 +638,73 @@ const spawnDaemon = (
       ).pipe(
         Effect.tap((result) =>
           debugLog(options.debug, "spawned ACN became ready", {
-            url: result.registration.url,
-            pid: result.registration.pid,
-            id: result.registration.id,
+            url: result.url,
+            pid: result.pid,
+            id: result.id,
           })
         ),
-        Effect.map((result) => result.registration.url)
+        Effect.map(endpointOf)
       ),
     };
   });
 
-// ─── Daemon action decision ──────────────────────────────────────────────────
-
-export type DaemonAction =
-  | {
-      readonly type: "reuse";
-      readonly url: string;
-      readonly reason: "same-release" | "newer-release";
-    }
-  | { readonly type: "replace"; readonly owner: AcnRegistration }
-  | {
-      readonly type: "wait";
-      readonly owner: AcnRegistration;
-      readonly state: AcnHealthResponse["state"];
-    }
-  | { readonly type: "unavailable"; readonly reason: "missing" | "stale" };
-
-export const decideDaemonAction = (input: {
-  readonly candidateVersion: string;
-  readonly registration: Option.Option<AcnRegistration>;
-  readonly health: Option.Option<AcnHealthResponse>;
-}): DaemonAction => {
-  if (Option.isNone(input.registration)) {
-    return { type: "unavailable", reason: "missing" };
-  }
-
-  if (Option.isNone(input.health)) {
-    return { type: "unavailable", reason: "stale" };
-  }
-
-  if (
-    input.health.value.version !== input.registration.value.version ||
-    input.health.value.id !== input.registration.value.id ||
-    input.health.value.pid !== input.registration.value.pid
-  ) {
-    return { type: "unavailable", reason: "stale" };
-  }
-
-  const owner = input.registration.value;
-  const comparison = compareReleaseVersions(
-    input.candidateVersion,
-    owner.version
-  );
-  if (comparison > 0 || input.health.value.state._tag === "Failed") {
-    return { type: "replace", owner };
-  }
-  if (
-    input.health.value.state._tag === "Starting" ||
-    input.health.value.state._tag === "Installing"
-  ) {
-    return {
-      type: "wait",
-      owner,
-      state: input.health.value.state,
-    };
-  }
-  if (comparison === 0)
-    return { type: "reuse", url: owner.url, reason: "same-release" };
-  if (comparison < 0)
-    return { type: "reuse", url: owner.url, reason: "newer-release" };
-  return { type: "replace", owner };
-};
-
-// ─── discover helper ─────────────────────────────────────────────────────────
+// ─── Public factories ───────────────────────────────────────────────────────
 
 /**
- * Reads the registration file, health-checks the daemon, returns the URL if
- * it's alive and matches the target version.
+ * Host settings required to observe the canonical local daemon.
  */
-const inspectDaemon = (
-  options: {
-    readonly dataDir: string;
-    readonly version: string;
-    readonly probeTimeoutMs: number;
-    readonly debug: boolean;
-  },
-  deps: {
-    readonly fs: FileSystem;
-    readonly client: HttpClient.HttpClient;
-  }
-): Effect.Effect<DaemonAction, DaemonError, never> =>
-  Effect.gen(function* () {
-    const regPath = registrationPath(options.dataDir);
-    const registration = yield* readRegistration(regPath, deps.fs);
-    yield* debugLog(
-      options.debug,
-      "read registration",
-      Option.match(registration, {
-        onNone: () => ({ state: "missing", version: options.version }),
-        onSome: (reg) => ({
-          state: "present",
-          url: reg.url,
-          version: reg.version,
-          pid: reg.pid,
-          id: reg.id,
-        }),
-      })
-    );
-
-    const health = yield* Option.match(registration, {
-      onNone: () => Effect.succeed(Option.none<AcnHealthResponse>()),
-      onSome: (reg) =>
-        probeHealth(reg.url, options.probeTimeoutMs, deps.client).pipe(
-          Effect.map(Option.some),
-          Effect.catchAll(() =>
-            Effect.succeed(Option.none<AcnHealthResponse>())
-          )
-        ),
-    });
-    yield* debugLog(
-      options.debug,
-      "probed health",
-      Option.match(health, {
-        onNone: () => ({ state: "unhealthy", version: options.version }),
-        onSome: (h) => ({ state: "healthy", version: h.version }),
-      })
-    );
-
-    const action = decideDaemonAction({
-      candidateVersion: options.version,
-      registration,
-      health,
-    });
-    return action;
-  });
-
-const discoverUrl = (
-  options: {
-    readonly dataDir: string;
-    readonly version: string;
-    readonly probeTimeoutMs: number;
-    readonly debug: boolean;
-  },
-  deps: {
-    readonly fs: FileSystem;
-    readonly client: HttpClient.HttpClient;
-  }
-): Effect.Effect<Option.Option<string>, DaemonError, never> =>
-  inspectDaemon(options, deps).pipe(
-    Effect.flatMap((action) => {
-      if (action.type === "reuse")
-        return Effect.succeed(Option.some(action.url));
-      return Effect.succeed(Option.none<string>());
-    })
-  );
-
-// ─── Public factory ──────────────────────────────────────────────────────────
-
-/**
- * Options for the local daemon spawner. These are passed through from
- * `EnsureDaemonOptions` by the caller.
- */
-export interface LocalSpawnerOptions {
-  readonly binaryPath?: string;
-  readonly version?: string;
-  /** Deadline from candidate spawn until its early registration is observable. */
-  readonly publicationTimeoutMs?: number;
+export interface LocalDaemonDiscoveryOptions {
   readonly probeTimeoutMs?: number;
   readonly debug?: boolean;
   /** Test/embedding override. Defaults to ~/.magnitude. */
   readonly dataDir?: string;
 }
 
-/**
- * Creates a local `DaemonSpawner` that captures `FileSystem`, `HttpClient`,
- * and `CommandExecutor` at construction time.
- *
- * The returned spawner's `discover` and `spawn` methods require only `never`
- * — all dependencies are sealed inside.
- *
- * @param options — version, timeouts, debug, binaryPath (passed from EnsureDaemonOptions)
- */
-export const makeLocalDaemonSpawner = (
-  options: LocalSpawnerOptions = {}
+/** Host settings required to launch and observe a local daemon candidate. */
+export interface LocalDaemonLauncherOptions extends LocalDaemonDiscoveryOptions {
+  readonly binaryPath?: string;
+  readonly version?: string;
+  /** Deadline from candidate spawn until its early registration is observable. */
+  readonly publicationTimeoutMs?: number;
+}
+
+/** Creates local daemon discovery from canonical registration and health. */
+export const makeLocalDaemonDiscovery = (
+  options: LocalDaemonDiscoveryOptions = {}
+): Effect.Effect<DaemonDiscovery, never, FileSystem | HttpClient.HttpClient> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem;
+    const client = yield* HttpClient.HttpClient;
+    const dataDir = options.dataDir ?? defaultDataDir();
+    const probeTimeoutMs = options.probeTimeoutMs ?? 2_000;
+    const debug = options.debug ?? process.env.MAGNITUDE_ACN_DEBUG === "1";
+    return {
+      current: () =>
+        readCurrentDaemon(
+          { dataDir, probeTimeoutMs, debug },
+          { fs, client },
+        ),
+    } satisfies DaemonDiscovery;
+  });
+
+/** Creates the launch mutation and captures its host-specific dependencies. */
+export const makeLocalDaemonLauncher = (
+  options: LocalDaemonLauncherOptions = {}
 ): Effect.Effect<
-  DaemonSpawner,
+  DaemonLauncher,
   never,
   | FileSystem
   | HttpClient.HttpClient
   | CommandExecutor.CommandExecutor
   | Path.Path
-  | SpawnProcess
+  | ChildProcessSpawner
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem;
     const client = yield* HttpClient.HttpClient;
     const cmd = yield* CommandExecutor.CommandExecutor;
     const path = yield* Path.Path;
-    const spawnProcess = yield* SpawnProcess;
+    const childProcessSpawner = yield* ChildProcessSpawner;
 
     const dataDir = options.dataDir ?? defaultDataDir();
     const targetVersion = options.version ?? SDK_VERSION;
@@ -829,80 +713,77 @@ export const makeLocalDaemonSpawner = (
     const probeTimeoutMs = options.probeTimeoutMs ?? 2000;
 
     const deps = { fs, client };
+    const observeCurrent = readCurrentDaemon(
+      { dataDir, probeTimeoutMs, debug },
+      deps,
+    );
+    const canJoinLaunch = (status: DaemonStatus): boolean =>
+      status.state._tag !== "Stopping" &&
+      canUseDaemonVersion(targetVersion, status.version);
 
     return {
-      discover: () =>
-        discoverUrl(
-          { dataDir, version: targetVersion, probeTimeoutMs, debug },
-          deps
-        ),
-
-      spawn: (command) =>
-        Stream.asyncPush<DaemonSpawnEvent, DaemonError>(
+      launch: (command) =>
+        Stream.asyncPush<DaemonLaunchEvent, DaemonError>(
           (emit) => {
             const emitObservation: EmitStartupObservation = (observation) =>
               Effect.sync(() => {
                 emit.single({ _tag: "Observation", observation });
               });
             const startup = Effect.gen(function* () {
-              let coordinate!: Effect.Effect<
-                { readonly ready: Effect.Effect<string, DaemonError> },
+              const initialOwnerId = yield* readRegistration(
+                registrationPath(dataDir),
+                fs,
+              ).pipe(Effect.map(Option.map((registration) => registration.id)));
+              const isConcurrentLaunch = (id: string): boolean =>
+                !Option.contains(initialOwnerId, id);
+
+              let launchCandidate!: Effect.Effect<
+                { readonly ready: Effect.Effect<AcnEndpoint, DaemonError> },
                 DaemonError
               >;
-              const awaitIncumbent: Effect.Effect<string, DaemonError> =
+              const awaitConcurrentLaunch: Effect.Effect<AcnEndpoint, DaemonError> =
                 Effect.suspend(() =>
-                  inspectDaemon(
-                    {
-                      dataDir,
-                      version: targetVersion,
-                      probeTimeoutMs,
-                      debug,
-                    },
-                    deps
-                  ).pipe(
-                    Effect.flatMap((action) => {
-                      switch (action.type) {
-                        case "reuse":
-                          return Effect.succeed(action.url);
-                        case "wait":
-                          return reportHealthState(
-                            action.state,
-                            emitObservation
-                          ).pipe(
+                  observeCurrent.pipe(
+                    Effect.flatMap(
+                      Option.match({
+                        onNone: () =>
+                          launchCandidate.pipe(Effect.flatMap(({ ready }) => ready)),
+                        onSome: (status) => {
+                          if (!isConcurrentLaunch(status.id) || !canJoinLaunch(status)) {
+                            return launchCandidate.pipe(
+                              Effect.flatMap(({ ready }) => ready),
+                            );
+                          }
+                          if (status.state._tag === "Ready") {
+                            return Effect.succeed(endpointOf(status));
+                          }
+                          return reportHealthState(status.state, emitObservation).pipe(
                             Effect.zipRight(Effect.sleep("100 millis")),
-                            Effect.zipRight(awaitIncumbent)
+                            Effect.zipRight(awaitConcurrentLaunch),
                           );
-                        case "unavailable":
-                        case "replace":
-                          return coordinate.pipe(
-                            Effect.flatMap(({ ready }) => ready)
-                          );
-                      }
-                    })
-                  )
+                        },
+                      }),
+                    ),
+                  ),
                 );
-              coordinate = withSpawnElection(
+              launchCandidate = withSpawnElection(
                 spawnElectionPath(dataDir),
                 fs,
                 emitObservation,
                 Effect.gen(function* () {
                   // Mandatory post-election convergence. A contender never
                   // acts on the stale state that caused it to enter election.
-                  const action = yield* inspectDaemon(
-                    {
-                      dataDir,
-                      version: targetVersion,
-                      probeTimeoutMs,
-                      debug,
-                    },
-                    deps
-                  );
-                  if (action.type === "wait") {
-                    yield* reportHealthState(action.state, emitObservation);
-                    return { ready: awaitIncumbent };
-                  }
-                  if (action.type === "reuse") {
-                    return { ready: Effect.succeed(action.url) };
+                  const current = yield* observeCurrent;
+                  if (
+                    Option.isSome(current) &&
+                    isConcurrentLaunch(current.value.id) &&
+                    canJoinLaunch(current.value)
+                  ) {
+                    if (current.value.state._tag === "Ready") {
+                      return { ready: Effect.succeed(endpointOf(current.value)) };
+                    }
+                    yield* reportHealthState(current.value.state, emitObservation);
+                    return { ready: awaitConcurrentLaunch };
                   }
 
                   const acquisitionPlan = yield* Ref.make<
@@ -973,14 +854,15 @@ export const makeLocalDaemonSpawner = (
                       dataDir,
                       version: targetVersion,
                       publicationTimeoutMs,
+                      initialOwnerId,
                       debug,
                       emitObservation,
                     },
-                    { fs, client, spawnProcess }
+                    { fs, client, childProcessSpawner }
                   );
                 })
               );
-              const awaitReady = yield* coordinate;
+              const awaitReady = yield* launchCandidate;
               return yield* awaitReady.ready;
             });
             return startup.pipe(
@@ -988,8 +870,8 @@ export const makeLocalDaemonSpawner = (
                 onFailure: (error) => {
                   emit.fail(error);
                 },
-                onSuccess: (url) => {
-                  emit.single({ _tag: "Ready", url });
+                onSuccess: (endpoint) => {
+                  emit.single({ _tag: "Ready", endpoint });
                   emit.end();
                 },
               }),
@@ -998,5 +880,5 @@ export const makeLocalDaemonSpawner = (
           },
           { bufferSize: "unbounded" }
         ),
-    } satisfies DaemonSpawner;
+    } satisfies DaemonLauncher;
   });

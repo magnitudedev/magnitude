@@ -17,12 +17,14 @@ describe("AcnSubscriptions", () => {
         requestId: "1",
         sessionId: "session-a",
         emit: emit(first),
+        close: Effect.void,
       })
       const secondHandle = yield* subscriptions.register({
         clientId: 2,
         requestId: "2",
         sessionId: "session-b",
         emit: emit(second),
+        close: Effect.void,
       })
 
       yield* subscriptions.suspendSession("session-a")
@@ -48,17 +50,20 @@ describe("AcnSubscriptions", () => {
     const program = Effect.gen(function* () {
       const subscriptions = yield* AcnSubscriptions
       const received = yield* Ref.make<AcnSubscriptionControl[]>([])
+      const closed = yield* Ref.make(false)
       yield* subscriptions.terminate
       const handle = yield* subscriptions.register({
         clientId: 1,
         requestId: "late",
         emit: (control) => Ref.update(received, (all) => [...all, control]),
+        close: Ref.set(closed, true),
       })
       yield* handle.unregister
-      return yield* Ref.get(received)
+      return { controls: yield* Ref.get(received), closed: yield* Ref.get(closed) }
     }).pipe(Effect.provide(AcnSubscriptionsLive))
     const controls = await Effect.runPromise(Effect.scoped(program))
 
-    expect(controls).toEqual([{ _tag: "terminated", reason: "acn-shutdown" }])
+    expect(controls.controls).toEqual([])
+    expect(controls.closed).toBe(true)
   })
 })

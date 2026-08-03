@@ -3,6 +3,7 @@ export {
   BinaryVersionMismatch,
   ChecksumMismatch,
   DaemonCrashed,
+  DaemonDiscoveryFailed,
   DaemonError,
   DaemonSpawnFailed,
   DownloadFailed,

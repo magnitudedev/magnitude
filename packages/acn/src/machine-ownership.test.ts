@@ -1,15 +1,24 @@
 import { describe, expect, it } from "vitest"
 import * as FileSystem from "@effect/platform/FileSystem"
-import { BunFileSystem } from "@effect/platform-bun"
-import { Deferred, Effect, Exit, Fiber, Option, Scope } from "effect"
+import type * as CommandExecutor from "@effect/platform/CommandExecutor"
+import { BunCommandExecutor, BunFileSystem } from "@effect/platform-bun"
+import { Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { acquireAcnMachineOwnership } from "./machine-ownership"
+import { AcnOwnerIdSchema } from "@magnitudedev/acn-protocol"
+
+const ownerId = AcnOwnerIdSchema.make
 
 const run = <A, E>(
-  effect: Effect.Effect<A, E, FileSystem.FileSystem>
-) => Effect.runPromise(effect.pipe(Effect.provide(BunFileSystem.layer)))
+  effect: Effect.Effect<A, E, FileSystem.FileSystem | CommandExecutor.CommandExecutor>
+) => Effect.runPromise(effect.pipe(
+  Effect.provide(Layer.merge(
+    BunFileSystem.layer,
+    BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
+  )),
+))
 
 describe("ACN machine ownership", () => {
   it("waits for the exact live owner and acquires after its release", async () => {
@@ -18,11 +27,11 @@ describe("ACN machine ownership", () => {
       Effect.gen(function* () {
         const firstScope = yield* Scope.make()
         const secondScope = yield* Scope.make()
-        yield* acquireAcnMachineOwnership({ dataDir, id: "first", version: "1" }).pipe(
+        yield* acquireAcnMachineOwnership({ dataDir, id: ownerId("first"), version: "1" }).pipe(
           Effect.provideService(Scope.Scope, firstScope),
         )
         const waiting = yield* Effect.fork(
-          acquireAcnMachineOwnership({ dataDir, id: "second", version: "2" }).pipe(
+          acquireAcnMachineOwnership({ dataDir, id: ownerId("second"), version: "2" }).pipe(
             Effect.provideService(Scope.Scope, secondScope),
           ),
         )
@@ -45,7 +54,7 @@ describe("ACN machine ownership", () => {
     )
     await run(
       Effect.scoped(
-        acquireAcnMachineOwnership({ dataDir, id: "replacement", version: "new" }),
+        acquireAcnMachineOwnership({ dataDir, id: ownerId("replacement"), version: "new" }),
       ),
     )
     expect(await Bun.file(join(directory, "owner")).exists()).toBe(false)
@@ -58,12 +67,12 @@ describe("ACN machine ownership", () => {
         const firstScope = yield* Scope.make()
         yield* acquireAcnMachineOwnership({
           dataDir,
-          id: "active",
+          id: ownerId("active"),
           version: "1",
         }).pipe(Effect.provideService(Scope.Scope, firstScope))
         const waiting = yield* acquireAcnMachineOwnership({
           dataDir,
-          id: "superseded",
+          id: ownerId("superseded"),
           version: "2",
         }).pipe(
           Effect.scoped,
@@ -90,7 +99,7 @@ describe("ACN machine ownership", () => {
         const firstAcquired = yield* Deferred.make<string>()
         const acquired = yield* Effect.all(
           ["left", "right"].map((id, index) =>
-            acquireAcnMachineOwnership({ dataDir, id, version: "1.0.0" }).pipe(
+            acquireAcnMachineOwnership({ dataDir, id: ownerId(id), version: "1.0.0" }).pipe(
               Effect.provideService(Scope.Scope, scopes[index]!),
               Effect.tap(() => Deferred.succeed(firstAcquired, id)),
               Effect.as(id),

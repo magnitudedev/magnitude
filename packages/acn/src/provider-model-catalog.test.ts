@@ -17,7 +17,7 @@ import { MirroredStateChangesLive } from "./mirrored-state"
 import { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderClient } from "@magnitudedev/sdk"
 import { AcnActivityTrackerLive } from "./activity-tracker"
-import { AcnShutdownLive } from "./acn-shutdown"
+import { AcnServiceLifecycleLive } from "./service-lifecycle"
 
 const providerA = ProviderIdSchema.make("provider-a")
 const providerB = ProviderIdSchema.make("provider-b")
@@ -109,7 +109,9 @@ describe("provider model catalog", () => {
           changes: Stream.fromPubSub(localChanges),
         })),
         MirroredStateChangesLive,
-        AcnActivityTrackerLive("30 minutes").pipe(Layer.provide(AcnShutdownLive)),
+        AcnActivityTrackerLive.pipe(
+          Layer.provide(AcnServiceLifecycleLive("30 minutes")),
+        ),
       )
       return yield* Effect.gen(function* () {
         const catalog = yield* ProviderModelCatalog
