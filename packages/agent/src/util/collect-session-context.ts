@@ -9,6 +9,7 @@ import type { MagnitudeStorageShape } from '@magnitudedev/storage'
 import type { SessionContext, GitContext } from '../events'
 import { loadSkills, skillLoadDiagnosticLogFields, type SkillLoadDiagnostic } from '@magnitudedev/skills'
 import { logger } from '@magnitudedev/logger'
+import { FOLDER_TREE_BUDGET_TOKENS, MAX_VCS_STATUS_LINES } from '../constants'
 import { runGitCommand } from './git-command'
 import { knapsackFolderTree } from './folder-tree-knapsack'
 import { truncateFolderTree } from '../truncation'
@@ -23,20 +24,17 @@ const logSkillLoadDiagnostic = (diagnostic: SkillLoadDiagnostic): void => {
 // Constants
 // =============================================================================
 
-const FOLDER_TREE_BUDGET_TOKENS = 2500
-const MAX_STATUS_LINES = 20
-
 // =============================================================================
 // Git Commands
 // =============================================================================
 
 function truncateStatus(status: string): string {
   const lines = status.split('\n')
-  if (lines.length <= MAX_STATUS_LINES) {
+  if (lines.length <= MAX_VCS_STATUS_LINES) {
     return status
   }
-  const shown = lines.slice(0, MAX_STATUS_LINES)
-  const remaining = lines.length - MAX_STATUS_LINES
+  const shown = lines.slice(0, MAX_VCS_STATUS_LINES)
+  const remaining = lines.length - MAX_VCS_STATUS_LINES
   return [...shown, `... (${remaining} more files)`].join('\n')
 }
 
@@ -72,7 +70,7 @@ async function collectGitContext(cwd: string): Promise<GitContext | null> {
 async function collectFolderStructure(cwd: string): Promise<string> {
   try {
     await access(join(cwd, '.git'))
-    const tree = await knapsackFolderTree(cwd, FOLDER_TREE_BUDGET_TOKENS)
+    const tree = await knapsackFolderTree(cwd)
     return tree || '(empty or no accessible folders)'
   } catch {
     const entries = await walk(cwd, cwd, 0, 2, null, {

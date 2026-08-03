@@ -1,6 +1,6 @@
 import { access } from 'fs/promises'
 import { join } from 'path'
-import { CHARS_PER_TOKEN_UPPER } from '../constants'
+import { CHARS_PER_TOKEN_UPPER, FOLDER_TREE_BUDGET_TOKENS } from '../constants'
 import { createDefaultIgnore } from './gitignore'
 import { runGitCommand } from './git-command'
 import { walk, type Entry } from './walk'
@@ -342,7 +342,7 @@ function render(roots: BuildNode[], selected: Set<number>): string {
   return lines.join('\n')
 }
 
-export async function knapsackFolderTree(cwd: string, budgetTokens = 2500): Promise<string> {
+export async function knapsackFolderTree(cwd: string, budgetTokens = FOLDER_TREE_BUDGET_TOKENS): Promise<string> {
   if (budgetTokens <= 0) return ''
 
   const ignore = createDefaultIgnore()

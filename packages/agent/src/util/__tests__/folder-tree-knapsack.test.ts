@@ -1,15 +1,14 @@
 import { expect, test } from 'bun:test'
 import { join } from 'path'
-import { CHARS_PER_TOKEN_UPPER } from '../../constants'
+import { CHARS_PER_TOKEN_UPPER, FOLDER_TREE_BUDGET_TOKENS } from '../../constants'
 import { knapsackFolderTree } from '../folder-tree-knapsack'
 
 const REPO_ROOT = join(import.meta.dir, '../../../../../')
 
-test('budget obeyed on real scratchpad', async () => {
-  const budget = 2500
-  const out = await knapsackFolderTree(REPO_ROOT, budget)
+test('default budget obeyed on real scratchpad', async () => {
+  const out = await knapsackFolderTree(REPO_ROOT)
   expect(out.length).toBeGreaterThan(0)
-  expect(Math.ceil(out.length / CHARS_PER_TOKEN_UPPER)).toBeLessThanOrEqual(budget)
+  expect(Math.ceil(out.length / CHARS_PER_TOKEN_UPPER)).toBeLessThanOrEqual(FOLDER_TREE_BUDGET_TOKENS)
 })
 
 test('files appear in output on real scratchpad', async () => {

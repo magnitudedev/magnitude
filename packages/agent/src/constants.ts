@@ -11,6 +11,12 @@ export const CHARS_PER_TOKEN_UPPER = 4
 /** Characters per token lower bound (for compaction estimation — lower = more tokens estimated = safer) */
 export const CHARS_PER_TOKEN_LOWER = 3
 
+/** Token budget for the folder structure included in initial session context */
+export const FOLDER_TREE_BUDGET_TOKENS = 1_000
+
+/** Maximum VCS status entries included in initial session context */
+export const MAX_VCS_STATUS_LINES = 20
+
 /** Max tokens for a resolved ref in an inspect block */
 export const TRUNCATION_TOKEN_LIMIT = 25_000
 
