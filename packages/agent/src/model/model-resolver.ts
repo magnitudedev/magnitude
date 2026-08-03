@@ -1,11 +1,11 @@
-import { Clock, Context, Effect, Layer, Option } from 'effect'
+import { Context, Effect, Layer, Option } from 'effect'
 import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, SlotIdSchema, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import type { RoleId } from '../agents/role-validation'
 import { ConfigAmbient, getSlotConfig, getSlotConfigForRole, type SlotConfig } from '../ambient/config-ambient'
 import { makeAgentBoundModel, type AgentBoundModel } from './agent-model'
 import { TurnContextTag } from '../engine/turn-context'
-import { ModelRequestActivityAmbient } from '../display'
+import { ModelRequestActivityAmbient } from './model-request-activity'
 import type { ModelRequestProgress } from '@magnitudedev/ai'
 import type { PrepareModelRequest } from './model-request-preparation'
 import { MAX_TOOL_CALLS_PER_TURN } from '../constants'
@@ -82,11 +82,9 @@ export const AgentModelResolverLive = (
             Effect.gen(function* () {
               const turn = yield* Effect.serviceOption(TurnContextTag)
               if (Option.isSome(turn)) {
-                const observedAt = yield* Clock.currentTimeMillis
                 yield* ambient.update(ModelRequestActivityAmbient, {
                   turn: turn.value,
                   progress,
-                  observedAt,
                 })
               }
             })

@@ -104,15 +104,14 @@ describe('display view materializer', () => {
 
     const idleRootWork = {
       phase: 'idle' as const,
-      accumulatedWorkMs: 0,
-      workingStartedAt: null,
-      lastChainMs: 0,
-      activity: null,
+      accumulatedProductiveMs: 0,
+      productiveStartedAt: null,
+      lastProductiveMs: 0,
+      chainStartedAt: null,
       activeChildCount: 0,
-      _currentTurnId: null,
+      _currentTurn: null,
       _currentChainId: null,
-      _thinkingCharCount: null,
-      _activeToolKey: null,
+      _isThinking: false,
       _generation: null,
     }
 
@@ -121,6 +120,7 @@ describe('display view materializer', () => {
       taskWorker,
       { forks: new Map<string | null, { tokenEstimate: number }>([[null, { tokenEstimate: 1200 }], ['fork-1', { tokenEstimate: 4600 }]]) },
       { forks: new Map() },
+      new Map(),
     )
     const tasks = materializeDisplayTasks(taskWorker)
     const actorKey = forkIdToKey('fork-1')

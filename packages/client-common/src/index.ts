@@ -10,6 +10,7 @@ export * from './state/file-watch-atom'
 export * from './state/active-session-statuses'
 export * from './state/acn-lifecycle'
 export * from './display-view-controller/hooks'
+export * from './hooks/use-stabilized-root-detail'
 
 // Platform
 export * from './platform/types'
@@ -48,8 +49,8 @@ export * from './utils/model-slots'
 export * from './utils/current-local-model'
 export * from './utils/model-memory'
 export * from './utils/hardware-memory'
-export * from './utils/actor-work'
-export * from './utils/model-request-progress'
+export * from './utils/actor-status'
+export * from './utils/root-detail'
 export * from './attachments/images'
 
 // Commands

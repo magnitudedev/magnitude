@@ -120,7 +120,8 @@ export {
 export type {
   DisplayState,
   DisplayActor,
-  DisplayActorWork,
+  DisplayRootStatus,
+  DisplayWorkerStatus,
   DisplayTimeline,
   DisplayTimelineState,
   DisplayMessage,

@@ -178,7 +178,9 @@ export function ComposerContainer({
       cwd={selectedCwd}
       clientWorkingDirectory={clientWorkingDirectory}
       status={rootTimeline?.mode ?? 'idle'}
-      hasRunningForks={(rootActor?.work.activeChildCount ?? 0) > 0}
+      hasRunningForks={rootActor?.kind === 'root'
+        && rootActor.status._tag === 'Working'
+        && rootActor.status.activeChildCount > 0}
       bashMode={composer.bashMode}
       modelsConfigured={modelsConfigured}
       modelSetupInProgress={modelSetupInProgress}

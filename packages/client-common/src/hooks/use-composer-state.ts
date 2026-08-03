@@ -43,7 +43,7 @@ import type {
   RawMentionOccurrence,
 } from "@magnitudedev/sdk"
 import { createId } from "@magnitudedev/generate-id"
-import { isDisplayActorWorkActive } from "../utils/actor-work"
+import { isDisplayRootStatusActive } from "../utils/actor-status"
 
 export interface UseComposerStateResult {
   /** Root agent's role label (capitalized) */
@@ -113,7 +113,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     : ""
 
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
-  const isStreaming = rootActor !== null && isDisplayActorWorkActive(rootActor.work)
+  const isStreaming = rootActor?.kind === "root" && isDisplayRootStatusActive(rootActor.status)
 
   const selectedSessionSyncAtom = useMemo(() => Atom.make(Effect.sync(() => {
     const previous = previousSelectedSessionIdRef.current

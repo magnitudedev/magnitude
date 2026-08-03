@@ -5,20 +5,18 @@ import {
 } from '../src/display/model-request-activity'
 
 describe('model request activity', () => {
-  it('preserves its start time when admission hands off to the native request', () => {
+  it('preserves request identity when admission hands off to the native request', () => {
     const turn = { turnId: 'turn-1', chainId: 'chain-1', forkId: null }
     const preparingState = reduceModelRequestActivity(
       initialModelRequestActivityState(),
       {
         turn,
         progress: { phase: 'preparing', requestId: null },
-        observedAt: 1_000,
       },
     )
     const queuedState = reduceModelRequestActivity(preparingState, {
       turn,
       progress: { phase: 'queued', requestId: 'request-1' },
-      observedAt: 2_000,
     })
     const active = {
       preparing: preparingState.requests.get('root'),
@@ -29,7 +27,6 @@ describe('model request activity', () => {
     expect(active.queued).toMatchObject({
       requestId: 'request-1',
       phase: 'queued',
-      startedAt: active.preparing?.startedAt,
     })
   })
 
@@ -38,17 +35,14 @@ describe('model request activity', () => {
     const first = reduceModelRequestActivity(initialModelRequestActivityState(), {
       turn,
       progress: { phase: 'queued', requestId: 'request-1' },
-      observedAt: 1_000,
     })
     const second = reduceModelRequestActivity(first, {
       turn,
       progress: { phase: 'queued', requestId: 'request-2' },
-      observedAt: 2_000,
     })
     const active = reduceModelRequestActivity(second, {
       turn,
       progress: { phase: 'cleared', requestId: 'request-1' },
-      observedAt: 3_000,
     }).requests
 
     expect(active.get('root')).toMatchObject({ requestId: 'request-2' })
@@ -60,7 +54,6 @@ describe('model request activity', () => {
       initialModelRequestActivityState(),
       {
         turn,
-        observedAt: 1_000,
         progress: {
           phase: 'prefill',
           requestId: 'request-1',
@@ -72,7 +65,6 @@ describe('model request activity', () => {
     )
     const result = reduceModelRequestActivity(prefill, {
       turn,
-      observedAt: 2_000,
       progress: {
         phase: 'generating',
         requestId: 'request-1',

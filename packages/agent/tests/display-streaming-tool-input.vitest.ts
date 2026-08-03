@@ -21,7 +21,6 @@ import { TurnProjection } from '../src/projections/turn'
 import { AgentRoutingProjection } from '../src/projections/agent-routing'
 import {
   AgentLifecycleProjection,
-  rootWorkActivity,
   type AgentLifecycleState,
 } from '../src/projections/agent-lifecycle'
 import { GoalProjection } from '../src/projections/goal'
@@ -226,7 +225,7 @@ describe('Display projection — tool lifecycle events', () => {
     expect(step2.toolKey).toBe('fileRead')
   })
 
-  it('shows advisor activity as status text while hidden advisor tool runs', async () => {
+  it('tracks hidden tool execution as generic tool activity', async () => {
     const toolCallId = 'advisor-1' as ToolCallId
     const providerToolCallId = 'advisor-1' as ProviderToolCallId
 
@@ -241,7 +240,7 @@ describe('Display projection — tool lifecycle events', () => {
       } as AppEvent,
     ])
 
-    expect(rootWorkActivity(active.rootWork)?.message).toBe('Asking advisor')
+    expect(active.rootWork._currentTurn?.modelActivityStarted).toBe(true)
     expect(listMessages(active.display.messages).some(m => m.type === 'tool' && m.toolKey === 'messageAdvisor')).toBe(false)
 
     const completed = await makeDisplayAndRootWork([
@@ -259,6 +258,6 @@ describe('Display projection — tool lifecycle events', () => {
       } as AppEvent,
     ])
 
-    expect(rootWorkActivity(completed.rootWork)).toBeNull()
+    expect(completed.rootWork._currentTurn?.modelActivityStarted).toBe(true)
   })
 })

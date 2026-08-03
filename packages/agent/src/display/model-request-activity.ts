@@ -1,33 +1,22 @@
-import type { ModelRequestProgress } from '@magnitudedev/ai'
-import { Ambient, Projection } from '@magnitudedev/event-core'
+import { Projection } from '@magnitudedev/event-core'
 import { forkIdToKey } from '@magnitudedev/acn-protocol'
 import { Schema } from 'effect'
 import type { AppEvent } from '../events'
+import {
+  ModelRequestActivityAmbient,
+  type ModelRequestActivityObservation,
+} from '../model/model-request-activity'
 
-interface ModelRequestTurn {
-  readonly turnId: string
-  readonly chainId: string
-  readonly forkId: string | null
-}
-
-export interface ModelRequestActivityObservation {
-  readonly turn: ModelRequestTurn
-  readonly progress: ModelRequestProgress
-  readonly observedAt: number
-}
-
-export const ModelRequestActivityAmbient =
-  Ambient.define<ModelRequestActivityObservation | null>({
-    name: 'ModelRequestActivity',
-    initial: null,
-  })
+export {
+  ModelRequestActivityAmbient,
+  type ModelRequestActivityObservation,
+} from '../model/model-request-activity'
 
 const ActiveModelRequestSchema = Schema.Struct({
   requestId: Schema.NullOr(Schema.String),
   turnId: Schema.String,
   chainId: Schema.String,
   forkId: Schema.NullOr(Schema.String),
-  startedAt: Schema.Number,
   phase: Schema.Literal('queued', 'preparing', 'prefill'),
   completedTokens: Schema.NullOr(Schema.Number),
   totalTokens: Schema.NullOr(Schema.Number),
@@ -56,7 +45,7 @@ export function reduceModelRequestActivity(
   current: ModelRequestActivityState,
   observation: ModelRequestActivityObservation,
 ): ModelRequestActivityState {
-  const { turn, progress, observedAt } = observation
+  const { turn, progress } = observation
   const key = forkIdToKey(turn.forkId)
 
   if (progress.phase === 'generating') {
@@ -89,15 +78,11 @@ export function reduceModelRequestActivity(
     return { ...current, requests }
   }
 
-  const active = current.requests.get(key)
-  const startedAt =
-    active?.turnId === turn.turnId ? active.startedAt : observedAt
   const nextActivity: ActiveModelRequest = {
     requestId: progress.requestId,
     turnId: turn.turnId,
     chainId: turn.chainId,
     forkId: turn.forkId,
-    startedAt,
     phase: progress.phase,
     completedTokens:
       progress.phase === 'prefill' ? progress.completedTokens : null,

@@ -1,7 +1,7 @@
 import { test, expect, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
-import type { DisplayActor, TaskDisplayRow } from '@magnitudedev/sdk'
+import type { DisplayActor, DisplayWorkerStatus, TaskDisplayRow } from '@magnitudedev/sdk'
 import { Option } from 'effect'
 const testTheme = {
   foreground: '#ffffff',
@@ -68,7 +68,7 @@ const makeActor = (
   actorKey: string,
   name: string,
   role = 'builder',
-  work: Partial<DisplayActor['work']> = {},
+  status: Partial<DisplayWorkerStatus> = {},
 ): DisplayActor => ({
   kind: 'worker',
   name,
@@ -76,15 +76,13 @@ const makeActor = (
   parentActorKey: 'root',
   taskId: null,
   context: { tokenEstimate: 0, isCompacting: false },
-  work: {
+  status: {
     phase: 'worked',
     activeSince: null,
     lastWorkMs: 0,
     accumulatedMs: 0,
     resumeCount: 0,
-    activity: null,
-    activeChildCount: 0,
-    ...work,
+    ...status,
   },
 })
 
