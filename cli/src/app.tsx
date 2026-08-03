@@ -209,7 +209,7 @@ function OnboardingGate(
 
   const onboardingRequired = Result.isSuccess(onboarding.state)
     ? !onboarding.state.value.completed
-    : true;
+    : false;
   const primary = Option.map(slotsSnapshot, ({ state }) => state.slots.primary);
   const modelSetupActive = deriveModelSetupActive({
     forceSetup: props.forceSetup,
