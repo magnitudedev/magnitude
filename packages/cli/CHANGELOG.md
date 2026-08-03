@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.29
+
+### Patch Changes
+
+- [`7ea43d0`](https://github.com/magnitudedev/magnitude/commit/7ea43d07185933a182ae95d1680a675c6b206089) Thanks [@anerli](https://github.com/anerli)! - allow launcher to use node or bun
+
 ## 0.0.1-alpha.28
 
 ### Patch Changes
