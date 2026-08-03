@@ -1,4 +1,7 @@
-#!/usr/bin/env node
+#!/bin/sh
+':' //; if command -v node >/dev/null 2>&1; then exec node "$0" "$@"; fi
+':' //; if command -v bun >/dev/null 2>&1; then exec bun "$0" "$@"; fi
+':' //; echo "Magnitude requires Node.js or Bun to start." >&2; exit 127
 
 const { ensureBinary } = require('../lib/download.js');
 
